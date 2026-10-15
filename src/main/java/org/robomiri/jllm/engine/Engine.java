@@ -158,6 +158,7 @@ public final class Engine implements AutoCloseable {
         String pending = ""; // text held back because it could be the start of a stop string
         int maxStop = p.stop().stream().mapToInt(String::length).max().orElse(0);
         String finish = "length";
+        boolean stopHit = false; // a stop string was found: everything after it is discarded
         int maxTokens = Math.min(p.maxTokens(), ctx - prompt.length);
         int[] one = new int[1];
 
@@ -180,6 +181,7 @@ public final class Engine implements AutoCloseable {
                 if (hit >= 0) {
                     emit(pending.substring(0, hit), text, sink);
                     pending = "";
+                    stopHit = true;
                     finish = "stop";
                     break;
                 }
@@ -195,10 +197,8 @@ public final class Engine implements AutoCloseable {
                 pos++;
             }
         }
-        if (!finish.equals("stop") || pending.isEmpty()) {
+        if (!stopHit) { // EOS, length or cancelled: release the held-back text plus any incomplete UTF-8 sequence
             emit(pending + dec.flush(), text, sink);
-        } else {
-            emit(pending, text, sink);
         }
         long t2 = System.nanoTime();
 
