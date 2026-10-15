@@ -313,18 +313,23 @@ kernel and the scalar `Q2K.dotRow` are at the 1e-7 level (the smoke test allows 
 `Q2KKernels.dequant` is the same unpacking with `q.fma(dl, −ml)` written to a float buffer for the prefill
 path ([07 §7.4](07-cpu-backend.md#74-decode-vs-prefill-matmul-cpubackendmatmul)).
 
-### Metal: `matmul_q2k`, `block_dot<2>`
+### Metal: `mm_row_q2k`, `block_dot<2>`
 
 The GPU has no register-width reason to interleave, so `q2k_sub_block` simply dequantizes one 16-weight
 sub-block into four `float4` (`(q >> shift) & 3) · dl − ml`) and the kernels `dot()` them with the activation,
-as `matmul_q4` does with its `lo/hi`. The one Q2_K-specific decision is the **work unit**: `matmul_q4` gives
-each lane of a simdgroup one 32-weight block, and a 1024-wide row has 32 of them — a perfect fit. A 1024-wide
-Q2_K row has only **4 super-blocks**; one super-block per lane would leave 28 of 32 lanes idle. `matmul_q2k`
-therefore strides over 16-weight sub-blocks (`u = lane, lane + 32, …`, 64 per 1024-wide row), computing
-`blk = wq + (row·nsb + u/16)·84` and `j = u % 16` for each. For the MoE kernels, `block_dot<2>` keeps the
-32-weight block interface (`moe_up`/`moe_down` are templates on it) and dequantizes sub-blocks `2b` and
-`2b+1`. The `ws` scale buffer argument is unused — `MetalBackend` binds offset 0 for Q2_K tensors because
-there is no scale region to point at.
+as the Q4_0 path does with its `lo/hi`. Every quantized matmul on Metal — the plain `matmul`, the fused q/k/v
+`matmul3`, the fused `matmul_swiglu`, with and without the folded rmsnorm — is one template on the
+quantization type `QT` whose inner loop is `mm_row<QT>`; `mm_row` hands `QT == 2` to `mm_row_q2k`, so one
+function covers all of them and the `_q2k` / `_q2k_norm` pipelines are plain instantiations
+(`matmul<2, false>`, `matmul3<2, true>`, …). The one Q2_K-specific decision is the **work unit**: the Q4_0
+loop gives each lane of a simdgroup one 32-weight block, and a 1024-wide row has 32 of them — a perfect fit. A
+1024-wide Q2_K row has only **4 super-blocks**; one super-block per lane would leave 28 of 32 lanes idle.
+`mm_row_q2k` therefore strides over 16-weight sub-blocks (`u = lane, lane + 32, …`, 64 per 1024-wide row),
+computing `blk = wq + (row·nsb + u/16)·84` and `j = u % 16` for each. For the MoE kernels, `block_dot<2>`
+keeps the 32-weight block interface (`moe_up`/`moe_down` are templates on it) and dequantizes sub-blocks `2b`
+and `2b+1`. The `ws` scale buffer argument is unused — `MetalBackend.scaleOff` binds offset 0 for Q2_K tensors
+because there is no scale region to point at, and `MetalBackend.byType` picks the `_q2k` pipeline from the
+tensor's type (the Mamba backend reuses both).
 
 ---
 
@@ -372,7 +377,7 @@ All numbers from a 10-core M1 Pro (32 GB) with Qwen3-0.6B, greedy decoding (`--t
 | on-grid rows (random `d, dmin, sc_j, m_j, q`) quantize → dequantize | exact (max error 0.0), for 1024-wide rows and 320-wide rows with a partial super-block |
 | SIMD `Q2KKernels.dequant` vs scalar `Q2K.dequantizeBlock` | identical |
 | SIMD `Q2KKernels.dot` vs scalar dequantize-then-dot | max difference 4e-8 of `Σ|w·x|` |
-| Metal `matmul_q2k`, `moe_up_q2k`, `moe_down_q2k` vs the CPU kernels (random expert tensors, 3 tokens, top-2) | max difference 5e-8 of `Σ|w·x|` |
+| Metal `matmul_q2k`, `matmul_q2k_norm` (folded rmsnorm), SwiGLU-fused `moe_up_q2k`, `moe_down_q2k` vs the CPU kernels (random expert tensors, 3 tokens, top-2) | max difference 7e-8 of `Σ|w·x|` |
 | byte layout vs llama.cpp (16 rows of `k_proj` through `gguf-py 0.18.0`'s `dequantize(…, Q2_K)`) | bit-identical floats |
 | 48 greedy tokens, CPU vs Metal | byte-identical output |
 | tiny MoE test model (`hidden 64`, partial super-blocks everywhere), two CPU runs | byte-identical output; the Metal backend rejects this model's `headDim = 16` independently of the format |
@@ -507,8 +512,8 @@ different unpacking in the kernels.
 | `QType.Q2_K` (`blockSize 256`, `blockBytes 84`, `scaleBytes 0`), `parse("q2k")` | `model/QType.java` |
 | per-type block arithmetic, `quantize`/`dequantizeRow` dispatch | `model/QTensor.java` |
 | SIMD `dot` and `dequant` | `cpu/Q2KKernels.java` (called from `VectorKernels.dotRow`/`dequantRow`) |
-| `q2k_sub_block`, `block_dot<2>`, `matmul_q2k`, `moe_up_q2k`, `moe_down_q2k` | `metal/kernels.metal`, section `Q2_K` at the end |
-| pipeline selection by `QTensor.type`, scale binding | `metal/MetalBackend.java` |
+| `q2k_sub_block`, `mm_row_q2k` (hooked from `mm_row` for `QT == 2`), `block_dot<2>`, the `_q2k`/`_q2k_norm` instantiations of `matmul`, `matmul3`, `matmul_swiglu`, `moe_up`, `moe_down` | `metal/kernels.metal`, section `Q2_K` at the end |
+| pipeline selection by `QTensor.type` (`byType`), scale binding (`scaleOff`) | `metal/MetalBackend.java`, `metal/MambaMetalBackend.java` (the MLA and shared-expert paths call `MetalBackend.matmul`/`swiglu`) |
 | `jllm-q2_k.bin` / `.json` (type name per tensor; embeddings stay `Q8_0`) | `model/QuantFile.java`, `model/ModelConverter.java` (unchanged) |
 | round trip, error bound, SIMD vs scalar | `src/test/java/org/robomiri/jllm/Q2KCheck.java` (from `SmokeTest`) |
 
