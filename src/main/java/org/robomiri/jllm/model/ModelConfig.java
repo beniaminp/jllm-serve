@@ -32,6 +32,7 @@ import java.util.stream.Collectors;
  * @param gemma         Gemma 2 / 3 specifics, null for every other family
  * @param mamba         state-space parameters of a Mamba model (then {@code hiddenDim} is {@code d_inner}, attention
  *                      fields are placeholders), null for transformers
+ * @param deepseek      DeepSeek-V2/V3 attention (MLA) and router parameters, null for every other family
  */
 public record ModelConfig(
         String architecture,
@@ -62,7 +63,8 @@ public record ModelConfig(
         Set<Integer> mlpOnlyLayers,
         double partialRotaryFactor,
         Gemma gemma,
-        MambaParams mamba) {
+        MambaParams mamba,
+        DeepSeekConfig deepseek) {
 
     /**
      * What distinguishes Gemma 2 / Gemma 3 (text) from the Llama-style decoder: GeLU(tanh) MLP, norm gain
@@ -160,7 +162,7 @@ public record ModelConfig(
      * were trained with {@code <s>} / {@code <|begin_of_text|>} at the start of each sequence, Qwen was not.
      */
     public int promptBosId() {
-        return modelType.equals("llama") || modelType.equals("mistral") || gemma != null ? bosTokenId : -1;
+        return modelType.equals("llama") || modelType.equals("mistral") || gemma != null || deepseek != null ? bosTokenId : -1;
     }
 
     public int qDim() {
@@ -195,9 +197,17 @@ public record ModelConfig(
         return numExperts > 0;
     }
 
-    /** Same rule as transformers' Qwen3MoeDecoderLayer. */
+    /** Same rule as transformers' Qwen3MoeDecoderLayer; DeepSeek: {@code l >= first_k_dense_replace && l % moe_layer_freq == 0}. */
     public boolean isMoeLayer(int l) {
+        if (deepseek != null) {
+            return numExperts > 0 && l >= deepseek.firstKDense() && l % deepseek.moeLayerFreq() == 0;
+        }
         return numExperts > 0 && !mlpOnlyLayers.contains(l) && (l + 1) % Math.max(1, sparseStep) == 0;
+    }
+
+    /** Width of the widest dense SwiGLU MLP: the dense layers' {@code intermediate_size} or the shared experts'. */
+    public int maxMlpDim() {
+        return deepseek == null ? hiddenDim : Math.max(hiddenDim, deepseek.nShared() * moeDim);
     }
 
     /** {@code model_type} values this engine implements, with the architecture class each corresponds to. */
@@ -212,7 +222,9 @@ public record ModelConfig(
             Map.entry("phi3", "Phi3ForCausalLM"),
             Map.entry("gemma2", "Gemma2ForCausalLM"),
             Map.entry("gemma3_text", "Gemma3ForCausalLM"),
-            Map.entry("mamba", "MambaForCausalLM"));
+            Map.entry("mamba", "MambaForCausalLM"),
+            Map.entry("deepseek_v2", "DeepseekV2ForCausalLM"),
+            Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"));
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
     private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration");
@@ -265,6 +277,13 @@ public record ModelConfig(
         int heads = requirePositive(c, "num_attention_heads");
         int kvHeads = (int) Json.num(c, "num_key_value_heads", heads);
         int headDim = (int) Json.num(c, "head_dim", dim / heads);
+        boolean isDeepseek = modelType.startsWith("deepseek");
+        DeepSeekConfig ds = null;
+        if (isDeepseek) {
+            ds = DeepSeekConfig.parse(c, modelType.equals("deepseek_v3"));
+            headDim = ds.qkDim();   // per-head query/key width; MLA has no grouped KV heads
+            kvHeads = heads;
+        }
         if (kvHeads <= 0 || heads % kvHeads != 0) {
             throw new IllegalArgumentException("num_key_value_heads=" + kvHeads + " must be positive and divide "
                     + "num_attention_heads=" + heads);
@@ -335,7 +354,8 @@ public record ModelConfig(
             }
             ropeSource = Json.obj("rope_scaling", g.containsKey("rope_type") ? g : null);
         }
-        ModelConfig.RopeScaling scaling = parseRopeScaling(ropeSource, (int) (headDim * partialRotary) & ~1);
+        ModelConfig.RopeScaling scaling = isDeepseek ? null // DeepSeek: yarn lives in ds
+                : parseRopeScaling(ropeSource, (int) (headDim * partialRotary) & ~1);
         List<Integer> eos = new java.util.ArrayList<>();
         Object eosRaw = c.get("eos_token_id");
         if (eosRaw instanceof Number n) {
@@ -348,7 +368,7 @@ public record ModelConfig(
         List<Object> mlpOnly = Json.list(c, "mlp_only_layers");
         Set<Integer> mlpOnlyLayers = mlpOnly == null ? Set.of()
                 : mlpOnly.stream().map(o -> ((Number) o).intValue()).collect(Collectors.toUnmodifiableSet());
-        int numExperts = (int) Json.num(c, "num_experts", 0);
+        int numExperts = (int) Json.num(c, isDeepseek ? "n_routed_experts" : "num_experts", 0);
         int expertsPerTok = (int) Json.num(c, "num_experts_per_tok", 0);
         int moeDim = (int) Json.num(c, "moe_intermediate_size", 0);
         if (numExperts > 0 && (expertsPerTok <= 0 || expertsPerTok > numExperts || moeDim <= 0)) {
@@ -384,7 +404,8 @@ public record ModelConfig(
                 mlpOnlyLayers,
                 partialRotary,
                 gemma ? gemmaOptions(c, modelType, layers, dim, localTheta) : null,
-                null);
+                null,
+                ds);
         boolean anyDense = false;
         for (int l = 0; l < layers; l++) {
             anyDense |= !cfg.isMoeLayer(l);
@@ -466,7 +487,7 @@ public record ModelConfig(
         MambaParams mp = new MambaParams(dState, dConv, dtRank, dInner, false, Json.bool(c, "use_conv_bias", true));
         return new ModelConfig(arch, "mamba", false, false, 0, 0, null, -1, List.copyOf(eos), dim, dInner, layers,
                 1, 1, dim, vocab, (int) Json.num(c, "max_position_embeddings", 1 << 20),
-                (float) Json.dbl(c, "layer_norm_epsilon", 1e-5), 0, Json.bool(c, "tie_word_embeddings", true), 0, 0, 0, false, 1, Set.of(), 1.0, null, mp);
+                (float) Json.dbl(c, "layer_norm_epsilon", 1e-5), 0, Json.bool(c, "tie_word_embeddings", true), 0, 0, 0, false, 1, Set.of(), 1.0, null, mp, null);
     }
 
     private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> c, int rotaryDim) {
@@ -554,7 +575,11 @@ public record ModelConfig(
         String moe = isMoe() ? String.format(" experts=%d/%d moeDim=%d", expertsPerTok, numExperts, moeDim) : "";
         // Features absent from the original Qwen3-only engine are appended only when set, so the description
         // (also stored in the quantized cache) of an existing Qwen3 model does not change.
-        String extra = (attentionBias ? " bias" : "") + (slidingWindow > 0 ? " window=" + slidingWindow
+        String mla = deepseek == null ? "" : String.format(" mla(q=%d kv=%d nope=%d rope=%d v=%d) shared=%d dense=%d %s",
+                deepseek.qLoraRank(), deepseek.kvLoraRank(), deepseek.qkNopeDim(), deepseek.qkRopeDim(),
+                deepseek.vHeadDim(), deepseek.nShared(), deepseek.firstKDense(), deepseek.topkMethod())
+                + (deepseek.yarn() != null ? " yarnx" + deepseek.yarn().factor() : "");
+        String extra = mla + (attentionBias ? " bias" : "") + (slidingWindow > 0 ? " window=" + slidingWindow
                 + (windowFromLayer > 0 ? "@" + windowFromLayer : "") : "")
                 + (ropeScaling != null ? " rope=" + ropeScaling.type() + "x" + ropeScaling.factor() : "")
                 + (ropeInterleaved() ? " rope=interleaved/" + rotaryDim() : "")

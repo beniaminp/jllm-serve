@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | mamba3 | mamba130m
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -32,6 +32,14 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
   mamba130m  not tiny: random weights with the exact mamba-130m-hf shapes (24 layers, d_model 768, 515 MB) to
              benchmark the Mamba backends without downloading the real checkpoint (output is gibberish)
   mamba3     Mamba v1: d_model 128, d_inner 256, state 8, conv 3, dt_rank 8 (ceil(128/16)), 2 layers, untied head
+  deepseek_v2  MLA with a single q_proj (q_lora_rank null, as DeepSeek-V2-Lite), 2 dense + 2 MoE layers, 8 routed
+               experts in 2 groups (group_limited_greedy, softmax), 2 shared experts, yarn (mscale == mscale_all_dim)
+  deepseek_v2q like deepseek_v2 with q_a_proj/q_a_layernorm/q_b_proj, norm_topk_prob, routed_scaling_factor 2.5
+               and yarn mscale != mscale_all_dim
+  deepseek_v3  MLA with q_lora_rank, sigmoid scores, noaux_tc with e_score_correction_bias, 1 shared expert,
+               routed_scaling_factor 2.5, norm_topk_prob, plus a stray layer 4 (V3's MTP layer, must be ignored)
+MLA head sizes are nope 32 + rope 32 = 64 for q/k and v 32, so the attention kernel's separate q/k and v widths
+are exercised.
 """
 import json
 import math
@@ -123,6 +131,84 @@ def gemma_wrapper(text):
                                    intermediate_size=64, num_attention_heads=2, num_hidden_layers=1,
                                    patch_size=14))
 
+_DS_COMMON = dict(
+    hidden_size=128, intermediate_size=192, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=4,
+    vocab_size=1000, max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=10000.0, hidden_act="silu",
+    attention_bias=False, tie_word_embeddings=False, bos_token_id=998, eos_token_id=999,
+    kv_lora_rank=64, qk_nope_head_dim=32, qk_rope_head_dim=32, v_head_dim=32,
+    first_k_dense_replace=2, moe_layer_freq=1, n_routed_experts=8, moe_intermediate_size=32,
+    num_experts_per_tok=2, n_group=2, topk_group=1)
+FAMILIES["deepseek_v2"] = dict(
+    _DS_COMMON, architectures=["DeepseekV2ForCausalLM"], model_type="deepseek_v2", q_lora_rank=None,
+    n_shared_experts=2, norm_topk_prob=False, routed_scaling_factor=1.0, scoring_func="softmax",
+    topk_method="group_limited_greedy",
+    rope_scaling=dict(type="yarn", factor=4.0, original_max_position_embeddings=64, beta_fast=32, beta_slow=1,
+                      mscale=0.707, mscale_all_dim=0.707))
+FAMILIES["deepseek_v2q"] = dict(
+    _DS_COMMON, architectures=["DeepseekV2ForCausalLM"], model_type="deepseek_v2", q_lora_rank=64,
+    n_shared_experts=1, norm_topk_prob=True, routed_scaling_factor=2.5, scoring_func="softmax",
+    topk_method="group_limited_greedy",
+    rope_scaling=dict(type="yarn", factor=4.0, original_max_position_embeddings=64, beta_fast=32, beta_slow=1,
+                      mscale=1.0, mscale_all_dim=0.707))
+FAMILIES["deepseek_v3"] = dict(
+    _DS_COMMON, architectures=["DeepseekV3ForCausalLM"], model_type="deepseek_v3", q_lora_rank=64,
+    n_shared_experts=1, norm_topk_prob=True, routed_scaling_factor=2.5, scoring_func="sigmoid",
+    topk_method="noaux_tc", n_group=4, topk_group=2,
+    rope_scaling=dict(type="yarn", factor=4.0, original_max_position_embeddings=64, beta_fast=32, beta_slow=1,
+                      mscale=1.0, mscale_all_dim=1.0))
+
+
+def deepseek_tensors(cfg, rnd):
+    """Tensor dict name -> (shape, values) of a tiny DeepSeek-V2/V3 checkpoint (HF names)."""
+    d, heads, vocab = cfg["hidden_size"], cfg["num_attention_heads"], cfg["vocab_size"]
+    nope, rope, vd = cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"], cfg["v_head_dim"]
+    ql, kvl = cfg["q_lora_rank"], cfg["kv_lora_rank"]
+    tensors = {}
+
+    def mat(name, rows, cols, std=0.08):
+        tensors[name] = ([rows, cols], [rnd.gauss(0, std) for _ in range(rows * cols)])
+
+    def vec(name, n, base=1.0, std=0.1):
+        tensors[name] = ([n], [base + rnd.gauss(0, std) for _ in range(n)])
+
+    def mlp(p, inter):
+        mat(p + "gate_proj.weight", inter, d)
+        mat(p + "up_proj.weight", inter, d)
+        mat(p + "down_proj.weight", d, inter)
+
+    mat("model.embed_tokens.weight", vocab, d, 1.0)
+    for l in range(cfg["num_hidden_layers"]):
+        p = "model.layers.%d." % l
+        a = p + "self_attn."
+        vec(p + "input_layernorm.weight", d)
+        vec(p + "post_attention_layernorm.weight", d)
+        if ql is None:
+            mat(a + "q_proj.weight", heads * (nope + rope), d)
+        else:
+            mat(a + "q_a_proj.weight", ql, d)
+            vec(a + "q_a_layernorm.weight", ql)
+            mat(a + "q_b_proj.weight", heads * (nope + rope), ql)
+        mat(a + "kv_a_proj_with_mqa.weight", kvl + rope, d)
+        vec(a + "kv_a_layernorm.weight", kvl)
+        mat(a + "kv_b_proj.weight", heads * (nope + vd), kvl)
+        mat(a + "o_proj.weight", d, heads * vd)
+        if l < cfg["first_k_dense_replace"] or l % cfg["moe_layer_freq"] != 0:
+            mlp(p + "mlp.", cfg["intermediate_size"])
+        else:
+            e, m = cfg["n_routed_experts"], cfg["moe_intermediate_size"]
+            mat(p + "mlp.gate.weight", e, d, 0.15)
+            if cfg["topk_method"] == "noaux_tc":
+                vec(p + "mlp.gate.e_score_correction_bias", e, 0.0, 0.3)
+            for i in range(e):
+                mlp(p + "mlp.experts.%d." % i, m)
+            if cfg["n_shared_experts"]:
+                mlp(p + "mlp.shared_experts.", m * cfg["n_shared_experts"])
+    if cfg["model_type"] == "deepseek_v3":  # the multi-token-prediction layer: present in the checkpoint, unused
+        mat("model.layers.%d.eh_proj.weight" % cfg["num_hidden_layers"], d, 2 * d)
+    vec("model.norm.weight", d)
+    mat("lm_head.weight", vocab, d, 0.5)
+    return tensors
+
 
 def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
     hd = hidden // heads
@@ -212,6 +298,10 @@ def main():
     pre = "language_model.model." if wrapper else "model."
 
     tensors = {}
+    if fam.startswith("deepseek"):
+        tensors = deepseek_tensors(cfg, rnd)
+        write(out, fam, cfg, tensors)
+        return
 
     def mat(name, rows, cols, std=0.08):
         tensors[name] = ([rows, cols], [rnd.gauss(0, std) for _ in range(rows * cols)])

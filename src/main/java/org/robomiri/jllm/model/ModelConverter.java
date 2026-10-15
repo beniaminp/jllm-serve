@@ -56,6 +56,11 @@ public final class ModelConverter {
         this.quant = quant;
         this.provider = provider;
         this.shardOf = shardMap();
+        if (shardOf.keySet().stream().anyMatch(n -> n.endsWith(".weight_scale_inv"))) {
+            throw new IOException("this checkpoint is block-quantized to FP8 (float8_e4m3fn weights with "
+                    + "weight_scale_inv tensors, e.g. DeepSeek-V3 / R1); FP8 dequantization is not implemented, "
+                    + "use a bf16/f16 checkpoint of the model");
+        }
         this.units = plan();
         for (Unit u : units) {
             for (String name : u.inputs()) {
@@ -128,7 +133,9 @@ public final class ModelConverter {
             int layer = l;
             String p = "model.layers." + l + ".";
             List<String> in = new ArrayList<>(layerNorms(p));
-            if (fusedQkv(p)) {
+            if (cfg.deepseek() != null) {
+                in.addAll(mlaInputs(p));
+            } else if (fusedQkv(p)) {
                 in.add(p + "self_attn.qkv_proj.weight");
                 in.add(p + "self_attn.o_proj.weight");
             } else {
@@ -136,7 +143,6 @@ public final class ModelConverter {
                     in.add(p + "self_attn." + n + ".weight");
                 }
             }
-            in.addAll(biasNames(p));
             if (cfg.isMoeLayer(l)) {
                 in.add(routerName(p));
                 if (fusedExperts(p)) {
@@ -150,6 +156,7 @@ public final class ModelConverter {
                         in.add(ep + "down_proj.weight");
                     }
                 }
+                in.addAll(deepseekMoeInputs(p));
             } else if (fusedGateUp(p)) {
                 in.add(p + "mlp.gate_up_proj.weight");
                 in.add(p + "mlp.down_proj.weight");
@@ -179,6 +186,37 @@ public final class ModelConverter {
             return List.of();
         }
         return List.of(p + "self_attn.q_proj.bias", p + "self_attn.k_proj.bias", p + "self_attn.v_proj.bias");
+    }
+
+    /** DeepSeek attention tensors of a layer (o_proj included). */
+    private List<String> mlaInputs(String p) {
+        String a = p + "self_attn.";
+        List<String> in = new ArrayList<>();
+        if (cfg.deepseek().qLoraRank() > 0) {
+            in.addAll(List.of(a + "q_a_proj.weight", a + "q_a_layernorm.weight", a + "q_b_proj.weight"));
+        } else {
+            in.add(a + "q_proj.weight");
+        }
+        in.addAll(List.of(a + "kv_a_proj_with_mqa.weight", a + "kv_a_layernorm.weight", a + "kv_b_proj.weight",
+                a + "o_proj.weight"));
+        return in;
+    }
+
+    /** Shared experts and the V3 correction bias of a DeepSeek MoE layer. */
+    private List<String> deepseekMoeInputs(String p) {
+        if (cfg.deepseek() == null) {
+            return List.of();
+        }
+        List<String> in = new ArrayList<>();
+        if (cfg.deepseek().nShared() > 0) {
+            for (String n : new String[]{"gate_proj", "up_proj", "down_proj"}) {
+                in.add(p + "mlp.shared_experts." + n + ".weight");
+            }
+        }
+        if (cfg.deepseek().topkMethod().equals("noaux_tc")) {
+            in.add(p + "mlp.gate.e_score_correction_bias");
+        }
+        return in;
     }
 
     private List<String> layerNorms(String p) {
@@ -225,7 +263,9 @@ public final class ModelConverter {
         for (String n : biasNames(p)) {
             w.putFloats(n, tensor(n).toFloatArray());
         }
-        if (fusedQkv(p)) {
+        if (cfg.deepseek() != null) {
+            convertMla(w, a, p);
+        } else if (fusedQkv(p)) {
             // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
             String name = p + "self_attn.qkv_proj.weight";
             SafeTensors.Tensor qkv = tensor(name);
@@ -262,6 +302,58 @@ public final class ModelConverter {
     }
 
     /**
+     * DeepSeek attention. {@code kv_a_proj_with_mqa [kvLora + rope, dim]} is stored as two tensors,
+     * {@code kv_a_latent.weight} (first kvLora rows) and {@code k_pe_proj.weight} (last rope rows); a row
+     * slice quantizes exactly like the whole matrix because quantization blocks run along a row.
+     */
+    private void convertMla(QuantFile.Writer w, Arena a, String p) throws IOException {
+        DeepSeekConfig d = cfg.deepseek();
+        String at = p + "self_attn.";
+        if (d.qLoraRank() > 0) {
+            w.putFloats(at + "q_a_layernorm.weight", tensor(at + "q_a_layernorm.weight").toFloatArray());
+            w.put(at + "q_a_proj.weight", quantize(a, quant, tensor(at + "q_a_proj.weight")));
+            w.put(at + "q_b_proj.weight", quantize(a, quant, tensor(at + "q_b_proj.weight")));
+        } else {
+            w.put(at + "q_proj.weight", quantize(a, quant, tensor(at + "q_proj.weight")));
+        }
+        w.putFloats(at + "kv_a_layernorm.weight", tensor(at + "kv_a_layernorm.weight").toFloatArray());
+        SafeTensors.Tensor kva = tensor(at + "kv_a_proj_with_mqa.weight");
+        if (kva.shape().length != 2 || kva.dim(0) != d.kvLoraRank() + d.qkRopeDim() || kva.dim(1) != cfg.dim()) {
+            throw new IOException("unexpected " + kva + ", expected [" + (d.kvLoraRank() + d.qkRopeDim()) + ", " + cfg.dim() + "]");
+        }
+        w.put(at + "kv_a_latent.weight", quantize(a, quant, rows(kva, 0, d.kvLoraRank())));
+        w.put(at + "k_pe_proj.weight", quantize(a, quant, rows(kva, d.kvLoraRank(), d.qkRopeDim())));
+        w.put(at + "kv_b_proj.weight", quantize(a, quant, tensor(at + "kv_b_proj.weight")));
+        w.put(at + "o_proj.weight", quantize(a, quant, tensor(at + "o_proj.weight")));
+    }
+
+    private static SafeTensors.Tensor rows(SafeTensors.Tensor t, int first, int n) {
+        long rowBytes = (long) t.dim(1) * t.dtype().bytes;
+        return new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{n, t.dim(1)},
+                t.data().asSlice(first * rowBytes, n * rowBytes));
+    }
+
+    /** DeepSeek shared experts (stacked gate/up, down) and the V3 {@code e_score_correction_bias}. */
+    private void convertDeepseekMoe(QuantFile.Writer w, Arena a, String p) throws IOException {
+        DeepSeekConfig d = cfg.deepseek();
+        if (d.nShared() > 0) {
+            String sp = p + "mlp.shared_experts.";
+            int sh = d.nShared() * cfg.moeDim();
+            SafeTensors.Tensor g = tensor(sp + "gate_proj.weight");
+            SafeTensors.Tensor u = tensor(sp + "up_proj.weight");
+            SafeTensors.Tensor dn = tensor(sp + "down_proj.weight");
+            if (g.dim(0) != sh || u.dim(0) != sh || dn.dim(1) != sh) {
+                throw new IOException(sp + " does not match n_shared_experts * moe_intermediate_size = " + sh);
+            }
+            w.put(p + "mlp.shared.gate_up", stack(a, quant, List.of(g, u)));
+            w.put(p + "mlp.shared.down", quantize(a, quant, dn));
+        }
+        if (d.topkMethod().equals("noaux_tc")) {
+            w.putFloats(p + "mlp.router_bias", tensor(p + "mlp.gate.e_score_correction_bias").toFloatArray());
+        }
+    }
+
+    /**
      * Two checkpoint layouts exist: per-expert 2-D tensors ({@code mlp.experts.N.gate_proj.weight}, router
      * {@code mlp.gate.weight}; transformers <= 4.53) and fused 3-D tensors ({@code mlp.experts.gate_up_proj}
      * {@code [E, 2m, dim]}, {@code mlp.experts.down_proj [E, dim, m]}, router {@code mlp.router.weight}).
@@ -271,6 +363,7 @@ public final class ModelConverter {
         int e = cfg.numExperts();
         int m = cfg.moeDim();
         w.putFloats(p + "mlp.router", tensor(routerName(p)).toFloatArray());
+        convertDeepseekMoe(w, a, p);
 
         if (fusedExperts(p)) {
             SafeTensors.Tensor gu = tensor(p + "mlp.experts.gate_up_proj");

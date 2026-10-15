@@ -42,6 +42,8 @@ public final class ModelWeights implements AutoCloseable {
         public QTensor expGateUp;
         /** MoE: expert {@code e} down is rows {@code [e*dim, (e+1)*dim)}, cols = moeDim. */
         public QTensor expDown;
+        /** DeepSeek: MLA projections, shared experts and router bias (wq/wk/wv are null); null for other families. */
+        public MlaWeights mla;
     }
 
     public final ModelConfig cfg;
@@ -96,9 +98,13 @@ public final class ModelWeights implements AutoCloseable {
             }
             L.qNorm = file.has(p + "self_attn.q_norm.weight") ? file.floats(p + "self_attn.q_norm.weight") : null;
             L.kNorm = file.has(p + "self_attn.k_norm.weight") ? file.floats(p + "self_attn.k_norm.weight") : null;
-            L.wq = file.tensor(p + "self_attn.q_proj.weight");
-            L.wk = file.tensor(p + "self_attn.k_proj.weight");
-            L.wv = file.tensor(p + "self_attn.v_proj.weight");
+            if (cfg.deepseek() != null) {
+                L.mla = loadMla(file, cfg, l, p);
+            } else {
+                L.wq = file.tensor(p + "self_attn.q_proj.weight");
+                L.wk = file.tensor(p + "self_attn.k_proj.weight");
+                L.wv = file.tensor(p + "self_attn.v_proj.weight");
+            }
             L.wo = file.tensor(p + "self_attn.o_proj.weight");
             if (cfg.attentionBias()) {
                 L.bq = file.floats(p + "self_attn.q_proj.bias");
@@ -122,6 +128,33 @@ public final class ModelWeights implements AutoCloseable {
             throw new IllegalArgumentException("model.norm.weight has " + finalNorm.length + " entries, expected "
                     + cfg.dim() + STALE_HINT);
         }
+    }
+
+    private static MlaWeights loadMla(QuantFile file, ModelConfig cfg, int l, String p) {
+        DeepSeekConfig d = cfg.deepseek();
+        MlaWeights m = new MlaWeights();
+        String a = p + "self_attn.";
+        if (d.qLoraRank() > 0) {
+            m.qA = file.tensor(a + "q_a_proj.weight");
+            m.qALayernorm = file.floats(a + "q_a_layernorm.weight");
+            m.qB = file.tensor(a + "q_b_proj.weight");
+        } else {
+            m.qProj = file.tensor(a + "q_proj.weight");
+        }
+        m.kvA = file.tensor(a + "kv_a_latent.weight");
+        m.kPe = file.tensor(a + "k_pe_proj.weight");
+        m.kvALayernorm = file.floats(a + "kv_a_layernorm.weight");
+        m.kvB = file.tensor(a + "kv_b_proj.weight");
+        if (cfg.isMoeLayer(l)) {
+            if (d.nShared() > 0) {
+                m.sharedGateUp = file.tensor(p + "mlp.shared.gate_up");
+                m.sharedDown = file.tensor(p + "mlp.shared.down");
+            }
+            if (file.has(p + "mlp.router_bias")) {
+                m.routerBias = file.floats(p + "mlp.router_bias");
+            }
+        }
+        return m;
     }
 
     private static final String STALE_HINT = " (stale jllm-*.bin cache? delete it to reconvert)";
@@ -148,6 +181,10 @@ public final class ModelWeights implements AutoCloseable {
 
     /** Every shape a backend relies on: a mismatch here would otherwise surface as a silent out-of-bounds read. */
     private static void checkShapes(ModelConfig c, Layer L, int l) {
+        if (c.deepseek() != null) {
+            checkMlaShapes(c, L, l);
+            return;
+        }
         boolean ok = L.attnNorm.length == c.dim() && L.ffnNorm.length == c.dim()
                 && L.wq.rows == c.qDim() && L.wq.cols == c.dim()
                 && L.wk.rows == c.kvDim() && L.wk.cols == c.dim()
@@ -165,6 +202,42 @@ public final class ModelWeights implements AutoCloseable {
                     && L.router.length == c.numExperts() * c.dim()
                     && L.expGateUp.rows == c.numExperts() * 2 * c.moeDim() && L.expGateUp.cols == c.dim()
                     && L.expDown.rows == c.numExperts() * c.dim() && L.expDown.cols == c.moeDim();
+        } else {
+            ok &= !c.isMoeLayer(l)
+                    && L.wGateUp.rows == 2 * c.hiddenDim() && L.wGateUp.cols == c.dim()
+                    && L.wDown.rows == c.dim() && L.wDown.cols == c.hiddenDim();
+        }
+        if (!ok) {
+            throw new IllegalArgumentException("layer " + l + " weight shapes do not match config " + c + STALE_HINT);
+        }
+    }
+
+    /** Shapes of a DeepSeek layer (MLA projections, dense / routed / shared MLP). */
+    private static void checkMlaShapes(ModelConfig c, Layer L, int l) {
+        DeepSeekConfig d = c.deepseek();
+        MlaWeights m = L.mla;
+        int h = c.heads();
+        boolean ok = L.attnNorm.length == c.dim() && L.ffnNorm.length == c.dim()
+                && (d.qLoraRank() > 0
+                    ? m.qA.rows == d.qLoraRank() && m.qA.cols == c.dim() && m.qALayernorm.length == d.qLoraRank()
+                        && m.qB.rows == h * d.qkDim() && m.qB.cols == d.qLoraRank()
+                    : m.qProj.rows == h * d.qkDim() && m.qProj.cols == c.dim())
+                && m.kvA.rows == d.kvLoraRank() && m.kvA.cols == c.dim()
+                && m.kPe.rows == d.qkRopeDim() && m.kPe.cols == c.dim()
+                && m.kvALayernorm.length == d.kvLoraRank()
+                && m.kvB.rows == h * (d.qkNopeDim() + d.vHeadDim()) && m.kvB.cols == d.kvLoraRank()
+                && L.wo.rows == c.dim() && L.wo.cols == h * d.vHeadDim();
+        if (L.moe) {
+            int sh = d.nShared() * c.moeDim();
+            ok &= c.isMoeLayer(l)
+                    && L.router.length == c.numExperts() * c.dim()
+                    && L.expGateUp.rows == c.numExperts() * 2 * c.moeDim() && L.expGateUp.cols == c.dim()
+                    && L.expDown.rows == c.numExperts() * c.dim() && L.expDown.cols == c.moeDim()
+                    && (sh == 0 ? m.sharedGateUp == null
+                        : m.sharedGateUp != null && m.sharedGateUp.rows == 2 * sh && m.sharedGateUp.cols == c.dim()
+                            && m.sharedDown.rows == c.dim() && m.sharedDown.cols == sh)
+                    && (d.topkMethod().equals("noaux_tc")
+                        ? m.routerBias != null && m.routerBias.length == c.numExperts() : m.routerBias == null);
         } else {
             ok &= !c.isMoeLayer(l)
                     && L.wGateUp.rows == 2 * c.hiddenDim() && L.wGateUp.cols == c.dim()

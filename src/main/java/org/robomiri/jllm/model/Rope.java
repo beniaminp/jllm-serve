@@ -36,7 +36,71 @@ public final class Rope {
     }
 
     public static Rope of(ModelConfig c, int ctx) {
+        if (c.deepseek() != null) {
+            return deepseek(c.deepseek(), c.ropeTheta(), ctx);
+        }
         return new Rope(c.rotaryDim(), c.ropeTheta(), ctx, c.ropeScaling());
+    }
+
+    private Rope(double[] inv, int ctx, double mscale) {
+        int half = inv.length;
+        cos = new float[ctx * half];
+        sin = new float[ctx * half];
+        for (int i = 0; i < half; i++) {
+            for (int p = 0; p < ctx; p++) {
+                double a = p * inv[i];
+                cos[p * half + i] = (float) (Math.cos(a) * mscale);
+                sin[p * half + i] = (float) (Math.sin(a) * mscale);
+            }
+        }
+    }
+
+    /**
+     * The table for the {@code qk_rope_head_dim} wide rotary part of DeepSeek MLA, as in modeling_deepseek.py:
+     * YaRN frequencies ({@link #yarnInvFreq}) and cos/sin multiplied by
+     * {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)}. The pairs are the
+     * interleaved dimensions (2i, 2i+1) of the checkpoint layout, rotated by {@code pos * invFreq[i]}.
+     */
+    public static Rope deepseek(DeepSeekConfig d, double theta, int ctx) {
+        DeepSeekConfig.Yarn y = d.yarn();
+        if (y == null) {
+            return new Rope(invFreq(d.qkRopeDim(), theta, null), ctx, 1.0);
+        }
+        double[] inv = yarnInvFreq(d.qkRopeDim(), theta, y.factor(), y.originalMaxPositions(), y.betaFast(), y.betaSlow());
+        return new Rope(inv, ctx, yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim()));
+    }
+
+    /** {@code yarn_get_mscale}: {@code 0.1 * mscale * ln(scale) + 1}, and 1 when {@code scale <= 1}. */
+    public static double yarnMscale(double scale, double mscale) {
+        return scale <= 1 ? 1.0 : 0.1 * mscale * Math.log(scale) + 1.0;
+    }
+
+    /** {@code yarn_find_correction_dim}: the dimension whose wavelength makes {@code rotations} turns in {@code origMax}. */
+    static double yarnCorrectionDim(double rotations, int dim, double base, int origMax) {
+        return dim * Math.log(origMax / (rotations * 2 * Math.PI)) / (2 * Math.log(base));
+    }
+
+    /**
+     * YaRN inverse frequencies ({@code DeepseekV2YarnRotaryEmbedding}): dimension pair {@code i} below the
+     * correction range keeps the plain frequency (extrapolation), above it the frequency is divided by
+     * {@code factor} (interpolation), in between the two are blended with a linear ramp. The range is
+     * {@code [max(floor(dim_fast), 0), min(ceil(dim_slow), dim-1)]} with {@code dim_x = yarnCorrectionDim(beta_x)}.
+     */
+    public static double[] yarnInvFreq(int dim, double base, double factor, int origMax, double betaFast, double betaSlow) {
+        int half = dim / 2;
+        double low = Math.max(Math.floor(yarnCorrectionDim(betaFast, dim, base, origMax)), 0);
+        double high = Math.min(Math.ceil(yarnCorrectionDim(betaSlow, dim, base, origMax)), dim - 1);
+        if (low == high) {
+            high += 0.001; // prevent a singularity
+        }
+        double[] f = new double[half];
+        for (int i = 0; i < half; i++) {
+            double extra = 1.0 / Math.pow(base, (2.0 * i) / dim);
+            double inter = 1.0 / (factor * Math.pow(base, (2.0 * i) / dim));
+            double ramp = Math.min(Math.max((i - low) / (high - low), 0), 1);
+            f[i] = inter * ramp + extra * (1 - ramp);
+        }
+        return f;
     }
 
     /**
