@@ -13,7 +13,8 @@ import java.util.stream.Collectors;
 /**
  * Hyper-parameters from a Hugging Face {@code config.json}: Llama ({@code llama}), Mistral ({@code mistral}),
  * Qwen2 ({@code qwen2}), Qwen3 dense ({@code qwen3}) and Mixture-of-Experts ({@code qwen3_moe}), Gemma 2
- * ({@code gemma2}) and Gemma 3 text ({@code gemma3_text}, also inside the {@code gemma3} multimodal wrapper) decoders.
+ * ({@code gemma2}) and Gemma 3 text ({@code gemma3_text}, also inside the {@code gemma3} multimodal wrapper) decoders, and
+ * DeepSeek-V2 / V3 ({@code deepseek_v2}, {@code deepseek_v3}; see {@link DeepSeekConfig}).
  *
  * @param modelType     the {@code model_type} string
  * @param attentionBias q/k/v projections have a bias (Qwen2)

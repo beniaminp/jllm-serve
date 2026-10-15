@@ -1,4 +1,4 @@
-# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills)
+# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills, DeepSeek-V2/V3)
 
 Code: `model/ModelConfig`, `model/Rope`, `model/ModelConverter` (biases, fused Phi-3 tensors), `cpu/CpuBackend.attention/addBias`,
 `kernels.metal` (`attention`, `add_bias`), `Main.eosIds`, `engine/Engine.generate` (BOS)
@@ -21,10 +21,12 @@ switches, all read from `config.json` into `ModelConfig`. Qwen3 is the reference
 | `phi3` | `Phi3ForCausalLM` | Phi-3-mini, Phi-3.5-mini, Phi-4-mini, phi-4 (14B), see 14.9 | `microsoft/Phi-3-mini-4k-instruct`, `Phi-3.5-mini-instruct`, `Phi-4-mini-instruct`, `phi-4` |
 | `gemma2` | `Gemma2ForCausalLM` | Gemma 2 2B / 9B / 27B (section 14.10) | `unsloth/gemma-2-2b-it` (mirror of the gated `google/gemma-2-2b-it`) |
 | `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` (text part) | Gemma 3 1B / 4B / 12B / 27B (section 14.10) | `unsloth/gemma-3-1b-it`, `unsloth/gemma-3-4b-it` |
+| `deepseek_v2` | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct (MLA, section 14.11) | config, safetensors header and `modeling_deepseek.py` on the Hub; tiny random models |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | DeepSeek-V3 / R1 (FP8 weights: **not loadable**, section 14.11.7) | config and header only; tiny random models |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
 `gelu_pytorch_tanh`), `mlp_bias: true`, or a `rope_scaling` type other than
-`default`/`linear`/`llama3`/`longrope` (e.g. `yarn`) is rejected at load time with a message naming the field.
+`default`/`linear`/`llama3`/`longrope` is rejected at load time with a message naming the field; `yarn` is accepted for the DeepSeek families only.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
 quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 256
@@ -156,7 +158,7 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
   `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
-- `yarn`, `dynamic` RoPE scaling; `hidden_act` other than `silu` (e.g. Gemma); MLP bias; an
+- `yarn` outside the DeepSeek families (14.11.2), `dynamic` RoPE scaling; FP8 checkpoints (14.11.7); `hidden_act` other than `silu` (e.g. Gemma); MLP bias; an
   `o_proj` bias; Llama 4, Mistral Nemo-style `head_dim` that is not a multiple of 32 on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
   vocabularies with byte fallback. That is the tokenizer's job (chapter 4), not the model's.
@@ -482,3 +484,219 @@ caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU ==
 the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
 configs above were read), no real weights were run; `rope_scaling` types other than `linear`/`llama3`; Gemma 3n and
 Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
+
+## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
+
+Code: `model/DeepSeekConfig`, `model/DeepSeekRouter`, `model/MlaWeights`, `model/Rope.deepseek/yarnInvFreq`,
+`model/ModelConverter.convertMla/convertDeepseekMoe`, `cpu/MlaCpu`, `metal/MlaMetal`, kernels `mla_rope`,
+`mla_kv_store`, `attention_mla`, `router_ds` (appended to `kernels.metal`), `tokenizer/ChatTemplate` (`deepseek-v2`).
+
+| `model_type` | Architecture class | Examples | Weights |
+|---|---|---|---|
+| `deepseek_v2` | `DeepseekV2ForCausalLM` | `deepseek-ai/DeepSeek-V2-Lite` (15.7 B, 27 layers), `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` | bf16, supported |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | `deepseek-ai/DeepSeek-V3`, `DeepSeek-R1` (671 B) | **FP8, not supported** (14.11.7) |
+
+The R1-*Distill* models are plain Qwen2/Llama checkpoints and were already supported (14.1).
+
+What was checked on the Hub (config, `model.safetensors.index.json`, the first 2 MB of one shard for the safetensors
+header, and `modeling_deepseek.py`; no weights were downloaded): the V2-Lite and Coder-V2-Lite-Instruct `config.json` are
+identical except for `transformers_version`, and so are their `modeling_deepseek.py` files (byte for byte); V3's modeling
+file differs in the router (`noaux_tc`, sigmoid) and in the V3-only `e_score_correction_bias`. Everything below follows
+those files.
+
+### 14.11.1 Multi-head Latent Attention
+
+Standard attention projects `x` to per-head `q`, `k`, `v`. MLA (DeepSeek-V2) squeezes keys and values through a small
+shared *latent* so that a cache of `kv_lora_rank + qk_rope_head_dim` numbers per token would suffice (the paper's
+point). A head's query/key has two parts: `qk_nope_head_dim` dimensions without position and `qk_rope_head_dim`
+dimensions that are rotated by RoPE. The rotated key part is a single vector shared by all heads.
+
+```
+                      x [dim]
+        ┌──────────────┼───────────────────────────────┐
+        │ q path       │ kv path                       │
+   q_proj (V2-Lite)    kv_a_proj_with_mqa [kv_lora + rope, dim]
+   or q_a_proj [q_lora, dim]          ├────────────┬──────────────┐
+     → q_a_layernorm                  │ latent     │ k_pe [rope]  │
+     → q_b_proj [H·qk, q_lora]        │ [kv_lora]  │ (one vector) │
+        │                             │ kv_a_layernorm              │
+        │                             │ kv_b_proj [H·(nope+v), kv_lora]
+   q [H, qk]                          │ → per head: k_nope [nope] | v [v_dim]
+   = q_nope | q_pe                    │              │                 │
+        │ rope(q_pe)                  │              │  rope(k_pe)     │
+        ▼                             ▼              ▼                 ▼
+   query_h = [q_nope_h | rope(q_pe_h)]     key_h = [k_nope_h | rope(k_pe)]   value_h = v_h
+        └──────────── softmax(query_h · key_s · scale) · value_s  (causal) ───────────┘
+                                   │
+                         concat heads [H·v_dim] → o_proj [dim, H·v_dim]
+```
+
+Shapes for DeepSeek-V2-Lite (`dim` 2048, `H` = 16, `nope` 128, `rope` 64, `qk` = 192, `v_dim` 128, `kv_lora` 512,
+`q_lora_rank: null`), as read from the safetensors header:
+
+| Tensor | Shape |
+|---|---|
+| `self_attn.q_proj.weight` | `[3072, 2048]` = `[H·qk, dim]` |
+| `self_attn.kv_a_proj_with_mqa.weight` | `[576, 2048]` = `[kv_lora + rope, dim]` |
+| `self_attn.kv_a_layernorm.weight` | `[512]` |
+| `self_attn.kv_b_proj.weight` | `[4096, 512]` = `[H·(nope + v_dim), kv_lora]` |
+| `self_attn.o_proj.weight` | `[2048, 2048]` = `[dim, H·v_dim]` |
+
+With `q_lora_rank` set (V3: 1536) `q_proj` is replaced by `q_a_proj [q_lora, dim]`, `q_a_layernorm [q_lora]` and
+`q_b_proj [H·qk, q_lora]`. V3 has `H` = 128, so `q_b_proj` is `[24576, 1536]` and `kv_b_proj` `[32768, 512]`.
+
+Implementation notes:
+
+- **`kv_a_proj_with_mqa` is split** by the converter into `kv_a_latent.weight [kv_lora, dim]` and `k_pe_proj.weight
+  [rope, dim]` (row slices; Q4_0/Q8_0 blocks run along a row, so slicing before quantization is exact). That makes the latent
+  contiguous per token for the RMSNorm and the rotary key a separate small matmul.
+- **Rotary layout.** The checkpoint stores the rotary dimensions interleaved. `apply_rotary_pos_emb` in
+  `modeling_deepseek.py` first de-interleaves (`view(d/2, 2).transpose`) and then applies the usual rotate-half. Because the
+  same permutation is applied to the query and the key, the dot product is identical to rotating the pairs `(2i, 2i+1)`
+  in place by `pos · inv_freq[i]`, which is what `MlaCpu.rotate` and `mla_rope` do (no permutation is needed).
+- **Different widths.** Query/key are `qk` = 192 wide and the value is `v_dim` = 128 wide. The CPU loops use the two widths
+  directly; Metal has the separate kernel `attention_mla` (a copy of `attention` with `qkDim` and `vDim`, no grouping and no
+  window, each lane owns `qk/32 ≤ 8` resp. `v/32 ≤ 8` dimensions) rather than padding V to 192. Both widths must be
+  multiples of 32 on Metal.
+- **Softmax scale** is `qk^-0.5` (192, not the 128 of an ordinary head) times `mscale²` with
+  `mscale = 0.1 · mscale_all_dim · ln(factor) + 1` when `rope_scaling.mscale_all_dim` is set (V2-Lite: 0.707 → 1.2608²;
+  V3: 1.0 → 1.3689²), see `DeepSeekConfig.softmaxScale`.
+- **KV cache.** The engine stores the *expanded* keys (`H·qk`) and values (`H·v_dim`) per layer in f32, like the other
+  families, instead of the compressed latent. This is the simplest correct choice and costs memory: V2-Lite needs
+  `(16·192 + 16·128) · 4 B` = 20 KB per layer and token, **553 KB per token over 27 layers** (2.2 GB at `--ctx 4096`),
+  against 62 KB per token for a latent cache (`(512 + 64) · 4 B · 27`). `backend.kv-dtype=f16` is rejected for these
+  models. (An absorbed-matrix latent cache, where `kv_b` is folded into the query and the output projection, is the known
+  way to shrink this and is not implemented.)
+- `ModelConfig` reports `headDim = qk` (192), `kvHeads = heads`, so `qDim = H·qk` and the Metal "multiple of 32, ≤ 256"
+  check applies to 192. The BOS id (`bos_token_id`, 100000 for V2) is put in front of raw prompts; the chat template has it.
+
+### 14.11.2 YaRN rotary scaling
+
+`rope_scaling: {"type": "yarn", factor, original_max_position_embeddings, beta_fast, beta_slow, mscale, mscale_all_dim}`
+applies only to the `rope` = 64 rotary dimensions (`Rope.deepseek`, `Rope.yarnInvFreq`). Each of the 32 frequency pairs
+`i` has the plain frequency `f_i = θ^(-2i/64)` ("extrapolation") and the stretched `f_i / factor` ("interpolation").
+Which one is used depends on how many turns the pair makes over the original context `L` = 4096:
+
+```
+dim(β) = 64 · ln(L / (β · 2π)) / (2 ln θ)
+low  = max(floor(dim(beta_fast)), 0)  = floor(10.47) = 10        (V2-Lite, θ = 10000, beta_fast 32)
+high = min(ceil(dim(beta_slow)), 63)  = ceil(22.51)  = 23        (beta_slow 1)
+ramp(i) = clamp((i - low) / (high - low), 0, 1)
+inv_freq[i] = f_i / factor · ramp(i)  +  f_i · (1 - ramp(i))
+```
+
+Pairs 0 – 10 keep their frequency, pairs 23 – 31 are divided by 40, pairs 11 – 22 blend: e.g. pair 16 has
+`f = 0.01`, ramp 6/13, `inv_freq = 0.00025 · 6/13 + 0.01 · 7/13 = 0.0055` (checked in `SmokeTest.yarnRope`).
+Finally the cos/sin tables are multiplied by `yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)`
+(exactly 1 for V2-Lite and V3, where the two are equal). Rope types other than `yarn` / none are rejected for DeepSeek.
+
+### 14.11.3 Mixture of experts: dense prefix, routed + shared experts
+
+Layer `l` is MoE when `l ≥ first_k_dense_replace` and `l % moe_layer_freq == 0`, otherwise a dense SwiGLU MLP with
+`intermediate_size` (V2-Lite: layer 0 dense, layers 1 – 26 MoE; V3: layers 0 – 2 dense). An MoE layer computes
+
+```
+y = Σ_{k ∈ top-k}  w_k · Expert_k(x)   +   SharedExperts(x)
+```
+
+- `n_routed_experts` routed experts (`mlp.experts.N.{gate,up,down}_proj`, width `moe_intermediate_size`), stacked into the
+  same two tensors as Qwen3-MoE (chapter 12) and run by the same `moe_up` / `moe_down` kernels.
+- `n_shared_experts` shared experts (`mlp.shared_experts.{gate,up,down}_proj`) that are *one* dense SwiGLU of width
+  `n_shared_experts · moe_intermediate_size` (V2-Lite: 2 · 1408 = 2816, `[2816, 2048]`), applied to every token and added. They
+  are stored as `mlp.shared.gate_up` / `mlp.shared.down` and run with the dense matmul + `silu_mul` path
+  (`CpuBackend.forward`, `MlaMetal.sharedExperts`).
+- The router `mlp.gate.weight [n_routed_experts, dim]` stays f32. V3 adds `mlp.gate.e_score_correction_bias [256]`
+  (f32), stored as `mlp.router_bias`. V3 also has a layer 61 (multi-token prediction) in the checkpoint which the
+  converter never reads (it is past `num_hidden_layers`).
+
+### 14.11.4 The three routing rules
+
+`scoring_func`: `softmax` (V2) or `sigmoid` (V3) over the router logits gives `scores`. Then `topk_method`
+(`DeepSeekRouter.select` on the CPU, `router_ds` on Metal; ties go to the lower index):
+
+| `topk_method` | Model | Selection |
+|---|---|---|
+| `greedy` | V2-Lite | the `k` highest scores |
+| `group_limited_greedy` | V2 (236 B) | experts form `n_group` consecutive groups; group score = **max** score; keep the `topk_group` best groups; the `k` highest scores inside the kept groups |
+| `noaux_tc` | V3 | choice = `scores + e_score_correction_bias`; group score = **sum of the two best** choices; keep `topk_group` groups; `k` highest *choices* inside them; the **weights are the uncorrected scores** |
+
+Weights: if `k > 1 && norm_topk_prob` they are divided by `Σ + 1e-20`; then multiplied by `routed_scaling_factor`.
+V3 always multiplies; the V2 code only multiplies in the branch where it did **not** normalize (the `else` of the
+`norm_topk_prob` test), which `DeepSeekConfig.scaleAlways` reproduces.
+
+Worked example for `noaux_tc` (8 experts, 4 groups of 2, `topk_group` 2, `k` 2, `routed_scaling_factor` 2.5):
+
+```
+expert            0    1  |  2    3  |  4    5  |  6    7
+sigmoid score    .9   .1  | .6   .5  | .8   .7  | .3   .2
+bias            -.5    0  |  0    0  |  0    0  | .45  .45
+choice           .4   .1  | .6   .5  | .8   .7  | .75  .65
+group score        .5     |   1.1    |   1.5    |   1.4          (sum of the two best choices)
+kept groups:  2 and 3  →  best two choices inside: expert 4 (.8), expert 6 (.75)
+weights: uncorrected .8 and .3  →  /1.1 → .727, .273  →  ×2.5 → 1.818, 0.682
+```
+
+Without the bias the kept groups would be 1 and 2 and the winners experts 4 and 5; with `group_limited_greedy` the group score would be the group maximum.
+The same numbers (and a softmax example for `greedy` vs `group_limited_greedy`) are asserted in `SmokeTest.deepseekRouting`.
+
+### 14.11.5 Config keys and tensor names (verified against the Hub)
+
+Read from `config.json`: `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `vocab_size`,
+`rms_norm_eps`, `rope_theta`, `rope_scaling` (yarn), `q_lora_rank` (null → 0), `kv_lora_rank`, `qk_nope_head_dim`,
+`qk_rope_head_dim`, `v_head_dim`, `first_k_dense_replace`, `moe_layer_freq`, `n_routed_experts`, `n_shared_experts`,
+`moe_intermediate_size`, `num_experts_per_tok`, `n_group`, `topk_group`, `topk_method`, `scoring_func`, `norm_topk_prob`,
+`routed_scaling_factor`, `bos_token_id`, `eos_token_id`, `tie_word_embeddings` (false). `attention_bias: true`,
+`hidden_act` ≠ `silu` and an unknown `topk_method` / `scoring_func` are rejected. `num_key_value_heads` is ignored
+(MLA has no grouped KV heads); `aux_loss_alpha`, `seq_aux`, `ep_size`, `pretraining_tp` and `num_nextn_predict_layers` are training or
+parallelism details.
+
+Per layer `model.layers.N.`: `input_layernorm.weight`, `post_attention_layernorm.weight`,
+`self_attn.{q_proj | q_a_proj, q_a_layernorm, q_b_proj}.weight`, `self_attn.kv_a_proj_with_mqa.weight`,
+`self_attn.kv_a_layernorm.weight`, `self_attn.kv_b_proj.weight`, `self_attn.o_proj.weight`, then either
+`mlp.{gate,up,down}_proj.weight` or `mlp.gate.weight`, `mlp.gate.e_score_correction_bias` (V3),
+`mlp.experts.E.{gate,up,down}_proj.weight`, `mlp.shared_experts.{gate,up,down}_proj.weight`. Global:
+`model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight` (separate). V2-Lite is split in 4 bf16 shards
+(31.4 GB), V3 in 163 shards.
+
+Tokens: the chat templates in `tokenizer_config.json` of V2-Lite and Coder-V2-Lite-Instruct are the
+`User: …\n\nAssistant:` format (`<｜begin▁of▁sentence｜>` + optional system text + `\n\n`, each assistant turn closed by
+`<｜end▁of▁sentence｜>`), implemented as `ChatTemplate` `deepseek-v2`; both set `add_bos_token`, BOS is 100000, EOS is 100001
+and the only stop token is `<｜end▁of▁sentence｜>`. V3 and R1 (same `model_type`) use the `<｜User｜>` / `<｜Assistant｜>`
+format that the `deepseek-r1` template implements; it always opens a `<think>` block, which is right for R1 but not for
+the non-reasoning V3 chat model. V3's BOS/EOS ids are 0 and 1 (its vocabulary has 129280 entries).
+
+### 14.11.6 Memory on this machine
+
+DeepSeek-V2-Lite at Q4_0: 15.3 B linear weights at 5 bits (4-bit values plus an f32 scale per 32) = 9.6 GB, plus the
+Q8_0 embedding and head (2 × 102400 × 2048 at 9 bits) = 0.47 GB: about **10 GB**, so it fits a 32 GB machine, plus the f32
+KV cache of 553 KB per token. Decode touches the 6 routed + 2 shared experts of each of 26 layers, about 2.4 B parameters per
+token, so it is far cheaper than the weight size suggests (as for Qwen3-MoE, chapter 12).
+
+DeepSeek-V3 / R1 has 671 B parameters (the Hub lists 685 B including the multi-token-prediction module, which the converter skips): at Q4_0 that is 671 B × 5/8 B ≈ **420 GB** (+ 2 GB of
+Q8_0 embedding and head), and its expanded f32 KV cache would be `128·(192 + 128)·4 B · 61` = **10 MB per token** (40 GB at
+`--ctx 4096`). It cannot run on a 32 GB laptop (not even on 128 GB; the 1.37 TB FP8 download alone exceeds the disk).
+
+### 14.11.7 FP8 checkpoints (V3, R1) are not supported
+
+The published V3/R1 weights are block-quantized FP8: every large matrix is `F8_E4M3` (`float8_e4m3fn`) with a companion
+`<name>.weight_scale_inv` tensor of dtype F32 holding one inverse scale per 128 × 128 block (e.g. `q_a_proj.weight`
+`[1536, 7168]` has `weight_scale_inv` `[12, 56]`); `config.json` carries `quantization_config: {quant_method: fp8,
+weight_block_size: [128, 128]}`. `SafeTensors` has no FP8 dtype and the converter does not dequantize
+(`w = fp8_value · scale_inv[block]`). The converter refuses such a checkpoint up front with an explanatory error (any
+index containing `weight_scale_inv`). Supporting V3 needs an FP8 dequantization path in `ModelConverter` plus bf16
+re-uploads (e.g. a community bf16 conversion works as is), and a machine with more than 400 GB of memory to run it.
+
+### 14.11.8 Testing
+
+`scripts/make-tiny-model.py` writes three random checkpoints with the real tensor names and small dims (all multiples of 32:
+`dim` 128, 4 heads, nope 32 + rope 32 = qk 64, v 32, kv_lora 64; 2 dense + 2 MoE layers; 8 routed experts):
+`deepseek_v2` (`q_lora_rank: null`, 2 groups with `group_limited_greedy`, 2 shared experts, yarn with equal mscales),
+`deepseek_v2q` (q LoRA, `norm_topk_prob`, `routed_scaling_factor` 2.5, yarn with `mscale` ≠ `mscale_all_dim`) and
+`deepseek_v3` (sigmoid, `noaux_tc` with bias, 4 groups, the stray layer 4). `scripts/arch-smoke.sh` runs each on CPU and
+Metal (q4 and q8; equal tokens, final logits within 1e-3 relative, measured below 1e-5) and `src/test/.../DeepSeekRef` compares the CPU and Metal logits of the
+12-token prompt with `scripts/deepseek-ref.py`, an independent float64 re-implementation of `modeling_deepseek.py`
+(explicit de-interleave + rotate-half, `MoEGate`, YaRN) run on weights rounded to Q8_0 the same way the converter does: the
+largest difference is 1e-5 of the logit range. (Without the rounding the engine is 1 – 6 % off, which is plain quantization
+noise: random weights with sharp attention are sensitive.) `mvn test` checks the YaRN frequencies against hand-computed values
+(14.11.2), the routing rules on hand-made score matrices (14.11.4), the V2-Lite and V3 configs, the V2 chat template and the
+FP8 refusal.
