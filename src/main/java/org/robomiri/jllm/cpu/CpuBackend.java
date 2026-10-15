@@ -228,9 +228,15 @@ public final class CpuBackend implements Backend {
     // ------------------------------------------------------------------ layers
 
     void rmsnorm(float[] in, float[] out, float[] weight, int n, int width) {
-        for (int t = 0; t < n; t++) {
-            rmsnormRow(in, t * width, out, t * width, weight, width);
+        if (n == 1) {
+            rmsnormRow(in, 0, out, 0, weight, width);
+            return;
         }
+        pool.forRange(n, 1, (t0, t1) -> {
+            for (int t = t0; t < t1; t++) {
+                rmsnormRow(in, t * width, out, t * width, weight, width);
+            }
+        });
     }
 
     /** x[t] += rmsnorm(y[t]) * weight for n rows; y is overwritten with the normalized rows. */
@@ -245,9 +251,7 @@ public final class CpuBackend implements Backend {
     void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
         float ss = VectorKernels.sumSquares(in, io, width);
         float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
-        for (int i = 0; i < width; i++) {
-            out[oo + i] = in[io + i] * scale * weight[i];
-        }
+        VectorKernels.scaleMul(in, io, scale, weight, out, oo, width);
     }
 
     /**
@@ -303,30 +307,33 @@ public final class CpuBackend implements Backend {
 
     /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
     private void normRope(float[] v, int base, int stride, int nHeads, float[] norm, int n, int pos, Rope rope) {
+        if (n == 1) {
+            normRopeHeads(v, base, stride, nHeads, norm, pos, rope, 0, nHeads);
+            return;
+        }
+        pool.forRange(n * nHeads, 4, (i0, i1) -> normRopeHeads(v, base, stride, nHeads, norm, pos, rope, i0, i1));
+    }
+
+    /** {@link #normRope} over the flat (token, head) indices {@code [i0, i1)}. */
+    private void normRopeHeads(float[] v, int base, int stride, int nHeads, float[] norm, int pos, Rope rope,
+                               int i0, int i1) {
         int hd = c.headDim();
         int half = c.rotaryDim() / 2; // rope table width; = hd / 2 unless partial_rotary_factor < 1
         boolean interleaved = c.ropeInterleaved();
-        for (int t = 0; t < n; t++) {
-            float[] cos = rope.cos;
-            float[] sin = rope.sin;
+        float[] cos = rope.cos;
+        float[] sin = rope.sin;
+        for (int i = i0; i < i1; i++) {
+            int t = i / nHeads;
+            int h = i - t * nHeads;
+            int o = base + t * stride + h * hd;
             int ro = (pos + t) * half;
-            for (int h = 0; h < nHeads; h++) {
-                int o = base + t * stride + h * hd;
-                if (norm != null) {
-                    rmsnormRow(v, o, v, o, norm, hd);
-                }
-                if (interleaved) {
-                    InterleavedRope.rotate(v, o, c.rotaryDim(), cos, sin, ro);
-                    continue;
-                }
-                for (int i = 0; i < half; i++) {
-                    float a = v[o + i];
-                    float b = v[o + i + half];
-                    float cs = cos[ro + i];
-                    float sn = sin[ro + i];
-                    v[o + i] = a * cs - b * sn;
-                    v[o + i + half] = b * cs + a * sn;
-                }
+            if (norm != null) {
+                rmsnormRow(v, o, v, o, norm, hd);
+            }
+            if (interleaved) {
+                InterleavedRope.rotate(v, o, c.rotaryDim(), cos, sin, ro);
+            } else {
+                VectorKernels.rope(v, o, half, cos, sin, ro);
             }
         }
     }
@@ -594,31 +601,37 @@ public final class CpuBackend implements Backend {
         }
     }
 
-    /** hidden = gelu_tanh(gate) * up, Gemma's GeGLU. */
+    /** hidden = gelu_tanh(gate) * up, Gemma's GeGLU; parallel over flat (token, i) indices like {@link #siluMul}. */
     private void geluMul(int n) {
         int hdim = c.hiddenDim();
-        for (int t = 0; t < n; t++) {
-            int gi = t * 2 * hdim;
-            int oi = t * hdim;
-            for (int i = 0; i < hdim; i++) {
-                hidden[oi + i] = GemmaMath.geluTanh(gateUp[gi + i]) * gateUp[gi + hdim + i];
+        pool.forRange(n * hdim, 512, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int t = i / hdim;
+                int j = i - t * hdim;
+                int gi = t * 2 * hdim;
+                hidden[t * hdim + j] = GemmaMath.geluTanh(gateUp[gi + j]) * gateUp[gi + hdim + j];
             }
-        }
+        });
     }
 
     private void siluMul(int n) {
         siluMul(n, c.hiddenDim());
     }
 
+    /**
+     * {@code hidden[t, i] = silu(gate[t, i]) * up[t, i]} over all tokens, parallel over flat (token, i) indices.
+     * {@code Math.exp} stays scalar: the Vector API's EXP is not bit-identical to it.
+     */
     private void siluMul(int n, int hdim) {
-        for (int t = 0; t < n; t++) {
-            int gi = t * 2 * hdim;
-            int oi = t * hdim;
-            for (int i = 0; i < hdim; i++) {
-                float g = gateUp[gi + i];
-                hidden[oi + i] = g / (1f + (float) Math.exp(-g)) * gateUp[gi + hdim + i];
+        pool.forRange(n * hdim, 512, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int t = i / hdim;
+                int j = i - t * hdim;
+                int gi = t * 2 * hdim;
+                float g = gateUp[gi + j];
+                hidden[t * hdim + j] = g / (1f + (float) Math.exp(-g)) * gateUp[gi + hdim + j];
             }
-        }
+        });
     }
 
     @Override

@@ -198,4 +198,43 @@ public final class VectorKernels {
     static float sumSquares(float[] x, int xo, int n) {
         return dot(x, xo, x, xo, n);
     }
+
+    /** {@code out[oo + i] = (in[io + i] * s) * w[i]}, the RMSNorm scaling step (same rounding as the scalar loop). */
+    static void scaleMul(float[] in, int io, float s, float[] w, float[] out, int oo, int n) {
+        FloatVector sv = FloatVector.broadcast(F, s);
+        int i = 0;
+        int ub = F.loopBound(n);
+        for (; i < ub; i += FL) {
+            FloatVector.fromArray(F, in, io + i).mul(sv).mul(FloatVector.fromArray(F, w, i)).intoArray(out, oo + i);
+        }
+        for (; i < n; i++) {
+            out[oo + i] = in[io + i] * s * w[i];
+        }
+    }
+
+    /**
+     * Rotary embedding of one head in place: for {@code i < half}, {@code (a, b) = (v[o+i], v[o+i+half])} becomes
+     * {@code (a*cos - b*sin, b*cos + a*sin)} with {@code cos/sin[co + i]}. Separate multiplies and add/subtract
+     * (no FMA), so the result matches the scalar expression bit for bit.
+     */
+    static void rope(float[] v, int o, int half, float[] cos, float[] sin, int co) {
+        int i = 0;
+        int ub = F.loopBound(half);
+        for (; i < ub; i += FL) {
+            FloatVector a = FloatVector.fromArray(F, v, o + i);
+            FloatVector b = FloatVector.fromArray(F, v, o + i + half);
+            FloatVector cs = FloatVector.fromArray(F, cos, co + i);
+            FloatVector sn = FloatVector.fromArray(F, sin, co + i);
+            a.mul(cs).sub(b.mul(sn)).intoArray(v, o + i);
+            b.mul(cs).add(a.mul(sn)).intoArray(v, o + i + half);
+        }
+        for (; i < half; i++) {
+            float a = v[o + i];
+            float b = v[o + i + half];
+            float cs = cos[co + i];
+            float sn = sin[co + i];
+            v[o + i] = a * cs - b * sn;
+            v[o + i + half] = b * cs + a * sn;
+        }
+    }
 }
