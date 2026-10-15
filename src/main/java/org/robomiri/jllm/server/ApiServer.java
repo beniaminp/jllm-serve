@@ -84,9 +84,9 @@ public final class ApiServer implements AutoCloseable {
             res.send(400, "application/json", error("invalid JSON: " + e.getMessage()));
             return;
         }
-        String prompt;
+        int[] prompt;
         try {
-            prompt = chat ? chatPrompt(body) : Json.str(body, "prompt", "");
+            prompt = chat ? chatPrompt(body) : engine.tokenizer().encode(Json.str(body, "prompt", ""));
         } catch (RuntimeException e) {
             res.send(400, "application/json", error(e.getMessage()));
             return;
@@ -104,7 +104,7 @@ public final class ApiServer implements AutoCloseable {
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
         if (!stream) {
-            Engine.Result r = engine.generate(prompt, params, null);
+            Engine.Result r = engine.generate(prompt, params, null, () -> false);
             Map<String, Object> choice = chat
                     ? Json.obj("index", 0, "message", Json.obj("role", "assistant", "content", r.text()), "finish_reason", r.finishReason())
                     : Json.obj("index", 0, "text", r.text(), "finish_reason", r.finishReason());
@@ -161,7 +161,7 @@ public final class ApiServer implements AutoCloseable {
                 "tokens_per_second", Math.round(s.tokPerSec() * 10) / 10.0);
     }
 
-    private String chatPrompt(Map<String, Object> body) {
+    private int[] chatPrompt(Map<String, Object> body) {
         List<Object> msgs = Json.list(body, "messages");
         if (msgs == null || msgs.isEmpty()) {
             throw new IllegalArgumentException("'messages' is required");
@@ -191,7 +191,7 @@ public final class ApiServer implements AutoCloseable {
         if (extra != null) {
             thinking = Json.bool(extra, "enable_thinking", thinking);
         }
-        return ChatTemplate.render(list, true, thinking);
+        return ChatTemplate.renderTokens(engine.tokenizer(), list, true, thinking);
     }
 
     private SamplingParams params(Map<String, Object> b) {

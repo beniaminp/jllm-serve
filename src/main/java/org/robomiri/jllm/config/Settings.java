@@ -123,7 +123,7 @@ public final class Settings {
     }
 
     private void put(String key, String value, String source) {
-        if (!props.containsKey(key) && !key.contains(".") && !CLI_ONLY.contains(key)) {
+        if (!props.containsKey(key) && !CLI_ONLY.contains(key)) {
             throw new IllegalArgumentException("unknown option --" + key + " (see jllm.properties for valid keys)");
         }
         props.setProperty(key, value.trim());

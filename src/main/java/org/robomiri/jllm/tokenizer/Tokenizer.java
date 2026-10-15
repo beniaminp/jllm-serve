@@ -148,8 +148,16 @@ public final class Tokenizer {
 
     /** Encodes text; added/special tokens appearing literally in the text are mapped to their ids. */
     public int[] encode(String text) {
+        return encode(text, true);
+    }
+
+    /**
+     * @param allowSpecial when false, added/special tokens written literally in the text are tokenized as
+     *                     ordinary characters (use this for untrusted content such as chat messages)
+     */
+    public int[] encode(String text, boolean allowSpecial) {
         IntList out = new IntList(Math.max(16, text.length() / 3));
-        if (addedPattern == null) {
+        if (addedPattern == null || !allowSpecial) {
             encodeOrdinary(text, out);
             return out.toArray();
         }

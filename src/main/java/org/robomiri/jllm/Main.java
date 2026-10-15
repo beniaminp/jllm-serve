@@ -175,14 +175,15 @@ public final class Main {
 
     private static void run(Engine engine, Settings s) {
         try (engine) {
-            String prompt = s.has("prompt") ? s.get("prompt") : "Hello";
-            if (!(s.has("raw") && s.getBool("raw"))) {
-                prompt = ChatTemplate.render(List.of(new ChatTemplate.Message("user", prompt)), true, s.getBool("chat.thinking"));
-            }
+            String text = s.has("prompt") ? s.get("prompt") : "Hello";
+            int[] prompt = s.has("raw") && s.getBool("raw")
+                    ? engine.tokenizer().encode(text)
+                    : ChatTemplate.renderTokens(engine.tokenizer(), List.of(new ChatTemplate.Message("user", text)),
+                            true, s.getBool("chat.thinking"));
             Engine.Result r = engine.generate(prompt, s.sampling(), out -> {
                 System.out.print(out);
                 System.out.flush();
-            });
+            }, () -> false);
             System.out.println();
             System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason());
         }
@@ -214,11 +215,11 @@ public final class Main {
                     continue;
                 }
                 history.add(new ChatTemplate.Message("user", line));
-                String prompt = ChatTemplate.render(history, true, think);
+                int[] prompt = ChatTemplate.renderTokens(engine.tokenizer(), history, true, think);
                 Engine.Result r = engine.generate(prompt, params, out -> {
                     System.out.print(out);
                     System.out.flush();
-                });
+                }, () -> false);
                 System.out.println();
                 System.err.println("[" + statsLine(r.stats()) + "]");
                 history.add(new ChatTemplate.Message("assistant", r.text()));
@@ -241,12 +242,13 @@ public final class Main {
             for (int i = 0; i < 40; i++) {
                 sb.append("The quick brown fox jumps over the lazy dog. ");
             }
-            String prompt = ChatTemplate.render(List.of(new ChatTemplate.Message("user", sb.toString())), true, false);
+            int[] prompt = ChatTemplate.renderTokens(engine.tokenizer(),
+                    List.of(new ChatTemplate.Message("user", sb.toString())), true, false);
             SamplingParams p = s.sampling().withMaxTokens(s.getInt("bench.max-tokens"));
-            engine.generate(prompt, p, null); // warm-up
+            engine.generate(prompt, p, null, () -> false); // warm-up
             for (int i = 0; i < s.getInt("bench.rounds"); i++) {
                 engine.generate("warm " + i, p.withMaxTokens(1), null); // evict prefix cache
-                Engine.Result r = engine.generate(prompt, p, null);
+                Engine.Result r = engine.generate(prompt, p, null, () -> false);
                 Engine.Stats st = r.stats();
                 System.out.printf("prefill %d tok in %.0f ms (%.1f tok/s), decode %d tok in %.0f ms (%.1f tok/s)%n",
                         st.promptTokens() - st.cachedTokens(), st.prefillMs(),

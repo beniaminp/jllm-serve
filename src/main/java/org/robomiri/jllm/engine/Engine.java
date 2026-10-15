@@ -66,7 +66,11 @@ public final class Engine implements AutoCloseable {
      * @param cancelled polled every token; generation stops with finish reason "cancelled" when true
      */
     public Result generate(String prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
-        int[] promptTokens = tokenizer.encode(prompt);
+        return generate(tokenizer.encode(prompt), p, sink, cancelled);
+    }
+
+    /** Generates from already-tokenized prompt ids (used by the chat template, which controls special tokens). */
+    public Result generate(int[] promptTokens, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
         if (promptTokens.length == 0) {
             promptTokens = new int[]{eosIds.iterator().next()};
         }
