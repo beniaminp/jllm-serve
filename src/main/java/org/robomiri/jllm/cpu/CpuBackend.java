@@ -42,13 +42,18 @@ public final class CpuBackend implements Backend {
     private final float[] gateUp;
     private final float[] hidden;
 
-    // MoE scratch (null for dense models)
+    // MoE scratch (null for dense models); per-slot buffers are indexed by slot = t * topK + k
     private final float[] routerLogits;
     private final int[] assign;
     private final float[] routeWeight;
     private final float[] moeGateUp;
     private final float[] moeHidden;
     private final float[] dsScratch;
+    private final float[] moeDown;
+    private final int[] expertStart;
+    private final int[] expertFill;
+    private final int[] usedExperts;
+    private final int[] slotOrder;
 
     final ThreadLocal<float[]> scratch;
 
@@ -83,12 +88,18 @@ public final class CpuBackend implements Backend {
         gateUp = new float[maxBatch * 2 * c.maxMlpDim()];
         hidden = new float[maxBatch * c.maxMlpDim()];
         if (c.isMoe()) {
+            int slots = maxBatch * c.expertsPerTok();
             routerLogits = new float[c.numExperts()];
-            assign = new int[c.expertsPerTok()];
-            routeWeight = new float[c.expertsPerTok()];
-            moeGateUp = new float[c.expertsPerTok() * 2 * c.moeDim()];
-            moeHidden = new float[c.expertsPerTok() * c.moeDim()];
+            assign = new int[slots];
+            routeWeight = new float[slots];
+            moeGateUp = new float[slots * 2 * c.moeDim()];
+            moeHidden = new float[slots * c.moeDim()];
             dsScratch = new float[c.numExperts()];
+            moeDown = new float[slots * c.dim()];
+            expertStart = new int[c.numExperts() + 1];
+            expertFill = new int[c.numExperts()];
+            usedExperts = new int[c.numExperts()];
+            slotOrder = new int[slots];
         } else {
             dsScratch = null;
             routerLogits = null;
@@ -96,8 +107,14 @@ public final class CpuBackend implements Backend {
             routeWeight = null;
             moeGateUp = null;
             moeHidden = null;
+            moeDown = null;
+            expertStart = null;
+            expertFill = null;
+            usedExperts = null;
+            slotOrder = null;
         }
-        int scratchLen = Math.max(ctx, 4 * Math.max(c.maxMlpDim(), Math.max(c.dim(), c.qDim())));
+        int scratchLen = Math.max(Math.max(ctx, c.numExperts()),
+                4 * Math.max(Math.max(c.maxMlpDim(), c.moeDim()), Math.max(c.dim(), c.qDim())));
         scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
     }
 
@@ -368,47 +385,166 @@ public final class CpuBackend implements Backend {
      * expert's SwiGLU MLP on the token and add the results to x weighted by the (renormalized) router probabilities.
      */
     private void moe(ModelWeights.Layer L, int n) {
+        if (n > 1) {
+            moeBatched(L, n);
+            return;
+        }
         int dim = c.dim();
         int e = c.numExperts();
         int topK = c.expertsPerTok();
         int m = c.moeDim();
         int gu = 2 * m;
-        for (int t = 0; t < n; t++) {
-            int xo = t * dim;
-            if (L.mla != null) {
-                routeDeepseek(L, xo, e, topK);
-            } else {
-                route(L.router, xo, e, topK);
+        if (L.mla != null) {
+            routeDeepseek(L, 0, e, topK);
+        } else {
+            route(L.router, 0, e, topK, routerLogits, 0);
+        }
+        // all selected experts' gate/up rows in one parallel loop
+        pool.forRange(topK * gu, 32, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int k = i / gu;
+                int r = i - k * gu;
+                moeGateUp[i] = VectorKernels.dotRow(L.expGateUp, assign[k] * gu + r, xb, 0);
             }
-            // all selected experts' gate/up rows in one parallel loop
-            pool.forRange(topK * gu, 32, (i0, i1) -> {
-                for (int i = i0; i < i1; i++) {
-                    int k = i / gu;
-                    int r = i - k * gu;
-                    moeGateUp[i] = VectorKernels.dotRow(L.expGateUp, assign[k] * gu + r, xb, xo);
-                }
-            });
-            for (int k = 0; k < topK; k++) {
-                int gi = k * gu;
-                int hi = k * m;
-                for (int i = 0; i < m; i++) {
-                    float g = moeGateUp[gi + i];
-                    moeHidden[hi + i] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + i];
-                }
+        });
+        for (int k = 0; k < topK; k++) {
+            int gi = k * gu;
+            int hi = k * m;
+            for (int i = 0; i < m; i++) {
+                float g = moeGateUp[gi + i];
+                moeHidden[hi + i] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + i];
             }
-            pool.forRange(dim, 8, (r0, r1) -> {
-                for (int r = r0; r < r1; r++) {
-                    float sum = 0;
-                    for (int k = 0; k < topK; k++) {
-                        sum += routeWeight[k] * VectorKernels.dotRow(L.expDown, assign[k] * dim + r, moeHidden, k * m);
-                    }
-                    x[xo + r] += sum;
+        }
+        pool.forRange(dim, 8, (r0, r1) -> {
+            for (int r = r0; r < r1; r++) {
+                float sum = 0;
+                for (int k = 0; k < topK; k++) {
+                    sum += routeWeight[k] * VectorKernels.dotRow(L.expDown, assign[k] * dim + r, moeHidden, k * m);
+                }
+                x[r] += sum;
+            }
+        });
+    }
+
+    /**
+     * Prefill MoE: route every token, group the {@code n * topK} slots by expert (counting sort), then run each
+     * expert once over all tokens routed to it with the dense prefill kernel (four rows dequantized once, reused
+     * for every token). Down-projection results are kept per slot and combined into x per token in slot order.
+     */
+    private void moeBatched(ModelWeights.Layer L, int n) {
+        int dim = c.dim();
+        int e = c.numExperts();
+        int topK = c.expertsPerTok();
+        int m = c.moeDim();
+        int gu = 2 * m;
+        int slots = n * topK;
+
+        if (L.mla != null) {
+            // DeepSeekRouter.select writes slots [0, topK): route the last token first and move each result to
+            // its own slots, so token 0 (which stays at offset 0) is written last
+            for (int t = n - 1; t >= 0; t--) {
+                routeDeepseek(L, t * dim, e, topK);
+                System.arraycopy(assign, 0, assign, t * topK, topK);
+                System.arraycopy(routeWeight, 0, routeWeight, t * topK, topK);
+            }
+        } else {
+            pool.forRange(n, 1, (t0, t1) -> {
+                float[] logits = scratch.get();
+                for (int t = t0; t < t1; t++) {
+                    route(L.router, t * dim, e, topK, logits, t * topK);
                 }
             });
         }
+
+        Arrays.fill(expertStart, 0, e + 1, 0);
+        for (int s = 0; s < slots; s++) {
+            expertStart[assign[s] + 1]++;
+        }
+        int used = 0;
+        for (int i = 0; i < e; i++) {
+            if (expertStart[i + 1] > 0) {
+                usedExperts[used++] = i;
+            }
+            expertStart[i + 1] += expertStart[i];
+            expertFill[i] = expertStart[i];
+        }
+        for (int s = 0; s < slots; s++) {
+            slotOrder[expertFill[assign[s]]++] = s;
+        }
+
+        expertMatmul(L.expGateUp, gu, used, xb, dim, false, moeGateUp, gu);
+
+        pool.forRange(slots * m, 256, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int s = i / m;
+                int j = i - s * m;
+                int gi = s * gu;
+                float g = moeGateUp[gi + j];
+                moeHidden[s * m + j] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + j];
+            }
+        });
+
+        expertMatmul(L.expDown, dim, used, moeHidden, m, true, moeDown, dim);
+
+        pool.forRange(n, 1, (t0, t1) -> {
+            for (int t = t0; t < t1; t++) {
+                int xo = t * dim;
+                int s0 = t * topK;
+                for (int r = 0; r < dim; r++) {
+                    float sum = 0;
+                    for (int k = 0; k < topK; k++) {
+                        sum += routeWeight[s0 + k] * moeDown[(s0 + k) * dim + r];
+                    }
+                    x[xo + r] += sum;
+                }
+            }
+        });
     }
 
-    /** DeepSeek router for one token (see {@link DeepSeekRouter}): fills assign[] / routeWeight[]. */
+    /**
+     * {@code out[slot, r] = dot(W[expert(slot) * rowsPer + r, :], in[src(slot), :])} for every slot of every
+     * used expert, where {@code src(slot)} is the slot itself ({@code inBySlot}) or its token. Parallel over
+     * (expert, 4-row group) pairs; each group is dequantized once and reused for all of the expert's slots.
+     */
+    private void expertMatmul(QTensor wt, int rowsPer, int used, float[] in, int inStride, boolean inBySlot,
+                              float[] out, int outStride) {
+        int cols = wt.cols;
+        int topK = c.expertsPerTok();
+        int groups = (rowsPer + 3) / 4;
+        pool.forRange(used * groups, 1, (g0, g1) -> {
+            float[] tmp = scratch.get();
+            for (int g = g0; g < g1; g++) {
+                int ex = usedExperts[g / groups];
+                int r = (g % groups) * 4;
+                int rowBase = ex * rowsPer;
+                int sBeg = expertStart[ex];
+                int sEnd = expertStart[ex + 1];
+                if (r + 4 <= rowsPer) {
+                    for (int k = 0; k < 4; k++) {
+                        VectorKernels.dequantRow(wt, rowBase + r + k, tmp, k * cols);
+                    }
+                    for (int s = sBeg; s < sEnd; s++) {
+                        int slot = slotOrder[s];
+                        int io = (inBySlot ? slot : slot / topK) * inStride;
+                        VectorKernels.dot4(tmp, 0, cols, in, io, out, slot * outStride + r, false);
+                    }
+                } else {
+                    for (int rr = r; rr < rowsPer; rr++) {
+                        for (int s = sBeg; s < sEnd; s++) {
+                            int slot = slotOrder[s];
+                            int io = (inBySlot ? slot : slot / topK) * inStride;
+                            out[slot * outStride + rr] = VectorKernels.dotRow(wt, rowBase + rr, in, io);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * DeepSeek router for one token at {@code xb[xo..]} (see {@link DeepSeekRouter}): fills
+     * {@code assign[0..topK)} / {@code routeWeight[0..topK)}. Uses the backend's own scratch, so one token at a time.
+     */
     private void routeDeepseek(ModelWeights.Layer L, int xo, int e, int topK) {
         int dim = c.dim();
         for (int i = 0; i < e; i++) {
@@ -418,19 +554,22 @@ public final class CpuBackend implements Backend {
                 dsScratch);
     }
 
-    /** Router for one token: fills assign[] / routeWeight[] (same rule as transformers' Qwen3MoeSparseMoeBlock). */
-    private void route(float[] router, int xo, int e, int topK) {
+    /**
+     * Router for one token at {@code xb[xo..]}: fills {@code assign[ao..ao+topK)} / {@code routeWeight[ao..]}
+     * (same rule as transformers' Qwen3MoeSparseMoeBlock). {@code logits} is scratch of at least {@code e} floats.
+     */
+    private void route(float[] router, int xo, int e, int topK, float[] logits, int ao) {
         int dim = c.dim();
         float max = Float.NEGATIVE_INFINITY;
         for (int i = 0; i < e; i++) {
             float v = VectorKernels.dot(router, i * dim, xb, xo, dim);
-            routerLogits[i] = v;
+            logits[i] = v;
             max = Math.max(max, v);
         }
         float sum = 0;
         for (int i = 0; i < e; i++) {
-            float p = (float) Math.exp(routerLogits[i] - max);
-            routerLogits[i] = p;
+            float p = (float) Math.exp(logits[i] - max);
+            logits[i] = p;
             sum += p;
         }
         float selected = 0;
@@ -438,19 +577,19 @@ public final class CpuBackend implements Backend {
             int best = -1;
             float bv = Float.NEGATIVE_INFINITY;
             for (int i = 0; i < e; i++) {
-                if (routerLogits[i] > bv) {
-                    bv = routerLogits[i];
+                if (logits[i] > bv) {
+                    bv = logits[i];
                     best = i;
                 }
             }
-            assign[k] = best;
-            routeWeight[k] = bv / sum;
+            assign[ao + k] = best;
+            routeWeight[ao + k] = bv / sum;
             selected += bv / sum;
-            routerLogits[best] = Float.NEGATIVE_INFINITY;
+            logits[best] = Float.NEGATIVE_INFINITY;
         }
         if (c.normTopK() && selected > 0) {
             for (int k = 0; k < topK; k++) {
-                routeWeight[k] /= selected;
+                routeWeight[ao + k] /= selected;
             }
         }
     }
