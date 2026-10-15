@@ -63,7 +63,7 @@ public final class Main {
         }
         String model = s.get("model.repo");
         Path dir = Path.of(s.get("model.dir")).resolve(model.replace('/', '_'));
-        HuggingFaceHub hub = new HuggingFaceHub(s.opt("hub.endpoint"), s.opt("hub.token"));
+        HuggingFaceHub hub = new HuggingFaceHub(s.opt("hub.endpoint"), s.opt("hub.token"), s.getLong("hub.timeout-ms"));
 
         switch (cmd) {
             case "config" -> System.out.print(s.describe());
