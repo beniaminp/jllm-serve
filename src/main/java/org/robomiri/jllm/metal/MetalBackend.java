@@ -1,0 +1,378 @@
+package org.robomiri.jllm.metal;
+
+import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.QTensor;
+import org.robomiri.jllm.model.QType;
+import org.robomiri.jllm.model.Rope;
+
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+/**
+ * Qwen3 forward pass on the GPU via Metal. Quantized weights are wrapped zero-copy (unified memory); the whole
+ * forward pass for a chunk of tokens is recorded into a single command buffer and executed with one round trip.
+ */
+public final class MetalBackend implements Backend {
+
+    private static final int TOK_TILE = 8; // must match kernels.metal
+    private static final int MAX_BUFS = 8;
+
+    private final ModelWeights w;
+    private final ModelConfig c;
+    private final int ctx;
+    private final int maxBatch;
+    private final Metal metal;
+    private final Arena arena = Arena.ofShared();
+
+    private final int pMatmulQ4;
+    private final int pMatmulQ8;
+    private final int pRmsnorm;
+    private final int pNormRope;
+    private final int pAttention;
+    private final int pSilu;
+    private final int pRouter;
+    private final int pMoeUpQ4;
+    private final int pMoeUpQ8;
+    private final int pMoeDownQ4;
+    private final int pMoeDownQ8;
+
+    private final Metal.Buffer embedQ;
+    private final Metal.Buffer lmHeadQ;
+    private final LayerBufs[] layers;
+    private final Metal.Buffer finalNorm;
+    private final Metal.Buffer ropeCos;
+    private final Metal.Buffer ropeSin;
+    private final Metal.Buffer[] keyCache;
+    private final Metal.Buffer[] valCache;
+
+    private final Metal.Buffer x;
+    private final Metal.Buffer xb;
+    private final Metal.Buffer q;
+    private final Metal.Buffer att;
+    private final Metal.Buffer gateUp;
+    private final Metal.Buffer hidden;
+    private final Metal.Buffer scores;
+    private final Metal.Buffer logitsBuf;
+    // MoE (null for dense models)
+    private final Metal.Buffer assign;
+    private final Metal.Buffer routeWeight;
+    private final Metal.Buffer moeGateUp;
+    private final Metal.Buffer moeHidden;
+
+    // dispatch argument scratch (re-used; the native side copies params at record time)
+    private final MemorySegment bufArgs;
+    private final MemorySegment offArgs;
+    private final MemorySegment params;
+
+    private static final class LayerBufs {
+        Metal.Buffer attnNorm;
+        Metal.Buffer ffnNorm;
+        Metal.Buffer qNorm;
+        Metal.Buffer kNorm;
+        Metal.Buffer wq;
+        Metal.Buffer wk;
+        Metal.Buffer wv;
+        Metal.Buffer wo;
+        Metal.Buffer wGateUp;
+        Metal.Buffer wDown;
+        Metal.Buffer router;
+        Metal.Buffer expGateUp;
+        Metal.Buffer expDown;
+    }
+
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch) {
+        this(w, ctx, maxBatch, null);
+    }
+
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib) {
+        this.w = w;
+        this.c = w.cfg;
+        this.ctx = ctx;
+        this.maxBatch = maxBatch;
+        if (c.headDim() % 32 != 0 || c.headDim() > 256) {
+            throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
+        }
+        this.metal = Metal.create(metalLib);
+        pMatmulQ4 = metal.pipeline("matmul_q4");
+        pMatmulQ8 = metal.pipeline("matmul_q8");
+        pRmsnorm = metal.pipeline("rmsnorm");
+        pNormRope = metal.pipeline("norm_rope");
+        pAttention = metal.pipeline("attention");
+        pSilu = metal.pipeline("silu_mul");
+        pRouter = metal.pipeline("router");
+        pMoeUpQ4 = metal.pipeline("moe_up_q4");
+        pMoeUpQ8 = metal.pipeline("moe_up_q8");
+        pMoeDownQ4 = metal.pipeline("moe_down_q4");
+        pMoeDownQ8 = metal.pipeline("moe_down_q8");
+        if (c.isMoe() && (c.numExperts() > 1024 || c.numExperts() > metal.maxThreads(pRouter))) {
+            throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
+        }
+
+        embedQ = metal.wrap(w.embed.data);
+        lmHeadQ = w.lmHead == w.embed ? embedQ : metal.wrap(w.lmHead.data);
+        layers = new LayerBufs[c.layers()];
+        for (int l = 0; l < c.layers(); l++) {
+            ModelWeights.Layer L = w.layers[l];
+            LayerBufs b = new LayerBufs();
+            b.attnNorm = upload(L.attnNorm);
+            b.ffnNorm = upload(L.ffnNorm);
+            b.qNorm = L.qNorm != null ? upload(L.qNorm) : null;
+            b.kNorm = L.kNorm != null ? upload(L.kNorm) : null;
+            b.wq = metal.wrap(L.wq.data);
+            b.wk = metal.wrap(L.wk.data);
+            b.wv = metal.wrap(L.wv.data);
+            b.wo = metal.wrap(L.wo.data);
+            if (L.moe) {
+                b.router = upload(L.router);
+                b.expGateUp = metal.wrap(L.expGateUp.data);
+                b.expDown = metal.wrap(L.expDown.data);
+            } else {
+                b.wGateUp = metal.wrap(L.wGateUp.data);
+                b.wDown = metal.wrap(L.wDown.data);
+            }
+            layers[l] = b;
+        }
+        finalNorm = upload(w.finalNorm);
+        Rope rope = new Rope(c.headDim(), c.ropeTheta(), ctx);
+        ropeCos = upload(rope.cos);
+        ropeSin = upload(rope.sin);
+
+        long kvBytes = (long) ctx * c.kvDim() * 4;
+        keyCache = new Metal.Buffer[c.layers()];
+        valCache = new Metal.Buffer[c.layers()];
+        for (int l = 0; l < c.layers(); l++) {
+            keyCache[l] = metal.newBuffer(kvBytes);
+            valCache[l] = metal.newBuffer(kvBytes);
+        }
+        x = metal.newBuffer((long) maxBatch * c.dim() * 4);
+        xb = metal.newBuffer((long) maxBatch * c.dim() * 4);
+        q = metal.newBuffer((long) maxBatch * c.qDim() * 4);
+        att = metal.newBuffer((long) maxBatch * c.qDim() * 4);
+        gateUp = metal.newBuffer((long) maxBatch * 2L * c.hiddenDim() * 4);
+        hidden = metal.newBuffer((long) maxBatch * c.hiddenDim() * 4);
+        scores = metal.newBuffer((long) maxBatch * c.heads() * ctx * 4);
+        logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4);
+        if (c.isMoe()) {
+            int slots = maxBatch * c.expertsPerTok();
+            assign = metal.newBuffer((long) slots * 4);
+            routeWeight = metal.newBuffer((long) slots * 4);
+            moeGateUp = metal.newBuffer((long) slots * 2 * c.moeDim() * 4);
+            moeHidden = metal.newBuffer((long) slots * c.moeDim() * 4);
+        } else {
+            assign = null;
+            routeWeight = null;
+            moeGateUp = null;
+            moeHidden = null;
+        }
+        long ws = metal.recommendedWorkingSet();
+        if (w.byteSize() > ws) {
+            System.err.printf("warning: weights (%.1f GB) exceed Metal's recommended working set (%.1f GB); expect paging%n",
+                    w.byteSize() / 1e9, ws / 1e9);
+        }
+
+        bufArgs = arena.allocate(ValueLayout.ADDRESS, MAX_BUFS);
+        offArgs = arena.allocate(ValueLayout.JAVA_LONG, MAX_BUFS);
+        params = arena.allocate(64);
+    }
+
+    private Metal.Buffer upload(float[] data) {
+        Metal.Buffer b = metal.newBuffer((long) data.length * 4);
+        MemorySegment.copy(data, 0, b.contents(), ValueLayout.JAVA_FLOAT, 0, data.length);
+        return b;
+    }
+
+    @Override
+    public String name() {
+        return "metal (" + metal.deviceName() + ")";
+    }
+
+    @Override
+    public int contextLength() {
+        return ctx;
+    }
+
+    @Override
+    public int maxBatch() {
+        return maxBatch;
+    }
+
+    @Override
+    public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+        if (n < 1 || n > maxBatch || pos + n > ctx) {
+            throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        int dim = c.dim();
+        int kvDim = c.kvDim();
+        // embeddings are gathered on the CPU (tiny) and written straight into the shared buffer
+        float[] row = new float[dim];
+        for (int t = 0; t < n; t++) {
+            w.embed.dequantizeRow(tokens[off + t], row, 0);
+            MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+        }
+
+        metal.begin();
+        for (int l = 0; l < c.layers(); l++) {
+            LayerBufs L = layers[l];
+            ModelWeights.Layer W = w.layers[l];
+            rmsnorm(x, L.attnNorm, xb, n, dim);
+            matmul(W.wq, L.wq, xb, q, 0, n, false);
+            matmul(W.wk, L.wk, xb, keyCache[l], (long) pos * kvDim * 4, n, false);
+            matmul(W.wv, L.wv, xb, valCache[l], (long) pos * kvDim * 4, n, false);
+            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
+            normRope(keyCache[l], (long) pos * kvDim * 4, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            attention(l, n, pos);
+            matmul(W.wo, L.wo, att, x, 0, n, true);
+
+            rmsnorm(x, L.ffnNorm, xb, n, dim);
+            if (W.moe) {
+                moe(W, L, n);
+            } else {
+                matmul(W.wGateUp, L.wGateUp, xb, gateUp, 0, n, false);
+                siluMul(n);
+                matmul(W.wDown, L.wDown, hidden, x, 0, n, true);
+            }
+        }
+        if (logits != null) {
+            // normalize only the last token: read x at row n-1, write xb row 0
+            rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
+            matmul(w.lmHead, lmHeadQ, xb, logitsBuf, 0, 1, false);
+        }
+        metal.commitAndWait();
+        if (logits != null) {
+            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0, w.lmHead.rows);
+        }
+    }
+
+    // ------------------------------------------------------------------ dispatch helpers
+
+    private void bind(int i, Metal.Buffer b, long offset) {
+        bufArgs.setAtIndex(ValueLayout.ADDRESS, i, b.handle());
+        offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset);
+    }
+
+    private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, Metal.Buffer out, long outOff, int n, boolean acc) {
+        bind(0, wbuf, 0);
+        bind(1, wbuf, t.scalesOffset);
+        bind(2, in, 0);
+        bind(3, out, outOff);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, t.rows);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, t.cols);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
+        int pipe = t.type == QType.Q4_0 ? pMatmulQ4 : pMatmulQ8;
+        int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
+        int gx = (t.rows + sgPerTg - 1) / sgPerTg;
+        int gy = (n + TOK_TILE - 1) / TOK_TILE;
+        metal.dispatch(pipe, bufArgs, offArgs, 4, params, 16, gx, gy, 1, 32 * sgPerTg, 1, 1);
+    }
+
+    private void rmsnorm(Metal.Buffer in, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
+        rmsnormAt(in, 0, weight, out, n, width);
+    }
+
+    private void rmsnormAt(Metal.Buffer in, long inOff, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
+        bind(0, in, inOff);
+        bind(1, weight, 0);
+        bind(2, out, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.normEps());
+        metal.dispatch(pRmsnorm, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
+    }
+
+    private void normRope(Metal.Buffer v, long off, int stride, int nHeads, Metal.Buffer norm, int n, int pos) {
+        bind(0, v, off);
+        bind(1, norm != null ? norm : finalNorm, 0); // dummy binding when unused
+        bind(2, ropeCos, 0);
+        bind(3, ropeSin, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, stride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, pos);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, norm != null ? 1 : 0);
+        metal.dispatch(pNormRope, bufArgs, offArgs, 4, params, 20, nHeads, n, 1, c.headDim() / 2, 1, 1);
+    }
+
+    private void attention(int l, int n, int pos) {
+        bind(0, q, 0);
+        bind(1, keyCache[l], 0);
+        bind(2, valCache[l], 0);
+        bind(3, att, 0);
+        bind(4, scores, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.kvHeads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.headDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, pos);
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, ctx);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, (float) (1.0 / Math.sqrt(c.headDim())));
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
+        metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 32, c.heads(), n, 1, 256, 1, 1);
+    }
+
+    private void siluMul(int n) {
+        siluMul(gateUp, hidden, n, c.hiddenDim());
+    }
+
+    private void siluMul(Metal.Buffer in, Metal.Buffer out, int ntok, int width) {
+        int total = ntok * width;
+        bind(0, in, 0);
+        bind(1, out, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, total);
+        metal.dispatch(pSilu, bufArgs, offArgs, 2, params, 8, (total + 255) / 256, 1, 1, 256, 1, 1);
+    }
+
+    /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */
+    private void moe(ModelWeights.Layer W, LayerBufs L, int n) {
+        int topK = c.expertsPerTok();
+        int m = c.moeDim();
+        int slots = n * topK;
+        int sgPerTg = 4;
+
+        bind(0, xb, 0);
+        bind(1, L.router, 0);
+        bind(2, assign, 0);
+        bind(3, routeWeight, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.numExperts());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
+        metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, c.numExperts(), 1, 1);
+
+        QTensor gu = W.expGateUp;
+        bind(0, L.expGateUp, 0);
+        bind(1, L.expGateUp, gu.scalesOffset);
+        bind(2, xb, 0);
+        bind(3, assign, 0);
+        bind(4, moeGateUp, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, 2 * m);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, gu.cols);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
+        metal.dispatch(gu.type == QType.Q4_0 ? pMoeUpQ4 : pMoeUpQ8, bufArgs, offArgs, 5, params, 12,
+                (2 * m + sgPerTg - 1) / sgPerTg, slots, 1, 32 * sgPerTg, 1, 1);
+
+        siluMul(moeGateUp, moeHidden, slots, m);
+
+        QTensor dn = W.expDown;
+        bind(0, L.expDown, 0);
+        bind(1, L.expDown, dn.scalesOffset);
+        bind(2, moeHidden, 0);
+        bind(3, assign, 0);
+        bind(4, routeWeight, 0);
+        bind(5, x, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.dim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, dn.cols);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
+        metal.dispatch(dn.type == QType.Q4_0 ? pMoeDownQ4 : pMoeDownQ8, bufArgs, offArgs, 6, params, 12,
+                (c.dim() + sgPerTg - 1) / sgPerTg, n, 1, 32 * sgPerTg, 1, 1);
+    }
+
+    @Override
+    public void close() {
+        metal.close();
+        arena.close();
+    }
+}

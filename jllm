@@ -1,0 +1,19 @@
+#!/bin/sh
+# Launcher: ./jllm <command> [options]   (see ./jllm --help)
+# Needs JDK 26+. Set JAVA_HOME to pick a specific JDK.
+set -eu
+cd "$(dirname "$0")"
+JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+if [ ! -d target/classes/org ]; then
+  echo "compiling..." >&2
+  mvn -q compile
+fi
+if [ "$(uname)" = "Darwin" ] && [ ! -f target/native/libjllm_metal.dylib ]; then
+  ./scripts/build-native.sh >&2 || true
+fi
+exec "$JAVA" \
+  --add-modules jdk.incubator.vector \
+  --enable-native-access=ALL-UNNAMED \
+  -XX:+UseParallelGC -Xmx4g \
+  -cp target/classes \
+  org.robomiri.jllm.Main "$@"

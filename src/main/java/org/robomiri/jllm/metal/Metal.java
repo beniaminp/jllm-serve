@@ -1,0 +1,284 @@
+package org.robomiri.jllm.metal;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SymbolLookup;
+import java.lang.invoke.MethodHandle;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+/**
+ * Panama FFM bindings for {@code libjllm_metal.dylib} (see {@code src/main/native/jllm_metal.m}).
+ *
+ * <p>Thin and generic: compile shader source, create/wrap buffers, record dispatches, commit and wait.
+ */
+public final class Metal implements AutoCloseable {
+
+    /** A Metal buffer handle plus a CPU view of its (shared) contents. */
+    public record Buffer(MemorySegment handle, MemorySegment contents, long size) {
+    }
+
+    private static final int ERR_LEN = 4096;
+    private static final Linker LINKER = Linker.nativeLinker();
+
+    private final MethodHandle create;
+    private final MethodHandle destroy;
+    private final MethodHandle deviceName;
+    private final MethodHandle workingSet;
+    private final MethodHandle pipeline;
+    private final MethodHandle pipelineMaxThreads;
+    private final MethodHandle bufferNew;
+    private final MethodHandle bufferWrap;
+    private final MethodHandle bufferContents;
+    private final MethodHandle bufferRelease;
+    private final MethodHandle begin;
+    private final MethodHandle dispatch;
+    private final MethodHandle commitWait;
+
+    private final Arena arena = Arena.ofShared();
+    private final MemorySegment err = arena.allocate(ERR_LEN);
+    private final MemorySegment ctx;
+    private final List<Buffer> buffers = new ArrayList<>();
+
+    private Metal(Path lib, String shaderSource) {
+        SymbolLookup l = SymbolLookup.libraryLookup(lib, arena);
+        create = handle(l, "jm_create", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
+        destroy = handle(l, "jm_destroy", FunctionDescriptor.ofVoid(ADDRESS));
+        deviceName = handle(l, "jm_device_name", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        workingSet = handle(l, "jm_recommended_working_set", FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+        pipeline = handle(l, "jm_pipeline", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
+        pipelineMaxThreads = handle(l, "jm_pipeline_max_threads", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        bufferNew = handle(l, "jm_buffer_new", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG));
+        bufferWrap = handle(l, "jm_buffer_wrap", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG));
+        bufferContents = handle(l, "jm_buffer_contents", FunctionDescriptor.of(ADDRESS, ADDRESS));
+        bufferRelease = handle(l, "jm_buffer_release", FunctionDescriptor.ofVoid(ADDRESS));
+        begin = handle(l, "jm_begin", FunctionDescriptor.ofVoid(ADDRESS));
+        dispatch = handle(l, "jm_dispatch", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT,
+                ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        commitWait = handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        try {
+            ctx = (MemorySegment) create.invokeExact(arena.allocateFrom(shaderSource), err, ERR_LEN);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+        if (ctx.equals(MemorySegment.NULL)) {
+            throw new IllegalStateException("Metal initialisation failed: " + error());
+        }
+    }
+
+    private static MethodHandle handle(SymbolLookup l, String name, FunctionDescriptor fd) {
+        return LINKER.downcallHandle(l.findOrThrow(name), fd);
+    }
+
+    /** Loads the native library and compiles the bundled kernels. */
+    public static Metal create() {
+        return create(null);
+    }
+
+    /** @param explicitLib path of libjllm_metal.dylib, or null to search the usual locations */
+    public static Metal create(String explicitLib) {
+        Path lib = findLibrary(explicitLib);
+        String src;
+        try (InputStream in = Metal.class.getResourceAsStream("kernels.metal")) {
+            if (in == null) {
+                throw new IllegalStateException("kernels.metal resource missing");
+            }
+            src = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+        return new Metal(lib, src);
+    }
+
+    /** True if this looks like a machine where the Metal backend can work. */
+    public static boolean available() {
+        return available(null);
+    }
+
+    public static boolean available(String explicitLib) {
+        return System.getProperty("os.name", "").toLowerCase().contains("mac") && locateLibrary(explicitLib) != null;
+    }
+
+    private static Path findLibrary(String explicitLib) {
+        Path p = locateLibrary(explicitLib);
+        if (p == null) {
+            throw new IllegalStateException("libjllm_metal.dylib not found. Build it with ./scripts/build-native.sh "
+                    + "or point -Djllm.metal.lib=/path/to/libjllm_metal.dylib at it");
+        }
+        return p;
+    }
+
+    private static Path locateLibrary(String explicitLib) {
+        List<Path> candidates = new ArrayList<>();
+        if (explicitLib != null && !explicitLib.isBlank()) {
+            candidates.add(Path.of(explicitLib));
+        }
+        String prop = System.getProperty("jllm.metal.lib");
+        if (prop != null) {
+            candidates.add(Path.of(prop));
+        }
+        String env = System.getenv("JLLM_METAL_LIB");
+        if (env != null) {
+            candidates.add(Path.of(env));
+        }
+        candidates.add(Path.of("target", "native", "libjllm_metal.dylib"));
+        candidates.add(Path.of("libjllm_metal.dylib"));
+        try { // next to the jar / classes directory
+            Path codeSource = Path.of(Metal.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            Path base = Files.isDirectory(codeSource) ? codeSource.getParent() : codeSource.getParent();
+            candidates.add(base.resolve("native").resolve("libjllm_metal.dylib"));
+        } catch (Exception ignored) {
+            // not resolvable
+        }
+        for (Path c : candidates) {
+            if (Files.isRegularFile(c)) {
+                return c.toAbsolutePath();
+            }
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------------ API
+
+    public String deviceName() {
+        try {
+            int ignored = (int) deviceName.invokeExact(ctx, err, ERR_LEN);
+            return err.getString(0);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    public long recommendedWorkingSet() {
+        try {
+            return (long) workingSet.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    public int pipeline(String name) {
+        try {
+            int idx = (int) pipeline.invokeExact(ctx, arena.allocateFrom(name), err, ERR_LEN);
+            if (idx < 0) {
+                throw new IllegalStateException("pipeline " + name + ": " + error());
+            }
+            return idx;
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    public int maxThreads(int pipelineIndex) {
+        try {
+            return (int) pipelineMaxThreads.invokeExact(ctx, pipelineIndex);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** New zero-filled shared buffer. */
+    public Buffer newBuffer(long bytes) {
+        try {
+            MemorySegment h = (MemorySegment) bufferNew.invokeExact(ctx, Math.max(16L, bytes));
+            if (h.equals(MemorySegment.NULL)) {
+                throw new OutOfMemoryError("Metal buffer of " + bytes + " bytes");
+            }
+            return track(h, bytes);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** Wraps Java-owned native memory (zero-copy when page aligned). The segment must outlive this object. */
+    public Buffer wrap(MemorySegment seg) {
+        try {
+            MemorySegment h = (MemorySegment) bufferWrap.invokeExact(ctx, seg, seg.byteSize());
+            if (h.equals(MemorySegment.NULL)) {
+                throw new OutOfMemoryError("cannot wrap " + seg.byteSize() + " bytes as a Metal buffer");
+            }
+            return track(h, seg.byteSize());
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    private Buffer track(MemorySegment h, long size) throws Throwable {
+        MemorySegment contents = ((MemorySegment) bufferContents.invokeExact(h)).reinterpret(size);
+        Buffer b = new Buffer(h, contents, size);
+        buffers.add(b);
+        return b;
+    }
+
+    public void begin() {
+        try {
+            begin.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /**
+     * Records a dispatch. {@code bufs}/{@code offsets} are native arrays of {@code nbuf} pointers/u64 offsets;
+     * {@code params} holds {@code plen} bytes bound after the buffers.
+     */
+    public void dispatch(int pipe, MemorySegment bufs, MemorySegment offsets, int nbuf, MemorySegment params, int plen,
+                         int gx, int gy, int gz, int tx, int ty, int tz) {
+        try {
+            dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, gx, gy, gz, tx, ty, tz);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    public void commitAndWait() {
+        try {
+            int rc = (int) commitWait.invokeExact(ctx, err, ERR_LEN);
+            if (rc != 0) {
+                throw new IllegalStateException("Metal command buffer failed: " + error());
+            }
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    private String error() {
+        return err.getString(0);
+    }
+
+    @Override
+    public void close() {
+        try {
+            for (Buffer b : buffers) {
+                bufferRelease.invokeExact(b.handle());
+            }
+            buffers.clear();
+            destroy.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            arena.close();
+        }
+    }
+
+    private static RuntimeException rethrow(Throwable t) {
+        if (t instanceof RuntimeException re) {
+            return re;
+        }
+        if (t instanceof Error e) {
+            throw e;
+        }
+        return new RuntimeException(t);
+    }
+}
