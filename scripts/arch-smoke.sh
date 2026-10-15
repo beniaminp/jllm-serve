@@ -16,6 +16,10 @@
 #                                                         tied embeddings, sliding window on layers >= 2
 #   hf-internal-testing_tiny-random-Llama3RopeForCausalLM generated: llama3 rope_scaling, MHA, tied embeddings
 #
+#   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
+#   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
+#   hf-internal-testing_tiny-random-Glm4ForCausalLM       generated: glm4, four norms per layer, partial interleaved rope
+#
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -44,7 +48,11 @@ gen llama LlamaPlainForCausalLM
 gen mistral MistralForCausalLM
 gen qwen2 Qwen2ForCausalLM
 gen llama3rope Llama3RopeForCausalLM
+gen glm GlmForCausalLM
+gen glmedge GlmEdgeForCausalLM
+gen glm4 Glm4ForCausalLM
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
-  "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM"
+  "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
+  "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM"

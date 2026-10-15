@@ -2,6 +2,7 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.Rope;
 import org.robomiri.jllm.safetensors.SafeTensors;
 import org.robomiri.jllm.sampling.Sampler;
@@ -39,6 +40,7 @@ public final class SmokeTest {
         sampler();
         safetensors(dir);
         ropeScaling();
+        glmRope();
         modelConfigs();
         System.out.println("all smoke tests passed");
     }
@@ -549,6 +551,57 @@ public final class SmokeTest {
         Rope plain = new Rope(8, 1e4, 4);
         Rope scaled = new Rope(8, 1e4, 4, l3);
         check(plain.cos[8 + 3] != scaled.cos[8 + 3] && plain.cos[8] == scaled.cos[8], "scaled table differs only in low freqs");
+    }
+
+    /** GLM interleaved partial rotation on a hand-computed 6-dim head with rotaryDim 4. */
+    static void glmRope() throws Exception {
+        // pair 0 = (x0, x1) rotates by 90 degrees (cos 0, sin 1), pair 1 = (x2, x3) by 180 degrees (cos -1, sin 0);
+        // x4, x5 are outside the rotary dims and stay put.
+        // pair 0: (1, 2) -> (1*0 - 2*1, 2*0 + 1*1) = (-2, 1);  pair 1: (3, 4) -> (-3, -4)
+        float[] v = {1, 2, 3, 4, 5, 6};
+        float[] cos = {0f, -1f};
+        float[] sin = {1f, 0f};
+        InterleavedRope.rotate(v, 0, 4, cos, sin, 0);
+        check(Arrays.equals(v, new float[]{-2, 1, -3, -4, 5, 6}), "glm interleaved rope: " + Arrays.toString(v));
+        // the rotate-half convention would pair (x0, x2) and (x1, x3): (1,3)@90 -> (-3,1), (2,4)@180 -> (-2,-4)
+        check(v[0] != -3 && v[1] != -2, "interleaved differs from rotate-half");
+        // a second head behind the first with a table offset (position 1 of a 2-position table)
+        float[] w = {9, 9, 9, 9, 9, 9, 1, 0, 0, 1};
+        InterleavedRope.rotate(w, 6, 4, new float[]{1f, 1f, 0f, -1f}, new float[]{0f, 0f, 1f, 0f}, 2);
+        check(Arrays.equals(w, new float[]{9, 9, 9, 9, 9, 9, 0, 1, -0f, -1}), "table offset and head offset: " + Arrays.toString(w));
+        // tables cover rotaryDim only: theta^(-2i/rotaryDim) (rotaryDim 4 -> 1, 0.01), not theta^(-2i/headDim)
+        Rope r = new Rope(4, 1e4, 3);
+        check(r.cos.length == 3 * 2 && Math.abs(r.sin[2 * 2 + 1] - (float) Math.sin(0.02)) < 1e-7, "glm rope table width");
+        Path tmp = Files.createTempDirectory("jllm-glm");
+        try {
+            ModelConfig edge = cfg(tmp, """
+                    {"architectures":["GlmForCausalLM"],"partial_rotary_factor":1.0,"attention_bias":false,
+                     "eos_token_id":[59246,59253,59255],"head_dim":128,"hidden_act":"silu","hidden_size":2048,
+                     "intermediate_size":6144,"model_type":"glm","num_attention_heads":16,"num_hidden_layers":28,
+                     "num_key_value_heads":4,"pad_token_id":59246,"rms_norm_eps":1e-05,"rope_theta":10000.0,
+                     "tie_word_embeddings":true,"vocab_size":59264}""");
+            check(edge.ropeInterleaved() && edge.rotaryDim() == 128 && !edge.attentionBias() && !edge.postNorms()
+                    && edge.tiedEmbeddings() && edge.promptBosId() == -1 && edge.eosTokenIds().equals(List.of(59246, 59253, 59255)),
+                    "GLM-Edge config");
+            ModelConfig chat = cfg(tmp, """
+                    {"architectures":["GlmForCausalLM"],"attention_bias":true,"eos_token_id":[151329,151336,151338],
+                     "head_dim":128,"hidden_size":4096,"intermediate_size":13696,"model_type":"glm",
+                     "num_attention_heads":32,"num_hidden_layers":40,"num_key_value_heads":2,"rms_norm_eps":1.5625e-07,
+                     "rope_theta":10000.0,"tie_word_embeddings":false,"vocab_size":151552}""");
+            check(chat.rotaryDim() == 64 && chat.attentionBias() && !chat.postNorms(), "glm-4-9b-chat-hf: default partial_rotary_factor 0.5");
+            ModelConfig g4 = cfg(tmp, """
+                    {"architectures":["Glm4ForCausalLM"],"attention_bias":true,"head_dim":128,"hidden_size":4096,
+                     "intermediate_size":13696,"model_type":"glm4","num_attention_heads":32,"num_hidden_layers":40,
+                     "num_key_value_heads":2,"partial_rotary_factor":0.5,"rms_norm_eps":1e-05,"rope_theta":10000.0,
+                     "vocab_size":151552}""");
+            check(g4.ropeInterleaved() && g4.postNorms() && g4.rotaryDim() == 64 && g4.attentionBias(), "GLM-4-0414 config");
+            check(cfg(tmp, """
+                    {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
+                     "num_attention_heads":16,"head_dim":128,"vocab_size":151936}""").rotaryDim() == 128, "non-GLM rotates the full head");
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
     }
 
     static void modelConfigs() throws Exception {
