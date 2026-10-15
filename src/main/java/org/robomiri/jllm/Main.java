@@ -8,6 +8,7 @@ import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
@@ -146,19 +147,20 @@ public final class Main {
             backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
         }
         int threads = s.getInt("backend.threads");
+        KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         Backend backend;
         try {
             backend = switch (backendName) {
                 case "cpu" -> new CpuBackend(weights, ctx, batch,
-                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors());
-                case "metal" -> new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"));
+                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype);
+                case "metal" -> new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         } catch (Exception e) {
             weights.close();
             throw e;
         }
-        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch);
+        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + kvDtype);
         return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok), s.getLong("server.queue-timeout-ms")));
     }
 
