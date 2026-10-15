@@ -29,15 +29,14 @@ public final class QuantFile implements AutoCloseable {
     public record Entry(String type, int rows, int cols, long offset, long size) {
     }
 
-    private final Arena arena = Arena.ofShared();
+    private final Arena arena;
     private final MemorySegment mapped;
     private final Map<String, Entry> entries;
 
-    private QuantFile(Path bin, Map<String, Entry> entries) throws IOException {
+    private QuantFile(Arena arena, MemorySegment mapped, Map<String, Entry> entries) {
+        this.arena = arena;
+        this.mapped = mapped;
         this.entries = entries;
-        try (FileChannel ch = FileChannel.open(bin, StandardOpenOption.READ)) {
-            mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size(), arena);
-        }
     }
 
     public static boolean exists(Path dir, QType quant) {
@@ -53,18 +52,92 @@ public final class QuantFile implements AutoCloseable {
     }
 
     public static QuantFile open(Path dir, QType quant) throws IOException {
-        Map<String, Object> header = Json.parseObject(Files.readString(jsonPath(dir, quant)));
+        Path json = jsonPath(dir, quant);
+        Map<String, Entry> entries = readIndex(json, Json.map(parseJson(json), "tensors"));
+        Path bin = binPath(dir, quant);
+        Arena arena = Arena.ofShared();
+        try {
+            MemorySegment mapped;
+            try (FileChannel ch = FileChannel.open(bin, StandardOpenOption.READ)) {
+                mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size(), arena);
+            }
+            for (Map.Entry<String, Entry> e : entries.entrySet()) {
+                checkEntry(e.getKey(), e.getValue(), mapped.byteSize(), bin);
+            }
+            return new QuantFile(arena, mapped, entries);
+        } catch (IOException | RuntimeException e) {
+            arena.close();
+            throw e;
+        }
+    }
+
+    private static Map<String, Object> parseJson(Path json) throws IOException {
+        Map<String, Object> header;
+        try {
+            header = Json.parseObject(Files.readString(json));
+        } catch (RuntimeException e) {
+            throw new IOException(json + " is not a valid jllm cache index: " + e.getMessage() + "; delete it to reconvert", e);
+        }
         if (Json.num(header, "version", 0) != VERSION) {
-            throw new IOException("unsupported jllm cache version; delete " + jsonPath(dir, quant));
+            throw new IOException("unsupported jllm cache version; delete " + json);
+        }
+        return header;
+    }
+
+    /** Parses a {@code {name: {type, rows, cols, offset, size}}} map, rejecting anything malformed. */
+    static Map<String, Entry> readIndex(Path json, Map<String, Object> tensors) throws IOException {
+        if (tensors == null) {
+            throw new IOException(json + " has no \"tensors\" map; delete it to reconvert");
         }
         Map<String, Entry> entries = new LinkedHashMap<>();
-        Map<String, Object> tensors = Json.map(header, "tensors");
         for (Map.Entry<String, Object> e : tensors.entrySet()) {
             Object v = e.getValue();
-            entries.put(e.getKey(), new Entry(Json.str(v, "type", "?"), (int) Json.num(v, "rows", 0),
-                    (int) Json.num(v, "cols", 0), Json.num(v, "offset", 0), Json.num(v, "size", 0)));
+            if (!(v instanceof Map)) {
+                throw new IOException(json + ": malformed entry for " + e.getKey());
+            }
+            entries.put(e.getKey(), new Entry(Json.str(v, "type", "?"), (int) Json.num(v, "rows", -1),
+                    (int) Json.num(v, "cols", -1), Json.num(v, "offset", -1), Json.num(v, "size", -1)));
         }
-        return new QuantFile(binPath(dir, quant), entries);
+        return entries;
+    }
+
+    /** Expected byte size of an entry in the file layout, or -1 if its type is unknown. */
+    static long expectedSize(Entry e) {
+        if (e.type().equals("F32")) {
+            return QTensor.align((long) e.rows() * e.cols() * Float.BYTES, QTensor.PAGE);
+        }
+        for (QType t : QType.values()) {
+            if (t.name().equals(e.type())) {
+                return e.cols() % QType.BLOCK == 0 ? QTensor.byteSize(t, e.rows(), e.cols()) : -1;
+            }
+        }
+        return -1;
+    }
+
+    /** Verifies that an index entry describes a well-formed, in-bounds blob of {@code fileSize} bytes. */
+    static void checkEntry(String name, Entry e, long fileSize, Path bin) throws IOException {
+        String problem = null;
+        if (e.rows() < 0 || e.cols() < 0 || e.offset() < 0 || e.size() < 0) {
+            problem = "negative field";
+        } else if (e.offset() % QTensor.PAGE != 0) {
+            problem = "offset is not page aligned";
+        } else if (expectedSize(e) != e.size()) {
+            problem = "size " + e.size() + " does not match " + e.rows() + "x" + e.cols() + " " + e.type();
+        } else {
+            long end;
+            try {
+                end = Math.addExact(e.offset(), e.size());
+            } catch (ArithmeticException ex) {
+                end = Long.MAX_VALUE;
+            }
+            if (end > fileSize) {
+                problem = "extends to " + end + " but " + bin + " has " + fileSize + " bytes";
+            }
+        }
+        if (problem != null) {
+            throw new IOException("corrupt jllm cache entry " + name + ": " + problem + "; delete " + bin
+                    + " and its .json to reconvert");
+        }
     }
 
     public boolean has(String name) {
