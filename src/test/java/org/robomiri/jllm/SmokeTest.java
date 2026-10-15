@@ -1072,6 +1072,32 @@ public final class SmokeTest {
                     && !v3.isMoeLayer(2) && v3.isMoeLayer(3) && v3.maxMlpDim() == 18432 && v3.promptBosId() == 0
                     && Math.abs(d3.softmaxScale() - 0.07216878364870322 * 1.3688879454113936 * 1.3688879454113936) < 1e-12,
                     "deepseek-v3 config");
+            // the V2 chat template of tokenizer_config.json
+            ChatTemplate.Format f = ChatTemplate.forModelType("deepseek_v2");
+            check(f.name().equals("deepseek-v2") && f.render(List.of(new ChatTemplate.Message("system", "Be brief."),
+                            new ChatTemplate.Message("user", "Hi"), new ChatTemplate.Message("assistant", "Hello"),
+                            new ChatTemplate.Message("user", "Bye")), true, false)
+                            .equals("<｜begin▁of▁sentence｜>Be brief.\n\nUser: Hi\n\nAssistant: Hello<｜end▁of▁sentence｜>"
+                                    + "User: Bye\n\nAssistant:"), "deepseek-v2 chat template");
+            check(ChatTemplate.forModelType("deepseek_v3").name().equals("deepseek-r1"), "deepseek_v3 uses the V3/R1 template");
+            // an FP8 checkpoint (V3 / R1 as published) is refused up front with an explanation
+            Path fp8 = Files.createTempDirectory("jllm-fp8");
+            try {
+                Files.writeString(fp8.resolve("model.safetensors.index.json"),
+                        "{\"weight_map\":{\"model.embed_tokens.weight\":\"a.safetensors\","
+                                + "\"model.layers.0.self_attn.q_a_proj.weight\":\"a.safetensors\","
+                                + "\"model.layers.0.self_attn.q_a_proj.weight_scale_inv\":\"a.safetensors\"}}");
+                try {
+                    org.robomiri.jllm.model.ModelConverter.convert(fp8, v3, org.robomiri.jllm.model.QType.Q4_0,
+                            org.robomiri.jllm.model.ShardProvider.local(fp8));
+                    check(false, "fp8 checkpoint must be refused");
+                } catch (java.io.IOException e) {
+                    check(e.getMessage().contains("FP8"), "fp8 checkpoint refused: " + e.getMessage());
+                }
+            } finally {
+                Files.deleteIfExists(fp8.resolve("model.safetensors.index.json"));
+                Files.deleteIfExists(fp8);
+            }
             expectIae(() -> {
                 try {
                     cfg(tmp, "{\"model_type\":\"deepseek_v2\",\"hidden_size\":64,\"intermediate_size\":64,\"num_hidden_layers\":2,"

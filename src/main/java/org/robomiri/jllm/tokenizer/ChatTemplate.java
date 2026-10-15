@@ -96,6 +96,8 @@ public final class ChatTemplate {
                             + " chat template here; only Llama 3.x is supported");
                 }
                 return llama3(LLAMA_DEFAULT_DATE);
+            case "deepseek_v2":
+                return DEEPSEEK_V2;
             case "deepseek", "deepseek_r1", "deepseek_v3":
                 return DEEPSEEK;
             case "mistral", "mixtral":
@@ -218,6 +220,28 @@ public final class ChatTemplate {
         }
         if (gen) {
             o.ctl("<｜Assistant｜><think>\n");
+        }
+    }, "<｜end▁of▁sentence｜>");
+
+    /**
+     * DeepSeek-V2 / V2-Lite / Coder-V2 chat: {@code <bos>system\n\nUser: ...\n\nAssistant: ...<eos>User: ...\n\nAssistant:}
+     * (the tokenizer_config.json template; a system message is emitted in place, followed by a blank line).
+     */
+    private static final Format DEEPSEEK_V2 = new Family("deepseek-v2", (m, gen, think, o) -> {
+        o.ctl("<｜begin▁of▁sentence｜>");
+        for (Message msg : m) {
+            String role = role(msg, "system", "user", "assistant");
+            switch (role) {
+                case "system" -> o.txt(content(msg) + "\n\n");
+                case "user" -> o.txt("User: " + content(msg) + "\n\n");
+                default -> {
+                    o.txt("Assistant: " + content(msg));
+                    o.ctl("<｜end▁of▁sentence｜>");
+                }
+            }
+        }
+        if (gen) {
+            o.txt("Assistant:");
         }
     }, "<｜end▁of▁sentence｜>");
 
