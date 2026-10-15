@@ -21,11 +21,30 @@ public final class ApiServer implements AutoCloseable {
     /**
      * @param sampling        sampling values used when a request omits a field
      * @param thinkingDefault whether Qwen3 thinking is on when a request does not say
+     * @param maxPromptBytes  reject prompts larger than this (text, before tokenizing); 0 = 16 * context length
      * @param http            connection limits of the underlying HTTP server
      */
-    public record Options(SamplingParams sampling, boolean thinkingDefault, HttpServer.Options http) {
+    public record Options(SamplingParams sampling, boolean thinkingDefault, long maxPromptBytes, HttpServer.Options http) {
         public static Options defaults() {
-            return new Options(SamplingParams.defaults(), false, HttpServer.Options.defaults());
+            return new Options(SamplingParams.defaults(), false, 0, HttpServer.Options.defaults());
+        }
+    }
+
+    /** A client error: carried out of the request parsing helpers and turned into a JSON error response. */
+    private static final class RequestError extends RuntimeException {
+        final int status;
+        final String type;
+        final String code;
+
+        RequestError(int status, String message, String type, String code) {
+            super(message);
+            this.status = status;
+            this.type = type;
+            this.code = code;
+        }
+
+        static RequestError invalid(String message) {
+            return new RequestError(400, message, "invalid_request_error", null);
         }
     }
 
@@ -35,6 +54,7 @@ public final class ApiServer implements AutoCloseable {
     private final AtomicLong counter = new AtomicLong();
     private final SamplingParams defaults;
     private final boolean thinkingDefault;
+    private final long maxPromptBytes;
 
     public ApiServer(Engine engine, String modelId, String host, int port) throws IOException {
         this(engine, modelId, host, port, Options.defaults());
@@ -42,7 +62,7 @@ public final class ApiServer implements AutoCloseable {
 
     public ApiServer(Engine engine, String modelId, String host, int port, SamplingParams defaults,
                      boolean thinkingDefault) throws IOException {
-        this(engine, modelId, host, port, new Options(defaults, thinkingDefault, HttpServer.Options.defaults()));
+        this(engine, modelId, host, port, new Options(defaults, thinkingDefault, 0, HttpServer.Options.defaults()));
     }
 
     public ApiServer(Engine engine, String modelId, String host, int port, Options options) throws IOException {
@@ -50,6 +70,8 @@ public final class ApiServer implements AutoCloseable {
         this.modelId = modelId;
         this.defaults = options.sampling();
         this.thinkingDefault = options.thinkingDefault();
+        this.maxPromptBytes = options.maxPromptBytes() > 0
+                ? options.maxPromptBytes() : 16L * engine.backend().contextLength();
         this.http = new HttpServer(host, port, options.http(), this::handle);
     }
 
@@ -96,15 +118,19 @@ public final class ApiServer implements AutoCloseable {
             return;
         }
         int[] prompt;
-        try {
-            prompt = chat ? chatPrompt(body) : engine.tokenizer().encode(Json.str(body, "prompt", ""));
-        } catch (RuntimeException e) {
-            res.send(400, "application/json", error(e.getMessage()));
-            return;
-        }
         SamplingParams params;
         try {
+            prompt = chat ? chatPrompt(body) : rawPrompt(body);
+            int ctx = engine.backend().contextLength();
+            if (prompt.length >= ctx) {
+                throw new RequestError(400, "prompt has " + prompt.length + " tokens, context is " + ctx
+                        + " (at least one token must be left for the completion)",
+                        "invalid_request_error", "context_length_exceeded");
+            }
             params = params(body);
+        } catch (RequestError e) {
+            res.send(e.status, "application/json", error(e));
+            return;
         } catch (RuntimeException e) {
             res.send(400, "application/json", error(e.getMessage()));
             return;
@@ -172,12 +198,45 @@ public final class ApiServer implements AutoCloseable {
                 "tokens_per_second", Math.round(s.tokPerSec() * 10) / 10.0);
     }
 
+    private int[] rawPrompt(Map<String, Object> body) {
+        String text = Json.str(body, "prompt", "");
+        checkPromptBytes(utf8Length(text));
+        return engine.tokenizer().encode(text);
+    }
+
+    /** Enforces the byte limit on the raw text so that oversized requests never reach the tokenizer. */
+    private void checkPromptBytes(long bytes) {
+        if (bytes > maxPromptBytes) {
+            throw new RequestError(400, "prompt is " + bytes + " bytes, the limit is " + maxPromptBytes,
+                    "invalid_request_error", "context_length_exceeded");
+        }
+    }
+
+    private static long utf8Length(String s) {
+        long n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) {
+                n += 1;
+            } else if (c < 0x800) {
+                n += 2;
+            } else if (Character.isHighSurrogate(c) && i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1))) {
+                n += 4;
+                i++;
+            } else {
+                n += 3;
+            }
+        }
+        return n;
+    }
+
     private int[] chatPrompt(Map<String, Object> body) {
         List<Object> msgs = Json.list(body, "messages");
         if (msgs == null || msgs.isEmpty()) {
             throw new IllegalArgumentException("'messages' is required");
         }
         List<ChatTemplate.Message> list = new ArrayList<>();
+        long bytes = 0;
         for (Object m : msgs) {
             String role = Json.str(m, "role", "user");
             Object content = m instanceof Map<?, ?> mm ? mm.get("content") : null;
@@ -195,6 +254,8 @@ public final class ApiServer implements AutoCloseable {
             } else {
                 text = "";
             }
+            bytes += utf8Length(role) + utf8Length(text);
+            checkPromptBytes(bytes);
             list.add(new ChatTemplate.Message(role, text));
         }
         boolean thinking = Json.bool(body, "enable_thinking", thinkingDefault);
@@ -231,7 +292,19 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private static String error(String msg) {
-        return Json.write(Json.obj("error", Json.obj("message", msg, "type", "invalid_request_error")));
+        return error(msg, "invalid_request_error", null);
+    }
+
+    private static String error(RequestError e) {
+        return error(e.getMessage(), e.type, e.code);
+    }
+
+    private static String error(String msg, String type, String code) {
+        Map<String, Object> e = Json.obj("message", msg, "type", type);
+        if (code != null) {
+            e.put("code", code);
+        }
+        return Json.write(Json.obj("error", e));
     }
 
     @Override

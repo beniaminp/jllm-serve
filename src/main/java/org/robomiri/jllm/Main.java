@@ -235,7 +235,8 @@ public final class Main {
                 s.getInt("server.read-timeout-ms"),
                 s.getInt("server.max-connections"),
                 s.getLong("server.max-body-bytes"));
-        ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"), http);
+        ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
+                s.getLong("engine.max-prompt-bytes"), http);
         try (engine; ApiServer server = new ApiServer(engine, model, host, port, options)) {
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();
