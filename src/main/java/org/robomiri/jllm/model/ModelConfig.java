@@ -109,14 +109,14 @@ public record ModelConfig(
     }
 
     /** {@code model_type} values this engine implements, with the architecture class each corresponds to. */
-    private static final Map<String, String> SUPPORTED = Map.of(
-            "llama", "LlamaForCausalLM",
-            "mistral", "MistralForCausalLM",
-            "qwen2", "Qwen2ForCausalLM",
-            "qwen3", "Qwen3ForCausalLM",
-            "qwen3_moe", "Qwen3MoeForCausalLM",
-            "glm", "GlmForCausalLM",
-            "glm4", "Glm4ForCausalLM");
+    private static final Map<String, String> SUPPORTED = Map.ofEntries(
+            Map.entry("llama", "LlamaForCausalLM"),
+            Map.entry("mistral", "MistralForCausalLM"),
+            Map.entry("qwen2", "Qwen2ForCausalLM"),
+            Map.entry("qwen3", "Qwen3ForCausalLM"),
+            Map.entry("qwen3_moe", "Qwen3MoeForCausalLM"),
+            Map.entry("glm", "GlmForCausalLM"),
+            Map.entry("glm4", "Glm4ForCausalLM"));
 
     public static ModelConfig load(Path dir) throws IOException {
         Map<String, Object> c;
