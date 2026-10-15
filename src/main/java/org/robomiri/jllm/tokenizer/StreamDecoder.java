@@ -11,6 +11,16 @@ public final class StreamDecoder {
 
     private byte[] buf = new byte[32];
     private int len;
+    /** Leading spaces still to be dropped (SentencePiece decoders such as Mistral's strip the first one). */
+    private int strip;
+
+    public StreamDecoder() {
+    }
+
+    /** A decoder that, like {@link Tokenizer#decode}, drops the leading space the tokenizer's decoder strips. */
+    public StreamDecoder(Tokenizer tokenizer) {
+        this.strip = tokenizer.decodeStripLeading();
+    }
 
     /** Appends token bytes and returns the text that is now complete (possibly empty). */
     public String push(byte[] bytes) {
@@ -19,6 +29,14 @@ public final class StreamDecoder {
         }
         System.arraycopy(bytes, 0, buf, len, bytes.length);
         len += bytes.length;
+        while (strip > 0 && len > 0) {
+            if (buf[0] == ' ') {
+                System.arraycopy(buf, 1, buf, 0, --len);
+                strip--;
+            } else {
+                strip = 0;
+            }
+        }
         int complete = completePrefix();
         if (complete == 0) {
             return "";

@@ -189,12 +189,21 @@ public final class Tokenizer {
                     : decodeSentencePiece(e.getKey());
         }
         if (byteLevel) {
+            // Some vocabularies (GPT-NeoX) lack the symbols of bytes that never occur in UTF-8 (0xC0, 0xF5..);
+            // like the reference, such bytes are dropped. A vocabulary with most of them missing is not byte-level.
+            int missing = -1;
+            int present = 0;
             for (int b = 0; b < 256; b++) {
                 Integer id = vocab.get(String.valueOf(byteToChar[b]));
+                byteCharIds[b] = id == null ? -1 : id;
                 if (id == null) {
-                    throw new IllegalArgumentException("vocab is missing byte-level symbol for byte " + b);
+                    missing = b;
+                } else {
+                    present++;
                 }
-                byteCharIds[b] = id;
+            }
+            if (present < 128) {
+                throw new IllegalArgumentException("vocab is missing byte-level symbol for byte " + missing);
             }
         }
         for (int b = 0; b < 256; b++) {
@@ -265,16 +274,22 @@ public final class Tokenizer {
      *                     ordinary characters (use this for untrusted content such as chat messages)
      */
     public int[] encode(String text, boolean allowSpecial) {
-        IntList out = new IntList(Math.max(16, text.length() / 3));
-        encodeInto(text, allowSpecial, true, out);
-        return out.toArray();
+        SequenceEncoder e = new SequenceEncoder();
+        if (allowSpecial) {
+            e.special(text);
+        } else {
+            e.text(text);
+        }
+        return e.toArray();
     }
 
     /**
-     * Incremental encoder for text assembled from trusted control strings and untrusted content, with exactly
-     * the result of encoding the concatenation in one go and treating only the control strings as special:
-     * the effects that cross piece boundaries (a Metaspace prefix only at offset 0, whitespace swallowed by an
-     * {@code rstrip} token such as Phi's {@code <|user|>}) are carried over.
+     * Incremental encoder for text assembled from trusted control strings and untrusted content. The result is
+     * exactly that of encoding the concatenation in one go while treating only the control strings as able to
+     * contain special tokens: ordinary text between two special tokens is tokenized as one run (so
+     * pre-tokenization and merges never see an artificial boundary between a control string and a message), a
+     * Metaspace prefix is applied only at offset 0, and the whitespace swallowed by {@code lstrip} / {@code rstrip}
+     * tokens (Phi's {@code <|user|>}) is swallowed across pieces too.
      */
     public SequenceEncoder newSequence() {
         return new SequenceEncoder();
@@ -282,40 +297,86 @@ public final class Tokenizer {
 
     public final class SequenceEncoder {
         private final IntList out = new IntList(64);
-        private boolean atStart = true;
+        private final StringBuilder run = new StringBuilder();
+        private boolean consumed; // anything (text or token) precedes the current run
+        private boolean runAtStart;
         private boolean pendingRstrip;
+
+        private SequenceEncoder() {
+        }
 
         /** Appends a control string; added tokens in it become their ids. */
         public SequenceEncoder special(String text) {
-            return append(text, true);
+            if (addedPattern == null) {
+                return text(text);
+            }
+            int len = text.length();
+            Matcher m = addedPattern.matcher(text);
+            int last = 0;
+            while (last <= len && m.find(last)) {
+                int id = addedTokens.get(m.group());
+                appendRun(text.substring(last, m.start()));
+                if (lstripIds.contains(id)) {
+                    int n = run.length();
+                    while (n > 0 && isWhitespace(run.charAt(n - 1))) {
+                        n--;
+                    }
+                    run.setLength(n);
+                }
+                flushRun();
+                out.add(id);
+                consumed = true;
+                int end = m.end();
+                boolean rs = rstripIds.contains(id);
+                if (rs) {
+                    while (end < len && isWhitespace(text.charAt(end))) {
+                        end++;
+                    }
+                }
+                pendingRstrip = rs && end == len;
+                last = end;
+            }
+            if (last < len) {
+                appendRun(text.substring(last));
+            }
+            return this;
         }
 
         /** Appends ordinary text; added tokens in it are NOT recognized. */
         public SequenceEncoder text(String text) {
-            return append(text, false);
-        }
-
-        private SequenceEncoder append(String text, boolean allowSpecial) {
-            if (pendingRstrip) {
-                int i = 0;
-                while (i < text.length() && isWhitespace(text.charAt(i))) {
-                    i++;
-                }
-                text = text.substring(i);
-                if (text.isEmpty()) {
-                    return this;
-                }
-            }
-            if (text.isEmpty()) {
-                return this;
-            }
-            pendingRstrip = encodeInto(text, allowSpecial, atStart, out);
-            atStart = false;
+            appendRun(text);
             return this;
         }
 
         public int[] toArray() {
+            flushRun();
             return out.toArray();
+        }
+
+        private void appendRun(String t) {
+            if (pendingRstrip) {
+                int i = 0;
+                while (i < t.length() && isWhitespace(t.charAt(i))) {
+                    i++;
+                }
+                t = t.substring(i);
+            }
+            if (t.isEmpty()) {
+                return;
+            }
+            pendingRstrip = false;
+            if (run.length() == 0) {
+                runAtStart = !consumed;
+            }
+            run.append(t);
+        }
+
+        private void flushRun() {
+            if (run.length() > 0) {
+                encodeOrdinary(run.toString(), out, runAtStart);
+                run.setLength(0);
+                consumed = true;
+            }
         }
     }
 
@@ -408,45 +469,6 @@ public final class Tokenizer {
         return id != null ? id : vocab.get(token);
     }
 
-    /** @return true when the text ended with an rstrip token, so that the next piece's leading whitespace is swallowed */
-    private boolean encodeInto(String text, boolean allowSpecial, boolean atStart, IntList out) {
-        if (addedPattern == null || !allowSpecial) {
-            encodeOrdinary(text, out, atStart);
-            return false;
-        }
-        int len = text.length();
-        Matcher m = addedPattern.matcher(text);
-        int last = 0;
-        boolean pending = false;
-        while (last <= len && m.find(last)) {
-            int id = addedTokens.get(m.group());
-            int start = m.start();
-            int end = m.end();
-            if (lstripIds.contains(id)) {
-                while (start > last && isWhitespace(text.charAt(start - 1))) {
-                    start--;
-                }
-            }
-            if (start > last) {
-                encodeOrdinary(text.substring(last, start), out, atStart && last == 0);
-            }
-            out.add(id);
-            boolean rs = rstripIds.contains(id);
-            if (rs) {
-                while (end < len && isWhitespace(text.charAt(end))) {
-                    end++;
-                }
-            }
-            pending = rs && end == len;
-            last = end;
-        }
-        if (last < len) {
-            encodeOrdinary(text.substring(last), out, atStart && last == 0);
-            pending = false;
-        }
-        return pending;
-    }
-
     /** Rust's {@code char::is_whitespace}, which decides what lstrip / rstrip tokens swallow. */
     private static boolean isWhitespace(char c) {
         if (c >= 0x1C && c <= 0x1F) {
@@ -488,10 +510,14 @@ public final class Tokenizer {
         }
         int n = bytes.length;
         int[] sym = new int[n];
+        int k = 0;
         for (int i = 0; i < n; i++) {
-            sym[i] = byteCharIds[bytes[i] & 0xFF];
+            int id = byteCharIds[bytes[i] & 0xFF];
+            if (id >= 0) {
+                sym[k++] = id;
+            }
         }
-        return mergeSymbols(sym, n);
+        return mergeSymbols(sym, k);
     }
 
     /**
