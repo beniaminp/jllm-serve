@@ -49,7 +49,7 @@ public final class SafeTensors implements AutoCloseable {
         public long numel() {
             long n = 1;
             for (long d : shape) {
-                n *= d;
+                n = Math.multiplyExact(n, d);
             }
             return n;
         }
@@ -136,7 +136,12 @@ public final class SafeTensors implements AutoCloseable {
                     throw new IOException(index + " has no weight_map");
                 }
                 TreeSet<String> shards = new TreeSet<>();
-                weightMap.values().forEach(v -> shards.add((String) v));
+                for (Object v : weightMap.values()) {
+                    if (!(v instanceof String s) || s.isBlank() || s.contains("/") || s.contains("\\") || s.contains("..")) {
+                        throw new IOException(index + ": invalid shard file name " + v);
+                    }
+                    shards.add(s);
+                }
                 files = shards.stream().map(path::resolve).toList();
             } else {
                 try (Stream<Path> s = Files.list(path)) {
@@ -177,7 +182,12 @@ public final class SafeTensors implements AutoCloseable {
             throw new IOException(file + ": invalid safetensors header length " + headerLen);
         }
         byte[] headerBytes = mapped.asSlice(8, headerLen).toArray(ValueLayout.JAVA_BYTE);
-        Map<String, Object> header = Json.parseObject(new String(headerBytes, StandardCharsets.UTF_8));
+        Map<String, Object> header;
+        try {
+            header = Json.parseObject(new String(headerBytes, StandardCharsets.UTF_8));
+        } catch (RuntimeException ex) {
+            throw new IOException(file + ": invalid safetensors header: " + ex.getMessage(), ex);
+        }
         long dataStart = 8 + headerLen;
         long dataSize = mapped.byteSize() - dataStart;
         for (Map.Entry<String, Object> e : header.entrySet()) {
@@ -189,21 +199,59 @@ public final class SafeTensors implements AutoCloseable {
                 continue;
             }
             Object info = e.getValue();
-            DType dtype = DType.valueOf(Json.str(info, "dtype", "?"));
+            if (!(info instanceof Map)) {
+                throw new IOException(file + ": malformed entry for " + name);
+            }
+            String dtypeName = Json.str(info, "dtype", null);
+            DType dtype = dtypeName == null ? null : parseDType(dtypeName);
+            if (dtype == null) {
+                throw new IOException(file + (dtypeName == null ? ": missing dtype for tensor " + name
+                        : ": unsupported dtype '" + dtypeName + "' for tensor " + name));
+            }
             List<Object> shapeList = Json.list(info, "shape");
             List<Object> offsets = Json.list(info, "data_offsets");
-            if (shapeList == null || offsets == null || offsets.size() != 2) {
+            if (shapeList == null || offsets == null || offsets.size() != 2
+                    || !shapeList.stream().allMatch(o -> o instanceof Number)
+                    || !offsets.stream().allMatch(o -> o instanceof Number)) {
                 throw new IOException(file + ": malformed entry for " + name);
             }
             long[] shape = shapeList.stream().mapToLong(o -> ((Number) o).longValue()).toArray();
             long begin = ((Number) offsets.get(0)).longValue();
             long end = ((Number) offsets.get(1)).longValue();
-            long numel = Arrays.stream(shape).reduce(1, (a, b) -> a * b);
-            if (begin < 0 || end > dataSize || end - begin != numel * dtype.bytes) {
-                throw new IOException(file + ": bad data_offsets for " + name);
+            long bytes;
+            try {
+                long numel = 1;
+                for (long d : shape) {
+                    if (d < 0) {
+                        throw new IOException(file + ": negative dimension in shape of " + name);
+                    }
+                    numel = Math.multiplyExact(numel, d);
+                }
+                bytes = Math.multiplyExact(numel, (long) dtype.bytes);
+            } catch (ArithmeticException ex) {
+                throw new IOException(file + ": shape of " + name + " overflows", ex);
             }
-            tensors.put(name, new Tensor(name, dtype, shape, mapped.asSlice(dataStart + begin, end - begin)));
+            if (begin < 0 || end < begin || end > dataSize || end - begin != bytes) {
+                throw new IOException(file + ": bad data_offsets for " + name + " (" + begin + ".." + end
+                        + ", expected " + bytes + " bytes, " + dataSize + " available)");
+            }
+            MemorySegment slice;
+            try {
+                slice = mapped.asSlice(dataStart + begin, end - begin);
+            } catch (RuntimeException ex) {
+                throw new IOException(file + ": cannot map tensor " + name, ex);
+            }
+            tensors.put(name, new Tensor(name, dtype, shape, slice));
         }
+    }
+
+    private static DType parseDType(String s) {
+        for (DType t : DType.values()) {
+            if (t.name().equals(s)) {
+                return t;
+            }
+        }
+        return null;
     }
 
     public Map<String, Tensor> tensors() {
