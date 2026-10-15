@@ -103,6 +103,9 @@ public final class ChatTemplate {
             case "gemma", "gemma2", "gemma3", "gemma3_text":
                 return GEMMA;
             case "phi3":
+                if (tok != null && tok.tokenId("<|im_sep|>") >= 0) {
+                    return PHI4_14B;
+                }
                 return tok != null && tok.isByteLevel() ? PHI4 : PHI3;
             case "phi4", "phi4_mini", "phimoe":
                 return PHI4;
@@ -282,6 +285,18 @@ public final class ChatTemplate {
         }
         o.ctl(gen ? "<|assistant|>" : "<|endoftext|>");
     }, "<|end|>", "<|endoftext|>");
+
+    /** phi-4 (14B, ChatML with a separator token): {@code <|im_start|>user<|im_sep|>...<|im_end|>}, no newlines. */
+    private static final Format PHI4_14B = new Family("phi4-chatml", (m, gen, think, o) -> {
+        for (Message msg : m) {
+            o.ctl("<|im_start|>" + role(msg, "system", "user", "assistant") + "<|im_sep|>");
+            o.txt(content(msg));
+            o.ctl("<|im_end|>");
+        }
+        if (gen) {
+            o.ctl("<|im_start|>assistant<|im_sep|>");
+        }
+    }, "<|im_end|>", "<|endoftext|>");
 
     /** GLM-Edge: {@code <|user|>\n...<|assistant|>\n...}; no BOS and no end-of-turn marker. */
     private static final Format GLM_EDGE = new Family("glm-edge", (m, gen, think, o) -> {
