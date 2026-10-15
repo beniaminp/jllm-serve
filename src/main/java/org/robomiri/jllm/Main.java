@@ -234,7 +234,8 @@ public final class Main {
         HttpServer.Options http = new HttpServer.Options(
                 s.getInt("server.read-timeout-ms"),
                 s.getInt("server.max-connections"),
-                s.getLong("server.max-body-bytes"));
+                s.getLong("server.max-body-bytes"),
+                s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         try (engine; ApiServer server = new ApiServer(engine, model, host, port, options)) {

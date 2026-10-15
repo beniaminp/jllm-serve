@@ -129,7 +129,12 @@ public final class ApiServer implements AutoCloseable {
         if (qm >= 0) {
             path = path.substring(0, qm);
         }
-        if (req.method.equals("OPTIONS")) {
+        if (req.method.equals("OPTIONS")) { // CORS preflight; the headers only make sense when an origin is configured
+            if (res.cors()) {
+                res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                        .header("Access-Control-Max-Age", "86400");
+            }
             res.send(204, "text/plain", "");
             return;
         }
@@ -148,6 +153,10 @@ public final class ApiServer implements AutoCloseable {
     private void completion(HttpServer.Request req, HttpServer.Response res, boolean chat) throws Exception {
         if (!req.method.equals("POST")) {
             res.send(405, "application/json", error("use POST"));
+            return;
+        }
+        if (!isJson(req.headers.get("content-type"))) {
+            res.send(415, "application/json", error("Content-Type must be application/json"));
             return;
         }
         Map<String, Object> body;
@@ -249,6 +258,16 @@ public final class ApiServer implements AutoCloseable {
             sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
                     "choices", List.of(Json.obj("index", 0, "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null))));
         }
+    }
+
+    /** {@code application/json}, case-insensitively and with optional parameters such as {@code ; charset=utf-8}. */
+    private static boolean isJson(String contentType) {
+        if (contentType == null) {
+            return false;
+        }
+        int semi = contentType.indexOf(';');
+        String media = (semi >= 0 ? contentType.substring(0, semi) : contentType).trim();
+        return media.equalsIgnoreCase("application/json");
     }
 
     private static void sse(HttpServer.Response res, Map<String, Object> event) throws IOException {

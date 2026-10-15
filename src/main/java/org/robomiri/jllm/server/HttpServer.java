@@ -32,16 +32,20 @@ public final class HttpServer implements AutoCloseable {
      * @param readTimeoutMs  socket read timeout while waiting for a request or its body, 0 = none
      * @param maxConnections simultaneous connections; further ones wait in the kernel accept queue
      * @param maxBodyBytes   largest accepted request body
+     * @param corsOrigin     value of {@code Access-Control-Allow-Origin}; null or empty = no CORS headers at all
      */
-    public record Options(int readTimeoutMs, int maxConnections, long maxBodyBytes) {
+    public record Options(int readTimeoutMs, int maxConnections, long maxBodyBytes, String corsOrigin) {
         public Options {
             if (readTimeoutMs < 0 || maxConnections < 1 || maxBodyBytes < 0) {
                 throw new IllegalArgumentException("invalid server options: " + this);
             }
+            if (corsOrigin != null && corsOrigin.isBlank()) {
+                corsOrigin = null;
+            }
         }
 
         public static Options defaults() {
-            return new Options(30_000, 256, 4L * 1024 * 1024);
+            return new Options(30_000, 256, 4L * 1024 * 1024, null);
         }
     }
 
@@ -67,13 +71,41 @@ public final class HttpServer implements AutoCloseable {
     public static final class Response {
         private final OutputStream out;
         private final boolean keepAlive;
+        private final String corsOrigin;
+        private final StringBuilder extraHeaders = new StringBuilder();
         private boolean started;
         private boolean streaming;
         private boolean ended;
 
-        Response(OutputStream out, boolean keepAlive) {
+        Response(OutputStream out, boolean keepAlive, String corsOrigin) {
             this.out = out;
             this.keepAlive = keepAlive;
+            this.corsOrigin = corsOrigin;
+        }
+
+        /** Adds a header to the response; must be called before {@link #send} or {@link #startStream}. */
+        public Response header(String name, String value) {
+            if (started) {
+                throw new IllegalStateException("response already started");
+            }
+            extraHeaders.append(name).append(": ").append(value).append("\r\n");
+            return this;
+        }
+
+        /** Whether CORS headers are configured (and therefore an OPTIONS preflight deserves an answer). */
+        public boolean cors() {
+            return corsOrigin != null;
+        }
+
+        private void commonHeaders(StringBuilder h) {
+            if (corsOrigin != null) {
+                h.append("Access-Control-Allow-Origin: ").append(corsOrigin).append("\r\n");
+                if (!corsOrigin.equals("*")) {
+                    h.append("Vary: Origin\r\n");
+                }
+            }
+            h.append(extraHeaders);
+            h.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n\r\n");
         }
 
         public void send(int status, String contentType, byte[] body) throws IOException {
@@ -86,8 +118,7 @@ public final class HttpServer implements AutoCloseable {
             h.append("HTTP/1.1 ").append(status).append(' ').append(reason(status)).append("\r\n");
             h.append("Content-Type: ").append(contentType).append("\r\n");
             h.append("Content-Length: ").append(body.length).append("\r\n");
-            h.append("Access-Control-Allow-Origin: *\r\n");
-            h.append("Connection: ").append(keepAlive ? "keep-alive" : "close").append("\r\n\r\n");
+            commonHeaders(h);
             out.write(h.toString().getBytes(StandardCharsets.ISO_8859_1));
             out.write(body);
             out.flush();
@@ -103,13 +134,13 @@ public final class HttpServer implements AutoCloseable {
             }
             started = true;
             streaming = true;
-            String h = "HTTP/1.1 " + status + " " + reason(status) + "\r\n"
-                    + "Content-Type: " + contentType + "\r\n"
-                    + "Transfer-Encoding: chunked\r\n"
-                    + "Cache-Control: no-cache\r\n"
-                    + "Access-Control-Allow-Origin: *\r\n"
-                    + "Connection: " + (keepAlive ? "keep-alive" : "close") + "\r\n\r\n";
-            out.write(h.getBytes(StandardCharsets.ISO_8859_1));
+            StringBuilder h = new StringBuilder();
+            h.append("HTTP/1.1 ").append(status).append(' ').append(reason(status)).append("\r\n");
+            h.append("Content-Type: ").append(contentType).append("\r\n");
+            h.append("Transfer-Encoding: chunked\r\n");
+            h.append("Cache-Control: no-cache\r\n");
+            commonHeaders(h);
+            out.write(h.toString().getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
         }
 
@@ -223,7 +254,7 @@ public final class HttpServer implements AutoCloseable {
                     return;
                 }
                 boolean keepAlive = !"close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
-                Response res = new Response(out, keepAlive);
+                Response res = new Response(out, keepAlive, options.corsOrigin());
                 try {
                     handler.handle(req, res);
                     if (!res.started()) {
@@ -359,6 +390,8 @@ public final class HttpServer implements AutoCloseable {
             case 400 -> "Bad Request";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 413 -> "Content Too Large";
+            case 415 -> "Unsupported Media Type";
             case 500 -> "Internal Server Error";
             case 503 -> "Service Unavailable";
             default -> "Status";
