@@ -900,3 +900,63 @@ kernel void add_bias(device float *v [[buffer(0)]],
     if (int(gid) >= p.total) return;
     v[gid] += b[int(gid) % p.width];
 }
+
+// ---------------------------------------------------------------------------------------------- GLM
+// norm_rope_il: GLM rotary embedding for the q rows and the k rows in one dispatch (like norm_rope, no qk-norm).
+// Only the first 2*rotHalf dims of each head rotate, and the pairs are adjacent: (2i, 2i+1) is rotated by table
+// entry i (rotate-half models pair i with i + headDim/2 instead). Grid: (nHeads + nKvHeads, ntok), rotHalf threads.
+
+struct RopeIlParams {
+    int headDim;
+    int qStride;
+    int kvStride;
+    int nHeads;
+    int pos0;
+    int rotHalf; // rotated dims / 2 = entries per position in the cos/sin tables
+};
+
+kernel void norm_rope_il(device float *q [[buffer(0)]],
+                         device float *k [[buffer(1)]],
+                         device const float *cosT [[buffer(2)]],
+                         device const float *sinT [[buffer(3)]],
+                         constant RopeIlParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort2 tid2 [[thread_position_in_threadgroup]]) {
+    const int tid = tid2.x;
+    const bool isQ = int(tgp.x) < p.nHeads;
+    const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
+    device float *h = isQ ? q + (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
+                          : k + (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    const int pos = p.pos0 + int(tgp.y);
+    const float a = h[2 * tid];
+    const float b = h[2 * tid + 1];
+    const float c = cosT[pos * p.rotHalf + tid];
+    const float s = sinT[pos * p.rotHalf + tid];
+    h[2 * tid] = a * c - b * s;
+    h[2 * tid + 1] = b * c + a * s;
+}
+
+// rmsnorm_add: out[row] += rmsnorm(y[row]) * w, for Glm4's post-attention / post-MLP norms applied to the
+// sub-layer output before the residual add. One threadgroup per row of length n.
+kernel void rmsnorm_add(device const float *y [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device float *out [[buffer(2)]],
+                        constant NormParams &p [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_position_in_threadgroup]],
+                        ushort tpg [[threads_per_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    device const float *yv = y + (ulong)tg * p.n;
+    device float *ov = out + (ulong)tg * p.n;
+    float ss = 0.0f;
+    for (int i = tid; i < p.n; i += tpg) {
+        float v = yv[i];
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float scale = rsqrt(ss / p.n + p.eps);
+    for (int i = tid; i < p.n; i += tpg) ov[i] += yv[i] * scale * w[i];
+}

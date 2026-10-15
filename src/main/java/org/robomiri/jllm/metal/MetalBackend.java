@@ -47,6 +47,8 @@ public final class MetalBackend implements Backend {
     private int pSwigluQ8Norm;
     private int pRmsnorm;
     private int pNormRope;
+    private int pNormRopeIl;  // GLM: interleaved partial rope, -1 otherwise
+    private int pRmsnormAdd;  // Glm4: post-norms, -1 otherwise
     private int pAttention;
     private int attnGroup; // query heads per attention threadgroup
     private int pAddBias;
@@ -91,6 +93,8 @@ public final class MetalBackend implements Backend {
     private static final class LayerBufs {
         Metal.Buffer attnNorm;
         Metal.Buffer ffnNorm;
+        Metal.Buffer postAttnNorm;
+        Metal.Buffer postMlpNorm;
         Metal.Buffer qNorm;
         Metal.Buffer kNorm;
         Metal.Buffer bq;
@@ -162,6 +166,8 @@ public final class MetalBackend implements Backend {
         pSwigluQ8Norm = metal.pipeline("matmul_swiglu_q8_norm");
         pRmsnorm = metal.pipeline("rmsnorm");
         pNormRope = metal.pipeline("norm_rope");
+        pNormRopeIl = c.ropeInterleaved() ? metal.pipeline("norm_rope_il") : -1;
+        pRmsnormAdd = c.postNorms() ? metal.pipeline("rmsnorm_add") : -1;
         // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
         // rows across the group (attnGroup > 1) measured no faster on Qwen3-0.6B (G=2) and slower on
         // Qwen3-30B-A3B (G=4/8: 20-22 tok/s vs 25 with G=1) because only kvHeads threadgroups run per decode
@@ -200,6 +206,8 @@ public final class MetalBackend implements Backend {
             LayerBufs b = new LayerBufs();
             b.attnNorm = upload(L.attnNorm);
             b.ffnNorm = upload(L.ffnNorm);
+            b.postAttnNorm = L.postAttnNorm != null ? upload(L.postAttnNorm) : null;
+            b.postMlpNorm = L.postMlpNorm != null ? upload(L.postMlpNorm) : null;
             b.qNorm = L.qNorm != null ? upload(L.qNorm) : null;
             b.kNorm = L.kNorm != null ? upload(L.kNorm) : null;
             b.bq = L.bq != null ? upload(L.bq) : null;
@@ -335,7 +343,13 @@ public final class MetalBackend implements Backend {
                     kvStore(l, n, pos);
                 }
                 attention(l, n, pos);
-                matmul(W.wo, L.wo, att, 0, x, 0, n, true, null);
+                if (L.postAttnNorm != null) {
+                    // Glm4: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
+                    matmul(W.wo, L.wo, att, 0, xb, 0, n, false, null);
+                    rmsnormAdd(xb, L.postAttnNorm, x, n, dim);
+                } else {
+                    matmul(W.wo, L.wo, att, 0, x, 0, n, true, null);
+                }
 
                 if (W.moe) {
                     rmsnorm(x, L.ffnNorm, xb, n, dim);
@@ -347,7 +361,12 @@ public final class MetalBackend implements Backend {
                         rmsnorm(x, L.ffnNorm, xb, n, dim);
                         swiglu(W, L, xb, null, n);
                     }
-                    matmul(W.wDown, L.wDown, hidden, 0, x, 0, n, true, null);
+                    if (L.postMlpNorm != null) {
+                        matmul(W.wDown, L.wDown, hidden, 0, xb, 0, n, false, null);
+                        rmsnormAdd(xb, L.postMlpNorm, x, n, dim);
+                    } else {
+                        matmul(W.wDown, L.wDown, hidden, 0, x, 0, n, true, null);
+                    }
                 }
             }
             if (logits != null) {
@@ -487,8 +506,38 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pRmsnorm, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
+    /** out[t] += rmsnorm(y[t]) * weight for n rows of the given width. */
+    private void rmsnormAdd(Metal.Buffer y, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
+        bind(0, y, 0);
+        bind(1, weight, 0);
+        bind(2, out, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.normEps());
+        metal.dispatch(pRmsnormAdd, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
+    }
+
+    /** GLM: interleaved-pair rotation of the first rotaryDim dims of every q and k head (no qk-norm). */
+    private void normRopeInterleaved(Metal.Buffer kDst, long kvOff, int n, int pos) {
+        bind(0, q, 0);
+        bind(1, kDst, kvOff);
+        bind(2, ropeCos, 0);
+        bind(3, ropeSin, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
+        params.setAtIndex(ValueLayout.JAVA_INT, 5, c.rotaryDim() / 2);
+        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 4, params, 24, c.heads() + c.kvHeads(), n, 1,
+                c.rotaryDim() / 2, 1, 1);
+    }
+
     /** QK-norm + RoPE for the q rows and the k rows just written at position pos, in one dispatch. */
     private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos) {
+        if (c.ropeInterleaved()) {
+            normRopeInterleaved(kDst, kvOff, n, pos);
+            return;
+        }
         boolean useNorm = L.qNorm != null && L.kNorm != null;
         bind(0, q, 0);
         bind(1, kDst, kvOff);
