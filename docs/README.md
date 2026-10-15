@@ -21,5 +21,6 @@ Suggested reading order:
 | 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers, what to improve next |
 | 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), stacked expert weights, converting a 61 GB checkpoint on a 32 GB laptop |
 | 14 | [Model families](14-model-families.md) | Llama 3.x, Mistral, Qwen2/2.5 and DeepSeek-R1 distills: bias, sliding window, llama3 RoPE scaling, tied embeddings, BOS, tensor names |
+| 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, why the prefix cache changes |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

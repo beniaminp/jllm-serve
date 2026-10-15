@@ -154,6 +154,8 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 ## 14.6 Not supported (yet)
 
+- State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
+  `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
 - `yarn`, `dynamic` RoPE scaling; `hidden_act` other than `silu` (e.g. Gemma); MLP bias; an
   `o_proj` bias; Llama 4, Mistral Nemo-style `head_dim` that is not a multiple of 32 on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
