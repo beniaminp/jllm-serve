@@ -197,7 +197,15 @@ public final class Json {
                         if (pos + 4 > s.length()) {
                             throw error("bad unicode escape");
                         }
-                        sb.append((char) Integer.parseInt(s, pos, pos + 4, 16));
+                        int cp = 0;
+                        for (int i = 0; i < 4; i++) {
+                            int h = Character.digit(s.charAt(pos + i), 16);
+                            if (h < 0) { // rejects signs and anything else Integer.parseInt would tolerate
+                                throw error("bad unicode escape");
+                            }
+                            cp = (cp << 4) | h;
+                        }
+                        sb.append((char) cp);
                         pos += 4;
                     }
                     default -> throw error("bad escape '\\" + e + "'");
@@ -206,28 +214,60 @@ public final class Json {
             throw error("unterminated string");
         }
 
+        /** RFC 8259 number grammar: {@code -? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?}. */
         Object number() {
             int start = pos;
-            boolean integral = true;
             if (peek() == '-') {
                 pos++;
             }
-            while (pos < s.length()) {
-                char c = s.charAt(pos);
-                if (c >= '0' && c <= '9') {
+            if (pos < s.length() && s.charAt(pos) == '0') {
+                pos++;
+                if (pos < s.length() && isDigit(s.charAt(pos))) {
+                    throw error("invalid number: leading zero");
+                }
+            } else if (digits() == 0) {
+                throw error("invalid number");
+            }
+            boolean integral = true;
+            if (pos < s.length() && s.charAt(pos) == '.') {
+                integral = false;
+                pos++;
+                if (digits() == 0) {
+                    throw error("invalid number: expected digits after '.'");
+                }
+            }
+            if (pos < s.length() && (s.charAt(pos) == 'e' || s.charAt(pos) == 'E')) {
+                integral = false;
+                pos++;
+                if (pos < s.length() && (s.charAt(pos) == '+' || s.charAt(pos) == '-')) {
                     pos++;
-                } else if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
-                    integral = false;
-                    pos++;
-                } else {
-                    break;
+                }
+                if (digits() == 0) {
+                    throw error("invalid number: expected exponent digits");
                 }
             }
             String num = s.substring(start, pos);
-            if (integral && num.length() < 19) {
-                return Long.parseLong(num);
+            if (integral) {
+                try {
+                    return Long.parseLong(num);
+                } catch (NumberFormatException outOfLongRange) {
+                    // fall through: too large for a long, keep it as a double
+                }
             }
             return Double.parseDouble(num);
+        }
+
+        private int digits() {
+            int n = 0;
+            while (pos < s.length() && isDigit(s.charAt(pos))) {
+                pos++;
+                n++;
+            }
+            return n;
+        }
+
+        private static boolean isDigit(char c) {
+            return c >= '0' && c <= '9';
         }
 
         char peek() {
@@ -302,7 +342,37 @@ public final class Json {
                 }
                 sb.append(']');
             }
-            default -> writeString(v.toString(), sb);
+            case long[] arr -> {
+                sb.append('[');
+                for (int i = 0; i < arr.length; i++) {
+                    if (i > 0) {
+                        sb.append(',');
+                    }
+                    sb.append(arr[i]);
+                }
+                sb.append(']');
+            }
+            case float[] arr -> {
+                sb.append('[');
+                for (int i = 0; i < arr.length; i++) {
+                    if (i > 0) {
+                        sb.append(',');
+                    }
+                    write(arr[i], sb); // boxed so NaN/Infinity become null like a scalar Float
+                }
+                sb.append(']');
+            }
+            case double[] arr -> {
+                sb.append('[');
+                for (int i = 0; i < arr.length; i++) {
+                    if (i > 0) {
+                        sb.append(',');
+                    }
+                    write(arr[i], sb);
+                }
+                sb.append(']');
+            }
+            default -> throw new IllegalArgumentException("cannot serialize " + v.getClass().getName() + " to JSON");
         }
     }
 

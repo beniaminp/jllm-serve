@@ -56,6 +56,43 @@ public final class SmokeTest {
         expectIae(() -> Json.parse("[".repeat(20_000)), "nesting deeper than", "json 20000 open brackets");
         expectIae(() -> Json.parseObject("{\"x\":" + "[".repeat(100_000) + "}"), "nesting deeper than",
                 "json 100000 open brackets inside an object");
+
+        // strict escapes and numbers
+        check(Json.parse("\"\\u00e9\\u0041\\uFFfd\"").equals("éA\ufffd"), "json unicode escape");
+        for (String bad : new String[]{"\"\\u-1ab\"", "\"\\u+1ab\"", "\"\\u00zz\"", "\"\\u12\"", "\"\\u 123\""}) {
+            expectIae(() -> Json.parse(bad), "bad unicode escape", "json rejects " + bad);
+        }
+        for (String bad : new String[]{"1.", "007", "-007", "1e5e5", "+1", "-", ".5", "1e", "1e+", "1.e5", "0x10",
+                "--1", "1-2", "1+2", "[1.]", "{\"a\":01}"}) {
+            expectIae(() -> Json.parse(bad), "JSON", "json rejects number " + bad);
+        }
+        check(Json.parse("0").equals(0L) && Json.parse("-0").equals(0L) && Json.parse("10").equals(10L)
+                && Json.parse("-12").equals(-12L), "json integers");
+        check(Json.parse("0.5").equals(0.5) && Json.parse("1e5").equals(1e5) && Json.parse("1E-2").equals(0.01)
+                && Json.parse("-2.5e+3").equals(-2500.0) && Json.parse("0e0").equals(0.0), "json floats");
+        check(Json.parse("1234567890123456789").equals(1234567890123456789L), "json 19-digit integer stays exact");
+        check(Json.parse("9223372036854775807").equals(Long.MAX_VALUE)
+                && Json.parse("-9223372036854775808").equals(Long.MIN_VALUE), "json long range stays exact");
+        check(Json.parse("9223372036854775808").equals(9223372036854775808.0)
+                && Json.parse("-9223372036854775809").equals(-9223372036854775809.0)
+                && Json.parse("123456789012345678901234567890") instanceof Double, "json beyond long range -> double");
+        check(Json.num(Json.parseObject("{\"seed\":1234567890123456789}"), "seed", -1) == 1234567890123456789L,
+                "json 19-digit seed round-trips");
+
+        // writer: primitive arrays, and no silent toString for anything else
+        check(Json.write(new int[]{1, -2}).equals("[1,-2]") && Json.write(new int[0]).equals("[]"), "json write int[]");
+        check(Json.write(new long[]{Long.MAX_VALUE, -1L}).equals("[9223372036854775807,-1]"), "json write long[]");
+        check(Json.write(new float[]{1.5f, 2f, Float.NaN}).equals("[1.5,2.0,null]"), "json write float[]");
+        check(Json.write(new double[]{0.25, Double.POSITIVE_INFINITY}).equals("[0.25,null]"), "json write double[]");
+        check(Json.write(Json.obj("f", new float[]{1f}, "l", new long[]{2L})).equals("{\"f\":[1.0],\"l\":[2]}"),
+                "json write arrays nested in objects");
+        record Point(int x, int y) {
+        }
+        expectIae(() -> Json.write(new Point(1, 2)), "cannot serialize", "json write rejects a record");
+        expectIae(() -> Json.write(new Object()), "cannot serialize", "json write rejects Object");
+        expectIae(() -> Json.write(new String[]{"a"}), "cannot serialize", "json write rejects String[]");
+        expectIae(() -> Json.write(Json.obj("k", java.nio.file.StandardOpenOption.READ)), "cannot serialize",
+                "json write rejects an enum nested in an object");
     }
 
     static void tokenizer(Path dir) throws Exception {
