@@ -49,17 +49,30 @@ public final class HttpServer implements AutoCloseable {
         }
     }
 
+    /** A malformed request: answered with the given status and the connection is closed. */
+    private static final class HttpError extends IOException {
+        final int status;
+
+        HttpError(int status, String message) {
+            super(message);
+            this.status = status;
+        }
+    }
+
     public static final class Request {
         public final String method;
         public final String path;
         public final Map<String, String> headers;
         public final byte[] body;
+        /** True for an HTTP/1.0 (or version-less) request: no keep-alive, no chunked responses. */
+        public final boolean http10;
 
-        Request(String method, String path, Map<String, String> headers, byte[] body) {
+        Request(String method, String path, Map<String, String> headers, byte[] body, boolean http10) {
             this.method = method;
             this.path = path;
             this.headers = headers;
             this.body = body;
+            this.http10 = http10;
         }
 
         public String bodyText() {
@@ -72,15 +85,19 @@ public final class HttpServer implements AutoCloseable {
         private final OutputStream out;
         private final boolean keepAlive;
         private final String corsOrigin;
+        private final boolean head;    // HEAD request: headers only, never a body
+        private final boolean chunked; // HTTP/1.1: streams use chunked encoding; HTTP/1.0: raw bytes until close
         private final StringBuilder extraHeaders = new StringBuilder();
         private boolean started;
         private boolean streaming;
         private boolean ended;
 
-        Response(OutputStream out, boolean keepAlive, String corsOrigin) {
+        Response(OutputStream out, boolean keepAlive, String corsOrigin, boolean head, boolean chunked) {
             this.out = out;
             this.keepAlive = keepAlive;
             this.corsOrigin = corsOrigin;
+            this.head = head;
+            this.chunked = chunked;
         }
 
         /** Adds a header to the response; must be called before {@link #send} or {@link #startStream}. */
@@ -120,7 +137,9 @@ public final class HttpServer implements AutoCloseable {
             h.append("Content-Length: ").append(body.length).append("\r\n");
             commonHeaders(h);
             out.write(h.toString().getBytes(StandardCharsets.ISO_8859_1));
-            out.write(body);
+            if (!head) {
+                out.write(body);
+            }
             out.flush();
         }
 
@@ -137,7 +156,9 @@ public final class HttpServer implements AutoCloseable {
             StringBuilder h = new StringBuilder();
             h.append("HTTP/1.1 ").append(status).append(' ').append(reason(status)).append("\r\n");
             h.append("Content-Type: ").append(contentType).append("\r\n");
-            h.append("Transfer-Encoding: chunked\r\n");
+            if (chunked) {
+                h.append("Transfer-Encoding: chunked\r\n");
+            }
             h.append("Cache-Control: no-cache\r\n");
             commonHeaders(h);
             out.write(h.toString().getBytes(StandardCharsets.ISO_8859_1));
@@ -146,20 +167,24 @@ public final class HttpServer implements AutoCloseable {
 
         public void write(String chunk) throws IOException {
             byte[] b = chunk.getBytes(StandardCharsets.UTF_8);
-            if (b.length == 0) {
+            if (b.length == 0 || head) {
                 return;
             }
-            out.write((Integer.toHexString(b.length) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
-            out.write(b);
-            out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            if (chunked) {
+                out.write((Integer.toHexString(b.length) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                out.write(b);
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            } else {
+                out.write(b);
+            }
             out.flush();
         }
 
         public void end() throws IOException {
-            if (streaming && !ended) {
+            if (streaming && !ended && chunked && !head) {
                 out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
-                out.flush();
             }
+            out.flush();
             ended = true;
         }
 
@@ -249,12 +274,19 @@ public final class HttpServer implements AutoCloseable {
             InputStream in = new BufferedInputStream(s.getInputStream());
             OutputStream out = new BufferedOutputStream(s.getOutputStream(), 1 << 16);
             while (!closed) {
-                Request req = readRequest(in, out);
+                Request req;
+                try {
+                    req = readRequest(in, out);
+                } catch (HttpError e) {
+                    new Response(out, false, options.corsOrigin(), false, false)
+                            .send(e.status, "application/json", errorJson("invalid_request_error", e.getMessage()));
+                    return;
+                }
                 if (req == null) {
                     return;
                 }
-                boolean keepAlive = !"close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
-                Response res = new Response(out, keepAlive, options.corsOrigin());
+                boolean keepAlive = !req.http10 && !"close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
+                Response res = new Response(out, keepAlive, options.corsOrigin(), req.method.equals("HEAD"), !req.http10);
                 try {
                     handler.handle(req, res);
                     if (!res.started()) {
@@ -295,8 +327,12 @@ public final class HttpServer implements AutoCloseable {
             }
         }
         String[] parts = requestLine.split(" ");
-        if (parts.length < 2) {
-            throw new IOException("bad request line");
+        if (parts.length < 2 || parts.length > 3 || parts[0].isEmpty() || parts[1].isEmpty()) {
+            throw new HttpError(400, "malformed request line");
+        }
+        boolean http10 = parts.length < 3 || !parts[2].equals("HTTP/1.1");
+        if (parts.length == 3 && !parts[2].startsWith("HTTP/1.")) {
+            throw new HttpError(400, "unsupported HTTP version");
         }
         Map<String, String> headers = new LinkedHashMap<>();
         int total = 0;
@@ -304,7 +340,7 @@ public final class HttpServer implements AutoCloseable {
         while ((line = readLine(in)) != null && !line.isEmpty()) {
             total += line.length();
             if (total > MAX_HEADER) {
-                throw new IOException("headers too large");
+                throw new HttpError(431, "request headers too large");
             }
             int c = line.indexOf(':');
             if (c > 0) {
@@ -316,17 +352,34 @@ public final class HttpServer implements AutoCloseable {
         }
         byte[] body = new byte[0];
         String cl = headers.get("content-length");
-        boolean chunked = "chunked".equalsIgnoreCase(headers.get("transfer-encoding"));
+        String te = headers.get("transfer-encoding");
+        if (cl != null && te != null) { // ambiguous framing (request smuggling vector): refuse it
+            throw new HttpError(400, "both Content-Length and Transfer-Encoding present");
+        }
+        boolean chunked = te != null;
+        if (chunked && !te.equalsIgnoreCase("chunked")) {
+            throw new HttpError(400, "unsupported Transfer-Encoding");
+        }
+        long len = 0;
+        if (cl != null) {
+            try {
+                len = Long.parseLong(cl.trim());
+            } catch (NumberFormatException e) {
+                throw new HttpError(400, "malformed Content-Length");
+            }
+            if (len < 0) {
+                throw new HttpError(400, "malformed Content-Length");
+            }
+            if (len > options.maxBodyBytes()) {
+                throw new HttpError(413, "request body larger than " + options.maxBodyBytes() + " bytes");
+            }
+        }
         if ((cl != null || chunked) && "100-continue".equalsIgnoreCase(headers.get("expect"))) {
             // the client holds the body back until told to go ahead (curl does this for bodies > 1 KB)
             out.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
         }
         if (cl != null) {
-            long len = Long.parseLong(cl.trim());
-            if (len < 0 || len > options.maxBodyBytes()) {
-                throw new IOException("body too large");
-            }
             body = in.readNBytes((int) len);
             if (body.length != len) {
                 throw new EOFException();
@@ -334,7 +387,7 @@ public final class HttpServer implements AutoCloseable {
         } else if (chunked) {
             body = readChunked(in);
         }
-        return new Request(parts[0], parts[1], headers, body);
+        return new Request(parts[0], parts[1], headers, body, http10);
     }
 
     private byte[] readChunked(InputStream in) throws IOException {
@@ -345,7 +398,15 @@ public final class HttpServer implements AutoCloseable {
                 throw new EOFException();
             }
             int semi = sizeLine.indexOf(';');
-            int size = Integer.parseInt((semi >= 0 ? sizeLine.substring(0, semi) : sizeLine).trim(), 16);
+            long size;
+            try {
+                size = Long.parseLong((semi >= 0 ? sizeLine.substring(0, semi) : sizeLine).trim(), 16);
+            } catch (NumberFormatException e) {
+                throw new HttpError(400, "malformed chunk size");
+            }
+            if (size < 0) {
+                throw new HttpError(400, "malformed chunk size");
+            }
             if (size == 0) {
                 while ((sizeLine = readLine(in)) != null && !sizeLine.isEmpty()) {
                     // trailers ignored
@@ -353,14 +414,16 @@ public final class HttpServer implements AutoCloseable {
                 return bos.toByteArray();
             }
             if (bos.size() + size > options.maxBodyBytes()) {
-                throw new IOException("body too large");
+                throw new HttpError(413, "request body larger than " + options.maxBodyBytes() + " bytes");
             }
-            byte[] chunk = in.readNBytes(size);
+            byte[] chunk = in.readNBytes((int) size);
             if (chunk.length != size) {
                 throw new EOFException();
             }
             bos.write(chunk);
-            readLine(in); // CRLF after chunk
+            if (!"".equals(readLine(in))) { // CRLF after chunk
+                throw new HttpError(400, "malformed chunk");
+            }
         }
     }
 
@@ -383,6 +446,21 @@ public final class HttpServer implements AutoCloseable {
         return sb.isEmpty() ? null : sb.toString();
     }
 
+    private static String errorJson(String type, String message) {
+        StringBuilder sb = new StringBuilder("{\"error\":{\"message\":\"");
+        for (int i = 0; i < message.length(); i++) {
+            char c = message.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\').append(c);
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.append("\",\"type\":\"").append(type).append("\"}}").toString();
+    }
+
     private static String reason(int status) {
         return switch (status) {
             case 200 -> "OK";
@@ -392,6 +470,7 @@ public final class HttpServer implements AutoCloseable {
             case 405 -> "Method Not Allowed";
             case 413 -> "Content Too Large";
             case 415 -> "Unsupported Media Type";
+            case 431 -> "Request Header Fields Too Large";
             case 500 -> "Internal Server Error";
             case 503 -> "Service Unavailable";
             default -> "Status";
