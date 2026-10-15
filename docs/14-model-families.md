@@ -1,6 +1,6 @@
-# 14. Model families (Llama, Mistral, Qwen2, DeepSeek-R1 distills)
+# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, DeepSeek-R1 distills)
 
-Code: `model/ModelConfig`, `model/Rope`, `model/ModelConverter` (biases), `cpu/CpuBackend.attention/addBias`,
+Code: `model/ModelConfig`, `model/Rope`, `model/ModelConverter` (biases, fused Phi-3 tensors), `cpu/CpuBackend.attention/addBias`,
 `kernels.metal` (`attention`, `add_bias`), `Main.eosIds`, `engine/Engine.generate` (BOS)
 
 All these models are the same decoder-only transformer that [chapter 5](05-transformer-math.md) describes:
@@ -18,9 +18,10 @@ switches, all read from `config.json` into `ModelConfig`. Qwen3 is the reference
 | `qwen3_moe` | `Qwen3MoeForCausalLM` | Qwen3-30B-A3B (chapter 12) | |
 | `glm` | `GlmForCausalLM` | GLM-Edge-1.5B/4B-Chat, glm-4-9b-chat-hf (section 14.8) | `THUDM/GLM-Edge-1.5B-Chat`, `THUDM/glm-4-9b-chat-hf` |
 | `glm4` | `Glm4ForCausalLM` | GLM-4-9B/32B-0414, GLM-Z1 (section 14.8) | `THUDM/GLM-4-9B-0414`, `THUDM/GLM-Z1-9B-0414` |
+| `phi3` | `Phi3ForCausalLM` | Phi-3-mini, Phi-3.5-mini, Phi-4-mini, phi-4 (14B), see 14.9 | `microsoft/Phi-3-mini-4k-instruct`, `Phi-3.5-mini-instruct`, `Phi-4-mini-instruct`, `phi-4` |
 
 A different `model_type`, a `hidden_act` other than `silu`, `mlp_bias: true`, or a `rope_scaling` type other than
-`default`/`linear`/`llama3` (e.g. `yarn`, `longrope`) is rejected at load time with a message naming the field.
+`default`/`linear`/`llama3`/`longrope` (e.g. `yarn`) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
 quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 256
@@ -150,7 +151,7 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 ## 14.6 Not supported (yet)
 
-- `yarn`, `longrope`, `dynamic` RoPE scaling; `hidden_act` other than `silu` (e.g. Gemma, Phi); MLP bias; an
+- `yarn`, `dynamic` RoPE scaling; `hidden_act` other than `silu` (e.g. Gemma); MLP bias; an
   `o_proj` bias; Llama 4, Mistral Nemo-style `head_dim` that is not a multiple of 32 on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
   vocabularies with byte fallback. That is the tokenizer's job (chapter 4), not the model's.
@@ -170,6 +171,11 @@ and a window on layers ≥ 2), converts each to q4 and q8, loads it, generates 8
 prompt on the CPU and on Metal, and requires equal token ids and final logits that agree to 1e-3 relative.
 Random weights give gibberish, but the computation is deterministic, so any disagreement is a bug in a backend.
 `mvn test` additionally checks the RoPE rule and the config parsing of each family.
+
+The three Phi-3 models (fused weights, longrope with the long factors, partial rotary, sliding window; the same with
+the short factors and tied embeddings; headDim 64 MHA with plain RoPE) are also checked by `ArchSmoke` for the
+fused split: each Q8_0 row of the converted `q_proj`/`k_proj`/`v_proj`/`gate_up` equals the matching row range of
+the checkpoint's `qkv_proj` / `gate_up_proj` within the quantization step.
 
 ## 14.8 GLM (`glm`, `glm4`)
 
@@ -256,3 +262,117 @@ Tensors per layer (header of shard 1, bf16): `input_layernorm.weight` `[d]`, `se
 four norms); CPU and Metal must agree on tokens and logits for q4 and q8. `SmokeTest.glmRope` checks the rotation
 on a hand-computed 6-element head and the configs above. A pure-Python float32 re-implementation of the
 transformers forward pass on the same tiny checkpoints gives the same first generated token for all three.
+
+## 14.9 Phi-3 / Phi-3.5 / Phi-4 (`model_type: phi3`)
+
+Same decoder as Llama (RMSNorm, GQA, SwiGLU, no biases, no QK-norm); four things differ. Verified against
+`modeling_phi3.py` and `_compute_longrope_parameters` in transformers (main) and the Hub files of the four
+repositories below.
+
+### Fused projections
+
+The checkpoint stores `self_attn.qkv_proj.weight` `[(heads + 2·kv_heads)·head_dim, d]` with the rows ordered
+q (`heads·head_dim`), k (`kv_heads·head_dim`), v (`kv_heads·head_dim`) (`qkv[..., :q]`, `qkv[..., q:q+kv]`,
+`qkv[..., q+kv:]` in the model code), and `mlp.gate_up_proj.weight` `[2·f, d]` with gate first, then up
+(`up_states.chunk(2, dim=-1)` → `gate, up`). There is no `q_proj`/`k_proj`/`v_proj`/`gate_proj`/`up_proj`.
+
+The converter splits qkv by rows into the usual `q_proj`/`k_proj`/`v_proj` cache tensors (so the backends see a
+Llama layer) and quantizes `gate_up_proj` directly as `mlp.gate_up`, which is already the stacked gate/up layout.
+No other Phi tensor needs special handling: `input_layernorm`, `post_attention_layernorm`, `o_proj`, `down_proj`,
+`model.norm`, `model.embed_tokens` and (untied models) `lm_head` have the Llama names.
+
+### LongRoPE (`rope_scaling.type` `longrope`, legacy `su`)
+
+`rope_scaling` carries `short_factor` and `long_factor`, one divisor per rotary pair (`rotary_dim/2` entries), and
+`original_max_position_embeddings` (in `rope_scaling` or at the top level of `config.json`). With `rot` the number
+of rotated dimensions and `ext` the chosen factor array:
+
+```
+inv_freq[i] = 1 / (ext[i] · theta^(2i/rot))                       i = 0 … rot/2 − 1
+ext         = long_factor   if context > original_max_position_embeddings, else short_factor
+factor      = rope_scaling.factor, or max_position_embeddings / original_max_position_embeddings
+attn        = attention_factor                         if given
+              1                                        if factor <= 1
+              sqrt(1 + ln(factor) / ln(original_max_position_embeddings))   otherwise
+cos, sin   *= attn      (applied to the table, so q·k scores are scaled by attn²)
+```
+
+transformers chooses `ext` per forward pass from the sequence length. This engine builds one table per backend,
+so it chooses once from `--ctx`: contexts up to the original length (4096 for Phi-3.5 / Phi-4-mini) use the short
+factors, longer ones use the long factors for *all* positions. That differs from transformers only for a
+conversation shorter than the original length inside a long `--ctx` (the long factors were trained for long inputs;
+the short ones are slightly better for short text), so use `--ctx 4096` when you do not need more. The attention
+factor is always applied, as in transformers.
+
+Worked example, Phi-3.5-mini (`rot = 96`, `theta = 10000`, `max_position_embeddings = 131072`, `original = 4096`):
+`factor = 131072 / 4096 = 32`, `attn = sqrt(1 + ln 32 / ln 4096) = sqrt(1 + 3.4657/8.3178) = sqrt(17/12) = 1.19024`.
+
+| pair | `theta^(-2i/96)` | `short_factor` | `long_factor` | `inv_freq` short | `inv_freq` long |
+|---|---|---|---|---|---|
+| 0 | 1.0 | 1.0 | 1.08 | 1.0 | 0.9259 |
+| 47 | 1.2115e-4 | 2.84 | 64.84 | 4.266e-5 | 1.868e-6 |
+
+Phi-4-mini uses the same rule with 48 pairs of `rot = 96` (see below) and long factors up to 47.77.
+`SmokeTest.longRope` checks the formula against hand-computed values (`sqrt(17/12)`, short and long arrays, the table
+entries), `SmokeTest.phi3Configs` parses the real config shapes.
+
+### Partial rotary (Phi-4-mini)
+
+`partial_rotary_factor: 0.75` with `head_dim = 128` rotates only the first `rot = int(128 · 0.75) = 96` dimensions
+of every query and key head, with rotate-half *inside that prefix* (dimension `i` pairs with `i + 48`); dimensions
+96 … 127 pass through unchanged. The inverse frequencies use `rot` in the exponent (`theta^(2i/rot)`), not
+`head_dim`. `ModelConfig.partialRotaryFactor` / `rotaryDim()` are shared with GLM (14.8); Phi keeps
+`ropeInterleaved()` false. `Rope` builds `[ctx × rot/2]` tables, `CpuBackend.normRope` pairs `(i, i + rot/2)`, and
+Metal reuses the GLM `norm_rope_il` dispatch (q and k heads together) with its `rotateHalf` parameter set, so the
+pairs are `(i, i + rot/2)` instead of `(2i, 2i+1)`. Partial rotation together with a QK-norm is rejected on Metal (no
+Phi model has one).
+
+### Other config keys
+
+| Key | Rule |
+|---|---|
+| `sliding_window` | all layers. Phi-3-mini-4k: 2047 (a real window, since the context is 4096); Phi-3.5 and Phi-4-mini: 262144 (never reached); phi-4: `null` |
+| `head_dim` | absent, so `hidden_size / num_attention_heads` (Phi-3-mini and 3.5: 96; Phi-4-mini and phi-4: 128). 96 is a multiple of 32, so Metal works |
+| `tie_word_embeddings` | true for Phi-4-mini (no `lm_head.weight`), false for the others |
+| `attention_bias`, `mlp_bias` | false, and rejected if true |
+| `embd_pdrop`, `resid_pdrop`, `attention_dropout`, `initializer_range`, `full_attn_mod`, `interpolate_factor`, `lm_head_bias` | ignored (dropout is inference-off; the last three only appear in Phi-4-mini and are 1 / 1 / false) |
+| `rms_norm_eps`, `rope_theta`, `hidden_act` | as for Llama (`silu` only); phi-4 has `rope_theta` 250000 |
+
+### BOS, EOS and templates
+
+| | Phi-3-mini, Phi-3.5 | Phi-4-mini | phi-4 (14B) |
+|---|---|---|---|
+| tokenizer | SentencePiece-style BPE, 32064 ids | GPT-4o-style byte-level, 200064 ids | cl100k-style byte-level, 100352 ids |
+| `bos_token_id` | 1 (`<s>`) | 199999 (`<\|endoftext\|>`) | 100257 (`<\|endoftext\|>`) |
+| config `eos_token_id` | 32000 | 199999 | 100265 (`<\|im_end\|>`) |
+| `generation_config.json` eos | 32000, 32001, 32007 (`<\|end\|>`) | 200020 (`<\|end\|>`), 199999 | 100257, 100265 |
+| chat template | `<\|user\|>\n…<\|end\|>\n<\|assistant\|>\n` | `<\|user\|>…<\|end\|><\|assistant\|>` | `<\|im_start\|>user<\|im_sep\|>…<\|im_end\|>` |
+| BOS prepended by this engine | no | no | no |
+
+None of the published tokenizers adds a BOS: Phi-3's `tokenizer_config.json` has `add_bos_token: false`, its
+`tokenizer.json` post-processor is empty and its chat template has no `<s>`; Phi-4-mini and phi-4 use
+`<|endoftext|>` as `bos_token_id` but never prepend it. So `ModelConfig.promptBosId` is -1 for `phi3` (a template
+or prompt that contains the token itself is of course left alone). The stop ids are the union of config,
+`generation_config.json` and the template's `<|end|>` / `<|im_end|>` / `<|endoftext|>`. `ChatTemplate` picks the
+phi-4 ChatML format when the vocabulary has `<|im_sep|>` (phi-4 14B), the Phi-4-mini format for other byte-level
+vocabularies, and the Phi-3 one otherwise.
+
+### Verified on the Hub
+
+Headers read with a ranged request (first 2 MB of shard 1, no weights downloaded), all BF16, layer 0:
+
+| Repository | d | heads/kv | head_dim | f | V | layers | `qkv_proj` | `gate_up_proj` | `lm_head` |
+|---|---|---|---|---|---|---|---|---|---|
+| `microsoft/Phi-3-mini-4k-instruct` | 3072 | 32/32 | 96 | 8192 | 32064 | 32 | 9216 × 3072 | 16384 × 3072 | present |
+| `microsoft/Phi-3.5-mini-instruct` | 3072 | 32/32 | 96 | 8192 | 32064 | 32 | 9216 × 3072 | 16384 × 3072 | present |
+| `microsoft/Phi-4-mini-instruct` | 3072 | 24/8 | 128 | 8192 | 200064 | 32 | 5120 × 3072 | 16384 × 3072 | absent (tied) |
+| `microsoft/phi-4` | 5120 | 40/10 | 128 | 17920 | 100352 | 40 | 7680 × 5120 | 35840 × 5120 | present |
+
+(`9216 = 3072 + 2·3072`, `5120 = 3072 + 2·1024`, `7680 = 5120 + 2·1280`.) Per layer the only other tensors are
+`input_layernorm.weight`, `post_attention_layernorm.weight`, `self_attn.o_proj.weight` and `mlp.down_proj.weight`.
+
+### Not supported for Phi
+
+- Phi-3-small, Phi-3-vision, Phi-3.5-MoE (`phimoe`), Phi-4-multimodal: other `model_type`s / extra towers.
+- Per-request switching between short and long RoPE factors (see above).
+- Phi-1 / Phi-2 (`model_type: phi`: LayerNorm, GELU, parallel attention) are a different architecture.
