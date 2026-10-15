@@ -67,10 +67,18 @@ public final class ModelWeights implements AutoCloseable {
             String p = "model.layers." + l + ".";
             Layer L = new Layer();
             L.attnNorm = file.floats(p + "input_layernorm.weight");
-            L.ffnNorm = file.floats(p + "post_attention_layernorm.weight");
-            if (cfg.postNorms()) {
-                L.postAttnNorm = file.floats(p + "post_self_attn_layernorm.weight");
-                L.postMlpNorm = file.floats(p + "post_mlp_layernorm.weight");
+            if (cfg.isGemma()) {
+                // Gemma: post_attention_layernorm is applied to the attention output; the MLP input norm is
+                // pre_feedforward_layernorm. All four hold 1 + w (folded in by the converter).
+                L.ffnNorm = file.floats(p + "pre_feedforward_layernorm.weight");
+                L.postAttnNorm = file.floats(p + "post_attention_layernorm.weight");
+                L.postMlpNorm = file.floats(p + "post_feedforward_layernorm.weight");
+            } else {
+                L.ffnNorm = file.floats(p + "post_attention_layernorm.weight");
+                if (cfg.postNorms()) {
+                    L.postAttnNorm = file.floats(p + "post_self_attn_layernorm.weight");
+                    L.postMlpNorm = file.floats(p + "post_mlp_layernorm.weight");
+                }
             }
             L.qNorm = file.has(p + "self_attn.q_norm.weight") ? file.floats(p + "self_attn.q_norm.weight") : null;
             L.kNorm = file.has(p + "self_attn.k_norm.weight") ? file.floats(p + "self_attn.k_norm.weight") : null;
@@ -135,6 +143,8 @@ public final class ModelWeights implements AutoCloseable {
                 && L.wo.rows == c.dim() && L.wo.cols == c.qDim()
                 && (c.attentionBias() == (L.bq != null))
                 && (L.bq == null || (L.bq.length == c.qDim() && L.bk.length == c.kvDim() && L.bv.length == c.kvDim()))
+                && (c.postNorms() == (L.postAttnNorm != null) && c.postNorms() == (L.postMlpNorm != null))
+                && (L.postAttnNorm == null || (L.postAttnNorm.length == c.dim() && L.postMlpNorm.length == c.dim()))
                 && (c.qkNorm() == (L.qNorm != null) && c.qkNorm() == (L.kNorm != null))
                 && (L.qNorm == null || L.qNorm.length == c.headDim())
                 && (L.kNorm == null || L.kNorm.length == c.headDim());

@@ -40,6 +40,14 @@ public final class Rope {
     }
 
     /**
+     * The table for layers with {@link ModelConfig#usesLocalRope local RoPE} (Gemma 3 sliding layers): base
+     * {@code rope_local_base_freq}, never scaled. Other layers use {@link #of}.
+     */
+    public static Rope local(ModelConfig c, int ctx) {
+        return new Rope(c.headDim(), c.gemma().localRopeTheta(), ctx, null);
+    }
+
+    /**
      * LongRoPE's multiplier on cos and sin (so on q.k it appears squared). transformers'
      * {@code _compute_longrope_parameters}: {@code attention_factor} if given, else 1 for {@code factor <= 1}, else
      * {@code sqrt(1 + ln(factor) / ln(original_max_position_embeddings))}. 1 for every other scaling type.

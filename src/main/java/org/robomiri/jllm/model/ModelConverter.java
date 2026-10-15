@@ -43,6 +43,8 @@ public final class ModelConverter {
     private final QType quant;
     private final ShardProvider provider;
     private final Map<String, String> shardOf;
+    /** Canonical tensor name -> name in the checkpoint, only where they differ (multimodal Gemma prefixes). */
+    private final Map<String, String> checkpointName = new HashMap<>();
     private final List<Unit> units;
     /** Per shard: how many planned tensor reads are still outstanding. */
     private final Map<String, Integer> remaining = new HashMap<>();
@@ -160,7 +162,7 @@ public final class ModelConverter {
             fin.add(LM_HEAD);
         }
         units.add(new Unit("final", List.copyOf(fin), (w, a) -> {
-            w.putFloats(FINAL_NORM, tensor(FINAL_NORM).toFloatArray());
+            w.putFloats(FINAL_NORM, normGain(tensor(FINAL_NORM)));
             if (hasLmHead()) {
                 w.put(LM_HEAD, quantize(a, QType.Q8_0, tensor(LM_HEAD)));
             }
@@ -179,6 +181,7 @@ public final class ModelConverter {
     private List<String> layerNorms(String p) {
         List<String> out = new ArrayList<>(4);
         for (String n : new String[]{"input_layernorm.weight", "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
                 "self_attn.q_norm.weight", "self_attn.k_norm.weight",
                 "post_self_attn_layernorm.weight", "post_mlp_layernorm.weight"}) {
             if (shardOf.containsKey(p + n)) {
@@ -214,7 +217,7 @@ public final class ModelConverter {
 
     private void convertLayer(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
         for (String n : layerNorms(p)) {
-            w.putFloats(n, tensor(n).toFloatArray());
+            w.putFloats(n, normGain(tensor(n)));
         }
         for (String n : biasNames(p)) {
             w.putFloats(n, tensor(n).toFloatArray());
@@ -304,6 +307,12 @@ public final class ModelConverter {
 
     // ------------------------------------------------------------------ helpers
 
+    /** Norm weights as f32. Gemma applies {@code 1 + w}, so the 1 is added here (exact in f32, as in transformers). */
+    private float[] normGain(SafeTensors.Tensor t) {
+        float[] v = t.toFloatArray();
+        return cfg.normPlusOne() ? GemmaMath.foldNormGain(v) : v;
+    }
+
     private static QTensor quantize(Arena a, QType type, SafeTensors.Tensor t) {
         int rows = t.dim(0);
         int cols = t.dim(1);
@@ -346,7 +355,37 @@ public final class ModelConverter {
             st = SafeTensors.open(provider.ensure(ShardProvider.checkName(dir, shard)));
             open.put(shard, st);
         }
-        return st.get(name);
+        return st.get(checkpointName.getOrDefault(name, name));
+    }
+
+    /**
+     * Maps the prefixes of multimodal checkpoints onto the plain names: {@code language_model.model.X}
+     * (Gemma 3 4B+ as released) and {@code model.language_model.X} (transformers >= 4.52) become {@code model.X}.
+     * Vision / projector tensors keep their names and are never read.
+     */
+    private static String canonicalName(String n) {
+        if (n.startsWith("language_model.model.")) {
+            return "model." + n.substring("language_model.model.".length());
+        }
+        if (n.startsWith("model.language_model.")) {
+            return "model." + n.substring("model.language_model.".length());
+        }
+        if (n.startsWith("language_model.lm_head.")) {
+            return "lm_head." + n.substring("language_model.lm_head.".length());
+        }
+        return n;
+    }
+
+    private Map<String, String> canonical(Map<String, String> raw) {
+        Map<String, String> m = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : raw.entrySet()) {
+            String c = canonicalName(e.getKey());
+            if (!c.equals(e.getKey())) {
+                checkpointName.put(c, e.getKey());
+            }
+            m.put(c, e.getValue());
+        }
+        return m;
     }
 
     /** Marks a planned tensor read consumed; closes and releases its shard once nothing else in it is needed. */
@@ -393,7 +432,7 @@ public final class ModelConverter {
                 }
                 m.put(e.getKey(), ShardProvider.checkName(dir, shard));
             }
-            return m;
+            return canonical(m);
         }
         List<Path> files;
         try (Stream<Path> s = Files.list(dir)) {
@@ -410,6 +449,6 @@ public final class ModelConverter {
                 }
             }
         }
-        return m;
+        return canonical(m);
     }
 }
