@@ -157,7 +157,8 @@ public final class Main {
                         ? new MambaCpuBackend(weights, ctx, batch,
                                 threads > 0 ? threads : Runtime.getRuntime().availableProcessors())
                         : new CpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype);
+                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
+                                s.getBool("backend.cpu.int8-activations"));
                 case "metal" -> weights.cfg.isMamba()
                         ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                         : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
