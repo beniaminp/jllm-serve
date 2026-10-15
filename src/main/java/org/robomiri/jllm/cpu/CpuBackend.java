@@ -3,6 +3,7 @@ package org.robomiri.jllm.cpu;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.GemmaMath;
+import org.robomiri.jllm.model.DeepSeekRouter;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
@@ -21,21 +22,23 @@ public final class CpuBackend implements Backend {
     private final ModelConfig c;
     private final int ctx;
     private final int maxBatch;
-    private final ThreadPool pool;
+    final ThreadPool pool;
     private final Rope rope;
     /** Gemma 3 sliding layers use another RoPE base; same object as {@link #rope} for every other model. */
     private final Rope ropeLocal;
 
     private final KvCache kv;
+    /** DeepSeek multi-head latent attention (own cache); null for every other family. */
+    private final MlaCpu mla;
     // k/v of the current chunk, [maxBatch, kvDim]: projected, normalized and rotated here, then stored
     private final float[] kStage;
     private final float[] vStage;
 
     // activations, [maxBatch, width] row-major
     private final float[] x;
-    private final float[] xb;
-    private final float[] q;
-    private final float[] att;
+    final float[] xb;
+    final float[] q;
+    final float[] att;
     private final float[] gateUp;
     private final float[] hidden;
 
@@ -45,8 +48,9 @@ public final class CpuBackend implements Backend {
     private final float[] routeWeight;
     private final float[] moeGateUp;
     private final float[] moeHidden;
+    private final float[] dsScratch;
 
-    private final ThreadLocal<float[]> scratch;
+    final ThreadLocal<float[]> scratch;
 
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads) {
         this(w, ctx, maxBatch, threads, KvDtype.F32);
@@ -60,29 +64,40 @@ public final class CpuBackend implements Backend {
         this.pool = new ThreadPool(threads);
         this.rope = Rope.of(c, ctx);
         this.ropeLocal = anyLocalRope(c) ? Rope.local(c, ctx) : rope;
-        kv = KvCache.create(kvDtype, c, ctx);
+        if (c.deepseek() != null) {
+            if (kvDtype != KvDtype.F32) {
+                throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
+            }
+            kv = null;
+            mla = new MlaCpu(this, c, rope, ctx, maxBatch);
+        } else {
+            kv = KvCache.create(kvDtype, c, ctx);
+            mla = null;
+        }
         kStage = new float[maxBatch * c.kvDim()];
         vStage = new float[maxBatch * c.kvDim()];
         x = new float[maxBatch * c.dim()];
         xb = new float[maxBatch * c.dim()];
         q = new float[maxBatch * c.qDim()];
-        att = new float[maxBatch * c.qDim()];
-        gateUp = new float[maxBatch * 2 * c.hiddenDim()];
-        hidden = new float[maxBatch * c.hiddenDim()];
+        att = new float[maxBatch * (c.deepseek() == null ? c.qDim() : Math.max(c.qDim(), c.heads() * c.deepseek().vHeadDim()))];
+        gateUp = new float[maxBatch * 2 * c.maxMlpDim()];
+        hidden = new float[maxBatch * c.maxMlpDim()];
         if (c.isMoe()) {
             routerLogits = new float[c.numExperts()];
             assign = new int[c.expertsPerTok()];
             routeWeight = new float[c.expertsPerTok()];
             moeGateUp = new float[c.expertsPerTok() * 2 * c.moeDim()];
             moeHidden = new float[c.expertsPerTok() * c.moeDim()];
+            dsScratch = new float[c.numExperts()];
         } else {
+            dsScratch = null;
             routerLogits = null;
             assign = null;
             routeWeight = null;
             moeGateUp = null;
             moeHidden = null;
         }
-        int scratchLen = Math.max(ctx, 4 * Math.max(c.hiddenDim(), Math.max(c.dim(), c.qDim())));
+        int scratchLen = Math.max(ctx, 4 * Math.max(c.maxMlpDim(), Math.max(c.dim(), c.qDim())));
         scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
     }
 
@@ -128,19 +143,23 @@ public final class CpuBackend implements Backend {
         for (int l = 0; l < c.layers(); l++) {
             ModelWeights.Layer L = w.layers[l];
             rmsnorm(x, xb, L.attnNorm, n, dim);
-            matmul(L.wq, xb, q, 0, n, false);
-            matmul(L.wk, xb, kStage, 0, n, false);
-            matmul(L.wv, xb, vStage, 0, n, false);
-            if (L.bq != null) {
-                addBias(q, 0, L.bq, n);
-                addBias(kStage, 0, L.bk, n);
-                addBias(vStage, 0, L.bv, n);
+            if (mla != null) {
+                mla.run(l, L, n, pos);
+            } else {
+                matmul(L.wq, xb, q, 0, n, false);
+                matmul(L.wk, xb, kStage, 0, n, false);
+                matmul(L.wv, xb, vStage, 0, n, false);
+                if (L.bq != null) {
+                    addBias(q, 0, L.bq, n);
+                    addBias(kStage, 0, L.bk, n);
+                    addBias(vStage, 0, L.bv, n);
+                }
+                Rope r = c.usesLocalRope(l) ? ropeLocal : rope;
+                normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos, r);
+                normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos, r);
+                kv.store(l, pos, kStage, vStage, n);
+                attention(l, n, pos);
             }
-            Rope r = c.usesLocalRope(l) ? ropeLocal : rope;
-            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos, r);
-            normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos, r);
-            kv.store(l, pos, kStage, vStage, n);
-            attention(l, n, pos);
             if (L.postAttnNorm != null) {
                 // Glm4: x += rmsnorm(o_proj(attention))
                 matmul(L.wo, att, xb, 0, n, false);
@@ -152,6 +171,13 @@ public final class CpuBackend implements Backend {
             rmsnorm(x, xb, L.ffnNorm, n, dim);
             if (L.moe) {
                 moe(L, n);
+                if (L.mla != null && L.mla.sharedGateUp != null) {
+                    // DeepSeek shared experts: a dense SwiGLU of every token, added to the routed output
+                    int sh = c.deepseek().nShared() * c.moeDim();
+                    matmul(L.mla.sharedGateUp, xb, gateUp, 0, n, false);
+                    siluMul(n, sh);
+                    matmul(L.mla.sharedDown, hidden, x, 0, n, true);
+                }
             } else {
                 matmul(L.wGateUp, xb, gateUp, 0, n, false);
                 if (c.isGemma()) {
@@ -184,7 +210,7 @@ public final class CpuBackend implements Backend {
 
     // ------------------------------------------------------------------ layers
 
-    private void rmsnorm(float[] in, float[] out, float[] weight, int n, int width) {
+    void rmsnorm(float[] in, float[] out, float[] weight, int n, int width) {
         for (int t = 0; t < n; t++) {
             rmsnormRow(in, t * width, out, t * width, weight, width);
         }
@@ -199,7 +225,7 @@ public final class CpuBackend implements Backend {
         }
     }
 
-    private void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
+    void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
         float ss = VectorKernels.sumSquares(in, io, width);
         float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
         for (int i = 0; i < width; i++) {
@@ -211,7 +237,7 @@ public final class CpuBackend implements Backend {
      * out[t, r] (+)= dot(W[r, :], in[t, :]) for t in [0, n). Decode streams quantized rows straight into FMAs;
      * prefill dequantizes four rows at a time and reuses them for every token in the batch.
      */
-    private void matmul(QTensor wt, float[] in, float[] out, int outOff, int n, boolean acc) {
+    void matmul(QTensor wt, float[] in, float[] out, int outOff, int n, boolean acc) {
         int rows = wt.rows;
         int cols = wt.cols;
         if (n == 1) {
@@ -349,7 +375,11 @@ public final class CpuBackend implements Backend {
         int gu = 2 * m;
         for (int t = 0; t < n; t++) {
             int xo = t * dim;
-            route(L.router, xo, e, topK);
+            if (L.mla != null) {
+                routeDeepseek(L, xo, e, topK);
+            } else {
+                route(L.router, xo, e, topK);
+            }
             // all selected experts' gate/up rows in one parallel loop
             pool.forRange(topK * gu, 32, (i0, i1) -> {
                 for (int i = i0; i < i1; i++) {
@@ -376,6 +406,16 @@ public final class CpuBackend implements Backend {
                 }
             });
         }
+    }
+
+    /** DeepSeek router for one token (see {@link DeepSeekRouter}): fills assign[] / routeWeight[]. */
+    private void routeDeepseek(ModelWeights.Layer L, int xo, int e, int topK) {
+        int dim = c.dim();
+        for (int i = 0; i < e; i++) {
+            routerLogits[i] = VectorKernels.dot(L.router, i * dim, xb, xo, dim);
+        }
+        DeepSeekRouter.select(routerLogits, L.mla.routerBias, c.deepseek(), topK, c.normTopK(), assign, routeWeight,
+                dsScratch);
     }
 
     /** Router for one token: fills assign[] / routeWeight[] (same rule as transformers' Qwen3MoeSparseMoeBlock). */
@@ -428,7 +468,10 @@ public final class CpuBackend implements Backend {
     }
 
     private void siluMul(int n) {
-        int hdim = c.hiddenDim();
+        siluMul(n, c.hiddenDim());
+    }
+
+    private void siluMul(int n, int hdim) {
         for (int t = 0; t < n; t++) {
             int gi = t * 2 * hdim;
             int oi = t * hdim;
