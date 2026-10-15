@@ -69,6 +69,10 @@ public final class CpuBackend implements Backend {
         this.pool = new ThreadPool(threads);
         this.rope = Rope.of(c, ctx);
         this.ropeLocal = anyLocalRope(c) ? Rope.local(c, ctx) : rope;
+        if (ctx > c.maxPositions()) {
+            System.err.println("warning: context " + ctx + " exceeds the model's max_position_embeddings ("
+                    + c.maxPositions() + "); RoPE positions beyond the training length are extrapolated");
+        }
         if (c.deepseek() != null) {
             if (kvDtype != KvDtype.F32) {
                 throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
