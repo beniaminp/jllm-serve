@@ -113,13 +113,32 @@ faster per token than decode. Attention and the scalar `exp`/`silu` loops become
 | quantized weights (mmap'd `jllm-q4_0.bin`, off-heap) | 452 MB | ≈ 19.7 GB |
 | KV cache, f32, per 1 024 tokens of `--ctx` | 28 layers × 1024 × 1024 × 8 B = 235 MB | 48 × 1024 × 512 × 8 B = 201 MB |
 | KV cache at `--ctx 4096` | 940 MB | 805 MB |
+| KV cache with `backend.kv-dtype=f16` (2 B per element) | 117 MB per 1 024 tokens; **470 MB** at `--ctx 4096` | 101 MB per 1 024 tokens; **403 MB** at `--ctx 4096` |
 | attention score scratch (Metal) `batch × heads × ctx × 4 B` | 64 × 16 × 4096 × 4 = 17 MB | 64 × 32 × ctx × 4 B |
 | activations, logits, MoE slot buffers | < 50 MB | < 100 MB |
 | JVM + classes | ≈ 100 MB | ≈ 100 MB |
 
 The KV cache scales linearly with `--ctx`: `--ctx 1024` is enough for short chats and cuts it by 4×; `--ctx 16384`
 on the 0.6B model needs 3.8 GB. On the CPU backend the cache lives on the Java heap (`float[][]`), so it must
-fit under `-Xmx`; on Metal it is in shared buffers outside the heap.
+fit under `-Xmx`; on Metal it is in shared buffers outside the heap. `backend.kv-dtype=f16` halves it on both
+backends ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)): measured on the 0.6B model at
+`--ctx 4096`, the CPU backend fails to start with `-Xmx1g` at f32 (`OutOfMemoryError` allocating the cache) and
+runs with `-Xmx1g` at f16 (`-Xmx640m` still starts but spends its time in GC; `-Xmx1280m` is the practical floor
+for f32).
+
+Speed with the f16 cache (M1 Pro, Qwen3-0.6B Q4_0, greedy; the machine was shared with other jobs, so treat
+differences under ~10 % as noise):
+
+| | f32 | f16 | outputs |
+|---|---|---|---|
+| Metal `bench`, `--ctx 4096`, 413-token prompt | 342–345 tok/s prefill, 65–73 tok/s decode | 347–349 tok/s prefill, 64–74 tok/s decode | identical |
+| Metal `run`, 623-token prompt, 119 generated | 55.6 tok/s decode | 63.0 tok/s decode | identical |
+| CPU `bench`, `--ctx 4096` (heavily contended run) | 25 tok/s prefill, 2.2 tok/s decode | 25 tok/s prefill, 2.4 tok/s decode | identical |
+
+At a few hundred tokens of context attention is a small share of a decode step on both backends
+([8.7](08-metal-backend.md#87-measured-numbers-and-where-the-time-goes), [7.9](07-cpu-backend.md#79-measured-numbers-and-the-bottleneck)),
+so halving its traffic is within noise there; the option is about memory and about long contexts. The f32 path
+is unchanged: same dispatches on Metal, one extra `arraycopy` per layer on the CPU, identical tokens.
 
 ---
 
@@ -130,7 +149,7 @@ fit under `-Xmx`; on Metal it is in shared buffers outside the heap.
 | `--add-modules jdk.incubator.vector` | the Vector API is an incubator module; without it `VectorKernels` does not load |
 | `--enable-native-access=ALL-UNNAMED` | silences the warning for FFM restricted methods (`Linker`, `SymbolLookup`) |
 | `-XX:+UseParallelGC` | almost nothing is allocated during generation; ParallelGC has the lowest overhead |
-| `-Xmx4g` | room for the CPU KV cache at `--ctx 4096`; raise it for larger contexts on CPU |
+| `-Xmx4g` | room for the CPU KV cache at `--ctx 4096`; raise it for larger contexts on CPU, or halve the cache with `backend.kv-dtype=f16` |
 
 JIT warm-up matters: the first ~50 tokens run before C2 has compiled the kernels; `bench` discards a warm-up
 round for that reason.
@@ -143,7 +162,7 @@ round for that reason.
 |---|---|---|---|
 | 1 | **Kernel fusion on Metal**: fold `rmsnorm` into the following matmul, launch q/k/v as one dispatch, fuse `silu_mul` into the gate/up matmul epilogue | ~340 → ~150 dispatches per token; decode toward 120–150 tok/s on the 0.6B model | `kernels.metal`, `MetalBackend.forward` |
 | 2 | **Int8 activations on CPU**: quantize the input vector to Q8 per block and use integer multiply-adds (16 lanes per 128-bit register instead of 4 floats) | 2–4× CPU decode; this is llama.cpp's core trick | `VectorKernels.dotQ4/dotQ8`, a `quantizeActivation` helper in `CpuBackend` |
-| 3 | **f16 KV cache** | halves attention traffic and cache memory; needed for long contexts | `CpuBackend` (`short[]` + `Float.float16ToFloat`), `MetalBackend` buffers, `attention` kernel reading `half` |
+| 3 | **f16 KV cache** — done: `backend.kv-dtype=f16` ([07 §7.12](07-cpu-backend.md#712-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; decode speed unchanged to slightly better at 400–600-token contexts, greedy outputs unchanged on the test prompts | `cpu/KvCache`, `kv_store_half`/`attention_h` in `kernels.metal` |
 | 4 | **Flash-style attention**: compute scores and the weighted value sum in one pass with an online softmax, never writing `scores` to device memory; one threadgroup per head *and* query tile | removes the score round trip; large win at long context | `attention` kernel, `CpuBackend.attention` |
 | 5 | **Continuous batching**: several sequences per forward pass so each weight read serves many tokens | turns decode from memory-bound toward compute-bound: near-linear throughput scaling with concurrent users | `Backend.forward` (batch of sequences), per-sequence KV cache slots, `Engine` scheduler, `ApiServer` lock |
 | 6 | **Expert-grouped MoE prefill**: gather the tokens routed to each expert and run one matmul per expert over them | MoE prefill from "stream all experts, no reuse" to dense-like reuse; 5–10× prefill on 30B-A3B | `moe_up`/`moe_down` kernels (+ gather/scatter), `CpuBackend.moe` |
@@ -159,4 +178,4 @@ round for that reason.
 - Today's Metal decode reaches ~17 % of the bandwidth roof; the gap is dispatch overhead and latency-bound small
   matmuls, which kernel fusion attacks first.
 - The CPU path is instruction-bound at 128-bit SIMD; integer dot products are the fix.
-- Memory is dominated by the weights and the f32 KV cache (`--ctx` is the knob).
+- Memory is dominated by the weights and the KV cache (`--ctx` and `backend.kv-dtype` are the knobs).

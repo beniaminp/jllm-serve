@@ -743,8 +743,14 @@ number 1000 is one 1-token forward pass plus 1000 dot products per head per laye
 
 **Where the cache lives.** CPU: `float[layers][ctx × kvDim]` on the Java heap (so `-Xmx` must cover it).
 Metal: one shared `MTLBuffer` per layer for K and one for V, written by the `k`/`v` matmul dispatches and read
-by the `attention` kernel. Both are plain f32; storing them as f16 would halve the traffic and is a planned
-optimization ([11](11-performance.md)).
+by the `attention` kernel. Both are plain f32 by default. `backend.kv-dtype=f16` stores the cache as IEEE
+half floats instead (CPU: `short[]`, Metal: `half` buffers): K and V are still projected, normalized and rotated
+in f32, rounded **once** (round-to-nearest-even) when they are stored, and expanded back to f32 inside
+attention, so the arithmetic is unchanged and only the stored values lose precision (~3 significant decimal
+digits instead of ~7). That halves the cache — 470 MB instead of 940 MB at `ctx = 4096` for the 0.6B model —
+and the bytes attention reads per token; greedy outputs on the test prompts are unchanged
+([07 §7.12](07-cpu-backend.md#712-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
+[11 §11.3](11-performance.md#113-memory-footprint)).
 
 **The prefix cache on top** ([10](10-engine-and-server.md)): the engine remembers which token ids currently
 occupy the cache. When the next request shares a prefix (a chat history), only the new tokens are prefilled.

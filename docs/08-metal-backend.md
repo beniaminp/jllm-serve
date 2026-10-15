@@ -273,7 +273,9 @@ Grid sizes are *threadgroups*; `×` = threads per threadgroup. `n` = tokens in t
 
 Notice steps 3, 4 and 6: the K and V projections write *directly into the KV cache* at the byte offset of
 position `pos` (`bind(3, keyCache[l], pos·kvDim·4)`), and `norm_rope` for K runs in place on those cache rows.
-There is no separate "store into cache" step.
+There is no separate "store into cache" step. (With `backend.kv-dtype=f16` steps 3, 4 and 6 target two f32
+staging buffers instead and a thirteenth dispatch, `kv_store_half`, rounds the rows into the `half` caches —
+[8.9](#89-the-f16-kv-cache).)
 
 ### Dispatch list per MoE layer (Qwen3-30B-A3B: dim 2048, qDim 4096, kvDim 512, 128 experts, top-8, moeDim 768)
 
@@ -323,7 +325,7 @@ buffer and silently produces garbage, which is why the CPU backend exists as a r
 | buffer | size (0.6B, ctx 4096, batch 64) | size (30B, ctx 2048) |
 |---|---|---|
 | weights (wrapped, zero copy) | 452 MB | ≈ 19.7 GB |
-| `keyCache` + `valCache`, per layer `ctx·kvDim·4` | 28 × 2 × 16 MB = 939 MB | 48 × 2 × 4 MB = 403 MB |
+| `keyCache` + `valCache`, per layer `ctx·kvDim·4` (`·2` with `backend.kv-dtype=f16`) | 28 × 2 × 16 MB = 939 MB (470 MB f16) | 48 × 2 × 4 MB = 403 MB (201 MB f16) |
 | `x`, `xb` (`batch·dim·4`) | 256 KB each | 512 KB |
 | `q`, `att` (`batch·qDim·4`) | 512 KB each | 1 MB |
 | `gateUp`, `hidden` | 1.5 MB, 768 KB | — (dense MLP unused) |
@@ -561,8 +563,8 @@ clearly slower. So the ~13 ms per token go elsewhere:
    every chosen expert's weights once *per token*. Sorting slots by expert and running a `TOK_TILE`-style loop
    over the tokens that share an expert gives the reuse the dense matmul already has.
 3. **Flash-style attention** — compute scores, the running max/sum and the value accumulation in one pass with
-   online softmax, never writing `scores` to device memory; and store the KV cache as `half` (f16) to halve
-   its traffic.
+   online softmax, never writing `scores` to device memory. (The `half` KV cache that halves the K/V traffic
+   exists already: `backend.kv-dtype=f16`, [8.9](#89-the-f16-kv-cache).)
 4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wk`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
 5. **Simdgroup matrix instructions** (`simdgroup_multiply_accumulate` on 8×8 tiles) for prefill matmuls, which
@@ -584,3 +586,33 @@ clearly slower. So the ~13 ms per token go elsewhere:
   serial command buffer and waits once.
 - Decode on the M1 Pro is currently limited by dispatch count and small grids rather than by bandwidth, which
   is exactly what the listed optimizations attack.
+
+---
+
+## 8.9 The f16 KV cache
+
+`backend.kv-dtype=f16` allocates `keyCache`/`valCache` as `half` buffers (`ctx·kvDim·2` bytes per layer, 470 MB
+instead of 939 MB for the 0.6B model at `ctx = 4096`) and changes three things in the dense layer; everything
+else, including every f32 kernel, is untouched. The kernels live in the "f16 KV cache" section at the end of
+`kernels.metal`.
+
+| step | f32 (default) | f16 |
+|---|---|---|
+| 3, 4 `matmul` Wk, Wv | into `keyCache[l]`/`valCache[l]` at offset `pos·kvDim·4` | into f32 staging buffers `kStage`/`vStage` (`batch·kvDim·4` bytes) at offset 0 |
+| 6 `norm_rope` (k) | in place on the cache rows | in place on `kStage` |
+| new `kv_store_half` | — | one thread per element: `kc[pos·kvDim + i] = half(kStage[i])`, same for V; grid `ceil(n·kvDim / 256)` |
+| 7 attention | `attention` | `attention_h` — the same kernel templated on the cache element type (`attention_kv<half>`) |
+
+So a decode step records 13 dispatches per dense layer instead of 12 (366 instead of 338 for the 0.6B model);
+`kv_store_half` moves 8 KB per layer and costs a few microseconds. The matmul and `norm_rope` kernels did not
+need `half` variants because the staging buffers are f32: K is rounded exactly once, after RoPE, with Metal's
+default round-to-nearest-even `half()` conversion — the same rounding as Java's `Float.floatToFloat16` on the
+CPU path, which is why the two backends' f16 outputs are identical.
+
+`attention_kv<KV>` differs from `attention` only in the pointer types of `kc`/`vc` and in the loads, which widen
+each `half` to `float` before the multiply (`qr[i] * float(kv[lane + i * 32])`). Scores, softmax and the
+value accumulation stay f32, so the f16 variant changes what is *read*, not what is computed: per cached
+position and lane it loads 4 × 2 bytes of K and 4 × 2 bytes of V instead of 4 × 4 each. On the M1 Pro this is
+worth a few percent of decode at a few hundred tokens of context (the attention kernel is not the dominant
+cost there — [8.7](#87-measured-numbers-and-where-the-time-goes)); the point of the option is the memory and
+the scaling at long contexts. Measurements are in [11 §11.3](11-performance.md#113-memory-footprint).

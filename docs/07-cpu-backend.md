@@ -92,7 +92,8 @@ All buffers are row-major `[token][feature]`, so token `t`'s vector starts at `t
 once; a forward pass allocates nothing (important for the thread pool and for avoiding GC pauses).
 
 The KV cache lives on the Java heap, which is why the launcher passes `-Xmx4g`. Weights are off-heap
-(`MemorySegment`) and do not count against it.
+(`MemorySegment`) and do not count against it. With `backend.kv-dtype=f16` the cache is `short[]` and half the
+size ([7.12](#712-the-f16-kv-cache-kvcache)).
 
 ---
 
@@ -103,9 +104,10 @@ for t < n:  embed.dequantizeRow(tokens[off+t], x, t*dim)              // 5.2
 for each layer L:
     rmsnorm(x, xb, L.attnNorm, n, dim)                                  // 5.3
     matmul(L.wq, xb, q, 0, n, false)                                    // 5.4
-    matmul(L.wk, xb, keyCache[l], pos*kvDim, n, false)                  //     written straight into the cache
-    matmul(L.wv, xb, valCache[l], pos*kvDim, n, false)
-    normRope(q, ...);  normRope(keyCache[l], pos*kvDim, ...)            // 5.5
+    matmul(L.wk, xb, kStage, 0, n, false)                               //     k/v of the chunk, [n, kvDim] staging
+    matmul(L.wv, xb, vStage, 0, n, false)
+    normRope(q, ...);  normRope(kStage, 0, ...)                         // 5.5
+    kv.store(l, pos, kStage, vStage, n)                                 //     into the KvCache: f32 copy or f16 rounding (7.12)
     attention(l, n, pos)                                                // 5.6
     matmul(L.wo, att, x, 0, n, true)                                    // 5.7  acc=true: x += ...
     rmsnorm(x, xb, L.ffnNorm, n, dim)
@@ -113,8 +115,9 @@ for each layer L:
 if logits != null: rmsnormRow(last token); matmul(lmHead, xb, logits, 0, 1, false)             // 5.10
 ```
 
-Two things to notice. `k` and `v` are produced *directly into* the KV cache at `pos × kvDim` — no copy. And
-the `acc` flag turns a matmul into "add to the destination", which implements the residual connections without
+Two things to notice. `k` and `v` are produced into two small staging buffers (`[batch × kvDim]`), normalized
+and rotated there, and only then stored into the `KvCache` at row `pos` — an `arraycopy` for f32, a rounding pass
+for f16 ([7.12](#712-the-f16-kv-cache-kvcache)). And the `acc` flag turns a matmul into "add to the destination", which implements the residual connections without
 a separate addition pass.
 
 ---
@@ -351,8 +354,8 @@ In order of expected payoff on this CPU:
    byte→float conversions. This is what llama.cpp's `vec_dot_q4_0_q8_0` does and is worth 2–4×.
 2. **Vectorized exp** in attention and SiLU (a polynomial approximation on `FloatVector`), removing the scalar
    `Math.exp` that dominates at long contexts.
-3. **f16 KV cache**: halves the 940 MB and the attention read traffic; convert with `Float.float16ToFloat`
-   lanes on load.
+3. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.12](#712-the-f16-kv-cache-kvcache)). What remains is
+   a fused f16 dot product that converts inside the SIMD loop instead of expanding each row to scratch first.
 4. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
    activation and the number of pool jobs.
 5. **Batch decode across requests** (continuous batching) so the weight read serves several tokens.
@@ -371,3 +374,51 @@ In order of expected payoff on this CPU:
   closed by a volatile re-check.
 - On 128-bit NEON the kernel is instruction-bound (byte→float conversions), not memory-bound; integer dot
   products are the fix.
+
+---
+
+## 7.12 The f16 KV cache (`KvCache`)
+
+`backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation. The storage lives in `cpu/KvCache.java`
+with two implementations; `CpuBackend` only knows `kv.store(...)` and, for f32, the raw arrays:
+
+| | `KvCache.F32` (default) | `KvCache.F16` |
+|---|---|---|
+| storage per layer | `float[ctx × kvDim]` for K and for V | `short[ctx × kvDim]` for K and for V |
+| 0.6B at `ctx = 4096` | 940 MB | **470 MB** |
+| `store` | `System.arraycopy` of the staged rows | `Float.floatToFloat16` per value (round-to-nearest-even) |
+| attention | `CpuBackend.attention` on the arrays, unchanged | `KvCache.F16.attention` |
+
+**Why staging buffers.** The k/v projections used to write straight into the cache and `normRope` ran in place
+on the cached row. With an f16 cache that would round k *before* RoPE and again after it. Instead both backends
+now compute k and v for the chunk in f32 (`kStage`/`vStage`, `[batch × kvDim]`), apply QK-norm and RoPE there,
+and store once — so a value is rounded exactly once, and the Metal backend rounds the same f32 numbers the same
+way, which is why the two backends' f16 outputs are identical. The f32 path pays one extra `arraycopy` of
+`n × kvDim` floats per layer, which does not show in the measurements.
+
+**The f16 attention loop.** `Float.float16ToFloat` is a JIT intrinsic (`fcvt` on NEON, F16C on x86) and C2
+auto-vectorizes the plain conversion loop, but the Vector API has no half-float lane type, so the SIMD `dot`
+and `axpy` cannot read `short[]` directly. The loop therefore expands each cached row slice into thread-local
+scratch and reuses the f32 kernels — and to convert as little as possible it is organized per **(token,
+kv-head)** rather than per (token, head):
+
+```
+for each (t, g) pair:                                  g = kv head, serving query heads g·group … g·group+group−1
+    for s < len:   expand K[s][g] → sc[kRow]  (128 shorts → floats, once)
+                   for h < group:  sc[h·ctx + s] = dot(q[t][g·group+h], sc[kRow]) · scale      (SIMD, as before)
+    per head:      softmax over sc[h·ctx .. h·ctx+len), 1/sum kept in sc[inv + h];  att[t][head] = 0
+    for s < len:   expand V[s][g] → sc[vRow]  (once)
+                   for h < group:  axpy(sc[h·ctx+s] · sc[inv+h], sc[vRow], att[t][g·group+h])
+```
+
+With `group = 2` (16 query heads over 8 KV heads) each cached value is converted once for two heads. The
+per-thread scratch is `group × ctx + 2 × headDim + group` floats (33 KB at `ctx = 4096`), allocated once. The
+work items per layer drop from `n × 16` to `n × 8`, which on 10 cores costs nothing measurable for decode.
+
+**Precision.** f16 keeps 11 significant bits (about 3 decimal digits) and a range of ±65 504; K and V values
+after QK-norm and RoPE are O(1), so nothing overflows and the rounding error is ~5 × 10⁻⁴ relative per value,
+averaged out by the 128-term dot products. Greedy outputs on a 25-token prompt, the 413-token `bench` prompt
+and a 623-token reading-comprehension prompt were identical to f32 on both backends.
+
+**Measured** (M1 Pro, 10 threads, Qwen3-0.6B Q4_0, ctx 4096, machine shared with other jobs so absolute
+numbers are below [7.9](#79-measured-numbers-and-the-bottleneck)): see [11 §11.3](11-performance.md#113-memory-footprint).
