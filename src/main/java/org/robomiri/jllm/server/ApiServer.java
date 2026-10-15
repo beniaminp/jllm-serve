@@ -397,7 +397,7 @@ public final class ApiServer implements AutoCloseable {
         if (extra != null) {
             thinking = Json.bool(extra, "enable_thinking", thinking);
         }
-        return ChatTemplate.renderTokens(engine.tokenizer(), list, true, thinking);
+        return engine.renderChat(list, thinking);
     }
 
     /** @param room how many tokens the context has left after the prompt (at least 1) */

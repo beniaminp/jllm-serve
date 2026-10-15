@@ -178,7 +178,7 @@ public final class Main {
             }
         }
         // Family stop tokens: ChatML (Qwen), Llama 3 end-of-turn / end-of-text, Mistral / Llama 2 </s>.
-        // TODO: pick the chat template with ChatTemplate.forModelType(cfg.modelType()) once that method exists.
+        // the family template's end-of-turn ids are added by Engine; these cover base models without a template
         for (String name : new String[]{"<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>"}) {
             int id = tok.tokenId(name);
             if (id >= 0) {
@@ -196,8 +196,7 @@ public final class Main {
             String text = s.has("prompt") ? s.get("prompt") : "Hello";
             int[] prompt = s.has("raw") && s.getBool("raw")
                     ? engine.tokenizer().encode(text)
-                    : ChatTemplate.renderTokens(engine.tokenizer(), List.of(new ChatTemplate.Message("user", text)),
-                            true, s.getBool("chat.thinking"));
+                    : engine.renderChat(List.of(new ChatTemplate.Message("user", text)), s.getBool("chat.thinking"));
             Engine.Result r = engine.generate(prompt, s.sampling(), out -> {
                 System.out.print(out);
                 System.out.flush();
@@ -233,7 +232,7 @@ public final class Main {
                     continue;
                 }
                 history.add(new ChatTemplate.Message("user", line));
-                int[] prompt = ChatTemplate.renderTokens(engine.tokenizer(), history, true, think);
+                int[] prompt = engine.renderChat(history, think);
                 Engine.Result r = engine.generate(prompt, params, out -> {
                     System.out.print(out);
                     System.out.flush();
@@ -268,8 +267,7 @@ public final class Main {
             for (int i = 0; i < 40; i++) {
                 sb.append("The quick brown fox jumps over the lazy dog. ");
             }
-            int[] prompt = ChatTemplate.renderTokens(engine.tokenizer(),
-                    List.of(new ChatTemplate.Message("user", sb.toString())), true, false);
+            int[] prompt = engine.renderChat(List.of(new ChatTemplate.Message("user", sb.toString())), false);
             SamplingParams p = s.sampling().withMaxTokens(s.getInt("bench.max-tokens"));
             engine.generate(prompt, p, null, () -> false); // warm-up
             for (int i = 0; i < s.getInt("bench.rounds"); i++) {

@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
+import org.robomiri.jllm.tokenizer.ChatTemplate;
 import org.robomiri.jllm.tokenizer.StreamDecoder;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 
@@ -53,6 +54,7 @@ public final class Engine implements AutoCloseable {
 
     private int[] cached = new int[0]; // tokens currently in the KV cache
     private int cachedLen;
+    private final ChatTemplate.Format template;
 
     public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds) {
         this(backend, tokenizer, cfg, eosIds, 0);
@@ -63,15 +65,36 @@ public final class Engine implements AutoCloseable {
      *                       before throwing {@link OverloadedException}; 0 = wait indefinitely
      */
     public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds, long queueTimeoutMs) {
+        this(backend, tokenizer, cfg, eosIds, queueTimeoutMs, ChatTemplate.forModelType(cfg.modelType(), tokenizer));
+    }
+
+    /** @param template the chat format of the model family (prompt rendering and end-of-turn tokens) */
+    public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds, long queueTimeoutMs,
+                  ChatTemplate.Format template) {
         this.backend = backend;
         this.tokenizer = tokenizer;
         this.cfg = cfg;
-        this.eosIds = eosIds;
+        this.template = template;
+        Set<Integer> stops = new java.util.HashSet<>(eosIds);
+        for (int id : template.stopIds(tokenizer)) {
+            stops.add(id);
+        }
+        this.eosIds = Set.copyOf(stops);
         this.queueTimeoutMs = queueTimeoutMs;
     }
 
     public Tokenizer tokenizer() {
         return tokenizer;
+    }
+
+    /** The model family's chat template. */
+    public ChatTemplate.Format template() {
+        return template;
+    }
+
+    /** Renders a conversation to prompt ids with the family template (content cannot inject control tokens). */
+    public int[] renderChat(java.util.List<ChatTemplate.Message> messages, boolean enableThinking) {
+        return template.renderTokens(tokenizer, messages, true, enableThinking);
     }
 
     public Backend backend() {

@@ -233,7 +233,7 @@ public final class CpuBackend implements Backend {
     /** Causal grouped-query attention for tokens at positions [pos, pos+n). */
     private void attention(int layer, int n, int pos) {
         if (kv instanceof KvCache.F16 half) {
-            half.attention(pool, layer, n, pos, q, att);
+            half.attention(pool, layer, n, pos, q, att, c.windowFor(layer));
             return;
         }
         float[] kc = ((KvCache.F32) kv).key[layer];
