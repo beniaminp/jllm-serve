@@ -183,14 +183,14 @@ def deepseek_tensors(cfg, rnd):
         vec(p + "input_layernorm.weight", d)
         vec(p + "post_attention_layernorm.weight", d)
         if ql is None:
-            mat(a + "q_proj.weight", heads * (nope + rope), d)
+            mat(a + "q_proj.weight", heads * (nope + rope), d, 0.25)
         else:
             mat(a + "q_a_proj.weight", ql, d)
             vec(a + "q_a_layernorm.weight", ql)
-            mat(a + "q_b_proj.weight", heads * (nope + rope), ql)
-        mat(a + "kv_a_proj_with_mqa.weight", kvl + rope, d)
+            mat(a + "q_b_proj.weight", heads * (nope + rope), ql, 0.25)
+        mat(a + "kv_a_proj_with_mqa.weight", kvl + rope, d, 0.25)
         vec(a + "kv_a_layernorm.weight", kvl)
-        mat(a + "kv_b_proj.weight", heads * (nope + vd), kvl)
+        mat(a + "kv_b_proj.weight", heads * (nope + vd), kvl, 0.25)
         mat(a + "o_proj.weight", d, heads * vd)
         if l < cfg["first_k_dense_replace"] or l % cfg["moe_layer_freq"] != 0:
             mlp(p + "mlp.", cfg["intermediate_size"])
