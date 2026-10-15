@@ -2,6 +2,8 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.safetensors.SafeTensors;
+import org.robomiri.jllm.sampling.Sampler;
+import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 import org.robomiri.jllm.tokenizer.StreamDecoder;
 import org.robomiri.jllm.tokenizer.Tokenizer;
@@ -32,6 +34,7 @@ public final class SmokeTest {
         tokenizerErrors();
         bpeEquivalence(dir);
         streamDecoder();
+        sampler();
         safetensors(dir);
         System.out.println("all smoke tests passed");
     }
@@ -413,6 +416,96 @@ public final class SmokeTest {
         check(d.push(new byte[]{rocket[0], rocket[1]}).isEmpty(), "held back partial");
         check(d.push(new byte[]{rocket[2], rocket[3]}).equals("🚀"), "completed");
         check(d.push("ab".getBytes()).equals("ab"), "ascii");
+    }
+
+    /**
+     * Top-p without top-k: the set of tokens the sampler can return must be the nucleus a brute-force
+     * reference computes over the full softmax (sort all probabilities, accumulate, include the crossing token).
+     * Observed by drawing many samples with a fixed seed: anything outside the nucleus is a failure, and every
+     * nucleus token with non-negligible mass must show up.
+     */
+    static void sampler() {
+        // worked example from the review: p = (0.86, 0.05, rest spread thinly), top_p = 0.9 -> keep 2.
+        // Normalizing over the surviving candidates alone gives 0.86 / 0.91 = 0.945 >= 0.9 and keeps only 1.
+        float[] skewed = probLogits(1000, 0.86, 0.05);
+        checkNucleus(skewed, 0.9f, 1f, 2000, "nucleus keeps the crossing token (0.86, 0.05, thin tail)");
+
+        // six-token nucleus where the sixth is the crossing token: cum 0.30 0.50 0.65 0.75 0.83 0.90 vs p = 0.88
+        float[] six = probLogits(1000, 0.30, 0.20, 0.15, 0.10, 0.08, 0.07);
+        checkNucleus(six, 0.88f, 1f, 4000, "nucleus keeps six tokens (crossing token sixth)");
+
+        // random logits with temperature: whatever the reference says, the sampler agrees
+        Random rnd = new Random(7);
+        float[] random = new float[4096];
+        for (int i = 0; i < random.length; i++) {
+            random[i] = (float) (rnd.nextGaussian() * 4);
+        }
+        checkNucleus(random, 0.9f, 0.7f, 20_000, "nucleus on random logits with T=0.7");
+        checkNucleus(random, 0.5f, 1.3f, 20_000, "nucleus on random logits with T=1.3");
+    }
+
+    /** Logits whose softmax gives the listed probabilities to tokens 0..k-1 and spreads the rest uniformly. */
+    static float[] probLogits(int vocab, double... head) {
+        double used = 0;
+        for (double p : head) {
+            used += p;
+        }
+        float[] logits = new float[vocab];
+        Arrays.fill(logits, (float) Math.log((1 - used) / (vocab - head.length)));
+        for (int i = 0; i < head.length; i++) {
+            logits[i] = (float) Math.log(head[i]);
+        }
+        return logits;
+    }
+
+    static void checkNucleus(float[] logits, float topP, float temperature, int draws, String what) {
+        // brute-force reference over the full vocabulary
+        int vocab = logits.length;
+        double max = Double.NEGATIVE_INFINITY;
+        for (float l : logits) {
+            max = Math.max(max, l);
+        }
+        double[] prob = new double[vocab];
+        double sum = 0;
+        for (int i = 0; i < vocab; i++) {
+            prob[i] = Math.exp((logits[i] - max) / temperature);
+            sum += prob[i];
+        }
+        Integer[] order = new Integer[vocab];
+        for (int i = 0; i < vocab; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order, (a, b) -> Double.compare(prob[b], prob[a]));
+        java.util.Set<Integer> nucleus = new java.util.HashSet<>();
+        double cum = 0;
+        double nucleusMass = 0;
+        for (int i : order) {
+            nucleus.add(i);
+            cum += prob[i] / sum;
+            nucleusMass += prob[i];
+            if (cum >= topP) {
+                break;
+            }
+        }
+        // sample
+        SamplingParams params = new SamplingParams(temperature, 0, topP, 0f, 1f, 0f, 0f, 1234L, 1, List.of());
+        Sampler s = new Sampler(params, vocab, new int[0]);
+        java.util.Set<Integer> observed = new java.util.HashSet<>();
+        for (int i = 0; i < draws; i++) {
+            observed.add(s.sample(logits.clone()));
+        }
+        for (int t : observed) {
+            if (!nucleus.contains(t)) {
+                throw new AssertionError(what + ": sampled token " + t + " outside the nucleus of " + nucleus.size());
+            }
+        }
+        for (int t : nucleus) {
+            if (prob[t] / nucleusMass >= 0.01 && !observed.contains(t)) {
+                throw new AssertionError(what + ": nucleus token " + t + " (p=" + prob[t] / nucleusMass
+                        + " within the nucleus) never sampled in " + draws + " draws");
+            }
+        }
+        check(true, what + ": nucleus of " + nucleus.size() + ", observed " + observed.size() + " distinct tokens");
     }
 
     static void safetensors(Path dir) throws Exception {

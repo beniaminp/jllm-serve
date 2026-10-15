@@ -18,6 +18,8 @@ public final class Sampler {
     // scratch
     private final int[] idx;
     private final float[] val;
+    /** Full-vocabulary softmax denominator computed by the last {@link #nucleusCandidates} call. */
+    private double nucleusSum;
 
     /**
      * @param vocab number of valid token ids; logits beyond it (padding rows of the embedding) are never sampled
@@ -55,10 +57,12 @@ public final class Sampler {
         float invT = 1f / p.temperature();
         int n;
         boolean sorted = true;
+        boolean nucleus = false;
         if (p.topK() > 0 && p.topK() < vocab) {
             n = topK(logits, p.topK());
         } else if (p.topP() < 1f) {
             n = nucleusCandidates(logits, invT);
+            nucleus = true;
         } else { // plain temperature sampling over the whole vocabulary, no need to sort
             n = vocab;
             for (int i = 0; i < n; i++) {
@@ -77,6 +81,13 @@ public final class Sampler {
             float e = (float) Math.exp((val[i] - max) * invT);
             val[i] = e;
             sum += e;
+        }
+        if (nucleus) {
+            // Top-p is defined over the whole distribution. The candidates are only the tokens that can be in
+            // the nucleus; normalizing by their mass alone would inflate every cumulative probability and cut
+            // the nucleus early. Whenever any candidate survives the bound the most likely token does too, so the
+            // max used in nucleusCandidates() equals the one above and the two denominators are comparable.
+            sum = nucleusSum;
         }
         // top-p on the sorted candidates
         int keep = n;
@@ -182,6 +193,7 @@ public final class Sampler {
         for (int i = 0; i < vocab; i++) {
             sum += Math.exp((logits[i] - max) * invT);
         }
+        nucleusSum = sum;
         double cutoff = p.topP() < 1f ? (1.0 - p.topP()) / (vocab - 1) : 0.0;
         int n = 0;
         for (int i = 0; i < vocab; i++) {
