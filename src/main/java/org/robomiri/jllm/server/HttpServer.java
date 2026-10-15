@@ -293,8 +293,13 @@ public final class HttpServer implements AutoCloseable {
                         res.send(404, "text/plain", "not found");
                     }
                 } catch (Exception e) {
+                    if (res.started() && e instanceof IOException) {
+                        return; // the client went away mid-stream: nothing to report
+                    }
+                    System.err.println("error handling " + req.method + " " + req.path + ":");
+                    e.printStackTrace();
                     if (!res.started()) {
-                        res.send(500, "text/plain", "internal error: " + e);
+                        res.send(500, "application/json", errorJson("server_error", "internal server error"));
                     } else {
                         return; // can't recover a half-written response; drop the connection
                     }
