@@ -1,4 +1,4 @@
-# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, DeepSeek-R1 distills)
+# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills)
 
 Code: `model/ModelConfig`, `model/Rope`, `model/ModelConverter` (biases, fused Phi-3 tensors), `cpu/CpuBackend.attention/addBias`,
 `kernels.metal` (`attention`, `add_bias`), `Main.eosIds`, `engine/Engine.generate` (BOS)
@@ -19,8 +19,11 @@ switches, all read from `config.json` into `ModelConfig`. Qwen3 is the reference
 | `glm` | `GlmForCausalLM` | GLM-Edge-1.5B/4B-Chat, glm-4-9b-chat-hf (section 14.8) | `THUDM/GLM-Edge-1.5B-Chat`, `THUDM/glm-4-9b-chat-hf` |
 | `glm4` | `Glm4ForCausalLM` | GLM-4-9B/32B-0414, GLM-Z1 (section 14.8) | `THUDM/GLM-4-9B-0414`, `THUDM/GLM-Z1-9B-0414` |
 | `phi3` | `Phi3ForCausalLM` | Phi-3-mini, Phi-3.5-mini, Phi-4-mini, phi-4 (14B), see 14.9 | `microsoft/Phi-3-mini-4k-instruct`, `Phi-3.5-mini-instruct`, `Phi-4-mini-instruct`, `phi-4` |
+| `gemma2` | `Gemma2ForCausalLM` | Gemma 2 2B / 9B / 27B (section 14.10) | `unsloth/gemma-2-2b-it` (mirror of the gated `google/gemma-2-2b-it`) |
+| `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` (text part) | Gemma 3 1B / 4B / 12B / 27B (section 14.10) | `unsloth/gemma-3-1b-it`, `unsloth/gemma-3-4b-it` |
 
-A different `model_type`, a `hidden_act` other than `silu`, `mlp_bias: true`, or a `rope_scaling` type other than
+A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
+`gelu_pytorch_tanh`), `mlp_bias: true`, or a `rope_scaling` type other than
 `default`/`linear`/`llama3`/`longrope` (e.g. `yarn`) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
@@ -170,7 +173,12 @@ generates tiny random models (plain Llama, llama3 RoPE scaling, Mistral with `sl
 and a window on layers ≥ 2), converts each to q4 and q8, loads it, generates 8 tokens greedily from a fixed 12-token
 prompt on the CPU and on Metal, and requires equal token ids and final logits that agree to 1e-3 relative.
 Random weights give gibberish, but the computation is deterministic, so any disagreement is a bug in a backend.
-`mvn test` additionally checks the RoPE rule and the config parsing of each family.
+`mvn test` additionally checks the RoPE rule and the config parsing of each family. The Gemma part of that
+(`GemmaChecks`, called from `SmokeTest`) compares `gelu_tanh`, the soft-cap and the `(1 + w)` RMSNorm with
+hand-computed values and parses the real Hub configs listed in 14.10. The arch smoke adds Gemma 2 (`head_dim` 64,
+attention cap 1.0 so that it matters on random weights, final cap 30, local layers 0 and 2 with a window of 6),
+Gemma 3 text (q/k norm, 6 layers = 5 local + 1 global, linear-×8 global RoPE and 10 000-base local RoPE), the
+multimodal wrapper layout and `head_dim` 256 variants of both.
 
 The three Phi-3 models (fused weights, longrope with the long factors, partial rotary, sliding window; the same with
 the short factors and tied embeddings; headDim 64 MHA with plain RoPE) are also checked by `ArchSmoke` for the
@@ -376,3 +384,99 @@ Headers read with a ranged request (first 2 MB of shard 1, no weights downloaded
 - Phi-3-small, Phi-3-vision, Phi-3.5-MoE (`phimoe`), Phi-4-multimodal: other `model_type`s / extra towers.
 - Per-request switching between short and long RoPE factors (see above).
 - Phi-1 / Phi-2 (`model_type: phi`: LayerNorm, GELU, parallel attention) are a different architecture.
+
+## 14.10 Gemma 2 and Gemma 3
+
+Code: `model/ModelConfig.Gemma`, `model/GemmaMath`, `model/Rope.local`, `ModelConverter.normGain/canonicalName`,
+`CpuBackend.geluMul`, `kernels.metal` (`rmsnorm_add` shared with GLM-4, `matmul_swiglu`'s `gelu` flag, `softcap`, `AttnParams.softcap`).
+Behaviour checked against transformers `modeling_gemma2.py` / `modeling_gemma3.py` (v4.51.3).
+
+Same decoder skeleton, with these differences from the Llama-style layer of chapter 5:
+
+| # | Gemma | Formula | Where |
+|---|---|---|---|
+| 1 | embedding scale | `x0 = embed[token] * normalizer`, `normalizer = bf16(sqrt(hidden_size))` | `ModelConfig.embedScale`, applied right after the row is dequantized (both backends) |
+| 2 | RMSNorm gain `1 + w` | `y = x * rsqrt(mean(x²) + eps) * (1 + w)`, in f32 (`Gemma3RMSNorm`; the checkpoints store `w`, initialised to 0) | the converter stores `1 + w` as f32 (`GemmaMath.foldNormGain`), so the unchanged `rmsnorm` / `norm_rope` kernels apply it; this includes `q_norm`, `k_norm` and the final norm |
+| 3 | four norms per layer | `h = x + post_attn_norm(attn(input_norm(x)))`, `x' = h + post_ffn_norm(mlp(pre_ffn_norm(h)))` | o_proj and down_proj write to `xb` (no accumulate); the GLM-4 post-norm path (`rmsnormAdd` / `rmsnorm_add`) normalizes it and adds it to the residual `x`; `postNorms()` is true for Gemma too |
+| 4 | GeLU-tanh MLP | `down(gelu_tanh(gate(x)) * up(x))`, `gelu_tanh(x) = 0.5x(1 + tanh(sqrt(2/π)(x + 0.044715x³)))` | `ModelConfig.activation()` is `gelu_tanh` for Gemma, else `silu`; CPU `geluMul`; Metal: the fused `matmul_swiglu` kernels take a `gelu` flag in `SwigluParams` and apply `gelu_tanh` instead of `silu` in the epilogue |
+| 5 | attention scale | `scores = q·k * query_pre_attn_scalar^-0.5` (not `head_dim^-0.5`; in the three checked configs the scalar equals `head_dim` = 256 so both give 1/16, the test checkpoints use 48 to tell them apart) | `ModelConfig.attnScale()` goes into the scale parameter of every attention path |
+| 6 | attention soft-cap (Gemma 2) | `s' = tanh(s / 50) * 50`, applied to the scaled score before the softmax; `null` in Gemma 3 | CPU f32 and f16 loops, Metal `attention` / `attention_h` (`AttnParams.softcap`, 0 = off, argument clamped to ±20 because fast-math `tanh` can overflow) |
+| 7 | final logit soft-cap (Gemma 2) | `l' = tanh(l / 30) * 30` after the LM head; `null` in Gemma 3 | CPU: after the head matmul; Metal: `softcap` kernel on the logits buffer |
+| 8 | QK-norm (Gemma 3 only) | per-head `(1+w)` RMSNorm of q and k before RoPE | reuses the Qwen3 `qNorm`/`kNorm` path (`qkNorm` is true for `gemma3_text`) |
+| 9 | local / global layers | local layers use the sliding window, global layers the full context. Gemma 2: layer `i` is local if `i % 2 == 0`. Gemma 3: local unless `(i + 1) % sliding_window_pattern == 0` (5 local, 1 global). `layer_types` (`sliding_attention` / `full_attention`) overrides both rules | `ModelConfig.Gemma.local[]`, `windowFor(l)` |
+| 10 | two RoPE tables (Gemma 3) | local layers: base `rope_local_base_freq` (10 000), no scaling; global layers: `rope_theta` (1 000 000) with `rope_scaling` (`linear`, factor 8 in the 4B, none in the 1B) | `Rope.of` (global) and `Rope.local`; each layer picks one (`usesLocalRope(l)`); Metal keeps two cos/sin buffers. Gemma 2 has one table (`rope_theta` 10 000) |
+| 11 | tied head, BOS, stops | `tie_word_embeddings` is absent from the configs and defaults to true; `<bos>` (id 2) is prepended (`promptBosId`; the chat template already emits it, so it is not doubled); stops: `eos_token_id` ([1, 107] for Gemma 2, 106 for Gemma 3) plus `<end_of_turn>` / `<eos>` from the template | |
+
+The sliding window follows transformers' mask `kv > q - window` (a token sees `window` positions including itself),
+the same convention as Mistral above. Gemma 2's `hidden_act` and `hidden_activation` are both
+`gelu_pytorch_tanh`; Gemma 3 only has `hidden_activation`. The embedding normalizer is a tensor of the checkpoint
+dtype in transformers, so `sqrt(1152) = 33.94` is really `34.0` in a bf16 model (`bf16(sqrt(2304)) = 48` exactly);
+`ModelConfig` reads `torch_dtype` for this (`float32` checkpoints, such as the test ones, keep the exact value).
+
+**Config keys read** (`ModelConfig.load`): `hidden_size`, `intermediate_size`, `num_hidden_layers`,
+`num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `rms_norm_eps`, `rope_theta`,
+`rope_local_base_freq`, `rope_scaling` (`rope_type` linear; also `rope_parameters`, keyed by layer type, of
+transformers 5), `sliding_window`, `sliding_window_pattern`, `layer_types`, `query_pre_attn_scalar`,
+`attn_logit_softcapping`, `final_logit_softcapping`, `hidden_activation`, `bos_token_id`, `eos_token_id`,
+`torch_dtype`. For the multimodal `gemma3` wrapper (`Gemma3ForConditionalGeneration`) all of these are taken from
+`text_config`, and `bos_token_id`, `eos_token_id` and `torch_dtype` fall back to the top level; `vision_config` and
+the image token ids are ignored.
+
+**What the Hub says** (config.json and safetensors headers fetched with Range requests, no weights downloaded):
+
+| | `unsloth/gemma-2-2b-it` | `unsloth/gemma-3-1b-it` | `unsloth/gemma-3-4b-it` (`text_config`) |
+|---|---|---|---|
+| `model_type` / class | `gemma2` / `Gemma2ForCausalLM` | `gemma3_text` / `Gemma3ForCausalLM` | `gemma3` / `Gemma3ForConditionalGeneration` (text: `gemma3_text`) |
+| hidden / ffn / layers | 2304 / 9216 / 26 | 1152 / 6912 / 26 | 2560 / 10240 / 34 |
+| heads / kv / `head_dim` | 8 / 4 / 256 | 4 / 1 / 256 | 8 / 4 / 256 |
+| vocab (embedding rows) | 256000 | 262144 | 262208 |
+| `query_pre_attn_scalar` | 256 | 256 | 256 |
+| `sliding_window` | 4096 | 512 (pattern 6) | 1024 (pattern 6) |
+| `rope_theta` / local / scaling | 10000 / - / none | 1e6 / 10000 / `null` | 1e6 / 10000 / linear ×8 |
+| `attn_logit_softcapping` / `final_logit_softcapping` | 50.0 / 30.0 | null / null | null / null |
+| `bos_token_id` / `eos_token_id` | 2 / [1, 107] | 2 / 106 (`generation_config`: [1, 106]) | 2 / 106 |
+| `torch_dtype` | bfloat16 | bfloat16 | bfloat16 |
+| `layer_types` | absent (rule above) | absent | absent |
+
+(`google/gemma-2-2b-it` and `google/gemma-3-4b-it` are gated; the `unsloth` mirrors were used. The head dim is 256
+in all three, so the Metal attention kernel (`headDim` ≤ 256, multiple of 32, 8 values per lane) covers them; the arch
+smoke runs `head_dim` 256 variants.)
+
+**Tensors** (all BF16; `d` = hidden, `q = heads·head_dim`, `kv = kv_heads·head_dim`, `f` = ffn, `V` = vocab; headers of
+`unsloth/gemma-2-2b-it`: 288 tensors, `unsloth/gemma-3-1b-it`: 340 tensors):
+
+| Tensor | Shape (2B / 1B) | Gemma 2 | Gemma 3 |
+|---|---|---|---|
+| `model.embed_tokens.weight` | V × d: 256000×2304 / 262144×1152 | x | x |
+| `model.layers.N.input_layernorm.weight` | d | x | x |
+| `model.layers.N.self_attn.{q,k,v}_proj.weight` | q × d, kv × d, kv × d: 2048/1024/1024 × 2304 / 1024/256/256 × 1152 | x | x |
+| `model.layers.N.self_attn.o_proj.weight` | d × q | x | x |
+| `model.layers.N.self_attn.{q,k}_norm.weight` | head_dim (256) | | x |
+| `model.layers.N.post_attention_layernorm.weight` | d, applied to the attention output | x | x |
+| `model.layers.N.pre_feedforward_layernorm.weight` | d, MLP input norm | x | x |
+| `model.layers.N.post_feedforward_layernorm.weight` | d, applied to the MLP output | x | x |
+| `model.layers.N.mlp.{gate,up}_proj.weight` | f × d | x | x |
+| `model.layers.N.mlp.down_proj.weight` | d × f | x | x |
+| `model.norm.weight` | d | x | x |
+| `lm_head.weight` | absent (tied) | | |
+
+Note that `post_attention_layernorm` is *not* the MLP input norm here, unlike Llama. In the 4B+ multimodal
+checkpoints (`model.safetensors.index.json`, 883 entries in 2 shards) the same tensors are prefixed
+`language_model.model.` (as released; transformers ≥ 4.52 writes `model.language_model.`), next to
+`vision_tower.vision_model.*` (SigLIP, 27 layers) and `multi_modal_projector.{mm_input_projection_weight,
+mm_soft_emb_norm.weight}`; the 4B embedding is `language_model.model.embed_tokens.weight` 262208 × 2560.
+`ModelConverter.canonicalName` maps both spellings to the plain names and never reads the vision tensors. In the
+quantized cache the norms are stored already as `1 + w` under their checkpoint names; delete a `jllm-*.bin` written
+by a build without Gemma support before loading a Gemma model.
+
+**How it was verified.** Beyond the CPU == Metal comparison of the arch smoke, the tiny random checkpoints were
+also run through an independent pure-Python implementation written line by line from `modeling_gemma2/3.py`
+(sequential attention with an explicit mask, `rotate_half`, `(1 + w)` norms, soft-caps). Final logits of the last
+prompt token agree with it to quantization noise (Q8_0: correlation 0.99997, max error 0.3–0.9 % of the largest
+logit; Q4_0: 0.9994, 1–4.5 %) on both backends, for Gemma 2, Gemma 3 and the multimodal layout, with f32 and f16 KV
+caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU == Metal).
+
+**Not supported / not verified**: images (the vision tower and projector are skipped, so Gemma 3 4B+ is text-only);
+the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
+configs above were read), no real weights were run; `rope_scaling` types other than `linear`/`llama3`; Gemma 3n and
+Gemma 1 (`model_type: gemma`, no extra norms) are rejected.

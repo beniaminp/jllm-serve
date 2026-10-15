@@ -23,6 +23,7 @@
 #                                                         attention + final soft-capping, local/global alternation
 #   hf-internal-testing_tiny-random-Gemma3ForCausalLM     generated: q/k norm, 5 local + 1 global layers, two RoPE bases
 #   hf-internal-testing_tiny-random-Gemma3MMForCausalLM   generated: the same decoder in the multimodal wrapper layout
+#   hf-internal-testing_tiny-random-Gemma{2,3}Hd256ForCausalLM  generated: head_dim 256, the largest Metal supports
 #
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
@@ -50,7 +51,7 @@ fi
 gen() { # family dir-suffix
   local d="$M/${P}-$2"
   rm -rf "$d"
-  python3 scripts/make-tiny-model.py "$d" "$1" >/dev/null
+  python3 scripts/make-tiny-model.py "$d" "$1" "${@:3}" >/dev/null
 }
 gen llama LlamaPlainForCausalLM
 gen mistral MistralForCausalLM
@@ -65,10 +66,13 @@ gen phi3mha Phi3MhaForCausalLM
 gen gemma2 Gemma2ForCausalLM
 gen gemma3 Gemma3ForCausalLM
 gen gemma3mm Gemma3MMForCausalLM
+gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
+gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
-  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM"
+  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \
+  "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM"

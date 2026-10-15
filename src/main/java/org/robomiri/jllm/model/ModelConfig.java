@@ -12,7 +12,8 @@ import java.util.stream.Collectors;
 
 /**
  * Hyper-parameters from a Hugging Face {@code config.json}: Llama ({@code llama}), Mistral ({@code mistral}),
- * Qwen2 ({@code qwen2}), Qwen3 dense ({@code qwen3}) and Mixture-of-Experts ({@code qwen3_moe}) decoders.
+ * Qwen2 ({@code qwen2}), Qwen3 dense ({@code qwen3}) and Mixture-of-Experts ({@code qwen3_moe}), Gemma 2
+ * ({@code gemma2}) and Gemma 3 text ({@code gemma3_text}, also inside the {@code gemma3} multimodal wrapper) decoders.
  *
  * @param modelType     the {@code model_type} string
  * @param attentionBias q/k/v projections have a bias (Qwen2)
@@ -355,7 +356,7 @@ public record ModelConfig(
                 (int) Json.num(c, "max_position_embeddings", 4096),
                 (float) Json.dbl(c, "rms_norm_eps", 1e-6),
                 ropeTheta,
-                Json.bool(c, "tie_word_embeddings", false),
+                Json.bool(c, "tie_word_embeddings", gemma), // Gemma configs omit the key; the class default is true
                 numExperts,
                 expertsPerTok,
                 moeDim,

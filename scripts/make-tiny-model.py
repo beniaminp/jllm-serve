@@ -2,7 +2,7 @@
 """Writes a tiny random-weight Hugging Face checkpoint (config.json + model.safetensors, float32) for
 pipeline tests. Standard library only.
 
-usage: make-tiny-model.py <out-dir> <family> [--seed N]
+usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
   family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
@@ -137,6 +137,10 @@ def main():
     wrapper = fam == "gemma3mm"
     cfg = dict(FAMILIES["gemma3" if wrapper else fam])
     d, heads, kv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
+    if "--head-dim" in sys.argv:  # e.g. 256 to exercise the largest head size the Metal attention kernel supports
+        cfg["head_dim"] = int(sys.argv[sys.argv.index("--head-dim") + 1])
+    if "--vocab" in sys.argv:  # e.g. 262144 for Gemma 3's vocabulary size
+        cfg["vocab_size"] = int(sys.argv[sys.argv.index("--vocab") + 1])
     hd = cfg.get("head_dim", d // heads)
     glm = cfg["model_type"] in ("glm", "glm4")
     ffn, vocab = cfg["intermediate_size"], cfg["vocab_size"]

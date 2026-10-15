@@ -64,6 +64,7 @@ final class GemmaChecks {
                      "torch_dtype":"bfloat16","vocab_size":256000}""");
             check(g2.isGemma() && g2.modelType().equals("gemma2") && !g2.qkNorm() && g2.activation().equals("gelu_tanh"),
                     "gemma2 basics");
+            check(g2.tiedEmbeddings(), "gemma2 ties embeddings although the config omits the key");
             check(g2.attnSoftcap() == 50f && g2.finalSoftcap() == 30f && g2.attnScale() == 0.0625f,
                     "gemma2 caps and scale 1/16");
             check(g2.windowFor(0) == 4096 && g2.windowFor(1) == 0 && g2.windowFor(24) == 4096 && g2.windowFor(25) == 0,
