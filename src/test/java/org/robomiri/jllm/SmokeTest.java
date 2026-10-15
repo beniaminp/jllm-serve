@@ -1,11 +1,14 @@
 package org.robomiri.jllm;
 
+import org.robomiri.jllm.cpu.Int8Kernels;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.DeepSeekConfig;
 import org.robomiri.jllm.model.DeepSeekRouter;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.Rope;
+import org.robomiri.jllm.model.QTensor;
+import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.safetensors.SafeTensors;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -41,6 +44,7 @@ public final class SmokeTest {
         bpeEquivalence(dir);
         streamDecoder();
         sampler();
+        int8Kernels();
         safetensors(dir);
         ropeScaling();
         glmRope();
@@ -54,6 +58,69 @@ public final class SmokeTest {
         prefixReuse(dir);
         deepseekConfigs();
         System.out.println("all smoke tests passed");
+    }
+
+    /** Int8 activation path: exact integer lanes, bit-identical quantizer, small error against the float kernels. */
+    static void int8Kernels() {
+        int rows = 256;
+        int cols = 1024;
+        Random rnd = new Random(7);
+        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofShared()) {
+            QTensor.RowSource src = (r, dst) -> {
+                Random rr = new Random(r);
+                for (int i = 0; i < cols; i++) {
+                    dst[i] = (float) rr.nextGaussian() * 0.05f;
+                }
+            };
+            QTensor w4 = QTensor.quantize(arena, QType.Q4_0, rows, cols, src);
+            QTensor w8 = QTensor.quantize(arena, QType.Q8_0, rows, cols, src);
+            float[] x = new float[2 * cols];
+            for (int i = 0; i < x.length; i++) {
+                x[i] = (float) rnd.nextGaussian() * (i % 97 == 0 ? 8f : 1f); // a few outliers, like real activations
+            }
+            short[] xq = new short[cols];
+            float[] xs = new float[cols / 32];
+            short[] xq2 = new short[cols];
+            float[] xs2 = new float[cols / 32];
+            Int8Kernels.quantize(x, cols, cols, xq, xs);
+            Int8Kernels.quantizeScalar(x, cols, cols, xq2, xs2);
+            check(Arrays.equals(xq, xq2) && Arrays.equals(xs, xs2), "int8 quantizer matches the scalar reference");
+            int amax = 0;
+            for (short v : xq) {
+                amax = Math.max(amax, Math.abs(v));
+            }
+            check(amax == 127, "int8 quantizer uses the full range (max |q| = " + amax + ")");
+            double err4 = 0, ref4 = 0, err8 = 0, ref8 = 0, kern = 0;
+            for (int r = 0; r < rows; r++) {
+                for (QTensor w : new QTensor[]{w4, w8}) {
+                    long exact = 0;
+                    for (int b = 0; b < cols / 32; b++) {
+                        exact += Int8Kernels.blockDotScalar(w, r, b, xq, 0);
+                    }
+                    check(Int8Kernels.intDotRow(w, r, xq, 0) == exact, "int8 " + w.type + " integer lanes exact, row " + r);
+                    float i8 = Int8Kernels.dotRow(w, r, xq, xs, 0);
+                    kern = Math.max(kern, Math.abs(i8 - Int8Kernels.dotRowScalar(w, r, xq, xs, 0)));
+                    float[] wrow = new float[cols];
+                    w.dequantizeRow(r, wrow, 0);
+                    double f = 0;
+                    for (int i = 0; i < cols; i++) {
+                        f += (double) wrow[i] * x[cols + i];
+                    }
+                    if (w == w4) {
+                        err4 += (i8 - f) * (i8 - f);
+                        ref4 += f * f;
+                    } else {
+                        err8 += (i8 - f) * (i8 - f);
+                        ref8 += f * f;
+                    }
+                }
+            }
+            double rel4 = Math.sqrt(err4 / ref4);
+            double rel8 = Math.sqrt(err8 / ref8);
+            check(kern < 1e-4, "int8 SIMD kernel matches the scalar scale arithmetic (max abs diff " + kern + ")");
+            check(rel4 < 0.02 && rel8 < 0.02, String.format("int8 dot product error vs float: q4 %.3f %%, q8 %.3f %% (rms, relative)",
+                    rel4 * 100, rel8 * 100));
+        }
     }
 
     static void json() {
