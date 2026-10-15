@@ -176,7 +176,7 @@ public final class ApiServer implements AutoCloseable {
                         + " (at least one token must be left for the completion)",
                         "invalid_request_error", "context_length_exceeded");
             }
-            params = params(body);
+            params = params(body, ctx - prompt.length);
         } catch (RequestError e) {
             res.send(e.status, "application/json", error(e));
             return;
@@ -353,7 +353,8 @@ public final class ApiServer implements AutoCloseable {
         return ChatTemplate.renderTokens(engine.tokenizer(), list, true, thinking);
     }
 
-    private SamplingParams params(Map<String, Object> b) {
+    /** @param room how many tokens the context has left after the prompt (at least 1) */
+    private SamplingParams params(Map<String, Object> b, int room) {
         SamplingParams d = defaults;
         List<String> stop = new ArrayList<>();
         Object s = b.get("stop");
@@ -365,6 +366,10 @@ public final class ApiServer implements AutoCloseable {
             }
         }
         long maxTokens = Json.num(b, "max_completion_tokens", Json.num(b, "max_tokens", d.maxTokens()));
+        if (maxTokens <= 0) {
+            throw RequestError.invalid("max_tokens must be at least 1");
+        }
+        maxTokens = Math.min(maxTokens, room); // the engine stops at the context edge anyway; this also avoids int overflow
         return new SamplingParams(
                 (float) Json.dbl(b, "temperature", d.temperature()),
                 (int) Json.num(b, "top_k", d.topK()),
@@ -374,7 +379,7 @@ public final class ApiServer implements AutoCloseable {
                 (float) Json.dbl(b, "presence_penalty", d.presencePenalty()),
                 (float) Json.dbl(b, "frequency_penalty", d.frequencyPenalty()),
                 Json.num(b, "seed", -1),
-                (int) Math.max(1, maxTokens),
+                (int) maxTokens,
                 stop);
     }
 
