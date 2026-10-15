@@ -217,3 +217,114 @@ checks `decode(encode(s)) == s` on Unicode, emoji, code and whitespace-heavy sam
 ids, the rendered template, and the stream decoder's handling of a split emoji. Matching ids matter: the model
 was trained on the reference tokenization, and a slightly different split (e.g. `" wor" "ld"`) would still
 decode to the same text but would be out-of-distribution for the model and hurt quality.
+
+## 4.11 Other tokenizer families
+
+The same `Tokenizer` class loads the tokenizers of Llama 3, Mistral, Gemma 2/3, Phi-3/Phi-4, GLM-4 / GLM-Edge,
+DeepSeek-R1-Distill and Mamba (GPT-NeoX). All of them are `"model": {"type": "BPE"}`; none uses the Unigram
+model, so no Unigram/Viterbi segmentation is implemented (such a file is rejected with "only BPE tokenizers are
+supported"). What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
+
+| Family | normalizer | pre-tokenizer | model flags | decoder |
+|---|---|---|---|---|
+| Qwen2/3, DeepSeek-R1-Distill | NFC | Split(regex, Isolated) + ByteLevel | `ignore_merges` (Qwen3) | ByteLevel |
+| Llama 3, GLM-4, GLM-Edge | none | Split(regex with `\p{N}{1,3}`, Isolated) + ByteLevel | `ignore_merges` | ByteLevel |
+| Phi-4-mini | none | Split(case-aware regex, **Removed + invert**) + ByteLevel | | ByteLevel |
+| Mamba (GPT-NeoX) | NFC | ByteLevel with `use_regex` (GPT-2 regex) | 6 of the 256 byte symbols absent from the vocabulary | ByteLevel |
+| Mistral v0.3 | none | **Metaspace** (`prepend_scheme: first`, `split: false`) | `byte_fallback`, `fuse_unk` | Replace ▁→space, ByteFallback, Fuse, **Strip(1)** |
+| Gemma 2/3 | **Replace " " → ▁** | Split(" ", MergedWithPrevious), a no-op once spaces are gone | `byte_fallback`, `fuse_unk` | Replace, ByteFallback, Fuse |
+| Phi-3 | **Prepend ▁, Replace " " → ▁** | none | `byte_fallback`, `fuse_unk` | Replace, ByteFallback, Fuse, Strip(1) |
+
+### Byte-level versus SentencePiece style
+
+The byte-level family (Qwen, Llama 3, Phi-4, GLM, DeepSeek, Mamba) works as described in 4.3: bytes are mapped to
+the printable GPT-2 alphabet and a space is part of the *following* word (`Ġworld`). The SentencePiece-style
+family (Mistral, Gemma, Phi-3) never touches bytes in the vocabulary strings. Instead:
+
+- **Spaces become `▁` (U+2581)**, again attached to the following word (`▁world`). Gemma and Phi-3 do this with a
+  `Replace` normalizer; Mistral with the `Metaspace` pre-tokenizer. Phi-3's `Prepend ▁` and Mistral's
+  `prepend_scheme: first` put a `▁` in front of the text, so `"hello"` and `" hello"` start alike. `first` means
+  *only at offset 0 of the input*: the text after `[INST]` or after `<s>` gets no extra `▁`. `Tokenizer`
+  carries that fact through `encode` and through the chat-template encoder (`newSequence()`).
+- **The merge loop starts from Unicode characters**, not bytes: each code point is looked up in the vocabulary.
+- **Byte fallback.** A character absent from the vocabulary (a rare CJK character, a control byte, an emoji the
+  vocabulary never saw) is replaced by the tokens `<0xE6>`, `<0x97>`, … of its UTF-8 bytes; these single-byte
+  tokens exist in the vocabulary for exactly this purpose. If even those are missing the character becomes the
+  `unk_token`, and with `fuse_unk` a run of unknowns collapses into one `<unk>`.
+- **Decoding** turns `▁` back into a space and `<0xXX>` tokens into the raw byte (`tokenBytes(id)` returns that
+  single byte, so `StreamDecoder` reassembles multi-byte characters as before). Mistral's and Phi-3's decoder
+  ends with `Strip(start=1)`, which removes the first space of the whole text (the one the prefix added);
+  `Tokenizer.decode` does the same and `new StreamDecoder(tokenizer)` does it for streams. Consequently
+  `decode(encode(" x"))` is `"x"` for those two, exactly like the reference. `clean_up_tokenization_spaces` is
+  never applied.
+
+Gemma deserves one remark: after the normalizer there are no spaces left, so its `Split` does nothing and the
+**whole text is a single BPE chunk** (merges can cross punctuation and newlines; `\n\n` is one token). The merge
+loop is the same O(n log n) heap, so this stays fast, but such chunks are too long for the piece cache.
+
+### Other constructs now understood
+
+- **Split behaviors**: `Isolated`, `Removed`, `MergedWithPrevious`, `MergedWithNext`, `Contiguous`, with
+  `invert`. Phi-4's `Removed` + `invert: true` keeps the regex matches and drops what lies between them.
+- **ByteLevel** with `add_prefix_space` and `use_regex`; **Digits**, **WhitespaceSplit**, **Whitespace**.
+- **Normalizers** `Sequence`, `NFC/NFD/NFKC/NFKD`, `Prepend`, `Replace` (string or regex), `Strip`, `Lowercase`.
+- **Added tokens with `lstrip` / `rstrip`.** Phi-3 and Phi-4 declare `<|user|>`, `<|end|>`, `<|assistant|>`, … with
+  `rstrip: true`: the tokenizer swallows the whitespace after such a token, so `<|user|>\nhi` encodes as
+  `<|user|>` `hi` and the newline never reaches the model. The reference does this and so do we, also across the
+  pieces of a chat prompt.
+- **Post-processor / BOS.** `bosId()`, `eosId()`, `unkId()` and `addBosByDefault()` come from the
+  `TemplateProcessing` post-processor and, when present, the sibling `tokenizer_config.json`
+  (`add_bos_token`, `bos_token`, `eos_token`; DeepSeek has no template but sets `add_bos_token`). `encode` never
+  prepends BOS; the caller decides. Chat-template output already contains BOS for the families whose template
+  starts with it.
+
+Unknown normalizer or pre-tokenizer types throw `IllegalArgumentException` instead of silently tokenizing
+differently. Not supported: the Unigram model, `Precompiled` normalizers (SentencePiece `.model` blobs), `BPE`
+dropout, `continuing_subword_prefix` / `end_of_word_suffix` (WordPiece-style BPE), `single_word` added tokens,
+the `normalized: true` added-token flag (those tokens are matched on the raw text, which is identical for
+Mamba's whitespace tokens), `clean_up_tokenization_spaces`, and tool-calling parts of the chat templates.
+
+### Chat templates per family
+
+`ChatTemplate.forModelType(modelType)` (or `forModelType(modelType, tokenizer)`) returns a `ChatTemplate.Format`
+with `render(...)`, `renderTokens(tok, ...)` and `stopIds(tok)`. Pass the tokenizer when you can: `phi3` is the
+`model_type` of both Phi-3 (SentencePiece vocabulary, newline-delimited roles) and Phi-4-mini (byte-level, no
+newlines), and DeepSeek-R1-Distill reports `qwen2` or `llama` although its template is different; the tokenizer
+tells them apart. Message content is always encoded with special tokens disabled.
+
+| `model_type` | Prompt layout (generation prompt in bold) | Stop ids (tokens) |
+|---|---|---|
+| `qwen3` | `<\|im_start\|>user\n…<\|im_end\|>\n` … **`<\|im_start\|>assistant\n`** (+ empty `<think>` block when thinking is off) | `<\|im_end\|>`, `<\|endoftext\|>` |
+| `qwen2` | same ChatML, default system prompt "You are Qwen, created by Alibaba Cloud…", no think block | `<\|im_end\|>`, `<\|endoftext\|>` |
+| `qwen2`/`llama` + R1 vocabulary | `<｜begin▁of▁sentence｜>{system}<｜User｜>…<｜Assistant｜>…<｜end▁of▁sentence｜>` … **`<｜Assistant｜><think>\n`** | `<｜end▁of▁sentence｜>` |
+| `llama` (3.x) | `<\|begin_of_text\|><\|start_header_id\|>system<\|end_header_id\|>\n\nCutting Knowledge Date…Today Date: …\n\n{system}<\|eot_id\|>` then `<\|start_header_id\|>user<\|end_header_id\|>\n\n…<\|eot_id\|>` … **`<\|start_header_id\|>assistant<\|end_header_id\|>\n\n`**; contents trimmed | `<\|eot_id\|>`, `<\|end_of_text\|>`, `<\|eom_id\|>` |
+| `mistral` | `<s>[INST] …[/INST] reply</s>[INST] …[/INST]`; the system prompt is prefixed (`sys\n\n`) to the last user turn | `</s>` |
+| `gemma2`, `gemma3` | `<bos><start_of_turn>user\n…<end_of_turn>\n<start_of_turn>model\n…<end_of_turn>\n` … **`<start_of_turn>model\n`**; system text is prefixed to the first user turn; contents trimmed | `<end_of_turn>`, `<eos>` |
+| `phi3` + SentencePiece vocab | `<\|system\|>\n…<\|end\|>\n<\|user\|>\n…<\|end\|>\n` … **`<\|assistant\|>\n`**; `<\|endoftext\|>` instead when not prompting | `<\|end\|>`, `<\|endoftext\|>`, `<\|assistant\|>` |
+| `phi3` + byte-level vocab (Phi-4-mini) | `<\|system\|>…<\|end\|><\|user\|>…<\|end\|>` … **`<\|assistant\|>`** | `<\|end\|>`, `<\|endoftext\|>` |
+| `glm4` | `[gMASK]<sop><\|system\|>\n…<\|user\|>\n…<\|assistant\|>\n…` … **`<\|assistant\|>`** (no newline) | `<\|endoftext\|>`, `<\|user\|>`, `<\|observation\|>` |
+| `glm` (GLM-Edge) | `<\|user\|>\n…<\|assistant\|>\n…` … **`<\|assistant\|>\n`**, no BOS | `<\|endoftext\|>`, `<\|user\|>`, `<\|observation\|>` |
+| `mamba` | no template: message contents joined by `\n` | `<\|endoftext\|>` |
+
+The Gemma 2 template refuses system messages; we fold them into the first turn as Gemma 3 does. Llama 3.1/3.2
+print a date in the system header; the template's own fallback `26 Jul 2024` is used unless you build the
+format with `ChatTemplate.llama3("…")`.
+
+### Verification
+
+`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each family, `encode` with the ids of the
+Python `tokenizers` package on 145 strings (English, code, numbers, CJK/emoji/RTL, leading/trailing/multiple
+spaces, newlines, special-token look-alikes, the empty string, random mixes), `decode` and token-by-token
+`StreamDecoder` output with the reference decode, `decode` of random id sequences, and `render` / `renderTokens`
+of 3–4 message conversations (with and without system prompt, odd whitespace, Unicode) with the official Jinja
+`chat_template` rendered by `jinja2` and encoded by `tokenizers`. The expected values live in
+`src/test/resources/tokenizers/*.json`, produced by `src/test/python/gen_tokenizer_fixtures.py`; the tokenizer
+files themselves are downloaded (no weights) into a directory passed as the first argument:
+
+```
+python3 -m venv /tmp/tokv && /tmp/tokv/bin/pip install tokenizers jinja2
+java -cp target/classes:target/test-classes org.robomiri.jllm.TokenizerFamiliesTest /tmp/jllm-tokenizers
+```
+
+Families whose directory is missing are skipped. `-Dtokenizer.fixtures=<dir>` points the test at a larger corpus
+generated with `gen_tokenizer_fixtures.py … <dir> 4000`.
