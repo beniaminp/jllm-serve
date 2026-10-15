@@ -32,6 +32,8 @@ public final class Tokenizer {
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
     private static final int CACHE_LIMIT = 100_000;
+    /** Chunks longer than this (in UTF-8 bytes) are never cached, bounding the cache's memory as well as its count. */
+    private static final int CACHE_MAX_PIECE_BYTES = 64;
 
     private final Map<String, Integer> vocab;
     private final byte[][] idToBytes;
@@ -241,7 +243,10 @@ public final class Tokenizer {
         int[] cached = cache.get(piece);
         if (cached == null) {
             cached = bpeUncached(piece);
-            if (cache.size() < CACHE_LIMIT) {
+            // Only short chunks are worth remembering (words, punctuation, short runs); long runs would let a
+            // single request fill the cache with megabytes per entry.
+            if (piece.length() <= CACHE_MAX_PIECE_BYTES && cache.size() < CACHE_LIMIT
+                    && piece.getBytes(StandardCharsets.UTF_8).length <= CACHE_MAX_PIECE_BYTES) {
                 cache.put(piece, cached);
             }
         }

@@ -128,6 +128,25 @@ public final class SmokeTest {
             check(Arrays.equals(a, b), "bpe equivalence on " + names[i] + " (" + a.length + " tokens)");
             check(ms < 1000, "encode " + names[i] + " in " + ms + " ms");
         }
+
+        // the BPE cache remembers short chunks only (<= 64 UTF-8 bytes), so long runs cannot fill the heap
+        Tokenizer fresh = Tokenizer.load(dir.resolve("tokenizer.json"));
+        Map<?, ?> cache = bpeCache(fresh);
+        fresh.encode("hello", false);
+        fresh.encode("b".repeat(64), false);
+        fresh.encode("c".repeat(65), false);
+        fresh.encode("é".repeat(40), false); // 40 chars but 80 UTF-8 bytes
+        fresh.encode(" ".repeat(20_000), false);
+        check(cache.containsKey("hello") && cache.containsKey("b".repeat(64)), "bpe cache keeps chunks <= 64 bytes");
+        check(!cache.containsKey("c".repeat(65)) && !cache.containsKey("é".repeat(40))
+                && !cache.containsKey(" ".repeat(20_000)), "bpe cache skips chunks > 64 bytes");
+        check(cache.size() == 2, "bpe cache size " + cache.size());
+    }
+
+    private static Map<?, ?> bpeCache(Tokenizer t) throws Exception {
+        java.lang.reflect.Field f = Tokenizer.class.getDeclaredField("cache");
+        f.setAccessible(true);
+        return (Map<?, ?>) f.get(t);
     }
 
     /** Verbatim copy of the original {@code Tokenizer} pipeline with the O(n^2) rescan-all-pairs merge loop. */
