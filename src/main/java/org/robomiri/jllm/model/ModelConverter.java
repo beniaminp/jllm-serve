@@ -14,19 +14,37 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 /**
- * Converts a Hugging Face checkpoint into a {@link QuantFile}, one layer at a time.
+ * Converts a Hugging Face checkpoint into a {@link QuantFile}, one unit (embedding, layer, final norm + head)
+ * at a time.
  *
  * <p>Shards are opened only when a tensor in them is needed and closed (and {@link ShardProvider#release
- * released}) as soon as every tensor they hold has been consumed, so at most two shards are open at any time.
+ * released}) as soon as every tensor the converter will ever read from them has been consumed, so at most two
+ * shards are open at any time. Tensors the converter never reads (e.g. {@code lm_head.weight} of a model with
+ * tied embeddings, or {@code rotary_emb.inv_freq} buffers) do not keep a shard alive.
  * MoE experts are stacked into two tensors per layer (gate/up for all experts, down for all experts).
  */
 public final class ModelConverter {
+
+    private static final String EMBED = "model.embed_tokens.weight";
+    private static final String FINAL_NORM = "model.norm.weight";
+    private static final String LM_HEAD = "lm_head.weight";
+
+    /** One conversion step: {@code inputs} are the checkpoint tensors it reads, {@code step} writes its outputs. */
+    private record Unit(String id, List<String> inputs, Step step) {
+    }
+
+    @FunctionalInterface
+    private interface Step {
+        void run(QuantFile.Writer w, Arena a) throws IOException;
+    }
 
     private final Path dir;
     private final ModelConfig cfg;
     private final QType quant;
     private final ShardProvider provider;
     private final Map<String, String> shardOf;
+    private final List<Unit> units;
+    /** Per shard: how many planned tensor reads are still outstanding. */
     private final Map<String, Integer> remaining = new HashMap<>();
     private final Map<String, SafeTensors> open = new LinkedHashMap<>();
 
@@ -36,8 +54,14 @@ public final class ModelConverter {
         this.quant = quant;
         this.provider = provider;
         this.shardOf = shardMap();
-        for (String shard : shardOf.values()) {
-            remaining.merge(shard, 1, Integer::sum);
+        this.units = plan();
+        for (Unit u : units) {
+            for (String name : u.inputs()) {
+                String shard = shardOf.get(name);
+                if (shard != null) {
+                    remaining.merge(shard, 1, Integer::sum);
+                }
+            }
         }
     }
 
@@ -51,57 +75,114 @@ public final class ModelConverter {
                     (System.nanoTime() - t0) / 1e9, w.bytesWritten() / 1e6, QuantFile.binPath(dir, quant));
         } finally {
             c.open.values().forEach(SafeTensors::close);
+            c.open.clear();
         }
     }
 
     private void run(QuantFile.Writer w) throws IOException {
-        // Embedding first: it is the largest single tensor and lives in the first shard.
-        try (Arena a = Arena.ofShared()) {
-            w.put("model.embed_tokens.weight", quantize(a, QType.Q8_0, tensor("model.embed_tokens.weight")));
-        }
-        done("model.embed_tokens.weight");
-
-        for (int l = 0; l < cfg.layers(); l++) {
-            String p = "model.layers." + l + ".";
-            List<String> used = new ArrayList<>();
+        for (int i = 0; i < units.size(); i++) {
+            Unit u = units.get(i);
             try (Arena a = Arena.ofShared()) {
-                for (String n : new String[]{"input_layernorm.weight", "post_attention_layernorm.weight",
-                        "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
-                    if (shardOf.containsKey(p + n)) {
-                        w.putFloats(p + n, tensor(p + n).toFloatArray());
-                        used.add(p + n);
-                    }
-                }
-                for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                    String name = p + "self_attn." + n + ".weight";
-                    w.put(name, quantize(a, quant, tensor(name)));
-                    used.add(name);
-                }
-                if (cfg.isMoeLayer(l)) {
-                    convertMoe(w, a, l, p, used);
-                } else {
-                    String g = p + "mlp.gate_proj.weight";
-                    String u = p + "mlp.up_proj.weight";
-                    String d = p + "mlp.down_proj.weight";
-                    w.put(p + "mlp.gate_up", stack(a, quant, List.of(tensor(g), tensor(u))));
-                    w.put(d, quantize(a, quant, tensor(d)));
-                    used.add(g);
-                    used.add(u);
-                    used.add(d);
-                }
+                u.step().run(w, a);
             }
-            used.forEach(this::done);
-            System.err.printf("\rConverting to %s: layer %d/%d (%.0f MB written)", quant, l + 1, cfg.layers(),
+            u.inputs().forEach(this::done);
+            System.err.printf("\rConverting to %s: %d/%d units (%.0f MB written)", quant, i + 1, units.size(),
                     w.bytesWritten() / 1e6);
         }
+        // Everything has been read: nothing may stay open, whatever the bookkeeping says.
+        for (String shard : new ArrayList<>(open.keySet())) {
+            release(shard);
+        }
+    }
 
-        try (Arena a = Arena.ofShared()) {
-            w.putFloats("model.norm.weight", tensor("model.norm.weight").toFloatArray());
-            done("model.norm.weight");
-            if (!cfg.tiedEmbeddings() && shardOf.containsKey("lm_head.weight")) {
-                w.put("lm_head.weight", quantize(a, QType.Q8_0, tensor("lm_head.weight")));
-                done("lm_head.weight");
+    // ------------------------------------------------------------------ plan
+
+    /** The ordered conversion units together with every checkpoint tensor each of them reads. */
+    private List<Unit> plan() {
+        List<Unit> units = new ArrayList<>();
+        // Embedding first: it is the largest single tensor and lives in the first shard.
+        units.add(new Unit("embed", List.of(EMBED), (w, a) -> w.put(EMBED, quantize(a, QType.Q8_0, tensor(EMBED)))));
+        for (int l = 0; l < cfg.layers(); l++) {
+            int layer = l;
+            String p = "model.layers." + l + ".";
+            List<String> in = new ArrayList<>(layerNorms(p));
+            for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                in.add(p + "self_attn." + n + ".weight");
             }
+            if (cfg.isMoeLayer(l)) {
+                in.add(routerName(p));
+                if (fusedExperts(p)) {
+                    in.add(p + "mlp.experts.gate_up_proj");
+                    in.add(p + "mlp.experts.down_proj");
+                } else {
+                    for (int i = 0; i < cfg.numExperts(); i++) {
+                        String ep = p + "mlp.experts." + i + ".";
+                        in.add(ep + "gate_proj.weight");
+                        in.add(ep + "up_proj.weight");
+                        in.add(ep + "down_proj.weight");
+                    }
+                }
+            } else {
+                in.add(p + "mlp.gate_proj.weight");
+                in.add(p + "mlp.up_proj.weight");
+                in.add(p + "mlp.down_proj.weight");
+            }
+            units.add(new Unit("layer." + l, List.copyOf(in), (w, a) -> convertLayer(w, a, layer, p)));
+        }
+        List<String> fin = new ArrayList<>(List.of(FINAL_NORM));
+        if (hasLmHead()) {
+            fin.add(LM_HEAD);
+        }
+        units.add(new Unit("final", List.copyOf(fin), (w, a) -> {
+            w.putFloats(FINAL_NORM, tensor(FINAL_NORM).toFloatArray());
+            if (hasLmHead()) {
+                w.put(LM_HEAD, quantize(a, QType.Q8_0, tensor(LM_HEAD)));
+            }
+        }));
+        return units;
+    }
+
+    private List<String> layerNorms(String p) {
+        List<String> out = new ArrayList<>(4);
+        for (String n : new String[]{"input_layernorm.weight", "post_attention_layernorm.weight",
+                "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+            if (shardOf.containsKey(p + n)) {
+                out.add(p + n);
+            }
+        }
+        return out;
+    }
+
+    private String routerName(String p) {
+        return shardOf.containsKey(p + "mlp.gate.weight") ? p + "mlp.gate.weight" : p + "mlp.router.weight";
+    }
+
+    private boolean fusedExperts(String p) {
+        return shardOf.containsKey(p + "mlp.experts.gate_up_proj");
+    }
+
+    private boolean hasLmHead() {
+        return !cfg.tiedEmbeddings() && shardOf.containsKey(LM_HEAD);
+    }
+
+    // ------------------------------------------------------------------ steps
+
+    private void convertLayer(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
+        for (String n : layerNorms(p)) {
+            w.putFloats(n, tensor(n).toFloatArray());
+        }
+        for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+            String name = p + "self_attn." + n + ".weight";
+            w.put(name, quantize(a, quant, tensor(name)));
+        }
+        if (cfg.isMoeLayer(l)) {
+            convertMoe(w, a, l, p);
+        } else {
+            String g = p + "mlp.gate_proj.weight";
+            String u = p + "mlp.up_proj.weight";
+            String d = p + "mlp.down_proj.weight";
+            w.put(p + "mlp.gate_up", stack(a, quant, List.of(tensor(g), tensor(u))));
+            w.put(d, quantize(a, quant, tensor(d)));
         }
     }
 
@@ -111,14 +192,12 @@ public final class ModelConverter {
      * {@code [E, 2m, dim]}, {@code mlp.experts.down_proj [E, dim, m]}, router {@code mlp.router.weight}).
      * Both end up as the same stacked {@code [E*2m, dim]} and {@code [E*dim, m]} matrices.
      */
-    private void convertMoe(QuantFile.Writer w, Arena a, int l, String p, List<String> used) throws IOException {
+    private void convertMoe(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
         int e = cfg.numExperts();
         int m = cfg.moeDim();
-        String router = shardOf.containsKey(p + "mlp.gate.weight") ? p + "mlp.gate.weight" : p + "mlp.router.weight";
-        w.putFloats(p + "mlp.router", tensor(router).toFloatArray());
-        used.add(router);
+        w.putFloats(p + "mlp.router", tensor(routerName(p)).toFloatArray());
 
-        if (shardOf.containsKey(p + "mlp.experts.gate_up_proj")) {
+        if (fusedExperts(p)) {
             SafeTensors.Tensor gu = tensor(p + "mlp.experts.gate_up_proj");
             SafeTensors.Tensor dn = tensor(p + "mlp.experts.down_proj");
             if (gu.shape().length != 3 || gu.dim(0) != e || gu.dim(1) != 2 * m || gu.dim(2) != cfg.dim()
@@ -127,8 +206,6 @@ public final class ModelConverter {
             }
             w.put(p + "mlp.experts.gate_up", quantize(a, quant, flatten(gu)));
             w.put(p + "mlp.experts.down", quantize(a, quant, flatten(dn)));
-            used.add(gu.name());
-            used.add(dn.name());
             return;
         }
 
@@ -145,9 +222,6 @@ public final class ModelConverter {
             gu.add(gate);   // rows [i*2m, i*2m+m) = gate_i
             gu.add(up);     // rows [i*2m+m, (i+1)*2m) = up_i
             downs.add(down);
-            used.add(gate.name());
-            used.add(up.name());
-            used.add(down.name());
         }
         w.put(p + "mlp.experts.gate_up", stack(a, quant, gu));
         w.put(p + "mlp.experts.down", stack(a, quant, downs));
@@ -200,20 +274,29 @@ public final class ModelConverter {
         return st.get(name);
     }
 
-    /** Marks a tensor consumed; closes and releases its shard once nothing else in it is needed. */
+    /** Marks a planned tensor read consumed; closes and releases its shard once nothing else in it is needed. */
     private void done(String name) {
         String shard = shardOf.get(name);
-        int left = remaining.merge(shard, -1, Integer::sum);
-        if (left <= 0) {
-            SafeTensors st = open.remove(shard);
-            if (st != null) {
-                st.close();
-            }
-            try {
-                provider.release(ShardProvider.checkName(dir, shard));
-            } catch (IOException e) {
-                System.err.println("warning: could not release " + shard + ": " + e.getMessage());
-            }
+        if (shard == null) {
+            return;
+        }
+        Integer left = remaining.computeIfPresent(shard, (k, v) -> v - 1);
+        if (left != null && left <= 0) {
+            release(shard);
+        }
+    }
+
+    /** Closes {@code shard} if it is open and hands it back to the provider (which may delete it). */
+    private void release(String shard) {
+        remaining.remove(shard);
+        SafeTensors st = open.remove(shard);
+        if (st != null) {
+            st.close();
+        }
+        try {
+            provider.release(ShardProvider.checkName(dir, shard));
+        } catch (IOException e) {
+            System.err.println("warning: could not release " + shard + ": " + e.getMessage());
         }
     }
 
