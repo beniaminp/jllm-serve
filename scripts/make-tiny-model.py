@@ -29,6 +29,8 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
   gemma3mm   the same decoder in the multimodal wrapper layout (Gemma3ForConditionalGeneration, text_config,
              tensors under language_model.model.*, plus dummy vision tensors that must be ignored)
   mamba      Mamba v1: d_model 64, d_inner 128, state 16, conv 4, dt_rank 4 (ceil(64/16)), 3 layers, tied head
+  mamba130m  not tiny: random weights with the exact mamba-130m-hf shapes (24 layers, d_model 768, 515 MB) to
+             benchmark the Mamba backends without downloading the real checkpoint (output is gibberish)
   mamba3     Mamba v1: d_model 128, d_inner 256, state 8, conv 3, dt_rank 8 (ceil(128/16)), 2 layers, untied head
 """
 import json
@@ -97,6 +99,11 @@ FAMILIES = {
     "mamba": dict(
         architectures=["MambaForCausalLM"], model_type="mamba", hidden_size=64, state_size=16, conv_kernel=4,
         expand=2, intermediate_size=128, time_step_rank=4, num_hidden_layers=3, vocab_size=1000,
+        layer_norm_epsilon=1e-5, use_bias=False, use_conv_bias=True, hidden_act="silu",
+        bos_token_id=0, eos_token_id=0),
+    "mamba130m": dict(
+        architectures=["MambaForCausalLM"], model_type="mamba", hidden_size=768, state_size=16, conv_kernel=4,
+        expand=2, intermediate_size=1536, time_step_rank=48, num_hidden_layers=24, vocab_size=50280,
         layer_norm_epsilon=1e-5, use_bias=False, use_conv_bias=True, hidden_act="silu",
         bos_token_id=0, eos_token_id=0),
     "mamba3": dict(
