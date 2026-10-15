@@ -161,11 +161,11 @@ public final class Main {
             throw e;
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + kvDtype);
-        return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok), s.getLong("server.queue-timeout-ms")));
+        return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok, cfg), s.getLong("server.queue-timeout-ms")));
     }
 
-    private static Set<Integer> eosIds(Path dir, Tokenizer tok) throws Exception {
-        Set<Integer> ids = new HashSet<>();
+    private static Set<Integer> eosIds(Path dir, Tokenizer tok, ModelConfig cfg) throws Exception {
+        Set<Integer> ids = new HashSet<>(cfg.eosTokenIds());
         Path gen = dir.resolve("generation_config.json");
         if (Files.isRegularFile(gen)) {
             Object eos = Json.parseObject(Files.readString(gen)).get("eos_token_id");
@@ -177,7 +177,9 @@ public final class Main {
                 }
             }
         }
-        for (String name : new String[]{"<|im_end|>", "<|endoftext|>"}) {
+        // Family stop tokens: ChatML (Qwen), Llama 3 end-of-turn / end-of-text, Mistral / Llama 2 </s>.
+        // TODO: pick the chat template with ChatTemplate.forModelType(cfg.modelType()) once that method exists.
+        for (String name : new String[]{"<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>"}) {
             int id = tok.tokenId(name);
             if (id >= 0) {
                 ids.add(id);

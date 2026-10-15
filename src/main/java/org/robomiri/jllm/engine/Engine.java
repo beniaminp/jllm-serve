@@ -96,6 +96,14 @@ public final class Engine implements AutoCloseable {
      * @throws OverloadedException if the engine stayed busy with other requests for longer than the queue timeout
      */
     public Result generate(int[] promptTokens, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
+        int bos = cfg.promptBosId();
+        if (bos >= 0 && (promptTokens.length == 0 || promptTokens[0] != bos)) {
+            // Llama / Mistral models were trained with a BOS token in front of every sequence.
+            int[] withBos = new int[promptTokens.length + 1];
+            withBos[0] = bos;
+            System.arraycopy(promptTokens, 0, withBos, 1, promptTokens.length);
+            promptTokens = withBos;
+        }
         if (promptTokens.length == 0) {
             promptTokens = new int[]{eosIds.iterator().next()};
         }
