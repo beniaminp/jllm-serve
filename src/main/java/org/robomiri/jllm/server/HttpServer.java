@@ -15,6 +15,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A small HTTP/1.1 server on plain sockets, one virtual thread per connection. Supports keep-alive,
@@ -23,7 +25,25 @@ import java.util.concurrent.Executors;
 public final class HttpServer implements AutoCloseable {
 
     private static final int MAX_HEADER = 64 * 1024;
-    private static final long MAX_BODY = 32L * 1024 * 1024;
+
+    /**
+     * Connection limits (the {@code server.*} keys in {@code jllm.properties}).
+     *
+     * @param readTimeoutMs  socket read timeout while waiting for a request or its body, 0 = none
+     * @param maxConnections simultaneous connections; further ones wait in the kernel accept queue
+     * @param maxBodyBytes   largest accepted request body
+     */
+    public record Options(int readTimeoutMs, int maxConnections, long maxBodyBytes) {
+        public Options {
+            if (readTimeoutMs < 0 || maxConnections < 1 || maxBodyBytes < 0) {
+                throw new IllegalArgumentException("invalid server options: " + this);
+            }
+        }
+
+        public static Options defaults() {
+            return new Options(30_000, 256, 4L * 1024 * 1024);
+        }
+    }
 
     public static final class Request {
         public final String method;
@@ -128,11 +148,19 @@ public final class HttpServer implements AutoCloseable {
 
     private final ServerSocket socket;
     private final Handler handler;
+    private final Options options;
+    private final Semaphore connections;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private volatile boolean closed;
 
     public HttpServer(String host, int port, Handler handler) throws IOException {
+        this(host, port, Options.defaults(), handler);
+    }
+
+    public HttpServer(String host, int port, Options options, Handler handler) throws IOException {
         this.handler = handler;
+        this.options = options;
+        this.connections = new Semaphore(options.maxConnections());
         this.socket = new ServerSocket();
         socket.setReuseAddress(true);
         socket.bind(new InetSocketAddress(host, port));
@@ -145,22 +173,48 @@ public final class HttpServer implements AutoCloseable {
     /** Accepts connections until {@link #close()}; blocks the calling thread. */
     public void serve() {
         while (!closed) {
+            try {
+                // hold the permit before accept() so connections beyond the cap wait in the kernel backlog
+                if (!connections.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+                    continue;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
             Socket s;
             try {
                 s = socket.accept();
             } catch (IOException e) {
+                connections.release();
                 if (closed) {
+                    return;
+                }
+                try {
+                    Thread.sleep(100); // e.g. out of file descriptors: back off instead of spinning
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
                     return;
                 }
                 continue;
             }
-            executor.submit(() -> connection(s));
+            try {
+                executor.submit(() -> connection(s));
+            } catch (RuntimeException e) { // executor shut down
+                connections.release();
+                try {
+                    s.close();
+                } catch (IOException ignored) {
+                    // nothing to do
+                }
+            }
         }
     }
 
     private void connection(Socket s) {
         try (s) {
             s.setTcpNoDelay(true);
+            s.setSoTimeout(options.readTimeoutMs());
             InputStream in = new BufferedInputStream(s.getInputStream());
             OutputStream out = new BufferedOutputStream(s.getOutputStream(), 1 << 16);
             while (!closed) {
@@ -191,12 +245,14 @@ public final class HttpServer implements AutoCloseable {
                 }
             }
         } catch (IOException ignored) {
-            // client went away
+            // client went away (or the read timeout expired)
+        } finally {
+            connections.release();
         }
     }
 
     /** Returns null at EOF before any request bytes. */
-    private static Request readRequest(InputStream in) throws IOException {
+    private Request readRequest(InputStream in) throws IOException {
         String requestLine = readLine(in);
         if (requestLine == null) {
             return null;
@@ -231,7 +287,7 @@ public final class HttpServer implements AutoCloseable {
         String cl = headers.get("content-length");
         if (cl != null) {
             long len = Long.parseLong(cl.trim());
-            if (len < 0 || len > MAX_BODY) {
+            if (len < 0 || len > options.maxBodyBytes()) {
                 throw new IOException("body too large");
             }
             body = in.readNBytes((int) len);
@@ -244,7 +300,7 @@ public final class HttpServer implements AutoCloseable {
         return new Request(parts[0], parts[1], headers, body);
     }
 
-    private static byte[] readChunked(InputStream in) throws IOException {
+    private byte[] readChunked(InputStream in) throws IOException {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         while (true) {
             String sizeLine = readLine(in);
@@ -259,7 +315,7 @@ public final class HttpServer implements AutoCloseable {
                 }
                 return bos.toByteArray();
             }
-            if (bos.size() + size > MAX_BODY) {
+            if (bos.size() + size > options.maxBodyBytes()) {
                 throw new IOException("body too large");
             }
             byte[] chunk = in.readNBytes(size);

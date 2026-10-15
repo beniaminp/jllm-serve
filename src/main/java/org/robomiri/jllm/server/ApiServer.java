@@ -18,6 +18,17 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class ApiServer implements AutoCloseable {
 
+    /**
+     * @param sampling        sampling values used when a request omits a field
+     * @param thinkingDefault whether Qwen3 thinking is on when a request does not say
+     * @param http            connection limits of the underlying HTTP server
+     */
+    public record Options(SamplingParams sampling, boolean thinkingDefault, HttpServer.Options http) {
+        public static Options defaults() {
+            return new Options(SamplingParams.defaults(), false, HttpServer.Options.defaults());
+        }
+    }
+
     private final Engine engine;
     private final String modelId;
     private final HttpServer http;
@@ -26,20 +37,20 @@ public final class ApiServer implements AutoCloseable {
     private final boolean thinkingDefault;
 
     public ApiServer(Engine engine, String modelId, String host, int port) throws IOException {
-        this(engine, modelId, host, port, SamplingParams.defaults(), false);
+        this(engine, modelId, host, port, Options.defaults());
     }
 
-    /**
-     * @param defaults        sampling values used when a request omits a field
-     * @param thinkingDefault whether Qwen3 thinking is on when a request does not say
-     */
     public ApiServer(Engine engine, String modelId, String host, int port, SamplingParams defaults,
                      boolean thinkingDefault) throws IOException {
+        this(engine, modelId, host, port, new Options(defaults, thinkingDefault, HttpServer.Options.defaults()));
+    }
+
+    public ApiServer(Engine engine, String modelId, String host, int port, Options options) throws IOException {
         this.engine = engine;
         this.modelId = modelId;
-        this.defaults = defaults;
-        this.thinkingDefault = thinkingDefault;
-        this.http = new HttpServer(host, port, this::handle);
+        this.defaults = options.sampling();
+        this.thinkingDefault = options.thinkingDefault();
+        this.http = new HttpServer(host, port, options.http(), this::handle);
     }
 
     public int port() {

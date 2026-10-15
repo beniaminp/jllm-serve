@@ -14,6 +14,7 @@ import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
+import org.robomiri.jllm.server.HttpServer;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 
@@ -230,7 +231,12 @@ public final class Main {
     private static void serve(Engine engine, String model, Settings s) throws Exception {
         int port = s.getInt("server.port");
         String host = s.get("server.host");
-        try (engine; ApiServer server = new ApiServer(engine, model, host, port, s.sampling(), s.getBool("chat.thinking"))) {
+        HttpServer.Options http = new HttpServer.Options(
+                s.getInt("server.read-timeout-ms"),
+                s.getInt("server.max-connections"),
+                s.getLong("server.max-body-bytes"));
+        ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"), http);
+        try (engine; ApiServer server = new ApiServer(engine, model, host, port, options)) {
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();
         }
