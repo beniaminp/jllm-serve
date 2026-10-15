@@ -4,7 +4,7 @@ reference chat renders (the official Jinja chat_template via jinja2) for every t
 Tokenizer / ChatTemplate support.
 
 Usage:  python3 -m venv /tmp/tokv && /tmp/tokv/bin/pip install tokenizers jinja2
-        /tmp/tokv/bin/python3 gen_tokenizer_fixtures.py /tmp/jllm-tokenizers <out dir>
+        /tmp/tokv/bin/python3 gen_tokenizer_fixtures.py /tmp/jllm-tokenizers <out dir> [random string count]
 
 <tokenizer dir>/<name>/ holds tokenizer.json, tokenizer_config.json (downloaded from the Hugging Face repos
 listed in docs/04-tokenizer.md); no model weights are needed.
@@ -106,10 +106,30 @@ def make_env():
     return env
 
 
-def main(src, dst):
+def id_sequences(tk, n, seed):
+    """Random id sequences (decode-only cases). Byte-fallback tokens above 0x7F are left out: the reference
+    decoder turns lone high bytes into one U+FFFD each, which no consumer relies on."""
+    import re
+    rnd = random.Random(seed)
+    size = tk.get_vocab_size(with_added_tokens=True)
+    out = []
+    while len(out) < n:
+        seq = []
+        for _ in range(rnd.randint(1, 12)):
+            for _try in range(50):
+                i = rnd.randrange(size)
+                t = tk.id_to_token(i)
+                if t is not None and not re.fullmatch(r"<0x[89A-F][0-9A-F]>", t):
+                    seq.append(i)
+                    break
+        out.append(seq)
+    return out
+
+
+def main(src, dst, n_random=60):
     os.makedirs(dst, exist_ok=True)
     env = make_env()
-    rnd_strings = random_strings(60, 20240601)
+    rnd_strings = random_strings(n_random, 20240601)
     for name in NAMES:
         d = os.path.join(src, name)
         tk = Tokenizer.from_file(os.path.join(d, "tokenizer.json"))
@@ -119,6 +139,8 @@ def main(src, dst):
             ids = tk.encode(text, add_special_tokens=False).ids
             dec = tk.decode(ids, skip_special_tokens=False)
             fixture["cases"].append({"text": text, "ids": ids, "decoded": dec})
+        fixture["idseqs"] = [{"ids": q, "decoded": tk.decode(q, skip_special_tokens=False)}
+                             for q in id_sequences(tk, 40, 7)]
         template = cfg.get("chat_template")
         if isinstance(template, list):
             template = next(t["template"] for t in template if t.get("name") == "default")
@@ -148,4 +170,4 @@ def main(src, dst):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 60)
