@@ -14,7 +14,6 @@ import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -36,12 +35,7 @@ public final class ArchSmoke {
         if (!metal) {
             System.out.println("note: Metal unavailable, comparing nothing on the GPU");
         }
-        List<QType> quants = new ArrayList<>(List.of(QType.Q4_0, QType.Q8_0));
-        try {
-            quants.add(QType.valueOf("Q2_K"));
-        } catch (IllegalArgumentException e) {
-            // Q2_K lives on another branch
-        }
+        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K);
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
