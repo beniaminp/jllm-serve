@@ -169,6 +169,9 @@ public final class Engine implements AutoCloseable {
         while (reuse < max && cached[reuse] == prompt[reuse]) {
             reuse++;
         }
+        if (!backend.supportsPrefixReuse() && reuse < cachedLen) {
+            reuse = 0; // a recurrent state cannot be rewound: only an exact extension of the cached tokens is reusable
+        }
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
         cachedLen = 0;

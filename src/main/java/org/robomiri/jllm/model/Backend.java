@@ -19,6 +19,15 @@ public interface Backend extends AutoCloseable {
      */
     void forward(int[] tokens, int off, int n, int pos, float[] logits);
 
+    /**
+     * Whether the state after tokens {@code [0, N)} can be rewound to an earlier position. A KV cache can (positions
+     * past {@code pos} are simply overwritten); a recurrent state (Mamba) cannot, so the engine then reuses the
+     * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.
+     */
+    default boolean supportsPrefixReuse() {
+        return true;
+    }
+
     @Override
     void close();
 }
