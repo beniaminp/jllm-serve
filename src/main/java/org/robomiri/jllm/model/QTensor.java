@@ -41,7 +41,12 @@ public final class QTensor {
     }
 
     public int blocksPerRow() {
-        return cols / QType.BLOCK;
+        return blocksPerRow(type, cols);
+    }
+
+    /** Blocks per row; a Q2_K row that is not a multiple of 256 ends with a partial super-block. */
+    private static int blocksPerRow(QType type, int cols) {
+        return (cols + type.blockSize - 1) / type.blockSize;
     }
 
     /** Byte offset of row {@code r}'s first quantized block. */
@@ -55,12 +60,12 @@ public final class QTensor {
     }
 
     public static long scalesOffset(QType type, int rows, int cols) {
-        return align((long) rows * (cols / QType.BLOCK) * type.blockBytes, 64);
+        return align((long) rows * blocksPerRow(type, cols) * type.blockBytes, 64);
     }
 
     /** Total bytes of the segment holding a {@code rows × cols} tensor of {@code type}. */
     public static long byteSize(QType type, int rows, int cols) {
-        return align(scalesOffset(type, rows, cols) + (long) rows * (cols / QType.BLOCK) * Float.BYTES, PAGE);
+        return align(scalesOffset(type, rows, cols) + (long) rows * blocksPerRow(type, cols) * type.scaleBytes, PAGE);
     }
 
     /** Wraps an existing segment in the layout produced by {@link #quantize} (e.g. a memory-mapped file). */
@@ -89,7 +94,12 @@ public final class QTensor {
             byte[] q = qBuf.get();
             float[] s = sBuf.get();
             src.row(r, row);
-            if (type == QType.Q4_0) {
+            if (type == QType.Q2_K) {
+                for (int b = 0; b < nb; b++) {
+                    int off = b * Q2K.BLOCK;
+                    Q2K.quantizeBlock(row, off, Math.min(Q2K.BLOCK, cols - off), q, b * Q2K.BLOCK_BYTES);
+                }
+            } else if (type == QType.Q4_0) {
                 for (int b = 0; b < nb; b++) {
                     s[b] = quantizeBlockQ4(row, b * QType.BLOCK, q, b * 16);
                 }
@@ -99,7 +109,9 @@ public final class QTensor {
                 }
             }
             MemorySegment.copy(q, 0, seg, ValueLayout.JAVA_BYTE, t.rowOffset(r), rowBytes);
-            MemorySegment.copy(s, 0, seg, ValueLayout.JAVA_FLOAT, t.scaleOffset(r), nb);
+            if (type.scaleBytes > 0) {
+                MemorySegment.copy(s, 0, seg, ValueLayout.JAVA_FLOAT, t.scaleOffset(r), nb);
+            }
         });
         return t;
     }
@@ -144,6 +156,10 @@ public final class QTensor {
 
     /** Dequantizes row {@code r} into {@code dst[off .. off + cols)}. */
     public void dequantizeRow(int r, float[] dst, int off) {
+        if (type == QType.Q2_K) {
+            Q2K.dequantizeRow(data, rowOffset(r), cols, dst, off);
+            return;
+        }
         int nb = blocksPerRow();
         long q = rowOffset(r);
         long s = scaleOffset(r);
