@@ -226,6 +226,10 @@ public final class MetalBackend implements Backend {
             moeGateUp = null;
             moeHidden = null;
         }
+        if (ctx > c.maxPositions()) {
+            System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
+                    + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
+        }
         long ws = metal.recommendedWorkingSet();
         if (w.byteSize() > ws) {
             System.err.printf("warning: weights (%.1f GB) exceed Metal's recommended working set (%.1f GB); expect paging%n",
@@ -321,7 +325,8 @@ public final class MetalBackend implements Backend {
             }
         }
         if (logits != null) {
-            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0, w.lmHead.rows);
+            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
+                    Math.min(w.lmHead.rows, logits.length));
         }
     }
 
