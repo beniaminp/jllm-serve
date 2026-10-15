@@ -10,8 +10,8 @@ import org.robomiri.jllm.model.Rope;
 import java.util.Arrays;
 
 /**
- * Qwen3 forward pass on the CPU: quantized matmuls with the Vector API, multithreaded over output rows
- * (decode) or row groups (prefill), f32 or f16 KV cache on the Java heap ({@link KvCache}).
+ * Decoder forward pass on the CPU (Llama, Mistral, Qwen2, Qwen3): quantized matmuls with the Vector API,
+ * multithreaded over output rows (decode) or row groups (prefill), f32 or f16 KV cache on the Java heap ({@link KvCache}).
  */
 public final class CpuBackend implements Backend {
 
@@ -54,7 +54,7 @@ public final class CpuBackend implements Backend {
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.pool = new ThreadPool(threads);
-        this.rope = new Rope(c.headDim(), c.ropeTheta(), ctx);
+        this.rope = Rope.of(c, ctx);
         kv = KvCache.create(kvDtype, c, ctx);
         kStage = new float[maxBatch * c.kvDim()];
         vStage = new float[maxBatch * c.kvDim()];
@@ -112,6 +112,11 @@ public final class CpuBackend implements Backend {
             matmul(L.wq, xb, q, 0, n, false);
             matmul(L.wk, xb, kStage, 0, n, false);
             matmul(L.wv, xb, vStage, 0, n, false);
+            if (L.bq != null) {
+                addBias(q, 0, L.bq, n);
+                addBias(kStage, 0, L.bk, n);
+                addBias(vStage, 0, L.bv, n);
+            }
             normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
             normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos);
             kv.store(l, pos, kStage, vStage, n);
@@ -190,6 +195,16 @@ public final class CpuBackend implements Backend {
         });
     }
 
+    /** buf[off + t*bias.length + i] += bias[i] for n rows (Qwen2 q/k/v bias). */
+    private static void addBias(float[] buf, int off, float[] bias, int n) {
+        for (int t = 0; t < n; t++) {
+            int o = off + t * bias.length;
+            for (int i = 0; i < bias.length; i++) {
+                buf[o + i] += bias[i];
+            }
+        }
+    }
+
     /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
     private void normRope(float[] v, int base, int stride, int nHeads, float[] norm, int n, int pos) {
         int hd = c.headDim();
@@ -229,6 +244,7 @@ public final class CpuBackend implements Backend {
         int qDim = c.qDim();
         int group = nh / c.kvHeads();
         float scale = (float) (1.0 / Math.sqrt(hd));
+        int window = c.windowFor(layer); // 0 = full causal attention
         pool.forRange(n * nh, 1, (i0, i1) -> {
             float[] sc = scratch.get();
             for (int i = i0; i < i1; i++) {
@@ -237,21 +253,22 @@ public final class CpuBackend implements Backend {
                 int ko = (h / group) * hd;
                 int qo = t * qDim + h * hd;
                 int len = pos + t + 1;
+                int first = window > 0 ? Math.max(0, len - window) : 0;
                 float max = Float.NEGATIVE_INFINITY;
-                for (int s = 0; s < len; s++) {
+                for (int s = first; s < len; s++) {
                     float d = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;
                     sc[s] = d;
                     max = Math.max(max, d);
                 }
                 float sum = 0;
-                for (int s = 0; s < len; s++) {
+                for (int s = first; s < len; s++) {
                     float e = (float) Math.exp(sc[s] - max);
                     sc[s] = e;
                     sum += e;
                 }
                 float inv = 1f / sum;
                 Arrays.fill(att, qo, qo + hd, 0f);
-                for (int s = 0; s < len; s++) {
+                for (int s = first; s < len; s++) {
                     VectorKernels.axpy(sc[s] * inv, vc, s * kvDim + ko, att, qo, hd);
                 }
             }

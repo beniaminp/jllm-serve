@@ -240,6 +240,7 @@ struct AttnParams {
     float scale;
     int qStride;
     int kvStride;
+    int window; // sliding-window length in tokens, 0 = full causal attention
 };
 
 kernel void attention(device const float *q [[buffer(0)]],
@@ -263,6 +264,7 @@ kernel void attention(device const float *q [[buffer(0)]],
     const int t = int(tgp.y);
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
     const int per = p.headDim / 32;
     device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
     device float *sc = scores + ((ulong)t * p.nHeads + h) * p.ctx;
@@ -274,7 +276,7 @@ kernel void attention(device const float *q [[buffer(0)]],
 
     // 1. scores
     float mx = -INFINITY;
-    for (int s = sg; s < len; s += nsg) {
+    for (int s = first + sg; s < len; s += nsg) {
         device const float *kv = kb + (ulong)s * p.kvStride;
         float d = 0.0f;
         for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * kv[lane + i * 32];
@@ -287,7 +289,7 @@ kernel void attention(device const float *q [[buffer(0)]],
 
     // 2. softmax numerators
     float sum = 0.0f;
-    for (int s = tid; s < len; s += tpg) {
+    for (int s = first + tid; s < len; s += tpg) {
         float e = exp(sc[s] - mx);
         sc[s] = e;
         sum += e;
@@ -298,7 +300,7 @@ kernel void attention(device const float *q [[buffer(0)]],
     // 3. weighted sum of values, split over simdgroups then reduced
     float o[8];
     for (int i = 0; i < 8; i++) o[i] = 0.0f;
-    for (int s = sg; s < len; s += nsg) {
+    for (int s = first + sg; s < len; s += nsg) {
         const float pr = sc[s];
         device const float *vv = vb + (ulong)s * p.kvStride;
         for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * vv[lane + i * 32];
@@ -503,6 +505,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
     const int t = int(tgp.y);
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
     const int per = p.headDim / 32;
     device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
     device float *sc = scores + ((ulong)t * p.nHeads + h) * p.ctx;
@@ -514,7 +517,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 
     // 1. scores
     float mx = -INFINITY;
-    for (int s = sg; s < len; s += nsg) {
+    for (int s = first + sg; s < len; s += nsg) {
         device const KV *kv = kb + (ulong)s * p.kvStride;
         float d = 0.0f;
         for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
@@ -527,7 +530,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 
     // 2. softmax numerators
     float sum = 0.0f;
-    for (int s = tid; s < len; s += tpg) {
+    for (int s = first + tid; s < len; s += tpg) {
         float e = exp(sc[s] - mx);
         sc[s] = e;
         sum += e;
@@ -538,7 +541,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
     // 3. weighted sum of values, split over simdgroups then reduced
     float o[8];
     for (int i = 0; i < 8; i++) o[i] = 0.0f;
-    for (int s = sg; s < len; s += nsg) {
+    for (int s = first + sg; s < len; s += nsg) {
         const float pr = sc[s];
         device const KV *vv = vb + (ulong)s * p.kvStride;
         for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
@@ -555,3 +558,19 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 
 typedef decltype(attention_kv<half>) attention_kv_t;
 template [[host_name("attention_h")]] kernel attention_kv_t attention_kv<half>;
+
+// ---------------------------------------------------------------------------------------------- bias
+// v[i] += b[i % width] for i < total (Qwen2 q/k/v projection bias; v is [ntok, width] row-major).
+
+struct BiasParams {
+    int width;
+    int total;
+};
+
+kernel void add_bias(device float *v [[buffer(0)]],
+                     device const float *b [[buffer(1)]],
+                     constant BiasParams &p [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.total) return;
+    v[gid] += b[int(gid) % p.width];
+}

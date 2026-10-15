@@ -100,6 +100,11 @@ abstract class KvCache {
 
         /** Causal grouped-query attention over this cache for tokens at positions [pos, pos+n); same math as f32. */
         void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att) {
+            attention(pool, layer, n, pos, q, att, 0);
+        }
+
+        /** @param window sliding-window length in tokens, 0 = full causal attention */
+        void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window) {
             short[] kc = key[layer];
             short[] vc = val[layer];
             int hd = headDim;
@@ -115,7 +120,8 @@ abstract class KvCache {
                     int ko = g * hd;
                     int qo0 = t * qDim + g * group * hd; // first query head of this kv head
                     int len = pos + t + 1;
-                    for (int s = 0; s < len; s++) {
+                    int first = window > 0 ? Math.max(0, len - window) : 0;
+                    for (int s = first; s < len; s++) {
                         toFloat(kc, s * kvDim + ko, sc, kOff, hd);
                         for (int h = 0; h < group; h++) {
                             sc[h * ctx + s] = VectorKernels.dot(q, qo0 + h * hd, sc, kOff, hd) * scale;
@@ -124,11 +130,11 @@ abstract class KvCache {
                     for (int h = 0; h < group; h++) {
                         int so = h * ctx;
                         float max = Float.NEGATIVE_INFINITY;
-                        for (int s = 0; s < len; s++) {
+                        for (int s = first; s < len; s++) {
                             max = Math.max(max, sc[so + s]);
                         }
                         float sum = 0;
-                        for (int s = 0; s < len; s++) {
+                        for (int s = first; s < len; s++) {
                             float e = (float) Math.exp(sc[so + s] - max);
                             sc[so + s] = e;
                             sum += e;
@@ -136,7 +142,7 @@ abstract class KvCache {
                         sc[invOff + h] = 1f / sum;
                         Arrays.fill(att, qo0 + h * hd, qo0 + (h + 1) * hd, 0f);
                     }
-                    for (int s = 0; s < len; s++) {
+                    for (int s = first; s < len; s++) {
                         toFloat(vc, s * kvDim + ko, sc, vOff, hd);
                         for (int h = 0; h < group; h++) {
                             VectorKernels.axpy(sc[h * ctx + s] * sc[invOff + h], sc, vOff, att, qo0 + h * hd, hd);

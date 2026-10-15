@@ -13,7 +13,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * Qwen3 forward pass on the GPU via Metal. Quantized weights are wrapped zero-copy (unified memory); the whole
+ * Decoder forward pass (Llama, Mistral, Qwen2, Qwen3) on the GPU via Metal. Quantized weights are wrapped zero-copy (unified memory); the whole
  * forward pass for a chunk of tokens is recorded into a single command buffer and executed with one round trip.
  */
 public final class MetalBackend implements Backend {
@@ -34,6 +34,7 @@ public final class MetalBackend implements Backend {
     private final int pNormRope;
     private final int pAttention;
     private final int pSilu;
+    private final int pAddBias;
     private final int pRouter;
     private final int pMoeUpQ4;
     private final int pMoeUpQ8;
@@ -80,6 +81,9 @@ public final class MetalBackend implements Backend {
         Metal.Buffer ffnNorm;
         Metal.Buffer qNorm;
         Metal.Buffer kNorm;
+        Metal.Buffer bq;
+        Metal.Buffer bk;
+        Metal.Buffer bv;
         Metal.Buffer wq;
         Metal.Buffer wk;
         Metal.Buffer wv;
@@ -115,6 +119,7 @@ public final class MetalBackend implements Backend {
         pNormRope = metal.pipeline("norm_rope");
         pAttention = metal.pipeline("attention");
         pSilu = metal.pipeline("silu_mul");
+        pAddBias = metal.pipeline("add_bias");
         pRouter = metal.pipeline("router");
         pMoeUpQ4 = metal.pipeline("moe_up_q4");
         pMoeUpQ8 = metal.pipeline("moe_up_q8");
@@ -136,6 +141,9 @@ public final class MetalBackend implements Backend {
             b.ffnNorm = upload(L.ffnNorm);
             b.qNorm = L.qNorm != null ? upload(L.qNorm) : null;
             b.kNorm = L.kNorm != null ? upload(L.kNorm) : null;
+            b.bq = L.bq != null ? upload(L.bq) : null;
+            b.bk = L.bk != null ? upload(L.bk) : null;
+            b.bv = L.bv != null ? upload(L.bv) : null;
             b.wq = metal.wrap(L.wq.data);
             b.wk = metal.wrap(L.wk.data);
             b.wv = metal.wrap(L.wv.data);
@@ -151,7 +159,7 @@ public final class MetalBackend implements Backend {
             layers[l] = b;
         }
         finalNorm = upload(w.finalNorm);
-        Rope rope = new Rope(c.headDim(), c.ropeTheta(), ctx);
+        Rope rope = Rope.of(c, ctx);
         ropeCos = upload(rope.cos);
         ropeSin = upload(rope.sin);
 
@@ -242,6 +250,11 @@ public final class MetalBackend implements Backend {
             long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
             matmul(W.wk, L.wk, xb, kDst, kvOff, n, false);
             matmul(W.wv, L.wv, xb, vDst, kvOff, n, false);
+            if (L.bq != null) {
+                addBias(q, 0, L.bq, n, c.qDim());
+                addBias(kDst, kvOff, L.bk, n, kvDim);
+                addBias(vDst, kvOff, L.bv, n, kvDim);
+            }
             normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
             normRope(kDst, kvOff, kvDim, c.kvHeads(), L.kNorm, n, pos);
             if (kvHalf) {
@@ -293,6 +306,14 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pipe, bufArgs, offArgs, 4, params, 16, gx, gy, 1, 32 * sgPerTg, 1, 1);
     }
 
+    private void addBias(Metal.Buffer v, long off, Metal.Buffer bias, int n, int width) {
+        bind(0, v, off);
+        bind(1, bias, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, n * width);
+        metal.dispatch(pAddBias, bufArgs, offArgs, 2, params, 8, (n * width + 255) / 256, 1, 1, 256, 1, 1);
+    }
+
     private void rmsnorm(Metal.Buffer in, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
         rmsnormAt(in, 0, weight, out, n, width);
     }
@@ -333,7 +354,8 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, (float) (1.0 / Math.sqrt(c.headDim())));
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
-        metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 32, c.heads(), n, 1, 256, 1, 1);
+        params.setAtIndex(ValueLayout.JAVA_INT, 8, c.windowFor(l));
+        metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 36, c.heads(), n, 1, 256, 1, 1);
     }
 
     /** f16 cache: rounds the n staged k/v rows into rows [pos, pos+n) of layer l's half caches. */
