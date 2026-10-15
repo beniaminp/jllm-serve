@@ -40,3 +40,4 @@ build/
 ### jllm-serve ###
 models/
 *.incomplete
+.claude/
