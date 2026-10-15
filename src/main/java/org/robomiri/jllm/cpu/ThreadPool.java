@@ -102,7 +102,19 @@ public final class ThreadPool implements AutoCloseable {
      * Runs {@code body} over {@code [0, n)} split into contiguous chunks of at least {@code grain} items.
      */
     public void forRange(int n, int grain, RangeBody body) {
-        int tasks = Math.min(threads * 4, Math.max(1, n / Math.max(1, grain)));
+        run(n, Math.min(threads * 4, Math.max(1, n / Math.max(1, grain))), body);
+    }
+
+    /**
+     * Runs {@code body} over {@code [0, n)} in chunks of exactly {@code chunk} items with no cap on the number of
+     * tasks. For loops whose items have very uneven cost (causal attention: later tokens see more keys) the fine
+     * grain keeps the tail short, since threads keep pulling small chunks until the last one is handed out.
+     */
+    public void forRangeFine(int n, int chunk, RangeBody body) {
+        run(n, Math.max(1, (n + chunk - 1) / Math.max(1, chunk)), body);
+    }
+
+    private void run(int n, int tasks, RangeBody body) {
         if (tasks <= 1 || threads == 1) {
             body.run(0, n);
             return;

@@ -372,7 +372,9 @@ public final class CpuBackend implements Backend {
         float scale = c.attnScale();
         float softcap = c.attnSoftcap();
         int window = c.windowFor(layer); // 0 = full causal attention
-        pool.forRange(n * nh, 1, (i0, i1) -> {
+        // one (token, head) pair per task: the work per pair grows with t, so contiguous chunks of pairs would
+        // leave the heaviest work to the last few tasks; a fine grain keeps the tail short
+        pool.forRangeFine(n * nh, 1, (i0, i1) -> {
             float[] sc = scratch.get();
             for (int i = i0; i < i1; i++) {
                 int t = i / nh;
