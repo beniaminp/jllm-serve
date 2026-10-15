@@ -42,6 +42,8 @@ public final class SmokeTest {
         ropeScaling();
         glmRope();
         modelConfigs();
+        longRope();
+        phi3Configs();
         System.out.println("all smoke tests passed");
     }
 
@@ -598,6 +600,100 @@ public final class SmokeTest {
             check(cfg(tmp, """
                     {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
                      "num_attention_heads":16,"head_dim":128,"vocab_size":151936}""").rotaryDim() == 128, "non-GLM rotates the full head");
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** LongRoPE (Phi-3) frequencies, attention factor and partial rotation against hand-computed values. */
+    static void longRope() {
+        // rotDim 8, theta 1e4: theta^(2i/8) = 1, 10, 100, 1000
+        double[] shortF = {1, 2, 4, 8};
+        double[] longF = {1, 1.5, 2, 4};
+        ModelConfig.RopeScaling sc = new ModelConfig.RopeScaling("longrope", 32, 1, 4, 4096, shortF, longF, 0);
+        double[] s = Rope.invFreq(8, 1e4, sc, 4096); // ctx <= original: short factors
+        check(s[0] == 1.0 && Math.abs(s[1] - 1 / 20.0) < 1e-15 && Math.abs(s[2] - 1 / 400.0) < 1e-15
+                && Math.abs(s[3] - 1 / 8000.0) < 1e-18, "longrope short factors: " + Arrays.toString(s));
+        double[] g = Rope.invFreq(8, 1e4, sc, 4097);  // ctx > original: long factors
+        check(g[0] == 1.0 && Math.abs(g[1] - 1 / 15.0) < 1e-15 && Math.abs(g[2] - 1 / 200.0) < 1e-15
+                && Math.abs(g[3] - 1 / 4000.0) < 1e-18, "longrope long factors: " + Arrays.toString(g));
+        // factor = 131072 / 4096 = 32: sqrt(1 + ln 32 / ln 4096) = sqrt(1 + 5/12) = sqrt(17/12) = 1.19023807
+        check(Math.abs(Rope.attentionFactor(sc) - Math.sqrt(17.0 / 12.0)) < 1e-12
+                && Math.abs(Rope.attentionFactor(sc) - 1.1902380714238083) < 1e-12, "longrope attention factor");
+        check(Rope.attentionFactor(new ModelConfig.RopeScaling("longrope", 1, 1, 4, 4096, shortF, longF, 0)) == 1.0,
+                "attention factor is 1 for factor <= 1");
+        check(Rope.attentionFactor(new ModelConfig.RopeScaling("longrope", 32, 1, 4, 4096, shortF, longF, 1.5)) == 1.5,
+                "attention_factor override");
+        check(Rope.attentionFactor(null) == 1.0 && Rope.attentionFactor(new ModelConfig.RopeScaling("llama3", 8, 1, 4, 8192)) == 1.0,
+                "other scalings have no attention factor");
+        // table: headDim 8 but only the first 4 dims rotate -> 2 pairs per position, scaled by the attention factor
+        Rope r = new Rope(4, 1e4, 3, sc);
+        double amp = Math.sqrt(17.0 / 12.0);
+        check(r.cos.length == 3 * 2 && r.sin.length == 3 * 2, "partial rope table size");
+        check(Math.abs(r.cos[0] - amp) < 1e-6 && r.sin[0] == 0, "position 0: cos = amp, sin = 0");
+        // frequencies use the rotated width: theta^(2i/4) = 1, 100, so pair 1 has inv = 1 / (2 * 100) = 0.005
+        // (ctx 3 <= 4096: short factors); position 2 -> angle 0.01
+        check(Math.abs(r.cos[2 * 2 + 1] - amp * Math.cos(0.01)) < 1e-6 && Math.abs(r.sin[2 * 2 + 1] - amp * Math.sin(0.01)) < 1e-6,
+                "longrope table value at position 2");
+        Rope plain = new Rope(8, 1e4, 3);
+        check(plain.cos.length == 3 * 4, "full rotation by default");
+    }
+
+    static void phi3Configs() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-phi");
+        try {
+            // Phi-3-mini-4k-instruct (Hub config): head_dim 96, MHA, window 2047, no scaling, BOS <s>
+            ModelConfig p3 = cfg(tmp, """
+                    {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":3072,"intermediate_size":8192,
+                     "num_hidden_layers":32,"num_attention_heads":32,"num_key_value_heads":32,"vocab_size":32064,
+                     "max_position_embeddings":4096,"original_max_position_embeddings":4096,"rms_norm_eps":1e-05,
+                     "rope_scaling":null,"rope_theta":10000.0,"sliding_window":2047,"tie_word_embeddings":false,
+                     "bos_token_id":1,"eos_token_id":32000,"attention_bias":false,"hidden_act":"silu"}""");
+            check(p3.headDim() == 96 && p3.rotaryDim() == 96 && p3.promptBosId() == -1 && p3.ropeScaling() == null && p3.windowFor(0) == 2047
+                    && p3.windowFor(31) == 2047 && !p3.qkNorm() && !p3.attentionBias()
+                    && p3.qDim() == 3072 && p3.kvDim() == 3072, "phi-3-mini config");
+            // Phi-4-mini-instruct: GQA 24/8, head_dim 128, partial_rotary_factor 0.75 (96 dims = 48 pairs), tied, BOS = <|endoftext|>
+            String f48 = "1.0" + (",1.0").repeat(47);
+            ModelConfig p4 = cfg(tmp, """
+                    {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":3072,"intermediate_size":8192,
+                     "num_hidden_layers":32,"num_attention_heads":24,"num_key_value_heads":8,"vocab_size":200064,
+                     "max_position_embeddings":131072,"original_max_position_embeddings":4096,"partial_rotary_factor":0.75,
+                     "rope_scaling":{"type":"longrope","short_factor":[%s],"long_factor":[%s]},"rope_theta":10000.0,
+                     "sliding_window":262144,"tie_word_embeddings":true,"bos_token_id":199999,"eos_token_id":199999}"""
+                    .formatted(f48, f48));
+            check(p4.headDim() == 128 && p4.rotaryDim() == 96 && p4.ropeScaling().type().equals("longrope")
+                    && p4.ropeScaling().shortFactor().length == 48 && p4.ropeScaling().originalMaxPositions() == 4096
+                    && p4.ropeScaling().factor() == 32 && p4.tiedEmbeddings() && p4.promptBosId() == -1
+                    && p4.windowFor(5) == 262144 && p4.qDim() == 3072 && p4.kvDim() == 1024, "phi-4-mini config");
+            check(Math.abs(Rope.attentionFactor(p4.ropeScaling()) - 1.1902380714238083) < 1e-12, "phi-4-mini attention factor");
+            // phi-4 (14B): 40/10 heads, head_dim 128, theta 250000, sliding_window null
+            ModelConfig p14 = cfg(tmp, """
+                    {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":5120,"intermediate_size":17920,
+                     "num_hidden_layers":40,"num_attention_heads":40,"num_key_value_heads":10,"vocab_size":100352,
+                     "max_position_embeddings":16384,"rope_scaling":null,"rope_theta":250000,"sliding_window":null,
+                     "tie_word_embeddings":false,"bos_token_id":100257,"eos_token_id":100265}""");
+            check(p14.headDim() == 128 && p14.windowFor(0) == 0 && p14.promptBosId() == -1 && p14.ropeTheta() == 250000
+                    && p14.eosTokenIds().equals(List.of(100265)), "phi-4 config");
+            // legacy 'su' name, original_max_position_embeddings only at the top level, factor = 4096 * 32 / 4096
+            ModelConfig su = cfg(tmp, """
+                    {"model_type":"phi3","hidden_size":128,"intermediate_size":192,"num_hidden_layers":2,
+                     "num_attention_heads":4,"vocab_size":100,"max_position_embeddings":131072,
+                     "original_max_position_embeddings":4096,
+                     "rope_scaling":{"type":"su","short_factor":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+                                     "long_factor":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]}}""");
+            check(su.ropeScaling().type().equals("longrope") && su.ropeScaling().factor() == 32
+                    && su.ropeScaling().longFactor()[3] == 2.0, "su is longrope");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, """
+                            {"model_type":"phi3","hidden_size":128,"intermediate_size":192,"num_hidden_layers":2,
+                             "num_attention_heads":4,"vocab_size":100,"partial_rotary_factor":0.75,
+                             "rope_scaling":{"type":"longrope","short_factor":[1,1],"long_factor":[1,1]}}""");
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "short_factor", "longrope factor count must be rotary_dim/2");
         } finally {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);

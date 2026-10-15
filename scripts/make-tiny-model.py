@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha
 
 All three use headDim = 32 so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -16,6 +16,11 @@ All three use headDim = 32 so the Metal backend (which needs a multiple of 32) c
   glm4       Glm4ForCausalLM: bias, head_dim 64, partial_rotary_factor 0.5, four norms per layer
              (post_self_attn_layernorm / post_mlp_layernorm), fused gate_up_proj
   llama3rope llama3 rope_scaling with original_max_position_embeddings=32 so every band of the rule is hit
+  phi3       Phi-3/4-mini layout: fused qkv_proj and gate_up_proj, longrope with original_max_position_embeddings=32
+             (the smoke tests run with ctx 64, so the long factors apply), partial_rotary_factor 0.75 (24 of 32
+             dims rotated), sliding_window=6 on all layers, GQA 4/2, untied head
+  phi3short  as phi3 but original_max_position_embeddings=128 (short factors), tied embeddings, no sliding window
+  phi3mha    Phi-3-mini / phi-4 style: headDim 64, MHA, plain RoPE (rope_scaling null), full rotation, sliding_window=6
 """
 import json
 import os
@@ -67,6 +72,30 @@ FAMILIES = {
 }
 
 
+def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
+    hd = hidden // heads
+    rot = int(hd * prf)
+    cfg = dict(
+        architectures=["Phi3ForCausalLM"], model_type="phi3", hidden_size=hidden, intermediate_size=192,
+        num_hidden_layers=3, num_attention_heads=heads, num_key_value_heads=kv, vocab_size=1000,
+        max_position_embeddings=512, original_max_position_embeddings=orig, rms_norm_eps=1e-5, rope_theta=theta,
+        hidden_act="silu", attention_bias=False, tie_word_embeddings=tied, sliding_window=window,
+        bos_token_id=1, eos_token_id=[2, 3], embd_pdrop=0.0, resid_pdrop=0.0, rope_scaling=None)
+    if prf != 1.0:
+        cfg["partial_rotary_factor"] = prf
+    if scaled:
+        n = rot // 2
+        cfg["rope_scaling"] = dict(type="longrope",
+                                   short_factor=[round(1.0 + 0.05 * i, 4) for i in range(n)],
+                                   long_factor=[round(1.0 + 0.6 * i, 4) for i in range(n)])
+    return cfg
+
+
+FAMILIES["phi3"] = phi3(128, 4, 2, 32, 0.75, 6, False, True)
+FAMILIES["phi3short"] = phi3(128, 4, 2, 128, 0.75, None, True, True)
+FAMILIES["phi3mha"] = phi3(256, 4, 4, 512, 1.0, 6, False, False)
+
+
 def main():
     if len(sys.argv) < 3 or sys.argv[2] not in FAMILIES:
         sys.exit(__doc__)
@@ -79,6 +108,7 @@ def main():
     glm = cfg["model_type"] in ("glm", "glm4")
     ffn, vocab = cfg["intermediate_size"], cfg["vocab_size"]
     bias = cfg["model_type"] == "qwen2" or (glm and cfg.get("attention_bias", True))
+    fused = cfg["model_type"] == "phi3"
 
     tensors = {}
 
@@ -93,9 +123,12 @@ def main():
         p = "model.layers.%d." % l
         vec(p + "input_layernorm.weight", d)
         vec(p + "post_attention_layernorm.weight", d)
-        mat(p + "self_attn.q_proj.weight", heads * hd, d)
-        mat(p + "self_attn.k_proj.weight", kv * hd, d)
-        mat(p + "self_attn.v_proj.weight", kv * hd, d)
+        if fused:  # rows: q (heads*hd), then k (kv*hd), then v (kv*hd)
+            mat(p + "self_attn.qkv_proj.weight", (heads + 2 * kv) * hd, d)
+        else:
+            mat(p + "self_attn.q_proj.weight", heads * hd, d)
+            mat(p + "self_attn.k_proj.weight", kv * hd, d)
+            mat(p + "self_attn.v_proj.weight", kv * hd, d)
         mat(p + "self_attn.o_proj.weight", d, heads * hd)
         if bias:
             vec(p + "self_attn.q_proj.bias", heads * hd, 0.0, 0.15)
@@ -104,8 +137,8 @@ def main():
         if cfg["model_type"] == "glm4":
             vec(p + "post_self_attn_layernorm.weight", d)
             vec(p + "post_mlp_layernorm.weight", d)
-        if glm:
-            mat(p + "mlp.gate_up_proj.weight", 2 * ffn, d)  # gate rows first, then up rows
+        if glm or fused:
+            mat(p + "mlp.gate_up_proj.weight", 2 * ffn, d)
         else:
             mat(p + "mlp.gate_proj.weight", ffn, d)
             mat(p + "mlp.up_proj.weight", ffn, d)

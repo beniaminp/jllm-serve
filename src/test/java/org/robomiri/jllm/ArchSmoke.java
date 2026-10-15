@@ -6,8 +6,10 @@ import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.ShardProvider;
+import org.robomiri.jllm.safetensors.SafeTensors;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -50,12 +52,62 @@ public final class ArchSmoke {
             for (QType q : quants) {
                 failures += run(dir, cfg, q, metal, lib);
             }
+            if (cfg.modelType().equals("phi3")) {
+                failures += checkFusedSplit(dir, cfg);
+            }
         }
         if (failures > 0) {
             System.out.println("FAILED: " + failures);
             System.exit(1);
         }
         System.out.println("arch smoke passed");
+    }
+
+    /**
+     * The converter must turn Phi-3's fused {@code qkv_proj} / {@code gate_up_proj} into the q/k/v cache tensors and
+     * {@code mlp.gate_up}: every dequantized row (Q8_0) equals the matching row of the fused checkpoint tensor
+     * within the quantization step, with the row ranges q, then k, then v / gate, then up.
+     */
+    private static int checkFusedSplit(Path dir, ModelConfig cfg) throws Exception {
+        int bad = 0;
+        try (ModelWeights w = ModelWeights.load(dir, cfg, QType.Q8_0, ShardProvider.local(dir));
+             SafeTensors st = SafeTensors.open(dir.resolve("model.safetensors"))) {
+            for (int l = 0; l < cfg.layers(); l++) {
+                String p = "model.layers." + l + ".";
+                SafeTensors.Tensor qkv = st.get(p + "self_attn.qkv_proj.weight");
+                SafeTensors.Tensor gu = st.get(p + "mlp.gate_up_proj.weight");
+                ModelWeights.Layer L = w.layers[l];
+                bad += compareRows(qkv, 0, L.wq, p + "q");
+                bad += compareRows(qkv, cfg.qDim(), L.wk, p + "k");
+                bad += compareRows(qkv, cfg.qDim() + cfg.kvDim(), L.wv, p + "v");
+                bad += compareRows(gu, 0, L.wGateUp, p + "gate_up");
+            }
+        }
+        System.out.println(dir.getFileName() + " fused qkv / gate_up split: " + (bad == 0 ? "ok" : bad + " BAD ROWS"));
+        return bad == 0 ? 0 : 1;
+    }
+
+    private static int compareRows(SafeTensors.Tensor fused, int rowStart, QTensor part, String what) {
+        int cols = part.cols;
+        float[] ref = new float[cols];
+        float[] got = new float[cols];
+        int bad = 0;
+        for (int r = 0; r < part.rows; r++) {
+            fused.toFloat((long) (rowStart + r) * cols, ref, 0, cols);
+            part.dequantizeRow(r, got, 0);
+            float max = 0;
+            for (float v : ref) {
+                max = Math.max(max, Math.abs(v));
+            }
+            for (int i = 0; i < cols; i++) {
+                if (Math.abs(ref[i] - got[i]) > max / 127f * 0.51f + 1e-7f) {
+                    System.out.println("  " + what + " row " + r + " col " + i + ": " + ref[i] + " vs " + got[i]);
+                    bad++;
+                    break;
+                }
+            }
+        }
+        return bad;
     }
 
     private static int run(Path dir, ModelConfig cfg, QType quant, boolean metal, String lib) throws Exception {
