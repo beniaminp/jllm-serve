@@ -1,6 +1,7 @@
 package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
@@ -38,6 +39,13 @@ public final class MetalBackend implements Backend {
     private final int pMoeUpQ8;
     private final int pMoeDownQ4;
     private final int pMoeDownQ8;
+    // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
+    // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
+    private final boolean kvHalf;
+    private final int pKvStoreHalf;
+    private final int pAttentionHalf;
+    private final Metal.Buffer kStage;
+    private final Metal.Buffer vStage;
 
     private final Metal.Buffer embedQ;
     private final Metal.Buffer lmHeadQ;
@@ -88,10 +96,15 @@ public final class MetalBackend implements Backend {
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib) {
+        this(w, ctx, maxBatch, metalLib, KvDtype.F32);
+    }
+
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
         this.w = w;
         this.c = w.cfg;
         this.ctx = ctx;
         this.maxBatch = maxBatch;
+        this.kvHalf = kvDtype == KvDtype.F16;
         if (c.headDim() % 32 != 0 || c.headDim() > 256) {
             throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
         }
@@ -107,6 +120,8 @@ public final class MetalBackend implements Backend {
         pMoeUpQ8 = metal.pipeline("moe_up_q8");
         pMoeDownQ4 = metal.pipeline("moe_down_q4");
         pMoeDownQ8 = metal.pipeline("moe_down_q8");
+        pKvStoreHalf = metal.pipeline("kv_store_half");
+        pAttentionHalf = metal.pipeline("attention_h");
         if (c.isMoe() && (c.numExperts() > 1024 || c.numExperts() > metal.maxThreads(pRouter))) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
@@ -140,13 +155,15 @@ public final class MetalBackend implements Backend {
         ropeCos = upload(rope.cos);
         ropeSin = upload(rope.sin);
 
-        long kvBytes = (long) ctx * c.kvDim() * 4;
+        long kvBytes = (long) ctx * c.kvDim() * kvDtype.bytes;
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
             keyCache[l] = metal.newBuffer(kvBytes);
             valCache[l] = metal.newBuffer(kvBytes);
         }
+        kStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4) : null;
+        vStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4) : null;
         x = metal.newBuffer((long) maxBatch * c.dim() * 4);
         xb = metal.newBuffer((long) maxBatch * c.dim() * 4);
         q = metal.newBuffer((long) maxBatch * c.qDim() * 4);
@@ -219,10 +236,17 @@ public final class MetalBackend implements Backend {
             ModelWeights.Layer W = w.layers[l];
             rmsnorm(x, L.attnNorm, xb, n, dim);
             matmul(W.wq, L.wq, xb, q, 0, n, false);
-            matmul(W.wk, L.wk, xb, keyCache[l], (long) pos * kvDim * 4, n, false);
-            matmul(W.wv, L.wv, xb, valCache[l], (long) pos * kvDim * 4, n, false);
+            // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
+            Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
+            Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
+            long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
+            matmul(W.wk, L.wk, xb, kDst, kvOff, n, false);
+            matmul(W.wv, L.wv, xb, vDst, kvOff, n, false);
             normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
-            normRope(keyCache[l], (long) pos * kvDim * 4, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            normRope(kDst, kvOff, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            if (kvHalf) {
+                kvStore(l, n, pos);
+            }
             attention(l, n, pos);
             matmul(W.wo, L.wo, att, x, 0, n, true);
 
@@ -309,7 +333,20 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, (float) (1.0 / Math.sqrt(c.headDim())));
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
-        metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 32, c.heads(), n, 1, 256, 1, 1);
+        metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 32, c.heads(), n, 1, 256, 1, 1);
+    }
+
+    /** f16 cache: rounds the n staged k/v rows into rows [pos, pos+n) of layer l's half caches. */
+    private void kvStore(int l, int n, int pos) {
+        int total = n * c.kvDim();
+        bind(0, kStage, 0);
+        bind(1, vStage, 0);
+        bind(2, keyCache[l], 0);
+        bind(3, valCache[l], 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, n);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, pos);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
+        metal.dispatch(pKvStoreHalf, bufArgs, offArgs, 4, params, 12, (total + 255) / 256, 1, 1, 256, 1, 1);
     }
 
     private void siluMul(int n) {

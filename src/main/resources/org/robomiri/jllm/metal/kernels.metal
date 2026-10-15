@@ -454,3 +454,104 @@ kernel void silu_mul(device const float *gu [[buffer(0)]],
     const float u = gu[(ulong)t * 2 * p.n + p.n + i];
     out[gid] = g / (1.0f + exp(-g)) * u;
 }
+
+// ---------------------------------------------------------------------------------------------- f16 KV cache
+// Optional half-precision cache (backend.kv-dtype=f16). K and V are projected, normalized and rotated in f32
+// staging buffers by the kernels above; kv_store_half then rounds them once (round-to-nearest-even, the same
+// rounding as Java's Float.floatToFloat16) into the half caches, and attention_h is the attention kernel
+// reading half K/V with the same f32 arithmetic as `attention`. The f32 kernels above are not involved.
+
+struct KvStoreParams {
+    int ntok;
+    int pos0;
+    int kvDim;
+};
+
+// kc/vc[pos0 + t, :] = half(k/v[t, :]) for t < ntok. One thread per element; grid: ceil(ntok * kvDim / 256).
+kernel void kv_store_half(device const float *k [[buffer(0)]],
+                          device const float *v [[buffer(1)]],
+                          device half *kc [[buffer(2)]],
+                          device half *vc [[buffer(3)]],
+                          constant KvStoreParams &p [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.ntok * p.kvDim) return;
+    const ulong o = (ulong)p.pos0 * p.kvDim + gid;
+    kc[o] = half(k[gid]);
+    vc[o] = half(v[gid]);
+}
+
+// Same algorithm and parameters as `attention`, templated on the cache element type.
+template <typename KV>
+kernel void attention_kv(device const float *q [[buffer(0)]],
+                         device const KV *kc [[buffer(1)]],
+                         device const KV *vc [[buffer(2)]],
+                         device float *out [[buffer(3)]],
+                         device float *scores [[buffer(4)]],
+                         constant AttnParams &p [[buffer(5)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort2 tid2 [[thread_position_in_threadgroup]],
+                         ushort2 tpg2 [[threads_per_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]],
+                         ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    threadgroup float part[8][256];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+
+    const int h = int(tgp.x);
+    const int t = int(tgp.y);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int len = p.pos0 + t + 1;
+    const int per = p.headDim / 32;
+    device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
+    device float *sc = scores + ((ulong)t * p.nHeads + h) * p.ctx;
+    device const KV *kb = kc + kvh * p.headDim;
+    device const KV *vb = vc + kvh * p.headDim;
+
+    float qr[8];
+    for (int i = 0; i < 8; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+
+    // 1. scores
+    float mx = -INFINITY;
+    for (int s = sg; s < len; s += nsg) {
+        device const KV *kv = kb + (ulong)s * p.kvStride;
+        float d = 0.0f;
+        for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
+        d = simd_sum(d) * p.scale;
+        if (lane == 0) sc[s] = d;
+        mx = max(mx, d);
+    }
+    mx = tg_max(mx, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // 2. softmax numerators
+    float sum = 0.0f;
+    for (int s = tid; s < len; s += tpg) {
+        float e = exp(sc[s] - mx);
+        sc[s] = e;
+        sum += e;
+    }
+    sum = tg_sum(sum, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // 3. weighted sum of values, split over simdgroups then reduced
+    float o[8];
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    for (int s = sg; s < len; s += nsg) {
+        const float pr = sc[s];
+        device const KV *vv = vb + (ulong)s * p.kvStride;
+        for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
+    }
+    for (int i = 0; i < 8; i++) if (i < per) part[sg][lane + i * 32] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sum;
+    for (int d = tid; d < p.headDim; d += tpg) {
+        float acc = 0.0f;
+        for (int g = 0; g < nsg; g++) acc += part[g][d];
+        out[(ulong)t * p.qStride + h * p.headDim + d] = acc * inv;
+    }
+}
+
+typedef decltype(attention_kv<half>) attention_kv_t;
+template [[host_name("attention_h")]] kernel attention_kv_t attention_kv<half>;
