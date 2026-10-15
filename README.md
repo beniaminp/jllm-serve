@@ -1,17 +1,22 @@
 # jllm-serve
 
-An LLM inference engine and OpenAI-compatible server for **Qwen3** models (dense: `Qwen/Qwen3-0.6B` … `32B`;
-Mixture-of-Experts: `Qwen/Qwen3-30B-A3B-*`), written in Java from scratch with **zero external dependencies** —
-only the JDK (Vector API, FFM/Panama) plus a ~200-line Objective-C shim for Metal.
+An LLM inference engine and OpenAI-compatible server written in Java from scratch with **zero external
+dependencies** — only the JDK (Vector API, FFM/Panama) plus a ~200-line Objective-C shim for Metal.
+
+Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`, `qwen3_moe`), **Qwen2 / 2.5**
+and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
+(`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
+**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16 checkpoints only) and **Mamba** (`mamba`).
+Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
 
 | Piece | Where | Written from scratch |
 |---|---|---|
 | Hugging Face Hub downloader (resumable, SHA-256 verified) | `hub/HuggingFaceHub.java` | yes, on `java.net.http` |
 | safetensors reader (memory-mapped via FFM) | `safetensors/SafeTensors.java` | yes |
-| Byte-level BPE tokenizer + Qwen chat template | `tokenizer/` | yes |
-| Q4_0 / Q8_0 block quantization + mmap'd quantized cache file | `model/QTensor.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
-| Transformer forward pass on CPU, dense + MoE (Vector API SIMD, custom thread pool) | `cpu/` | yes |
-| Transformer forward pass on GPU, dense + MoE (Metal kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
+| Byte-level and SentencePiece-style BPE tokenizers + per-family chat templates | `tokenizer/` | yes |
+| Q4_0 / Q8_0 / Q2_K block quantization + mmap'd quantized cache file, shard-by-shard conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
+| Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, custom thread pool, f32/f16 KV cache) | `cpu/` | yes |
+| Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
 | JSON parser/writer | `json/Json.java` | yes |
 | HTTP/1.1 server (virtual threads, chunked SSE) + OpenAI API + web chat UI | `server/` | yes |
@@ -43,10 +48,19 @@ and are ready in milliseconds.
 ```sh
 ./jllm chat --model Qwen/Qwen3-4B                               # any dense Qwen3 checkpoint
 ./jllm serve --model Qwen/Qwen3-30B-A3B-Thinking-2507 --low-disk --ctx 2048   # 128-expert MoE, 61 GB download
+./jllm chat --model unsloth/Llama-3.2-1B-Instruct               # Llama 3 (ungated mirror)
+./jllm chat --model Qwen/Qwen2.5-1.5B-Instruct --quant q8        # Qwen2.5 at 8 bits
+./jllm chat --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B   # R1 distill (Qwen2 architecture)
+./jllm chat --model THUDM/GLM-4-9B-0414 --backend.kv-dtype f16  # GLM-4 with a half-precision KV cache
+./jllm run  --model state-spaces/mamba-130m-hf --raw --prompt "The capital of France is"
 ```
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
+Family details (what differs between them, verified tensor names, limits) are in
+[docs/14](docs/14-model-families.md) and [docs/15](docs/15-mamba.md). Note: the Llama/Mistral/Qwen2/GLM/Phi/
+Gemma/DeepSeek/Mamba paths were verified against reference implementations on synthetic checkpoints and on
+tokenizer fixtures, not yet on the real published weights — run a real checkpoint before relying on them.
 
 The `./jllm` launcher compiles the Java code and the native Metal library on first use. Equivalent manual steps:
 
@@ -93,20 +107,26 @@ Short flags:
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)
 ```
 
-## Measured on an Apple M1 Pro (10 cores), Qwen3-0.6B Q4_0, 413-token prompt
+## Measured on an Apple M1 Pro (10 cores, 32 GB)
 
-| Backend | Prefill | Decode |
-|---|---|---|
-| Metal | ~344 tok/s | ~75 tok/s (≈110 tok/s on short contexts) |
-| CPU (NEON 128-bit, 10 threads) | ~153 tok/s | ~17 tok/s |
+| Model | Backend | Prefill | Decode |
+|---|---|---|---|
+| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~375 tok/s | ~95 tok/s (f16 KV ≈ 100) |
+| Qwen3-0.6B Q4_0 | CPU (NEON 128-bit, 10 threads) | ~153 tok/s | ~17 tok/s |
+| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~44 tok/s | ~23–25 tok/s |
 
-Both backends produce identical greedy output.
+Both backends produce identical greedy output (checked on every merge for Qwen3 and the 30B MoE, and across
+20 synthetic models of all families × 3 quantization formats by `scripts/arch-smoke.sh`).
 
 ## Tests
 
 ```sh
-mvn test            # runs SmokeTest (plain main(), no test framework) against models/Qwen_Qwen3-0.6B
+mvn test                   # SmokeTest (plain main(), no test framework) against models/Qwen_Qwen3-0.6B
+sh scripts/arch-smoke.sh   # every family on synthetic tiny checkpoints, Q4/Q8/Q2_K, CPU == Metal
 ```
+
+`TokenizerFamiliesTest` compares the tokenizers and chat templates of all families against fixtures generated
+with the reference `tokenizers`/`jinja2` libraries (`src/test/python/gen_tokenizer_fixtures.py`).
 
 Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the CPU KV cache lives on the heap),
 `JAVA_OPTS` (extra JVM flags), `JLLM_NO_BUILD=1` to skip the incremental compile.
