@@ -10,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 @interface JMContext : NSObject
@@ -118,8 +119,9 @@ void *jm_buffer_new(void *ctx, uint64_t len, int zero) {
     }
 }
 
-// Wraps memory owned by the caller (must stay alive while the buffer is used). Zero-copy when ptr and len are
-// page aligned; otherwise falls back to a copy.
+// Wraps memory owned by the caller (must stay alive while the buffer is used) without copying. Metal requires
+// ptr and len to be page aligned; when it refuses, the reason is printed to stderr and NULL is returned (the
+// Java side throws). A silent copying fallback would double the memory of a multi-gigabyte model.
 void *jm_buffer_wrap(void *ctx, void *ptr, uint64_t len) {
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
@@ -128,9 +130,17 @@ void *jm_buffer_wrap(void *ctx, void *ptr, uint64_t len) {
                                                      options:MTLResourceStorageModeShared
                                                  deallocator:nil];
         if (!b) {
-            b = [c.device newBufferWithBytes:ptr length:(NSUInteger) len options:MTLResourceStorageModeShared];
+            uint64_t page = (uint64_t) NSPageSize();
+            fprintf(stderr,
+                    "jllm_metal: newBufferWithBytesNoCopy refused %llu bytes at %p (page size %llu: ptr %s, "
+                    "length %s, max buffer length %llu)\n",
+                    (unsigned long long) len, ptr, (unsigned long long) page,
+                    ((uintptr_t) ptr % page) == 0 ? "aligned" : "misaligned",
+                    (len % page) == 0 ? "page multiple" : "not a page multiple",
+                    (unsigned long long) c.device.maxBufferLength);
+            return NULL;
         }
-        return b ? (__bridge_retained void *) b : NULL;
+        return (__bridge_retained void *) b;
     }
 }
 
@@ -170,6 +180,20 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
         }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger) gx, (NSUInteger) gy, (NSUInteger) gz)
             threadsPerThreadgroup:MTLSizeMake((NSUInteger) tx, (NSUInteger) ty, (NSUInteger) tz)];
+    }
+}
+
+// Discards the command buffer being recorded without running it. Metal aborts the process if a compute
+// encoder is released before endEncoding, so the Java side calls this when recording fails part-way.
+// A no-op when nothing is being recorded.
+void jm_abort(void *ctx) {
+    @autoreleasepool {
+        JMContext *c = (__bridge JMContext *) ctx;
+        if (c.enc) {
+            [c.enc endEncoding];
+        }
+        c.enc = nil;
+        c.cmd = nil;
     }
 }
 

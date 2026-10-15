@@ -33,53 +33,53 @@ public final class MetalBackend implements Backend {
     private final Metal metal;
     private final Arena arena = Arena.ofShared();
 
-    private final int pMatmulQ4;
-    private final int pMatmulQ8;
-    private final int pRmsnorm;
-    private final int pNormRope;
-    private final int pAttention;
-    private final int pSilu;
-    private final int pAddBias;
-    private final int pRouter;
-    private final int pMoeUpQ4;
-    private final int pMoeUpQ8;
-    private final int pMoeDownQ4;
-    private final int pMoeDownQ8;
+    private int pMatmulQ4;
+    private int pMatmulQ8;
+    private int pRmsnorm;
+    private int pNormRope;
+    private int pAttention;
+    private int pSilu;
+    private int pAddBias;
+    private int pRouter;
+    private int pMoeUpQ4;
+    private int pMoeUpQ8;
+    private int pMoeDownQ4;
+    private int pMoeDownQ8;
     // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
     // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
-    private final int pKvStoreHalf;
-    private final int pAttentionHalf;
-    private final Metal.Buffer kStage;
-    private final Metal.Buffer vStage;
+    private int pKvStoreHalf;
+    private int pAttentionHalf;
+    private Metal.Buffer kStage;
+    private Metal.Buffer vStage;
 
-    private final Metal.Buffer embedQ;
-    private final Metal.Buffer lmHeadQ;
-    private final LayerBufs[] layers;
-    private final Metal.Buffer finalNorm;
-    private final Metal.Buffer ropeCos;
-    private final Metal.Buffer ropeSin;
-    private final Metal.Buffer[] keyCache;
-    private final Metal.Buffer[] valCache;
+    private Metal.Buffer embedQ;
+    private Metal.Buffer lmHeadQ;
+    private LayerBufs[] layers;
+    private Metal.Buffer finalNorm;
+    private Metal.Buffer ropeCos;
+    private Metal.Buffer ropeSin;
+    private Metal.Buffer[] keyCache;
+    private Metal.Buffer[] valCache;
 
-    private final Metal.Buffer x;
-    private final Metal.Buffer xb;
-    private final Metal.Buffer q;
-    private final Metal.Buffer att;
-    private final Metal.Buffer gateUp;
-    private final Metal.Buffer hidden;
-    private final Metal.Buffer scores;
-    private final Metal.Buffer logitsBuf;
+    private Metal.Buffer x;
+    private Metal.Buffer xb;
+    private Metal.Buffer q;
+    private Metal.Buffer att;
+    private Metal.Buffer gateUp;
+    private Metal.Buffer hidden;
+    private Metal.Buffer scores;
+    private Metal.Buffer logitsBuf;
     // MoE (null for dense models)
-    private final Metal.Buffer assign;
-    private final Metal.Buffer routeWeight;
-    private final Metal.Buffer moeGateUp;
-    private final Metal.Buffer moeHidden;
+    private Metal.Buffer assign;
+    private Metal.Buffer routeWeight;
+    private Metal.Buffer moeGateUp;
+    private Metal.Buffer moeHidden;
 
     // dispatch argument scratch (re-used; the native side copies params at record time)
-    private final MemorySegment bufArgs;
-    private final MemorySegment offArgs;
-    private final MemorySegment params;
+    private MemorySegment bufArgs;
+    private MemorySegment offArgs;
+    private MemorySegment params;
 
     private static final class LayerBufs {
         Metal.Buffer attnNorm;
@@ -101,7 +101,7 @@ public final class MetalBackend implements Backend {
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch) {
-        this(w, ctx, maxBatch, null);
+        this(w, ctx, maxBatch, (String) null);
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib) {
@@ -109,15 +109,38 @@ public final class MetalBackend implements Backend {
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
+        this(w, ctx, maxBatch, open(w.cfg, metalLib), kvDtype);
+    }
+
+    private static Metal open(ModelConfig c, String metalLib) {
+        if (c.headDim() % 32 != 0 || c.headDim() > 256) {
+            throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
+        }
+        return Metal.create(metalLib);
+    }
+
+    /** Owns {@code metal} from here on: it is closed again if anything below throws. */
+    private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype) {
         this.w = w;
         this.c = w.cfg;
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.kvHalf = kvDtype == KvDtype.F16;
-        if (c.headDim() % 32 != 0 || c.headDim() > 256) {
-            throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
+        this.metal = metal;
+        try {
+            init(kvDtype);
+        } catch (RuntimeException | Error e) {
+            try {
+                metal.close();
+            } catch (RuntimeException | Error suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            arena.close();
+            throw e;
         }
-        this.metal = Metal.create(metalLib);
+    }
+
+    private void init(KvDtype kvDtype) {
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pRmsnorm = metal.pipeline("rmsnorm");
@@ -250,45 +273,53 @@ public final class MetalBackend implements Backend {
         }
 
         metal.begin();
-        for (int l = 0; l < c.layers(); l++) {
-            LayerBufs L = layers[l];
-            ModelWeights.Layer W = w.layers[l];
-            rmsnorm(x, L.attnNorm, xb, n, dim);
-            matmul(W.wq, L.wq, xb, q, 0, n, false);
-            // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
-            Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
-            Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
-            long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
-            matmul(W.wk, L.wk, xb, kDst, kvOff, n, false);
-            matmul(W.wv, L.wv, xb, vDst, kvOff, n, false);
-            if (L.bq != null) {
-                addBias(q, 0, L.bq, n, c.qDim());
-                addBias(kDst, kvOff, L.bk, n, kvDim);
-                addBias(vDst, kvOff, L.bv, n, kvDim);
-            }
-            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
-            normRope(kDst, kvOff, kvDim, c.kvHeads(), L.kNorm, n, pos);
-            if (kvHalf) {
-                kvStore(l, n, pos);
-            }
-            attention(l, n, pos);
-            matmul(W.wo, L.wo, att, x, 0, n, true);
+        boolean committed = false;
+        try {
+            for (int l = 0; l < c.layers(); l++) {
+                LayerBufs L = layers[l];
+                ModelWeights.Layer W = w.layers[l];
+                rmsnorm(x, L.attnNorm, xb, n, dim);
+                matmul(W.wq, L.wq, xb, q, 0, n, false);
+                // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
+                Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
+                Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
+                long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
+                matmul(W.wk, L.wk, xb, kDst, kvOff, n, false);
+                matmul(W.wv, L.wv, xb, vDst, kvOff, n, false);
+                if (L.bq != null) {
+                    addBias(q, 0, L.bq, n, c.qDim());
+                    addBias(kDst, kvOff, L.bk, n, kvDim);
+                    addBias(vDst, kvOff, L.bv, n, kvDim);
+                }
+                normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
+                normRope(kDst, kvOff, kvDim, c.kvHeads(), L.kNorm, n, pos);
+                if (kvHalf) {
+                    kvStore(l, n, pos);
+                }
+                attention(l, n, pos);
+                matmul(W.wo, L.wo, att, x, 0, n, true);
 
-            rmsnorm(x, L.ffnNorm, xb, n, dim);
-            if (W.moe) {
-                moe(W, L, n);
-            } else {
-                matmul(W.wGateUp, L.wGateUp, xb, gateUp, 0, n, false);
-                siluMul(n);
-                matmul(W.wDown, L.wDown, hidden, x, 0, n, true);
+                rmsnorm(x, L.ffnNorm, xb, n, dim);
+                if (W.moe) {
+                    moe(W, L, n);
+                } else {
+                    matmul(W.wGateUp, L.wGateUp, xb, gateUp, 0, n, false);
+                    siluMul(n);
+                    matmul(W.wDown, L.wDown, hidden, x, 0, n, true);
+                }
+            }
+            if (logits != null) {
+                // normalize only the last token: read x at row n-1, write xb row 0
+                rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
+                matmul(w.lmHead, lmHeadQ, xb, logitsBuf, 0, 1, false);
+            }
+            metal.commitAndWait();
+            committed = true;
+        } finally {
+            if (!committed) {
+                metal.abort(); // an un-ended encoder would make Metal abort the process on release
             }
         }
-        if (logits != null) {
-            // normalize only the last token: read x at row n-1, write xb row 0
-            rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
-            matmul(w.lmHead, lmHeadQ, xb, logitsBuf, 0, 1, false);
-        }
-        metal.commitAndWait();
         if (logits != null) {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0, w.lmHead.rows);
         }

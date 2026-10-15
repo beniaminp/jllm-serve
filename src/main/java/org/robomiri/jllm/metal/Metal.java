@@ -44,6 +44,7 @@ public final class Metal implements AutoCloseable {
     private final MethodHandle bufferRelease;
     private final MethodHandle begin;
     private final MethodHandle dispatch;
+    private final MethodHandle abort;
     private final MethodHandle commitWait;
 
     private final Arena arena = Arena.ofShared();
@@ -66,6 +67,7 @@ public final class Metal implements AutoCloseable {
         begin = handle(l, "jm_begin", FunctionDescriptor.ofVoid(ADDRESS));
         dispatch = handle(l, "jm_dispatch", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT,
                 ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        abort = handle(l, "jm_abort", FunctionDescriptor.ofVoid(ADDRESS));
         commitWait = handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
         try {
             ctx = (MemorySegment) create.invokeExact(arena.allocateFrom(shaderSource), err, ERR_LEN);
@@ -209,12 +211,16 @@ public final class Metal implements AutoCloseable {
         }
     }
 
-    /** Wraps Java-owned native memory (zero-copy when page aligned). The segment must outlive this object. */
+    /**
+     * Wraps Java-owned native memory zero-copy. The segment must be page aligned (address and size) and must
+     * outlive this object; the shim prints the reason to stderr and this throws if Metal refuses.
+     */
     public Buffer wrap(MemorySegment seg) {
         try {
             MemorySegment h = (MemorySegment) bufferWrap.invokeExact(ctx, seg, seg.byteSize());
             if (h.equals(MemorySegment.NULL)) {
-                throw new OutOfMemoryError("cannot wrap " + seg.byteSize() + " bytes as a Metal buffer");
+                throw new IllegalStateException("cannot wrap " + seg.byteSize() + " bytes at 0x"
+                        + Long.toHexString(seg.address()) + " as a zero-copy Metal buffer (see stderr)");
             }
             return track(h, seg.byteSize());
         } catch (Throwable t) {
@@ -245,6 +251,18 @@ public final class Metal implements AutoCloseable {
                          int gx, int gy, int gz, int tx, int ty, int tz) {
         try {
             dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, gx, gy, gz, tx, ty, tz);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /**
+     * Drops the command buffer being recorded without executing it (ends the encoder first, which Metal
+     * insists on). Safe to call when nothing is being recorded.
+     */
+    public void abort() {
+        try {
+            abort.invokeExact(ctx);
         } catch (Throwable t) {
             throw rethrow(t);
         }
