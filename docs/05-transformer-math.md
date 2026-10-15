@@ -218,7 +218,31 @@ x = E[id]            (1024 numbers)
 No arithmetic. The rows were learned so that tokens used in similar ways end up with similar vectors
 (`" cat"` and `" dog"` have a large dot product; `" cat"` and `" parliament"` a small one).
 
-Code: `w.embed.dequantizeRow(tokens[off + t], x, t * dim)` — the row is stored in Q8_0 and expanded to floats.
+**Worked example** (a toy vocabulary of 4 tokens, `dim = 3`):
+
+```
+E = ┌  0.2  −1.0   0.5 ┐   ← token 0  "the"
+    │  0.9   0.1  −0.3 │   ← token 1  " cat"
+    │  0.8   0.2  −0.2 │   ← token 2  " dog"
+    └ −0.7   0.6   0.9 ┘   ← token 3  " parliament"
+
+prompt ids [0, 1]  →  x_0 = E[0] = [0.2, −1.0, 0.5]      x_1 = E[1] = [0.9, 0.1, −0.3]
+
+similarity:  E[1]·E[2] = 0.72 + 0.02 + 0.06 = 0.80       " cat" vs " dog": close
+             E[1]·E[3] = −0.63 + 0.06 − 0.27 = −0.84     " cat" vs " parliament": far
+```
+
+**Shapes in and out.** In: `n` token ids (`int[]`). Out: the activation matrix `x` of shape `[n, dim]` —
+for prefill of a 64-token chunk that is `64 × 1024` floats = 256 KB; for decode `1 × 1024`.
+
+**What the code does.** `CpuBackend.forward` loops `t = 0 … n−1` and calls
+`w.embed.dequantizeRow(tokens[off + t], x, t * dim)`: the row is stored as Q8_0 ([06](06-quantization.md)) and is
+expanded to 1024 floats directly into row `t` of `x`. The Metal backend does the same on the CPU (it is 2048
+numbers per token — far cheaper than a GPU dispatch) and writes them straight into the shared `x` buffer.
+
+**Common misconception.** The embedding is *not* a one-hot vector multiplied by a matrix — that would be the same
+result at 151 936× the cost. It is an array index. (The one-hot view is how textbooks explain why it is still a
+"linear layer".)
 
 ---
 
@@ -247,7 +271,35 @@ copy `xb` that feeds the block. `ε` is there so that an all-zero vector does no
 
 (The older LayerNorm also subtracts the mean; RMSNorm skips that, which is cheaper and works as well.)
 
-Code: `CpuBackend.rmsnormRow` — `sumSquares` is a SIMD dot product of `x` with itself.
+**What happens without it — a 3-layer thought experiment.** Suppose each layer's update is, on average, as
+large as its input. Then `|x|` doubles per layer: after 28 layers it is `2²⁸ ≈ 2.7 × 10⁸` times the embedding.
+The dot products inside attention would be in the `10¹⁶` range, every softmax would be exactly one-hot, and
+float arithmetic would lose all precision. Normalizing the *input to each block* (not the stream itself) keeps
+every block operating in the regime it was trained in, while the residual stream is free to grow.
+
+**Why `ε` inside the square root.** For a vector that is exactly zero (it can happen for padding) the RMS is
+0 and `x / 0` would be `NaN`, which then poisons every later computation. `ε = 10⁻⁶` is small enough to be
+invisible for normal vectors (whose mean square is around 1) and large enough to keep the division finite.
+
+**Shapes.** In: `[n, width]` where `width` is `dim` (1024) for the two per-layer norms and the final norm, or
+`head_dim` (128) for the QK-norms of 5.5. Out: same shape. The gain `g` has length `width` and is the only
+learned parameter — 1024 numbers per norm, negligible next to the matrices.
+
+**What the code does** (`CpuBackend.rmsnormRow(in, io, out, oo, weight, width)`):
+
+```java
+float ss = VectorKernels.sumSquares(in, io, width);                 // Σ x²   (SIMD dot of x with itself)
+float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));  // 1 / rms
+for (int i = 0; i < width; i++)
+    out[oo + i] = in[io + i] * scale * weight[i];                   // y = x · (1/rms) · g
+```
+
+Computing `1/rms` once and multiplying is cheaper than dividing 1024 times. The Metal `rmsnorm` kernel does the
+same with one threadgroup per row: each thread sums the squares of a strided subset, the partial sums are
+combined with `simd_sum` and threadgroup memory, then every thread scales its elements.
+
+**Count per token:** `2 × 28 + 1 = 57` RMSNorms of width 1024 plus `24 × 28` of width 128 — about 150 k
+multiply-adds, under 0.03 % of the forward pass.
 
 ---
 
@@ -283,6 +335,41 @@ sentence. The cost is the same as one wide lookup.
 16 query heads but only 8 key/value heads: **query heads `2j` and `2j+1` share KV head `j`**. This halves the
 size of the KV cache and the bandwidth to read it, at a tiny quality cost. In the code the KV head of query
 head `h` is `h / group` with `group = H / Hkv = 2`, i.e. `ko = (h / group) * hd` in `attention()`.
+
+**Worked example of a projection** (toy sizes: `dim = 3`, one head of `hd = 2`):
+
+```
+xb = [1.0, −0.5, 2.0]                       the normalized token
+
+Wq = ┌ 0.5  0.0  1.0 ┐      q = Wq·xb = [0.5·1 + 0·(−0.5) + 1·2,  −1·1 + 2·(−0.5) + 0·2] = [2.5, −2.0]
+     └ −1.0 2.0  0.0 ┘
+
+Wk = ┌ 1.0  1.0  0.0 ┐      k = Wk·xb = [1 − 0.5 + 0,  0 + 0 + 2]                        = [0.5, 2.0]
+     └ 0.0  0.0  1.0 ┘
+
+Wv = ┌ 0.0  1.0  0.0 ┐      v = Wv·xb = [−0.5,  1.0]
+     └ 1.0  0.0  0.0 ┘
+```
+
+Each output number is one dot product of a weight row with `xb`. At real size that is 2048 + 1024 + 1024 =
+4096 dot products of length 1024 per token — **4.2 M multiply-adds**, the first big cost of the layer.
+
+**Where each head lives in memory.** `q` is one array of 2048 floats; head `h` is the slice
+`[h·128, (h+1)·128)`. Nothing is physically split — "16 heads" is a way of *reading* the same array. For `k`
+and `v` the slices are `[j·128, (j+1)·128)` for `j < 8`. A token's `k` (1024 floats) is written at
+`keyCache[layer][pos · 1024 …]`, so the cache of one layer is a `[ctx, 1024]` matrix indexed by position.
+
+```
+q (2048):  | head 0 | head 1 | head 2 | … | head 15 |        each 128 wide
+k (1024):  | kv 0   | kv 1   | …  | kv 7 |                  query heads 0,1 → kv 0;  2,3 → kv 1; …
+```
+
+**What the code does.** Three `matmul` calls per layer; the `k` and `v` ones write directly into the cache
+(`matmul(L.wk, xb, keyCache[l], pos * kvDim, n, false)`) — no separate copy step. On Metal they are three
+`matmul_q4` dispatches with the KV cache buffer bound at byte offset `pos × kvDim × 4`.
+
+**Why Q is wider than the model (2048 > 1024).** Qwen3 chose `head_dim = 128` with 16 heads, giving
+`16 × 128 = 2048`. Nothing requires `H × hd = dim`; `Wq` projects up and `Wo` (5.7) projects back down.
 
 ---
 
@@ -355,6 +442,57 @@ v[o + i + half] = b * cos + a * sin;
 
 Both `q` and `k` are rotated; `v` is not (values carry content, not position).
 
+**Worked example: the relative-position property with numbers.** Take one pair with `θ = 1` (pair 0) and
+the same key content `k = (1, 0)` and query content `q = (1, 0)`. Place the key at position 2 and the query at
+position 5 — then move both by +10 and check the score does not change:
+
+```
+rotate (1, 0) by angle p:   (cos p, sin p)
+
+key   at s = 2:   k' = (cos 2, sin 2) = (−0.416, 0.909)
+query at p = 5:   q' = (cos 5, sin 5) = ( 0.284, −0.959)
+score = q'·k' = −0.118 − 0.872 = −0.990          = cos(5 − 2) = cos 3 = −0.990  ✓
+
+shift both by 10:
+key   at s = 12:  k' = (cos 12, sin 12) = (0.844, −0.537)
+query at p = 15:  q' = (cos 15, sin 15) = (−0.760, 0.650)
+score = −0.641 − 0.349 = −0.990                   same: only p − s = 3 matters ✓
+```
+
+The query "sees" a key 3 positions back identically wherever the pair sits in the text — which is what lets a
+model trained on short texts handle any position, and what makes the KV cache valid: a stored key never needs
+to be re-rotated when more tokens arrive.
+
+**Why pairs and not single numbers?** A rotation needs two coordinates. Rotating 64 pairs with 64 different
+speeds gives each head a rich, multi-scale "clock": pair 0 ticks once per token, pair 63 once per million
+tokens. Two tokens 1 apart differ on the fast clocks; two tokens 1000 apart differ on the slow ones.
+
+**Shapes.** In place on `q` (`[n, 2048]`, 16 heads) and `k` (`[n, 1024]`, 8 heads, already in the cache).
+For token `t` of a prefill chunk starting at `pos`, the angle uses position `pos + t`.
+
+**What the code does** (`CpuBackend.normRope(v, base, stride, nHeads, norm, n, pos)`):
+
+```java
+for (int t = 0; t < n; t++)                                  // each token
+    for (int h = 0; h < nHeads; h++) {                       // each head
+        int o = base + t * stride + h * hd;                  // start of this head's 128 numbers
+        if (norm != null) rmsnormRow(v, o, v, o, norm, hd);  // QK-norm, in place
+        for (int i = 0; i < half; i++) {                     // 64 pairs
+            float a = v[o + i], b = v[o + i + half];
+            float cs = cos[(pos + t) * half + i], sn = sin[(pos + t) * half + i];
+            v[o + i]        = a * cs - b * sn;
+            v[o + i + half] = b * cs + a * sn;
+        }
+    }
+```
+
+The Metal `norm_rope` kernel launches one threadgroup per `(head, token)` with 64 threads, one per pair; the
+QK-norm's sum of squares is a 64-thread reduction, then each thread rotates its own pair.
+
+**Cost:** 16 + 8 heads × 64 pairs × 4 multiplies ≈ 6 k per layer — negligible. The precomputed tables are
+the reason it stays negligible: computing `cos`/`sin` on the fly would be the most expensive instruction in
+the layer.
+
 ---
 
 ## 5.6 Step 4 — Attention
@@ -392,8 +530,52 @@ training; dividing by `sqrt(hd)` brings scores back to order 1. At inference we 
 exist in the cache). During prefill, token `t` of the batch uses `len = pos + t + 1` cached entries — see
 `attention()`.
 
-All 16 heads produce 128 numbers each; concatenated they form `a` (2048). Code: `CpuBackend.attention` —
-scores into the scratch `sc[]`, then `exp`, then `axpy` accumulates `w_j · v_j` into `att`.
+All 16 heads produce 128 numbers each; concatenated they form `a` (2048).
+
+**What a head actually learns — intuition.** Keys and queries are learned so that useful pairs score high.
+A "previous-token head" learns `Wq`/`Wk` such that the query at position `p` matches the key of position
+`p − 1` through the RoPE clocks (5.5). An "induction head" looks for an earlier occurrence of the current
+token and copies what followed it — the mechanism behind in-context learning. Nobody programs these; they
+emerge from training. At inference we only run the arithmetic.
+
+**Shapes and the two loops.** For a prefill chunk of `n` tokens there are `n × 16` independent
+`(token, head)` jobs; each job scores `pos + t + 1` cached keys, so the work is a triangle (later tokens
+score more keys). Inputs: `q [n, 2048]`, the cache `K, V [ctx, 1024]`. Output: `att [n, 2048]`.
+
+**What the code does** (`CpuBackend.attention(layer, n, pos)`), one `(t, h)` job:
+
+```java
+int ko = (h / group) * hd;                     // which KV head's slice this query head reads
+int qo = t * qDim + h * hd;                    // this query head's 128 numbers
+int len = pos + t + 1;                         // causal: keys 0 … pos+t
+
+float max = -inf;
+for (int s = 0; s < len; s++) {                // 1. scores
+    sc[s] = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;     // q·k_s / sqrt(128)
+    max = Math.max(max, sc[s]);
+}
+float sum = 0;
+for (int s = 0; s < len; s++) {                // 2. softmax numerators
+    sc[s] = (float) Math.exp(sc[s] - max);
+    sum += sc[s];
+}
+Arrays.fill(att, qo, qo + hd, 0f);
+for (int s = 0; s < len; s++)                  // 3. weighted sum of values
+    VectorKernels.axpy(sc[s] / sum, vc, s * kvDim + ko, att, qo, hd);     // att += w_s · v_s
+```
+
+`sc[]` is a per-thread scratch array of length `ctx`, so the three passes never allocate. The thread pool
+hands out `(t, h)` jobs in chunks ([07](07-cpu-backend.md)). The Metal `attention` kernel runs the same three
+phases with one 256-thread threadgroup per `(token, head)` and keeps the scores in a device scratch buffer
+([08](08-metal-backend.md)).
+
+**Cost per token:** `16 heads × (pos+1) keys × 128 × 2` multiply-adds (scores and values) — at `pos = 1000`
+that is 4 M per layer, comparable to one of the projection matrices; at `pos = 4096` it exceeds all of them.
+This growth is the "quadratic attention" everyone talks about: total work over a sequence of length `N` is
+`O(N²)`.
+
+**Why the KV cache holds K and V but not Q.** Each query is used exactly once (by its own token, now). Each key
+and value is used by *every later* token. Caching Q would waste memory; not caching K/V would waste compute.
 
 ---
 
@@ -412,7 +594,32 @@ there, and information from the embedding can reach the last layer untouched. (2
 reads the stream, computes something, and writes its contribution back. Layers communicate through this shared
 scratchpad.
 
-Code: `matmul(L.wo, att, x, 0, n, true)` — the `true` is `acc`: accumulate into `x`.
+**Worked example** (toy `dim = 3`, two heads of `hd = 1`, so `a` has 2 numbers):
+
+```
+x  (residual stream before attention) = [0.2, −1.0, 0.5]
+a  (concatenated head outputs)        = [4.0, −1.0]
+
+Wo = ┌ 0.1  0.0 ┐      Wo·a = [0.4, −0.4 + 0.5·(−1.0)·0 …]   let's do it fully:
+     │ 0.0  0.5 │             row 0: 0.1·4.0 + 0.0·(−1.0) = 0.40
+     └ 0.2  0.2 ┘             row 1: 0.0·4.0 + 0.5·(−1.0) = −0.50
+                              row 2: 0.2·4.0 + 0.2·(−1.0) = 0.60
+
+x += Wo·a  →  x = [0.2 + 0.40, −1.0 − 0.50, 0.5 + 0.60] = [0.60, −1.50, 1.10]
+```
+
+The stream now carries both what it had (the token's own embedding and earlier layers' work) and the new
+context information mixed in by attention.
+
+**Shapes.** In: `att [n, 2048]`. `Wo [1024, 2048]`. Out: added to `x [n, 1024]`.
+
+**What the code does.** `matmul(L.wo, att, x, 0, n, true)` — the last argument `acc = true` makes the kernel
+compute `x[r] += dot(...)` instead of `x[r] = dot(...)`, so the residual addition costs nothing extra. On Metal
+the `matmul_q4` kernel has the same flag in its parameter struct (`accumulate`).
+
+**Why there is no normalization *after* the block.** Older designs ("post-norm") normalized the sum; modern
+ones ("pre-norm", used here) normalize only the block's input and leave the stream raw. Pre-norm trains far
+more reliably at depth, which is why every current LLM uses it.
 
 ---
 
@@ -448,8 +655,49 @@ name", "we are inside a code block") whose outputs `Wdown` turns back into resid
 model's factual knowledge is believed to live in these matrices — which is why the MoE models scale exactly this
 block ([12](12-mixture-of-experts.md)).
 
+**Worked example** (toy `dim = 2`, `ffn = 3` hidden units):
+
+```
+xb = [1.0, 2.0]
+
+Wgate = ┌  1.0  0.0 ┐      gate = Wgate·xb = [ 1.0,  −0.5·1 + 0.5·2,  −1.0·1 − 1.0·2 ] = [1.0, 0.5, −3.0]
+        │ −0.5  0.5 │
+        └ −1.0 −1.0 ┘
+
+Wup   = ┌  0.0  1.0 ┐      up   = Wup·xb   = [2.0,  3.0,  5.0]
+        │  1.0  1.0 │
+        └  2.0  1.5 ┘
+
+silu(gate) = [1.0·σ(1.0), 0.5·σ(0.5), −3.0·σ(−3.0)] = [0.731, 0.311, −0.142]
+h = silu(gate) ⊙ up = [0.731·2.0, 0.311·3.0, −0.142·5.0] = [1.462, 0.933, −0.711]
+
+Wdown = ┌ 1.0  0.0  1.0 ┐   Wdown·h = [1.462 − 0.711,  0.933·0.5 + (−0.711)·(−1.0)] = [0.751, 1.178]
+        └ 0.0  0.5 −1.0 ┘
+x += Wdown·h
+```
+
+Read what the gate did: hidden unit 2 had a strongly negative gate (−3.0), so its `up` value of 5.0 was almost
+entirely suppressed (−0.142 × 5.0). Unit 0 was "open" (gate 1.0) and passed 73 % of its `up` value. The gate
+is a learned, input-dependent switch per hidden unit.
+
+**Shapes.** In: `xb [n, 1024]`. `wGateUp [6144, 1024]` → `gateUp [n, 6144]`; `hidden [n, 3072]`;
+`Wdown [1024, 3072]` → added to `x [n, 1024]`.
+
+**What the code does** (`CpuBackend`):
+
+```java
+matmul(L.wGateUp, xb, gateUp, 0, n, false);   // one pass: rows 0..3071 = gate, 3072..6143 = up
+siluMul(n);                                   // hidden[i] = gate[i] / (1 + exp(-gate[i])) * up[i]
+matmul(L.wDown, hidden, x, 0, n, true);       // x += Wdown · hidden
+```
+
 **Implementation detail:** `ModelWeights` stacks `Wgate` and `Wup` into one `[6144, 1024]` matrix so a single
-pass over `xb` produces both (`wGateUp`); `siluMul` then reads halves `[0, 3072)` and `[3072, 6144)`.
+pass over `xb` produces both (`wGateUp`); `siluMul` then reads halves `[0, 3072)` and `[3072, 6144)`. The
+stacking is free because both matrices have the same number of columns (1024) — rows are simply concatenated
+([03 §3.1](03-safetensors.md#31-what-is-a-tensor)).
+
+**Cost:** `6144 × 1024 + 1024 × 3072 = 9.4 M` multiply-adds per token per layer — **60 % of the layer**. The
+FFN, not attention, is where the time goes at short context, and it is why MoE models scale this block.
 
 ---
 
@@ -480,6 +728,27 @@ The engine runs prefill in chunks of 64 only because the activation buffers are 
 is just more chunks. Logits are computed only for the final token of the prompt — earlier tokens are processed
 solely to populate the cache.
 
+**A timeline.** Prompt of 5 tokens, then 3 generated tokens, `--batch 64`:
+
+```
+call                      tokens fed          positions   cache afterwards        logits for
+forward(prompt, 0, 5, 0)  t0 t1 t2 t3 t4       0..4        [k0 k1 k2 k3 k4]       t4  → sample t5
+forward([t5], 0, 1, 5)    t5                   5           [k0 … k5]              t5  → sample t6
+forward([t6], 0, 1, 6)    t6                   6           [k0 … k6]              t6  → sample t7
+forward([t7], 0, 1, 7)    t7                   7           [k0 … k7]              t7  → sample t8 …
+```
+
+Each decode call attends to everything before it without recomputing anything: the cost of generating token
+number 1000 is one 1-token forward pass plus 1000 dot products per head per layer — not 1000 forward passes.
+
+**Where the cache lives.** CPU: `float[layers][ctx × kvDim]` on the Java heap (so `-Xmx` must cover it).
+Metal: one shared `MTLBuffer` per layer for K and one for V, written by the `k`/`v` matmul dispatches and read
+by the `attention` kernel. Both are plain f32; storing them as f16 would halve the traffic and is a planned
+optimization ([11](11-performance.md)).
+
+**The prefix cache on top** ([10](10-engine-and-server.md)): the engine remembers which token ids currently
+occupy the cache. When the next request shares a prefix (a chat history), only the new tokens are prefilled.
+
 ---
 
 ## 5.10 Steps 9–10 — Final norm and logits
@@ -493,6 +762,39 @@ logits = Wlm · xb                              151 936
 with the final state — "how compatible is the current state with emitting token `i`". With
 `tie_word_embeddings = true`, `Wlm` **is the embedding matrix `E`**: the same vectors are used to read tokens in
 and to score them on the way out, saving 155 M parameters. (Qwen3-30B-A3B has a separate `lm_head.weight`.)
+
+**Worked example** (toy vocabulary of 4, `dim = 3`, reusing `E` from 5.2 as `Wlm`):
+
+```
+final state after norm:  xb = [0.8, 0.3, −0.4]
+
+logits = E · xb:
+   token 0 "the":          0.2·0.8 − 1.0·0.3 + 0.5·(−0.4) = 0.16 − 0.30 − 0.20 = −0.34
+   token 1 " cat":         0.9·0.8 + 0.1·0.3 − 0.3·(−0.4) = 0.72 + 0.03 + 0.12 =  0.87
+   token 2 " dog":         0.8·0.8 + 0.2·0.3 − 0.2·(−0.4) = 0.64 + 0.06 + 0.08 =  0.78
+   token 3 " parliament": −0.7·0.8 + 0.6·0.3 + 0.9·(−0.4) = −0.56 + 0.18 − 0.36 = −0.74
+
+softmax (T = 1):  [0.11, 0.37, 0.34, 0.07]     " cat" is most likely, " dog" close behind
+```
+
+The state `xb` "points toward" the `" cat"`/`" dog"` region of embedding space, so those rows score highest.
+With tied embeddings this geometric picture is exact: the model predicts the next token by producing a vector
+that resembles that token's embedding.
+
+**Shapes.** In: `x [n, 1024]` — but only row `n − 1` is used. `Wlm [151936, 1024]`. Out: `logits [151936]`.
+
+**What the code does.**
+
+```java
+if (logits != null) {
+    rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);   // normalize the LAST token only, into xb row 0
+    matmul(w.lmHead, xb, logits, 0, 1, false);               // 151 936 dot products of length 1024
+}
+```
+
+**Cost:** 155.6 M multiply-adds — **a quarter of the whole forward pass** for this small model, and in bytes
+(Q8_0: 165 MB) over a third of all weight traffic per token. Larger models are less dominated by it because
+their layers grow while the vocabulary does not.
 
 The logits go to the sampler ([09](09-sampling.md)), which applies softmax (with temperature) and draws a token.
 Note that the forward pass itself never computes a softmax over the vocabulary — the sampler does, only once.
