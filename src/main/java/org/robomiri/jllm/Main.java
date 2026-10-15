@@ -98,7 +98,14 @@ public final class Main {
                   any property key directly, e.g. --server.port 9000 or --bench.rounds=5""");
     }
 
-    private static Engine load(Settings s, HuggingFaceHub hub, String model, Path dir) throws Exception {
+    /**
+     * The loaded model. Close in this order: engine (the backend releases its buffers) and then weights (the
+     * memory-mapped quantized cache): {@code try (ModelWeights w = l.weights(); Engine e = l.engine())}.
+     */
+    private record Loaded(ModelWeights weights, Engine engine) {
+    }
+
+    private static Loaded load(Settings s, HuggingFaceHub hub, String model, Path dir) throws Exception {
         String revision = s.get("model.revision");
         if (!Files.isRegularFile(dir.resolve("config.json"))) {
             hub.downloadMetadata(model, revision, dir);
@@ -139,14 +146,20 @@ public final class Main {
             backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
         }
         int threads = s.getInt("backend.threads");
-        Backend backend = switch (backendName) {
-            case "cpu" -> new CpuBackend(weights, ctx, batch,
-                    threads > 0 ? threads : Runtime.getRuntime().availableProcessors());
-            case "metal" -> new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"));
-            default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
-        };
+        Backend backend;
+        try {
+            backend = switch (backendName) {
+                case "cpu" -> new CpuBackend(weights, ctx, batch,
+                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors());
+                case "metal" -> new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"));
+                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
+            };
+        } catch (Exception e) {
+            weights.close();
+            throw e;
+        }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch);
-        return new Engine(backend, tok, cfg, eosIds(dir, tok), s.getLong("server.queue-timeout-ms"));
+        return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok), s.getLong("server.queue-timeout-ms")));
     }
 
     private static Set<Integer> eosIds(Path dir, Tokenizer tok) throws Exception {
@@ -174,8 +187,8 @@ public final class Main {
         return ids;
     }
 
-    private static void run(Engine engine, Settings s) {
-        try (engine) {
+    private static void run(Loaded l, Settings s) {
+        try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             String text = s.has("prompt") ? s.get("prompt") : "Hello";
             int[] prompt = s.has("raw") && s.getBool("raw")
                     ? engine.tokenizer().encode(text)
@@ -190,8 +203,8 @@ public final class Main {
         }
     }
 
-    private static void chat(Engine engine, Settings s) throws Exception {
-        try (engine) {
+    private static void chat(Loaded l, Settings s) throws Exception {
+        try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
             List<ChatTemplate.Message> history = new ArrayList<>();
             String system = s.opt("chat.system");
@@ -228,7 +241,7 @@ public final class Main {
         }
     }
 
-    private static void serve(Engine engine, String model, Settings s) throws Exception {
+    private static void serve(Loaded l, String model, Settings s) throws Exception {
         int port = s.getInt("server.port");
         String host = s.get("server.host");
         HttpServer.Options http = new HttpServer.Options(
@@ -238,14 +251,15 @@ public final class Main {
                 s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
-        try (engine; ApiServer server = new ApiServer(engine, model, host, port, options)) {
+        try (ModelWeights weights = l.weights(); Engine engine = l.engine();
+             ApiServer server = new ApiServer(engine, model, host, port, options)) {
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();
         }
     }
 
-    private static void bench(Engine engine, Settings s) {
-        try (engine) {
+    private static void bench(Loaded l, Settings s) {
+        try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < 40; i++) {
                 sb.append("The quick brown fox jumps over the lazy dog. ");
