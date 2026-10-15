@@ -8,11 +8,20 @@
     <artifactId>jllm-serve</artifactId>
     <version>1.0-SNAPSHOT</version>
 
-    <!-- No dependencies on purpose: everything (JSON, HTTP client/server, tokenizer, kernels) uses only the JDK. -->
+    <!--
+      No dependencies on purpose: JSON, HTTP client/server, tokenizer and compute kernels use only the JDK.
+      The plugins below are build tooling, not runtime dependencies.
+
+      Run:   ./jllm <command>            (compiles, builds the Metal library, launches with the right JVM flags)
+      Test:  mvn test                    (runs SmokeTest against models/Qwen_Qwen3-0.6B; download it first)
+      Note:  `java -jar target/jllm-serve.jar` does not work because a manifest cannot enable the
+             incubating Vector API; use ./jllm or the explicit `java --add-modules jdk.incubator.vector` form.
+    -->
 
     <properties>
         <maven.compiler.release>26</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <jllm.test.model>${project.basedir}/models/Qwen_Qwen3-0.6B</jllm.test.model>
     </properties>
 
     <build>
@@ -28,6 +37,43 @@
                         <arg>--add-modules</arg>
                         <arg>jdk.incubator.vector</arg>
                     </compilerArgs>
+                </configuration>
+            </plugin>
+            <!-- SmokeTest is a plain main() class (no test framework), run during the test phase. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <id>smoke-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.SmokeTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+                <configuration>
+                    <skip>true</skip>
                 </configuration>
             </plugin>
             <plugin>

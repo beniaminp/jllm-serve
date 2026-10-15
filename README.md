@@ -105,9 +105,11 @@ Both backends produce identical greedy output.
 ## Tests
 
 ```sh
-mvn -q test-compile
-$JAVA_HOME/bin/java --add-modules jdk.incubator.vector -cp target/classes:target/test-classes org.robomiri.jllm.SmokeTest
+mvn test            # runs SmokeTest (plain main(), no test framework) against models/Qwen_Qwen3-0.6B
 ```
+
+Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the CPU KV cache lives on the heap),
+`JAVA_OPTS` (extra JVM flags), `JLLM_NO_BUILD=1` to skip the incremental compile.
 
 ## Layout
 
