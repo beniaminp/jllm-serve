@@ -195,6 +195,69 @@ public final class VectorKernels {
         }
     }
 
+    /**
+     * 4 x 4 register tile: the four rows {@code w[wo + k*n ..]} against four activation vectors
+     * {@code x[xa..], x[xb..], x[xc..], x[xd..]}; results for vector {@code x?} go to {@code out[o? .. o?+4)}.
+     * Eight loads feed sixteen FMAs. Every accumulator follows the same lane-wise order as {@link #dot4}, so each
+     * output is bit-identical to the untiled kernel.
+     */
+    static void dot4x4(float[] w, int wo, int n, float[] x, int xa, int xb, int xc, int xd,
+                       float[] out, int oa, int ob, int oc, int od, boolean acc) {
+        FloatVector a0 = FloatVector.zero(F), a1 = FloatVector.zero(F), a2 = FloatVector.zero(F), a3 = FloatVector.zero(F);
+        FloatVector b0 = FloatVector.zero(F), b1 = FloatVector.zero(F), b2 = FloatVector.zero(F), b3 = FloatVector.zero(F);
+        FloatVector c0 = FloatVector.zero(F), c1 = FloatVector.zero(F), c2 = FloatVector.zero(F), c3 = FloatVector.zero(F);
+        FloatVector d0 = FloatVector.zero(F), d1 = FloatVector.zero(F), d2 = FloatVector.zero(F), d3 = FloatVector.zero(F);
+        for (int i = 0; i < n; i += FL) {
+            FloatVector w0 = FloatVector.fromArray(F, w, wo + i);
+            FloatVector w1 = FloatVector.fromArray(F, w, wo + n + i);
+            FloatVector w2 = FloatVector.fromArray(F, w, wo + 2 * n + i);
+            FloatVector w3 = FloatVector.fromArray(F, w, wo + 3 * n + i);
+            FloatVector xv = FloatVector.fromArray(F, x, xa + i);
+            a0 = w0.fma(xv, a0);
+            a1 = w1.fma(xv, a1);
+            a2 = w2.fma(xv, a2);
+            a3 = w3.fma(xv, a3);
+            xv = FloatVector.fromArray(F, x, xb + i);
+            b0 = w0.fma(xv, b0);
+            b1 = w1.fma(xv, b1);
+            b2 = w2.fma(xv, b2);
+            b3 = w3.fma(xv, b3);
+            xv = FloatVector.fromArray(F, x, xc + i);
+            c0 = w0.fma(xv, c0);
+            c1 = w1.fma(xv, c1);
+            c2 = w2.fma(xv, c2);
+            c3 = w3.fma(xv, c3);
+            xv = FloatVector.fromArray(F, x, xd + i);
+            d0 = w0.fma(xv, d0);
+            d1 = w1.fma(xv, d1);
+            d2 = w2.fma(xv, d2);
+            d3 = w3.fma(xv, d3);
+        }
+        store4(out, oa, a0, a1, a2, a3, acc);
+        store4(out, ob, b0, b1, b2, b3, acc);
+        store4(out, oc, c0, c1, c2, c3, acc);
+        store4(out, od, d0, d1, d2, d3, acc);
+    }
+
+    private static void store4(float[] out, int oo, FloatVector s0, FloatVector s1, FloatVector s2, FloatVector s3,
+                               boolean acc) {
+        float r0 = s0.reduceLanes(VectorOperators.ADD);
+        float r1 = s1.reduceLanes(VectorOperators.ADD);
+        float r2 = s2.reduceLanes(VectorOperators.ADD);
+        float r3 = s3.reduceLanes(VectorOperators.ADD);
+        if (acc) {
+            out[oo] += r0;
+            out[oo + 1] += r1;
+            out[oo + 2] += r2;
+            out[oo + 3] += r3;
+        } else {
+            out[oo] = r0;
+            out[oo + 1] = r1;
+            out[oo + 2] = r2;
+            out[oo + 3] = r3;
+        }
+    }
+
     static float sumSquares(float[] x, int xo, int n) {
         return dot(x, xo, x, xo, n);
     }

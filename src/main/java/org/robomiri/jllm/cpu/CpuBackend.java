@@ -279,7 +279,14 @@ public final class CpuBackend implements Backend {
                     for (int k = 0; k < 4; k++) {
                         VectorKernels.dequantRow(wt, r + k, tmp, k * cols);
                     }
-                    for (int t = 0; t < n; t++) {
+                    int t = 0;
+                    for (; t + 4 <= n; t += 4) {
+                        int xo = t * cols;
+                        int oo = outOff + t * rows + r;
+                        VectorKernels.dot4x4(tmp, 0, cols, in, xo, xo + cols, xo + 2 * cols, xo + 3 * cols,
+                                out, oo, oo + rows, oo + 2 * rows, oo + 3 * rows, acc);
+                    }
+                    for (; t < n; t++) {
                         VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, outOff + t * rows + r, acc);
                     }
                 } else {
@@ -530,7 +537,19 @@ public final class CpuBackend implements Backend {
                     for (int k = 0; k < 4; k++) {
                         VectorKernels.dequantRow(wt, rowBase + r + k, tmp, k * cols);
                     }
-                    for (int s = sBeg; s < sEnd; s++) {
+                    int s = sBeg;
+                    for (; s + 4 <= sEnd; s += 4) {
+                        int sa = slotOrder[s];
+                        int sb = slotOrder[s + 1];
+                        int sc = slotOrder[s + 2];
+                        int sd = slotOrder[s + 3];
+                        VectorKernels.dot4x4(tmp, 0, cols, in,
+                                (inBySlot ? sa : sa / topK) * inStride, (inBySlot ? sb : sb / topK) * inStride,
+                                (inBySlot ? sc : sc / topK) * inStride, (inBySlot ? sd : sd / topK) * inStride,
+                                out, sa * outStride + r, sb * outStride + r, sc * outStride + r, sd * outStride + r,
+                                false);
+                    }
+                    for (; s < sEnd; s++) {
                         int slot = slotOrder[s];
                         int io = (inBySlot ? slot : slot / topK) * inStride;
                         VectorKernels.dot4(tmp, 0, cols, in, io, out, slot * outStride + r, false);
