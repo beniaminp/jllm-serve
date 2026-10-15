@@ -2,6 +2,7 @@ package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.InterleavedRope;
+import org.robomiri.jllm.model.GemmaMath;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
@@ -22,6 +23,8 @@ public final class CpuBackend implements Backend {
     private final int maxBatch;
     private final ThreadPool pool;
     private final Rope rope;
+    /** Gemma 3 sliding layers use another RoPE base; same object as {@link #rope} for every other model. */
+    private final Rope ropeLocal;
 
     private final KvCache kv;
     // k/v of the current chunk, [maxBatch, kvDim]: projected, normalized and rotated here, then stored
@@ -56,6 +59,7 @@ public final class CpuBackend implements Backend {
         this.maxBatch = maxBatch;
         this.pool = new ThreadPool(threads);
         this.rope = Rope.of(c, ctx);
+        this.ropeLocal = anyLocalRope(c) ? Rope.local(c, ctx) : rope;
         kv = KvCache.create(kvDtype, c, ctx);
         kStage = new float[maxBatch * c.kvDim()];
         vStage = new float[maxBatch * c.kvDim()];
@@ -80,6 +84,15 @@ public final class CpuBackend implements Backend {
         }
         int scratchLen = Math.max(ctx, 4 * Math.max(c.hiddenDim(), Math.max(c.dim(), c.qDim())));
         scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
+    }
+
+    private static boolean anyLocalRope(ModelConfig c) {
+        for (int l = 0; l < c.layers(); l++) {
+            if (c.usesLocalRope(l)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -107,6 +120,11 @@ public final class CpuBackend implements Backend {
         for (int t = 0; t < n; t++) {
             w.embed.dequantizeRow(tokens[off + t], x, t * dim);
         }
+        if (c.embedScale() != 1f) {
+            for (int i = 0, m = n * dim; i < m; i++) {
+                x[i] *= c.embedScale();
+            }
+        }
         for (int l = 0; l < c.layers(); l++) {
             ModelWeights.Layer L = w.layers[l];
             rmsnorm(x, xb, L.attnNorm, n, dim);
@@ -118,8 +136,9 @@ public final class CpuBackend implements Backend {
                 addBias(kStage, 0, L.bk, n);
                 addBias(vStage, 0, L.bv, n);
             }
-            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
-            normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            Rope r = c.usesLocalRope(l) ? ropeLocal : rope;
+            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos, r);
+            normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos, r);
             kv.store(l, pos, kStage, vStage, n);
             attention(l, n, pos);
             if (L.postAttnNorm != null) {
@@ -135,7 +154,11 @@ public final class CpuBackend implements Backend {
                 moe(L, n);
             } else {
                 matmul(L.wGateUp, xb, gateUp, 0, n, false);
-                siluMul(n);
+                if (c.isGemma()) {
+                    geluMul(n);
+                } else {
+                    siluMul(n);
+                }
                 if (L.postMlpNorm != null) {
                     // Glm4: x += rmsnorm(down_proj(mlp)); xb is free again once gate/up are computed
                     matmul(L.wDown, hidden, xb, 0, n, false);
@@ -148,6 +171,14 @@ public final class CpuBackend implements Backend {
         if (logits != null) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
             matmul(w.lmHead, xb, logits, 0, 1, false);
+            float cap = c.finalSoftcap();
+            if (cap > 0) {
+                pool.forRange(w.lmHead.rows, 4096, (i0, i1) -> {
+                    for (int i = i0; i < i1; i++) {
+                        logits[i] = GemmaMath.softcap(logits[i], cap);
+                    }
+                });
+            }
         }
     }
 
@@ -228,7 +259,7 @@ public final class CpuBackend implements Backend {
     }
 
     /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
-    private void normRope(float[] v, int base, int stride, int nHeads, float[] norm, int n, int pos) {
+    private void normRope(float[] v, int base, int stride, int nHeads, float[] norm, int n, int pos, Rope rope) {
         int hd = c.headDim();
         int half = c.rotaryDim() / 2; // rope table width; = hd / 2 unless partial_rotary_factor < 1
         boolean interleaved = c.ropeInterleaved();
@@ -260,7 +291,7 @@ public final class CpuBackend implements Backend {
     /** Causal grouped-query attention for tokens at positions [pos, pos+n). */
     private void attention(int layer, int n, int pos) {
         if (kv instanceof KvCache.F16 half) {
-            half.attention(pool, layer, n, pos, q, att, c.windowFor(layer));
+            half.attention(pool, layer, n, pos, q, att, c.windowFor(layer), c.attnScale(), c.attnSoftcap());
             return;
         }
         float[] kc = ((KvCache.F32) kv).key[layer];
@@ -270,7 +301,8 @@ public final class CpuBackend implements Backend {
         int kvDim = c.kvDim();
         int qDim = c.qDim();
         int group = nh / c.kvHeads();
-        float scale = (float) (1.0 / Math.sqrt(hd));
+        float scale = c.attnScale();
+        float softcap = c.attnSoftcap();
         int window = c.windowFor(layer); // 0 = full causal attention
         pool.forRange(n * nh, 1, (i0, i1) -> {
             float[] sc = scratch.get();
@@ -284,6 +316,9 @@ public final class CpuBackend implements Backend {
                 float max = Float.NEGATIVE_INFINITY;
                 for (int s = first; s < len; s++) {
                     float d = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;
+                    if (softcap > 0) {
+                        d = (float) Math.tanh(d / softcap) * softcap;
+                    }
                     sc[s] = d;
                     max = Math.max(max, d);
                 }
@@ -376,6 +411,18 @@ public final class CpuBackend implements Backend {
         if (c.normTopK() && selected > 0) {
             for (int k = 0; k < topK; k++) {
                 routeWeight[k] /= selected;
+            }
+        }
+    }
+
+    /** hidden = gelu_tanh(gate) * up, Gemma's GeGLU. */
+    private void geluMul(int n) {
+        int hdim = c.hiddenDim();
+        for (int t = 0; t < n; t++) {
+            int gi = t * 2 * hdim;
+            int oi = t * hdim;
+            for (int i = 0; i < hdim; i++) {
+                hidden[oi + i] = GemmaMath.geluTanh(gateUp[gi + i]) * gateUp[gi + hdim + i];
             }
         }
     }

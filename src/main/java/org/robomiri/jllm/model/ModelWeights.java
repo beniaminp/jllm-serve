@@ -135,8 +135,6 @@ public final class ModelWeights implements AutoCloseable {
     /** Every shape a backend relies on: a mismatch here would otherwise surface as a silent out-of-bounds read. */
     private static void checkShapes(ModelConfig c, Layer L, int l) {
         boolean ok = L.attnNorm.length == c.dim() && L.ffnNorm.length == c.dim()
-                && (c.postNorms() == (L.postAttnNorm != null) && c.postNorms() == (L.postMlpNorm != null))
-                && (L.postAttnNorm == null || (L.postAttnNorm.length == c.dim() && L.postMlpNorm.length == c.dim()))
                 && L.wq.rows == c.qDim() && L.wq.cols == c.dim()
                 && L.wk.rows == c.kvDim() && L.wk.cols == c.dim()
                 && L.wv.rows == c.kvDim() && L.wv.cols == c.dim()

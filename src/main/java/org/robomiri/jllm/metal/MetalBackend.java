@@ -52,6 +52,7 @@ public final class MetalBackend implements Backend {
     private int pAttention;
     private int attnGroup; // query heads per attention threadgroup
     private int pAddBias;
+    private int pSoftcap;     // Gemma 2 final-logit cap, -1 otherwise
     private int pRouter;
     private int pMoeUpQ4;
     private int pMoeUpQ8;
@@ -70,6 +71,8 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer finalNorm;
     private Metal.Buffer ropeCos;
     private Metal.Buffer ropeSin;
+    private Metal.Buffer ropeCosLocal; // Gemma 3 sliding layers; the same buffers as above when there is no local table
+    private Metal.Buffer ropeSinLocal;
     private Metal.Buffer[] keyCache;
     private Metal.Buffer[] valCache;
 
@@ -188,6 +191,7 @@ public final class MetalBackend implements Backend {
             pAttention = metal.pipeline(kvHalf ? "attention_h" : "attention");
         }
         pAddBias = metal.pipeline("add_bias");
+        pSoftcap = c.finalSoftcap() > 0 ? metal.pipeline("softcap") : -1;
         pRouter = metal.pipeline("router");
         pMoeUpQ4 = metal.pipeline("moe_up_q4");
         pMoeUpQ8 = metal.pipeline("moe_up_q8");
@@ -231,6 +235,18 @@ public final class MetalBackend implements Backend {
         Rope rope = Rope.of(c, ctx);
         ropeCos = upload(rope.cos);
         ropeSin = upload(rope.sin);
+        boolean localRope = false;
+        for (int l = 0; l < c.layers(); l++) {
+            localRope |= c.usesLocalRope(l);
+        }
+        if (localRope) {
+            Rope local = Rope.local(c, ctx);
+            ropeCosLocal = upload(local.cos);
+            ropeSinLocal = upload(local.sin);
+        } else {
+            ropeCosLocal = ropeCos;
+            ropeSinLocal = ropeSin;
+        }
 
         // None of the buffers below is zeroed: every element is written before it is read. The KV cache rows
         // [0, pos + n) are written by the K/V projections (or kv_store_half) before attention reads them,
@@ -311,6 +327,11 @@ public final class MetalBackend implements Backend {
         float[] row = new float[dim];
         for (int t = 0; t < n; t++) {
             w.embed.dequantizeRow(tokens[off + t], row, 0);
+            if (c.embedScale() != 1f) {
+                for (int i = 0; i < dim; i++) {
+                    row[i] *= c.embedScale();
+                }
+            }
             MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
         }
 
@@ -338,7 +359,7 @@ public final class MetalBackend implements Backend {
                     addBias(kDst, kvOff, L.bk, n, kvDim);
                     addBias(vDst, kvOff, L.bv, n, kvDim);
                 }
-                normRope(L, kDst, kvOff, n, pos);
+                normRope(L, kDst, kvOff, n, pos, c.usesLocalRope(l));
                 if (kvHalf) {
                     kvStore(l, n, pos);
                 }
@@ -375,6 +396,12 @@ public final class MetalBackend implements Backend {
                 // ~38k threadgroups, which costs more than the one dispatch it saves.
                 rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
                 matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null);
+                if (pSoftcap >= 0) {
+                    bind(0, logitsBuf, 0);
+                    params.setAtIndex(ValueLayout.JAVA_INT, 0, w.lmHead.rows);
+                    params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.finalSoftcap());
+                    metal.dispatch(pSoftcap, bufArgs, offArgs, 1, params, 8, (w.lmHead.rows + 255) / 256, 1, 1, 256, 1, 1);
+                }
             }
             metal.commitAndWait();
             committed = true;
@@ -477,11 +504,12 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 1, t.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, c.isGemma() ? 1 : 0);
         int pipe = t.type == QType.Q4_0 ? (norm != null ? pSwigluQ4Norm : pSwigluQ4)
                                         : (norm != null ? pSwigluQ8Norm : pSwigluQ8);
         int gx = (hiddenDim + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 16, normTgMem(norm, t.cols), gx, gy, 1,
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1,
                 32 * SG_PER_TG, 1, 1);
     }
 
@@ -534,7 +562,7 @@ public final class MetalBackend implements Backend {
     }
 
     /** QK-norm + RoPE for the q rows and the k rows just written at position pos, in one dispatch. */
-    private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos) {
+    private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos, boolean localRope) {
         if (c.ropeInterleaved() || c.ropePartialHalf()) {
             if (L.qNorm != null) {
                 throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
@@ -547,8 +575,8 @@ public final class MetalBackend implements Backend {
         bind(1, kDst, kvOff);
         bind(2, useNorm ? L.qNorm : finalNorm, 0); // dummy bindings when unused
         bind(3, useNorm ? L.kNorm : finalNorm, 0);
-        bind(4, ropeCos, 0);
-        bind(5, ropeSin, 0);
+        bind(4, localRope ? ropeCosLocal : ropeCos, 0);
+        bind(5, localRope ? ropeSinLocal : ropeSin, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
@@ -572,13 +600,14 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 3, pos);
         params.setAtIndex(ValueLayout.JAVA_INT, 4, ctx);
-        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, (float) (1.0 / Math.sqrt(c.headDim())));
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.attnScale());
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 8, c.windowFor(l));
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 10, c.attnSoftcap());
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             params.setAtIndex(ValueLayout.JAVA_INT, 9, t0);
-            metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 40, c.heads() / attnGroup,
+            metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 44, c.heads() / attnGroup,
                     Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
     }

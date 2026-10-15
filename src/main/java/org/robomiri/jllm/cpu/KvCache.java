@@ -105,13 +105,18 @@ abstract class KvCache {
 
         /** @param window sliding-window length in tokens, 0 = full causal attention */
         void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window) {
+            attention(pool, layer, n, pos, q, att, window, (float) (1.0 / Math.sqrt(headDim)), 0f);
+        }
+
+        /** @param scale multiplier of q.k; @param softcap {@code tanh(s/cap)*cap} on the scaled score, 0 = off */
+        void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
+                       float scale, float softcap) {
             short[] kc = key[layer];
             short[] vc = val[layer];
             int hd = headDim;
             int kOff = group * ctx;
             int vOff = kOff + hd;
             int invOff = vOff + hd;
-            float scale = (float) (1.0 / Math.sqrt(hd));
             pool.forRange(n * kvHeads, 1, (i0, i1) -> {
                 float[] sc = scratch.get();
                 for (int i = i0; i < i1; i++) {
@@ -124,7 +129,8 @@ abstract class KvCache {
                     for (int s = first; s < len; s++) {
                         toFloat(kc, s * kvDim + ko, sc, kOff, hd);
                         for (int h = 0; h < group; h++) {
-                            sc[h * ctx + s] = VectorKernels.dot(q, qo0 + h * hd, sc, kOff, hd) * scale;
+                            float d = VectorKernels.dot(q, qo0 + h * hd, sc, kOff, hd) * scale;
+                            sc[h * ctx + s] = softcap > 0 ? (float) Math.tanh(d / softcap) * softcap : d;
                         }
                     }
                     for (int h = 0; h < group; h++) {

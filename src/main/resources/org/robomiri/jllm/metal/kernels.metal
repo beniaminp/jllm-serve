@@ -87,7 +87,14 @@ struct SwigluParams {
     int cols;
     int ntok;
     float eps;
+    int gelu;       // 1 = Gemma's GeGLU: gelu_tanh(gate) * up instead of silu(gate) * up
 };
+
+// gelu_pytorch_tanh; the argument of tanh is clamped because fast-math tanh overflows to NaN for large inputs
+static inline float gelu_tanh_f(float g) {
+    const float a = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    return 0.5f * g * (1.0f + tanh(clamp(a, -20.0f, 20.0f)));
+}
 
 // rmsnorm's scale for the row x[0..n), reduced exactly as the 256-thread rmsnorm kernel reduces it, on a
 // 128-thread threadgroup (4 simdgroups): thread (sg, lane) plays rmsnorm's threads v = sg*32 + lane and
@@ -305,7 +312,7 @@ kernel void matmul_swiglu(device const uchar *wq [[buffer(0)]],
         if (t < nt) {
             float g = simd_sum(accg[t]);
             float u = simd_sum(accu[t]);
-            if (lane == 0) out[(ulong)(t0 + t) * p.hidden + row] = g / (1.0f + exp(-g)) * u;
+            if (lane == 0) out[(ulong)(t0 + t) * p.hidden + row] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
         }
     }
 }
@@ -426,6 +433,7 @@ struct AttnParams {
     int kvStride;
     int window;      // sliding-window length in tokens, 0 = full causal attention
     int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
+    float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
 };
 
 kernel void attention(device const float *q [[buffer(0)]],
@@ -466,6 +474,7 @@ kernel void attention(device const float *q [[buffer(0)]],
         float d = 0.0f;
         for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * kv[lane + i * 32];
         d = simd_sum(d) * p.scale;
+        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
         if (lane == 0) sc[s] = d;
         mx = max(mx, d);
     }
@@ -553,6 +562,7 @@ kernel void attention_g(device const float *q [[buffer(0)]],
             float d = 0.0f;
             for (int i = 0; i < PER; i++) d += qr[g][i] * kr[i];
             d = simd_sum(d) * p.scale;
+            if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
             if (lane == 0) sc[g][s] = d;
             mx[g] = max(mx[g], d);
         }
@@ -848,6 +858,7 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
         float d = 0.0f;
         for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
         d = simd_sum(d) * p.scale;
+        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
         if (lane == 0) sc[s] = d;
         mx = max(mx, d);
     }
@@ -962,4 +973,20 @@ kernel void rmsnorm_add(device const float *y [[buffer(0)]],
     ss = tg_sum(ss, buf, sg, lane, nsg);
     const float scale = rsqrt(ss / p.n + p.eps);
     for (int i = tid; i < p.n; i += tpg) ov[i] += yv[i] * scale * w[i];
+}
+
+// ---------------------------------------------------------------------------------------------- Gemma 2 / 3
+// Final-logit soft-capping: v[i] = tanh(v[i] / cap) * cap. (The sandwich norms reuse rmsnorm_add above, the
+// GeGLU is the `gelu` flag of matmul_swiglu, the attention soft-cap is AttnParams.softcap.)
+
+struct SoftcapParams {
+    int n;
+    float cap;
+};
+
+kernel void softcap(device float *v [[buffer(0)]],
+                    constant SoftcapParams &p [[buffer(1)]],
+                    uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    v[gid] = tanh(clamp(v[gid] / p.cap, -20.0f, 20.0f)) * p.cap;
 }
