@@ -49,6 +49,12 @@ public final class ModelWeights implements AutoCloseable {
         this.file = file;
         embed = file.tensor("model.embed_tokens.weight");
         lmHead = file.has("lm_head.weight") ? file.tensor("lm_head.weight") : embed;
+        // The engine sizes its logits from vocabSize and backends write lmHead.rows outputs, so both must agree.
+        if (embed.cols != cfg.dim() || embed.rows != cfg.vocabSize()
+                || lmHead.cols != cfg.dim() || lmHead.rows != cfg.vocabSize()) {
+            throw new IllegalArgumentException("embedding " + embed.rows + "x" + embed.cols + " / lm_head "
+                    + lmHead.rows + "x" + lmHead.cols + " do not match config " + cfg + STALE_HINT);
+        }
         layers = new Layer[cfg.layers()];
         for (int l = 0; l < cfg.layers(); l++) {
             String p = "model.layers." + l + ".";
@@ -74,7 +80,13 @@ public final class ModelWeights implements AutoCloseable {
             layers[l] = L;
         }
         finalNorm = file.floats("model.norm.weight");
+        if (finalNorm.length != cfg.dim()) {
+            throw new IllegalArgumentException("model.norm.weight has " + finalNorm.length + " entries, expected "
+                    + cfg.dim() + STALE_HINT);
+        }
     }
+
+    private static final String STALE_HINT = " (stale jllm-*.bin cache? delete it to reconvert)";
 
     /**
      * Opens the quantized cache in {@code dir}, converting the Hugging Face checkpoint first if there is none.
@@ -96,11 +108,15 @@ public final class ModelWeights implements AutoCloseable {
         }
     }
 
+    /** Every shape a backend relies on: a mismatch here would otherwise surface as a silent out-of-bounds read. */
     private static void checkShapes(ModelConfig c, Layer L, int l) {
-        boolean ok = L.wq.rows == c.qDim() && L.wq.cols == c.dim()
-                && L.wk.rows == c.kvDim() && L.wv.rows == c.kvDim()
+        boolean ok = L.attnNorm.length == c.dim() && L.ffnNorm.length == c.dim()
+                && L.wq.rows == c.qDim() && L.wq.cols == c.dim()
+                && L.wk.rows == c.kvDim() && L.wk.cols == c.dim()
+                && L.wv.rows == c.kvDim() && L.wv.cols == c.dim()
                 && L.wo.rows == c.dim() && L.wo.cols == c.qDim()
-                && (L.qNorm == null || L.qNorm.length == c.headDim());
+                && (L.qNorm == null || L.qNorm.length == c.headDim())
+                && (L.kNorm == null || L.kNorm.length == c.headDim());
         if (L.moe) {
             ok &= c.isMoeLayer(l)
                     && L.router.length == c.numExperts() * c.dim()
@@ -108,11 +124,11 @@ public final class ModelWeights implements AutoCloseable {
                     && L.expDown.rows == c.numExperts() * c.dim() && L.expDown.cols == c.moeDim();
         } else {
             ok &= !c.isMoeLayer(l)
-                    && L.wGateUp.rows == 2 * c.hiddenDim() && L.wDown.cols == c.hiddenDim();
+                    && L.wGateUp.rows == 2 * c.hiddenDim() && L.wGateUp.cols == c.dim()
+                    && L.wDown.rows == c.dim() && L.wDown.cols == c.hiddenDim();
         }
         if (!ok) {
-            throw new IllegalArgumentException("layer " + l + " weight shapes do not match config " + c
-                    + " (stale jllm-*.bin cache? delete it to reconvert)");
+            throw new IllegalArgumentException("layer " + l + " weight shapes do not match config " + c + STALE_HINT);
         }
     }
 
