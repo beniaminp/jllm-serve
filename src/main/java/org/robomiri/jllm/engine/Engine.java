@@ -138,6 +138,9 @@ public final class Engine implements AutoCloseable {
         while (reuse < max && cached[reuse] == prompt[reuse]) {
             reuse++;
         }
+        // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
+        // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
+        cachedLen = 0;
         long t0 = System.nanoTime();
         int pos = reuse;
         int batch = backend.maxBatch();
