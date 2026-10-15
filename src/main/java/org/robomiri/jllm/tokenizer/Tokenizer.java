@@ -256,31 +256,66 @@ public final class Tokenizer {
                 return new int[]{whole};
             }
         }
-        int[] sym = new int[bytes.length];
-        for (int i = 0; i < bytes.length; i++) {
+        int n = bytes.length;
+        int[] sym = new int[n];
+        for (int i = 0; i < n; i++) {
             sym[i] = byteCharIds[bytes[i] & 0xFF];
         }
-        int n = sym.length;
-        while (n > 1) {
-            long bestRank = Long.MAX_VALUE;
-            int bestPos = -1;
-            int bestId = -1;
-            for (int i = 0; i + 1 < n; i++) {
-                Long v = merges.get(pairKey(sym[i], sym[i + 1]));
-                if (v != null && (v >>> 32) < bestRank) {
-                    bestRank = v >>> 32;
-                    bestPos = i;
-                    bestId = (int) (long) v;
-                }
-            }
-            if (bestPos < 0) {
-                break;
-            }
-            sym[bestPos] = bestId;
-            System.arraycopy(sym, bestPos + 2, sym, bestPos + 1, n - bestPos - 2);
-            n--;
+        if (n < 2) {
+            return sym;
         }
-        return Arrays.copyOf(sym, n);
+        // Symbols form a doubly linked list over their original positions; a min-heap of (rank, position)
+        // yields the lowest-ranked pair, leftmost first, which is exactly the order a full rescan would pick.
+        // Entries go stale when either side of their pair has been merged away; they are verified on pop by
+        // re-reading the pair at that position (ranks are unique per pair, so an equal rank means the same pair).
+        int[] next = new int[n];
+        int[] prev = new int[n];
+        LongHeap heap = new LongHeap(2 * n);
+        for (int i = 0; i < n; i++) {
+            next[i] = i + 1 < n ? i + 1 : -1;
+            prev[i] = i - 1;
+            if (i + 1 < n) {
+                offer(heap, sym, i, i + 1);
+            }
+        }
+        int alive = n;
+        while (!heap.isEmpty()) {
+            long e = heap.pop();
+            int i = (int) e;
+            int j = next[i];
+            if (sym[i] < 0 || j < 0) {
+                continue;
+            }
+            Long v = merges.get(pairKey(sym[i], sym[j]));
+            if (v == null || (v >>> 32) != (e >>> 32)) {
+                continue;
+            }
+            sym[i] = (int) (long) v;
+            sym[j] = -1;
+            int k = next[j];
+            next[i] = k;
+            if (k >= 0) {
+                prev[k] = i;
+                offer(heap, sym, i, k);
+            }
+            if (prev[i] >= 0) {
+                offer(heap, sym, prev[i], i);
+            }
+            alive--;
+        }
+        int[] out = new int[alive];
+        int o = 0;
+        for (int i = 0; i >= 0; i = next[i]) {
+            out[o++] = sym[i];
+        }
+        return out;
+    }
+
+    private void offer(LongHeap heap, int[] sym, int left, int right) {
+        Long v = merges.get(pairKey(sym[left], sym[right]));
+        if (v != null) {
+            heap.push((v & 0xFFFFFFFF00000000L) | left);
+        }
     }
 
     private static long pairKey(int a, int b) {
@@ -372,6 +407,57 @@ public final class Tokenizer {
     @SuppressWarnings("unchecked")
     private static Map<String, Object> asMap(Object o) {
         return o instanceof Map ? (Map<String, Object>) o : null;
+    }
+
+    /** Binary min-heap of longs without boxing; used for (rank << 32 | position) merge candidates. */
+    static final class LongHeap {
+        private long[] a;
+        private int n;
+
+        LongHeap(int cap) {
+            a = new long[Math.max(cap, 4)];
+        }
+
+        boolean isEmpty() {
+            return n == 0;
+        }
+
+        void push(long v) {
+            if (n == a.length) {
+                a = Arrays.copyOf(a, a.length * 2);
+            }
+            int i = n++;
+            while (i > 0) {
+                int parent = (i - 1) >>> 1;
+                if (a[parent] <= v) {
+                    break;
+                }
+                a[i] = a[parent];
+                i = parent;
+            }
+            a[i] = v;
+        }
+
+        long pop() {
+            long top = a[0];
+            long v = a[--n];
+            int i = 0;
+            while (true) {
+                int l = 2 * i + 1;
+                if (l >= n) {
+                    break;
+                }
+                int r = l + 1;
+                int m = r < n && a[r] < a[l] ? r : l;
+                if (a[m] >= v) {
+                    break;
+                }
+                a[i] = a[m];
+                i = m;
+            }
+            a[i] = v;
+            return top;
+        }
     }
 
     /** Growable int array without boxing. */
