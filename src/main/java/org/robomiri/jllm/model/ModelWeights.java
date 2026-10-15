@@ -4,7 +4,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * Quantized weights of a Qwen3 (dense or MoE) decoder, memory-mapped from a {@link QuantFile}.
+ * Quantized weights of a Llama / Mistral / Qwen2 / Qwen3 (dense or MoE) decoder, memory-mapped from a {@link QuantFile}.
  *
  * <p>Linear layers use the requested format (Q4_0 by default); the embedding / LM head always uses Q8_0 because
  * small models are sensitive to output-layer precision. Gate and up projections are fused into one matrix; in MoE
@@ -18,6 +18,10 @@ public final class ModelWeights implements AutoCloseable {
         /** Per-head RMSNorm on queries/keys (Qwen3); null for models without it. */
         public float[] qNorm;
         public float[] kNorm;
+        /** q/k/v projection biases (Qwen2); null for models without them. */
+        public float[] bq;
+        public float[] bk;
+        public float[] bv;
         public QTensor wq;
         public QTensor wk;
         public QTensor wv;
@@ -67,6 +71,11 @@ public final class ModelWeights implements AutoCloseable {
             L.wk = file.tensor(p + "self_attn.k_proj.weight");
             L.wv = file.tensor(p + "self_attn.v_proj.weight");
             L.wo = file.tensor(p + "self_attn.o_proj.weight");
+            if (cfg.attentionBias()) {
+                L.bq = file.floats(p + "self_attn.q_proj.bias");
+                L.bk = file.floats(p + "self_attn.k_proj.bias");
+                L.bv = file.floats(p + "self_attn.v_proj.bias");
+            }
             L.moe = file.has(p + "mlp.router");
             if (L.moe) {
                 L.router = file.floats(p + "mlp.router");
@@ -115,6 +124,9 @@ public final class ModelWeights implements AutoCloseable {
                 && L.wk.rows == c.kvDim() && L.wk.cols == c.dim()
                 && L.wv.rows == c.kvDim() && L.wv.cols == c.dim()
                 && L.wo.rows == c.dim() && L.wo.cols == c.qDim()
+                && (c.attentionBias() == (L.bq != null))
+                && (L.bq == null || (L.bq.length == c.qDim() && L.bk.length == c.kvDim() && L.bv.length == c.kvDim()))
+                && (c.qkNorm() == (L.qNorm != null) && c.qkNorm() == (L.kNorm != null))
                 && (L.qNorm == null || L.qNorm.length == c.headDim())
                 && (L.kNorm == null || L.kNorm.length == c.headDim());
         if (L.moe) {

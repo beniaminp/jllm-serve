@@ -126,6 +126,7 @@ public final class ModelConverter {
             for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
                 in.add(p + "self_attn." + n + ".weight");
             }
+            in.addAll(biasNames(p));
             if (cfg.isMoeLayer(l)) {
                 in.add(routerName(p));
                 if (fusedExperts(p)) {
@@ -159,6 +160,14 @@ public final class ModelConverter {
         return units;
     }
 
+    /** q/k/v projection biases (Qwen2), stored as f32 under their checkpoint names. */
+    private List<String> biasNames(String p) {
+        if (!cfg.attentionBias()) {
+            return List.of();
+        }
+        return List.of(p + "self_attn.q_proj.bias", p + "self_attn.k_proj.bias", p + "self_attn.v_proj.bias");
+    }
+
     private List<String> layerNorms(String p) {
         List<String> out = new ArrayList<>(4);
         for (String n : new String[]{"input_layernorm.weight", "post_attention_layernorm.weight",
@@ -186,6 +195,9 @@ public final class ModelConverter {
 
     private void convertLayer(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
         for (String n : layerNorms(p)) {
+            w.putFloats(n, tensor(n).toFloatArray());
+        }
+        for (String n : biasNames(p)) {
             w.putFloats(n, tensor(n).toFloatArray());
         }
         for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
