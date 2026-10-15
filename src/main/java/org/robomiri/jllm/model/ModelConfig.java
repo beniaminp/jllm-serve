@@ -30,6 +30,8 @@ import java.util.stream.Collectors;
  * @param mlpOnlyLayers layers that use the dense MLP even in a MoE model
  * @param partialRotaryFactor fraction of each head that is rotated by RoPE (GLM: 0.5 or 1.0; others 1.0)
  * @param gemma         Gemma 2 / 3 specifics, null for every other family
+ * @param mamba         state-space parameters of a Mamba model (then {@code hiddenDim} is {@code d_inner}, attention
+ *                      fields are placeholders), null for transformers
  */
 public record ModelConfig(
         String architecture,
@@ -59,7 +61,8 @@ public record ModelConfig(
         int sparseStep,
         Set<Integer> mlpOnlyLayers,
         double partialRotaryFactor,
-        Gemma gemma) {
+        Gemma gemma,
+        MambaParams mamba) {
 
     /**
      * What distinguishes Gemma 2 / Gemma 3 (text) from the Llama-style decoder: GeLU(tanh) MLP, norm gain
@@ -115,6 +118,18 @@ public record ModelConfig(
     /** Gemma stores norm gains as {@code w} and applies {@code 1 + w}; the converter folds the 1 in. */
     public boolean normPlusOne() {
         return gemma != null;
+    }
+
+    /**
+     * Mamba (v1) mixer sizes from config.json: {@code state_size}, {@code conv_kernel}, {@code time_step_rank}
+     * (resolved from "auto" = ceil(d_model/16)), {@code d_inner} ({@code intermediate_size} or
+     * {@code expand * hidden_size}) and the two optional biases.
+     */
+    public record MambaParams(int dState, int dConv, int dtRank, int dInner, boolean useBias, boolean convBias) {
+    }
+
+    public boolean isMamba() {
+        return mamba != null;
     }
 
     /**
@@ -196,7 +211,8 @@ public record ModelConfig(
             Map.entry("glm4", "Glm4ForCausalLM"),
             Map.entry("phi3", "Phi3ForCausalLM"),
             Map.entry("gemma2", "Gemma2ForCausalLM"),
-            Map.entry("gemma3_text", "Gemma3ForCausalLM"));
+            Map.entry("gemma3_text", "Gemma3ForCausalLM"),
+            Map.entry("mamba", "MambaForCausalLM"));
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
     private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration");
@@ -240,6 +256,9 @@ public record ModelConfig(
                     + archs + "; supported: " + SUPPORTED);
         }
         String arch = declaredArch != null ? declaredArch : SUPPORTED.get(modelType);
+        if (modelType.equals("mamba")) {
+            return loadMamba(c, arch);
+        }
         int dim = requirePositive(c, "hidden_size");
         int layers = requirePositive(c, "num_hidden_layers");
         int vocab = requirePositive(c, "vocab_size");
@@ -364,7 +383,8 @@ public record ModelConfig(
                 (int) Json.num(c, "decoder_sparse_step", 1),
                 mlpOnlyLayers,
                 partialRotary,
-                gemma ? gemmaOptions(c, modelType, layers, dim, localTheta) : null);
+                gemma ? gemmaOptions(c, modelType, layers, dim, localTheta) : null,
+                null);
         boolean anyDense = false;
         for (int l = 0; l < layers; l++) {
             anyDense |= !cfg.isMoeLayer(l);
@@ -406,6 +426,47 @@ public record ModelConfig(
     public static int roundBf16(int bits) {
         int lsb = (bits >>> 16) & 1;
         return (bits + 0x7FFF + lsb) & 0xFFFF0000;
+    }
+
+    /**
+     * Mamba config. Attention fields are placeholders (1 head of size d_model) so generic checks hold; the
+     * LM head is tied to the embeddings unless the config says otherwise (the released checkpoints have no lm_head).
+     */
+    private static ModelConfig loadMamba(Map<String, Object> c, String arch) {
+        int dim = requirePositive(c, "hidden_size");
+        int layers = requirePositive(c, "num_hidden_layers");
+        int vocab = requirePositive(c, "vocab_size");
+        int dState = (int) Json.num(c, "state_size", 16);
+        int dConv = (int) Json.num(c, "conv_kernel", 4);
+        int expand = (int) Json.num(c, "expand", 2);
+        int dInner = (int) Json.num(c, "intermediate_size", (long) expand * dim);
+        Object rank = c.get("time_step_rank");
+        int dtRank = rank instanceof Number n ? n.intValue() : (dim + 15) / 16; // "auto"
+        if (dState <= 0 || dState > 64 || dConv < 1 || dConv > 8 || dInner <= 0 || dtRank <= 0) {
+            throw new IllegalArgumentException("invalid mamba config: state_size=" + dState + " (1..64), conv_kernel="
+                    + dConv + " (1..8), d_inner=" + dInner + ", time_step_rank=" + dtRank);
+        }
+        String act = Json.str(c, "hidden_act", "silu");
+        if (!act.equals("silu")) {
+            throw new IllegalArgumentException("unsupported hidden_act '" + act + "': only silu is implemented");
+        }
+        if (Json.bool(c, "use_bias", false)) {
+            throw new IllegalArgumentException("mamba models with in_proj/out_proj biases (use_bias=true) are not "
+                    + "supported; no released checkpoint uses them");
+        }
+        List<Integer> eos = new java.util.ArrayList<>();
+        Object eosRaw = c.get("eos_token_id");
+        if (eosRaw instanceof Number n) {
+            eos.add(n.intValue());
+        } else if (eosRaw instanceof List<?> l) {
+            for (Object o : l) {
+                eos.add(((Number) o).intValue());
+            }
+        }
+        MambaParams mp = new MambaParams(dState, dConv, dtRank, dInner, false, Json.bool(c, "use_conv_bias", true));
+        return new ModelConfig(arch, "mamba", false, false, 0, 0, null, -1, List.copyOf(eos), dim, dInner, layers,
+                1, 1, dim, vocab, (int) Json.num(c, "max_position_embeddings", 1 << 20),
+                (float) Json.dbl(c, "layer_norm_epsilon", 1e-5), 0, Json.bool(c, "tie_word_embeddings", true), 0, 0, 0, false, 1, Set.of(), 1.0, null, mp);
     }
 
     private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> c, int rotaryDim) {
@@ -486,6 +547,10 @@ public record ModelConfig(
 
     @Override
     public String toString() {
+        if (isMamba()) {
+            return String.format("%s dim=%d dInner=%d layers=%d dState=%d dConv=%d dtRank=%d vocab=%d", architecture,
+                    dim, mamba.dInner(), layers, mamba.dState(), mamba.dConv(), mamba.dtRank(), vocabSize);
+        }
         String moe = isMoe() ? String.format(" experts=%d/%d moeDim=%d", expertsPerTok, numExperts, moeDim) : "";
         // Features absent from the original Qwen3-only engine are appended only when set, so the description
         // (also stored in the quantized cache) of an existing Qwen3 model does not change.

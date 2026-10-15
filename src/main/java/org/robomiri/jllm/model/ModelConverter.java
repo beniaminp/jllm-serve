@@ -118,6 +118,9 @@ public final class ModelConverter {
 
     /** The ordered conversion units together with every checkpoint tensor each of them reads. */
     private List<Unit> plan() {
+        if (cfg.isMamba()) {
+            return planMamba();
+        }
         List<Unit> units = new ArrayList<>();
         // Embedding first: it is the largest single tensor and lives in the first shard.
         units.add(new Unit("embed", List.of(EMBED), (w, a) -> w.put(EMBED, quantize(a, QType.Q8_0, tensor(EMBED)))));
@@ -303,6 +306,59 @@ public final class ModelConverter {
     private static SafeTensors.Tensor flatten(SafeTensors.Tensor t) {
         long[] s = t.shape();
         return new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{s[0] * s[1], s[2]}, t.data());
+    }
+
+    // ------------------------------------------------------------------ Mamba
+
+    private static final String M_EMBED = "backbone.embeddings.weight";
+    private static final String M_FINAL_NORM = "backbone.norm_f.weight";
+
+    /** embedding, one unit per Mamba block, final norm (+ lm_head if the checkpoint has an untied one). */
+    private List<Unit> planMamba() {
+        ModelConfig.MambaParams m = cfg.mamba();
+        List<Unit> units = new ArrayList<>();
+        units.add(new Unit("embed", List.of(M_EMBED), (w, a) -> w.put(M_EMBED, quantize(a, QType.Q8_0, tensor(M_EMBED)))));
+        for (int l = 0; l < cfg.layers(); l++) {
+            String p = "backbone.layers." + l + ".";
+            String q = p + "mixer.";
+            List<String> in = new ArrayList<>(List.of(p + "norm.weight", q + "in_proj.weight", q + "conv1d.weight",
+                    q + "x_proj.weight", q + "dt_proj.weight", q + "dt_proj.bias", q + "A_log", q + "D",
+                    q + "out_proj.weight"));
+            if (m.convBias()) {
+                in.add(q + "conv1d.bias");
+            }
+            units.add(new Unit("layer." + l, List.copyOf(in), (w, a) -> {
+                w.putFloats(p + "norm.weight", tensor(p + "norm.weight").toFloatArray());
+                w.put(q + "in_proj.weight", quantize(a, quant, tensor(q + "in_proj.weight")));
+                w.putFloats(q + "conv1d.weight", tensor(q + "conv1d.weight").toFloatArray());
+                if (m.convBias()) {
+                    w.putFloats(q + "conv1d.bias", tensor(q + "conv1d.bias").toFloatArray());
+                }
+                w.put(q + "x_proj.weight", quantize(a, quant, tensor(q + "x_proj.weight")));
+                // dt_proj has dt_rank columns (48 for mamba-130m: not a multiple of the block size): stays f32
+                w.putFloats(q + "dt_proj.weight", tensor(q + "dt_proj.weight").toFloatArray());
+                w.putFloats(q + "dt_proj.bias", tensor(q + "dt_proj.bias").toFloatArray());
+                // the scan only ever uses A = -exp(A_log)
+                float[] aLog = tensor(q + "A_log").toFloatArray();
+                for (int i = 0; i < aLog.length; i++) {
+                    aLog[i] = (float) -Math.exp(aLog[i]);
+                }
+                w.putFloats(q + "A", aLog);
+                w.putFloats(q + "D", tensor(q + "D").toFloatArray());
+                w.put(q + "out_proj.weight", quantize(a, quant, tensor(q + "out_proj.weight")));
+            }));
+        }
+        List<String> fin = new ArrayList<>(List.of(M_FINAL_NORM));
+        if (hasLmHead()) {
+            fin.add(LM_HEAD);
+        }
+        units.add(new Unit("final", List.copyOf(fin), (w, a) -> {
+            w.putFloats(M_FINAL_NORM, tensor(M_FINAL_NORM).toFloatArray());
+            if (hasLmHead()) {
+                w.put(LM_HEAD, quantize(a, QType.Q8_0, tensor(LM_HEAD)));
+            }
+        }));
+        return units;
     }
 
     // ------------------------------------------------------------------ helpers

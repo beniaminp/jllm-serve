@@ -13,6 +13,8 @@ import java.nio.file.Path;
 public final class ModelWeights implements AutoCloseable {
 
     public static final class Layer {
+        /** Mamba block weights; for a Mamba model this is the only field set. */
+        public MambaLayer mamba;
         public float[] attnNorm;
         public float[] ffnNorm;
         /** Glm4: RMSNorm of the attention / MLP output before the residual add; null for other models. */
@@ -54,7 +56,7 @@ public final class ModelWeights implements AutoCloseable {
         this.cfg = cfg;
         this.quant = quant;
         this.file = file;
-        embed = file.tensor("model.embed_tokens.weight");
+        embed = file.tensor(cfg.isMamba() ? "backbone.embeddings.weight" : "model.embed_tokens.weight");
         lmHead = file.has("lm_head.weight") ? file.tensor("lm_head.weight") : embed;
         // The engine sizes its logits from vocabSize and backends write lmHead.rows outputs, so both must agree.
         if (embed.cols != cfg.dim() || embed.rows != cfg.vocabSize()
@@ -63,6 +65,18 @@ public final class ModelWeights implements AutoCloseable {
                     + lmHead.rows + "x" + lmHead.cols + " do not match config " + cfg + STALE_HINT);
         }
         layers = new Layer[cfg.layers()];
+        if (cfg.isMamba()) {
+            for (int l = 0; l < cfg.layers(); l++) {
+                layers[l] = new Layer();
+                layers[l].mamba = MambaLayer.load(file, "backbone.layers." + l + ".", cfg);
+            }
+            finalNorm = file.floats("backbone.norm_f.weight");
+            if (finalNorm.length != cfg.dim()) {
+                throw new IllegalArgumentException("backbone.norm_f.weight has " + finalNorm.length
+                        + " entries, expected " + cfg.dim() + STALE_HINT);
+            }
+            return;
+        }
         for (int l = 0; l < cfg.layers(); l++) {
             String p = "model.layers." + l + ".";
             Layer L = new Layer();
