@@ -369,8 +369,13 @@ kernel void router(device const float *x [[buffer(0)]],
     }
 }
 
-// moe_up: out[s, row] = W_{assign[s]}[row] . x[s / topK]   for slot s = token*topK + k.
-// Grid: (ceil(rowsPerExpert / simdgroups), ntok * topK). One simdgroup per output row.
+// moe_up: h[s, row] = silu(Wgate_e[row] . x[t]) * (Wup_e[row] . x[t])   for slot s = token*topK + k,
+// e = assign[s], t = s / topK. The stacked expert tensor holds gate rows [e*2m, e*2m + m) and up rows
+// [e*2m + m, (e+1)*2m), so rowsPerExpert = 2m and one simdgroup computes rows `row` and `row + m` of the
+// same expert and applies SwiGLU in the epilogue (no separate silu_mul pass, no gate/up scratch).
+// Each row still accumulates its own blocks in lane order and is reduced with one simd_sum, so the
+// per-row dot products are the ones the unfused kernel produced.
+// Grid: (ceil(m / simdgroups), ntok * topK).
 
 struct MoeParams {
     int rowsPerExpert;
@@ -389,17 +394,24 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
                    ushort sg [[simdgroup_index_in_threadgroup]],
                    ushort lane [[thread_index_in_simdgroup]],
                    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int m = p.rowsPerExpert / 2;
     const int row = int(tgp.x) * nsg + sg;
-    if (row >= p.rowsPerExpert) return;
+    if (row >= m) return;
     const int s = int(tgp.y);
     const int t = s / p.topK;
-    const ulong grow = (ulong)assign[s] * p.rowsPerExpert + row;
+    const ulong growG = (ulong)assign[s] * p.rowsPerExpert + row;
+    const ulong growU = growG + m;
     const int nb = p.cols / QK;
     device const float4 *x4 = (device const float4 *)(x + (ulong)t * p.cols);
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) acc += block_dot<QT>(wq, ws, grow, nb, b, x4 + b * 8);
-    acc = simd_sum(acc);
-    if (lane == 0) out[(ulong)s * p.rowsPerExpert + row] = acc;
+    float g = 0.0f;
+    float u = 0.0f;
+    for (int b = lane; b < nb; b += 32) {
+        g += block_dot<QT>(wq, ws, growG, nb, b, x4 + b * 8);
+        u += block_dot<QT>(wq, ws, growU, nb, b, x4 + b * 8);
+    }
+    g = simd_sum(g);
+    u = simd_sum(u);
+    if (lane == 0) out[(ulong)s * m + row] = g / (1.0f + exp(-g)) * u;
 }
 
 // moe_down: x[t, row] += sum_k rw[t,k] * (W_{assign[t,k]}[row] . h[t*topK + k]). rowsPerExpert = dim.

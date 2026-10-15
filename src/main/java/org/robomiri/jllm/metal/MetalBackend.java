@@ -73,7 +73,6 @@ public final class MetalBackend implements Backend {
     // MoE (null for dense models)
     private Metal.Buffer assign;
     private Metal.Buffer routeWeight;
-    private Metal.Buffer moeGateUp;
     private Metal.Buffer moeHidden;
 
     // dispatch argument scratch (re-used; the native side copies params at record time)
@@ -218,12 +217,10 @@ public final class MetalBackend implements Backend {
             int slots = maxBatch * c.expertsPerTok();
             assign = metal.newBuffer((long) slots * 4, false);
             routeWeight = metal.newBuffer((long) slots * 4, false);
-            moeGateUp = metal.newBuffer((long) slots * 2 * c.moeDim() * 4, false);
             moeHidden = metal.newBuffer((long) slots * c.moeDim() * 4, false);
         } else {
             assign = null;
             routeWeight = null;
-            moeGateUp = null;
             moeHidden = null;
         }
         if (ctx > c.maxPositions()) {
@@ -453,19 +450,18 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
         metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, c.numExperts(), 1, 1);
 
+        // gate/up projections with SwiGLU fused in: one simdgroup per (slot, hidden unit) writes moeHidden
         QTensor gu = W.expGateUp;
         bind(0, L.expGateUp, 0);
         bind(1, L.expGateUp, gu.scalesOffset);
         bind(2, xb, 0);
         bind(3, assign, 0);
-        bind(4, moeGateUp, 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, 2 * m);
+        bind(4, moeHidden, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, 2 * m); // rows per expert in the stacked tensor (gate | up)
         params.setAtIndex(ValueLayout.JAVA_INT, 1, gu.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
         metal.dispatch(gu.type == QType.Q4_0 ? pMoeUpQ4 : pMoeUpQ8, bufArgs, offArgs, 5, params, 12,
-                (2 * m + sgPerTg - 1) / sgPerTg, slots, 1, 32 * sgPerTg, 1, 1);
-
-        siluMul(moeGateUp, moeHidden, slots, m);
+                (m + sgPerTg - 1) / sgPerTg, slots, 1, 32 * sgPerTg, 1, 1);
 
         QTensor dn = W.expDown;
         bind(0, L.expDown, 0);
