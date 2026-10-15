@@ -58,27 +58,49 @@ public final class SafeTensors implements AutoCloseable {
             return Math.toIntExact(shape[i]);
         }
 
-        /** Converts {@code n} elements starting at flat element index {@code start} to float. */
+        /**
+         * Converts {@code n} elements starting at flat element index {@code start} to float.
+         *
+         * <p>Half-precision data is staged into a per-thread {@code short[]} with one bulk copy and converted in
+         * a plain array loop, instead of one bounds-checked segment access per element.
+         */
         public void toFloat(long start, float[] dst, int dstOff, int n) {
             switch (dtype) {
                 case F32 -> MemorySegment.copy(data, FLOAT_LE, start * 4, dst, dstOff, n);
                 case BF16 -> {
+                    short[] s = shortScratch(n);
+                    MemorySegment.copy(data, SHORT_LE, start * 2, s, 0, n);
                     for (int i = 0; i < n; i++) {
-                        dst[dstOff + i] = Float.intBitsToFloat((data.get(SHORT_LE, (start + i) * 2) & 0xFFFF) << 16);
+                        dst[dstOff + i] = Float.intBitsToFloat((s[i] & 0xFFFF) << 16);
                     }
                 }
                 case F16 -> {
+                    short[] s = shortScratch(n);
+                    MemorySegment.copy(data, SHORT_LE, start * 2, s, 0, n);
                     for (int i = 0; i < n; i++) {
-                        dst[dstOff + i] = Float.float16ToFloat(data.get(SHORT_LE, (start + i) * 2));
+                        dst[dstOff + i] = Float.float16ToFloat(s[i]);
                     }
                 }
                 case F64 -> {
+                    double[] d = new double[n];
+                    MemorySegment.copy(data, DOUBLE_LE, start * 8, d, 0, n);
                     for (int i = 0; i < n; i++) {
-                        dst[dstOff + i] = (float) data.get(DOUBLE_LE, (start + i) * 8);
+                        dst[dstOff + i] = (float) d[i];
                     }
                 }
                 default -> throw new UnsupportedOperationException("cannot convert " + dtype + " tensor " + name + " to float");
             }
+        }
+
+        private static final ThreadLocal<short[]> SHORT_SCRATCH = ThreadLocal.withInitial(() -> new short[0]);
+
+        private static short[] shortScratch(int n) {
+            short[] s = SHORT_SCRATCH.get();
+            if (s.length < n) {
+                s = new short[Math.max(n, 4096)];
+                SHORT_SCRATCH.set(s);
+            }
+            return s;
         }
 
         public float[] toFloatArray() {

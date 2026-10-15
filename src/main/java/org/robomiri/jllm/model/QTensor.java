@@ -78,23 +78,37 @@ public final class QTensor {
         MemorySegment seg = arena.allocate(byteSize(type, rows, cols), PAGE);
         QTensor t = new QTensor(type, rows, cols, seg);
         int nb = t.blocksPerRow();
+        int rowBytes = nb * type.blockBytes;
+        // Each row is quantized into on-heap scratch arrays and copied out with two bulk copies, instead of one
+        // bounds-checked segment access per quantized byte.
         ThreadLocal<float[]> rowBuf = ThreadLocal.withInitial(() -> new float[cols]);
+        ThreadLocal<byte[]> qBuf = ThreadLocal.withInitial(() -> new byte[rowBytes]);
+        ThreadLocal<float[]> sBuf = ThreadLocal.withInitial(() -> new float[nb]);
         IntStream.range(0, rows).parallel().forEach(r -> {
             float[] row = rowBuf.get();
+            byte[] q = qBuf.get();
+            float[] s = sBuf.get();
             src.row(r, row);
-            for (int b = 0; b < nb; b++) {
-                if (type == QType.Q4_0) {
-                    t.quantizeBlockQ4(r, b, row, b * QType.BLOCK);
-                } else {
-                    t.quantizeBlockQ8(r, b, row, b * QType.BLOCK);
+            if (type == QType.Q4_0) {
+                for (int b = 0; b < nb; b++) {
+                    s[b] = quantizeBlockQ4(row, b * QType.BLOCK, q, b * 16);
+                }
+            } else {
+                for (int b = 0; b < nb; b++) {
+                    s[b] = quantizeBlockQ8(row, b * QType.BLOCK, q, b * 32);
                 }
             }
+            MemorySegment.copy(q, 0, seg, ValueLayout.JAVA_BYTE, t.rowOffset(r), rowBytes);
+            MemorySegment.copy(s, 0, seg, ValueLayout.JAVA_FLOAT, t.scaleOffset(r), nb);
         });
         return t;
     }
 
-    /** Same scheme as llama.cpp Q4_0: the largest-magnitude value maps to -8. */
-    private void quantizeBlockQ4(int r, int b, float[] x, int off) {
+    /**
+     * Same scheme as llama.cpp Q4_0: the largest-magnitude value maps to -8. Writes 16 bytes at
+     * {@code q[qOff..]} and returns the block scale.
+     */
+    private static float quantizeBlockQ4(float[] x, int off, byte[] q, int qOff) {
         float amax = 0;
         float max = 0;
         for (int j = 0; j < QType.BLOCK; j++) {
@@ -106,27 +120,26 @@ public final class QTensor {
         }
         float d = max / -8f;
         float id = d != 0 ? 1f / d : 0f;
-        long q = rowOffset(r) + (long) b * 16;
         for (int j = 0; j < 16; j++) {
             int lo = Math.min(15, (int) (x[off + j] * id + 8.5f));
             int hi = Math.min(15, (int) (x[off + j + 16] * id + 8.5f));
-            data.set(ValueLayout.JAVA_BYTE, q + j, (byte) (lo | (hi << 4)));
+            q[qOff + j] = (byte) (lo | (hi << 4));
         }
-        data.set(ValueLayout.JAVA_FLOAT, scaleOffset(r) + (long) b * 4, d);
+        return d;
     }
 
-    private void quantizeBlockQ8(int r, int b, float[] x, int off) {
+    /** Writes 32 signed bytes at {@code q[qOff..]} and returns the block scale. */
+    private static float quantizeBlockQ8(float[] x, int off, byte[] q, int qOff) {
         float amax = 0;
         for (int j = 0; j < QType.BLOCK; j++) {
             amax = Math.max(amax, Math.abs(x[off + j]));
         }
         float d = amax / 127f;
         float id = d != 0 ? 1f / d : 0f;
-        long q = rowOffset(r) + (long) b * 32;
         for (int j = 0; j < QType.BLOCK; j++) {
-            data.set(ValueLayout.JAVA_BYTE, q + j, (byte) Math.round(x[off + j] * id));
+            q[qOff + j] = (byte) Math.round(x[off + j] * id);
         }
-        data.set(ValueLayout.JAVA_FLOAT, scaleOffset(r) + (long) b * 4, d);
+        return d;
     }
 
     /** Dequantizes row {@code r} into {@code dst[off .. off + cols)}. */
