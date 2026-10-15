@@ -1,0 +1,263 @@
+package org.robomiri.jllm.cpu;
+
+import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.MambaLayer;
+import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.QTensor;
+
+import java.util.Arrays;
+
+/**
+ * Mamba (v1, {@code MambaForCausalLM}) forward pass on the CPU. There is no attention and no KV cache: every layer
+ * keeps a fixed-size recurrent state, a conv state {@code [d_inner, d_conv-1]} and an SSM state
+ * {@code [d_inner, d_state]} (both f32), that is advanced token by token.
+ *
+ * <p>Per layer and chunk of {@code n} tokens (see docs/15-mamba.md): RMSNorm, {@code in_proj} (quantized matmul over
+ * the whole chunk), causal conv + SiLU, {@code x_proj} (matmul), then the selective scan, and {@code out_proj} added
+ * to the residual. The conv and the scan are sequential over the tokens of the chunk but independent per channel,
+ * so they are parallelized over {@code d_inner}; the dot products inside use the Vector API. The scan's
+ * {@code exp} is scalar ({@code d_state} = 16 values per channel and token).
+ *
+ * <p>The state belongs to one sequence: {@code pos == 0} starts a new one, any other {@code pos} must equal the
+ * number of tokens fed so far (the engine restarts at 0 whenever it cannot extend the previous sequence).
+ */
+public final class MambaCpuBackend implements Backend {
+
+    private final ModelWeights w;
+    private final ModelConfig c;
+    private final ModelConfig.MambaParams m;
+    private final int ctx;
+    private final int maxBatch;
+    private final ThreadPool pool;
+
+    private final float[][] convState;
+    private final float[][] ssmState;
+    /** Tokens fed into the current state, -1 while a forward is in flight or after one failed. */
+    private int statePos = 0;
+
+    private final float[] x;
+    private final float[] xb;
+    private final float[] xz;
+    private final float[] xc;
+    private final float[] dbc;
+    private final float[] y;
+    private final ThreadLocal<float[]> scratch;
+
+    public MambaCpuBackend(ModelWeights w, int ctx, int maxBatch, int threads) {
+        if (!w.cfg.isMamba()) {
+            throw new IllegalArgumentException("not a Mamba model: " + w.cfg);
+        }
+        this.w = w;
+        this.c = w.cfg;
+        this.m = c.mamba();
+        this.ctx = ctx;
+        this.maxBatch = maxBatch;
+        this.pool = new ThreadPool(threads);
+        int di = m.dInner();
+        convState = new float[c.layers()][di * (m.dConv() - 1)];
+        ssmState = new float[c.layers()][di * m.dState()];
+        x = new float[maxBatch * c.dim()];
+        xb = new float[maxBatch * c.dim()];
+        xz = new float[maxBatch * 2 * di];
+        xc = new float[maxBatch * di];
+        dbc = new float[maxBatch * (m.dtRank() + 2 * m.dState())];
+        y = new float[maxBatch * di];
+        int scratchLen = 4 * Math.max(c.dim(), di);
+        scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
+    }
+
+    @Override
+    public String name() {
+        return "cpu mamba (" + VectorKernels.describe() + ", " + pool.threads() + " threads)";
+    }
+
+    @Override
+    public int contextLength() {
+        return ctx;
+    }
+
+    @Override
+    public int maxBatch() {
+        return maxBatch;
+    }
+
+    /** The recurrent state cannot be rewound to an earlier position. */
+    @Override
+    public boolean supportsPrefixReuse() {
+        return false;
+    }
+
+    @Override
+    public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+        if (n < 1 || n > maxBatch || pos + n > ctx) {
+            throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (pos == 0) {
+            for (int l = 0; l < c.layers(); l++) {
+                Arrays.fill(convState[l], 0f);
+                Arrays.fill(ssmState[l], 0f);
+            }
+        } else if (pos != statePos) {
+            throw new IllegalStateException("Mamba state holds " + statePos + " tokens, cannot continue at " + pos);
+        }
+        statePos = -1;
+        int dim = c.dim();
+        for (int t = 0; t < n; t++) {
+            w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+        }
+        for (int l = 0; l < c.layers(); l++) {
+            MambaLayer L = w.layers[l].mamba;
+            for (int t = 0; t < n; t++) {
+                rmsnormRow(x, t * dim, xb, t * dim, L.norm, dim);
+            }
+            matmul(L.inProj, xb, xz, n, false);
+            conv(L, l, n);
+            matmul(L.xProj, xc, dbc, n, false);
+            scan(L, l, n);
+            matmul(L.outProj, y, x, n, true);
+        }
+        if (logits != null) {
+            rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
+            matmul(w.lmHead, xb, logits, 1, false);
+        }
+        statePos = pos + n;
+    }
+
+    // ------------------------------------------------------------------ mixer
+
+    /**
+     * Depthwise causal conv with the state of the previous {@code d_conv-1} inputs, then SiLU. Reads the x half of
+     * {@code xz}, writes {@code xc}; the state is advanced past all {@code n} tokens.
+     */
+    private void conv(MambaLayer L, int layer, int n) {
+        int di = m.dInner();
+        int dc = m.dConv();
+        float[] st = convState[layer];
+        pool.forRange(di, 32, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                for (int t = 0; t < n; t++) {
+                    xc[t * di + i] = convStep(L.conv, i * dc, L.convBias[i], st, i * (dc - 1), dc, xz[t * 2 * di + i]);
+                }
+            }
+        });
+    }
+
+    /**
+     * One token of one channel of the causal conv: the window is the {@code dc-1} states (oldest first) followed by
+     * {@code u}; returns {@code silu(Σ w[k]·window[k] + bias)} and shifts {@code u} into the state.
+     */
+    public static float convStep(float[] weight, int wo, float bias, float[] state, int so, int dc, float u) {
+        float sum = bias;
+        for (int k = 0; k < dc - 1; k++) {
+            sum += weight[wo + k] * state[so + k];
+        }
+        sum += weight[wo + dc - 1] * u;
+        for (int k = 0; k < dc - 2; k++) {
+            state[so + k] = state[so + k + 1];
+        }
+        if (dc > 1) {
+            state[so + dc - 2] = u;
+        }
+        return sum / (1f + (float) Math.exp(-sum));
+    }
+
+    /**
+     * Selective scan, one channel at a time: {@code dt = softplus(dt_proj[i]·dt_in + bias)};
+     * {@code s[n] = exp(dt·A[i,n])·s[n] + dt·B[n]·u}; {@code y = (Σ s[n]·C[n] + D·u)·silu(z)}.
+     */
+    private void scan(MambaLayer L, int layer, int n) {
+        int di = m.dInner();
+        int ds = m.dState();
+        int rank = m.dtRank();
+        int stride = rank + 2 * ds;
+        float[] s = ssmState[layer];
+        pool.forRange(di, 16, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int so = i * ds;
+                for (int t = 0; t < n; t++) {
+                    int bo = t * stride + rank;
+                    float raw = VectorKernels.dot(L.dtProj, i * rank, dbc, t * stride, rank) + L.dtBias[i];
+                    float dt = softplus(raw);
+                    float u = xc[t * di + i];
+                    float acc = scanStep(dt, u, L.a, so, s, so, dbc, bo, ds);
+                    float z = xz[t * 2 * di + di + i];
+                    y[t * di + i] = (acc + L.d[i] * u) * (z / (1f + (float) Math.exp(-z)));
+                }
+            }
+        });
+    }
+
+    /**
+     * One token of one channel of the selective scan over {@code ds} states: {@code s[k] = exp(dt·A[k])·s[k] +
+     * dt·B[k]·u}, returning {@code Σ s[k]·C[k]} with {@code B = bc[bo..bo+ds)} and {@code C = bc[bo+ds..bo+2ds)}.
+     */
+    public static float scanStep(float dt, float u, float[] a, int ao, float[] s, int so, float[] bc, int bo, int ds) {
+        float du = dt * u;
+        float acc = 0f;
+        for (int k = 0; k < ds; k++) {
+            float sk = (float) Math.exp(dt * a[ao + k]) * s[so + k] + du * bc[bo + k];
+            s[so + k] = sk;
+            acc += sk * bc[bo + ds + k];
+        }
+        return acc;
+    }
+
+    /** {@code log(1 + exp(x))}, linear above 20 like torch's {@code softplus}. */
+    public static float softplus(float x) {
+        return x > 20f ? x : (float) Math.log1p(Math.exp(x));
+    }
+
+    // ------------------------------------------------------------------ shared pieces
+
+    private void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
+        float ss = VectorKernels.sumSquares(in, io, width);
+        float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
+        for (int i = 0; i < width; i++) {
+            out[oo + i] = in[io + i] * scale * weight[i];
+        }
+    }
+
+    /** out[t, r] (+)= dot(W[r, :], in[t, :]); same scheme as CpuBackend.matmul (streamed decode, 4-row prefill). */
+    private void matmul(QTensor wt, float[] in, float[] out, int n, boolean acc) {
+        int rows = wt.rows;
+        int cols = wt.cols;
+        if (n == 1) {
+            pool.forRange(rows, 16, (r0, r1) -> {
+                for (int r = r0; r < r1; r++) {
+                    float v = VectorKernels.dotRow(wt, r, in, 0);
+                    out[r] = acc ? out[r] + v : v;
+                }
+            });
+            return;
+        }
+        int groups = (rows + 3) / 4;
+        pool.forRange(groups, 1, (g0, g1) -> {
+            float[] tmp = scratch.get();
+            for (int g = g0; g < g1; g++) {
+                int r = g * 4;
+                if (r + 4 <= rows) {
+                    for (int k = 0; k < 4; k++) {
+                        VectorKernels.dequantRow(wt, r + k, tmp, k * cols);
+                    }
+                    for (int t = 0; t < n; t++) {
+                        VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, t * rows + r, acc);
+                    }
+                } else {
+                    for (int rr = r; rr < rows; rr++) {
+                        for (int t = 0; t < n; t++) {
+                            float v = VectorKernels.dotRow(wt, rr, in, t * cols);
+                            int o = t * rows + rr;
+                            out[o] = acc ? out[o] + v : v;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Override
+    public void close() {
+        pool.close();
+    }
+}
