@@ -10,6 +10,7 @@ import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,20 +24,32 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Downloads model repositories from the Hugging Face Hub using only {@link HttpClient}.
  *
  * <p>Supports resumable downloads (HTTP Range), SHA-256 verification of LFS files, {@code HF_TOKEN}
  * authentication and the {@code HF_ENDPOINT} mirror override.
+ *
+ * <p>Every request has a response timeout and every download body has a stall watchdog (no bytes for the
+ * timeout counts as a connection failure), so a hung connection is retried instead of blocking forever.
+ * Client errors (4xx) are not retried; server errors (5xx) and I/O failures are retried with back-off.
  */
 public final class HuggingFaceHub {
 
     private static final int MAX_REDIRECTS = 10;
+    private static final int MAX_ATTEMPTS = 5;
+    /** Default response / stall timeout. */
+    public static final long DEFAULT_TIMEOUT_MILLIS = 60_000;
 
     private final HttpClient http;
     private final String endpoint;
     private final String token;
+    private volatile long timeoutMillis;
 
     public HuggingFaceHub() {
         this(null, null);
@@ -47,6 +60,15 @@ public final class HuggingFaceHub {
      * @param token    access token, or null for {@code $HF_TOKEN} / {@code ~/.cache/huggingface/token}
      */
     public HuggingFaceHub(String endpoint, String token) {
+        this(endpoint, token, DEFAULT_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * @param endpoint      Hub base URL, or null for {@code $HF_ENDPOINT} / https://huggingface.co
+     * @param token         access token, or null for {@code $HF_TOKEN} / {@code ~/.cache/huggingface/token}
+     * @param timeoutMillis response timeout of each request and maximum time without progress on a download
+     */
+    public HuggingFaceHub(String endpoint, String token, long timeoutMillis) {
         this.http = HttpClient.newBuilder()
                 .followRedirects(HttpClient.Redirect.NEVER) // handled manually so the token never leaks to CDNs
                 .connectTimeout(Duration.ofSeconds(30))
@@ -54,6 +76,19 @@ public final class HuggingFaceHub {
         String ep = endpoint != null ? endpoint : System.getenv("HF_ENDPOINT");
         this.endpoint = ep == null || ep.isBlank() ? "https://huggingface.co" : ep.replaceAll("/+$", "");
         this.token = token != null && !token.isBlank() ? token.trim() : findToken();
+        setTimeoutMillis(timeoutMillis);
+    }
+
+    /** Sets the response timeout of each request and the maximum time without progress on a download body. */
+    public void setTimeoutMillis(long timeoutMillis) {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("timeout must be positive: " + timeoutMillis);
+        }
+        this.timeoutMillis = timeoutMillis;
+    }
+
+    public long timeoutMillis() {
+        return timeoutMillis;
     }
 
     private static String findToken() {
@@ -79,6 +114,24 @@ public final class HuggingFaceHub {
     public record RepoFile(String name, long size, String sha256) {
     }
 
+    /** An HTTP response with an unexpected status; 4xx statuses are not retried. */
+    public static final class HttpStatusException extends IOException {
+        private final int status;
+
+        HttpStatusException(int status, String message) {
+            super(message);
+            this.status = status;
+        }
+
+        public int status() {
+            return status;
+        }
+
+        boolean isClientError() {
+            return status >= 400 && status < 500;
+        }
+    }
+
     /** True for the files an inference engine needs: configs, tokenizer and safetensors weights. */
     public static boolean isInferenceFile(String name) {
         return name.equals("config.json")
@@ -98,10 +151,10 @@ public final class HuggingFaceHub {
         if (cached != null) {
             return cached;
         }
-        URI uri = URI.create(endpoint + "/api/models/" + repo + "/revision/" + encodePath(revision) + "?blobs=true");
-        HttpResponse<String> resp = send(uri, HttpResponse.BodyHandlers.ofString(), null);
+        URI uri = URI.create(endpoint + "/api/models/" + repo + "/revision/" + encodeSegment(revision) + "?blobs=true");
+        HttpResponse<String> resp = send(uri, HttpResponse.BodyHandlers.ofString(), null, false);
         if (resp.statusCode() != 200) {
-            throw new IOException("Hub API " + uri + " returned HTTP " + resp.statusCode()
+            throw new HttpStatusException(resp.statusCode(), "Hub API " + uri + " returned HTTP " + resp.statusCode()
                     + (resp.statusCode() == 401 || resp.statusCode() == 403 ? " (gated/private repo? set HF_TOKEN)" : "")
                     + ": " + truncate(resp.body()));
         }
@@ -186,51 +239,61 @@ public final class HuggingFaceHub {
         }
         Files.createDirectories(target.getParent());
         Path part = target.resolveSibling(target.getFileName() + ".incomplete");
-        URI uri = URI.create(endpoint + "/" + repo + "/resolve/" + encodePath(revision) + "/" + encodePath(f.name()));
+        URI uri = URI.create(endpoint + "/" + repo + "/resolve/" + encodeSegment(revision) + "/" + encodePath(f.name()));
 
-        MessageDigest sha = sha256();
-        long have = Files.isRegularFile(part) ? Files.size(part) : 0;
-        if (f.size() >= 0 && have > f.size()) {
-            have = 0;
-        }
-        if (have > 0) {
-            hashExisting(part, sha);
-        }
-        for (int attempt = 1; ; attempt++) {
-            try {
-                have = transfer(uri, part, have, f, sha);
-                break;
-            } catch (IOException e) {
-                if (attempt >= 5) {
-                    throw e;
-                }
-                System.err.printf("%n  %s: %s, retrying (%d/5)%n", f.name(), e.getMessage(), attempt);
-                Thread.sleep(1000L * attempt);
-                // resume from what is on disk; re-hash it since the stream state is unknown
-                have = Files.isRegularFile(part) ? Files.size(part) : 0;
-                sha = sha256();
-                if (have > 0) {
-                    hashExisting(part, sha);
+        // A checksum mismatch means the partial file on disk was corrupt (or the file changed on the Hub while
+        // we were resuming), so the download is restarted once from byte 0 before giving up.
+        for (int pass = 1; ; pass++) {
+            MessageDigest sha = sha256();
+            long have = Files.isRegularFile(part) ? Files.size(part) : 0;
+            if (f.size() >= 0 && have > f.size()) {
+                have = 0;
+            }
+            if (have > 0) {
+                hashExisting(part, sha);
+            }
+            for (int attempt = 1; ; attempt++) {
+                try {
+                    have = transfer(uri, part, have, f, sha);
+                    break;
+                } catch (IOException e) {
+                    if (attempt >= MAX_ATTEMPTS || e instanceof HttpStatusException h && h.isClientError()) {
+                        throw e;
+                    }
+                    System.err.printf("%n  %s: %s, retrying (%d/%d)%n", f.name(), e.getMessage(), attempt, MAX_ATTEMPTS);
+                    Thread.sleep(1000L * attempt);
+                    // resume from what is on disk; re-hash it since the stream state is unknown
+                    have = Files.isRegularFile(part) ? Files.size(part) : 0;
+                    sha = sha256();
+                    if (have > 0) {
+                        hashExisting(part, sha);
+                    }
                 }
             }
-        }
-        if (f.size() >= 0 && have != f.size()) {
-            throw new IOException(f.name() + ": size mismatch, got " + have + " expected " + f.size());
-        }
-        if (f.sha256() != null) {
-            String got = HexFormat.of().formatHex(sha.digest());
-            if (!got.equalsIgnoreCase(f.sha256())) {
-                Files.deleteIfExists(part);
-                throw new IOException(f.name() + ": sha256 mismatch, got " + got + " expected " + f.sha256());
+            if (f.size() >= 0 && have != f.size()) {
+                throw new IOException(f.name() + ": size mismatch, got " + have + " expected " + f.size());
             }
+            if (f.sha256() != null) {
+                String got = HexFormat.of().formatHex(sha.digest());
+                if (!got.equalsIgnoreCase(f.sha256())) {
+                    Files.deleteIfExists(part);
+                    if (pass == 1) {
+                        System.err.printf("  %s: sha256 mismatch (got %s), downloading again from the start%n",
+                                f.name(), got);
+                        continue;
+                    }
+                    throw new IOException(f.name() + ": sha256 mismatch, got " + got + " expected " + f.sha256());
+                }
+            }
+            Files.move(part, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            return;
         }
-        Files.move(part, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     /** Streams {@code uri} into {@code part} starting at byte {@code have}; returns the final size. */
     private long transfer(URI uri, Path part, long have, RepoFile f, MessageDigest sha) throws IOException, InterruptedException {
         String range = have > 0 ? "bytes=" + have + "-" : null;
-        HttpResponse<InputStream> resp = send(uri, HttpResponse.BodyHandlers.ofInputStream(), range);
+        HttpResponse<InputStream> resp = send(uri, HttpResponse.BodyHandlers.ofInputStream(), range, true);
         int status = resp.statusCode();
         if (status == 416 && have > 0 && have == f.size()) {
             resp.body().close();
@@ -250,41 +313,138 @@ public final class HuggingFaceHub {
             try (InputStream in = resp.body()) {
                 body = new String(in.readNBytes(512), StandardCharsets.UTF_8);
             }
-            throw new IOException("GET " + uri + " returned HTTP " + status + ": " + truncate(body));
+            throw new HttpStatusException(status, "GET " + uri + " returned HTTP " + status + ": " + truncate(body));
         }
         long size = f.size() >= 0 ? f.size() : have + resp.headers().firstValueAsLong("content-length").orElse(-1);
         Progress progress = new Progress(f.name(), size, have);
+        long timeout = timeoutMillis;
         try (InputStream in = resp.body();
              OutputStream out = Files.newOutputStream(part, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
-                     append ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING)) {
+                     append ? StandardOpenOption.APPEND : StandardOpenOption.TRUNCATE_EXISTING);
+             StallWatchdog watchdog = new StallWatchdog(in, timeout)) {
             byte[] buf = new byte[1 << 20];
             int n;
-            while ((n = in.read(buf)) >= 0) {
-                out.write(buf, 0, n);
-                sha.update(buf, 0, n);
-                have += n;
-                progress.update(have);
+            try {
+                while ((n = in.read(buf)) >= 0) {
+                    watchdog.progress();
+                    out.write(buf, 0, n);
+                    sha.update(buf, 0, n);
+                    have += n;
+                    progress.update(have);
+                }
+            } catch (IOException e) {
+                if (watchdog.stalled()) {
+                    throw new IOException("no data received for " + describe(timeout), e);
+                }
+                throw e;
             }
         }
         progress.done(have);
         return have;
     }
 
-    /** Sends a GET, following redirects manually; the auth header is only sent to the Hub endpoint itself. */
-    private <T> HttpResponse<T> send(URI uri, HttpResponse.BodyHandler<T> handler, String range)
+    /**
+     * Closes a response body when no byte has arrived for {@code timeoutMillis}, which makes the blocked
+     * {@code read} fail with an {@link IOException} and hands control back to the retry loop.
+     */
+    private static final class StallWatchdog implements AutoCloseable {
+        private final InputStream body;
+        private final long timeoutMillis;
+        private final Thread thread;
+        private volatile long lastProgress = System.nanoTime();
+        private volatile boolean stalled;
+        private volatile boolean closed;
+
+        StallWatchdog(InputStream body, long timeoutMillis) {
+            this.body = body;
+            this.timeoutMillis = timeoutMillis;
+            this.thread = Thread.ofVirtual().unstarted(this::watch);
+            thread.start();
+        }
+
+        void progress() {
+            lastProgress = System.nanoTime();
+        }
+
+        boolean stalled() {
+            return stalled;
+        }
+
+        private void watch() {
+            try {
+                while (!closed) {
+                    long idle = (System.nanoTime() - lastProgress) / 1_000_000;
+                    if (idle >= timeoutMillis) {
+                        stalled = true;
+                        try {
+                            body.close();
+                        } catch (IOException ignored) {
+                            // the reader will see the failure
+                        }
+                        return;
+                    }
+                    Thread.sleep(Math.min(1000, timeoutMillis - idle));
+                }
+            } catch (InterruptedException ignored) {
+                // stopped
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            thread.interrupt();
+        }
+    }
+
+    /**
+     * Sends a GET, following redirects manually; the auth header is only sent to the Hub endpoint itself, and
+     * only over https so the token never travels in clear text.
+     *
+     * <p>Timeouts: {@link HttpRequest.Builder#timeout} runs until the whole body has been consumed, which would
+     * abort any download longer than the timeout, so it is only set on {@code !streaming} (small API) requests.
+     * A streaming request is bounded by the timeout until its headers arrive, and its body by the
+     * {@link StallWatchdog} in {@link #transfer}.
+     */
+    private <T> HttpResponse<T> send(URI uri, HttpResponse.BodyHandler<T> handler, String range, boolean streaming)
             throws IOException, InterruptedException {
         URI current = uri;
         String hubHost = URI.create(endpoint).getHost();
+        long timeout = timeoutMillis;
         for (int i = 0; i <= MAX_REDIRECTS; i++) {
             HttpRequest.Builder b = HttpRequest.newBuilder(current).GET()
                     .header("User-Agent", "jllm-serve/1.0 (java " + Runtime.version() + ")");
-            if (token != null && hubHost.equalsIgnoreCase(current.getHost())) {
+            if (!streaming) {
+                b.timeout(Duration.ofMillis(timeout));
+            }
+            if (token != null && hubHost != null && hubHost.equalsIgnoreCase(current.getHost())
+                    && "https".equalsIgnoreCase(current.getScheme())) {
                 b.header("Authorization", "Bearer " + token);
             }
             if (range != null) {
                 b.header("Range", range);
             }
-            HttpResponse<T> resp = http.send(b.build(), handler);
+            HttpResponse<T> resp;
+            if (streaming) {
+                CompletableFuture<HttpResponse<T>> cf = http.sendAsync(b.build(), handler);
+                try {
+                    resp = cf.get(timeout, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException e) {
+                    cf.cancel(true);
+                    throw new HttpTimeoutException("no response from " + current + " within " + describe(timeout));
+                } catch (ExecutionException e) {
+                    Throwable c = e.getCause();
+                    if (c instanceof IOException io) {
+                        throw io;
+                    }
+                    if (c instanceof RuntimeException re) {
+                        throw re;
+                    }
+                    throw new IOException(c);
+                }
+            } else {
+                resp = http.send(b.build(), handler);
+            }
             int s = resp.statusCode();
             if (s == 301 || s == 302 || s == 303 || s == 307 || s == 308) {
                 String loc = resp.headers().firstValue("location")
@@ -326,15 +486,25 @@ public final class HuggingFaceHub {
         }
     }
 
+    /** Encodes a repository path, keeping its {@code /} separators. */
     private static String encodePath(String path) {
         StringBuilder sb = new StringBuilder();
         for (String seg : path.split("/")) {
             if (!sb.isEmpty()) {
                 sb.append('/');
             }
-            sb.append(URLEncoder.encode(seg, StandardCharsets.UTF_8).replace("+", "%20"));
+            sb.append(encodeSegment(seg));
         }
         return sb.toString();
+    }
+
+    /** Encodes one URL path segment: a revision such as {@code refs/pr/1} becomes {@code refs%2Fpr%2F1}. */
+    private static String encodeSegment(String segment) {
+        return URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    private static String describe(long millis) {
+        return millis % 1000 == 0 ? millis / 1000 + " s" : millis + " ms";
     }
 
     private static String truncate(String s) {
