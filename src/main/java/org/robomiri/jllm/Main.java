@@ -2,10 +2,12 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
+import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
@@ -151,9 +153,14 @@ public final class Main {
         Backend backend;
         try {
             backend = switch (backendName) {
-                case "cpu" -> new CpuBackend(weights, ctx, batch,
-                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype);
-                case "metal" -> new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+                case "cpu" -> weights.cfg.isMamba()
+                        ? new MambaCpuBackend(weights, ctx, batch,
+                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors())
+                        : new CpuBackend(weights, ctx, batch,
+                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype);
+                case "metal" -> weights.cfg.isMamba()
+                        ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
+                        : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         } catch (Exception e) {

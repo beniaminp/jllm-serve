@@ -990,3 +990,94 @@ kernel void softcap(device float *v [[buffer(0)]],
     if (int(gid) >= p.n) return;
     v[gid] = tanh(clamp(v[gid] / p.cap, -20.0f, 20.0f)) * p.cap;
 }
+
+// ---------------------------------------------------------------------------------------------- Mamba
+// Mamba (v1) mixer pieces, used by MambaMetalBackend. The projections (in_proj, x_proj, out_proj) reuse the
+// matmul kernels above; the two kernels below are the parts that carry state across tokens. Both use one thread
+// per channel and run the tokens of the chunk sequentially inside the thread (the recurrence is inherently
+// sequential over tokens, independent over channels), so a layer costs one dispatch per kernel instead of one per
+// token. The price: parallelism is d_inner threads (1536 .. 5120), no more during a long prefill.
+
+#define MAMBA_MAX_STATE 64
+
+struct MambaConvParams {
+    int dInner;
+    int dConv;
+    int ntok;
+};
+
+// xc[t, i] = silu(bias[i] + sum_k w[i, k] * window[k]) where window = (conv state of channel i, xz[t, i]);
+// the state (d_conv - 1 previous inputs per channel, oldest first) is advanced past the chunk.
+// xz is [ntok, 2 * dInner] (x half first), xc is [ntok, dInner].
+kernel void mamba_conv(device const float *xz [[buffer(0)]],
+                       device const float *w [[buffer(1)]],
+                       device const float *bias [[buffer(2)]],
+                       device float *state [[buffer(3)]],
+                       device float *xc [[buffer(4)]],
+                       constant MambaConvParams &p [[buffer(5)]],
+                       uint gid [[thread_position_in_grid]]) {
+    const int i = int(gid);
+    if (i >= p.dInner) return;
+    const int dc = p.dConv;
+    device float *st = state + (ulong)i * (dc - 1);
+    device const float *wi = w + (ulong)i * dc;
+    for (int t = 0; t < p.ntok; t++) {
+        const float u = xz[(ulong)t * 2 * p.dInner + i];
+        float sum = bias[i] + wi[dc - 1] * u;
+        for (int k = 0; k < dc - 1; k++) sum += wi[k] * st[k];
+        for (int k = 0; k + 1 < dc - 1; k++) st[k] = st[k + 1];
+        if (dc > 1) st[dc - 2] = u;
+        xc[(ulong)t * p.dInner + i] = sum / (1.0f + precise::exp(-sum));
+    }
+}
+
+struct MambaScanParams {
+    int dInner;
+    int dState;
+    int dtRank;
+    int ntok;
+};
+
+// Selective scan for one channel i over the tokens of the chunk:
+//   dt = softplus(dot(dt_proj[i, :], dbc[t, 0:R]) + dt_bias[i])
+//   s[n] = exp(dt * A[i, n]) * s[n] + dt * B[t, n] * u          (u = xc[t, i], B = dbc[t, R:R+N])
+//   y = (sum_n s[n] * C[t, n] + D[i] * u) * silu(z)              (C = dbc[t, R+N:R+2N], z = xz[t, dInner + i])
+// The SSM state [dInner, dState] lives in registers for the whole chunk and is written back at the end.
+kernel void mamba_scan(device const float *xc [[buffer(0)]],
+                       device const float *xz [[buffer(1)]],
+                       device const float *dbc [[buffer(2)]],
+                       device const float *dtw [[buffer(3)]],
+                       device const float *dtb [[buffer(4)]],
+                       device const float *A [[buffer(5)]],
+                       device const float *D [[buffer(6)]],
+                       device float *state [[buffer(7)]],
+                       device float *y [[buffer(8)]],
+                       constant MambaScanParams &p [[buffer(9)]],
+                       uint gid [[thread_position_in_grid]]) {
+    const int i = int(gid);
+    if (i >= p.dInner) return;
+    const int N = p.dState;
+    const int R = p.dtRank;
+    const int stride = R + 2 * N;
+    device float *st = state + (ulong)i * N;
+    device const float *a = A + (ulong)i * N;
+    device const float *wi = dtw + (ulong)i * R;
+    float s[MAMBA_MAX_STATE];
+    for (int n = 0; n < N; n++) s[n] = st[n];
+    for (int t = 0; t < p.ntok; t++) {
+        device const float *row = dbc + (ulong)t * stride;
+        float raw = dtb[i];
+        for (int r = 0; r < R; r++) raw += wi[r] * row[r];
+        const float dt = raw > 20.0f ? raw : precise::log(1.0f + precise::exp(raw));
+        const float u = xc[(ulong)t * p.dInner + i];
+        const float du = dt * u;
+        float acc = 0.0f;
+        for (int n = 0; n < N; n++) {
+            s[n] = precise::exp(dt * a[n]) * s[n] + du * row[R + n];
+            acc += s[n] * row[R + N + n];
+        }
+        const float z = xz[(ulong)t * 2 * p.dInner + p.dInner + i];
+        y[(ulong)t * p.dInner + i] = (acc + D[i] * u) * (z / (1.0f + precise::exp(-z)));
+    }
+    for (int n = 0; n < N; n++) st[n] = s[n];
+}
