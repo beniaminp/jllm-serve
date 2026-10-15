@@ -39,6 +39,7 @@ public final class MambaMetalBackend implements Backend {
 
     private final int pMatmulQ4;
     private final int pMatmulQ8;
+    private final int pMatmulQ2K;
     private final int pRmsnorm;
     private final int pConv;
     private final int pScan;
@@ -91,6 +92,7 @@ public final class MambaMetalBackend implements Backend {
         this.metal = Metal.create(metalLib);
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
+        pMatmulQ2K = metal.pipeline("matmul_q2k");
         pRmsnorm = metal.pipeline("rmsnorm");
         pConv = metal.pipeline("mamba_conv");
         pScan = metal.pipeline("mamba_scan");
@@ -223,7 +225,7 @@ public final class MambaMetalBackend implements Backend {
 
     private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, Metal.Buffer out, int n, boolean acc) {
         bind(0, wbuf, 0);
-        bind(1, wbuf, t.scalesOffset);
+        bind(1, wbuf, MetalBackend.scaleOff(t));
         bind(2, in, 0);
         bind(3, out, 0);
         bind(4, finalNorm, 0); // dummy binding: only the *_norm kernel variants read it
@@ -232,7 +234,7 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
-        int pipe = t.type == QType.Q4_0 ? pMatmulQ4 : pMatmulQ8;
+        int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
         int gx = (t.rows + sgPerTg - 1) / sgPerTg;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;

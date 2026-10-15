@@ -58,6 +58,15 @@ public final class MetalBackend implements Backend {
     private int pMoeUpQ8;
     private int pMoeDownQ4;
     private int pMoeDownQ8;
+    // Q2_K variants of every quantized matmul (see the Q2_K section of kernels.metal)
+    private int pMatmulQ2K;
+    private int pMatmulQ2KNorm;
+    private int pMatmul3Q2K;
+    private int pMatmul3Q2KNorm;
+    private int pSwigluQ2K;
+    private int pSwigluQ2KNorm;
+    private int pMoeUpQ2K;
+    private int pMoeDownQ2K;
     // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
     // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
@@ -202,6 +211,14 @@ public final class MetalBackend implements Backend {
         pMoeUpQ8 = metal.pipeline("moe_up_q8");
         pMoeDownQ4 = metal.pipeline("moe_down_q4");
         pMoeDownQ8 = metal.pipeline("moe_down_q8");
+        pMatmulQ2K = metal.pipeline("matmul_q2k");
+        pMatmulQ2KNorm = metal.pipeline("matmul_q2k_norm");
+        pMatmul3Q2K = metal.pipeline("matmul3_q2k");
+        pMatmul3Q2KNorm = metal.pipeline("matmul3_q2k_norm");
+        pSwigluQ2K = metal.pipeline("matmul_swiglu_q2k");
+        pSwigluQ2KNorm = metal.pipeline("matmul_swiglu_q2k_norm");
+        pMoeUpQ2K = metal.pipeline("moe_up_q2k");
+        pMoeDownQ2K = metal.pipeline("moe_down_q2k");
         pKvStoreHalf = metal.pipeline("kv_store_half");
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
@@ -452,7 +469,7 @@ public final class MetalBackend implements Backend {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
         }
         bind(0, wbuf, 0);
-        bind(1, wbuf, t.scalesOffset);
+        bind(1, wbuf, scaleOff(t));
         bind(2, in, inOff);
         bind(3, out, outOff);
         bind(4, norm != null ? norm : finalNorm, 0); // dummy binding when unused
@@ -461,8 +478,8 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
-        int pipe = t.type == QType.Q4_0 ? (norm != null ? pMatmulQ4Norm : pMatmulQ4)
-                                        : (norm != null ? pMatmulQ8Norm : pMatmulQ8);
+        int pipe = norm != null ? byType(t.type, pMatmulQ4Norm, pMatmulQ8Norm, pMatmulQ2KNorm)
+                                : byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
@@ -471,6 +488,20 @@ public final class MetalBackend implements Backend {
     /** Dynamic threadgroup memory for the normalised input row of the *_norm kernels (0 when unused). */
     private static int normTgMem(Metal.Buffer norm, int cols) {
         return norm != null ? cols * 4 : 0;
+    }
+
+    /** Offset of the f32 scale region to bind as buffer(1); Q2_K keeps its scales inside the blocks (unused binding). */
+    static long scaleOff(QTensor t) {
+        return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
+    }
+
+    /** The pipeline variant for a tensor's quantization type. */
+    static int byType(QType type, int q4, int q8, int q2k) {
+        return switch (type) {
+            case Q4_0 -> q4;
+            case Q8_0 -> q8;
+            case Q2_K -> q2k;
+        };
     }
 
     /** q, k and v projections of {@code in} in one dispatch (k and v straight into the caches at pos). */
@@ -483,11 +514,11 @@ public final class MetalBackend implements Backend {
             return;
         }
         bind(0, L.wq, 0);
-        bind(1, L.wq, W.wq.scalesOffset);
+        bind(1, L.wq, scaleOff(W.wq));
         bind(2, L.wk, 0);
-        bind(3, L.wk, W.wk.scalesOffset);
+        bind(3, L.wk, scaleOff(W.wk));
         bind(4, L.wv, 0);
-        bind(5, L.wv, W.wv.scalesOffset);
+        bind(5, L.wv, scaleOff(W.wv));
         bind(6, in, 0);
         bind(7, q, 0);
         bind(8, kDst, kvOff);
@@ -499,8 +530,8 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 3, W.wq.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 4, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
-        int pipe = W.wq.type == QType.Q4_0 ? (norm != null ? pMatmul3Q4Norm : pMatmul3Q4)
-                                           : (norm != null ? pMatmul3Q8Norm : pMatmul3Q8);
+        int pipe = norm != null ? byType(W.wq.type, pMatmul3Q4Norm, pMatmul3Q8Norm, pMatmul3Q2KNorm)
+                                : byType(W.wq.type, pMatmul3Q4, pMatmul3Q8, pMatmul3Q2K);
         int rows = W.wq.rows + W.wk.rows + W.wv.rows;
         int gx = (rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
@@ -517,7 +548,7 @@ public final class MetalBackend implements Backend {
     void swiglu(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, Metal.Buffer norm, int n) {
         int hiddenDim = t.rows / 2;
         bind(0, wbuf, 0);
-        bind(1, wbuf, t.scalesOffset);
+        bind(1, wbuf, scaleOff(t));
         bind(2, in, 0);
         bind(3, hidden, 0);
         bind(4, norm != null ? norm : finalNorm, 0);
@@ -526,8 +557,8 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_INT, 4, c.isGemma() ? 1 : 0);
-        int pipe = t.type == QType.Q4_0 ? (norm != null ? pSwigluQ4Norm : pSwigluQ4)
-                                        : (norm != null ? pSwigluQ8Norm : pSwigluQ8);
+        int pipe = norm != null ? byType(t.type, pSwigluQ4Norm, pSwigluQ8Norm, pSwigluQ2KNorm)
+                                : byType(t.type, pSwigluQ4, pSwigluQ8, pSwigluQ2K);
         int gx = (hiddenDim + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1,
@@ -670,19 +701,19 @@ public final class MetalBackend implements Backend {
         // gate/up projections with SwiGLU fused in: one simdgroup per (slot, hidden unit) writes moeHidden
         QTensor gu = W.expGateUp;
         bind(0, L.expGateUp, 0);
-        bind(1, L.expGateUp, gu.scalesOffset);
+        bind(1, L.expGateUp, scaleOff(gu));
         bind(2, xb, 0);
         bind(3, assign, 0);
         bind(4, moeHidden, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, 2 * m); // rows per expert in the stacked tensor (gate | up)
         params.setAtIndex(ValueLayout.JAVA_INT, 1, gu.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
-        metal.dispatch(gu.type == QType.Q4_0 ? pMoeUpQ4 : pMoeUpQ8, bufArgs, offArgs, 5, params, 12,
+        metal.dispatch(byType(gu.type, pMoeUpQ4, pMoeUpQ8, pMoeUpQ2K), bufArgs, offArgs, 5, params, 12,
                 (m + sgPerTg - 1) / sgPerTg, slots, 1, 32 * sgPerTg, 1, 1);
 
         QTensor dn = W.expDown;
         bind(0, L.expDown, 0);
-        bind(1, L.expDown, dn.scalesOffset);
+        bind(1, L.expDown, scaleOff(dn));
         bind(2, moeHidden, 0);
         bind(3, assign, 0);
         bind(4, routeWeight, 0);
@@ -690,7 +721,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.dim());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, dn.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
-        metal.dispatch(dn.type == QType.Q4_0 ? pMoeDownQ4 : pMoeDownQ8, bufArgs, offArgs, 6, params, 12,
+        metal.dispatch(byType(dn.type, pMoeDownQ4, pMoeDownQ8, pMoeDownQ2K), bufArgs, offArgs, 6, params, 12,
                 (c.dim() + sgPerTg - 1) / sgPerTg, n, 1, 32 * sgPerTg, 1, 1);
     }
 

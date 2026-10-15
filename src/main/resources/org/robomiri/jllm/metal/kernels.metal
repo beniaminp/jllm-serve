@@ -139,9 +139,17 @@ static inline threadgroup const float4 *as_f4(threadgroup const float *p) { retu
 
 // acc[t] += W[grow] . x[t * xstride ..] for t < nt; blocks walked in lane order, each dequantized once for
 // all tokens. XP is a device or threadgroup float pointer.
+template <typename XP>
+static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                              thread float *acc, ushort lane); // Q2_K section at the end of the file
+
 template <int QT, typename XP>
 static inline void mm_row(device const uchar *wq, device const float *ws, ulong grow, int nb,
                           XP x, ulong xstride, int nt, thread float *acc, ushort lane) {
+    if (QT == 2) {
+        mm_row_q2k(wq, grow, nb, x, xstride, nt, acc, lane);
+        return;
+    }
     device const float *rs = ws + grow * nb;
     if (QT == 4) {
         device const uchar4 *rq = (device const uchar4 *)(wq + grow * nb * 16);
@@ -1339,3 +1347,69 @@ kernel void router_ds(device const float *x [[buffer(0)]],
         rw[tg * p.topK + k] = v;
     }
 }
+
+// ============================================================================================== Q2_K
+// llama.cpp's Q2_K: 256-weight super-blocks of 84 bytes = 16 scale/min bytes (low nibble = 4-bit scale sc,
+// high nibble = 4-bit min m) + 64 bytes of 2-bit quants + f16 d + f16 dmin; weight = d*sc*q - dmin*m.
+// Sub-block j (weights 16j .. 16j+15) is at qs + (j/8)*32 + (j%2)*16 with bit shift 2*((j%8)/2).
+// Scales live inside the block, so buffer(1) (ws) is unused by these kernels. See docs/13-q2k-quantization.md.
+
+#define QK_K 256
+#define Q2K_BYTES 84
+
+// Dequantizes 16-weight sub-block u of global row `grow` (nsb super-blocks per row) into w[0..4).
+static inline void q2k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w) {
+    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q2K_BYTES;
+    const int j = u & 15;
+    const uchar s = blk[j];
+    const float dl = float(*(device const half *)(blk + 80)) * float(s & 15);
+    const float ml = float(*(device const half *)(blk + 82)) * float(s >> 4);
+    const uchar shift = uchar(((j & 7) >> 1) << 1);
+    device const uchar4 *q = (device const uchar4 *)(blk + 16 + (j >> 3) * 32 + (j & 1) * 16);
+    for (int k = 0; k < 4; k++) w[k] = float4((q[k] >> uchar4(shift)) & uchar4(3)) * dl - ml;
+}
+
+// block_dot for the MoE kernels: 32-weight block b of a Q2_K row = sub-blocks 2b and 2b+1 (nb = cols / 32).
+template <>
+inline float block_dot<2>(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,
+                          device const float4 *x4) {
+    const int nsb = (nb + 7) >> 3;
+    float4 w[4];
+    float d = 0.0f;
+    q2k_sub_block(wq, grow, nsb, 2 * b, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+    q2k_sub_block(wq, grow, nsb, 2 * b + 1, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k + 4]);
+    return d;
+}
+
+// mm_row for QT == 2 (called from the generic mm_row, so every matmul / matmul3 / matmul_swiglu variant gets it):
+// a lane's unit of work is one 16-weight sub-block (cols / 16 units per row, nb = cols / 32) so all 32 lanes
+// stay busy on 1024-wide rows, which hold only 4 super-blocks.
+template <typename XP>
+static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                              thread float *acc, ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nsub = nb * 2;
+    for (int u = lane; u < nsub; u += 32) {
+        float4 w[4];
+        q2k_sub_block(wq, grow, nsb, u, w);
+        for (int t = 0; t < TOK_TILE; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
+                float d = 0.0f;
+                for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+                acc[t] += d;
+            }
+        }
+    }
+}
+
+template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
+template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;
+template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false>;
+template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true>;
+template [[host_name("matmul_swiglu_q2k")]] kernel matmul_swiglu_t matmul_swiglu<2, false>;
+template [[host_name("matmul_swiglu_q2k_norm")]] kernel matmul_swiglu_t matmul_swiglu<2, true>;
+template [[host_name("moe_up_q2k")]] kernel moe_up_t moe_up<2>;
+template [[host_name("moe_down_q2k")]] kernel moe_down_t moe_down<2>;
