@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.text.Normalizer;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -15,19 +14,30 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Byte-level BPE tokenizer that reads a Hugging Face {@code tokenizer.json} (GPT-2 / Qwen style).
+ * BPE tokenizer that reads a Hugging Face {@code tokenizer.json}. Two flavours of the same model type are
+ * supported:
  *
- * <p>Pipeline: split on added tokens, NFC-normalize, regex pre-tokenize, map bytes to the GPT-2 printable
- * alphabet, apply BPE merges by rank.
+ * <ul>
+ *   <li><b>byte-level</b> (GPT-2 / Qwen / Llama 3 / Phi-4 / GLM / DeepSeek / GPT-NeoX): split on added tokens,
+ *       normalize, regex pre-tokenize, map bytes to the GPT-2 printable alphabet, apply merges by rank;</li>
+ *   <li><b>SentencePiece style</b> (Mistral, Gemma, Phi-3): split on added tokens, normalize and/or Metaspace
+ *       (spaces become {@code U+2581}), start from Unicode characters, unknown characters fall back to
+ *       {@code <0xXX>} byte tokens, apply merges by rank.</li>
+ * </ul>
+ *
+ * <p>The normalizer, pre-tokenizer, added-token (lstrip / rstrip) and post-processor (BOS) constructs found in
+ * the tokenizers of the common model families are interpreted from the JSON; unknown constructs fail loudly
+ * rather than silently tokenizing differently. Unigram models are not supported.
  */
 public final class Tokenizer {
 
-    /** Qwen2/3 pre-tokenizer, used when tokenizer.json does not carry a Split regex. */
+    /** Qwen2/3 pre-tokenizer, used when tokenizer.json does not carry any pre-tokenizer. */
     private static final String DEFAULT_SPLIT =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
@@ -42,16 +52,27 @@ public final class Tokenizer {
     private final Map<Long, Long> merges;
     private final Map<String, Integer> addedTokens;
     private final Set<Integer> specialIds;
+    private final Set<Integer> lstripIds = new HashSet<>();
+    private final Set<Integer> rstripIds = new HashSet<>();
     private final Pattern addedPattern;
-    private final Pattern splitPattern;
-    private final boolean nfc;
+    private final UnaryOperator<String> normalizer;
+    private final PreTokenizers.Chain preTokenizer;
+    private final boolean byteLevel;
+    private final boolean byteFallback;
+    private final boolean fuseUnk;
+    private final int unkId;
+    private final int[] byteTokenIds = new int[256];
+    private final int stripOnDecode;
+    private final int bosId;
+    private final int eosId;
+    private final boolean addBos;
     private final boolean ignoreMerges;
     private final char[] byteToChar = new char[256];
     private final int[] charToByte = new int[512];
     private final int[] byteCharIds = new int[256];
     private final Map<String, int[]> cache = new ConcurrentHashMap<>();
 
-    private Tokenizer(Map<String, Object> json) {
+    private Tokenizer(Map<String, Object> json, Map<String, Object> config) {
         initByteMapping();
         Map<String, Object> model = Json.map(json, "model");
         if (model == null) {
@@ -62,6 +83,8 @@ public final class Tokenizer {
                     + Json.str(model, "type", null));
         }
         ignoreMerges = Json.bool(model, "ignore_merges", false);
+        byteFallback = Json.bool(model, "byte_fallback", false);
+        fuseUnk = Json.bool(model, "fuse_unk", false);
 
         Map<String, Object> v = Json.map(model, "vocab");
         if (v == null) {
@@ -126,27 +149,62 @@ public final class Tokenizer {
                 if (Json.bool(o, "special", false)) {
                     specialIds.add(id);
                 }
+                if (Json.bool(o, "lstrip", false)) {
+                    lstripIds.add(id);
+                }
+                if (Json.bool(o, "rstrip", false)) {
+                    rstripIds.add(id);
+                }
                 maxId = Math.max(maxId, id);
             }
         }
 
+        // ---- pipeline stages
+        Map<String, Object> normalizerNode = Json.map(json, "normalizer");
+        Map<String, Object> preNode = Json.map(json, "pre_tokenizer");
+        Map<String, Object> decoderNode = Json.map(json, "decoder");
+        normalizer = Normalizers.build(normalizerNode);
+        PreTokenizers.Chain pre = PreTokenizers.build(preNode);
+        boolean spSignal = pre.metaspace || byteFallback || containsType(decoderNode, "Replace")
+                || containsType(decoderNode, "Metaspace") || containsType(decoderNode, "ByteFallback")
+                || containsType(normalizerNode, "Replace") || containsType(normalizerNode, "Prepend");
+        byteLevel = pre.byteLevel || !spSignal; // tokenizers with no hints at all keep the historical byte-level default
+        if (byteLevel && !pre.byteLevel && !pre.splitRegex) { // legacy default: Qwen's regex
+            pre = PreTokenizers.build(Json.obj("type", "Split", "pattern", Json.obj("Regex", DEFAULT_SPLIT),
+                    "behavior", "Isolated"));
+        }
+        preTokenizer = pre;
+        stripOnDecode = decodeStrip(decoderNode);
+
+        // ---- id tables
         idToBytes = new byte[maxId + 1][];
         idToString = new String[maxId + 1];
         for (Map.Entry<String, Integer> e : vocab.entrySet()) {
             idToString[e.getValue()] = e.getKey();
-            idToBytes[e.getValue()] = decodeByteLevel(e.getKey());
+            idToBytes[e.getValue()] = byteLevel ? decodeByteLevel(e.getKey()) : decodeSentencePiece(e.getKey());
         }
         for (Map.Entry<String, Integer> e : addedTokens.entrySet()) {
             idToString[e.getValue()] = e.getKey();
-            idToBytes[e.getValue()] = e.getKey().getBytes(StandardCharsets.UTF_8);
+            idToBytes[e.getValue()] = byteLevel ? e.getKey().getBytes(StandardCharsets.UTF_8)
+                    : decodeSentencePiece(e.getKey());
+        }
+        if (byteLevel) {
+            for (int b = 0; b < 256; b++) {
+                Integer id = vocab.get(String.valueOf(byteToChar[b]));
+                if (id == null) {
+                    throw new IllegalArgumentException("vocab is missing byte-level symbol for byte " + b);
+                }
+                byteCharIds[b] = id;
+            }
         }
         for (int b = 0; b < 256; b++) {
-            Integer id = vocab.get(String.valueOf(byteToChar[b]));
-            if (id == null) {
-                throw new IllegalArgumentException("vocab is missing byte-level symbol for byte " + b);
-            }
-            byteCharIds[b] = id;
+            Integer id = vocab.get(String.format("<0x%02X>", b));
+            byteTokenIds[b] = id == null ? -1 : id;
         }
+
+        String unkToken = Json.str(model, "unk_token", null);
+        Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
+        unkId = unk == null ? -1 : unk;
 
         // Longest-first alternation so e.g. "<|im_start|>" wins over any shorter overlapping token.
         addedPattern = addedTokens.isEmpty() ? null : Pattern.compile(addedTokens.keySet().stream()
@@ -154,24 +212,50 @@ public final class Tokenizer {
                 .map(Pattern::quote)
                 .collect(Collectors.joining("|")));
 
-        Map<String, Object> normalizer = Json.map(json, "normalizer");
-        nfc = normalizer != null && containsType(normalizer, "NFC");
-        String regex = findSplitRegex(Json.map(json, "pre_tokenizer"));
-        splitPattern = Pattern.compile(regex == null ? DEFAULT_SPLIT : regex, Pattern.UNICODE_CHARACTER_CLASS);
+        // ---- BOS / EOS: tokenizer_config.json (when available) wins over the post-processor template
+        int[] template = findTemplateBos(Json.map(json, "post_processor"));
+        int tplBos = template[0];
+        Integer cfgBos = config == null ? null : tokenIdOrNull(specialName(config.get("bos_token")));
+        Integer cfgEos = config == null ? null : tokenIdOrNull(specialName(config.get("eos_token")));
+        bosId = cfgBos != null ? cfgBos : tplBos;
+        eosId = cfgEos != null ? cfgEos : -1;
+        boolean cfgAddBos = config != null && config.get("add_bos_token") instanceof Boolean b
+                ? b : tplBos >= 0;
+        addBos = cfgAddBos && bosId >= 0;
     }
 
     public static Tokenizer load(Path tokenizerJson) throws IOException {
-        return fromJson(Files.readString(tokenizerJson));
+        Path cfg = tokenizerJson.resolveSibling("tokenizer_config.json");
+        return fromJson(Files.readString(tokenizerJson), Files.isRegularFile(cfg) ? Files.readString(cfg) : null);
     }
 
     /** @throws IllegalArgumentException if the text is not a well-formed BPE tokenizer.json */
     public static Tokenizer fromJson(String tokenizerJson) {
-        return new Tokenizer(Json.parseObject(tokenizerJson));
+        return fromJson(tokenizerJson, null);
+    }
+
+    /**
+     * @param tokenizerConfigJson the sibling {@code tokenizer_config.json} (may be null); supplies bos/eos tokens
+     *                            and {@code add_bos_token}
+     */
+    public static Tokenizer fromJson(String tokenizerJson, String tokenizerConfigJson) {
+        Map<String, Object> config = null;
+        if (tokenizerConfigJson != null) {
+            try {
+                config = Json.parseObject(tokenizerConfigJson);
+            } catch (RuntimeException e) {
+                config = null; // a broken tokenizer_config.json must not stop the tokenizer from loading
+            }
+        }
+        return new Tokenizer(Json.parseObject(tokenizerJson), config);
     }
 
     // ------------------------------------------------------------------ public API
 
-    /** Encodes text; added/special tokens appearing literally in the text are mapped to their ids. */
+    /**
+     * Encodes text; added/special tokens appearing literally in the text are mapped to their ids. No BOS is
+     * added; see {@link #addBosByDefault()} and {@link #bosId()}.
+     */
     public int[] encode(String text) {
         return encode(text, true);
     }
@@ -182,23 +266,57 @@ public final class Tokenizer {
      */
     public int[] encode(String text, boolean allowSpecial) {
         IntList out = new IntList(Math.max(16, text.length() / 3));
-        if (addedPattern == null || !allowSpecial) {
-            encodeOrdinary(text, out);
+        encodeInto(text, allowSpecial, true, out);
+        return out.toArray();
+    }
+
+    /**
+     * Incremental encoder for text assembled from trusted control strings and untrusted content, with exactly
+     * the result of encoding the concatenation in one go and treating only the control strings as special:
+     * the effects that cross piece boundaries (a Metaspace prefix only at offset 0, whitespace swallowed by an
+     * {@code rstrip} token such as Phi's {@code <|user|>}) are carried over.
+     */
+    public SequenceEncoder newSequence() {
+        return new SequenceEncoder();
+    }
+
+    public final class SequenceEncoder {
+        private final IntList out = new IntList(64);
+        private boolean atStart = true;
+        private boolean pendingRstrip;
+
+        /** Appends a control string; added tokens in it become their ids. */
+        public SequenceEncoder special(String text) {
+            return append(text, true);
+        }
+
+        /** Appends ordinary text; added tokens in it are NOT recognized. */
+        public SequenceEncoder text(String text) {
+            return append(text, false);
+        }
+
+        private SequenceEncoder append(String text, boolean allowSpecial) {
+            if (pendingRstrip) {
+                int i = 0;
+                while (i < text.length() && isWhitespace(text.charAt(i))) {
+                    i++;
+                }
+                text = text.substring(i);
+                if (text.isEmpty()) {
+                    return this;
+                }
+            }
+            if (text.isEmpty()) {
+                return this;
+            }
+            pendingRstrip = encodeInto(text, allowSpecial, atStart, out);
+            atStart = false;
+            return this;
+        }
+
+        public int[] toArray() {
             return out.toArray();
         }
-        Matcher m = addedPattern.matcher(text);
-        int last = 0;
-        while (m.find()) {
-            if (m.start() > last) {
-                encodeOrdinary(text.substring(last, m.start()), out);
-            }
-            out.add(addedTokens.get(m.group()));
-            last = m.end();
-        }
-        if (last < text.length()) {
-            encodeOrdinary(text.substring(last), out);
-        }
-        return out.toArray();
     }
 
     /** Raw bytes of a token (UTF-8 fragments; a multi-byte character may span several tokens). */
@@ -209,12 +327,27 @@ public final class Tokenizer {
         return idToBytes[id];
     }
 
+    /**
+     * Concatenates the token bytes and decodes them as UTF-8. Special tokens are written out literally. For
+     * SentencePiece-style tokenizers whose decoder strips the leading space (Mistral, Phi-3) the first space
+     * is dropped, like the reference implementation.
+     */
     public String decode(int[] ids) {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         for (int id : ids) {
             bos.writeBytes(tokenBytes(id));
         }
-        return bos.toString(StandardCharsets.UTF_8);
+        byte[] all = bos.toByteArray();
+        int skip = 0;
+        while (skip < stripOnDecode && skip < all.length && all[skip] == ' ') {
+            skip++;
+        }
+        return new String(all, skip, all.length - skip, StandardCharsets.UTF_8);
+    }
+
+    /** Number of leading spaces the reference decoder removes from the decoded text (0 or 1 in practice). */
+    public int decodeStripLeading() {
+        return stripOnDecode;
     }
 
     /** The token's surface form in the vocabulary (byte-level alphabet), for debugging. */
@@ -224,10 +357,7 @@ public final class Tokenizer {
 
     /** Id of a vocabulary or added token, or -1. */
     public int tokenId(String token) {
-        Integer id = addedTokens.get(token);
-        if (id == null) {
-            id = vocab.get(token);
-        }
+        Integer id = tokenIdOrNull(token);
         return id == null ? -1 : id;
     }
 
@@ -240,32 +370,104 @@ public final class Tokenizer {
         return idToBytes.length;
     }
 
+    /** True for GPT-2-style byte-level BPE, false for SentencePiece-style (Metaspace / byte fallback) BPE. */
+    public boolean isByteLevel() {
+        return byteLevel;
+    }
+
+    /** Id of the beginning-of-sequence token, or -1 if the tokenizer defines none. */
+    public int bosId() {
+        return bosId;
+    }
+
+    /** Id of the end-of-sequence token named by tokenizer_config.json, or -1. */
+    public int eosId() {
+        return eosId;
+    }
+
+    /** Id of the unknown token, or -1. */
+    public int unkId() {
+        return unkId;
+    }
+
+    /**
+     * Whether the tokenizer's post-processor / config asks for {@link #bosId()} in front of a plain prompt.
+     * {@code encode} never adds it; the caller decides.
+     */
+    public boolean addBosByDefault() {
+        return addBos;
+    }
+
     // ------------------------------------------------------------------ internals
 
-    private void encodeOrdinary(String text, IntList out) {
-        if (nfc) {
-            text = Normalizer.normalize(text, Normalizer.Form.NFC);
+    private Integer tokenIdOrNull(String token) {
+        if (token == null) {
+            return null;
         }
-        Matcher m = splitPattern.matcher(text);
+        Integer id = addedTokens.get(token);
+        return id != null ? id : vocab.get(token);
+    }
+
+    /** @return true when the text ended with an rstrip token, so that the next piece's leading whitespace is swallowed */
+    private boolean encodeInto(String text, boolean allowSpecial, boolean atStart, IntList out) {
+        if (addedPattern == null || !allowSpecial) {
+            encodeOrdinary(text, out, atStart);
+            return false;
+        }
+        int len = text.length();
+        Matcher m = addedPattern.matcher(text);
         int last = 0;
-        while (m.find()) {
-            if (m.start() > last) { // "Isolated" split behaviour keeps unmatched gaps as pieces
-                bpe(text.substring(last, m.start()), out);
+        boolean pending = false;
+        while (last <= len && m.find(last)) {
+            int id = addedTokens.get(m.group());
+            int start = m.start();
+            int end = m.end();
+            if (lstripIds.contains(id)) {
+                while (start > last && isWhitespace(text.charAt(start - 1))) {
+                    start--;
+                }
             }
-            if (m.end() > m.start()) {
-                bpe(m.group(), out);
+            if (start > last) {
+                encodeOrdinary(text.substring(last, start), out, atStart && last == 0);
             }
-            last = m.end();
+            out.add(id);
+            boolean rs = rstripIds.contains(id);
+            if (rs) {
+                while (end < len && isWhitespace(text.charAt(end))) {
+                    end++;
+                }
+            }
+            pending = rs && end == len;
+            last = end;
         }
-        if (last < text.length()) {
-            bpe(text.substring(last), out);
+        if (last < len) {
+            encodeOrdinary(text.substring(last), out, atStart && last == 0);
+            pending = false;
+        }
+        return pending;
+    }
+
+    /** Rust's {@code char::is_whitespace}, which decides what lstrip / rstrip tokens swallow. */
+    private static boolean isWhitespace(char c) {
+        if (c >= 0x1C && c <= 0x1F) {
+            return false;
+        }
+        return Character.isWhitespace(c) || Character.isSpaceChar(c) || c == 0x85;
+    }
+
+    private void encodeOrdinary(String text, IntList out, boolean first) {
+        if (normalizer != null) {
+            text = normalizer.apply(text);
+        }
+        for (String piece : preTokenizer.apply(text, first)) {
+            bpe(piece, out);
         }
     }
 
     private void bpe(String piece, IntList out) {
         int[] cached = cache.get(piece);
         if (cached == null) {
-            cached = bpeUncached(piece);
+            cached = byteLevel ? bpeUncached(piece) : bpeCharsUncached(piece);
             // Only short chunks are worth remembering (words, punctuation, short runs); long runs would let a
             // single request fill the cache with megabytes per entry.
             if (piece.length() <= CACHE_MAX_PIECE_BYTES && cache.size() < CACHE_LIMIT
@@ -289,8 +491,59 @@ public final class Tokenizer {
         for (int i = 0; i < n; i++) {
             sym[i] = byteCharIds[bytes[i] & 0xFF];
         }
+        return mergeSymbols(sym, n);
+    }
+
+    /**
+     * SentencePiece-style initial symbols: one per Unicode character; characters missing from the vocabulary
+     * become their {@code <0xXX>} byte tokens (byte_fallback) or the unknown token (fused when fuse_unk),
+     * or are dropped when neither exists.
+     */
+    private int[] bpeCharsUncached(String piece) {
+        if (ignoreMerges) {
+            Integer whole = vocab.get(piece);
+            if (whole != null) {
+                return new int[]{whole};
+            }
+        }
+        IntList syms = new IntList(piece.length() + 1);
+        boolean lastUnk = false;
+        for (int i = 0; i < piece.length(); ) {
+            int cp = piece.codePointAt(i);
+            int cl = Character.charCount(cp);
+            Integer id = vocab.get(piece.substring(i, i + cl));
+            i += cl;
+            if (id != null) {
+                syms.add(id);
+                lastUnk = false;
+                continue;
+            }
+            if (byteFallback) {
+                byte[] bs = new String(Character.toChars(cp)).getBytes(StandardCharsets.UTF_8);
+                boolean all = true;
+                for (byte b : bs) {
+                    all &= byteTokenIds[b & 0xFF] >= 0;
+                }
+                if (all) {
+                    for (byte b : bs) {
+                        syms.add(byteTokenIds[b & 0xFF]);
+                    }
+                    lastUnk = false;
+                    continue;
+                }
+            }
+            if (unkId >= 0 && !(fuseUnk && lastUnk)) {
+                syms.add(unkId);
+            }
+            lastUnk = unkId >= 0;
+        }
+        int[] sym = syms.toArray();
+        return mergeSymbols(sym, sym.length);
+    }
+
+    private int[] mergeSymbols(int[] sym, int n) {
         if (n < 2) {
-            return sym;
+            return n == sym.length ? sym : Arrays.copyOf(sym, n);
         }
         // Symbols form a doubly linked list over their original positions; a min-heap of (rank, position)
         // yields the lowest-ranked pair, leftmost first, which is exactly the order a full rescan would pick.
@@ -397,43 +650,109 @@ public final class Tokenizer {
         return n == out.length ? out : Arrays.copyOf(out, n);
     }
 
+    /** SentencePiece decoding of one token: {@code <0xXX>} is one raw byte, U+2581 is a space. */
+    private byte[] decodeSentencePiece(String token) {
+        if (byteFallback && token.length() == 6 && token.startsWith("<0x") && token.endsWith(">")) {
+            int hi = Character.digit(token.charAt(3), 16);
+            int lo = Character.digit(token.charAt(4), 16);
+            if (hi >= 0 && lo >= 0) {
+                return new byte[]{(byte) (hi << 4 | lo)};
+            }
+        }
+        return token.replace('▁', ' ').getBytes(StandardCharsets.UTF_8);
+    }
+
     private static boolean containsType(Map<String, Object> node, String type) {
+        if (node == null) {
+            return false;
+        }
         if (type.equals(Json.str(node, "type", null))) {
             return true;
         }
-        List<Object> children = Json.list(node, "normalizers");
-        if (children != null) {
-            for (Object c : children) {
-                if (c instanceof Map<?, ?> && containsType(asMap(c), type)) {
-                    return true;
+        for (String key : new String[]{"normalizers", "pretokenizers", "decoders", "processors"}) {
+            List<Object> children = Json.list(node, key);
+            if (children != null) {
+                for (Object c : children) {
+                    if (c instanceof Map<?, ?> && containsType(asMap(c), type)) {
+                        return true;
+                    }
                 }
             }
         }
         return false;
     }
 
-    private static String findSplitRegex(Map<String, Object> pre) {
-        if (pre == null) {
-            return null;
+    /** How many leading spaces the decoder removes: a {@code Strip} decoder with start>0, or Metaspace with a prefix. */
+    private static int decodeStrip(Map<String, Object> node) {
+        if (node == null) {
+            return 0;
         }
-        if ("Split".equals(Json.str(pre, "type", null))) {
-            Map<String, Object> pattern = Json.map(pre, "pattern");
-            return pattern == null ? null : Json.str(pattern, "Regex", null);
+        String type = Json.str(node, "type", "");
+        int n = 0;
+        if (type.equals("Strip") && " ".equals(Json.str(node, "content", " "))) {
+            n = (int) Json.num(node, "start", 0);
+        } else if (type.equals("Metaspace")) {
+            String scheme = Json.str(node, "prepend_scheme", null);
+            boolean prefix = scheme != null ? !scheme.equals("never") : Json.bool(node, "add_prefix_space", true);
+            n = prefix ? 1 : 0;
         }
-        List<Object> children = Json.list(pre, "pretokenizers");
+        List<Object> children = Json.list(node, "decoders");
         if (children != null) {
             for (Object c : children) {
-                String r = findSplitRegex(asMap(c));
-                if (r != null) {
-                    return r;
+                n = Math.max(n, decodeStrip(asMap(c)));
+            }
+        }
+        return n;
+    }
+
+    /** @return {bosId or -1} from a TemplateProcessing {@code single} template that starts with a special token */
+    private int[] findTemplateBos(Map<String, Object> pp) {
+        int[] none = {-1};
+        if (pp == null) {
+            return none;
+        }
+        String type = Json.str(pp, "type", "");
+        if (type.equals("Sequence")) {
+            List<Object> procs = Json.list(pp, "processors");
+            if (procs != null) {
+                for (Object p : procs) {
+                    int[] r = findTemplateBos(asMap(p));
+                    if (r[0] >= 0) {
+                        return r;
+                    }
+                }
+            }
+        } else if (type.equals("TemplateProcessing")) {
+            List<Object> single = Json.list(pp, "single");
+            if (single != null && !single.isEmpty() && single.get(0) instanceof Map<?, ?> first) {
+                Map<String, Object> st = Json.map(first, "SpecialToken");
+                String name = Json.str(st, "id", null);
+                if (name != null) {
+                    Map<String, Object> reg = Json.map(Json.map(pp, "special_tokens"), name);
+                    List<Object> ids = Json.list(reg, "ids");
+                    if (ids != null && !ids.isEmpty() && ids.get(0) instanceof Number n) {
+                        return new int[]{n.intValue()};
+                    }
+                    int id = tokenId(name);
+                    if (id >= 0) {
+                        return new int[]{id};
+                    }
                 }
             }
         }
-        return null;
+        return none;
+    }
+
+    /** A tokenizer_config special token is either a string or an object with a "content" field. */
+    private static String specialName(Object o) {
+        if (o instanceof String s) {
+            return s;
+        }
+        return o instanceof Map<?, ?> ? Json.str(o, "content", null) : null;
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> asMap(Object o) {
+    static Map<String, Object> asMap(Object o) {
         return o instanceof Map ? (Map<String, Object>) o : null;
     }
 
@@ -494,7 +813,7 @@ public final class Tokenizer {
         private int n;
 
         IntList(int cap) {
-            a = new int[cap];
+            a = new int[Math.max(cap, 4)];
         }
 
         void add(int v) {
