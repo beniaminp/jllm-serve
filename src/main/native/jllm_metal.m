@@ -165,9 +165,10 @@ void jm_begin(void *ctx) {
     }
 }
 
-// Records one dispatch. Buffers are bound at indices [0, nbuf); params (if any) at index nbuf.
+// Records one dispatch. Buffers are bound at indices [0, nbuf); params (if any) at index nbuf; tgmem > 0
+// sets the size of the kernel's dynamic threadgroup memory argument [[threadgroup(0)]].
 void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, int nbuf,
-                 const void *params, int plen, int gx, int gy, int gz, int tx, int ty, int tz) {
+                 const void *params, int plen, int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
         id<MTLComputeCommandEncoder> enc = c.enc;
@@ -177,6 +178,9 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
         }
         if (plen > 0) {
             [enc setBytes:params length:(NSUInteger) plen atIndex:(NSUInteger) nbuf];
+        }
+        if (tgmem > 0) {
+            [enc setThreadgroupMemoryLength:(NSUInteger) tgmem atIndex:0];
         }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger) gx, (NSUInteger) gy, (NSUInteger) gz)
             threadsPerThreadgroup:MTLSizeMake((NSUInteger) tx, (NSUInteger) ty, (NSUInteger) tz)];

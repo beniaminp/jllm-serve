@@ -24,7 +24,7 @@ public final class MetalBackend implements Backend {
      * instead of one per (batch token, head). 32 keeps a 64-token prefill chunk at two dispatches per layer.
      */
     private static final int ATT_TILE = 32;
-    private static final int MAX_BUFS = 8;
+    private static final int MAX_BUFS = 16; // matmul3 binds 11 buffers
 
     private final ModelWeights w;
     private final ModelConfig c;
@@ -35,11 +35,20 @@ public final class MetalBackend implements Backend {
 
     private int pMatmulQ4;
     private int pMatmulQ8;
+    private int pMatmulQ4Norm;
+    private int pMatmulQ8Norm;
+    private int pMatmul3Q4;
+    private int pMatmul3Q8;
+    private int pMatmul3Q4Norm;
+    private int pMatmul3Q8Norm;
+    private int pSwigluQ4;
+    private int pSwigluQ8;
+    private int pSwigluQ4Norm;
+    private int pSwigluQ8Norm;
     private int pRmsnorm;
     private int pNormRope;
     private int pAttention;
     private int attnGroup; // query heads per attention threadgroup
-    private int pSilu;
     private int pAddBias;
     private int pRouter;
     private int pMoeUpQ4;
@@ -66,7 +75,6 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer xb;
     private Metal.Buffer q;
     private Metal.Buffer att;
-    private Metal.Buffer gateUp;
     private Metal.Buffer hidden;
     private Metal.Buffer scores;
     private Metal.Buffer logitsBuf;
@@ -142,6 +150,16 @@ public final class MetalBackend implements Backend {
     private void init(KvDtype kvDtype) {
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
+        pMatmulQ4Norm = metal.pipeline("matmul_q4_norm");
+        pMatmulQ8Norm = metal.pipeline("matmul_q8_norm");
+        pMatmul3Q4 = metal.pipeline("matmul3_q4");
+        pMatmul3Q8 = metal.pipeline("matmul3_q8");
+        pMatmul3Q4Norm = metal.pipeline("matmul3_q4_norm");
+        pMatmul3Q8Norm = metal.pipeline("matmul3_q8_norm");
+        pSwigluQ4 = metal.pipeline("matmul_swiglu_q4");
+        pSwigluQ8 = metal.pipeline("matmul_swiglu_q8");
+        pSwigluQ4Norm = metal.pipeline("matmul_swiglu_q4_norm");
+        pSwigluQ8Norm = metal.pipeline("matmul_swiglu_q8_norm");
         pRmsnorm = metal.pipeline("rmsnorm");
         pNormRope = metal.pipeline("norm_rope");
         // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
@@ -163,7 +181,6 @@ public final class MetalBackend implements Backend {
             attnGroup = 1;
             pAttention = metal.pipeline(kvHalf ? "attention_h" : "attention");
         }
-        pSilu = metal.pipeline("silu_mul");
         pAddBias = metal.pipeline("add_bias");
         pRouter = metal.pipeline("router");
         pMoeUpQ4 = metal.pipeline("moe_up_q4");
@@ -226,7 +243,6 @@ public final class MetalBackend implements Backend {
         xb = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
         q = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
         att = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
-        gateUp = metal.newBuffer((long) maxBatch * 2L * c.hiddenDim() * 4, false);
         hidden = metal.newBuffer((long) maxBatch * c.hiddenDim() * 4, false);
         scores = metal.newBuffer((long) Math.min(ATT_TILE, maxBatch) * c.heads() * ctx * 4, false);
         logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4, false);
@@ -293,17 +309,22 @@ public final class MetalBackend implements Backend {
         metal.begin();
         boolean committed = false;
         try {
+            // For a single token the rmsnorm preceding a projection is folded into the projection kernel
+            // (the *_norm variants read x and normalise on the fly); otherwise it writes xb first.
+            boolean fuseNorm = n == 1;
             for (int l = 0; l < c.layers(); l++) {
                 LayerBufs L = layers[l];
                 ModelWeights.Layer W = w.layers[l];
-                rmsnorm(x, L.attnNorm, xb, n, dim);
-                matmul(W.wq, L.wq, xb, q, 0, n, false);
                 // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
                 Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
                 Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
                 long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
-                matmul(W.wk, L.wk, xb, kDst, kvOff, n, false);
-                matmul(W.wv, L.wv, xb, vDst, kvOff, n, false);
+                if (fuseNorm) {
+                    qkv(W, L, x, L.attnNorm, kDst, vDst, kvOff, n);
+                } else {
+                    rmsnorm(x, L.attnNorm, xb, n, dim);
+                    qkv(W, L, xb, null, kDst, vDst, kvOff, n);
+                }
                 if (L.bq != null) {
                     addBias(q, 0, L.bq, n, c.qDim());
                     addBias(kDst, kvOff, L.bk, n, kvDim);
@@ -314,21 +335,27 @@ public final class MetalBackend implements Backend {
                     kvStore(l, n, pos);
                 }
                 attention(l, n, pos);
-                matmul(W.wo, L.wo, att, x, 0, n, true);
+                matmul(W.wo, L.wo, att, 0, x, 0, n, true, null);
 
-                rmsnorm(x, L.ffnNorm, xb, n, dim);
                 if (W.moe) {
+                    rmsnorm(x, L.ffnNorm, xb, n, dim);
                     moe(W, L, n);
                 } else {
-                    matmul(W.wGateUp, L.wGateUp, xb, gateUp, 0, n, false);
-                    siluMul(n);
-                    matmul(W.wDown, L.wDown, hidden, x, 0, n, true);
+                    if (fuseNorm) {
+                        swiglu(W, L, x, L.ffnNorm, n);
+                    } else {
+                        rmsnorm(x, L.ffnNorm, xb, n, dim);
+                        swiglu(W, L, xb, null, n);
+                    }
+                    matmul(W.wDown, L.wDown, hidden, 0, x, 0, n, true, null);
                 }
             }
             if (logits != null) {
-                // normalize only the last token: read x at row n-1, write xb row 0
+                // normalise only the last token (read x at row n-1, write xb row 0), then the LM head. Folding
+                // the norm into the LM-head kernel measured ~5% slower at decode: its prologue runs in all
+                // ~38k threadgroups, which costs more than the one dispatch it saves.
                 rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
-                matmul(w.lmHead, lmHeadQ, xb, logitsBuf, 0, 1, false);
+                matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null);
             }
             metal.commitAndWait();
             committed = true;
@@ -350,20 +377,93 @@ public final class MetalBackend implements Backend {
         offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset);
     }
 
-    private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, Metal.Buffer out, long outOff, int n, boolean acc) {
+    private static final int SG_PER_TG = 4; // 128 threads = 4 rows per matmul threadgroup (kernels assume it)
+
+    /**
+     * out[t, row] (+)= W[row] . in[t]. With {@code norm != null} (single token only) the kernel first
+     * applies rmsnorm with those weights to the input row, exactly as the rmsnorm kernel would.
+     */
+    private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
+                        int n, boolean acc, Metal.Buffer norm) {
+        if (norm != null && n != 1) {
+            throw new IllegalArgumentException("fused rmsnorm needs a single token");
+        }
         bind(0, wbuf, 0);
         bind(1, wbuf, t.scalesOffset);
-        bind(2, in, 0);
+        bind(2, in, inOff);
         bind(3, out, outOff);
+        bind(4, norm != null ? norm : finalNorm, 0); // dummy binding when unused
         params.setAtIndex(ValueLayout.JAVA_INT, 0, t.rows);
         params.setAtIndex(ValueLayout.JAVA_INT, 1, t.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
-        int pipe = t.type == QType.Q4_0 ? pMatmulQ4 : pMatmulQ8;
-        int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
-        int gx = (t.rows + sgPerTg - 1) / sgPerTg;
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
+        int pipe = t.type == QType.Q4_0 ? (norm != null ? pMatmulQ4Norm : pMatmulQ4)
+                                        : (norm != null ? pMatmulQ8Norm : pMatmulQ8);
+        int gx = (t.rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 4, params, 16, gx, gy, 1, 32 * sgPerTg, 1, 1);
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
+    }
+
+    /** Dynamic threadgroup memory for the normalised input row of the *_norm kernels (0 when unused). */
+    private static int normTgMem(Metal.Buffer norm, int cols) {
+        return norm != null ? cols * 4 : 0;
+    }
+
+    /** q, k and v projections of {@code in} in one dispatch (k and v straight into the caches at pos). */
+    private void qkv(ModelWeights.Layer W, LayerBufs L, Metal.Buffer in, Metal.Buffer norm,
+                     Metal.Buffer kDst, Metal.Buffer vDst, long kvOff, int n) {
+        if (W.wq.type != W.wk.type || W.wk.type != W.wv.type || W.wq.cols != W.wk.cols || W.wk.cols != W.wv.cols) {
+            matmul(W.wq, L.wq, in, 0, q, 0, n, false, norm);
+            matmul(W.wk, L.wk, in, 0, kDst, kvOff, n, false, norm);
+            matmul(W.wv, L.wv, in, 0, vDst, kvOff, n, false, norm);
+            return;
+        }
+        bind(0, L.wq, 0);
+        bind(1, L.wq, W.wq.scalesOffset);
+        bind(2, L.wk, 0);
+        bind(3, L.wk, W.wk.scalesOffset);
+        bind(4, L.wv, 0);
+        bind(5, L.wv, W.wv.scalesOffset);
+        bind(6, in, 0);
+        bind(7, q, 0);
+        bind(8, kDst, kvOff);
+        bind(9, vDst, kvOff);
+        bind(10, norm != null ? norm : finalNorm, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, W.wq.rows);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, W.wk.rows);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, W.wv.rows);
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, W.wq.cols);
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, n);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
+        int pipe = W.wq.type == QType.Q4_0 ? (norm != null ? pMatmul3Q4Norm : pMatmul3Q4)
+                                           : (norm != null ? pMatmul3Q8Norm : pMatmul3Q8);
+        int rows = W.wq.rows + W.wk.rows + W.wv.rows;
+        int gx = (rows + SG_PER_TG - 1) / SG_PER_TG;
+        int gy = (n + TOK_TILE - 1) / TOK_TILE;
+        metal.dispatch(pipe, bufArgs, offArgs, 11, params, 24, normTgMem(norm, W.wq.cols), gx, gy, 1,
+                32 * SG_PER_TG, 1, 1);
+    }
+
+    /** hidden[t] = silu(Wgate . in[t]) * (Wup . in[t]) from the stacked [2 * hidden, dim] gate|up matrix. */
+    private void swiglu(ModelWeights.Layer W, LayerBufs L, Metal.Buffer in, Metal.Buffer norm, int n) {
+        QTensor t = W.wGateUp;
+        int hiddenDim = t.rows / 2;
+        bind(0, L.wGateUp, 0);
+        bind(1, L.wGateUp, t.scalesOffset);
+        bind(2, in, 0);
+        bind(3, hidden, 0);
+        bind(4, norm != null ? norm : finalNorm, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, hiddenDim);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, t.cols);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
+        int pipe = t.type == QType.Q4_0 ? (norm != null ? pSwigluQ4Norm : pSwigluQ4)
+                                        : (norm != null ? pSwigluQ8Norm : pSwigluQ8);
+        int gx = (hiddenDim + SG_PER_TG - 1) / SG_PER_TG;
+        int gy = (n + TOK_TILE - 1) / TOK_TILE;
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 16, normTgMem(norm, t.cols), gx, gy, 1,
+                32 * SG_PER_TG, 1, 1);
     }
 
     private void addBias(Metal.Buffer v, long off, Metal.Buffer bias, int n, int width) {
@@ -441,19 +541,6 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 1, pos);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
         metal.dispatch(pKvStoreHalf, bufArgs, offArgs, 4, params, 12, (total + 255) / 256, 1, 1, 256, 1, 1);
-    }
-
-    private void siluMul(int n) {
-        siluMul(gateUp, hidden, n, c.hiddenDim());
-    }
-
-    private void siluMul(Metal.Buffer in, Metal.Buffer out, int ntok, int width) {
-        int total = ntok * width;
-        bind(0, in, 0);
-        bind(1, out, 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, total);
-        metal.dispatch(pSilu, bufArgs, offArgs, 2, params, 8, (total + 255) / 256, 1, 1, 256, 1, 1);
     }
 
     /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */

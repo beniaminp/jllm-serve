@@ -66,7 +66,7 @@ public final class Metal implements AutoCloseable {
         bufferRelease = handle(l, "jm_buffer_release", FunctionDescriptor.ofVoid(ADDRESS));
         begin = handle(l, "jm_begin", FunctionDescriptor.ofVoid(ADDRESS));
         dispatch = handle(l, "jm_dispatch", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT,
-                ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
         abort = handle(l, "jm_abort", FunctionDescriptor.ofVoid(ADDRESS));
         commitWait = handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
         try {
@@ -249,8 +249,14 @@ public final class Metal implements AutoCloseable {
      */
     public void dispatch(int pipe, MemorySegment bufs, MemorySegment offsets, int nbuf, MemorySegment params, int plen,
                          int gx, int gy, int gz, int tx, int ty, int tz) {
+        dispatch(pipe, bufs, offsets, nbuf, params, plen, 0, gx, gy, gz, tx, ty, tz);
+    }
+
+    /** As above, with {@code tgmem} bytes of dynamic threadgroup memory for the kernel's [[threadgroup(0)]]. */
+    public void dispatch(int pipe, MemorySegment bufs, MemorySegment offsets, int nbuf, MemorySegment params, int plen,
+                         int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
         try {
-            dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, gx, gy, gz, tx, ty, tz);
+            dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, tgmem, gx, gy, gz, tx, ty, tz);
         } catch (Throwable t) {
             throw rethrow(t);
         }
