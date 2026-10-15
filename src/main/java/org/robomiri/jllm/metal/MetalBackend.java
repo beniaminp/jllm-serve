@@ -30,7 +30,7 @@ public final class MetalBackend implements Backend {
     private final ModelConfig c;
     private final int ctx;
     private final int maxBatch;
-    private final Metal metal;
+    final Metal metal;
     private final Arena arena = Arena.ofShared();
 
     private int pMatmulQ4;
@@ -69,29 +69,31 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer lmHeadQ;
     private LayerBufs[] layers;
     private Metal.Buffer finalNorm;
-    private Metal.Buffer ropeCos;
-    private Metal.Buffer ropeSin;
+    Metal.Buffer ropeCos;
+    Metal.Buffer ropeSin;
     private Metal.Buffer ropeCosLocal; // Gemma 3 sliding layers; the same buffers as above when there is no local table
     private Metal.Buffer ropeSinLocal;
     private Metal.Buffer[] keyCache;
     private Metal.Buffer[] valCache;
 
-    private Metal.Buffer x;
-    private Metal.Buffer xb;
-    private Metal.Buffer q;
-    private Metal.Buffer att;
-    private Metal.Buffer hidden;
-    private Metal.Buffer scores;
+    Metal.Buffer x;
+    Metal.Buffer xb;
+    Metal.Buffer q;
+    Metal.Buffer att;
+    Metal.Buffer hidden;
+    Metal.Buffer scores;
     private Metal.Buffer logitsBuf;
     // MoE (null for dense models)
-    private Metal.Buffer assign;
-    private Metal.Buffer routeWeight;
+    Metal.Buffer assign;
+    Metal.Buffer routeWeight;
     private Metal.Buffer moeHidden;
 
     // dispatch argument scratch (re-used; the native side copies params at record time)
-    private MemorySegment bufArgs;
-    private MemorySegment offArgs;
-    private MemorySegment params;
+    MemorySegment bufArgs;
+    MemorySegment offArgs;
+    MemorySegment params;
+    /** DeepSeek multi-head latent attention, router and shared experts (own caches); null for other families. */
+    private MlaMetal mla;
 
     private static final class LayerBufs {
         Metal.Buffer attnNorm;
@@ -155,6 +157,9 @@ public final class MetalBackend implements Backend {
     }
 
     private void init(KvDtype kvDtype) {
+        if (c.deepseek() != null && kvDtype != KvDtype.F32) {
+            throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
+        }
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pMatmulQ4Norm = metal.pipeline("matmul_q4_norm");
@@ -217,9 +222,11 @@ public final class MetalBackend implements Backend {
             b.bq = L.bq != null ? upload(L.bq) : null;
             b.bk = L.bk != null ? upload(L.bk) : null;
             b.bv = L.bv != null ? upload(L.bv) : null;
-            b.wq = metal.wrap(L.wq.data);
-            b.wk = metal.wrap(L.wk.data);
-            b.wv = metal.wrap(L.wv.data);
+            if (L.mla == null) {
+                b.wq = metal.wrap(L.wq.data);
+                b.wk = metal.wrap(L.wk.data);
+                b.wv = metal.wrap(L.wv.data);
+            }
             b.wo = metal.wrap(L.wo.data);
             if (L.moe) {
                 b.router = upload(L.router);
@@ -257,7 +264,7 @@ public final class MetalBackend implements Backend {
         long kvBytes = (long) ctx * c.kvDim() * kvDtype.bytes;
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
-        for (int l = 0; l < c.layers(); l++) {
+        for (int l = 0; l < c.layers() && c.deepseek() == null; l++) { // DeepSeek: MlaMetal owns its caches
             keyCache[l] = metal.newBuffer(kvBytes, false);
             valCache[l] = metal.newBuffer(kvBytes, false);
         }
@@ -266,8 +273,9 @@ public final class MetalBackend implements Backend {
         x = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
         xb = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
         q = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
-        att = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
-        hidden = metal.newBuffer((long) maxBatch * c.hiddenDim() * 4, false);
+        att = metal.newBuffer((long) maxBatch * (c.deepseek() == null ? c.qDim()
+                : Math.max(c.qDim(), c.heads() * c.deepseek().vHeadDim())) * 4, false);
+        hidden = metal.newBuffer((long) maxBatch * c.maxMlpDim() * 4, false);
         scores = metal.newBuffer((long) Math.min(ATT_TILE, maxBatch) * c.heads() * ctx * 4, false);
         logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4, false);
         if (c.isMoe()) {
@@ -280,6 +288,7 @@ public final class MetalBackend implements Backend {
             routeWeight = null;
             moeHidden = null;
         }
+        mla = c.deepseek() != null ? new MlaMetal(this, w, ctx, maxBatch) : null;
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
@@ -295,7 +304,7 @@ public final class MetalBackend implements Backend {
         params = arena.allocate(64);
     }
 
-    private Metal.Buffer upload(float[] data) {
+    Metal.Buffer upload(float[] data) {
         Metal.Buffer b = metal.newBuffer((long) data.length * 4, false); // fully overwritten below
         MemorySegment.copy(data, 0, b.contents(), ValueLayout.JAVA_FLOAT, 0, data.length);
         return b;
@@ -344,26 +353,31 @@ public final class MetalBackend implements Backend {
             for (int l = 0; l < c.layers(); l++) {
                 LayerBufs L = layers[l];
                 ModelWeights.Layer W = w.layers[l];
-                // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
-                Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
-                Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
-                long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
-                if (fuseNorm) {
-                    qkv(W, L, x, L.attnNorm, kDst, vDst, kvOff, n);
-                } else {
+                if (mla != null) {
                     rmsnorm(x, L.attnNorm, xb, n, dim);
-                    qkv(W, L, xb, null, kDst, vDst, kvOff, n);
+                    mla.run(l, W, n, pos);
+                } else {
+                    // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
+                    Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
+                    Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
+                    long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
+                    if (fuseNorm) {
+                        qkv(W, L, x, L.attnNorm, kDst, vDst, kvOff, n);
+                    } else {
+                        rmsnorm(x, L.attnNorm, xb, n, dim);
+                        qkv(W, L, xb, null, kDst, vDst, kvOff, n);
+                    }
+                    if (L.bq != null) {
+                        addBias(q, 0, L.bq, n, c.qDim());
+                        addBias(kDst, kvOff, L.bk, n, kvDim);
+                        addBias(vDst, kvOff, L.bv, n, kvDim);
+                    }
+                    normRope(L, kDst, kvOff, n, pos, c.usesLocalRope(l));
+                    if (kvHalf) {
+                        kvStore(l, n, pos);
+                    }
+                    attention(l, n, pos);
                 }
-                if (L.bq != null) {
-                    addBias(q, 0, L.bq, n, c.qDim());
-                    addBias(kDst, kvOff, L.bk, n, kvDim);
-                    addBias(vDst, kvOff, L.bv, n, kvDim);
-                }
-                normRope(L, kDst, kvOff, n, pos, c.usesLocalRope(l));
-                if (kvHalf) {
-                    kvStore(l, n, pos);
-                }
-                attention(l, n, pos);
                 if (L.postAttnNorm != null) {
                     // Glm4: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
                     matmul(W.wo, L.wo, att, 0, xb, 0, n, false, null);
@@ -374,7 +388,10 @@ public final class MetalBackend implements Backend {
 
                 if (W.moe) {
                     rmsnorm(x, L.ffnNorm, xb, n, dim);
-                    moe(W, L, n);
+                    moe(W, L, l, n);
+                    if (mla != null) {
+                        mla.sharedExperts(W, l, n);
+                    }
                 } else {
                     if (fuseNorm) {
                         swiglu(W, L, x, L.ffnNorm, n);
@@ -418,7 +435,7 @@ public final class MetalBackend implements Backend {
 
     // ------------------------------------------------------------------ dispatch helpers
 
-    private void bind(int i, Metal.Buffer b, long offset) {
+    void bind(int i, Metal.Buffer b, long offset) {
         bufArgs.setAtIndex(ValueLayout.ADDRESS, i, b.handle());
         offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset);
     }
@@ -429,7 +446,7 @@ public final class MetalBackend implements Backend {
      * out[t, row] (+)= W[row] . in[t]. With {@code norm != null} (single token only) the kernel first
      * applies rmsnorm with those weights to the input row, exactly as the rmsnorm kernel would.
      */
-    private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
+    void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
                         int n, boolean acc, Metal.Buffer norm) {
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
@@ -493,10 +510,14 @@ public final class MetalBackend implements Backend {
 
     /** hidden[t] = silu(Wgate . in[t]) * (Wup . in[t]) from the stacked [2 * hidden, dim] gate|up matrix. */
     private void swiglu(ModelWeights.Layer W, LayerBufs L, Metal.Buffer in, Metal.Buffer norm, int n) {
-        QTensor t = W.wGateUp;
+        swiglu(W.wGateUp, L.wGateUp, in, norm, n);
+    }
+
+    /** Same for any stacked gate|up tensor {@code t} (also the DeepSeek shared experts); writes {@code hidden}. */
+    void swiglu(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, Metal.Buffer norm, int n) {
         int hiddenDim = t.rows / 2;
-        bind(0, L.wGateUp, 0);
-        bind(1, L.wGateUp, t.scalesOffset);
+        bind(0, wbuf, 0);
+        bind(1, wbuf, t.scalesOffset);
         bind(2, in, 0);
         bind(3, hidden, 0);
         bind(4, norm != null ? norm : finalNorm, 0);
@@ -521,7 +542,7 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pAddBias, bufArgs, offArgs, 2, params, 8, (n * width + 255) / 256, 1, 1, 256, 1, 1);
     }
 
-    private void rmsnorm(Metal.Buffer in, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
+    void rmsnorm(Metal.Buffer in, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
         rmsnormAt(in, 0, weight, out, n, width);
     }
 
@@ -626,21 +647,25 @@ public final class MetalBackend implements Backend {
     }
 
     /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */
-    private void moe(ModelWeights.Layer W, LayerBufs L, int n) {
+    private void moe(ModelWeights.Layer W, LayerBufs L, int l, int n) {
         int topK = c.expertsPerTok();
         int m = c.moeDim();
         int slots = n * topK;
         int sgPerTg = 4;
 
-        bind(0, xb, 0);
-        bind(1, L.router, 0);
-        bind(2, assign, 0);
-        bind(3, routeWeight, 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.numExperts());
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
-        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
-        metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, 256, 1, 1);
+        if (mla != null) {
+            mla.router(l, L.router, n); // DeepSeek rule; fills assign / routeWeight like `router`
+        } else {
+            bind(0, xb, 0);
+            bind(1, L.router, 0);
+            bind(2, assign, 0);
+            bind(3, routeWeight, 0);
+            params.setAtIndex(ValueLayout.JAVA_INT, 0, c.numExperts());
+            params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
+            params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
+            params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
+            metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, 256, 1, 1);
+        }
 
         // gate/up projections with SwiGLU fused in: one simdgroup per (slot, hidden unit) writes moeHidden
         QTensor gu = W.expGateUp;

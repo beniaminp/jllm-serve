@@ -1081,3 +1081,261 @@ kernel void mamba_scan(device const float *xc [[buffer(0)]],
     }
     for (int n = 0; n < N; n++) st[n] = s[n];
 }
+
+// ---------------------------------------------------------------------------------------------- DeepSeek MLA
+// Multi-head latent attention (DeepSeek-V2/V3). Projections, norms and the output projection use the generic
+// matmul / rmsnorm kernels; only what is specific to MLA is below. Keys and queries are qk = nope + rope wide, values
+// are vDim wide (not equal), so the cache has separate row strides for K and V.
+
+// mla_rope: rotates the interleaved pairs (2i, 2i+1) of the `rope` wide slice that starts `nope` into every head of
+// each row (q: heads = nHeads, nope = qk - rope; the shared k_pe: heads = 1, nope = 0). In place.
+// Grid: (heads, ntok); threads per threadgroup = rope / 2.
+
+struct MlaRopeParams {
+    int qk;         // head stride within a row
+    int nope;
+    int rope;
+    int rowStride;
+    int pos0;
+};
+
+kernel void mla_rope(device float *v [[buffer(0)]],
+                     device const float *cosT [[buffer(1)]],
+                     device const float *sinT [[buffer(2)]],
+                     constant MlaRopeParams &p [[buffer(3)]],
+                     uint2 tgp [[threadgroup_position_in_grid]],
+                     ushort2 tid2 [[thread_position_in_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const int half_dim = p.rope / 2;
+    device float *h = v + (ulong)tgp.y * p.rowStride + (ulong)tgp.x * p.qk + p.nope;
+    const int pos = p.pos0 + int(tgp.y);
+    const float a = h[2 * tid];
+    const float b = h[2 * tid + 1];
+    const float c = cosT[pos * half_dim + tid];
+    const float s = sinT[pos * half_dim + tid];
+    h[2 * tid] = a * c - b * s;
+    h[2 * tid + 1] = b * c + a * s;
+}
+
+// mla_kv_store: assembles key = [k_nope | k_pe] and value for every head of every token from the kv_b output
+// ([ntok, heads * (nope + vDim)], per head nope key values then vDim values) and the rotated k_pe ([ntok, rope]).
+// kc / vc are bound at the row of the first token. Grid: (heads, ntok), 64 threads.
+
+struct MlaStoreParams {
+    int nope;
+    int rope;
+    int vDim;
+    int kvbStride;
+    int kStride;
+    int vStride;
+};
+
+kernel void mla_kv_store(device const float *kvb [[buffer(0)]],
+                         device const float *kpe [[buffer(1)]],
+                         device float *kc [[buffer(2)]],
+                         device float *vc [[buffer(3)]],
+                         constant MlaStoreParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort2 tid2 [[thread_position_in_threadgroup]],
+                         ushort2 tpg2 [[threads_per_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int h = int(tgp.x);
+    const int t = int(tgp.y);
+    device const float *src = kvb + (ulong)t * p.kvbStride + (ulong)h * (p.nope + p.vDim);
+    device float *kd = kc + (ulong)t * p.kStride + (ulong)h * (p.nope + p.rope);
+    device float *vd = vc + (ulong)t * p.vStride + (ulong)h * p.vDim;
+    for (int i = tid; i < p.nope; i += tpg) kd[i] = src[i];
+    for (int i = tid; i < p.rope; i += tpg) kd[p.nope + i] = kpe[(ulong)t * p.rope + i];
+    for (int i = tid; i < p.vDim; i += tpg) vd[i] = src[p.nope + i];
+}
+
+// attention_mla: same algorithm as `attention` (one head x token per threadgroup, 256 threads) with a q/k width
+// `qkDim` and a different value width `vDim` (both multiples of 32, <= 256) and no grouped heads or window. Token tiles as
+// in `attention`: t = tokenOffset + tgp.y, scores indexed by the tile-local token.
+
+struct MlaAttnParams {
+    int nHeads;
+    int qkDim;
+    int vDim;
+    int pos0;
+    int ctx;
+    float scale;
+    int qStride;
+    int kStride;
+    int vStride;
+    int oStride;
+    int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
+};
+
+kernel void attention_mla(device const float *q [[buffer(0)]],
+                          device const float *kc [[buffer(1)]],
+                          device const float *vc [[buffer(2)]],
+                          device float *out [[buffer(3)]],
+                          device float *scores [[buffer(4)]],
+                          constant MlaAttnParams &p [[buffer(5)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort2 tid2 [[thread_position_in_threadgroup]],
+                          ushort2 tpg2 [[threads_per_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]],
+                          ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    threadgroup float part[8][256];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+
+    const int h = int(tgp.x);
+    const int t = p.tokenOffset + int(tgp.y);
+    const int len = p.pos0 + t + 1;
+    const int perK = p.qkDim / 32;
+    const int perV = p.vDim / 32;
+    device const float *qv = q + (ulong)t * p.qStride + h * p.qkDim;
+    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
+    device const float *kb = kc + h * p.qkDim;
+    device const float *vb = vc + h * p.vDim;
+
+    float qr[8];
+    for (int i = 0; i < 8; i++) qr[i] = i < perK ? qv[lane + i * 32] : 0.0f;
+
+    float mx = -INFINITY;
+    for (int s = sg; s < len; s += nsg) {
+        device const float *kv = kb + (ulong)s * p.kStride;
+        float d = 0.0f;
+        for (int i = 0; i < 8; i++) if (i < perK) d += qr[i] * kv[lane + i * 32];
+        d = simd_sum(d) * p.scale;
+        if (lane == 0) sc[s] = d;
+        mx = max(mx, d);
+    }
+    mx = tg_max(mx, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float sum = 0.0f;
+    for (int s = tid; s < len; s += tpg) {
+        float e = exp(sc[s] - mx);
+        sc[s] = e;
+        sum += e;
+    }
+    sum = tg_sum(sum, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float o[8];
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    for (int s = sg; s < len; s += nsg) {
+        const float pr = sc[s];
+        device const float *vv = vb + (ulong)s * p.vStride;
+        for (int i = 0; i < 8; i++) if (i < perV) o[i] += pr * vv[lane + i * 32];
+    }
+    for (int i = 0; i < 8; i++) if (i < perV) part[sg][lane + i * 32] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sum;
+    for (int d = tid; d < p.vDim; d += tpg) {
+        float acc = 0.0f;
+        for (int g = 0; g < nsg; g++) acc += part[g][d];
+        out[(ulong)t * p.oStride + h * p.vDim + d] = acc * inv;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- DeepSeek router
+// router_ds: one threadgroup per token with nExperts threads (<= 1024). Thread e computes logit e; thread 0 then
+// applies the DeepSeek rule (see DeepSeekRouter.java, which this mirrors): softmax or sigmoid scores; method 0 =
+// greedy, 1 = group_limited_greedy (group score = max), 2 = noaux_tc (selection on scores + bias, group score = sum
+// of the two best); the topkGroup best of nGroup (<= 64) groups are kept; top-k inside them; weights are the
+// uncorrected scores, renormalized if requested, times routedScale (always if scaleAlways, otherwise only when not
+// renormalized). Writes assign[t*topK+k] and rw[t*topK+k], consumed by moe_up / moe_down.
+
+struct RouterDsParams {
+    int nExperts;
+    int dim;
+    int topK;
+    int normalize;
+    int nGroup;
+    int topkGroup;
+    int sigmoidScore;
+    int method;
+    int scaleAlways;
+    float routedScale;
+};
+
+kernel void router_ds(device const float *x [[buffer(0)]],
+                      device const float *w [[buffer(1)]],
+                      device int *assign [[buffer(2)]],
+                      device float *rw [[buffer(3)]],
+                      device const float *bias [[buffer(4)]],
+                      constant RouterDsParams &p [[buffer(5)]],
+                      uint tg [[threadgroup_position_in_grid]],
+                      ushort tid [[thread_position_in_threadgroup]]) {
+    threadgroup float scores[1024];
+    threadgroup float choice[1024];
+    device const float *xv = x + (ulong)tg * p.dim;
+    device const float *wv = w + (ulong)tid * p.dim;
+    float d = 0.0f;
+    for (int i = 0; i < p.dim; i++) d += wv[i] * xv[i];
+    scores[tid] = d;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+
+    const int ne = p.nExperts;
+    if (p.sigmoidScore) {
+        for (int e = 0; e < ne; e++) scores[e] = 1.0f / (1.0f + exp(-scores[e]));
+    } else {
+        float mx = -INFINITY;
+        for (int e = 0; e < ne; e++) mx = max(mx, scores[e]);
+        float sum = 0.0f;
+        for (int e = 0; e < ne; e++) {
+            scores[e] = exp(scores[e] - mx);
+            sum += scores[e];
+        }
+        for (int e = 0; e < ne; e++) scores[e] /= sum;
+    }
+    for (int e = 0; e < ne; e++) choice[e] = p.method == 2 ? scores[e] + bias[e] : scores[e];
+
+    if (p.method != 0) {
+        const int gs = ne / p.nGroup;
+        float gsc[64];
+        bool keep[64];
+        for (int g = 0; g < p.nGroup; g++) {
+            float b1 = -INFINITY;
+            float b2 = -INFINITY;
+            for (int i = 0; i < gs; i++) {
+                float v = choice[g * gs + i];
+                if (v > b1) { b2 = b1; b1 = v; }
+                else if (v > b2) { b2 = v; }
+            }
+            gsc[g] = p.method == 2 && gs > 1 ? b1 + b2 : b1;
+            keep[g] = false;
+        }
+        for (int k = 0; k < p.topkGroup; k++) {
+            int best = -1;
+            for (int g = 0; g < p.nGroup; g++) {
+                if (!keep[g] && (best < 0 || gsc[g] > gsc[best])) best = g;
+            }
+            keep[best] = true;
+        }
+        for (int e = 0; e < ne; e++) {
+            if (!keep[e / gs]) choice[e] = -INFINITY;
+        }
+    }
+
+    float selected = 0.0f;
+    for (int k = 0; k < p.topK; k++) {
+        int best = -1;
+        float bv = -INFINITY;
+        for (int e = 0; e < ne; e++) {
+            if (choice[e] > bv) { bv = choice[e]; best = e; }
+        }
+        assign[tg * p.topK + k] = best;
+        rw[tg * p.topK + k] = scores[best];
+        selected += scores[best];
+        choice[best] = -INFINITY;
+    }
+    const bool renorm = p.topK > 1 && p.normalize != 0;
+    const float denom = selected + 1e-20f;
+    const bool scale = renorm ? p.scaleAlways != 0 : true;
+    for (int k = 0; k < p.topK; k++) {
+        float v = rw[tg * p.topK + k];
+        if (renorm) v /= denom;
+        if (scale) v *= p.routedScale;
+        rw[tg * p.topK + k] = v;
+    }
+}
