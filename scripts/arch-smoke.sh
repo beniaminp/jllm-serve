@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture smoke test: Llama / Mistral / Qwen2 / GLM / Phi-3 / Gemma 2 / Gemma 3 / Mamba pipeline on tiny random checkpoints.
+# Architecture smoke test: Llama / Mistral / Qwen2 / GLM / Phi-3 / Gemma / Mamba / DeepSeek pipeline on tiny random checkpoints.
 #
 # For every model it converts to q4 and q8 (and q2k when QType.Q2_K exists), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
@@ -28,6 +28,9 @@
 #   hf-internal-testing_tiny-random-Mamba3ForCausalLM     generated: Mamba v1, d_model 128, state 8, conv 3, untied head
 #                                                         (Mamba models additionally check that chunking the prompt
 #                                                         differently gives the same logits)
+#   ...-DeepseekV2ForCausalLM / -DeepseekV2QLoraForCausalLM / -DeepseekV3ForCausalLM  generated: MLA + shared experts +
+#                                                         yarn, group-limited softmax routing (q_lora null / set) and
+#                                                         sigmoid noaux_tc routing; also checked against deepseek-ref.py
 #
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
@@ -74,6 +77,17 @@ gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
 gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
 gen mamba MambaForCausalLM
 gen mamba3 Mamba3ForCausalLM
+gen deepseek_v2 DeepseekV2ForCausalLM
+gen deepseek_v2q DeepseekV2QLoraForCausalLM
+gen deepseek_v3 DeepseekV3ForCausalLM
+
+# DeepSeek: engine vs. the independent float64 reference (scripts/deepseek-ref.py) on Q8_0-rounded weights
+for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
+  REF_Q8=1 python3 scripts/deepseek-ref.py "$M/${P}-$n" >/dev/null
+done
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+  -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef target/native/libjllm_metal.dylib \
+  "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
@@ -82,4 +96,5 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
   "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
-  "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM"
+  "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" \
+  "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
