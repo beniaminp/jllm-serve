@@ -556,7 +556,7 @@ Implementation notes:
   in place by `pos · inv_freq[i]`, which is what `MlaCpu.rotate` and `mla_rope` do (no permutation is needed).
 - **Different widths.** Query/key are `qk` = 192 wide and the value is `v_dim` = 128 wide. The CPU loops use the two widths
   directly; Metal has the separate kernel `attention_mla` (a copy of `attention` with `qkDim` and `vDim`, no grouping and no
-  window, each lane owns `qk/32 ≤ 8` resp. `v/32 ≤ 8` dimensions) rather than padding V to 192. Both widths must be
+  window, dispatched in the same 32-token tiles with `tokenOffset` as `attention`, each lane owns `qk/32 ≤ 8` resp. `v/32 ≤ 8` dimensions) rather than padding V to 192. Both widths must be
   multiples of 32 on Metal.
 - **Softmax scale** is `qk^-0.5` (192, not the 128 of an ordinary head) times `mscale²` with
   `mscale = 0.1 · mscale_all_dim · ln(factor) + 1` when `rope_scaling.mscale_all_dim` is set (V2-Lite: 0.707 → 1.2608²;
@@ -603,7 +603,7 @@ y = Σ_{k ∈ top-k}  w_k · Expert_k(x)   +   SharedExperts(x)
   same two tensors as Qwen3-MoE (chapter 12) and run by the same `moe_up` / `moe_down` kernels.
 - `n_shared_experts` shared experts (`mlp.shared_experts.{gate,up,down}_proj`) that are *one* dense SwiGLU of width
   `n_shared_experts · moe_intermediate_size` (V2-Lite: 2 · 1408 = 2816, `[2816, 2048]`), applied to every token and added. They
-  are stored as `mlp.shared.gate_up` / `mlp.shared.down` and run with the dense matmul + `silu_mul` path
+  are stored as `mlp.shared.gate_up` / `mlp.shared.down` and run with the dense fused-SwiGLU + down-projection path
   (`CpuBackend.forward`, `MlaMetal.sharedExperts`).
 - The router `mlp.gate.weight [n_routed_experts, dim]` stays f32. V3 adds `mlp.gate.e_score_correction_bias [256]`
   (f32), stored as `mlp.router_bias`. V3 also has a layer 61 (multi-token prediction) in the checkpoint which the
