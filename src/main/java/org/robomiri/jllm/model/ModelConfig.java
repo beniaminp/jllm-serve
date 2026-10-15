@@ -58,9 +58,19 @@ public record ModelConfig(
         Set<Integer> mlpOnlyLayers,
         double partialRotaryFactor) {
 
-    /** RoPE scaling from {@code rope_scaling}. {@code type} is {@code llama3} or {@code linear}. */
+    /**
+     * RoPE scaling from {@code rope_scaling}. {@code type} is {@code llama3}, {@code linear} or {@code longrope}
+     * (Phi-3; the legacy name {@code su} is normalized). LongRoPE uses {@code shortFactor} / {@code longFactor}
+     * (one divisor per rotary pair) and {@code attentionFactor} (0 = derive it from {@code factor}); there
+     * {@code factor} is {@code rope_scaling.factor} or else {@code max_position_embeddings / original}.
+     */
     public record RopeScaling(String type, double factor, double lowFreqFactor, double highFreqFactor,
-                              int originalMaxPositions) {
+                              int originalMaxPositions, double[] shortFactor, double[] longFactor,
+                              double attentionFactor) {
+        public RopeScaling(String type, double factor, double lowFreqFactor, double highFreqFactor,
+                           int originalMaxPositions) {
+            this(type, factor, lowFreqFactor, highFreqFactor, originalMaxPositions, null, null, 0);
+        }
     }
 
     /** Attention window of layer {@code l} in tokens; 0 means the full causal context. */
@@ -94,6 +104,11 @@ public record ModelConfig(
         return (int) (headDim * partialRotaryFactor) & ~1;
     }
 
+    /** Rotate-half RoPE on a prefix of each head only (Phi-4-mini, {@code partial_rotary_factor} < 1). */
+    public boolean ropePartialHalf() {
+        return !ropeInterleaved() && rotaryDim() != headDim;
+    }
+
     /** Glm4: RMSNorms on the attention and MLP outputs, before they are added to the residual stream. */
     public boolean postNorms() {
         return modelType.equals("glm4");
@@ -116,7 +131,8 @@ public record ModelConfig(
             Map.entry("qwen3", "Qwen3ForCausalLM"),
             Map.entry("qwen3_moe", "Qwen3MoeForCausalLM"),
             Map.entry("glm", "GlmForCausalLM"),
-            Map.entry("glm4", "Glm4ForCausalLM"));
+            Map.entry("glm4", "Glm4ForCausalLM"),
+            Map.entry("phi3", "Phi3ForCausalLM"));
 
     public static ModelConfig load(Path dir) throws IOException {
         Map<String, Object> c;
@@ -160,6 +176,7 @@ public record ModelConfig(
         }
         boolean qwen2 = modelType.equals("qwen2");
         boolean glm = modelType.equals("glm") || modelType.equals("glm4");
+        boolean phi3 = modelType.equals("phi3");
         // GlmConfig / Glm4Config default attention_bias to true (q/k/v only; o_proj never has a bias there)
         boolean bias = qwen2 || (glm && Json.bool(c, "attention_bias", true));
         if (!qwen2 && !glm && Json.bool(c, "attention_bias", false)) {
@@ -181,12 +198,15 @@ public record ModelConfig(
         if (sw > 0) {
             if (modelType.equals("mistral")) {
                 window = (int) Math.min(sw, Integer.MAX_VALUE);
+            } else if (phi3) {
+                // all layers; Phi-3.5 / Phi-4-mini set 262144, which is never reached
+                window = (int) Math.min(sw, Integer.MAX_VALUE);
             } else if (qwen2 && Json.bool(c, "use_sliding_window", false)) {
                 window = (int) Math.min(sw, Integer.MAX_VALUE);
                 windowFrom = (int) Json.num(c, "max_window_layers", layers);
             }
         }
-        ModelConfig.RopeScaling scaling = parseRopeScaling(c);
+        ModelConfig.RopeScaling scaling = parseRopeScaling(c, (int) (headDim * partialRotary) & ~1);
         List<Integer> eos = new java.util.ArrayList<>();
         Object eosRaw = c.get("eos_token_id");
         if (eosRaw instanceof Number n) {
@@ -244,7 +264,7 @@ public record ModelConfig(
         return cfg;
     }
 
-    private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> c) {
+    private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> c, int rotaryDim) {
         Map<String, Object> rs = Json.map(c, "rope_scaling");
         if (rs == null) {
             return null;
@@ -263,6 +283,19 @@ public record ModelConfig(
                 }
                 return new ModelConfig.RopeScaling(type, factor, low, high, orig);
             }
+            case "longrope", "su": {
+                int maxPos = (int) Json.num(c, "max_position_embeddings", 4096);
+                int orig = (int) Json.num(rs, "original_max_position_embeddings",
+                        Json.num(c, "original_max_position_embeddings", maxPos));
+                double[] shortF = factors(rs, "short_factor", rotaryDim / 2);
+                double[] longF = factors(rs, "long_factor", rotaryDim / 2);
+                double f = rs.containsKey("factor") ? factor : (double) maxPos / orig;
+                if (orig <= 1 || f <= 0) {
+                    throw new IllegalArgumentException("invalid longrope rope_scaling: " + rs);
+                }
+                return new ModelConfig.RopeScaling("longrope", f, 1, 4, orig, shortF, longF,
+                        Json.dbl(rs, "attention_factor", 0));
+            }
             case "linear":
                 if (factor <= 0) {
                     throw new IllegalArgumentException("invalid linear rope_scaling: " + rs);
@@ -270,8 +303,24 @@ public record ModelConfig(
                 return new ModelConfig.RopeScaling(type, factor, 1, 4, 0);
             default:
                 throw new IllegalArgumentException("unsupported rope_scaling type '" + type
-                        + "' (supported: default, linear, llama3)");
+                        + "' (supported: default, linear, llama3, longrope)");
         }
+    }
+
+    private static double[] factors(Map<String, Object> rs, String key, int n) {
+        List<Object> l = Json.list(rs, key);
+        if (l == null || l.size() != n) {
+            throw new IllegalArgumentException("rope_scaling." + key + " must have " + n + " entries (rotary_dim/2), got "
+                    + (l == null ? "nothing" : String.valueOf(l.size())));
+        }
+        double[] out = new double[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = ((Number) l.get(i)).doubleValue();
+            if (!(out[i] > 0)) {
+                throw new IllegalArgumentException("rope_scaling." + key + "[" + i + "] must be positive");
+            }
+        }
+        return out;
     }
 
     private static int requirePositive(Map<String, Object> c, String key) {
@@ -291,7 +340,8 @@ public record ModelConfig(
         String extra = (attentionBias ? " bias" : "") + (slidingWindow > 0 ? " window=" + slidingWindow
                 + (windowFromLayer > 0 ? "@" + windowFromLayer : "") : "")
                 + (ropeScaling != null ? " rope=" + ropeScaling.type() + "x" + ropeScaling.factor() : "")
-                + (ropeInterleaved() ? " rope=interleaved/" + rotaryDim() : "") + (postNorms() ? " postnorms" : "");
+                + (ropeInterleaved() ? " rope=interleaved/" + rotaryDim() : "")
+                + (!ropeInterleaved() && rotaryDim() != headDim ? " rotary=" + rotaryDim() : "") + (postNorms() ? " postnorms" : "");
         return String.format("%s dim=%d ffn=%d layers=%d heads=%d/%d headDim=%d vocab=%d theta=%.0f%s%s",
                 architecture, dim, hiddenDim, layers, heads, kvHeads, headDim, vocabSize, ropeTheta, moe, extra);
     }

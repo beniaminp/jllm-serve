@@ -23,19 +23,53 @@ public final class Rope {
         int half = headDim / 2;
         cos = new float[ctx * half];
         sin = new float[ctx * half];
-        double[] inv = invFreq(headDim, theta, scaling);
+        double[] inv = invFreq(headDim, theta, scaling, ctx);
+        double amp = attentionFactor(scaling);
         for (int i = 0; i < half; i++) {
             double freq = inv[i];
             for (int p = 0; p < ctx; p++) {
                 double a = p * freq;
-                cos[p * half + i] = (float) Math.cos(a);
-                sin[p * half + i] = (float) Math.sin(a);
+                cos[p * half + i] = (float) (Math.cos(a) * amp);
+                sin[p * half + i] = (float) (Math.sin(a) * amp);
             }
         }
     }
 
     public static Rope of(ModelConfig c, int ctx) {
         return new Rope(c.rotaryDim(), c.ropeTheta(), ctx, c.ropeScaling());
+    }
+
+    /**
+     * LongRoPE's multiplier on cos and sin (so on q.k it appears squared). transformers'
+     * {@code _compute_longrope_parameters}: {@code attention_factor} if given, else 1 for {@code factor <= 1}, else
+     * {@code sqrt(1 + ln(factor) / ln(original_max_position_embeddings))}. 1 for every other scaling type.
+     */
+    public static double attentionFactor(ModelConfig.RopeScaling sc) {
+        if (sc == null || !sc.type().equals("longrope")) {
+            return 1.0;
+        }
+        if (sc.attentionFactor() > 0) {
+            return sc.attentionFactor();
+        }
+        return sc.factor() <= 1.0 ? 1.0 : Math.sqrt(1 + Math.log(sc.factor()) / Math.log(sc.originalMaxPositions()));
+    }
+
+    /**
+     * LongRoPE: {@code inv_freq[i] = 1 / (ext[i] * theta^(2i/rotDim))} with {@code ext} the long factors when the
+     * context exceeds {@code original_max_position_embeddings} and the short ones otherwise. transformers picks per
+     * sequence length; here the choice is made once from the context size the backend is created with.
+     */
+    public static double[] invFreq(int rotDim, double theta, ModelConfig.RopeScaling sc, int ctx) {
+        if (sc == null || !sc.type().equals("longrope")) {
+            return invFreq(rotDim, theta, sc);
+        }
+        double[] ext = ctx > sc.originalMaxPositions() ? sc.longFactor() : sc.shortFactor();
+        int half = rotDim / 2;
+        double[] f = new double[half];
+        for (int i = 0; i < half; i++) {
+            f[i] = 1.0 / (ext[i] * Math.pow(theta, (2.0 * i) / rotDim));
+        }
+        return f;
     }
 
     /**

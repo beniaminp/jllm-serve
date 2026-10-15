@@ -123,8 +123,13 @@ public final class ModelConverter {
             int layer = l;
             String p = "model.layers." + l + ".";
             List<String> in = new ArrayList<>(layerNorms(p));
-            for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                in.add(p + "self_attn." + n + ".weight");
+            if (fusedQkv(p)) {
+                in.add(p + "self_attn.qkv_proj.weight");
+                in.add(p + "self_attn.o_proj.weight");
+            } else {
+                for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                    in.add(p + "self_attn." + n + ".weight");
+                }
             }
             in.addAll(biasNames(p));
             if (cfg.isMoeLayer(l)) {
@@ -187,6 +192,11 @@ public final class ModelConverter {
         return shardOf.containsKey(p + "mlp.gate.weight") ? p + "mlp.gate.weight" : p + "mlp.router.weight";
     }
 
+    /** Phi-3 checkpoints store q, k and v as one {@code self_attn.qkv_proj} (rows in that order). */
+    private boolean fusedQkv(String p) {
+        return shardOf.containsKey(p + "self_attn.qkv_proj.weight");
+    }
+
     /** GLM checkpoints store the dense MLP's gate and up projections as one {@code mlp.gate_up_proj}. */
     private boolean fusedGateUp(String p) {
         return shardOf.containsKey(p + "mlp.gate_up_proj.weight");
@@ -209,9 +219,25 @@ public final class ModelConverter {
         for (String n : biasNames(p)) {
             w.putFloats(n, tensor(n).toFloatArray());
         }
-        for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-            String name = p + "self_attn." + n + ".weight";
-            w.put(name, quantize(a, quant, tensor(name)));
+        if (fusedQkv(p)) {
+            // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
+            String name = p + "self_attn.qkv_proj.weight";
+            SafeTensors.Tensor qkv = tensor(name);
+            int q = cfg.qDim();
+            int kv = cfg.kvDim();
+            if (qkv.shape().length != 2 || qkv.dim(0) != q + 2 * kv || qkv.dim(1) != cfg.dim()) {
+                throw new IOException("layer " + l + ": " + qkv + " does not match [" + (q + 2 * kv) + ", " + cfg.dim() + "]");
+            }
+            w.put(p + "self_attn.q_proj.weight", quantizeRows(a, quant, qkv, 0, q));
+            w.put(p + "self_attn.k_proj.weight", quantizeRows(a, quant, qkv, q, kv));
+            w.put(p + "self_attn.v_proj.weight", quantizeRows(a, quant, qkv, q + kv, kv));
+            String o = p + "self_attn.o_proj.weight";
+            w.put(o, quantize(a, quant, tensor(o)));
+        } else {
+            for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                String name = p + "self_attn." + n + ".weight";
+                w.put(name, quantize(a, quant, tensor(name)));
+            }
         }
         if (cfg.isMoeLayer(l)) {
             convertMoe(w, a, l, p);
@@ -282,6 +308,12 @@ public final class ModelConverter {
         int rows = t.dim(0);
         int cols = t.dim(1);
         return QTensor.quantize(a, type, rows, cols, (r, dst) -> t.toFloat((long) r * cols, dst, 0, cols));
+    }
+
+    /** Quantizes rows {@code [start, start + rows)} of a 2-D tensor. */
+    private static QTensor quantizeRows(Arena a, QType type, SafeTensors.Tensor t, int start, int rows) {
+        int cols = t.dim(1);
+        return QTensor.quantize(a, type, rows, cols, (r, dst) -> t.toFloat((long) (start + r) * cols, dst, 0, cols));
     }
 
     /** Quantizes several {@code [rows_i, cols]} matrices as one {@code [Σ rows_i, cols]} tensor. */

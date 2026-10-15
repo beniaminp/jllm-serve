@@ -166,7 +166,7 @@ public final class MetalBackend implements Backend {
         pSwigluQ8Norm = metal.pipeline("matmul_swiglu_q8_norm");
         pRmsnorm = metal.pipeline("rmsnorm");
         pNormRope = metal.pipeline("norm_rope");
-        pNormRopeIl = c.ropeInterleaved() ? metal.pipeline("norm_rope_il") : -1;
+        pNormRopeIl = c.ropeInterleaved() || c.ropePartialHalf() ? metal.pipeline("norm_rope_il") : -1;
         pRmsnormAdd = c.postNorms() ? metal.pipeline("rmsnorm_add") : -1;
         // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
         // rows across the group (attnGroup > 1) measured no faster on Qwen3-0.6B (G=2) and slower on
@@ -516,7 +516,7 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pRmsnormAdd, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
-    /** GLM: interleaved-pair rotation of the first rotaryDim dims of every q and k head (no qk-norm). */
+    /** GLM interleaved pairs, or rotate-half pairs for partial rotary (Phi-4-mini): the first rotaryDim dims of every q and k head (no qk-norm). */
     private void normRopeInterleaved(Metal.Buffer kDst, long kvOff, int n, int pos) {
         bind(0, q, 0);
         bind(1, kDst, kvOff);
@@ -528,13 +528,17 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 3, c.heads());
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_INT, 5, c.rotaryDim() / 2);
-        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 4, params, 24, c.heads() + c.kvHeads(), n, 1,
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, c.ropeInterleaved() ? 0 : 1);
+        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 4, params, 28, c.heads() + c.kvHeads(), n, 1,
                 c.rotaryDim() / 2, 1, 1);
     }
 
     /** QK-norm + RoPE for the q rows and the k rows just written at position pos, in one dispatch. */
     private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos) {
-        if (c.ropeInterleaved()) {
+        if (c.ropeInterleaved() || c.ropePartialHalf()) {
+            if (L.qNorm != null) {
+                throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
+            }
             normRopeInterleaved(kDst, kvOff, n, pos);
             return;
         }
