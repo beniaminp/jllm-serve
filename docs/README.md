@@ -20,6 +20,7 @@ Suggested reading order:
 | 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix caching, stop strings, HTTP/1.1, SSE streaming, the OpenAI API |
 | 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers, what to improve next |
 | 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), stacked expert weights, converting a 61 GB checkpoint on a 32 GB laptop |
+| 13 | [Q2_K quantization](13-q2k-quantization.md) | 2-bit weights: sub-block scales and mins, the 84-byte super-block, the quantizer search, the Σx dot product, measured size/speed/quality |
 | 14 | [Model families](14-model-families.md) | Llama 3.x, Mistral, Qwen2/2.5 and DeepSeek-R1 distills: bias, sliding window, llama3 RoPE scaling, tied embeddings, BOS, tensor names; DeepSeek-V2/V3: multi-head latent attention, YaRN, shared experts, routing rules, the FP8 limitation |
 | 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, why the prefix cache changes |
 

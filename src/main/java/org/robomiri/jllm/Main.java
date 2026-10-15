@@ -93,7 +93,7 @@ public final class Main {
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
-                  --model <repo>        --revision <rev>     --dir <path>        --quant q4|q8   --low-disk
+                  --model <repo>        --revision <rev>     --dir <path>        --quant q4|q8|q2k   --low-disk
                   --backend cpu|metal   --ctx <n>            --batch <n>         --threads <n>
                   --temp <t> --top-k <k> --top-p <p> --min-p <p> --rep-penalty <r> --seed <s> --max-tokens <n>
                   --think               --system "..."       --host <h>          --port <p>

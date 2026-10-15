@@ -347,7 +347,8 @@ memory to save — and the attention scores are sensitive to their precision.
 
 | format | idea | not in this project because |
 |---|---|---|
-| **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | more complex kernels; Q4_0 is the simplest format that works |
+| **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | implemented: `--quant q2k`, see [13](13-q2k-quantization.md) |
+| **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | more complex kernels; Q4_0 is the simplest format that works ([13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them) |
 | **GPTQ / AWQ** | choose the quantized values by minimizing the *output* error on calibration data, not per-weight rounding | needs calibration runs and a solver at conversion time |
 | **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, 4× more lanes per SIMD register | the next CPU optimization ([07 §7.10](07-cpu-backend.md#710-what-to-optimize-next)) |
 | **fp8 / NF4** | 8-bit floats; 4-bit non-uniform "normal float" levels | GPU-oriented; no hardware fp8 on Apple M1 |
