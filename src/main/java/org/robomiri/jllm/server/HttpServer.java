@@ -218,7 +218,7 @@ public final class HttpServer implements AutoCloseable {
             InputStream in = new BufferedInputStream(s.getInputStream());
             OutputStream out = new BufferedOutputStream(s.getOutputStream(), 1 << 16);
             while (!closed) {
-                Request req = readRequest(in);
+                Request req = readRequest(in, out);
                 if (req == null) {
                     return;
                 }
@@ -252,7 +252,7 @@ public final class HttpServer implements AutoCloseable {
     }
 
     /** Returns null at EOF before any request bytes. */
-    private Request readRequest(InputStream in) throws IOException {
+    private Request readRequest(InputStream in, OutputStream out) throws IOException {
         String requestLine = readLine(in);
         if (requestLine == null) {
             return null;
@@ -285,6 +285,12 @@ public final class HttpServer implements AutoCloseable {
         }
         byte[] body = new byte[0];
         String cl = headers.get("content-length");
+        boolean chunked = "chunked".equalsIgnoreCase(headers.get("transfer-encoding"));
+        if ((cl != null || chunked) && "100-continue".equalsIgnoreCase(headers.get("expect"))) {
+            // the client holds the body back until told to go ahead (curl does this for bodies > 1 KB)
+            out.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            out.flush();
+        }
         if (cl != null) {
             long len = Long.parseLong(cl.trim());
             if (len < 0 || len > options.maxBodyBytes()) {
@@ -294,7 +300,7 @@ public final class HttpServer implements AutoCloseable {
             if (body.length != len) {
                 throw new EOFException();
             }
-        } else if ("chunked".equalsIgnoreCase(headers.get("transfer-encoding"))) {
+        } else if (chunked) {
             body = readChunked(in);
         }
         return new Request(parts[0], parts[1], headers, body);
