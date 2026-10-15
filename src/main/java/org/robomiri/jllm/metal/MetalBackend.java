@@ -38,6 +38,7 @@ public final class MetalBackend implements Backend {
     private int pRmsnorm;
     private int pNormRope;
     private int pAttention;
+    private int attnGroup; // query heads per attention threadgroup
     private int pSilu;
     private int pAddBias;
     private int pRouter;
@@ -49,7 +50,6 @@ public final class MetalBackend implements Backend {
     // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
     private int pKvStoreHalf;
-    private int pAttentionHalf;
     private Metal.Buffer kStage;
     private Metal.Buffer vStage;
 
@@ -144,7 +144,25 @@ public final class MetalBackend implements Backend {
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pRmsnorm = metal.pipeline("rmsnorm");
         pNormRope = metal.pipeline("norm_rope");
-        pAttention = metal.pipeline("attention");
+        // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
+        // rows across the group (attnGroup > 1) measured no faster on Qwen3-0.6B (G=2) and slower on
+        // Qwen3-30B-A3B (G=4/8: 20-22 tok/s vs 25 with G=1) because only kvHeads threadgroups run per decode
+        // token and each one's serial work grows with the group, so the default is 1;
+        // -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads).
+        int group = c.heads() / c.kvHeads();
+        int g = 1;
+        int override = Integer.getInteger("jllm.metal.attnGroup", 0);
+        if (override > 0 && override <= 8 && Integer.bitCount(override) == 1 && group % override == 0) {
+            g = override;
+        }
+        int hd = c.headDim();
+        if (hd == 64 || hd == 128 || hd == 256) {
+            attnGroup = g;
+            pAttention = metal.pipeline("attention_g" + g + "_d" + hd + (kvHalf ? "_h" : ""));
+        } else {
+            attnGroup = 1;
+            pAttention = metal.pipeline(kvHalf ? "attention_h" : "attention");
+        }
         pSilu = metal.pipeline("silu_mul");
         pAddBias = metal.pipeline("add_bias");
         pRouter = metal.pipeline("router");
@@ -153,7 +171,6 @@ public final class MetalBackend implements Backend {
         pMoeDownQ4 = metal.pipeline("moe_down_q4");
         pMoeDownQ8 = metal.pipeline("moe_down_q8");
         pKvStoreHalf = metal.pipeline("kv_store_half");
-        pAttentionHalf = metal.pipeline("attention_h");
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
@@ -408,7 +425,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 8, c.windowFor(l));
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             params.setAtIndex(ValueLayout.JAVA_INT, 9, t0);
-            metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 40, c.heads(),
+            metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 40, c.heads() / attnGroup,
                     Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
     }
