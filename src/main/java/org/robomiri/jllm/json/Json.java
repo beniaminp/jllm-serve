@@ -38,9 +38,13 @@ public final class Json {
         return (Map<String, Object>) v;
     }
 
+    /** Maximum number of nested arrays/objects; deeper input is rejected rather than overflowing the stack. */
+    public static final int MAX_DEPTH = 256;
+
     private static final class Parser {
         final String s;
         int pos;
+        int depth;
 
         Parser(String s) {
             this.s = s;
@@ -48,6 +52,12 @@ public final class Json {
 
         IllegalArgumentException error(String msg) {
             return new IllegalArgumentException("JSON " + msg + " at offset " + pos);
+        }
+
+        void enter() {
+            if (++depth > MAX_DEPTH) {
+                throw error("nesting deeper than " + MAX_DEPTH);
+            }
         }
 
         void skipWs() {
@@ -91,11 +101,13 @@ public final class Json {
         }
 
         Map<String, Object> object() {
+            enter();
             Map<String, Object> m = new LinkedHashMap<>();
             pos++; // {
             skipWs();
             if (peek() == '}') {
                 pos++;
+                depth--;
                 return m;
             }
             while (true) {
@@ -111,6 +123,7 @@ public final class Json {
                 skipWs();
                 char c = next();
                 if (c == '}') {
+                    depth--;
                     return m;
                 }
                 if (c != ',') {
@@ -120,11 +133,13 @@ public final class Json {
         }
 
         List<Object> array() {
+            enter();
             List<Object> list = new ArrayList<>();
             pos++; // [
             skipWs();
             if (peek() == ']') {
                 pos++;
+                depth--;
                 return list;
             }
             while (true) {
@@ -133,6 +148,7 @@ public final class Json {
                 skipWs();
                 char c = next();
                 if (c == ']') {
+                    depth--;
                     return list;
                 }
                 if (c != ',') {

@@ -43,6 +43,19 @@ public final class SmokeTest {
         check(Json.num(Json.map(m, "b"), "c", 0) == -3, "json nested");
         String s = Json.write(Json.obj("k", "v\"\n", "n", 1, "l", List.of(1, 2)));
         check(s.equals("{\"k\":\"v\\\"\\n\",\"n\":1,\"l\":[1,2]}"), "json write: " + s);
+
+        // nesting depth is bounded, so hostile input cannot overflow the stack
+        int d = Json.MAX_DEPTH;
+        check(Json.parse("[".repeat(d) + "]".repeat(d)) instanceof List<?>, "json nesting at the limit parses");
+        check(Json.parse("{\"a\":".repeat(d - 1) + "{}" + "}".repeat(d - 1)) instanceof Map<?, ?>,
+                "json object nesting at the limit parses");
+        expectIae(() -> Json.parse("[".repeat(d + 1) + "]".repeat(d + 1)), "nesting deeper than",
+                "json nesting one past the limit");
+        expectIae(() -> Json.parse("{\"a\":".repeat(d) + "{}" + "}".repeat(d)), "nesting deeper than",
+                "json object nesting one past the limit");
+        expectIae(() -> Json.parse("[".repeat(20_000)), "nesting deeper than", "json 20000 open brackets");
+        expectIae(() -> Json.parseObject("{\"x\":" + "[".repeat(100_000) + "}"), "nesting deeper than",
+                "json 100000 open brackets inside an object");
     }
 
     static void tokenizer(Path dir) throws Exception {
