@@ -65,10 +65,14 @@ public final class ModelConverter {
         }
     }
 
+    /**
+     * Converts the checkpoint in {@code dir} into {@code jllm-<quant>.bin/.json}. A conversion interrupted by a
+     * crash is resumed from the units recorded in {@code jllm-<quant>.partial.json} (see {@link QuantFile.Writer}).
+     */
     public static void convert(Path dir, ModelConfig cfg, QType quant, ShardProvider provider) throws IOException {
         long t0 = System.nanoTime();
         ModelConverter c = new ModelConverter(dir, cfg, quant, provider);
-        try (QuantFile.Writer w = new QuantFile.Writer(dir, quant)) {
+        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, cfg.toString(), c.unitIds())) {
             c.run(w);
             w.finish();
             System.err.printf("\rConverted %s to %s in %.0fs (%.0f MB) -> %s%n", cfg.architecture(), quant,
@@ -79,12 +83,25 @@ public final class ModelConverter {
         }
     }
 
+    private List<String> unitIds() {
+        return units.stream().map(Unit::id).toList();
+    }
+
     private void run(QuantFile.Writer w) throws IOException {
+        int skip = w.completedUnits().size(); // a prefix of the plan, verified by the writer
+        if (skip > 0) {
+            System.err.printf("Resuming conversion: %d/%d units already converted (%.0f MB)%n", skip, units.size(),
+                    w.bytesWritten() / 1e6);
+        }
         for (int i = 0; i < units.size(); i++) {
             Unit u = units.get(i);
-            try (Arena a = Arena.ofShared()) {
-                u.step().run(w, a);
+            if (i >= skip) {
+                try (Arena a = Arena.ofShared()) {
+                    u.step().run(w, a);
+                }
+                w.commitUnit(u.id());
             }
+            // Also for skipped units: their shards are consumed, so a low-disk provider may delete them.
             u.inputs().forEach(this::done);
             System.err.printf("\rConverting to %s: %d/%d units (%.0f MB written)", quant, i + 1, units.size(),
                     w.bytesWritten() / 1e6);

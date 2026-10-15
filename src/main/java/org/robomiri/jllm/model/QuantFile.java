@@ -10,8 +10,12 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -176,22 +180,138 @@ public final class QuantFile implements AutoCloseable {
         arena.close();
     }
 
-    /** Streams tensors into a new cache; call {@link #finish()} to write the index. */
+
+    /** Sidecar that records the units already written while a conversion is in progress. */
+    public static Path partialPath(Path dir, QType quant) {
+        return dir.resolve("jllm-" + quant.name().toLowerCase() + ".partial.json");
+    }
+
+    /**
+     * Streams tensors into a new cache; call {@link #finish()} to write the index.
+     *
+     * <p>A conversion is a sequence of units (one layer each). After every unit {@link #commitUnit} forces the
+     * data to disk and rewrites the sidecar {@code jllm-<quant>.partial.json} ({@code version, quant, model,
+     * units, tensors}) atomically, so a crash loses at most the unit in progress. {@link #openOrResume} picks a
+     * consistent sidecar up again: the recorded units must be a prefix of the planned ones, the recorded
+     * entries must form a contiguous, well-formed prefix of the {@code .bin}, and the {@code .bin} must hold at
+     * least that many bytes (a longer tail from an interrupted unit is truncated). On any doubt the conversion
+     * starts over.
+     */
     public static final class Writer implements AutoCloseable {
         private final Path dir;
         private final QType quant;
         private final Path bin;
+        private final Path partial;
+        private final String model;
         private final FileChannel ch;
         private final Map<String, Object> index = new LinkedHashMap<>();
+        private final List<String> units = new ArrayList<>();
         private long offset;
+        /** Byte count covered by the last commit; everything beyond it is discarded on failure. */
+        private long committed;
 
+        /** Starts a fresh cache, discarding any previous partial conversion. */
         public Writer(Path dir, QType quant) throws IOException {
+            this(dir, quant, "", false);
+        }
+
+        private Writer(Path dir, QType quant, String model, boolean resume) throws IOException {
             this.dir = dir;
             this.quant = quant;
+            this.model = model;
             this.bin = binPath(dir, quant);
+            this.partial = partialPath(dir, quant);
             Files.deleteIfExists(jsonPath(dir, quant));
-            this.ch = FileChannel.open(bin, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING);
+            if (!resume) {
+                Files.deleteIfExists(partial);
+                this.ch = FileChannel.open(bin, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                        StandardOpenOption.TRUNCATE_EXISTING);
+            } else {
+                this.ch = FileChannel.open(bin, StandardOpenOption.WRITE);
+            }
+        }
+
+        /**
+         * Resumes the conversion recorded in the sidecar when it is consistent with {@code model} and
+         * {@code plannedUnits}, otherwise starts fresh. {@link #completedUnits()} tells which units to skip.
+         */
+        public static Writer openOrResume(Path dir, QType quant, String model, List<String> plannedUnits)
+                throws IOException {
+            Resumable r = inspect(dir, quant, model, plannedUnits);
+            if (r == null) {
+                return new Writer(dir, quant, model, false);
+            }
+            Writer w = new Writer(dir, quant, model, true);
+            try {
+                if (w.ch.size() != r.bytes()) {
+                    w.ch.truncate(r.bytes());
+                    w.ch.force(true);
+                }
+                w.ch.position(r.bytes());
+            } catch (IOException e) {
+                w.ch.close();
+                throw e;
+            }
+            r.entries().forEach((name, e) -> w.index.put(name,
+                    Json.obj("type", e.type(), "rows", e.rows(), "cols", e.cols(), "offset", e.offset(), "size", e.size())));
+            w.units.addAll(r.units());
+            w.offset = r.bytes();
+            w.committed = r.bytes();
+            return w;
+        }
+
+        private record Resumable(List<String> units, Map<String, Entry> entries, long bytes) {
+        }
+
+        /** Returns what a sidecar lets us reuse, or null (printing why) when the conversion must start over. */
+        private static Resumable inspect(Path dir, QType quant, String model, List<String> plannedUnits) {
+            Path partial = partialPath(dir, quant);
+            Path bin = binPath(dir, quant);
+            if (!Files.isRegularFile(partial)) {
+                return null;
+            }
+            String reason;
+            try {
+                Map<String, Object> side = Json.parseObject(Files.readString(partial));
+                List<Object> unitObjs = Json.list(side, "units");
+                if (Json.num(side, "version", 0) != VERSION || !quant.name().equals(Json.str(side, "quant", null))
+                        || !model.equals(Json.str(side, "model", null)) || unitObjs == null) {
+                    reason = "it was written for a different model or format";
+                } else if (!Files.isRegularFile(bin)) {
+                    reason = bin.getFileName() + " is missing";
+                } else {
+                    List<String> units = new ArrayList<>();
+                    for (Object o : unitObjs) {
+                        units.add(String.valueOf(o));
+                    }
+                    Map<String, Entry> entries = readIndex(partial, Json.map(side, "tensors"));
+                    long bytes = 0;
+                    for (Map.Entry<String, Entry> e : entries.entrySet()) {
+                        if (e.getValue().offset() != bytes) {
+                            throw new IOException("entries are not contiguous at " + e.getKey());
+                        }
+                        checkEntry(e.getKey(), e.getValue(), Long.MAX_VALUE, bin);
+                        bytes += e.getValue().size();
+                    }
+                    if (units.isEmpty() || units.size() > plannedUnits.size()
+                            || !units.equals(plannedUnits.subList(0, units.size()))) {
+                        reason = "its units do not match the conversion plan";
+                    } else if (Files.size(bin) < bytes) {
+                        reason = bin.getFileName() + " is shorter than the " + bytes + " bytes recorded";
+                    } else {
+                        return new Resumable(units, entries, bytes);
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                reason = e.getMessage();
+            }
+            System.err.println("Ignoring partial conversion " + partial.getFileName() + ": " + reason);
+            return null;
+        }
+
+        /** Units already written by a previous, interrupted conversion (a prefix of the plan). */
+        public List<String> completedUnits() {
+            return Collections.unmodifiableList(units);
         }
 
         public void put(String name, QTensor t) throws IOException {
@@ -234,17 +354,41 @@ public final class QuantFile implements AutoCloseable {
             return offset;
         }
 
+        /** Marks everything written so far as unit {@code unitId}: data is forced to disk and the sidecar updated. */
+        public void commitUnit(String unitId) throws IOException {
+            ch.force(false);
+            units.add(unitId);
+            committed = offset;
+            Path tmp = partial.resolveSibling(partial.getFileName() + ".tmp");
+            Files.writeString(tmp, Json.write(Json.obj("version", VERSION, "quant", quant.name(), "model", model,
+                    "units", units, "tensors", index)));
+            Files.move(tmp, partial, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        }
+
         public void finish() throws IOException {
             ch.force(true);
             ch.close();
             Files.writeString(jsonPath(dir, quant), Json.write(Json.obj("version", VERSION, "quant", quant.name(), "tensors", index)));
+            Files.deleteIfExists(partial);
         }
 
+        /** Without {@link #finish()}: keeps the committed units for a later resume, or removes an empty cache. */
         @Override
         public void close() throws IOException {
-            if (ch.isOpen()) { // finish() was not called: leave no half-written cache behind
+            if (!ch.isOpen()) {
+                return;
+            }
+            try {
+                if (committed > 0 && Files.isRegularFile(partial)) {
+                    ch.truncate(committed);
+                    ch.force(true);
+                }
+            } finally {
                 ch.close();
-                Files.deleteIfExists(bin);
+                if (committed == 0 || !Files.isRegularFile(partial)) {
+                    Files.deleteIfExists(bin);
+                    Files.deleteIfExists(partial);
+                }
             }
         }
     }
