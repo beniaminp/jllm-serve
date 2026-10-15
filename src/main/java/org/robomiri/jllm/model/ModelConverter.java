@@ -194,7 +194,7 @@ public final class ModelConverter {
         }
         SafeTensors st = open.get(shard);
         if (st == null) {
-            st = SafeTensors.open(provider.ensure(shard));
+            st = SafeTensors.open(provider.ensure(ShardProvider.checkName(dir, shard)));
             open.put(shard, st);
         }
         return st.get(name);
@@ -210,7 +210,7 @@ public final class ModelConverter {
                 st.close();
             }
             try {
-                provider.release(shard);
+                provider.release(ShardProvider.checkName(dir, shard));
             } catch (IOException e) {
                 System.err.println("warning: could not release " + shard + ": " + e.getMessage());
             }
@@ -226,8 +226,15 @@ public final class ModelConverter {
             if (wm == null) {
                 throw new IOException(index + " has no weight_map");
             }
+            // The index is downloaded data: every shard name is validated before it reaches the provider,
+            // whose low-disk implementation deletes dir/name.
             Map<String, String> m = new LinkedHashMap<>();
-            wm.forEach((k, v) -> m.put(k, (String) v));
+            for (Map.Entry<String, Object> e : wm.entrySet()) {
+                if (!(e.getValue() instanceof String shard)) {
+                    throw new IOException(index + ": weight_map entry for " + e.getKey() + " is not a file name");
+                }
+                m.put(e.getKey(), ShardProvider.checkName(dir, shard));
+            }
             return m;
         }
         List<Path> files;
