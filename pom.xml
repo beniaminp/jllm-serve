@@ -15,7 +15,7 @@
       Run:   ./jllm <command>            (compiles, builds the Metal library, launches with the right JVM flags)
       Test:  mvn test                    (runs SmokeTest against models/Qwen_Qwen3-0.6B; download it first)
       Note:  `java -jar target/jllm-serve.jar` does not work because a manifest cannot enable the
-             incubating Vector API; use ./jllm or the explicit `java --add-modules jdk.incubator.vector` form.
+             incubating Vector API; use ./jllm, which passes the add-modules flag explicitly.
     -->
 
     <properties>
