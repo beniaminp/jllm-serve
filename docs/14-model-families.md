@@ -16,6 +16,8 @@ switches, all read from `config.json` into `ModelConfig`. Qwen3 is the reference
 | `qwen2` | `Qwen2ForCausalLM` | Qwen2 / Qwen2.5, DeepSeek-R1-Distill-Qwen | `Qwen/Qwen2.5-1.5B-Instruct`, `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` |
 | `qwen3` | `Qwen3ForCausalLM` | Qwen3 dense | `Qwen/Qwen3-0.6B` |
 | `qwen3_moe` | `Qwen3MoeForCausalLM` | Qwen3-30B-A3B (chapter 12) | |
+| `glm` | `GlmForCausalLM` | GLM-Edge-1.5B/4B-Chat, glm-4-9b-chat-hf (section 14.8) | `THUDM/GLM-Edge-1.5B-Chat`, `THUDM/glm-4-9b-chat-hf` |
+| `glm4` | `Glm4ForCausalLM` | GLM-4-9B/32B-0414, GLM-Z1 (section 14.8) | `THUDM/GLM-4-9B-0414`, `THUDM/GLM-Z1-9B-0414` |
 
 A different `model_type`, a `hidden_act` other than `silu`, `mlp_bias: true`, or a `rope_scaling` type other than
 `default`/`linear`/`llama3` (e.g. `yarn`, `longrope`) is rejected at load time with a message naming the field.
@@ -168,3 +170,89 @@ and a window on layers ≥ 2), converts each to q4 and q8, loads it, generates 8
 prompt on the CPU and on Metal, and requires equal token ids and final logits that agree to 1e-3 relative.
 Random weights give gibberish, but the computation is deterministic, so any disagreement is a bug in a backend.
 `mvn test` additionally checks the RoPE rule and the config parsing of each family.
+
+## 14.8 GLM (`glm`, `glm4`)
+
+Code: `model/InterleavedRope`, `ModelConfig.ropeInterleaved/rotaryDim/postNorms`, `CpuBackend.addNormed`,
+`kernels.metal` (`norm_rope_il`, `rmsnorm_add`, appended at the end), `ModelConverter.fusedGateUp`
+
+Checked against transformers' `modeling_glm.py` / `modeling_glm4.py` and the Hub `config.json` and safetensors
+headers of `THUDM/GLM-Edge-1.5B-Chat`, `THUDM/glm-4-9b-chat-hf`, `THUDM/GLM-4-9B-0414`, `THUDM/GLM-Z1-9B-0414`
+(no weights were downloaded).
+
+### Interleaved, partial RoPE
+
+Every family so far uses the "rotate half" convention: element `i` of a head is paired with element `i + d/2`.
+GLM pairs *adjacent* elements, and rotates only the first `partial_rotary_factor × head_dim` of them:
+
+```
+head_dim = 8, partial_rotary_factor = 0.5 (rotary_dim = 4), dimensions 0..7 of one head
+
+rotate half (Llama, Qwen, ...)          interleaved + partial (GLM)
+  pairs: (0,4) (1,5) (2,6) (3,7)          pairs: (0,1) (2,3)      elements 4..7 untouched
+  [0 1 2 3 | 4 5 6 7]                     [0 1 | 2 3 | 4 5 6 7]
+   `-----------'  angle f0                  `-'   angle f0  (pair 0)
+     `-----------'  angle f1                      `-'  angle f1  (pair 1)
+```
+
+`x'[2i] = x[2i] cos - x[2i+1] sin`, `x'[2i+1] = x[2i+1] cos + x[2i] sin`; elements `>= rotary_dim` pass through.
+The frequencies are `f_i = theta^(-2i / rotary_dim)` with `rotary_dim = head_dim × factor`, *not* divided by
+`head_dim` (transformers builds `inv_freq` from `int(head_dim × factor)`). `Rope` therefore builds tables of
+`rotary_dim / 2` entries per position, and the same tables serve both backends (`norm_rope_il` on Metal, one thread
+per rotated pair; `InterleavedRope.rotate` on the CPU). The existing rotate-half path is untouched.
+
+`partial_rotary_factor` is 0.5 when the key is absent (the config class sets it for backward compatibility), which
+is the case for `glm-4-9b-chat-hf`; GLM-Edge sets 1.0 explicitly and GLM-4-0414 sets 0.5. Newer transformers nest
+`rope_theta` and `partial_rotary_factor` in `rope_parameters`; both layouts are read.
+
+### Norms
+
+`glm` has the usual two norms. `glm4` has four per layer; the two extra ones are applied to the sub-layer output
+*before* it is added to the residual stream:
+
+```
+glm :  x = x + o_proj(attn(input_layernorm(x)))              x = x + mlp(post_attention_layernorm(x))
+glm4:  x = x + post_self_attn_layernorm(o_proj(attn(input_layernorm(x))))
+       x = x + post_mlp_layernorm(mlp(post_attention_layernorm(x)))
+```
+
+The engine projects into the scratch buffer `xb`, then adds `rmsnorm(xb) * w` to `x` (`rmsnorm_add` on Metal).
+Models without these norms keep the fused `matmul(..., accumulate)` path.
+
+### Other differences
+
+- q/k/v bias when `attention_bias` is true (the config default if the key is missing); `o_proj` has no bias. GLM-Edge
+  has `attention_bias: false`, glm-4-9b-chat-hf and GLM-4-0414 have `true`.
+- MLP: `mlp.gate_up_proj.weight` is `[2f, d]`, gate rows first, then up rows (`gate, up = chunk(2)`): the layout of
+  our `mlp.gate_up`, so it is quantized as is. `mlp.down_proj.weight` as usual, activation `silu`.
+- `head_dim` is explicit (128) in all four checkpoints (GQA with 4 kv heads for Edge-1.5B, 2 for the 9B models); the
+  engine takes it from the config rather than `hidden/heads`.
+- No BOS token: the chat templates start with `[gMASK]<sop>` (GLM-4) or `<|user|>` (GLM-Edge), so `promptBosId` is -1.
+  Stop ids come from `eos_token_id` (`[59246, 59253, 59255]` for Edge, `[151329, 151336, 151338]` for the others)
+  plus the template's stop tokens. `pad_token_id` is ignored.
+- `tie_word_embeddings`: true for GLM-Edge-1.5B-Chat (the checkpoint nevertheless contains `lm_head.weight`, which
+  the converter skips), false for the 9B models.
+- `rms_norm_eps` differs per checkpoint: 1e-5 (Edge, 0414), 1.5625e-7 (glm-4-9b-chat-hf).
+
+### Verified configuration
+
+| Repository | model_type | d | heads/kv | head_dim | f | V | layers | rotary factor | bias | tied | norms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `THUDM/GLM-Edge-1.5B-Chat` | glm | 2048 | 16/4 | 128 | 6144 | 59264 | 28 | 1.0 (explicit) | no | yes | 2 |
+| `THUDM/glm-4-9b-chat-hf` | glm | 4096 | 32/2 | 128 | 13696 | 151552 | 40 | 0.5 (default) | yes | no | 2 |
+| `THUDM/GLM-4-9B-0414` | glm4 | 4096 | 32/2 | 128 | 13696 | 151552 | 40 | 0.5 | yes | no | 4 |
+| `THUDM/GLM-Z1-9B-0414` | glm4 | 4096 | 32/2 | 128 | 13696 | 151552 | 40 | 0.5 | yes | no | 4 |
+
+Tensors per layer (header of shard 1, bf16): `input_layernorm.weight` `[d]`, `self_attn.{q,k,v}_proj.weight` and
+`.bias` (only with bias), `self_attn.o_proj.weight` `[d, q]`, `post_attention_layernorm.weight`,
+`mlp.gate_up_proj.weight` `[2f, d]`, `mlp.down_proj.weight` `[d, f]`, and for `glm4` also
+`post_self_attn_layernorm.weight` and `post_mlp_layernorm.weight` (both `[d]`); globally `model.embed_tokens.weight`,
+`model.norm.weight`, `lm_head.weight` (untied models).
+
+### Testing
+
+`scripts/arch-smoke.sh` adds three tiny random models: `glm` (bias, `head_dim` 32, default factor 0.5), `glmedge`
+(`head_dim` 64 with `hidden/heads` = 32, factor 1.0, no bias, tied) and `glm4` (bias, `head_dim` 64, factor 0.5,
+four norms); CPU and Metal must agree on tokens and logits for q4 and q8. `SmokeTest.glmRope` checks the rotation
+on a hand-computed 6-element head and the configs above. A pure-Python float32 re-implementation of the
+transformers forward pass on the same tiny checkpoints gives the same first generated token for all three.
