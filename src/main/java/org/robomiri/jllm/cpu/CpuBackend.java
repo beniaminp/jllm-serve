@@ -1,6 +1,7 @@
 package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
@@ -10,7 +11,7 @@ import java.util.Arrays;
 
 /**
  * Qwen3 forward pass on the CPU: quantized matmuls with the Vector API, multithreaded over output rows
- * (decode) or row groups (prefill), f32 KV cache on the Java heap.
+ * (decode) or row groups (prefill), f32 or f16 KV cache on the Java heap ({@link KvCache}).
  */
 public final class CpuBackend implements Backend {
 
@@ -21,8 +22,10 @@ public final class CpuBackend implements Backend {
     private final ThreadPool pool;
     private final Rope rope;
 
-    private final float[][] keyCache;
-    private final float[][] valCache;
+    private final KvCache kv;
+    // k/v of the current chunk, [maxBatch, kvDim]: projected, normalized and rotated here, then stored
+    private final float[] kStage;
+    private final float[] vStage;
 
     // activations, [maxBatch, width] row-major
     private final float[] x;
@@ -42,18 +45,19 @@ public final class CpuBackend implements Backend {
     private final ThreadLocal<float[]> scratch;
 
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads) {
+        this(w, ctx, maxBatch, threads, KvDtype.F32);
+    }
+
+    public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, KvDtype kvDtype) {
         this.w = w;
         this.c = w.cfg;
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.pool = new ThreadPool(threads);
         this.rope = new Rope(c.headDim(), c.ropeTheta(), ctx);
-        long cacheLen = (long) ctx * c.kvDim();
-        if (cacheLen > Integer.MAX_VALUE - 16) {
-            throw new IllegalArgumentException("context " + ctx + " is too large for the CPU KV cache");
-        }
-        keyCache = new float[c.layers()][(int) cacheLen];
-        valCache = new float[c.layers()][(int) cacheLen];
+        kv = KvCache.create(kvDtype, c, ctx);
+        kStage = new float[maxBatch * c.kvDim()];
+        vStage = new float[maxBatch * c.kvDim()];
         x = new float[maxBatch * c.dim()];
         xb = new float[maxBatch * c.dim()];
         q = new float[maxBatch * c.qDim()];
@@ -106,10 +110,11 @@ public final class CpuBackend implements Backend {
             ModelWeights.Layer L = w.layers[l];
             rmsnorm(x, xb, L.attnNorm, n, dim);
             matmul(L.wq, xb, q, 0, n, false);
-            matmul(L.wk, xb, keyCache[l], pos * kvDim, n, false);
-            matmul(L.wv, xb, valCache[l], pos * kvDim, n, false);
+            matmul(L.wk, xb, kStage, 0, n, false);
+            matmul(L.wv, xb, vStage, 0, n, false);
             normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
-            normRope(keyCache[l], pos * kvDim, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos);
+            kv.store(l, pos, kStage, vStage, n);
             attention(l, n, pos);
             matmul(L.wo, att, x, 0, n, true);
 
@@ -212,8 +217,12 @@ public final class CpuBackend implements Backend {
 
     /** Causal grouped-query attention for tokens at positions [pos, pos+n). */
     private void attention(int layer, int n, int pos) {
-        float[] kc = keyCache[layer];
-        float[] vc = valCache[layer];
+        if (kv instanceof KvCache.F16 half) {
+            half.attention(pool, layer, n, pos, q, att);
+            return;
+        }
+        float[] kc = ((KvCache.F32) kv).key[layer];
+        float[] vc = ((KvCache.F32) kv).val[layer];
         int hd = c.headDim();
         int nh = c.heads();
         int kvDim = c.kvDim();
