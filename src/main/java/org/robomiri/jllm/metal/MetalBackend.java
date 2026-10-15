@@ -154,7 +154,7 @@ public final class MetalBackend implements Backend {
         pMoeDownQ8 = metal.pipeline("moe_down_q8");
         pKvStoreHalf = metal.pipeline("kv_store_half");
         pAttentionHalf = metal.pipeline("attention_h");
-        if (c.isMoe() && (c.numExperts() > 1024 || c.numExperts() > metal.maxThreads(pRouter))) {
+        if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
 
@@ -454,7 +454,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
-        metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, c.numExperts(), 1, 1);
+        metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, 256, 1, 1);
 
         // gate/up projections with SwiGLU fused in: one simdgroup per (slot, hidden unit) writes moeHidden
         QTensor gu = W.expGateUp;

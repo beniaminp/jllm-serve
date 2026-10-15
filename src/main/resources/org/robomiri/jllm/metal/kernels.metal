@@ -329,8 +329,10 @@ kernel void attention(device const float *q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- mixture of experts
-// router: one threadgroup per token with nExperts threads. Thread e computes logit e; thread 0 then does the
-// softmax and the top-k selection (nExperts <= 1024). Writes assign[t*topK+k] and routeWeight[t*topK+k].
+// router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
+// sg, sg + 8, ...: the 32 lanes stride over dim in float4 steps (each iteration reads 512 contiguous bytes of
+// the router row) and finish with simd_sum. The softmax max and sum are threadgroup reductions; the top-k
+// selection is serial on thread 0 (nExperts <= 1024). Writes assign[t*topK+k] and routeWeight[t*topK+k].
 
 struct RouterParams {
     int nExperts;
@@ -345,22 +347,37 @@ kernel void router(device const float *x [[buffer(0)]],
                    device float *rw [[buffer(3)]],
                    constant RouterParams &p [[buffer(4)]],
                    uint tg [[threadgroup_position_in_grid]],
-                   ushort tid [[thread_position_in_threadgroup]]) {
+                   ushort tid [[thread_position_in_threadgroup]],
+                   ushort tpg [[threads_per_threadgroup]],
+                   ushort sg [[simdgroup_index_in_threadgroup]],
+                   ushort lane [[thread_index_in_simdgroup]],
+                   ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float logits[1024];
+    threadgroup float buf[32];
     device const float *xv = x + (ulong)tg * p.dim;
-    device const float *wv = w + (ulong)tid * p.dim;
-    float d = 0.0f;
-    for (int i = 0; i < p.dim; i++) d += wv[i] * xv[i];
-    logits[tid] = d;
+    device const float4 *x4 = (device const float4 *)xv;
+    const int n4 = p.dim / 4;
+    for (int e = sg; e < p.nExperts; e += nsg) {
+        device const float *wv = w + (ulong)e * p.dim;
+        device const float4 *w4 = (device const float4 *)wv;
+        float d = 0.0f;
+        for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
+        for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
+        d = simd_sum(d);
+        if (lane == 0) logits[e] = d;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mx = -INFINITY;
+    for (int e = tid; e < p.nExperts; e += tpg) mx = max(mx, logits[e]);
+    mx = tg_max(mx, buf, sg, lane, nsg);
+    float sum = 0.0f;
+    for (int e = tid; e < p.nExperts; e += tpg) {
+        const float v = exp(logits[e] - mx);
+        logits[e] = v;
+        sum += v;
+    }
+    sum = tg_sum(sum, buf, sg, lane, nsg); // its barriers also publish the exp'd logits to thread 0
     if (tid == 0) {
-        float mx = -INFINITY;
-        for (int e = 0; e < p.nExperts; e++) mx = max(mx, logits[e]);
-        float sum = 0.0f;
-        for (int e = 0; e < p.nExperts; e++) {
-            logits[e] = exp(logits[e] - mx);
-            sum += logits[e];
-        }
         float selected = 0.0f;
         for (int k = 0; k < p.topK; k++) {
             int best = -1;
