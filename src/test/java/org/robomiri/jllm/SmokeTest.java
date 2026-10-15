@@ -45,6 +45,8 @@ public final class SmokeTest {
         longRope();
         phi3Configs();
         GemmaChecks.run();
+        mamba();
+        prefixReuse(dir);
         System.out.println("all smoke tests passed");
     }
 
@@ -751,6 +753,160 @@ public final class SmokeTest {
                     throw new RuntimeException(e);
                 }
             }, "hidden_act", "gelu rejected");
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** Mamba: config parsing, the selective-scan step and the causal conv with a known state (hand-computed). */
+    static void mamba() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-mamba-cfg");
+        try {
+            ModelConfig m = cfg(tmp, """
+                    {"architectures":["MambaForCausalLM"],"model_type":"mamba","hidden_size":768,"state_size":16,
+                     "conv_kernel":4,"expand":2,"intermediate_size":1536,"time_step_rank":48,"num_hidden_layers":24,
+                     "layer_norm_epsilon":1e-5,"vocab_size":50280,"use_bias":false,"use_conv_bias":true,
+                     "bos_token_id":0,"eos_token_id":0}""");
+            ModelConfig.MambaParams p = m.mamba();
+            check(m.isMamba() && m.dim() == 768 && m.layers() == 24 && m.vocabSize() == 50280 && m.tiedEmbeddings()
+                    && p.dInner() == 1536 && p.dState() == 16 && p.dConv() == 4 && p.dtRank() == 48
+                    && p.convBias() && m.eosTokenIds().equals(List.of(0)) && m.promptBosId() == -1, "mamba-130m config");
+            ModelConfig auto = cfg(tmp, """
+                    {"model_type":"mamba","hidden_size":100,"state_size":8,"conv_kernel":3,"expand":2,
+                     "time_step_rank":"auto","num_hidden_layers":2,"vocab_size":10}""");
+            check(auto.mamba().dtRank() == 7 && auto.mamba().dInner() == 200, "mamba time_step_rank auto = ceil(d/16), expand");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, "{\"model_type\":\"mamba\",\"hidden_size\":64,\"num_hidden_layers\":1,\"vocab_size\":10,"
+                            + "\"use_bias\":true}");
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "use_bias", "mamba use_bias rejected");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, "{\"model_type\":\"mamba2\",\"hidden_size\":64,\"num_hidden_layers\":1,\"vocab_size\":10}");
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "unsupported model", "mamba2 rejected");
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
+
+        // selective scan, 2 channels x 2 states: s = exp(dt*A)*s + dt*B*u ; y = sum(s*C)
+        float[] bc = {1f, 2f, 3f, 4f};             // channel 0: B = (1, 2), C = (3, 4)
+        float[] s0 = {1f, 0.5f};
+        float y0 = org.robomiri.jllm.cpu.MambaCpuBackend.scanStep(0.5f, 2f, new float[]{-1f, -2f}, 0, s0, 0, bc, 0, 2);
+        double e1 = Math.exp(-0.5) + 1.0;          // exp(0.5*-1)*1 + 0.5*1*2
+        double e2 = 0.5 * Math.exp(-1.0) + 2.0;    // exp(0.5*-2)*0.5 + 0.5*2*2
+        check(Math.abs(s0[0] - e1) < 1e-6 && Math.abs(s0[1] - e2) < 1e-6 && Math.abs(s0[0] - 1.60653066) < 1e-6
+                && Math.abs(s0[1] - 2.18393972) < 1e-6, "scan step channel 0 state");
+        check(Math.abs(y0 - 13.55535086) < 1e-4, "scan step channel 0 output " + y0 + " = 3*1.60653 + 4*2.18394");
+        // channel 1 uses A = (0, -ln 2): exp(0) = 1, exp(-ln 2) = 1/2, so everything is exact
+        float[] bc1 = {0.5f, 1f, 1f, 2f};
+        float[] s1 = {1f, 1f};
+        float y1 = org.robomiri.jllm.cpu.MambaCpuBackend.scanStep(1f, 2f, new float[]{0f, (float) -Math.log(2)}, 0,
+                s1, 0, bc1, 0, 2);
+        check(Math.abs(s1[0] - 2f) < 1e-6 && Math.abs(s1[1] - 2.5f) < 1e-6 && Math.abs(y1 - 7f) < 1e-5,
+                "scan step channel 1: s = (2, 2.5), y = " + y1 + " (expected 7)");
+        // a second token on channel 0 continues from the new state
+        float y0b = org.robomiri.jllm.cpu.MambaCpuBackend.scanStep(0f, 5f, new float[]{-1f, -2f}, 0, s0, 0, bc, 0, 2);
+        check(Math.abs(y0b - y0) < 1e-4 && Math.abs(s0[0] - e1) < 1e-6, "scan step with dt = 0 keeps the state");
+        check(Math.abs(org.robomiri.jllm.cpu.MambaCpuBackend.softplus(0f) - Math.log(2)) < 1e-6
+                && org.robomiri.jllm.cpu.MambaCpuBackend.softplus(25f) == 25f
+                && Math.abs(org.robomiri.jllm.cpu.MambaCpuBackend.softplus(-30f)) < 1e-12, "softplus");
+
+        // causal conv, d_conv = 4, state (oldest first) = (1, -1, 2), new input 3: 1*1 + 2*-1 + 3*2 + 4*3 + 0.5 = 17.5
+        float[] st = {1f, -1f, 2f};
+        float c1 = org.robomiri.jllm.cpu.MambaCpuBackend.convStep(new float[]{1f, 2f, 3f, 4f}, 0, 0.5f, st, 0, 4, 3f);
+        check(Math.abs(c1 - 17.5f / (1f + (float) Math.exp(-17.5))) < 1e-5 && Arrays.equals(st, new float[]{-1f, 2f, 3f}),
+                "conv step value " + c1 + " and shifted state " + Arrays.toString(st));
+        // taps (0, 0, 0, 1) just pass the input through silu: silu(1) = 0.7310586; then (2, 3, 1) -> window (3, 1, ...)
+        float[] st2 = {0f, 0f, 0f};
+        float c2 = org.robomiri.jllm.cpu.MambaCpuBackend.convStep(new float[]{0f, 0f, 0f, 1f}, 0, 0f, st2, 0, 4, 1f);
+        check(Math.abs(c2 - 0.7310586f) < 1e-6 && Arrays.equals(st2, new float[]{0f, 0f, 1f}), "conv step silu(1)");
+        // oldest tap weighs the input from d_conv-1 steps ago: feed 1, 0, 0, 0 with taps (1, 0, 0, 0)
+        float[] st3 = {0f, 0f, 0f};
+        float[] outs = new float[4];
+        float[] in = {1f, 0f, 0f, 0f};
+        for (int t = 0; t < 4; t++) {
+            outs[t] = org.robomiri.jllm.cpu.MambaCpuBackend.convStep(new float[]{1f, 0f, 0f, 0f}, 0, 0f, st3, 0, 4, in[t]);
+        }
+        check(Math.abs(outs[3] - 0.7310586f) < 1e-6 && outs[0] == 0f && outs[1] == 0f && outs[2] == 0f,
+                "conv tap 0 sees the input d_conv-1 tokens back");
+    }
+
+    /** A backend that records the (pos, n) of every forward() and always predicts token 0. */
+    private static final class RecordingBackend implements org.robomiri.jllm.model.Backend {
+        final boolean reuse;
+        final List<int[]> calls = new ArrayList<>();
+
+        RecordingBackend(boolean reuse) {
+            this.reuse = reuse;
+        }
+
+        public String name() {
+            return "recording";
+        }
+
+        public int contextLength() {
+            return 64;
+        }
+
+        public int maxBatch() {
+            return 16;
+        }
+
+        public boolean supportsPrefixReuse() {
+            return reuse;
+        }
+
+        public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+            calls.add(new int[]{pos, n});
+            if (logits != null) {
+                Arrays.fill(logits, 0f);
+                logits[0] = 1f;
+            }
+        }
+
+        public void close() {
+        }
+    }
+
+    /**
+     * Engine prefix cache: a KV-cache backend resumes after the longest common prefix, a backend whose state cannot
+     * be rewound (Mamba) only when the new prompt extends everything it has seen, otherwise it restarts at 0.
+     */
+    static void prefixReuse(Path dir) throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-engine");
+        try {
+            ModelConfig cfg = cfg(tmp, "{\"model_type\":\"mamba\",\"hidden_size\":64,\"num_hidden_layers\":1,"
+                    + "\"vocab_size\":100}");
+            Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
+            SamplingParams two = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 2, List.of());
+            for (boolean rewind : new boolean[]{true, false}) {
+                RecordingBackend b = new RecordingBackend(rewind);
+                org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(b, tok, cfg, java.util.Set.of(99));
+                e.generate(new int[]{5, 6, 7, 8}, two, null, () -> false); // feeds 5 6 7 8 and the generated 0
+                check(b.calls.size() == 2 && b.calls.get(0)[0] == 0 && b.calls.get(0)[1] == 4 && b.calls.get(1)[0] == 4,
+                        "first request prefills from 0");
+                b.calls.clear();
+                e.generate(new int[]{5, 6, 7, 8, 0, 9, 10}, two, null, () -> false);
+                check(b.calls.get(0)[0] == 5 && b.calls.get(0)[1] == 2, (rewind ? "kv" : "mamba")
+                        + " backend: a prompt extending the cached tokens resumes at 5");
+                b.calls.clear();
+                e.generate(new int[]{5, 6, 7, 8, 0, 9, 11, 12}, two, null, () -> false); // diverges at index 6
+                int expect = rewind ? 6 : 0;
+                check(b.calls.get(0)[0] == expect, (rewind ? "kv" : "mamba") + " backend: diverging prompt restarts at "
+                        + expect + " (got " + b.calls.get(0)[0] + ")");
+                b.calls.clear();
+                e.generate(new int[]{5, 6, 7, 8, 0, 9, 11, 12}, two, null, () -> false); // identical resend
+                check(b.calls.get(0)[0] == (rewind ? 7 : 0), (rewind ? "kv" : "mamba")
+                        + " backend: resending the same prompt restarts at " + (rewind ? 7 : 0));
+            }
         } finally {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);

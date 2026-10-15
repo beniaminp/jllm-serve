@@ -1,7 +1,9 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.metal.Metal;
+import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.ModelConfig;
@@ -112,25 +114,28 @@ public final class ArchSmoke {
 
     private static int run(Path dir, ModelConfig cfg, QType quant, boolean metal, String lib) throws Exception {
         String label = dir.getFileName() + " " + quant;
+        int failures = 0;
         try (ModelWeights w = ModelWeights.load(dir, cfg, quant, ShardProvider.local(dir))) {
             int[] cpu;
             float[] cpuLogits = new float[cfg.vocabSize()];
-            try (Backend b = new CpuBackend(w, 64, 16, 4)) {
+            try (Backend b = cfg.isMamba() ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4)) {
                 cpu = generate(b, cpuLogits);
+                failures += cfg.isMamba() ? stateChecks(b, cfg, "cpu") : 0;
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
             if (!metal) {
-                return 0;
+                return failures;
             }
-            if (cfg.headDim() % 32 != 0) {
+            if (!cfg.isMamba() && cfg.headDim() % 32 != 0) {
                 System.out.println("  metal skipped: headDim " + cfg.headDim() + " is not a multiple of 32");
-                return 0;
+                return failures;
             }
             int[] gpu;
             float[] gpuLogits = new float[cfg.vocabSize()];
-            try (Backend b = new MetalBackend(w, 64, 16, lib)) {
+            try (Backend b = cfg.isMamba() ? new MambaMetalBackend(w, 64, 16, lib) : new MetalBackend(w, 64, 16, lib)) {
                 gpu = generate(b, gpuLogits);
+                failures += cfg.isMamba() ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
             // the argmax of a random model can be degenerate, so also compare the full final logits
@@ -143,15 +148,50 @@ public final class ArchSmoke {
             System.out.printf("  final logits: max|cpu-metal| = %.2e (max|logit| = %.2f)%n", diff, scale);
             if (!(diff <= 1e-3f * scale + 1e-4f)) {
                 System.out.println("  LOGITS MISMATCH");
-                return 1;
+                return failures + 1;
             }
             if (!Arrays.equals(cpu, gpu)) {
                 System.out.println("  MISMATCH");
-                return 1;
+                return failures + 1;
             }
             System.out.println("  cpu == metal");
-            return 0;
+            return failures;
         }
+    }
+
+    /**
+     * Mamba keeps a recurrent state instead of a KV cache, so the way the prompt is cut into forward() calls must not
+     * change the result: one chunk, 5 + 7, and token by token give the same logits, and pos == 0 starts afresh
+     * (here after the state was left in some other position). Continuing at a wrong position is refused.
+     */
+    private static int stateChecks(Backend b, ModelConfig cfg, String name) {
+        float[] one = new float[cfg.vocabSize()];
+        float[] split = new float[cfg.vocabSize()];
+        float[] single = new float[cfg.vocabSize()];
+        b.forward(PROMPT, 0, PROMPT.length, 0, one);
+        b.forward(PROMPT, 0, 5, 0, null);
+        b.forward(PROMPT, 5, PROMPT.length - 5, 5, split);
+        for (int i = 0; i < PROMPT.length; i++) {
+            b.forward(PROMPT, i, 1, i, i == PROMPT.length - 1 ? single : null);
+        }
+        float scale = 0;
+        float d1 = 0;
+        float d2 = 0;
+        for (int i = 0; i < one.length; i++) {
+            scale = Math.max(scale, Math.abs(one[i]));
+            d1 = Math.max(d1, Math.abs(one[i] - split[i]));
+            d2 = Math.max(d2, Math.abs(one[i] - single[i]));
+        }
+        boolean refused = false;
+        try {
+            b.forward(PROMPT, 0, 1, PROMPT.length + 3, null);
+        } catch (IllegalStateException e) {
+            refused = true;
+        }
+        boolean ok = d1 <= 1e-4f * scale + 1e-5f && d2 <= 1e-4f * scale + 1e-5f && refused && !b.supportsPrefixReuse();
+        System.out.printf("  %s state: one chunk vs 5+7 %.1e, vs token by token %.1e, wrong pos refused=%b -> %s%n", name, d1,
+                d2, refused, ok ? "ok" : "FAILED");
+        return ok ? 0 : 1;
     }
 
     private static int[] generate(Backend b, float[] logits) {

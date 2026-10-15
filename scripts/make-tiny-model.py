@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | mamba3 | mamba130m
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -28,8 +28,11 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
              rope_theta 1e6 with linear scaling 8 on the global layer, rope_local_base_freq 1e4 on local ones
   gemma3mm   the same decoder in the multimodal wrapper layout (Gemma3ForConditionalGeneration, text_config,
              tensors under language_model.model.*, plus dummy vision tensors that must be ignored)
+  mamba      Mamba v1: d_model 64, d_inner 128, state 16, conv 4, dt_rank 4 (ceil(64/16)), 3 layers, tied head
+  mamba3     Mamba v1: d_model 128, d_inner 256, state 8, conv 3, dt_rank 8 (ceil(128/16)), 2 layers, untied head
 """
 import json
+import math
 import os
 import random
 import struct
@@ -91,6 +94,16 @@ FAMILIES = {
         attn_logit_softcapping=None, final_logit_softcapping=None, query_pre_attn_scalar=48, sliding_window=6,
         sliding_window_pattern=6, attention_bias=False, tie_word_embeddings=True, bos_token_id=2,
         eos_token_id=106),
+    "mamba": dict(
+        architectures=["MambaForCausalLM"], model_type="mamba", hidden_size=64, state_size=16, conv_kernel=4,
+        expand=2, intermediate_size=128, time_step_rank=4, num_hidden_layers=3, vocab_size=1000,
+        layer_norm_epsilon=1e-5, use_bias=False, use_conv_bias=True, hidden_act="silu",
+        bos_token_id=0, eos_token_id=0),
+    "mamba3": dict(
+        architectures=["MambaForCausalLM"], model_type="mamba", hidden_size=128, state_size=8, conv_kernel=3,
+        expand=2, intermediate_size=256, time_step_rank="auto", num_hidden_layers=2, vocab_size=1000,
+        layer_norm_epsilon=1e-5, use_bias=False, use_conv_bias=True, hidden_act="silu",
+        bos_token_id=0, eos_token_id=0, tie_word_embeddings=False),
 }
 TEXT_KEYS_EXCLUDED_IN_WRAPPER = ("architectures", "bos_token_id", "eos_token_id")
 
@@ -126,6 +139,43 @@ def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
 FAMILIES["phi3"] = phi3(128, 4, 2, 32, 0.75, 6, False, True)
 FAMILIES["phi3short"] = phi3(128, 4, 2, 128, 0.75, None, True, True)
 FAMILIES["phi3mha"] = phi3(256, 4, 4, 512, 1.0, 6, False, False)
+def mamba_tensors(cfg, rnd):
+    """Random Mamba v1 weights with the real checkpoint's names and shapes (A_log = log(1..d_state) like the
+    S4D-real init, dt_proj.bias spread so softplus(dt) covers small and large steps)."""
+    d, di, ds, dc = cfg["hidden_size"], cfg["intermediate_size"], cfg["state_size"], cfg["conv_kernel"]
+    r = math.ceil(d / 16) if cfg["time_step_rank"] == "auto" else cfg["time_step_rank"]
+    tensors = {}
+
+    def mat(name, shape, std):
+        n = 1
+        for x in shape:
+            n *= x
+        tensors[name] = (shape, [rnd.gauss(0, std) for _ in range(n)])
+
+    def vec(name, shape, fn):
+        n = 1
+        for x in shape:
+            n *= x
+        tensors[name] = (shape, [fn(i) for i in range(n)])
+
+    mat("backbone.embeddings.weight", [cfg["vocab_size"], d], 1.0)
+    for l in range(cfg["num_hidden_layers"]):
+        p = "backbone.layers.%d." % l
+        vec(p + "norm.weight", [d], lambda i: 1.0 + rnd.gauss(0, 0.1))
+        q = p + "mixer."
+        mat(q + "in_proj.weight", [2 * di, d], 0.15)
+        mat(q + "conv1d.weight", [di, 1, dc], 0.4)
+        vec(q + "conv1d.bias", [di], lambda i: rnd.gauss(0, 0.1))
+        mat(q + "x_proj.weight", [r + 2 * ds, di], 0.2)
+        mat(q + "dt_proj.weight", [di, r], 0.6)
+        vec(q + "dt_proj.bias", [di], lambda i: rnd.uniform(-3.0, 0.5))
+        vec(q + "A_log", [di, ds], lambda i: math.log(i % ds + 1) + rnd.gauss(0, 0.05))
+        vec(q + "D", [di], lambda i: 1.0 + rnd.gauss(0, 0.2))
+        mat(q + "out_proj.weight", [d, di], 0.12)
+    vec("backbone.norm_f.weight", [d], lambda i: 1.0 + rnd.gauss(0, 0.1))
+    if cfg.get("tie_word_embeddings") is False:
+        mat("lm_head.weight", [cfg["vocab_size"], d], 0.5)
+    return tensors
 
 
 def main():
@@ -136,6 +186,9 @@ def main():
     rnd = random.Random(seed)
     wrapper = fam == "gemma3mm"
     cfg = dict(FAMILIES["gemma3" if wrapper else fam])
+    if cfg["model_type"] == "mamba":
+        write(out, fam, cfg, mamba_tensors(cfg, rnd))
+        return
     d, heads, kv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     if "--head-dim" in sys.argv:  # e.g. 256 to exercise the largest head size the Metal attention kernel supports
         cfg["head_dim"] = int(sys.argv[sys.argv.index("--head-dim") + 1])
@@ -197,6 +250,10 @@ def main():
         mat("vision_tower.vision_model.embeddings.patch_embedding.weight", 32, 24, 0.1)
         mat("multi_modal_projector.mm_input_projection_weight", 32, d, 0.1)
 
+    write(out, fam, cfg, tensors, wrapper)
+
+
+def write(out, fam, cfg, tensors, wrapper=False):
     header, blobs, off = {}, [], 0
     for name, (shape, vals) in tensors.items():
         raw = struct.pack("<%df" % len(vals), *vals)
