@@ -292,8 +292,7 @@ public final class MetalBackend implements Backend {
                     addBias(kDst, kvOff, L.bk, n, kvDim);
                     addBias(vDst, kvOff, L.bv, n, kvDim);
                 }
-                normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos);
-                normRope(kDst, kvOff, kvDim, c.kvHeads(), L.kNorm, n, pos);
+                normRope(L, kDst, kvOff, n, pos);
                 if (kvHalf) {
                     kvStore(l, n, pos);
                 }
@@ -371,17 +370,24 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pRmsnorm, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
-    private void normRope(Metal.Buffer v, long off, int stride, int nHeads, Metal.Buffer norm, int n, int pos) {
-        bind(0, v, off);
-        bind(1, norm != null ? norm : finalNorm, 0); // dummy binding when unused
-        bind(2, ropeCos, 0);
-        bind(3, ropeSin, 0);
+    /** QK-norm + RoPE for the q rows and the k rows just written at position pos, in one dispatch. */
+    private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos) {
+        boolean useNorm = L.qNorm != null && L.kNorm != null;
+        bind(0, q, 0);
+        bind(1, kDst, kvOff);
+        bind(2, useNorm ? L.qNorm : finalNorm, 0); // dummy bindings when unused
+        bind(3, useNorm ? L.kNorm : finalNorm, 0);
+        bind(4, ropeCos, 0);
+        bind(5, ropeSin, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, stride);
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, pos);
-        params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
-        params.setAtIndex(ValueLayout.JAVA_INT, 4, norm != null ? 1 : 0);
-        metal.dispatch(pNormRope, bufArgs, offArgs, 4, params, 20, nHeads, n, 1, c.headDim() / 2, 1, 1);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, useNorm ? 1 : 0);
+        metal.dispatch(pNormRope, bufArgs, offArgs, 6, params, 28, c.heads() + c.kvHeads(), n, 1,
+                c.headDim() / 2, 1, 1);
     }
 
     /** One dispatch per tile of ATT_TILE tokens; the scores scratch is indexed by the tile-local token. */

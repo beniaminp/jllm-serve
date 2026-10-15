@@ -186,22 +186,28 @@ kernel void rmsnorm(device const float *x [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- qk-norm + rope
-// In place on [ntok, rowStride] rows holding nHeads heads of headDim. Grid: (nHeads, ntok);
-// threads per threadgroup = headDim / 2, thread i owns the rotary pair (i, i + headDim/2).
+// In place on the q rows ([ntok, qStride], nHeads heads) and the freshly written k rows of the KV cache
+// ([ntok, kvStride], nKvHeads heads) in one dispatch. Grid: (nHeads + nKvHeads, ntok); threadgroup x < nHeads
+// handles q head x, otherwise k head x - nHeads. Threads per threadgroup = headDim / 2, thread i owns the
+// rotary pair (i, i + headDim/2).
 
 struct RopeParams {
     int headDim;
-    int rowStride;
+    int qStride;
+    int kvStride;
+    int nHeads;
     int pos0;
     float eps;
     int useNorm;
 };
 
-kernel void norm_rope(device float *v [[buffer(0)]],
-                      device const float *w [[buffer(1)]],
-                      device const float *cosT [[buffer(2)]],
-                      device const float *sinT [[buffer(3)]],
-                      constant RopeParams &p [[buffer(4)]],
+kernel void norm_rope(device float *q [[buffer(0)]],
+                      device float *k [[buffer(1)]],
+                      device const float *qw [[buffer(2)]],
+                      device const float *kw [[buffer(3)]],
+                      device const float *cosT [[buffer(4)]],
+                      device const float *sinT [[buffer(5)]],
+                      constant RopeParams &p [[buffer(6)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
                       ushort2 tid2 [[thread_position_in_threadgroup]],
                       ushort sg [[simdgroup_index_in_threadgroup]],
@@ -210,7 +216,11 @@ kernel void norm_rope(device float *v [[buffer(0)]],
     threadgroup float buf[32];
     const ushort tid = tid2.x;
     const int half_dim = p.headDim / 2;
-    device float *h = v + (ulong)tgp.y * p.rowStride + (ulong)tgp.x * p.headDim;
+    const bool isQ = int(tgp.x) < p.nHeads;
+    const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
+    device float *h = isQ ? q + (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
+                          : k + (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    device const float *w = isQ ? qw : kw;
     float a = h[tid];
     float b = h[tid + half_dim];
     if (p.useNorm) {
