@@ -230,7 +230,7 @@ supported"). What differs is the pipeline around the merge loop, which is read f
 | Qwen2/3, DeepSeek-R1-Distill | NFC | Split(regex, Isolated) + ByteLevel | `ignore_merges` (Qwen3) | ByteLevel |
 | Llama 3, GLM-4, GLM-Edge | none | Split(regex with `\p{N}{1,3}`, Isolated) + ByteLevel | `ignore_merges` | ByteLevel |
 | Phi-4-mini | none | Split(case-aware regex, **Removed + invert**) + ByteLevel | | ByteLevel |
-| Mamba (GPT-NeoX) | NFC | ByteLevel with `use_regex` (GPT-2 regex) | 6 of the 256 byte symbols absent from the vocabulary | ByteLevel |
+| Mamba (GPT-NeoX) | NFC | ByteLevel with `use_regex` (GPT-2 regex) | 13 byte symbols (0xC0, 0xC1, 0xF5..0xFF, never valid UTF-8) absent from the vocabulary; such bytes are dropped | ByteLevel |
 | Mistral v0.3 | none | **Metaspace** (`prepend_scheme: first`, `split: false`) | `byte_fallback`, `fuse_unk` | Replace ▁→space, ByteFallback, Fuse, **Strip(1)** |
 | Gemma 2/3 | **Replace " " → ▁** | Split(" ", MergedWithPrevious), a no-op once spaces are gone | `byte_fallback`, `fuse_unk` | Replace, ByteFallback, Fuse |
 | Phi-3 | **Prepend ▁, Replace " " → ▁** | none | `byte_fallback`, `fuse_unk` | Replace, ByteFallback, Fuse, Strip(1) |
