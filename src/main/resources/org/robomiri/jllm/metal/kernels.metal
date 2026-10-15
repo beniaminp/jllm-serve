@@ -227,7 +227,9 @@ kernel void norm_rope(device float *v [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- attention
-// Causal GQA attention for token t at position pos0 + t. Grid: (nHeads, ntok), 256 threads = 8 simdgroups.
+// Causal GQA attention for token t = tokenOffset + tgp.y at position pos0 + t. Grid: (nHeads, tile),
+// 256 threads = 8 simdgroups. Tokens are dispatched in tiles so the scores scratch only needs
+// tile * nHeads * ctx floats: it is indexed by the tile-local token tgp.y, not by t.
 // Scores go to a device scratch row (so context length is not limited by threadgroup memory).
 // Each lane owns headDim/32 (<= 8) dimensions of q, k and v.
 
@@ -240,7 +242,8 @@ struct AttnParams {
     float scale;
     int qStride;
     int kvStride;
-    int window; // sliding-window length in tokens, 0 = full causal attention
+    int window;      // sliding-window length in tokens, 0 = full causal attention
+    int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
 };
 
 kernel void attention(device const float *q [[buffer(0)]],
@@ -261,13 +264,13 @@ kernel void attention(device const float *q [[buffer(0)]],
     const ushort tpg = tpg2.x;
 
     const int h = int(tgp.x);
-    const int t = int(tgp.y);
+    const int t = p.tokenOffset + int(tgp.y);
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
     const int first = p.window > 0 ? max(0, len - p.window) : 0;
     const int per = p.headDim / 32;
     device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
-    device float *sc = scores + ((ulong)t * p.nHeads + h) * p.ctx;
+    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
     device const float *kb = kc + kvh * p.headDim;
     device const float *vb = vc + kvh * p.headDim;
 
@@ -502,13 +505,13 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
     const ushort tpg = tpg2.x;
 
     const int h = int(tgp.x);
-    const int t = int(tgp.y);
+    const int t = p.tokenOffset + int(tgp.y);
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
     const int first = p.window > 0 ? max(0, len - p.window) : 0;
     const int per = p.headDim / 32;
     device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
-    device float *sc = scores + ((ulong)t * p.nHeads + h) * p.ctx;
+    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
     device const KV *kb = kc + kvh * p.headDim;
     device const KV *vb = vc + kvh * p.headDim;
 

@@ -59,7 +59,7 @@ public final class Metal implements AutoCloseable {
         workingSet = handle(l, "jm_recommended_working_set", FunctionDescriptor.of(JAVA_LONG, ADDRESS));
         pipeline = handle(l, "jm_pipeline", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
         pipelineMaxThreads = handle(l, "jm_pipeline_max_threads", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
-        bufferNew = handle(l, "jm_buffer_new", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG));
+        bufferNew = handle(l, "jm_buffer_new", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT));
         bufferWrap = handle(l, "jm_buffer_wrap", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG));
         bufferContents = handle(l, "jm_buffer_contents", FunctionDescriptor.of(ADDRESS, ADDRESS));
         bufferRelease = handle(l, "jm_buffer_release", FunctionDescriptor.ofVoid(ADDRESS));
@@ -190,8 +190,16 @@ public final class Metal implements AutoCloseable {
 
     /** New zero-filled shared buffer. */
     public Buffer newBuffer(long bytes) {
+        return newBuffer(bytes, true);
+    }
+
+    /**
+     * New shared buffer. With {@code zero == false} the contents are left uninitialised, which skips a memset
+     * (and the page commit it implies) for scratch buffers that are always written before they are read.
+     */
+    public Buffer newBuffer(long bytes, boolean zero) {
         try {
-            MemorySegment h = (MemorySegment) bufferNew.invokeExact(ctx, Math.max(16L, bytes));
+            MemorySegment h = (MemorySegment) bufferNew.invokeExact(ctx, Math.max(16L, bytes), zero ? 1 : 0);
             if (h.equals(MemorySegment.NULL)) {
                 throw new OutOfMemoryError("Metal buffer of " + bytes + " bytes");
             }

@@ -101,15 +101,19 @@ int jm_pipeline_max_threads(void *ctx, int pipeline) {
     return (int) c.pipelines[(NSUInteger) pipeline].maxTotalThreadsPerThreadgroup;
 }
 
-// New zero-filled buffer in shared (CPU+GPU visible) memory.
-void *jm_buffer_new(void *ctx, uint64_t len) {
+// New buffer in shared (CPU+GPU visible) memory. With zero != 0 the contents are cleared up front; otherwise
+// they are left untouched (pages are then only committed when first written), which is right for scratch
+// buffers that are always fully written before they are read.
+void *jm_buffer_new(void *ctx, uint64_t len, int zero) {
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
         id<MTLBuffer> b = [c.device newBufferWithLength:(NSUInteger) len options:MTLResourceStorageModeShared];
         if (!b) {
             return NULL;
         }
-        memset(b.contents, 0, (size_t) len);
+        if (zero) {
+            memset(b.contents, 0, (size_t) len);
+        }
         return (__bridge_retained void *) b;
     }
 }

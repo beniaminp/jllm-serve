@@ -19,6 +19,11 @@ import java.lang.foreign.ValueLayout;
 public final class MetalBackend implements Backend {
 
     private static final int TOK_TILE = 8; // must match kernels.metal
+    /**
+     * Tokens per attention dispatch; the scores scratch holds one row of ctx floats per (tile token, head)
+     * instead of one per (batch token, head). 32 keeps a 64-token prefill chunk at two dispatches per layer.
+     */
+    private static final int ATT_TILE = 32;
     private static final int MAX_BUFS = 8;
 
     private final ModelWeights w;
@@ -163,29 +168,35 @@ public final class MetalBackend implements Backend {
         ropeCos = upload(rope.cos);
         ropeSin = upload(rope.sin);
 
+        // None of the buffers below is zeroed: every element is written before it is read. The KV cache rows
+        // [0, pos + n) are written by the K/V projections (or kv_store_half) before attention reads them,
+        // activations and staging rows are written for every token of the current chunk, and the scores
+        // scratch is written for positions [first, len) before the softmax reads the same range. Skipping the
+        // memset keeps start-up fast and only commits pages that are actually touched (a long context would
+        // otherwise clear gigabytes).
         long kvBytes = (long) ctx * c.kvDim() * kvDtype.bytes;
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
-            keyCache[l] = metal.newBuffer(kvBytes);
-            valCache[l] = metal.newBuffer(kvBytes);
+            keyCache[l] = metal.newBuffer(kvBytes, false);
+            valCache[l] = metal.newBuffer(kvBytes, false);
         }
-        kStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4) : null;
-        vStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4) : null;
-        x = metal.newBuffer((long) maxBatch * c.dim() * 4);
-        xb = metal.newBuffer((long) maxBatch * c.dim() * 4);
-        q = metal.newBuffer((long) maxBatch * c.qDim() * 4);
-        att = metal.newBuffer((long) maxBatch * c.qDim() * 4);
-        gateUp = metal.newBuffer((long) maxBatch * 2L * c.hiddenDim() * 4);
-        hidden = metal.newBuffer((long) maxBatch * c.hiddenDim() * 4);
-        scores = metal.newBuffer((long) maxBatch * c.heads() * ctx * 4);
-        logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4);
+        kStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4, false) : null;
+        vStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4, false) : null;
+        x = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
+        xb = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
+        q = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
+        att = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
+        gateUp = metal.newBuffer((long) maxBatch * 2L * c.hiddenDim() * 4, false);
+        hidden = metal.newBuffer((long) maxBatch * c.hiddenDim() * 4, false);
+        scores = metal.newBuffer((long) Math.min(ATT_TILE, maxBatch) * c.heads() * ctx * 4, false);
+        logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4, false);
         if (c.isMoe()) {
             int slots = maxBatch * c.expertsPerTok();
-            assign = metal.newBuffer((long) slots * 4);
-            routeWeight = metal.newBuffer((long) slots * 4);
-            moeGateUp = metal.newBuffer((long) slots * 2 * c.moeDim() * 4);
-            moeHidden = metal.newBuffer((long) slots * c.moeDim() * 4);
+            assign = metal.newBuffer((long) slots * 4, false);
+            routeWeight = metal.newBuffer((long) slots * 4, false);
+            moeGateUp = metal.newBuffer((long) slots * 2 * c.moeDim() * 4, false);
+            moeHidden = metal.newBuffer((long) slots * c.moeDim() * 4, false);
         } else {
             assign = null;
             routeWeight = null;
@@ -204,7 +215,7 @@ public final class MetalBackend implements Backend {
     }
 
     private Metal.Buffer upload(float[] data) {
-        Metal.Buffer b = metal.newBuffer((long) data.length * 4);
+        Metal.Buffer b = metal.newBuffer((long) data.length * 4, false); // fully overwritten below
         MemorySegment.copy(data, 0, b.contents(), ValueLayout.JAVA_FLOAT, 0, data.length);
         return b;
     }
@@ -340,6 +351,7 @@ public final class MetalBackend implements Backend {
         metal.dispatch(pNormRope, bufArgs, offArgs, 4, params, 20, nHeads, n, 1, c.headDim() / 2, 1, 1);
     }
 
+    /** One dispatch per tile of ATT_TILE tokens; the scores scratch is indexed by the tile-local token. */
     private void attention(int l, int n, int pos) {
         bind(0, q, 0);
         bind(1, keyCache[l], 0);
@@ -355,7 +367,11 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 8, c.windowFor(l));
-        metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 36, c.heads(), n, 1, 256, 1, 1);
+        for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
+            params.setAtIndex(ValueLayout.JAVA_INT, 9, t0);
+            metal.dispatch(kvHalf ? pAttentionHalf : pAttention, bufArgs, offArgs, 5, params, 40, c.heads(),
+                    Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
+        }
     }
 
     /** f16 cache: rounds the n staged k/v rows into rows [pos, pos+n) of layer l's half caches. */
