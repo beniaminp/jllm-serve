@@ -146,7 +146,7 @@ public final class Main {
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch);
-        return new Engine(backend, tok, cfg, eosIds(dir, tok));
+        return new Engine(backend, tok, cfg, eosIds(dir, tok), s.getLong("server.queue-timeout-ms"));
     }
 
     private static Set<Integer> eosIds(Path dir, Tokenizer tok) throws Exception {
@@ -236,7 +236,7 @@ public final class Main {
                 s.getInt("server.max-connections"),
                 s.getLong("server.max-body-bytes"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
-                s.getLong("engine.max-prompt-bytes"), http);
+                s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         try (engine; ApiServer server = new ApiServer(engine, model, host, port, options)) {
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();

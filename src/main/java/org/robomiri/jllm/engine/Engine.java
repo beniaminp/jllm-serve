@@ -10,14 +10,24 @@ import org.robomiri.jllm.tokenizer.Tokenizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 
 /**
  * Generation loop: tokenizes, prefills in chunks, samples one token at a time and streams text.
- * The backend owns a single KV cache, so requests are serialized with a lock; a prefix cache lets
- * consecutive chat turns skip re-prefilling the shared prefix.
+ * The backend owns a single KV cache, so requests are serialized with a fair lock (a bounded wait, after
+ * which {@link OverloadedException} is thrown); a prefix cache lets consecutive chat turns skip re-prefilling
+ * the shared prefix.
  */
 public final class Engine implements AutoCloseable {
+
+    /** Thrown when a request waited longer than the queue timeout for the engine. */
+    public static final class OverloadedException extends RuntimeException {
+        OverloadedException(String message) {
+            super(message);
+        }
+    }
 
     public record Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs) {
         public double tokPerSec() {
@@ -38,16 +48,26 @@ public final class Engine implements AutoCloseable {
     private final Tokenizer tokenizer;
     private final ModelConfig cfg;
     private final Set<Integer> eosIds;
-    private final Object lock = new Object();
+    private final ReentrantLock lock = new ReentrantLock(true);
+    private final long queueTimeoutMs;
 
     private int[] cached = new int[0]; // tokens currently in the KV cache
     private int cachedLen;
 
     public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds) {
+        this(backend, tokenizer, cfg, eosIds, 0);
+    }
+
+    /**
+     * @param queueTimeoutMs how long {@link #generate} may wait for the engine while another request runs
+     *                       before throwing {@link OverloadedException}; 0 = wait indefinitely
+     */
+    public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds, long queueTimeoutMs) {
         this.backend = backend;
         this.tokenizer = tokenizer;
         this.cfg = cfg;
         this.eosIds = eosIds;
+        this.queueTimeoutMs = queueTimeoutMs;
     }
 
     public Tokenizer tokenizer() {
@@ -63,19 +83,40 @@ public final class Engine implements AutoCloseable {
     }
 
     /**
-     * @param cancelled polled every token; generation stops with finish reason "cancelled" when true
+     * @param cancelled polled once when generation starts and then before every token; generation stops with
+     *                  finish reason "cancelled" when true
      */
     public Result generate(String prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
         return generate(tokenizer.encode(prompt), p, sink, cancelled);
     }
 
-    /** Generates from already-tokenized prompt ids (used by the chat template, which controls special tokens). */
+    /**
+     * Generates from already-tokenized prompt ids (used by the chat template, which controls special tokens).
+     *
+     * @throws OverloadedException if the engine stayed busy with other requests for longer than the queue timeout
+     */
     public Result generate(int[] promptTokens, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
         if (promptTokens.length == 0) {
             promptTokens = new int[]{eosIds.iterator().next()};
         }
-        synchronized (lock) {
+        acquire();
+        try {
             return generateLocked(promptTokens, p, sink, cancelled);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void acquire() {
+        try {
+            if (queueTimeoutMs <= 0) {
+                lock.lockInterruptibly();
+            } else if (!lock.tryLock(queueTimeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new OverloadedException("engine busy: no capacity after waiting " + queueTimeoutMs + " ms");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new OverloadedException("interrupted while waiting for the engine");
         }
     }
 
@@ -83,6 +124,9 @@ public final class Engine implements AutoCloseable {
         int ctx = backend.contextLength();
         if (prompt.length >= ctx) {
             throw new IllegalArgumentException("prompt has " + prompt.length + " tokens, context is " + ctx);
+        }
+        if (cancelled.getAsBoolean()) { // the client went away while this request was queued
+            return new Result("", new int[0], "cancelled", new Stats(prompt.length, 0, 0, 0, 0));
         }
         int vocab = Math.min(cfg.vocabSize(), tokenizer.vocabSize());
         float[] logits = new float[cfg.vocabSize()];

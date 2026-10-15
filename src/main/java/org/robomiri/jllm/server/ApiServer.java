@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * OpenAI-compatible endpoints on top of {@link Engine}:
@@ -21,12 +22,49 @@ public final class ApiServer implements AutoCloseable {
     /**
      * @param sampling        sampling values used when a request omits a field
      * @param thinkingDefault whether Qwen3 thinking is on when a request does not say
-     * @param maxPromptBytes  reject prompts larger than this (text, before tokenizing); 0 = 16 * context length
-     * @param http            connection limits of the underlying HTTP server
+     * @param maxPromptBytes   reject prompts larger than this (text, before tokenizing); 0 = 16 * context length
+     * @param requestTimeoutMs wall-clock limit for one request's generation (finish_reason "length" when hit); 0 = none
+     * @param http             connection limits of the underlying HTTP server
      */
-    public record Options(SamplingParams sampling, boolean thinkingDefault, long maxPromptBytes, HttpServer.Options http) {
+    public record Options(SamplingParams sampling, boolean thinkingDefault, long maxPromptBytes, long requestTimeoutMs,
+                          HttpServer.Options http) {
         public static Options defaults() {
-            return new Options(SamplingParams.defaults(), false, 0, HttpServer.Options.defaults());
+            return new Options(SamplingParams.defaults(), false, 0, 0, HttpServer.Options.defaults());
+        }
+    }
+
+    /**
+     * Cancels generation once the request has run for longer than the limit. The clock starts at the first
+     * poll, which the engine makes right after acquiring its lock, so time spent queued does not count.
+     */
+    private static final class Deadline implements BooleanSupplier {
+        private final long limitNanos;
+        private long start;
+        private boolean started;
+        boolean expired;
+
+        Deadline(long limitMs) {
+            this.limitNanos = limitMs * 1_000_000L;
+        }
+
+        @Override
+        public boolean getAsBoolean() {
+            if (limitNanos <= 0) {
+                return false;
+            }
+            long now = System.nanoTime();
+            if (!started) {
+                started = true;
+                start = now;
+                return false;
+            }
+            expired = now - start >= limitNanos;
+            return expired;
+        }
+
+        /** Maps the engine's "cancelled" to the OpenAI finish reason "length" when it was this deadline that fired. */
+        String finishReason(Engine.Result r) {
+            return expired && r.finishReason().equals("cancelled") ? "length" : r.finishReason();
         }
     }
 
@@ -55,6 +93,7 @@ public final class ApiServer implements AutoCloseable {
     private final SamplingParams defaults;
     private final boolean thinkingDefault;
     private final long maxPromptBytes;
+    private final long requestTimeoutMs;
 
     public ApiServer(Engine engine, String modelId, String host, int port) throws IOException {
         this(engine, modelId, host, port, Options.defaults());
@@ -62,7 +101,7 @@ public final class ApiServer implements AutoCloseable {
 
     public ApiServer(Engine engine, String modelId, String host, int port, SamplingParams defaults,
                      boolean thinkingDefault) throws IOException {
-        this(engine, modelId, host, port, new Options(defaults, thinkingDefault, 0, HttpServer.Options.defaults()));
+        this(engine, modelId, host, port, new Options(defaults, thinkingDefault, 0, 0, HttpServer.Options.defaults()));
     }
 
     public ApiServer(Engine engine, String modelId, String host, int port, Options options) throws IOException {
@@ -72,6 +111,7 @@ public final class ApiServer implements AutoCloseable {
         this.thinkingDefault = options.thinkingDefault();
         this.maxPromptBytes = options.maxPromptBytes() > 0
                 ? options.maxPromptBytes() : 16L * engine.backend().contextLength();
+        this.requestTimeoutMs = options.requestTimeoutMs();
         this.http = new HttpServer(host, port, options.http(), this::handle);
     }
 
@@ -140,11 +180,19 @@ public final class ApiServer implements AutoCloseable {
         long created = System.currentTimeMillis() / 1000;
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
+        Deadline deadline = new Deadline(requestTimeoutMs);
         if (!stream) {
-            Engine.Result r = engine.generate(prompt, params, null, () -> false);
+            Engine.Result r;
+            try {
+                r = engine.generate(prompt, params, null, deadline);
+            } catch (Engine.OverloadedException e) {
+                res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+                return;
+            }
+            String finish = deadline.finishReason(r);
             Map<String, Object> choice = chat
-                    ? Json.obj("index", 0, "message", Json.obj("role", "assistant", "content", r.text()), "finish_reason", r.finishReason())
-                    : Json.obj("index", 0, "text", r.text(), "finish_reason", r.finishReason());
+                    ? Json.obj("index", 0, "message", Json.obj("role", "assistant", "content", r.text()), "finish_reason", finish)
+                    : Json.obj("index", 0, "text", r.text(), "finish_reason", finish);
             res.send(200, "application/json", Json.write(Json.obj(
                     "id", id, "object", object, "created", created, "model", modelId,
                     "choices", List.of(choice),
@@ -152,35 +200,55 @@ public final class ApiServer implements AutoCloseable {
             return;
         }
 
+        // The stream headers are sent lazily, at the first token: until then a queue timeout can still be a 503.
+        IOException[] failure = new IOException[1];
+        Engine.Result r;
+        try {
+            r = engine.generate(prompt, params, text -> {
+                if (failure[0] != null) {
+                    return;
+                }
+                Map<String, Object> choice = chat
+                        ? Json.obj("index", 0, "delta", Json.obj("content", text), "finish_reason", null)
+                        : Json.obj("index", 0, "text", text, "finish_reason", null);
+                try {
+                    startStream(res, chat, id, object, created);
+                    sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
+                } catch (IOException e) {
+                    failure[0] = e; // client disconnected: stop generating
+                }
+            }, () -> failure[0] != null || deadline.getAsBoolean());
+        } catch (Engine.OverloadedException e) {
+            if (res.started()) {
+                throw e;
+            }
+            res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+            return;
+        }
+        if (failure[0] != null) {
+            throw failure[0];
+        }
+        startStream(res, chat, id, object, created);
+        String finish = deadline.finishReason(r);
+        Map<String, Object> last = chat
+                ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
+                : Json.obj("index", 0, "text", "", "finish_reason", finish);
+        sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                "choices", List.of(last), "usage", usage(r.stats())));
+        res.write("data: [DONE]\n\n");
+        res.end();
+    }
+
+    /** Sends the SSE headers (and, for chat, the initial role event) unless already done. */
+    private void startStream(HttpServer.Response res, boolean chat, String id, String object, long created) throws IOException {
+        if (res.started()) {
+            return;
+        }
         res.startStream(200, "text/event-stream; charset=utf-8");
         if (chat) {
             sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
                     "choices", List.of(Json.obj("index", 0, "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null))));
         }
-        IOException[] failure = new IOException[1];
-        Engine.Result r = engine.generate(prompt, params, text -> {
-            if (failure[0] != null) {
-                return;
-            }
-            Map<String, Object> choice = chat
-                    ? Json.obj("index", 0, "delta", Json.obj("content", text), "finish_reason", null)
-                    : Json.obj("index", 0, "text", text, "finish_reason", null);
-            try {
-                sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
-            } catch (IOException e) {
-                failure[0] = e; // client disconnected: stop generating
-            }
-        }, () -> failure[0] != null);
-        if (failure[0] != null) {
-            throw failure[0];
-        }
-        Map<String, Object> last = chat
-                ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", r.finishReason())
-                : Json.obj("index", 0, "text", "", "finish_reason", r.finishReason());
-        sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                "choices", List.of(last), "usage", usage(r.stats())));
-        res.write("data: [DONE]\n\n");
-        res.end();
     }
 
     private static void sse(HttpServer.Response res, Map<String, Object> event) throws IOException {
