@@ -123,26 +123,36 @@ step  symbols                best adjacent pair (lowest rank)      result
  5    Ġworld                 no mergeable pair                    done
 ```
 
-(Ranks are illustrative; the order is what matters.) The algorithm, `bpeUncached()`:
+(Ranks are illustrative; the order is what matters.) Conceptually the algorithm is:
 
 ```
 symbols = ids of the single-byte tokens
 loop:
-    scan all adjacent pairs, remember the pair with the smallest rank
+    among all adjacent pairs, take the one with the smallest rank (leftmost on ties)
     if no pair is in the merge table → stop
-    replace that pair with the merged token id (shift the rest left)
+    replace that pair with the merged token id
 ```
 
-Three implementation details keep this fast:
+Done naively — rescan every pair after every merge — this is O(n²) in the chunk length, and the pre-tokenizer
+can produce arbitrarily long chunks (a run of 1 MB of spaces is one chunk), which an API client could exploit.
+`bpeUncached()` therefore uses the standard O(n log n) formulation: the symbols live in a **doubly linked list**
+over their original positions, and every mergeable adjacent pair is a candidate in a **min-heap** keyed by
+`(rank, position)`. Each step pops the best candidate, checks that the pair is still present at that position
+(entries go stale when a neighbour was merged — ranks are unique per pair, so a matching rank means a matching
+pair), links the merged symbol in, and pushes the two new pairs formed with its neighbours. The result is
+identical to the naive loop (the smoke test proves this against a verbatim copy of the old implementation on
+every vocabulary string, thousands of random strings and 20 000-character runs, which now encode in
+milliseconds).
+
+Three more implementation details keep this fast:
 
 1. **No strings.** Symbols are token ids; the merge table is `HashMap<Long, Long>` keyed by
    `(leftId << 32) | rightId` with value `(rank << 32) | mergedId`. One hash lookup per pair, no concatenation.
 2. **`ignore_merges`** (true for Qwen): if the whole chunk is already a vocabulary entry, return it directly.
    Common words skip the loop entirely.
-3. **Memoization.** The result for each chunk is cached in a `ConcurrentHashMap` (capped at 100 000 entries).
-   Chunks like `" the"`, `","`, `"\n"` recur constantly; a chat prompt is mostly cache hits.
-
-Complexity is O(n²) in chunk length in the worst case, but chunks are words, so it does not matter.
+3. **Memoization.** The result for each chunk is cached in a `ConcurrentHashMap` (capped at 100 000 entries,
+   and only for chunks of at most 64 bytes so that unusual input cannot fill memory). Chunks like `" the"`,
+   `","`, `"\n"` recur constantly; a chat prompt is mostly cache hits.
 
 ## 4.7 Added and special tokens
 

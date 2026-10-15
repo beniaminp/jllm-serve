@@ -163,10 +163,11 @@ mass from i onward  ≤  (V − 1) · pᵢ          hence   pᵢ < (1 − p) / (
 For `p = 0.95`, `V = 151 936`: the cutoff is `3.3 × 10⁻⁷`. Typically only a few hundred tokens survive, and only
 those are sorted (`sortDescending`).
 
-**Known limitation** (found in review): on this `top_k = 0` path the softmax `sum` used for `cum` is computed
-over the *surviving* candidates rather than the full vocabulary, so cumulative probabilities are slightly
-inflated and the nucleus can be cut one token early. The default path (`top_k = 20`) is unaffected, since there
-the top-k set *is* the candidate set, matching Hugging Face exactly.
+One subtlety: the cumulative probabilities must be measured against the **full-vocabulary** softmax sum, not
+the sum over the survivors — the pruned tail still carries up to `1 − p` of the mass. `nucleusCandidates()`
+therefore returns the denominator computed over all `V` logits, and `sample()` uses it for `cum` on this path.
+(An earlier version normalized over the survivors only, which cut the nucleus one token early; `SmokeTest`
+now checks the kept set against a brute-force reference.)
 
 ---
 
