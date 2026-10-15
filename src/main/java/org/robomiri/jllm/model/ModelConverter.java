@@ -140,6 +140,9 @@ public final class ModelConverter {
                         in.add(ep + "down_proj.weight");
                     }
                 }
+            } else if (fusedGateUp(p)) {
+                in.add(p + "mlp.gate_up_proj.weight");
+                in.add(p + "mlp.down_proj.weight");
             } else {
                 in.add(p + "mlp.gate_proj.weight");
                 in.add(p + "mlp.up_proj.weight");
@@ -171,7 +174,8 @@ public final class ModelConverter {
     private List<String> layerNorms(String p) {
         List<String> out = new ArrayList<>(4);
         for (String n : new String[]{"input_layernorm.weight", "post_attention_layernorm.weight",
-                "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+                "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+                "post_self_attn_layernorm.weight", "post_mlp_layernorm.weight"}) {
             if (shardOf.containsKey(p + n)) {
                 out.add(p + n);
             }
@@ -181,6 +185,11 @@ public final class ModelConverter {
 
     private String routerName(String p) {
         return shardOf.containsKey(p + "mlp.gate.weight") ? p + "mlp.gate.weight" : p + "mlp.router.weight";
+    }
+
+    /** GLM checkpoints store the dense MLP's gate and up projections as one {@code mlp.gate_up_proj}. */
+    private boolean fusedGateUp(String p) {
+        return shardOf.containsKey(p + "mlp.gate_up_proj.weight");
     }
 
     private boolean fusedExperts(String p) {
@@ -206,6 +215,11 @@ public final class ModelConverter {
         }
         if (cfg.isMoeLayer(l)) {
             convertMoe(w, a, l, p);
+        } else if (fusedGateUp(p)) {
+            // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
+            w.put(p + "mlp.gate_up", quantize(a, quant, tensor(p + "mlp.gate_up_proj.weight")));
+            String d = p + "mlp.down_proj.weight";
+            w.put(d, quantize(a, quant, tensor(d)));
         } else {
             String g = p + "mlp.gate_proj.weight";
             String u = p + "mlp.up_proj.weight";

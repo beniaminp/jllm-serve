@@ -15,6 +15,9 @@ public final class ModelWeights implements AutoCloseable {
     public static final class Layer {
         public float[] attnNorm;
         public float[] ffnNorm;
+        /** Glm4: RMSNorm of the attention / MLP output before the residual add; null for other models. */
+        public float[] postAttnNorm;
+        public float[] postMlpNorm;
         /** Per-head RMSNorm on queries/keys (Qwen3); null for models without it. */
         public float[] qNorm;
         public float[] kNorm;
@@ -65,6 +68,10 @@ public final class ModelWeights implements AutoCloseable {
             Layer L = new Layer();
             L.attnNorm = file.floats(p + "input_layernorm.weight");
             L.ffnNorm = file.floats(p + "post_attention_layernorm.weight");
+            if (cfg.postNorms()) {
+                L.postAttnNorm = file.floats(p + "post_self_attn_layernorm.weight");
+                L.postMlpNorm = file.floats(p + "post_mlp_layernorm.weight");
+            }
             L.qNorm = file.has(p + "self_attn.q_norm.weight") ? file.floats(p + "self_attn.q_norm.weight") : null;
             L.kNorm = file.has(p + "self_attn.k_norm.weight") ? file.floats(p + "self_attn.k_norm.weight") : null;
             L.wq = file.tensor(p + "self_attn.q_proj.weight");
@@ -120,6 +127,8 @@ public final class ModelWeights implements AutoCloseable {
     /** Every shape a backend relies on: a mismatch here would otherwise surface as a silent out-of-bounds read. */
     private static void checkShapes(ModelConfig c, Layer L, int l) {
         boolean ok = L.attnNorm.length == c.dim() && L.ffnNorm.length == c.dim()
+                && (c.postNorms() == (L.postAttnNorm != null) && c.postNorms() == (L.postMlpNorm != null))
+                && (L.postAttnNorm == null || (L.postAttnNorm.length == c.dim() && L.postMlpNorm.length == c.dim()))
                 && L.wq.rows == c.qDim() && L.wq.cols == c.dim()
                 && L.wk.rows == c.kvDim() && L.wk.cols == c.dim()
                 && L.wv.rows == c.kvDim() && L.wv.cols == c.dim()

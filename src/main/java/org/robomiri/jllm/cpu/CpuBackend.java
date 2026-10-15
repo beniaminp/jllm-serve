@@ -1,6 +1,7 @@
 package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
@@ -121,7 +122,13 @@ public final class CpuBackend implements Backend {
             normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos);
             kv.store(l, pos, kStage, vStage, n);
             attention(l, n, pos);
-            matmul(L.wo, att, x, 0, n, true);
+            if (L.postAttnNorm != null) {
+                // Glm4: x += rmsnorm(o_proj(attention))
+                matmul(L.wo, att, xb, 0, n, false);
+                addNormed(xb, L.postAttnNorm, n);
+            } else {
+                matmul(L.wo, att, x, 0, n, true);
+            }
 
             rmsnorm(x, xb, L.ffnNorm, n, dim);
             if (L.moe) {
@@ -129,7 +136,13 @@ public final class CpuBackend implements Backend {
             } else {
                 matmul(L.wGateUp, xb, gateUp, 0, n, false);
                 siluMul(n);
-                matmul(L.wDown, hidden, x, 0, n, true);
+                if (L.postMlpNorm != null) {
+                    // Glm4: x += rmsnorm(down_proj(mlp)); xb is free again once gate/up are computed
+                    matmul(L.wDown, hidden, xb, 0, n, false);
+                    addNormed(xb, L.postMlpNorm, n);
+                } else {
+                    matmul(L.wDown, hidden, x, 0, n, true);
+                }
             }
         }
         if (logits != null) {
@@ -143,6 +156,15 @@ public final class CpuBackend implements Backend {
     private void rmsnorm(float[] in, float[] out, float[] weight, int n, int width) {
         for (int t = 0; t < n; t++) {
             rmsnormRow(in, t * width, out, t * width, weight, width);
+        }
+    }
+
+    /** x[t] += rmsnorm(y[t]) * weight for n rows; y is overwritten with the normalized rows. */
+    private void addNormed(float[] y, float[] weight, int n) {
+        int dim = c.dim();
+        rmsnorm(y, y, weight, n, dim);
+        for (int i = 0; i < n * dim; i++) {
+            x[i] += y[i];
         }
     }
 
@@ -208,7 +230,8 @@ public final class CpuBackend implements Backend {
     /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
     private void normRope(float[] v, int base, int stride, int nHeads, float[] norm, int n, int pos) {
         int hd = c.headDim();
-        int half = hd / 2;
+        int half = c.rotaryDim() / 2; // rope table width; = hd / 2 unless partial_rotary_factor < 1
+        boolean interleaved = c.ropeInterleaved();
         for (int t = 0; t < n; t++) {
             float[] cos = rope.cos;
             float[] sin = rope.sin;
@@ -217,6 +240,10 @@ public final class CpuBackend implements Backend {
                 int o = base + t * stride + h * hd;
                 if (norm != null) {
                     rmsnormRow(v, o, v, o, norm, hd);
+                }
+                if (interleaved) {
+                    InterleavedRope.rotate(v, o, c.rotaryDim(), cos, sin, ro);
+                    continue;
                 }
                 for (int i = 0; i < half; i++) {
                     float a = v[o + i];

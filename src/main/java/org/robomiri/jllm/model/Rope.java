@@ -6,6 +6,9 @@ package org.robomiri.jllm.model;
  * {@code theta^(-2i/headDim)} optionally rescaled for long-context models (see {@link #invFreq}).
  */
 public final class Rope {
+    // GLM (ModelConfig.ropeInterleaved) uses the same tables, built for the rotated slice only: rotaryDim/2
+    // entries per position and frequencies theta^(-2i/rotaryDim). The pair (2i, 2i+1) of the head is rotated by
+    // entry i instead of the pair (i, i + rotaryDim/2).
 
     /** {@code [ctx * headDim/2]} cosines. */
     public final float[] cos;
@@ -32,7 +35,7 @@ public final class Rope {
     }
 
     public static Rope of(ModelConfig c, int ctx) {
-        return new Rope(c.headDim(), c.ropeTheta(), ctx, c.ropeScaling());
+        return new Rope(c.rotaryDim(), c.ropeTheta(), ctx, c.ropeScaling());
     }
 
     /**

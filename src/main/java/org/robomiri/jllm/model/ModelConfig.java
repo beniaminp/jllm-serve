@@ -27,6 +27,7 @@ import java.util.stream.Collectors;
  * @param moeDim        intermediate size of each expert
  * @param normTopK      renormalize the top-k router weights to sum to 1
  * @param mlpOnlyLayers layers that use the dense MLP even in a MoE model
+ * @param partialRotaryFactor fraction of each head that is rotated by RoPE (GLM: 0.5 or 1.0; others 1.0)
  */
 public record ModelConfig(
         String architecture,
@@ -54,7 +55,8 @@ public record ModelConfig(
         int moeDim,
         boolean normTopK,
         int sparseStep,
-        Set<Integer> mlpOnlyLayers) {
+        Set<Integer> mlpOnlyLayers,
+        double partialRotaryFactor) {
 
     /** RoPE scaling from {@code rope_scaling}. {@code type} is {@code llama3} or {@code linear}. */
     public record RopeScaling(String type, double factor, double lowFreqFactor, double highFreqFactor,
@@ -82,6 +84,21 @@ public record ModelConfig(
         return kvHeads * headDim;
     }
 
+    /** GLM family (glm, glm4): RoPE rotates the interleaved pairs (2i, 2i+1) instead of (i, i + headDim/2). */
+    public boolean ropeInterleaved() {
+        return modelType.equals("glm") || modelType.equals("glm4");
+    }
+
+    /** Leading dimensions of each head that RoPE rotates: {@code headDim * partial_rotary_factor}, even. */
+    public int rotaryDim() {
+        return (int) (headDim * partialRotaryFactor) & ~1;
+    }
+
+    /** Glm4: RMSNorms on the attention and MLP outputs, before they are added to the residual stream. */
+    public boolean postNorms() {
+        return modelType.equals("glm4");
+    }
+
     public boolean isMoe() {
         return numExperts > 0;
     }
@@ -97,7 +114,9 @@ public record ModelConfig(
             "mistral", "MistralForCausalLM",
             "qwen2", "Qwen2ForCausalLM",
             "qwen3", "Qwen3ForCausalLM",
-            "qwen3_moe", "Qwen3MoeForCausalLM");
+            "qwen3_moe", "Qwen3MoeForCausalLM",
+            "glm", "GlmForCausalLM",
+            "glm4", "Glm4ForCausalLM");
 
     public static ModelConfig load(Path dir) throws IOException {
         Map<String, Object> c;
@@ -140,10 +159,22 @@ public record ModelConfig(
             throw new IllegalArgumentException("models with an MLP bias (mlp_bias=true) are not supported");
         }
         boolean qwen2 = modelType.equals("qwen2");
-        if (!qwen2 && Json.bool(c, "attention_bias", false)) {
+        boolean glm = modelType.equals("glm") || modelType.equals("glm4");
+        // GlmConfig / Glm4Config default attention_bias to true (q/k/v only; o_proj never has a bias there)
+        boolean bias = qwen2 || (glm && Json.bool(c, "attention_bias", true));
+        if (!qwen2 && !glm && Json.bool(c, "attention_bias", false)) {
             // transformers also adds a bias to o_proj in that case, which this engine does not implement
-            throw new IllegalArgumentException("attention_bias=true is only supported for qwen2 (q/k/v bias)");
+            throw new IllegalArgumentException("attention_bias=true is only supported for qwen2 and glm (q/k/v bias)");
         }
+        // newer transformers nest rope_theta / partial_rotary_factor in rope_parameters; Hub configs use top level
+        Map<String, Object> ropeParams = Json.map(c, "rope_parameters");
+        double partialRotary = Json.dbl(c, "partial_rotary_factor",
+                ropeParams != null ? Json.dbl(ropeParams, "partial_rotary_factor", glm ? 0.5 : 1.0) : glm ? 0.5 : 1.0);
+        if (partialRotary <= 0 || partialRotary > 1 || (int) (headDim * partialRotary) < 2) {
+            throw new IllegalArgumentException("invalid partial_rotary_factor " + partialRotary);
+        }
+        double ropeTheta = Json.dbl(c, "rope_theta",
+                ropeParams != null ? Json.dbl(ropeParams, "rope_theta", 10000.0) : 10000.0);
         int window = 0;
         int windowFrom = 0;
         long sw = Json.num(c, "sliding_window", 0);
@@ -178,7 +209,7 @@ public record ModelConfig(
         ModelConfig cfg = new ModelConfig(
                 arch,
                 modelType,
-                qwen2,
+                bias,
                 modelType.startsWith("qwen3"),
                 window,
                 windowFrom,
@@ -194,14 +225,15 @@ public record ModelConfig(
                 vocab,
                 (int) Json.num(c, "max_position_embeddings", 4096),
                 (float) Json.dbl(c, "rms_norm_eps", 1e-6),
-                Json.dbl(c, "rope_theta", 10000.0),
+                ropeTheta,
                 Json.bool(c, "tie_word_embeddings", false),
                 numExperts,
                 expertsPerTok,
                 moeDim,
                 Json.bool(c, "norm_topk_prob", false),
                 (int) Json.num(c, "decoder_sparse_step", 1),
-                mlpOnlyLayers);
+                mlpOnlyLayers,
+                partialRotary);
         boolean anyDense = false;
         for (int l = 0; l < layers; l++) {
             anyDense |= !cfg.isMoeLayer(l);
@@ -258,7 +290,8 @@ public record ModelConfig(
         // (also stored in the quantized cache) of an existing Qwen3 model does not change.
         String extra = (attentionBias ? " bias" : "") + (slidingWindow > 0 ? " window=" + slidingWindow
                 + (windowFromLayer > 0 ? "@" + windowFromLayer : "") : "")
-                + (ropeScaling != null ? " rope=" + ropeScaling.type() + "x" + ropeScaling.factor() : "");
+                + (ropeScaling != null ? " rope=" + ropeScaling.type() + "x" + ropeScaling.factor() : "")
+                + (ropeInterleaved() ? " rope=interleaved/" + rotaryDim() : "") + (postNorms() ? " postnorms" : "");
         return String.format("%s dim=%d ffn=%d layers=%d heads=%d/%d headDim=%d vocab=%d theta=%.0f%s%s",
                 architecture, dim, hiddenDim, layers, heads, kvHeads, headDim, vocabSize, ropeTheta, moe, extra);
     }
