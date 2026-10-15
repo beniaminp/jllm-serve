@@ -169,6 +169,7 @@ public final class ApiServer implements AutoCloseable {
         int[] prompt;
         SamplingParams params;
         try {
+            checkUnsupported(body, chat);
             prompt = chat ? chatPrompt(body) : rawPrompt(body);
             int ctx = engine.backend().contextLength();
             if (prompt.length >= ctx) {
@@ -185,6 +186,11 @@ public final class ApiServer implements AutoCloseable {
             return;
         }
         boolean stream = Json.bool(body, "stream", false);
+        // OpenAI: with stream_options the usage goes into a separate final chunk (only when include_usage is true);
+        // without it we keep the legacy inline usage on the last choice chunk
+        Map<String, Object> streamOptions = Json.map(body, "stream_options");
+        boolean separateUsage = streamOptions != null;
+        boolean includeUsage = streamOptions == null || Json.bool(streamOptions, "include_usage", false);
         String id = (chat ? "chatcmpl-" : "cmpl-") + Long.toHexString(System.currentTimeMillis()) + "-" + counter.incrementAndGet();
         long created = System.currentTimeMillis() / 1000;
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
@@ -242,10 +248,47 @@ public final class ApiServer implements AutoCloseable {
         Map<String, Object> last = chat
                 ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
                 : Json.obj("index", 0, "text", "", "finish_reason", finish);
-        sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                "choices", List.of(last), "usage", usage(r.stats())));
+        Map<String, Object> event = Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                "choices", List.of(last));
+        if (includeUsage && !separateUsage) {
+            event.put("usage", usage(r.stats()));
+        }
+        sse(res, event);
+        if (includeUsage && separateUsage) {
+            sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                    "choices", List.of(), "usage", usage(r.stats())));
+        }
         res.write("data: [DONE]\n\n");
         res.end();
+    }
+
+    /** Rejects request features this server cannot honour rather than silently ignoring them. */
+    private static void checkUnsupported(Map<String, Object> b, boolean chat) {
+        if (Json.num(b, "n", 1) != 1) {
+            throw RequestError.invalid("'n' other than 1 is not supported");
+        }
+        Object tools = b.get("tools");
+        if (tools instanceof List<?> l && !l.isEmpty()) {
+            throw RequestError.invalid("'tools' is not supported");
+        }
+        Object toolChoice = b.get("tool_choice");
+        if (toolChoice != null && !"none".equals(toolChoice)) {
+            throw RequestError.invalid("'tool_choice' is not supported");
+        }
+        Map<String, Object> format = Json.map(b, "response_format");
+        if (format != null && !"text".equals(Json.str(format, "type", "text"))) {
+            throw RequestError.invalid("'response_format' other than text is not supported");
+        }
+        Object logprobs = b.get("logprobs"); // boolean on chat, an integer (top n) on completions
+        if (Boolean.TRUE.equals(logprobs) || logprobs instanceof Number n && n.intValue() != 0) {
+            throw RequestError.invalid("'logprobs' is not supported");
+        }
+        if (!chat && b.get("prompt") instanceof List<?> l) {
+            if (l.size() != 1 || !(l.getFirst() instanceof String)) {
+                throw RequestError.invalid("'prompt' must be a string or a single-element array of strings"
+                        + " (batches and token-id arrays are not supported)");
+            }
+        }
     }
 
     /** Sends the SSE headers (and, for chat, the initial role event) unless already done. */
@@ -286,7 +329,11 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private int[] rawPrompt(Map<String, Object> body) {
-        String text = Json.str(body, "prompt", "");
+        Object p = body.get("prompt");
+        if (p instanceof List<?> l) { // a single-element string array (validated in checkUnsupported)
+            p = l.getFirst();
+        }
+        String text = p instanceof String str ? str : "";
         checkPromptBytes(utf8Length(text));
         return engine.tokenizer().encode(text);
     }
