@@ -71,7 +71,15 @@ public final class VectorKernels {
         return acc.reduceLanes(VectorOperators.ADD);
     }
 
-    /** sum(bytes[0..16) * x[xb .. xb+16)) as a float vector (lanes not yet reduced). */
+    /**
+     * sum(bytes[0..16) * x[xb .. xb+16)) as a float vector (lanes not yet reduced).
+     *
+     * <p>{@code castShape(F, part)} with {@code part > 0} is implemented as {@code slice(part * FL)} followed by a
+     * part-0 cast; on AArch64 the slice is a single {@code ext} and the JIT compiles it as cheaply as part 0
+     * (measured: equal cost). Restructuring this to narrower byte loads so that only part-0 casts remain was
+     * measured slower on 128-bit NEON (1.5x per Q4 row in isolation, and the wider Q8 body fell off the intrinsic
+     * path entirely), so the part-based form is kept deliberately.
+     */
     private static FloatVector halfDot(ByteVector bytes, float[] x, int xb) {
         if (FL == 16) {
             return ((FloatVector) bytes.castShape(F, 0)).mul(FloatVector.fromArray(F, x, xb));
