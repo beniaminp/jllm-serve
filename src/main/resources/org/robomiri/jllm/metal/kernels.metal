@@ -1362,8 +1362,9 @@ static inline void q2k_sub_block(device const uchar *wq, ulong grow, int nsb, in
     device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q2K_BYTES;
     const int j = u & 15;
     const uchar s = blk[j];
-    const float dl = float(*(device const half *)(blk + 80)) * float(s & 15);
-    const float ml = float(*(device const half *)(blk + 82)) * float(s >> 4);
+    const float2 dd = float2(as_type<half2>(*(device const uint *)(blk + 80)));   // d, dmin (4-byte aligned)
+    const float dl = dd.x * float(s & 15);
+    const float ml = dd.y * float(s >> 4);
     const uchar shift = uchar(((j & 7) >> 1) << 1);
     device const uchar4 *q = (device const uchar4 *)(blk + 16 + (j >> 3) * 32 + (j & 1) * 16);
     for (int k = 0; k < 4; k++) w[k] = float4((q[k] >> uchar4(shift)) & uchar4(3)) * dl - ml;
