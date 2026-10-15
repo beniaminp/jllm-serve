@@ -29,6 +29,7 @@ public final class SmokeTest {
         Path dir = Path.of(args.length > 0 ? args[0] : "models/Qwen_Qwen3-0.6B");
         json();
         tokenizer(dir);
+        tokenizerErrors();
         bpeEquivalence(dir);
         streamDecoder();
         safetensors(dir);
@@ -60,6 +61,45 @@ public final class SmokeTest {
         check(t.tokenId("<|im_end|>") == 151645 && t.isSpecial(151645), "special tokens");
         String p = ChatTemplate.render(List.of(new ChatTemplate.Message("user", "hi")), true, false);
         check(p.equals("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"), "template");
+    }
+
+    /** Malformed tokenizer.json must fail with IllegalArgumentException and a message naming the problem. */
+    static void tokenizerErrors() {
+        expectIae(() -> Tokenizer.fromJson("[]"), "expected a JSON object", "non-object tokenizer.json");
+        expectIae(() -> Tokenizer.fromJson("{}"), "no \"model\"", "missing model");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"WordPiece\"}}"), "only BPE", "non-BPE model");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\"}}"), "no \"vocab\"", "missing vocab");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":[]}}"), "no \"vocab\"",
+                "vocab not an object");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":\"x\"}}}"), "invalid id",
+                "vocab id not a number");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":-1}}}"), "invalid id",
+                "vocab id negative");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[\"ab\"]}}"),
+                "merge #0", "legacy merge without a space");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[\"a b\",\"c \"]}}"),
+                "merge #1", "legacy merge with empty right side");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[[\"a\"]]}}"),
+                "merge #0", "merge pair with one element");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[[\"a\",1]]}}"),
+                "merge #0", "merge pair with non-string");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[7]}}"),
+                "merge #0", "merge entry of wrong type");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[\"a b\"]}}"),
+                "byte-level symbol", "vocab without byte alphabet");
+    }
+
+    static void expectIae(Runnable r, String messagePart, String what) {
+        try {
+            r.run();
+        } catch (IllegalArgumentException e) {
+            check(e.getMessage() != null && e.getMessage().contains(messagePart),
+                    what + ": " + e.getMessage());
+            return;
+        } catch (RuntimeException e) {
+            throw new AssertionError(what + ": expected IllegalArgumentException, got " + e, e);
+        }
+        throw new AssertionError(what + ": expected IllegalArgumentException, nothing was thrown");
     }
 
     /**

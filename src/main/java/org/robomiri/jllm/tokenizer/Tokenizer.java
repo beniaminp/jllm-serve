@@ -54,18 +54,62 @@ public final class Tokenizer {
     private Tokenizer(Map<String, Object> json) {
         initByteMapping();
         Map<String, Object> model = Json.map(json, "model");
-        if (model == null || !"BPE".equals(Json.str(model, "type", "BPE"))) {
-            throw new IllegalArgumentException("only BPE tokenizers are supported");
+        if (model == null) {
+            throw new IllegalArgumentException("tokenizer.json has no \"model\" object");
+        }
+        if (!"BPE".equals(Json.str(model, "type", "BPE"))) {
+            throw new IllegalArgumentException("only BPE tokenizers are supported, got model.type="
+                    + Json.str(model, "type", null));
         }
         ignoreMerges = Json.bool(model, "ignore_merges", false);
 
         Map<String, Object> v = Json.map(model, "vocab");
+        if (v == null) {
+            throw new IllegalArgumentException("tokenizer.json model has no \"vocab\" object");
+        }
         vocab = new HashMap<>(v.size() * 2);
         int maxId = -1;
         for (Map.Entry<String, Object> e : v.entrySet()) {
-            int id = ((Number) e.getValue()).intValue();
+            if (!(e.getValue() instanceof Number n) || n.longValue() < 0 || n.longValue() > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("vocab entry " + Json.write(e.getKey()) + " has invalid id "
+                        + e.getValue());
+            }
+            int id = n.intValue();
             vocab.put(e.getKey(), id);
             maxId = Math.max(maxId, id);
+        }
+
+        List<Object> mergeList = Json.list(model, "merges");
+        merges = new HashMap<>(mergeList == null ? 16 : mergeList.size() * 2);
+        if (mergeList != null) {
+            int rank = 0;
+            for (Object m : mergeList) {
+                String a;
+                String b;
+                if (m instanceof String s) { // legacy "a b" format
+                    int sp = s.indexOf(' ');
+                    if (sp <= 0 || sp == s.length() - 1) {
+                        throw new IllegalArgumentException("merge #" + rank + " " + Json.write(s)
+                                + " is not of the form \"left right\"");
+                    }
+                    a = s.substring(0, sp);
+                    b = s.substring(sp + 1);
+                } else if (m instanceof List<?> pair && pair.size() == 2
+                        && pair.get(0) instanceof String l && pair.get(1) instanceof String r) {
+                    a = l;
+                    b = r;
+                } else {
+                    throw new IllegalArgumentException("merge #" + rank + " " + Json.write(m)
+                            + " is neither \"left right\" nor [\"left\", \"right\"]");
+                }
+                Integer ia = vocab.get(a);
+                Integer ib = vocab.get(b);
+                Integer merged = vocab.get(a + b);
+                if (ia != null && ib != null && merged != null) {
+                    merges.putIfAbsent(pairKey(ia, ib), ((long) rank << 32) | merged);
+                }
+                rank++;
+            }
         }
 
         addedTokens = new HashMap<>();
@@ -104,32 +148,6 @@ public final class Tokenizer {
             byteCharIds[b] = id;
         }
 
-        List<Object> mergeList = Json.list(model, "merges");
-        merges = new HashMap<>(mergeList == null ? 16 : mergeList.size() * 2);
-        if (mergeList != null) {
-            int rank = 0;
-            for (Object m : mergeList) {
-                String a;
-                String b;
-                if (m instanceof String s) { // legacy "a b" format
-                    int sp = s.indexOf(' ');
-                    a = s.substring(0, sp);
-                    b = s.substring(sp + 1);
-                } else {
-                    List<?> pair = (List<?>) m;
-                    a = (String) pair.get(0);
-                    b = (String) pair.get(1);
-                }
-                Integer ia = vocab.get(a);
-                Integer ib = vocab.get(b);
-                Integer merged = vocab.get(a + b);
-                if (ia != null && ib != null && merged != null) {
-                    merges.putIfAbsent(pairKey(ia, ib), ((long) rank << 32) | merged);
-                }
-                rank++;
-            }
-        }
-
         // Longest-first alternation so e.g. "<|im_start|>" wins over any shorter overlapping token.
         addedPattern = addedTokens.isEmpty() ? null : Pattern.compile(addedTokens.keySet().stream()
                 .sorted(Comparator.comparingInt(String::length).reversed())
@@ -143,7 +161,12 @@ public final class Tokenizer {
     }
 
     public static Tokenizer load(Path tokenizerJson) throws IOException {
-        return new Tokenizer(Json.parseObject(Files.readString(tokenizerJson)));
+        return fromJson(Files.readString(tokenizerJson));
+    }
+
+    /** @throws IllegalArgumentException if the text is not a well-formed BPE tokenizer.json */
+    public static Tokenizer fromJson(String tokenizerJson) {
+        return new Tokenizer(Json.parseObject(tokenizerJson));
     }
 
     // ------------------------------------------------------------------ public API
