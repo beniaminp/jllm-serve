@@ -1,6 +1,8 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.model.DeepSeekConfig;
+import org.robomiri.jllm.model.DeepSeekRouter;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.Rope;
@@ -41,12 +43,15 @@ public final class SmokeTest {
         safetensors(dir);
         ropeScaling();
         glmRope();
+        yarnRope();
+        deepseekRouting();
         modelConfigs();
         longRope();
         phi3Configs();
         GemmaChecks.run();
         mamba();
         prefixReuse(dir);
+        deepseekConfigs();
         System.out.println("all smoke tests passed");
     }
 
@@ -907,6 +912,175 @@ public final class SmokeTest {
                 check(b.calls.get(0)[0] == (rewind ? 7 : 0), (rewind ? "kv" : "mamba")
                         + " backend: resending the same prompt restarts at " + (rewind ? 7 : 0));
             }
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * YaRN inverse frequencies (DeepSeek-V2-Lite: rope dim 64, theta 1e4, factor 40, original 4096, beta 32 / 1) against
+     * hand-computed values. Correction dims: 64 ln(4096 / (32 * 2 pi)) / (2 ln 1e4) = 10.47, so low = floor = 10;
+     * 64 ln(4096 / (1 * 2 pi)) / (2 ln 1e4) = 22.51, so high = ceil = 23. Pairs i <= 10 keep theta^(-i/32), pairs
+     * i >= 23 are divided by 40, in between ramp = (i - 10) / 13 blends: i = 16 gives
+     * 0.00025 * 6/13 + 0.01 * 7/13 = 0.0055.
+     */
+    static void yarnRope() {
+        double[] f = Rope.yarnInvFreq(64, 1e4, 40, 4096, 32, 1);
+        check(f.length == 32 && f[0] == 1.0, "yarn keeps the fastest pair");
+        check(Math.abs(f[5] - Math.pow(1e4, -5.0 / 32)) < 1e-15 && Math.abs(f[10] - 0.056234132519034905) < 1e-15,
+                "yarn extrapolates pairs up to the low correction dim: " + f[10]);
+        check(Math.abs(f[16] - 0.0055) < 1e-15, "yarn ramp at pair 16: " + f[16]);
+        check(Math.abs(f[22] - 0.0001778279410038922) < 1e-15, "yarn ramp at pair 22: " + f[22]);
+        check(Math.abs(f[23] - 3.33380358040831e-05) < 1e-18 && Math.abs(f[23] - Math.pow(1e4, -23.0 / 32) / 40) < 1e-18
+                && Math.abs(f[31] - Math.pow(1e4, -31.0 / 32) / 40) < 1e-18, "yarn interpolates the slow pairs (divided by 40)");
+        // mscale = 0.1 * mscale * ln(factor) + 1
+        check(Math.abs(Rope.yarnMscale(40, 0.707) - 1.2608037774058554) < 1e-12 && Rope.yarnMscale(1, 0.707) == 1.0
+                && Math.abs(Rope.yarnMscale(40, 1.0) - 1.3688879454113936) < 1e-12, "yarn mscale");
+        // the table: cos/sin are multiplied by mscale / mscale_all_dim (1.0 when they are equal)
+        DeepSeekConfig.Yarn same = new DeepSeekConfig.Yarn(40, 4096, 32, 1, 0.707, 0.707);
+        Rope r = Rope.deepseek(new DeepSeekConfig(0, 512, 32, 64, 128, 1, 1, 2, 1, 1, false, "greedy", 1.0, false, same, 0.1),
+                1e4, 4);
+        check(r.cos[0] == 1f && r.sin[0] == 0f && Math.abs(r.cos[32 + 16] - (float) Math.cos(0.0055)) < 1e-6,
+                "yarn table without mscale correction");
+        DeepSeekConfig.Yarn diff = new DeepSeekConfig.Yarn(40, 4096, 32, 1, 1.0, 0.707);
+        Rope r2 = Rope.deepseek(new DeepSeekConfig(0, 512, 32, 64, 128, 1, 1, 2, 1, 1, false, "greedy", 1.0, false, diff, 0.1),
+                1e4, 4);
+        double m = 1.3688879454113936 / 1.2608037774058554;
+        check(Math.abs(r2.cos[0] - m) < 1e-6 && Math.abs(r2.sin[32 + 16] - Math.sin(0.0055) * m) < 1e-6,
+                "yarn table scaled by mscale / mscale_all_dim");
+    }
+
+    /** The three DeepSeek routing rules on hand-made score matrices. */
+    static void deepseekRouting() {
+        // softmax scores equal to the given probabilities (they sum to 1): logits = ln(p)
+        double[] p = {0.30, 0.02, 0.02, 0.01, 0.25, 0.20, 0.15, 0.05};
+        int[] idx = new int[3];
+        float[] w = new float[3];
+        // greedy: the three best experts overall
+        route(p, ds("greedy", 1, 1, false, 1.0, false), null, 3, false, idx, w);
+        check(Arrays.equals(idx, new int[]{0, 4, 5}) && near(w, 0.30f, 0.25f, 0.20f), "greedy top-3: " + Arrays.toString(idx));
+        // group_limited_greedy: 2 groups of 4, keep the group with the best max (g0: 0.30 vs 0.25), top-3 inside it:
+        // 0.30, then the 0.02 tie goes to the lower index
+        route(p, ds("group_limited_greedy", 2, 1, false, 1.0, false), null, 3, false, idx, w);
+        check(Arrays.equals(idx, new int[]{0, 1, 2}) && near(w, 0.30f, 0.02f, 0.02f),
+                "group_limited_greedy stays inside the best group: " + Arrays.toString(idx) + Arrays.toString(w));
+        // norm_topk_prob renormalizes to sum 1 (0.30 / 0.34 ...); V3 then multiplies by 2.5, V2 does not
+        route(p, ds("group_limited_greedy", 2, 1, false, 2.5, false), null, 3, true, idx, w);
+        check(near(w, 0.30f / 0.34f, 0.02f / 0.34f, 0.02f / 0.34f), "V2: routed_scaling_factor is skipped when renormalized");
+        route(p, ds("group_limited_greedy", 2, 1, false, 2.5, true), null, 3, true, idx, w);
+        check(near(w, 2.5f * 0.30f / 0.34f, 2.5f * 0.02f / 0.34f, 2.5f * 0.02f / 0.34f), "V3: renormalized weights times 2.5");
+        route(p, ds("group_limited_greedy", 2, 1, false, 2.5, false), null, 3, false, idx, w);
+        check(near(w, 0.75f, 0.05f, 0.05f), "V2: routed_scaling_factor applies without renormalization");
+        // keeping both groups excludes nothing: same as greedy
+        route(p, ds("group_limited_greedy", 2, 2, false, 1.0, false), null, 3, false, idx, w);
+        check(Arrays.equals(idx, new int[]{0, 4, 5}), "group_limited_greedy with all groups kept equals greedy");
+
+        // noaux_tc: sigmoid scores s = [.9 .1 | .6 .5 | .8 .7 | .3 .2], bias [-.5 0 | 0 0 | 0 0 | .45 .45]
+        // corrected = [.4 .1 | .6 .5 | .8 .7 | .75 .65]; group scores (sum of top 2) 0.5 1.1 1.5 1.4 -> groups 2 and 3;
+        // best two corrected inside them: expert 4 (.8), expert 6 (.75); weights are the uncorrected sigmoids .8 and .3
+        double[] s = {0.9, 0.1, 0.6, 0.5, 0.8, 0.7, 0.3, 0.2};
+        float[] bias = {-0.5f, 0, 0, 0, 0, 0, 0.45f, 0.45f};
+        int[] idx2 = new int[2];
+        float[] w2 = new float[2];
+        DeepSeekConfig v3 = ds("noaux_tc", 4, 2, true, 2.5, true);
+        DeepSeekRouter.select(logit(s), bias, v3, 2, true, idx2, w2, new float[8]);
+        check(Arrays.equals(idx2, new int[]{4, 6}) && near(w2, 2.5f * 0.8f / 1.1f, 2.5f * 0.3f / 1.1f),
+                "noaux_tc: selection on corrected scores, weights from the uncorrected: " + Arrays.toString(idx2) + Arrays.toString(w2));
+        // without the bias the raw group sums are 1.0 1.1 1.5 0.5: groups 2 and 1, best two inside: experts 4 and 5
+        DeepSeekRouter.select(logit(s), new float[8], v3, 2, true, idx2, w2, new float[8]);
+        check(Arrays.equals(idx2, new int[]{4, 5}), "noaux_tc with zero bias: " + Arrays.toString(idx2));
+        // noaux_tc ranks groups by the sum of their two best scores, group_limited_greedy by the maximum:
+        // [.5 .5] (sum 1.0, max .5) against [.95 .01] (sum .96, max .95)
+        double[] t = {0.5, 0.5, 0.95, 0.01};
+        int[] i1 = new int[1];
+        float[] w1 = new float[1];
+        DeepSeekRouter.select(logit(t), new float[4], ds("noaux_tc", 2, 1, true, 1.0, true), 1, false, i1, w1, new float[4]);
+        check(i1[0] == 0, "noaux_tc ranks groups by the sum of their two best scores: " + i1[0]);
+        DeepSeekRouter.select(logit(t), null, ds("group_limited_greedy", 2, 1, true, 1.0, false), 1, false, i1, w1, new float[4]);
+        check(i1[0] == 2, "group_limited_greedy ranks groups by their maximum: " + i1[0]);
+    }
+
+    private static DeepSeekConfig ds(String method, int nGroup, int topkGroup, boolean sigmoid, double scale, boolean scaleAlways) {
+        return new DeepSeekConfig(0, 64, 32, 32, 32, 0, 1, 0, nGroup, topkGroup, sigmoid, method, scale, scaleAlways, null, 1.0);
+    }
+
+    /** Logits whose sigmoid is {@code s}. */
+    private static float[] logit(double[] s) {
+        float[] out = new float[s.length];
+        for (int i = 0; i < s.length; i++) {
+            out[i] = (float) Math.log(s[i] / (1 - s[i]));
+        }
+        return out;
+    }
+
+    private static void route(double[] probs, DeepSeekConfig d, float[] bias, int k, boolean norm, int[] idx, float[] w) {
+        float[] logits = new float[probs.length];
+        for (int i = 0; i < probs.length; i++) {
+            logits[i] = (float) Math.log(probs[i]);
+        }
+        DeepSeekRouter.select(logits, bias, d, k, norm, idx, w, new float[probs.length]);
+    }
+
+    private static boolean near(float[] got, float... want) {
+        for (int i = 0; i < want.length; i++) {
+            if (Math.abs(got[i] - want[i]) > 1e-5f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The configs of DeepSeek-V2-Lite and DeepSeek-V3 as published (trimmed to the keys the engine reads). */
+    static void deepseekConfigs() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-cfg");
+        try {
+            ModelConfig v2 = cfg(tmp, """
+                    {"architectures":["DeepseekV2ForCausalLM"],"model_type":"deepseek_v2","bos_token_id":100000,
+                     "eos_token_id":100001,"first_k_dense_replace":1,"hidden_act":"silu","hidden_size":2048,
+                     "intermediate_size":10944,"kv_lora_rank":512,"max_position_embeddings":163840,
+                     "moe_intermediate_size":1408,"moe_layer_freq":1,"n_group":1,"n_routed_experts":64,"n_shared_experts":2,
+                     "norm_topk_prob":false,"num_attention_heads":16,"num_experts_per_tok":6,"num_hidden_layers":27,
+                     "num_key_value_heads":16,"q_lora_rank":null,"qk_nope_head_dim":128,"qk_rope_head_dim":64,
+                     "rms_norm_eps":1e-06,"rope_scaling":{"beta_fast":32,"beta_slow":1,"factor":40,"mscale":0.707,
+                     "mscale_all_dim":0.707,"original_max_position_embeddings":4096,"type":"yarn"},"rope_theta":10000,
+                     "routed_scaling_factor":1.0,"scoring_func":"softmax","tie_word_embeddings":false,"topk_group":1,
+                     "topk_method":"greedy","v_head_dim":128,"vocab_size":102400}""");
+            DeepSeekConfig d = v2.deepseek();
+            check(v2.headDim() == 192 && v2.qDim() == 16 * 192 && v2.kvHeads() == 16 && d.qLoraRank() == 0 && d.vHeadDim() == 128
+                    && d.kvLoraRank() == 512 && d.nShared() == 2 && v2.numExperts() == 64 && v2.expertsPerTok() == 6
+                    && v2.moeDim() == 1408 && !v2.isMoeLayer(0) && v2.isMoeLayer(1) && v2.isMoeLayer(26) && !v2.tiedEmbeddings()
+                    && v2.promptBosId() == 100000 && v2.eosTokenIds().equals(List.of(100001)) && v2.maxMlpDim() == 10944
+                    && !d.sigmoid() && d.topkMethod().equals("greedy") && !d.scaleAlways(), "deepseek-v2-lite config");
+            // softmax scale = 192^-0.5 * (0.1 * 0.707 * ln 40 + 1)^2
+            check(Math.abs(d.softmaxScale() - 0.07216878364870322 * 1.5896261651208736) < 1e-12 && d.yarn().factor() == 40,
+                    "deepseek-v2-lite attention scale with the yarn mscale: " + d.softmaxScale());
+            ModelConfig v3 = cfg(tmp, """
+                    {"architectures":["DeepseekV3ForCausalLM"],"model_type":"deepseek_v3","bos_token_id":0,"eos_token_id":1,
+                     "first_k_dense_replace":3,"hidden_size":7168,"intermediate_size":18432,"kv_lora_rank":512,
+                     "moe_intermediate_size":2048,"moe_layer_freq":1,"n_group":8,"n_routed_experts":256,"n_shared_experts":1,
+                     "norm_topk_prob":true,"num_attention_heads":128,"num_experts_per_tok":8,"num_hidden_layers":61,
+                     "num_key_value_heads":128,"q_lora_rank":1536,"qk_nope_head_dim":128,"qk_rope_head_dim":64,
+                     "rms_norm_eps":1e-06,"rope_scaling":{"beta_fast":32,"beta_slow":1,"factor":40,"mscale":1.0,
+                     "mscale_all_dim":1.0,"original_max_position_embeddings":4096,"type":"yarn"},"rope_theta":10000,
+                     "routed_scaling_factor":2.5,"scoring_func":"sigmoid","tie_word_embeddings":false,"topk_group":4,
+                     "topk_method":"noaux_tc","v_head_dim":128,"vocab_size":129280,
+                     "quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}""");
+            DeepSeekConfig d3 = v3.deepseek();
+            check(d3.qLoraRank() == 1536 && d3.sigmoid() && d3.topkMethod().equals("noaux_tc") && d3.nGroup() == 8
+                    && d3.topkGroup() == 4 && d3.routedScale() == 2.5 && d3.scaleAlways() && v3.normTopK()
+                    && !v3.isMoeLayer(2) && v3.isMoeLayer(3) && v3.maxMlpDim() == 18432 && v3.promptBosId() == 0
+                    && Math.abs(d3.softmaxScale() - 0.07216878364870322 * 1.3688879454113936 * 1.3688879454113936) < 1e-12,
+                    "deepseek-v3 config");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, "{\"model_type\":\"deepseek_v2\",\"hidden_size\":64,\"intermediate_size\":64,\"num_hidden_layers\":2,"
+                            + "\"num_attention_heads\":2,\"vocab_size\":10,\"kv_lora_rank\":32,\"qk_nope_head_dim\":32,"
+                            + "\"qk_rope_head_dim\":32,\"v_head_dim\":32,\"topk_method\":\"magic\"}");
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "topk_method", "unknown topk_method rejected");
         } finally {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);
