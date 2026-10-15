@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture smoke test: Llama / Mistral / Qwen2 / Phi-3 pipeline on tiny random checkpoints.
+# Architecture smoke test: Llama / Mistral / Qwen2 / GLM / Phi-3 / Gemma 2 / Gemma 3 pipeline on tiny random checkpoints.
 #
 # For every model it converts to q4 and q8 (and q2k when QType.Q2_K exists), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
@@ -19,6 +19,10 @@
 #                                                         at ctx 64), partial_rotary_factor 0.75, sliding window 6
 #   hf-internal-testing_tiny-random-Phi3ShortForCausalLM  generated: as above with the short factors, tied embeddings
 #   hf-internal-testing_tiny-random-Phi3MhaForCausalLM    generated: headDim 64, MHA, plain RoPE, sliding window 6
+#   hf-internal-testing_tiny-random-Gemma2ForCausalLM     generated: head_dim 64, (1+w) sandwich norms, gelu_tanh,
+#                                                         attention + final soft-capping, local/global alternation
+#   hf-internal-testing_tiny-random-Gemma3ForCausalLM     generated: q/k norm, 5 local + 1 global layers, two RoPE bases
+#   hf-internal-testing_tiny-random-Gemma3MMForCausalLM   generated: the same decoder in the multimodal wrapper layout
 #
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
@@ -58,9 +62,13 @@ gen glm4 Glm4ForCausalLM
 gen phi3 Phi3ForCausalLM
 gen phi3short Phi3ShortForCausalLM
 gen phi3mha Phi3MhaForCausalLM
+gen gemma2 Gemma2ForCausalLM
+gen gemma3 Gemma3ForCausalLM
+gen gemma3mm Gemma3MMForCausalLM
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
-  "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM"
+  "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
+  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM"

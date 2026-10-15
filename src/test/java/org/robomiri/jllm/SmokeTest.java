@@ -44,6 +44,7 @@ public final class SmokeTest {
         modelConfigs();
         longRope();
         phi3Configs();
+        GemmaChecks.run();
         System.out.println("all smoke tests passed");
     }
 

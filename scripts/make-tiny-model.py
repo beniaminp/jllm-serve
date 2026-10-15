@@ -3,9 +3,9 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm
 
-All three use headDim = 32 so the Metal backend (which needs a multiple of 32) can run them:
+All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
   mistral    sliding_window=4 on every layer, GQA 4/2, untied head
   qwen2      q/k/v bias, tied embeddings, sliding window 6 on layers >= 2 (use_sliding_window)
@@ -21,6 +21,13 @@ All three use headDim = 32 so the Metal backend (which needs a multiple of 32) c
              dims rotated), sliding_window=6 on all layers, GQA 4/2, untied head
   phi3short  as phi3 but original_max_position_embeddings=128 (short factors), tied embeddings, no sliding window
   phi3mha    Phi-3-mini / phi-4 style: headDim 64, MHA, plain RoPE (rope_scaling null), full rotation, sliding_window=6
+  gemma2     Gemma 2: head_dim 64, 4 norms per layer, (1+w) norms, gelu_tanh, attention soft-cap 1.0 (small so it
+             bites on random weights) and final soft-cap 30, query_pre_attn_scalar 48, local layers 0 and 2
+             (sliding_window 6), embedding scaled by sqrt(hidden)
+  gemma3     Gemma 3 text: head_dim 32, q/k norm, no soft-caps, 6 layers = 5 local + 1 global (pattern 6),
+             rope_theta 1e6 with linear scaling 8 on the global layer, rope_local_base_freq 1e4 on local ones
+  gemma3mm   the same decoder in the multimodal wrapper layout (Gemma3ForConditionalGeneration, text_config,
+             tensors under language_model.model.*, plus dummy vision tensors that must be ignored)
 """
 import json
 import os
@@ -69,7 +76,32 @@ FAMILIES = {
         max_position_embeddings=512, rms_norm_eps=1e-5, rope_theta=10000.0, hidden_act="silu",
         attention_bias=True, partial_rotary_factor=0.5, tie_word_embeddings=False, eos_token_id=[998, 999],
         pad_token_id=998),
+    "gemma2": dict(
+        architectures=["Gemma2ForCausalLM"], model_type="gemma2", hidden_size=128, intermediate_size=192,
+        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=64, vocab_size=1000,
+        max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=10000.0, hidden_act="gelu_pytorch_tanh",
+        hidden_activation="gelu_pytorch_tanh", attn_logit_softcapping=1.0, final_logit_softcapping=30.0,
+        query_pre_attn_scalar=48, sliding_window=6, attention_bias=False, tie_word_embeddings=True,
+        bos_token_id=2, eos_token_id=[1, 107]),
+    "gemma3": dict(
+        architectures=["Gemma3ForCausalLM"], model_type="gemma3_text", hidden_size=128, intermediate_size=192,
+        num_hidden_layers=6, num_attention_heads=4, num_key_value_heads=1, head_dim=32, vocab_size=1000,
+        max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=1000000.0, rope_local_base_freq=10000.0,
+        rope_scaling=dict(factor=8.0, rope_type="linear"), hidden_activation="gelu_pytorch_tanh",
+        attn_logit_softcapping=None, final_logit_softcapping=None, query_pre_attn_scalar=48, sliding_window=6,
+        sliding_window_pattern=6, attention_bias=False, tie_word_embeddings=True, bos_token_id=2,
+        eos_token_id=106),
 }
+TEXT_KEYS_EXCLUDED_IN_WRAPPER = ("architectures", "bos_token_id", "eos_token_id")
+
+
+def gemma_wrapper(text):
+    inner = {k: v for k, v in text.items() if k not in TEXT_KEYS_EXCLUDED_IN_WRAPPER}
+    return dict(architectures=["Gemma3ForConditionalGeneration"], model_type="gemma3", bos_token_id=2,
+                eos_token_id=106, image_token_index=1001, mm_tokens_per_image=4, text_config=inner,
+                vision_config=dict(model_type="siglip_vision_model", hidden_size=32, image_size=28,
+                                   intermediate_size=64, num_attention_heads=2, num_hidden_layers=1,
+                                   patch_size=14))
 
 
 def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
@@ -97,18 +129,23 @@ FAMILIES["phi3mha"] = phi3(256, 4, 4, 512, 1.0, 6, False, False)
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[2] not in FAMILIES:
+    if len(sys.argv) < 3 or sys.argv[2] not in FAMILIES and sys.argv[2] != "gemma3mm":
         sys.exit(__doc__)
     out, fam = sys.argv[1], sys.argv[2]
     seed = int(sys.argv[sys.argv.index("--seed") + 1]) if "--seed" in sys.argv else 1234
     rnd = random.Random(seed)
-    cfg = dict(FAMILIES[fam])
+    wrapper = fam == "gemma3mm"
+    cfg = dict(FAMILIES["gemma3" if wrapper else fam])
     d, heads, kv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     hd = cfg.get("head_dim", d // heads)
     glm = cfg["model_type"] in ("glm", "glm4")
     ffn, vocab = cfg["intermediate_size"], cfg["vocab_size"]
     bias = cfg["model_type"] == "qwen2" or (glm and cfg.get("attention_bias", True))
     fused = cfg["model_type"] == "phi3"
+    gemma = cfg["model_type"].startswith("gemma")
+    # Gemma stores norm gains as w and applies 1 + w, so random gains are centered on 0
+    nb = 0.0 if gemma else 1.0
+    pre = "language_model.model." if wrapper else "model."
 
     tensors = {}
 
@@ -118,11 +155,17 @@ def main():
     def vec(name, n, base=1.0, std=0.1):
         tensors[name] = ([n], [base + rnd.gauss(0, std) for _ in range(n)])
 
-    mat("model.embed_tokens.weight", vocab, d, 1.0)
+    mat(pre + "embed_tokens.weight", vocab, d, 1.0)
     for l in range(cfg["num_hidden_layers"]):
-        p = "model.layers.%d." % l
-        vec(p + "input_layernorm.weight", d)
-        vec(p + "post_attention_layernorm.weight", d)
+        p = pre + "layers.%d." % l
+        vec(p + "input_layernorm.weight", d, nb)
+        vec(p + "post_attention_layernorm.weight", d, nb)
+        if gemma:
+            vec(p + "pre_feedforward_layernorm.weight", d, nb)
+            vec(p + "post_feedforward_layernorm.weight", d, nb)
+        if cfg["model_type"] == "gemma3_text":
+            vec(p + "self_attn.q_norm.weight", hd, nb)
+            vec(p + "self_attn.k_norm.weight", hd, nb)
         if fused:  # rows: q (heads*hd), then k (kv*hd), then v (kv*hd)
             mat(p + "self_attn.qkv_proj.weight", (heads + 2 * kv) * hd, d)
         else:
@@ -143,9 +186,12 @@ def main():
             mat(p + "mlp.gate_proj.weight", ffn, d)
             mat(p + "mlp.up_proj.weight", ffn, d)
         mat(p + "mlp.down_proj.weight", d, ffn)
-    vec("model.norm.weight", d)
+    vec(pre + "norm.weight", d, nb)
     if not cfg["tie_word_embeddings"]:
         mat("lm_head.weight", vocab, d, 0.5)
+    if wrapper:
+        mat("vision_tower.vision_model.embeddings.patch_embedding.weight", 32, 24, 0.1)
+        mat("multi_modal_projector.mm_input_projection_weight", 32, d, 0.1)
 
     header, blobs, off = {}, [], 0
     for name, (shape, vals) in tensors.items():
@@ -162,6 +208,10 @@ def main():
         for b in blobs:
             f.write(b)
     cfg["torch_dtype"] = "float32"
+    if wrapper:
+        cfg = gemma_wrapper(cfg)
+        cfg["torch_dtype"] = "float32"
+        cfg["text_config"]["torch_dtype"] = "float32"
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
     print("wrote %s (%s, %d tensors, %.1f MB)" % (out, fam, len(tensors), off / 1e6))
