@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Architecture smoke test: Llama / Mistral / Qwen2 pipeline on tiny random checkpoints.
+#
+# For every model it converts to q4 and q8 (and q2k when QType.Q2_K exists), loads, generates 8 tokens greedily
+# on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
+#
+# Models (under $ARCH_MODELS, default /tmp/jllm-arch-models):
+#   hf-internal-testing_tiny-random-LlamaForCausalLM      downloaded from the Hub (4 MB, random weights);
+#                                                         hidden_size 16: not a multiple of the 32-wide quantization
+#                                                         block, so the engine reports it as unsupported (skipped)
+#   hf-internal-testing_tiny-random-LlamaPlainForCausalLM generated: plain Llama, GQA, untied head
+#   hf-internal-testing_tiny-random-MistralForCausalLM    generated: the Hub repo only has pytorch_model.bin and a
+#                                                         gelu config, so a silu Mistral config with
+#                                                         sliding_window=4 and fresh random weights is written
+#   hf-internal-testing_tiny-random-Qwen2ForCausalLM      generated: the repo does not exist on the Hub; q/k/v bias,
+#                                                         tied embeddings, sliding window on layers >= 2
+#   hf-internal-testing_tiny-random-Llama3RopeForCausalLM generated: llama3 rope_scaling, MHA, tied embeddings
+#
+# usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -x /opt/homebrew/opt/openjdk@26/bin/java ] && export JAVA_HOME=/opt/homebrew/opt/openjdk@26
+export JAVA_HOME="${JAVA_HOME:?set JAVA_HOME to a JDK 26}"
+M="${ARCH_MODELS:-/tmp/jllm-arch-models}"
+P=hf-internal-testing_tiny-random
+
+mvn -q compile test-compile
+./scripts/build-native.sh >/dev/null
+
+LLAMA="$M/${P}-LlamaForCausalLM"
+if [ ! -f "$LLAMA/model.safetensors" ]; then
+  mkdir -p "$LLAMA"
+  for f in config.json generation_config.json model.safetensors; do
+    curl -sfL -o "$LLAMA/$f" "https://huggingface.co/hf-internal-testing/tiny-random-LlamaForCausalLM/resolve/main/$f"
+  done
+fi
+
+gen() { # family dir-suffix
+  local d="$M/${P}-$2"
+  rm -rf "$d"
+  python3 scripts/make-tiny-model.py "$d" "$1" >/dev/null
+}
+gen llama LlamaPlainForCausalLM
+gen mistral MistralForCausalLM
+gen qwen2 Qwen2ForCausalLM
+gen llama3rope Llama3RopeForCausalLM
+
+exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
+  "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM"

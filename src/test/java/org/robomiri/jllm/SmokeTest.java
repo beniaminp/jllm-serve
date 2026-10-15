@@ -1,6 +1,8 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Rope;
 import org.robomiri.jllm.safetensors.SafeTensors;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -36,6 +38,8 @@ public final class SmokeTest {
         streamDecoder();
         sampler();
         safetensors(dir);
+        ropeScaling();
+        modelConfigs();
         System.out.println("all smoke tests passed");
     }
 
@@ -521,6 +525,91 @@ public final class SmokeTest {
             check(finite, "bf16 conversion finite");
             check(st.tensors().size() == 311, "tensor count " + st.tensors().size());
         }
+    }
+
+    /** llama3 RoPE scaling against values computed by hand from the transformers formula. */
+    static void ropeScaling() {
+        ModelConfig.RopeScaling l3 = new ModelConfig.RopeScaling("llama3", 8, 1, 4, 8192);
+        // headDim 8, theta 1e4: inv_freq = 1, 0.1, 0.01, 0.001 with wavelengths 6.28, 62.8, 628, 6283.
+        // Below 8192/4 = 2048 they are kept; 6283 lies in (2048, 8192): smooth = (8192/6283.185 - 1)/3 = 0.101266,
+        // inv = (1 - smooth) * 0.001 / 8 + smooth * 0.001 = 2.13608e-4.
+        double[] f = Rope.invFreq(8, 1e4, l3);
+        check(f[0] == 1.0 && Math.abs(f[1] - 0.1) < 1e-15 && Math.abs(f[2] - 0.01) < 1e-15, "llama3 keeps high frequencies");
+        check(Math.abs(f[3] - 2.1360754402756864e-4) < 1e-12, "llama3 smoothed band: " + f[3]);
+        // theta 1e6: inv_freq = 1, 0.0316, 0.001 (smoothed again), 3.1623e-5 (wavelen 198692 > 8192: / factor 8)
+        double[] g = Rope.invFreq(8, 1e6, l3);
+        check(Math.abs(g[2] - 2.1360754402756864e-4) < 1e-12 && Math.abs(g[3] - 3.1622776601683795e-5 / 8) < 1e-15,
+                "llama3 low frequencies divided by factor: " + g[3]);
+        // headDim 64, theta 5e5 (Llama 3): first and last of 32 frequencies
+        double[] h = Rope.invFreq(64, 5e5, l3);
+        check(h[0] == 1.0 && Math.abs(h[31] - 3.7673226901739635e-7) < 1e-18 && Math.abs(h[1] - 0.6636012376960885) < 1e-12,
+                "llama3 headDim 64");
+        check(Arrays.equals(Rope.invFreq(8, 1e4, null), new double[]{1.0, 0.1, 0.01, 0.001}) || Math.abs(
+                Rope.invFreq(8, 1e4, null)[3] - 0.001) < 1e-15, "plain rope unchanged");
+        Rope plain = new Rope(8, 1e4, 4);
+        Rope scaled = new Rope(8, 1e4, 4, l3);
+        check(plain.cos[8 + 3] != scaled.cos[8 + 3] && plain.cos[8] == scaled.cos[8], "scaled table differs only in low freqs");
+    }
+
+    static void modelConfigs() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-cfg");
+        try {
+            ModelConfig ll = cfg(tmp, """
+                    {"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":2048,"intermediate_size":8192,
+                     "num_hidden_layers":16,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"vocab_size":128256,
+                     "hidden_act":"silu","rms_norm_eps":1e-5,"rope_theta":500000.0,"tie_word_embeddings":true,
+                     "bos_token_id":128000,"eos_token_id":128009,
+                     "rope_scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,
+                                     "original_max_position_embeddings":8192,"rope_type":"llama3"}}""");
+            check(ll.tiedEmbeddings() && ll.headDim() == 64 && !ll.attentionBias() && !ll.qkNorm() && ll.slidingWindow() == 0
+                    && ll.ropeScaling().factor() == 32 && ll.eosTokenIds().equals(List.of(128009))
+                    && ll.promptBosId() == 128000, "llama 3.2 config");
+            ModelConfig old = cfg(tmp, """
+                    {"model_type":"llama","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
+                     "num_attention_heads":32,"vocab_size":128256,"rope_scaling":{"type":"llama3","factor":8.0,
+                     "low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":8192}}""");
+            check(old.headDim() == 128 && old.kvHeads() == 32 && old.ropeScaling().factor() == 8, "legacy rope 'type' key, head_dim default");
+            ModelConfig mi = cfg(tmp, """
+                    {"architectures":["MistralForCausalLM"],"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,
+                     "num_hidden_layers":32,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":32768,
+                     "sliding_window":4096,"bos_token_id":1,"eos_token_id":2}""");
+            check(mi.windowFor(0) == 4096 && mi.windowFor(31) == 4096 && mi.promptBosId() == 1, "mistral window on every layer");
+            ModelConfig mnull = cfg(tmp, """
+                    {"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
+                     "num_attention_heads":32,"vocab_size":32768,"sliding_window":null}""");
+            check(mnull.windowFor(0) == 0, "mistral sliding_window null");
+            ModelConfig q2 = cfg(tmp, """
+                    {"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2","hidden_size":1536,"intermediate_size":8960,
+                     "num_hidden_layers":28,"num_attention_heads":12,"num_key_value_heads":2,"vocab_size":151936,
+                     "sliding_window":32768,"use_sliding_window":false,"max_window_layers":21,"tie_word_embeddings":true,
+                     "eos_token_id":[151645,151643]}""");
+            check(q2.attentionBias() && !q2.qkNorm() && q2.windowFor(27) == 0 && q2.headDim() == 128
+                    && q2.eosTokenIds().equals(List.of(151645, 151643)) && q2.promptBosId() == -1, "qwen2.5 config");
+            ModelConfig q2w = cfg(tmp, """
+                    {"model_type":"qwen2","hidden_size":1536,"intermediate_size":8960,"num_hidden_layers":28,
+                     "num_attention_heads":12,"vocab_size":151936,"sliding_window":4096,"use_sliding_window":true,
+                     "max_window_layers":21}""");
+            check(q2w.windowFor(20) == 0 && q2w.windowFor(21) == 4096, "qwen2 window from max_window_layers");
+            check(cfg(tmp, """
+                    {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":151936}""").qkNorm(), "qwen3 qk-norm");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, "{\"model_type\":\"mistral\",\"hidden_size\":32,\"intermediate_size\":37,\"num_hidden_layers\":2,"
+                            + "\"num_attention_heads\":4,\"vocab_size\":10,\"hidden_act\":\"gelu\"}");
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "hidden_act", "gelu rejected");
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    private static ModelConfig cfg(Path dir, String json) throws java.io.IOException {
+        Files.writeString(dir.resolve("config.json"), json);
+        return ModelConfig.load(dir);
     }
 
     static void checkEq(int[] a, int[] b, String what) {
