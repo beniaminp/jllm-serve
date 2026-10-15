@@ -213,10 +213,12 @@ public final class CpuBackend implements Backend {
         }
         if (logits != null) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
-            matmul(w.lmHead, xb, logits, 0, 1, false);
+            // the caller sizes logits by cfg.vocabSize(); the LM head may have fewer (or, padded, more) rows
+            int rows = Math.min(w.lmHead.rows, logits.length);
+            matmul(w.lmHead, rows, xb, logits, 0, 1, false);
             float cap = c.finalSoftcap();
             if (cap > 0) {
-                pool.forRange(w.lmHead.rows, 4096, (i0, i1) -> {
+                pool.forRange(rows, 4096, (i0, i1) -> {
                     for (int i = i0; i < i1; i++) {
                         logits[i] = GemmaMath.softcap(logits[i], cap);
                     }
@@ -259,7 +261,11 @@ public final class CpuBackend implements Backend {
      * prefill dequantizes four rows at a time and reuses them for every token in the batch.
      */
     void matmul(QTensor wt, float[] in, float[] out, int outOff, int n, boolean acc) {
-        int rows = wt.rows;
+        matmul(wt, wt.rows, in, out, outOff, n, acc);
+    }
+
+    /** {@link #matmul} over the first {@code rows} rows of {@code wt}; for {@code n > 1} the output row stride stays {@code wt.rows}. */
+    private void matmul(QTensor wt, int rows, float[] in, float[] out, int outOff, int n, boolean acc) {
         int cols = wt.cols;
         if (n == 1) {
             pool.forRange(rows, 16, (r0, r1) -> {
@@ -270,6 +276,7 @@ public final class CpuBackend implements Backend {
             });
             return;
         }
+        int stride = wt.rows;
         int groups = (rows + 3) / 4;
         pool.forRange(groups, 1, (g0, g1) -> {
             float[] tmp = scratch.get();
@@ -282,18 +289,18 @@ public final class CpuBackend implements Backend {
                     int t = 0;
                     for (; t + 4 <= n; t += 4) {
                         int xo = t * cols;
-                        int oo = outOff + t * rows + r;
+                        int oo = outOff + t * stride + r;
                         VectorKernels.dot4x4(tmp, 0, cols, in, xo, xo + cols, xo + 2 * cols, xo + 3 * cols,
-                                out, oo, oo + rows, oo + 2 * rows, oo + 3 * rows, acc);
+                                out, oo, oo + stride, oo + 2 * stride, oo + 3 * stride, acc);
                     }
                     for (; t < n; t++) {
-                        VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, outOff + t * rows + r, acc);
+                        VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, outOff + t * stride + r, acc);
                     }
                 } else {
                     for (int rr = r; rr < rows; rr++) {
                         for (int t = 0; t < n; t++) {
                             float v = VectorKernels.dotRow(wt, rr, in, t * cols);
-                            int o = outOff + t * rows + rr;
+                            int o = outOff + t * stride + rr;
                             out[o] = acc ? out[o] + v : v;
                         }
                     }
