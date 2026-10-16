@@ -361,7 +361,7 @@ default for `enable_thinking`; `run`, `chat` and `bench` use them directly.
 | `bench` | 413-token prompt, `bench.max-tokens` generated, `bench.rounds` rounds after a warm-up, prefix cache evicted between rounds |
 | `config` | prints the effective settings |
 
-`load()` is the assembly line: download metadata if needed → `ModelConfig` → `Tokenizer` → `ModelWeights.load`
+`load()` is the assembly line: download metadata if needed → `Architecture` → `Tokenizer` → `ModelWeights.load`
 (converting to the quantized cache on first use, with a `ShardProvider` that downloads shards on demand and
 deletes them when `model.low-disk` is set) → `CpuBackend` or `MetalBackend` (`backend=auto` picks Metal on
 macOS when the dylib is available) → `Engine` with the EOS ids from `generation_config.json` and the tokenizer.

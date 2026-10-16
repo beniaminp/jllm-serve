@@ -120,7 +120,7 @@ start-up (`Main.load`):
 
 ```
 Hub ──HuggingFaceHub──▶ models/<repo>/*.safetensors ──ModelConverter──▶ jllm-q4_0.bin ──QuantFile (mmap)──▶ ModelWeights ──▶ Backend
-                       config.json ─────────────────▶ ModelConfig                                                   ▲
+                       config.json ─────────────────▶ Architecture                                                  ▲
                        tokenizer.json ──────────────▶ Tokenizer ─────────────────────────────────────────────────────┘ (Engine)
 ```
 
@@ -155,7 +155,7 @@ generating. Chapter [10](10-engine-and-server.md) covers the engine and server; 
 
 ## 1.4 The models, in numbers
 
-From `config.json` (`ModelConfig`):
+From `config.json` (`Architecture`):
 
 | | Qwen3-0.6B (dense) | Qwen3-30B-A3B-Thinking-2507 (MoE) |
 |---|---|---|
@@ -220,7 +220,11 @@ org.robomiri.jllm
 │   ├── ChatTemplate     Qwen3 ChatML prompt format, thinking on/off
 │   └── StreamDecoder    emits text only when a UTF-8 character is complete
 ├── model
-│   ├── ModelConfig      config.json → record (dense and MoE fields)
+│   ├── Architecture     sealed: Decoder | MambaArch, plus the shared Core (parsed from config.json)
+│   ├── Families         one parser per model family, holding its defaults
+│   ├── Decoder, DecoderLayer, LayerSpec   per-layer Attention (Gqa | Mla), Mlp (Dense | Moe), norms
+│   ├── Attention, Mlp, Router, RopeTable, Scaling, MambaArch   the typed vocabulary
+│   ├── LayerWeights, AttnWeights, MlpWeights   sealed weights mirroring LayerSpec
 │   ├── QType, QTensor   Q4_0 / Q8_0 block quantization, page-aligned off-heap layout
 │   ├── QuantFile        jllm-<quant>.bin/.json: quantized weights on disk, memory-mapped
 │   ├── ModelConverter   safetensors → QuantFile, one layer at a time, shards on demand

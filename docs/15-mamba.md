@@ -1,6 +1,6 @@
 # 15. Mamba — a model without attention
 
-Code: `model/ModelConfig.MambaParams`, `model/MambaLayer`, `model/ModelConverter.planMamba`, `cpu/MambaCpuBackend`,
+Code: `model/MambaArch`, `model/MambaLayer`, `model/ModelConverter.planMamba`, `cpu/MambaCpuBackend`,
 `metal/MambaMetalBackend`, `kernels.metal` (`mamba_conv`, `mamba_scan`), `Backend.supportsPrefixReuse`,
 `engine/Engine.generateLocked`
 
@@ -261,7 +261,7 @@ head). Deep random networks amplify float32 rounding (at the 130m shape, 8 layer
 
 The plain-text chat format (no template; messages joined with newlines, `<|endoftext|>` stops) lives in
 `ChatTemplate` for `mamba`; the model is a base model and simply continues the text. There is no BOS token
-(`ModelConfig.promptBosId()` is −1 for Mamba even though the config has `bos_token_id: 0`).
+(`Core.bosTokenId` is −1 for Mamba even though the config has `bos_token_id: 0`).
 
 ## 15.10 Testing
 

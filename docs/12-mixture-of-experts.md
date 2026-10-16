@@ -77,7 +77,7 @@ repo, transformers ≤ 4.53) and fused 3-D tensors `mlp.experts.gate_up_proj [E,
 already the stacked matrix in memory, so the converter merely re-labels its shape (`flatten`).
 
 Dense-MLP exceptions (`mlp_only_layers`, `decoder_sparse_step`) are honoured per layer via
-`ModelConfig.isMoeLayer(l)`; Qwen3-30B has none.
+a layer's `Mlp` being `Mlp.Moe`; Qwen3-30B has none.
 
 ## 12.4 CPU implementation
 

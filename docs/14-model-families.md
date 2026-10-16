@@ -1,11 +1,11 @@
 # 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills, DeepSeek-V2/V3)
 
-Code: `model/ModelConfig`, `model/Rope`, `model/ModelConverter` (biases, fused Phi-3 tensors), `cpu/CpuBackend.attention/addBias`,
+Code: `model/Architecture`, `model/Families`, `model/Rope`, `model/ModelConverter` (biases, fused Phi-3 tensors), `cpu/CpuBackend.attention/addBias`,
 `kernels.metal` (`attention`, `add_bias`), `Main.eosIds`, `engine/Engine.generate` (BOS)
 
 All these models are the same decoder-only transformer that [chapter 5](05-transformer-math.md) describes:
 embedding, N × (RMSNorm → attention → RMSNorm → SwiGLU MLP), final RMSNorm, LM head. They differ in a handful of
-switches, all read from `config.json` into `ModelConfig`. Qwen3 is the reference; this chapter lists what changes.
+switches, all read from `config.json` into an `Architecture` (section 14.12). Qwen3 is the reference; this chapter lists what changes.
 
 ## 14.1 Supported families
 
@@ -48,12 +48,12 @@ quantization block), and the Metal backend additionally needs `head_dim` to be a
 
 How each is implemented:
 
-- **Bias.** `ModelConfig.attentionBias` is true for `qwen2`. The converter stores `self_attn.{q,k,v}_proj.bias` as
+- **Bias.** `Attention.Gqa.bias` is true for `qwen2`. The converter stores `self_attn.{q,k,v}_proj.bias` as
   f32 (they are tiny), the backends add them right after the q/k/v matmuls and *before* RoPE. CPU: a loop over
   the freshly written rows; Metal: an `add_bias` kernel, one thread per element (`v[i] += b[i % width]`).
   The same per-layer arrays work for `attention_bias: true` in `qwen2` only; for other families that flag would
   also add an `o_proj` bias, which is not implemented and is rejected.
-- **QK-norm.** Present only if the checkpoint has `q_norm`/`k_norm` (Qwen3). `ModelConfig.qkNorm` is true for
+- **QK-norm.** Present only if the checkpoint has `q_norm`/`k_norm` (Qwen3). `Attention.Gqa.qkNorm` is true for
   `qwen3*` and `ModelWeights` checks that the tensors exist exactly when it is set.
 - **Tied embeddings.** `tie_word_embeddings: true` means there is no `lm_head.weight`; the LM head reuses
   `model.embed_tokens.weight` (quantized to Q8_0 once, shared by both uses).
@@ -81,7 +81,7 @@ entries per layer would also cut memory, but needs position-dependent indexing a
 Stacking `L` windowed layers lets information travel `L × W` tokens, which is why a 4096 window still sees far
 more than 4096 tokens back in a 32-layer model.
 
-`ModelConfig.windowFor(layer)`: Mistral `sliding_window` applies to all layers; Qwen2 applies it to layers
+`Attention.Gqa.window` (per layer): Mistral `sliding_window` applies to all layers; Qwen2 applies it to layers
 `l ≥ max_window_layers` only when `use_sliding_window` is true (Qwen2.5 checkpoints set it to false, so the
 `sliding_window: 32768` in their config is inert).
 
@@ -191,7 +191,7 @@ the checkpoint's `qkv_proj` / `gate_up_proj` within the quantization step.
 
 ## 14.8 GLM (`glm`, `glm4`)
 
-Code: `model/InterleavedRope`, `ModelConfig.ropeInterleaved/rotaryDim/postNorms`, `CpuBackend.addNormed`,
+Code: `model/InterleavedRope`, `RopeTable.pairing/rotaryDim`, `LayerSpec.Norms.post`, `CpuBackend.addNormed`,
 `kernels.metal` (`norm_rope_il`, `rmsnorm_add`, appended at the end), `ModelConverter.fusedGateUp`
 
 Checked against transformers' `modeling_glm.py` / `modeling_glm4.py` and the Hub `config.json` and safetensors
@@ -333,7 +333,7 @@ entries), `SmokeTest.phi3Configs` parses the real config shapes.
 `partial_rotary_factor: 0.75` with `head_dim = 128` rotates only the first `rot = int(128 · 0.75) = 96` dimensions
 of every query and key head, with rotate-half *inside that prefix* (dimension `i` pairs with `i + 48`); dimensions
 96 … 127 pass through unchanged. The inverse frequencies use `rot` in the exponent (`theta^(2i/rot)`), not
-`head_dim`. `ModelConfig.partialRotaryFactor` / `rotaryDim()` are shared with GLM (14.8); Phi keeps
+`head_dim`. `RopeTable.rotaryDim` (from `partial_rotary_factor`) are shared with GLM (14.8); Phi keeps
 `ropeInterleaved()` false. `Rope` builds `[ctx × rot/2]` tables, `CpuBackend.normRope` pairs `(i, i + rot/2)`, and
 Metal reuses the GLM `norm_rope_il` dispatch (q and k heads together) with its `rotateHalf` parameter set, so the
 pairs are `(i, i + rot/2)` instead of `(2i, 2i+1)`. Partial rotation together with a QK-norm is rejected on Metal (no
@@ -363,7 +363,7 @@ Phi model has one).
 
 None of the published tokenizers adds a BOS: Phi-3's `tokenizer_config.json` has `add_bos_token: false`, its
 `tokenizer.json` post-processor is empty and its chat template has no `<s>`; Phi-4-mini and phi-4 use
-`<|endoftext|>` as `bos_token_id` but never prepend it. So `ModelConfig.promptBosId` is -1 for `phi3` (a template
+`<|endoftext|>` as `bos_token_id` but never prepend it. So `Core.bosTokenId` is -1 for `phi3` (a template
 or prompt that contains the token itself is of course left alone). The stop ids are the union of config,
 `generation_config.json` and the template's `<|end|>` / `<|im_end|>` / `<|endoftext|>`. `ChatTemplate` picks the
 phi-4 ChatML format when the vocabulary has `<|im_sep|>` (phi-4 14B), the Phi-4-mini format for other byte-level
@@ -391,7 +391,7 @@ Headers read with a ranged request (first 2 MB of shard 1, no weights downloaded
 
 ## 14.10 Gemma 2 and Gemma 3
 
-Code: `model/ModelConfig.Gemma`, `model/GemmaMath`, `model/Rope.local`, `ModelConverter.normGain/canonicalName`,
+Code: `Families.gemma`, `model/GemmaMath`, `model/Rope.local`, `ModelConverter.normGain/canonicalName`,
 `CpuBackend.geluMul`, `kernels.metal` (`rmsnorm_add` shared with GLM-4, `matmul_swiglu`'s `gelu` flag, `softcap`, `AttnParams.softcap`).
 Behaviour checked against transformers `modeling_gemma2.py` / `modeling_gemma3.py` (v4.51.3).
 
@@ -399,15 +399,15 @@ Same decoder skeleton, with these differences from the Llama-style layer of chap
 
 | # | Gemma | Formula | Where |
 |---|---|---|---|
-| 1 | embedding scale | `x0 = embed[token] * normalizer`, `normalizer = bf16(sqrt(hidden_size))` | `ModelConfig.embedScale`, applied right after the row is dequantized (both backends) |
+| 1 | embedding scale | `x0 = embed[token] * normalizer`, `normalizer = bf16(sqrt(hidden_size))` | `Core.embedScale`, applied right after the row is dequantized (both backends) |
 | 2 | RMSNorm gain `1 + w` | `y = x * rsqrt(mean(x²) + eps) * (1 + w)`, in f32 (`Gemma3RMSNorm`; the checkpoints store `w`, initialised to 0) | the converter stores `1 + w` as f32 (`GemmaMath.foldNormGain`), so the unchanged `rmsnorm` / `norm_rope` kernels apply it; this includes `q_norm`, `k_norm` and the final norm |
 | 3 | four norms per layer | `h = x + post_attn_norm(attn(input_norm(x)))`, `x' = h + post_ffn_norm(mlp(pre_ffn_norm(h)))` | o_proj and down_proj write to `xb` (no accumulate); the GLM-4 post-norm path (`rmsnormAdd` / `rmsnorm_add`) normalizes it and adds it to the residual `x`; `postNorms()` is true for Gemma too |
-| 4 | GeLU-tanh MLP | `down(gelu_tanh(gate(x)) * up(x))`, `gelu_tanh(x) = 0.5x(1 + tanh(sqrt(2/π)(x + 0.044715x³)))` | `ModelConfig.activation()` is `gelu_tanh` for Gemma, else `silu`; CPU `geluMul`; Metal: the fused `matmul_swiglu` kernels take a `gelu` flag in `SwigluParams` and apply `gelu_tanh` instead of `silu` in the epilogue |
-| 5 | attention scale | `scores = q·k * query_pre_attn_scalar^-0.5` (not `head_dim^-0.5`; in the three checked configs the scalar equals `head_dim` = 256 so both give 1/16, the test checkpoints use 48 to tell them apart) | `ModelConfig.attnScale()` goes into the scale parameter of every attention path |
+| 4 | GeLU-tanh MLP | `down(gelu_tanh(gate(x)) * up(x))`, `gelu_tanh(x) = 0.5x(1 + tanh(sqrt(2/π)(x + 0.044715x³)))` | `Mlp.Dense.act` is `gelu_tanh` for Gemma, else `silu`; CPU `geluMul`; Metal: the fused `matmul_swiglu` kernels take a `gelu` flag in `SwigluParams` and apply `gelu_tanh` instead of `silu` in the epilogue |
+| 5 | attention scale | `scores = q·k * query_pre_attn_scalar^-0.5` (not `head_dim^-0.5`; in the three checked configs the scalar equals `head_dim` = 256 so both give 1/16, the test checkpoints use 48 to tell them apart) | `Attention.Gqa.scale` goes into the scale parameter of every attention path |
 | 6 | attention soft-cap (Gemma 2) | `s' = tanh(s / 50) * 50`, applied to the scaled score before the softmax; `null` in Gemma 3 | CPU f32 and f16 loops, Metal `attention` / `attention_h` (`AttnParams.softcap`, 0 = off, argument clamped to ±20 because fast-math `tanh` can overflow) |
 | 7 | final logit soft-cap (Gemma 2) | `l' = tanh(l / 30) * 30` after the LM head; `null` in Gemma 3 | CPU: after the head matmul; Metal: `softcap` kernel on the logits buffer |
 | 8 | QK-norm (Gemma 3 only) | per-head `(1+w)` RMSNorm of q and k before RoPE | reuses the Qwen3 `qNorm`/`kNorm` path (`qkNorm` is true for `gemma3_text`) |
-| 9 | local / global layers | local layers use the sliding window, global layers the full context. Gemma 2: layer `i` is local if `i % 2 == 0`. Gemma 3: local unless `(i + 1) % sliding_window_pattern == 0` (5 local, 1 global). `layer_types` (`sliding_attention` / `full_attention`) overrides both rules | `ModelConfig.Gemma.local[]`, `windowFor(l)` |
+| 9 | local / global layers | local layers use the sliding window, global layers the full context. Gemma 2: layer `i` is local if `i % 2 == 0`. Gemma 3: local unless `(i + 1) % sliding_window_pattern == 0` (5 local, 1 global). `layer_types` (`sliding_attention` / `full_attention`) overrides both rules | `Attention.Gqa.window` per layer |
 | 10 | two RoPE tables (Gemma 3) | local layers: base `rope_local_base_freq` (10 000), no scaling; global layers: `rope_theta` (1 000 000) with `rope_scaling` (`linear`, factor 8 in the 4B, none in the 1B) | `Rope.of` (global) and `Rope.local`; each layer picks one (`usesLocalRope(l)`); Metal keeps two cos/sin buffers. Gemma 2 has one table (`rope_theta` 10 000) |
 | 11 | tied head, BOS, stops | `tie_word_embeddings` is absent from the configs and defaults to true; `<bos>` (id 2) is prepended (`promptBosId`; the chat template already emits it, so it is not doubled); stops: `eos_token_id` ([1, 107] for Gemma 2, 106 for Gemma 3) plus `<end_of_turn>` / `<eos>` from the template | |
 
@@ -415,9 +415,9 @@ The sliding window follows transformers' mask `kv > q - window` (a token sees `w
 the same convention as Mistral above. Gemma 2's `hidden_act` and `hidden_activation` are both
 `gelu_pytorch_tanh`; Gemma 3 only has `hidden_activation`. The embedding normalizer is a tensor of the checkpoint
 dtype in transformers, so `sqrt(1152) = 33.94` is really `34.0` in a bf16 model (`bf16(sqrt(2304)) = 48` exactly);
-`ModelConfig` reads `torch_dtype` for this (`float32` checkpoints, such as the test ones, keep the exact value).
+`Families` reads `torch_dtype` for this (`float32` checkpoints, such as the test ones, keep the exact value).
 
-**Config keys read** (`ModelConfig.load`): `hidden_size`, `intermediate_size`, `num_hidden_layers`,
+**Config keys read** (`Families.parse`): `hidden_size`, `intermediate_size`, `num_hidden_layers`,
 `num_attention_heads`, `num_key_value_heads`, `head_dim`, `vocab_size`, `rms_norm_eps`, `rope_theta`,
 `rope_local_base_freq`, `rope_scaling` (`rope_type` linear; also `rope_parameters`, keyed by layer type, of
 transformers 5), `sliding_window`, `sliding_window_pattern`, `layer_types`, `query_pre_attn_scalar`,
@@ -487,7 +487,7 @@ Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
-Code: `model/DeepSeekConfig`, `model/DeepSeekRouter`, `model/MlaWeights` (+ `kvBKeys` / `kvBValues`),
+Code: `Families.deepseek`, `model/Attention.Mla`, `model/DeepSeekRouter`, `model/AttnWeights.Mla` (+ `kvBKeys` / `kvBValues`),
 `model/Rope.deepseek/yarnInvFreq`, `model/ModelConverter.convertMla/convertDeepseekMoe`, `cpu/MlaCpu`, `metal/MlaMetal`,
 kernels `mla_lat_store`, `mla_absorb_q`, `mla_apply_v`, the `attention_mla` instantiation and `router_ds` (section 7 of
 `kernels.metal`), `tokenizer/ChatTemplate` (`deepseek-v2`).
@@ -571,7 +571,7 @@ Implementation notes:
   `modeling_deepseek.py` first de-interleaves (`view(d/2, 2).transpose`) and then applies the usual rotate-half. Because the
   same permutation is applied to the query and the key, the dot product is identical to rotating the pairs `(2i, 2i+1)`
   in place by `pos · inv_freq[i]`, which is what `MlaCpu.rotate` and `mla_rope` do (no permutation is needed).
-- **Absorbed `kv_b_proj`.** `MlaWeights.kvBKeys` / `kvBValues` dequantize the two halves of `kv_b_proj` per head to f32
+- **Absorbed `kv_b_proj`.** `AttnWeights.Mla.kvBKeys` / `kvBValues` dequantize the two halves of `kv_b_proj` per head to f32
   once at load (`H · (nope + v_dim) · kv_lora` floats per layer: 8 MB for V2-Lite, 216 MB over 27 layers; on Metal they
   are uploaded as f32 buffers, laid out so that the absorb / apply kernels read them coalesced). The absorption
   `q_abs_h = W_kb_k[h]ᵀ q_nope_h` costs `H · nope · kv_lora` multiply-adds per token (1 M for V2-Lite, a sixth of
@@ -585,7 +585,7 @@ Implementation notes:
   buffers bound to the same cache. Metal needs `kv_lora` and `kv_lora + rope` to be multiples of 32 and ≤ 576.
 - **Softmax scale** is `qk^-0.5` (192, not the 128 of an ordinary head) times `mscale²` with
   `mscale = 0.1 · mscale_all_dim · ln(factor) + 1` when `rope_scaling.mscale_all_dim` is set (V2-Lite: 0.707 → 1.2608²;
-  V3: 1.0 → 1.3689²), see `DeepSeekConfig.softmaxScale`.
+  V3: 1.0 → 1.3689²), see `Attention.Mla.scale`.
 - **KV cache.** One row `[c | rope(k_pe)]` of `kv_lora + rope` values per token and layer, f32 or (`backend.kv-dtype=f16`)
   half with the arithmetic in f32, exactly as the dense families' caches: V2-Lite needs `576 · 4 B` = 2.3 KB per layer and
   token, **62 KB per token over 27 layers (255 MB at `--ctx 4096`), 31 KB / 127 MB at f16**. The expanded per-head
@@ -595,7 +595,7 @@ Implementation notes:
   only: on the three tiny models the largest difference between the two cache layouts is 3.1e-5 (relative 1.7e-6 of
   the largest logit) on CPU and Metal, Q4_0 and Q8_0, with the same argmax, and the f16 cache differs from f32 by
   2e-3 relative (the half rounding of the latent, as on the dense families).
-- `ModelConfig` reports `headDim = qk` (192), `kvHeads = heads`, so `qDim = H·qk` and the Metal "multiple of 32, ≤ 256"
+- `Attention.Mla` reports `headDim = qk` (192), so `qDim = H·qk` and the Metal "multiple of 32, ≤ 256"
   check applies to 192 (the rope kernel's slice). The BOS id (`bos_token_id`, 100000 for V2) is put in front of raw
   prompts; the chat template has it.
 
@@ -651,7 +651,7 @@ y = Σ_{k ∈ top-k}  w_k · Expert_k(x)   +   SharedExperts(x)
 
 Weights: if `k > 1 && norm_topk_prob` they are divided by `Σ + 1e-20`; then multiplied by `routed_scaling_factor`.
 V3 always multiplies; the V2 code only multiplies in the branch where it did **not** normalize (the `else` of the
-`norm_topk_prob` test), which `DeepSeekConfig.scaleAlways` reproduces.
+`norm_topk_prob` test), which `Mlp.Moe.normTopK` and `DeepSeekRouter` reproduce.
 
 Worked example for `noaux_tc` (8 experts, 4 groups of 2, `topk_group` 2, `k` 2, `routed_scaling_factor` 2.5):
 
@@ -735,3 +735,48 @@ which is plain quantization noise: random weights with sharp attention are sensi
 frequencies against hand-computed values
 (14.11.2), the routing rules on hand-made score matrices (14.11.4), the V2-Lite and V3 configs, the V2 chat template and the
 FP8 refusal.
+
+## 14.12 The typed model: `Architecture`
+
+`config.json` is resolved once into a sealed `Architecture`; nothing after that looks at `model_type` (except the chat
+template). The pieces:
+
+```
+Architecture (sealed)
+├── Decoder(core, List<LayerSpec> layers, List<RopeTable> ropeTables)
+│     LayerSpec(Attention attn, Mlp mlp, Norms norms)
+│       Attention = Gqa(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, scale, softcap)
+│                 | Mla(heads, qLoraRank, kvLoraRank, nope, rope, vDim, ropeTable, scale)
+│       Mlp       = Dense(hidden, act) | Moe(experts, topK, moeDim, normTopK, Router, shared Dense)
+│       Norms     = PRE | SANDWICH_GLM4 | SANDWICH_GEMMA   (also names the tensors)
+│     RopeTable(rotaryDim, theta, Scaling, Pairing HALF | INTERLEAVED)
+│       Scaling   = None | Linear | Llama3 | LongRope | Yarn
+└── MambaArch(core, dInner, dState, dConv, dtRank)
+Core = dim, layers, vocab, norm eps, tied head, BOS/EOS, embed scale, final soft-cap, description
+```
+
+A family's switches become values in this vocabulary: Qwen2's bias is `Gqa.bias`, Mistral's window is `Gqa.window`
+per layer, Gemma 3's second RoPE base is a second `RopeTable`, DeepSeek's `first_k_dense_replace` is `Dense` for the
+first layers and `Moe` for the rest. All layers of a `Decoder` share the attention variant and head shape
+(`Attention.sameShape`), so a backend sizes its caches once; window, table, scale and MLP may differ per layer.
+
+`ModelWeights.load` mirrors the spec with a sealed `LayerWeights` (`AttnWeights.Gqa | Mla`, `MlpWeights.Dense | Moe`,
+norms), so shape checks are per variant: a GQA layer is checked for `q/k/v/o` shapes, an MLA layer for the latent
+projections. The backends switch over `LayerSpec`, not over families.
+
+`Core.description` is the one-line text (`Qwen3ForCausalLM dim=1024 ffn=3072 ...`) that `Architecture.toString()` prints
+and the quantized cache index records; it is compared on resume, so for an existing family it must never change.
+
+### Adding a family
+
+1. **One parser** in `Families` (a method returning a `Decoder`, registered in `SUPPORTED` and the `parse` switch). It
+   holds the family's defaults (`rope_theta`, norm eps, activation, ...), reads its `config.json` keys and builds the
+   `LayerSpec` list and `RopeTable`s. Append anything new to the description only when it is set, as the existing
+   parsers do, so old caches stay valid.
+2. **Converter rules** in `ModelConverter`: the table mapping checkpoint tensor names to cache tensors (renames, fused
+   tensors to split, `1 + w` norm folding). The shard bookkeeping is derived from the rules.
+3. **Chat template** entry in `ChatTemplate.forModelType` if the prompt format is new.
+
+If the family only combines existing `Attention`, `Mlp`, `Norms` and `Scaling` variants, no backend changes. A new
+variant (a new attention kind, say) adds a case to the sealed type, which makes every `switch` over it a compile error
+until the CPU and Metal backends, `LayerWeights` and the converter handle it.
