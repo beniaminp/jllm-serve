@@ -62,11 +62,15 @@ Qwen3-0.6B, 413-token prompt, 128 generated tokens, after JIT warm-up (`./jllm b
 
 | backend | prefill | decode | weight traffic at that decode rate | % of bandwidth ceiling |
 |---|---|---|---|---|
-| Metal Q4_0 | 344 tok/s | 75 tok/s | 34 GB/s | 17 % |
-| Metal Q8_0 | 338 tok/s | 77 tok/s | 54 GB/s | 27 % |
-| CPU Q4_0 (NEON 128-bit, 10 threads), float activations | 153 tok/s | 17 tok/s | 7.6 GB/s | 4 % |
+| Metal Q4_0, first version (one kernel per op) | 344 tok/s | 75 tok/s | 34 GB/s | 17 % |
+| Metal Q8_0, first version | 338 tok/s | 77 tok/s | 54 GB/s | 27 % |
+| **Metal Q4_0, fused kernels** (current) | **378 tok/s** | **107 tok/s** | 48 GB/s | 24 % |
+| CPU Q4_0 (NEON 128-bit, 10 threads), float activations, first version | 153 tok/s | 17 tok/s | 7.6 GB/s | 4 % |
+| **CPU Q4_0, int8 activations + grouped prefill** (current) | **275 tok/s** | **51 tok/s** | 23 GB/s | 11 % |
 
-Short prompts decode at ~110 tok/s on Metal (less attention work). Both backends produce identical greedy text.
+(Current numbers measured on an otherwise idle machine on 2026-10-16, `./jllm bench --ctx 1024`.) Short prompts
+decode faster still (less attention work). Metal and CPU-with-int8-off produce identical greedy text; int8
+activations change the last bits of the logits, so their greedy text can differ on close calls.
 
 ### CPU int8 activations (`backend.cpu.int8-activations`, [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels))
 
@@ -91,8 +95,11 @@ float run a prose paragraph) — with a 0.6B model, greedy decoding amplifies an
 size into a different continuation after the first near-tie, which is the expected behaviour of two
 equally valid quantization noises, not a degradation.
 
-Qwen3-30B-A3B: *to be measured* (expected: decode a few tens of tok/s on Metal; prefill bandwidth-limited by
-streaming all experts per chunk).
+Qwen3-30B-A3B-Thinking-2507 (Q4_0, 19.4 GB cache, same 413-token prompt): Metal **44.7 tok/s prefill, 24.1 tok/s
+decode**; CPU (int8 activations) ≈ 12 tok/s prefill and ≈ 6 tok/s decode on a 24-token prompt. Decode at 24 tok/s
+means ~49 GB/s of expert traffic (8 of 128 experts per layer ≈ 2 GB per token) — the same ~25 % of the bandwidth
+ceiling as the dense model, so the MoE path is as efficient per byte as the dense one. Prefill is bandwidth-bound
+by streaming nearly all experts per chunk, which is why it is only ~2× decode here versus ~3.5× for the dense model.
 
 The striking row is Q4 vs Q8 on Metal: Q8 moves 1.6× the bytes yet decodes at the same speed. That proves the
 GPU path is **not** at the memory roof yet — something else dominates.
@@ -125,7 +132,7 @@ path ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-in
 conversions with shift-and-mask unpacking on 8 short lanes and cuts the kernel's time by 6×; what remains
 of the decode step is attention, the element-wise passes and pool synchronization.
 
-### CPU prefill (153 tok/s)
+### CPU prefill (153 tok/s originally, 275 tok/s with the 4×4 register tiling and parallel element-wise passes)
 
 Rows are dequantized once per 4-row group and reused across the 64 tokens by `dot4`, which is why prefill is 9×
 faster per token than decode. Attention and the scalar `exp`/`silu` loops become visible here.

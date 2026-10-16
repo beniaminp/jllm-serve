@@ -132,7 +132,21 @@ runs. Every later start maps the cache in milliseconds. Note that the "Thinking"
 its chat template has no thinking switch, so expect a `<think>` block before every answer and give it a generous
 `max_tokens`.
 
-## 12.7 Why decode is fast and prefill is not
+## 12.7 Measured
+
+Qwen3-30B-A3B-Thinking-2507 at Q4_0 (19.4 GB cache), Apple M1 Pro, idle machine, 413-token prompt
+(`./jllm bench --model Qwen/Qwen3-30B-A3B-Thinking-2507 --ctx 1024`):
+
+| backend | prefill | decode |
+|---|---|---|
+| Metal | 44.7 tok/s | 24.1 tok/s |
+| CPU (10 threads, int8 activations) | ≈ 12 tok/s | ≈ 6 tok/s |
+
+Conversion from the 61 GB bf16 shards took 30 minutes with `--low-disk` (download-bound); the cache then maps in
+under 0.1 s. Greedy output is identical on both backends ("The capital of France is Paris." for the test prompt),
+and thinking mode produces coherent step-by-step reasoning.
+
+## 12.8 Why decode is fast and prefill is not
 
 Decode reads ~2 GB of weights per token (8 active experts), so the bandwidth ceiling is ~10× lower than for the
 0.6B model but the same as a dense 3B model. Prefill, however, cannot share weights between tokens the way a
