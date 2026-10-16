@@ -327,9 +327,12 @@ either.
 | `glm` (GLM-Edge) | `<\|user\|>\n…<\|assistant\|>\n…` … **`<\|assistant\|>\n`**, no BOS | `<\|endoftext\|>`, `<\|user\|>`, `<\|observation\|>` |
 | `mamba` | no template: message contents joined by `\n` | `<\|endoftext\|>` |
 
-The Gemma 2 template refuses system messages; we fold them into the first turn as Gemma 3 does. Llama 3.1/3.2
-print a date in the system header; the template's own fallback `26 Jul 2024` is used unless you build the
-format with `ChatTemplate.llama3("…")`.
+The Gemma 2 template refuses system messages; we fold them into the first turn as Gemma 3 does. Mistral and
+Gemma insist, like their Jinja (`raise_exception`), that the turns after the optional system message alternate
+user/assistant/user/… and throw `IllegalArgumentException` otherwise. Llama 3.1/3.2 print a date in the system
+header: `forModelType("llama")` uses the date of the render (`%d %b %Y`, what transformers' `strftime_now`
+produces); `ChatTemplate.llama3("26 Jul 2024")` pins it, which the fixture test does because jinja2 without
+`strftime_now` renders the template's fallback date. `phimoe` (Phi-3.5-MoE) renders with the Phi-3 template.
 
 ### Verification
 

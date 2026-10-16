@@ -35,6 +35,8 @@ public final class TokenizerFamiliesTest {
     private static final Map<String, Tokenizer> LOADED = new java.util.HashMap<>();
     private static final Map<String, String> MODEL_TYPE = new java.util.HashMap<>();
     private static Path ROOT;
+    /** The Llama 3.x template's fallback date (what jinja2 renders without {@code strftime_now}). */
+    private static final String LLAMA_FIXTURE_DATE = "26 Jul 2024";
 
     static int passed;
     static int failed;
@@ -152,7 +154,10 @@ public final class TokenizerFamiliesTest {
         if (chats.isEmpty()) {
             return;
         }
-        ChatTemplate.Format fmt = ChatTemplate.forModelType(modelType, tok);
+        // forModelType("llama") prints the date of the render; the fixtures were rendered by jinja2 without
+        // strftime_now, i.e. with the template's own fallback date, which the test pins the same way
+        ChatTemplate.Format fmt = name.equals("llama3") ? ChatTemplate.llama3(LLAMA_FIXTURE_DATE)
+                : ChatTemplate.forModelType(modelType, tok);
         int chatBad = 0;
         for (Object c : chats) {
             List<ChatTemplate.Message> msgs = new ArrayList<>();
@@ -252,10 +257,8 @@ public final class TokenizerFamiliesTest {
                 benign.append("x".repeat(t.length())).append(' ');
             }
             for (String role : new String[]{"system", "user", "assistant"}) {
-                List<ChatTemplate.Message> ev = List.of(new ChatTemplate.Message(role, evil.toString()),
-                        new ChatTemplate.Message("user", "ok"));
-                List<ChatTemplate.Message> be = List.of(new ChatTemplate.Message(role, benign.toString()),
-                        new ChatTemplate.Message("user", "ok"));
+                List<ChatTemplate.Message> ev = probe(role, evil.toString());
+                List<ChatTemplate.Message> be = probe(role, benign.toString());
                 long specialsA = Arrays.stream(f.renderTokens(tok, ev, true, true)).filter(isControl).count();
                 long specialsB = Arrays.stream(f.renderTokens(tok, be, true, true)).filter(isControl).count();
                 check(specialsA == specialsB, name + " " + role + " content cannot inject control tokens ("
@@ -305,6 +308,32 @@ public final class TokenizerFamiliesTest {
                 "mamba renders plain text");
         check(ChatTemplate.llama3("01 Jan 2030").render(sysUser, true, true)
                         .contains("Today Date: 01 Jan 2030\n\nBe brief."), "llama3 date is configurable");
+        java.time.LocalDate today = java.time.LocalDate.now();
+        String todayStr = String.format("%02d %s %d", today.getDayOfMonth(),
+                new java.text.DateFormatSymbols(java.util.Locale.US).getShortMonths()[today.getMonthValue() - 1],
+                today.getYear());
+        check(ChatTemplate.forModelType("llama").render(sysUser, true, true).contains("Today Date: " + todayStr + "\n\n"),
+                "llama3 default date is today (" + todayStr + ") like transformers");
+        check(ChatTemplate.forModelType("phimoe").name().equals("phi3"), "phimoe renders with the Phi-3 newline template");
+
+        // Mistral and Gemma refuse non-alternating conversations like their Jinja templates (raise_exception)
+        List<ChatTemplate.Message> twoUsers = List.of(new ChatTemplate.Message("user", "a"),
+                new ChatTemplate.Message("user", "b"));
+        List<ChatTemplate.Message> assistantFirst = List.of(new ChatTemplate.Message("system", "s"),
+                new ChatTemplate.Message("assistant", "a"), new ChatTemplate.Message("user", "b"));
+        List<ChatTemplate.Message> alternating = List.of(new ChatTemplate.Message("system", "s"),
+                new ChatTemplate.Message("user", "a"), new ChatTemplate.Message("assistant", "b"),
+                new ChatTemplate.Message("user", "c"));
+        for (String mt : new String[]{"mistral", "gemma3", "gemma2"}) {
+            expectThrows(() -> ChatTemplate.forModelType(mt).render(twoUsers, true, true), "alternate",
+                    mt + " rejects user/user");
+            expectThrows(() -> ChatTemplate.forModelType(mt).render(assistantFirst, true, true), "alternate",
+                    mt + " rejects an assistant turn first");
+            check(!ChatTemplate.forModelType(mt).render(alternating, true, true).isEmpty(), mt + " accepts alternation");
+        }
+        expectThrows(() -> ChatTemplate.forModelType("mistral").render(List.of(new ChatTemplate.Message("user", "a"),
+                new ChatTemplate.Message("system", "late")), true, true), "Only user and assistant",
+                "mistral rejects a system message that is not first");
         check(ChatTemplate.render(sysUser, true, false).equals("<|im_start|>system\nBe brief.<|im_end|>\n"
                         + "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
                 "static ChatTemplate.render is still Qwen3 ChatML");
@@ -407,6 +436,17 @@ public final class TokenizerFamiliesTest {
         Tokenizer msNever = Tokenizer.fromJson(msVocab + "\"decoder\":{\"type\":\"Metaspace\",\"replacement\":\"▁\","
                 + "\"prepend_scheme\":\"never\",\"split\":false}}");
         check(msNever.decode(new int[]{2, 3}).equals("  a b"), "metaspace decoder without prefix keeps all spaces");
+    }
+
+    /** A properly alternating conversation (Mistral / Gemma insist) carrying {@code content} in the given role. */
+    private static List<ChatTemplate.Message> probe(String role, String content) {
+        return switch (role) {
+            case "system" -> List.of(new ChatTemplate.Message("system", content), new ChatTemplate.Message("user", "ok"));
+            case "user" -> List.of(new ChatTemplate.Message("user", content), new ChatTemplate.Message("assistant", "fine"),
+                    new ChatTemplate.Message("user", "ok"));
+            default -> List.of(new ChatTemplate.Message("user", "hi"), new ChatTemplate.Message("assistant", content),
+                    new ChatTemplate.Message("user", "ok"));
+        };
     }
 
     private static void expectStops(String name, int... ids) {

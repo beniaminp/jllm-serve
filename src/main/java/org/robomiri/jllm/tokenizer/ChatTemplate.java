@@ -1,10 +1,12 @@
 package org.robomiri.jllm.tokenizer;
 
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * Chat templates of the supported model families, each derived from the Jinja {@code chat_template} in the
@@ -50,8 +52,11 @@ public final class ChatTemplate {
     }
 
     private static final Set<String> QWEN3_ROLES = Set.of("system", "user", "assistant", "tool");
-    /** Fallback of the Llama 3.x template when the caller passes no date (transformers would use today's). */
-    private static final String LLAMA_DEFAULT_DATE = "26 Jul 2024";
+    /** Python's {@code %b} in the C locale, for the Llama 3.x {@code Today Date:} line. */
+    private static final String[] MONTHS = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+            "Nov", "Dec"};
+    /** Llama 3.x with the date taken at render time, like transformers' {@code strftime_now("%d %b %Y")}. */
+    private static final Format LLAMA3_TODAY = llama3(ChatTemplate::today);
 
     private ChatTemplate() {
     }
@@ -106,7 +111,7 @@ public final class ChatTemplate {
                     throw new IllegalArgumentException("model_type llama with a SentencePiece tokenizer (Llama 2) has no"
                             + " chat template here; only Llama 3.x is supported");
                 }
-                return llama3(LLAMA_DEFAULT_DATE);
+                return LLAMA3_TODAY;
             case "deepseek_v2":
                 return DEEPSEEK_V2;
             case "deepseek", "deepseek_r1", "deepseek_v3":
@@ -115,12 +120,12 @@ public final class ChatTemplate {
                 return MISTRAL;
             case "gemma", "gemma2", "gemma3", "gemma3_text":
                 return GEMMA;
-            case "phi3":
+            case "phi3", "phimoe": // Phi-3.5-MoE uses the Phi-3 SentencePiece tokenizer and newline template
                 if (tok != null && tok.tokenId("<|im_sep|>") >= 0) {
                     return PHI4_14B;
                 }
                 return tok != null && tok.isByteLevel() ? PHI4 : PHI3;
-            case "phi4", "phi4_mini", "phimoe":
+            case "phi4", "phi4_mini":
                 return PHI4;
             case "glm":
                 return GLM_EDGE;
@@ -133,8 +138,21 @@ public final class ChatTemplate {
         }
     }
 
-    /** Llama 3.1/3.2 template with an explicit {@code Today Date:} string such as {@code "26 Jul 2024"}. */
+    /**
+     * Llama 3.1/3.2 template with a fixed {@code Today Date:} string such as {@code "26 Jul 2024"} (the
+     * template's own fallback) instead of the date of the render; use it for reproducible prompts.
+     */
     public static Format llama3(String dateString) {
+        return llama3(() -> dateString);
+    }
+
+    /** Today as Python's {@code strftime("%d %b %Y")} in the C locale. */
+    static String today() {
+        LocalDate d = LocalDate.now();
+        return String.format("%02d %s %d", d.getDayOfMonth(), MONTHS[d.getMonthValue() - 1], d.getYear());
+    }
+
+    private static Format llama3(Supplier<String> date) {
         return new Family("llama3", (m, gen, think, o) -> {
             o.ctl("<|begin_of_text|>");
             int first = 0;
@@ -144,7 +162,7 @@ public final class ChatTemplate {
                 first = 1;
             }
             o.ctl("<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: "
-                    + dateString + "\n\n");
+                    + date.get() + "\n\n");
             o.txt(system);
             o.ctl("<|eot_id|>");
             for (int i = first; i < m.size(); i++) {
@@ -318,6 +336,17 @@ public final class ChatTemplate {
             system = content(m.get(0));
             first = 1;
         }
+        for (int i = first; i < m.size(); i++) {
+            String r = m.get(i).role();
+            if (!"user".equals(r) && !"assistant".equals(r)) {
+                throw new IllegalArgumentException("Only user and assistant roles are supported, with the exception"
+                        + " of an initial optional system message!");
+            }
+            if (r.equals("user") != ((i - first) % 2 == 0)) {
+                throw new IllegalArgumentException("After the optional system message, conversation roles must"
+                        + " alternate user/assistant/user/assistant/...");
+            }
+        }
         o.ctl("<s>");
         for (int i = first; i < m.size(); i++) {
             String role = role(m.get(i), "user", "assistant");
@@ -346,6 +375,9 @@ public final class ChatTemplate {
         }
         for (int i = first; i < m.size(); i++) {
             String role = role(m.get(i), "system", "user", "assistant");
+            if (role.equals("user") != ((i - first) % 2 == 0)) {
+                throw new IllegalArgumentException("Conversation roles must alternate user/assistant/user/assistant/...");
+            }
             o.ctl("<start_of_turn>" + (role.equals("assistant") ? "model" : role) + "\n");
             o.txt((i == first ? prefix : "") + pyTrim(content(m.get(i))));
             o.ctl("<end_of_turn>\n");
