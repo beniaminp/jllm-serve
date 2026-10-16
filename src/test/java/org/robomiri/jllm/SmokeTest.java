@@ -57,6 +57,7 @@ public final class SmokeTest {
         mamba();
         kvCacheAttention();
         fastMath();
+        threadPool();
         prefixReuse(dir);
         deepseekConfigs();
         System.out.println("all smoke tests passed");
@@ -1075,6 +1076,71 @@ public final class SmokeTest {
         }
         float got = org.robomiri.jllm.cpu.VectorKernels.softmaxExp(sm.clone(), 0, sm.length, 3f);
         check(Math.abs(got - ref) < 1e-6f, "softmaxExp sum " + got + " vs " + ref);
+    }
+
+    /**
+     * The thread pool's reusable job: thousands of back-to-back jobs land every item exactly once (the epoch-tagged
+     * task counter must never let a lagging worker run a stale body or steal a task of the next job), a throwing
+     * task is rethrown on the caller with the remaining chunks skipped, and the pool keeps working afterwards.
+     */
+    static void threadPool() {
+        try (org.robomiri.jllm.cpu.ThreadPool pool = new org.robomiri.jllm.cpu.ThreadPool(5)) {
+            int items = 777;
+            int jobs = 20000;
+            int[] hits = new int[items];
+            for (int j = 0; j < jobs; j++) {
+                int add = j + 1;
+                if (j % 2 == 0) {
+                    pool.forRange(items, 7, (a, b) -> {
+                        for (int i = a; i < b; i++) {
+                            hits[i] += add;
+                        }
+                    });
+                } else {
+                    pool.forRangeFine(items, 3, (a, b) -> {
+                        for (int i = a; i < b; i++) {
+                            hits[i] += add;
+                        }
+                    });
+                }
+            }
+            long expect = (long) jobs * (jobs + 1) / 2;
+            boolean ok = true;
+            for (int h : hits) {
+                ok &= h == expect;
+            }
+            check(ok, "thread pool: " + jobs + " jobs, every item visited exactly once per job");
+            java.util.concurrent.atomic.AtomicInteger ran = new java.util.concurrent.atomic.AtomicInteger();
+            String msg = null;
+            try {
+                pool.forRangeFine(1000, 1, (a, b) -> {
+                    if (a == 0) {
+                        throw new IllegalStateException("chunk 0 failed");
+                    }
+                    ran.incrementAndGet();
+                    try {
+                        Thread.sleep(0, 200_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            } catch (IllegalStateException e) {
+                msg = e.getMessage();
+            }
+            check("chunk 0 failed".equals(msg), "thread pool rethrows the first exception on the caller: " + msg);
+            check(ran.get() < 999, "thread pool skips chunks after the failure (" + ran.get() + " of 999 ran)");
+            int[] again = new int[items];
+            pool.forRange(items, 1, (a, b) -> {
+                for (int i = a; i < b; i++) {
+                    again[i]++;
+                }
+            });
+            boolean fine = true;
+            for (int h : again) {
+                fine &= h == 1;
+            }
+            check(fine, "thread pool works after a failed job");
+        }
     }
 
     /** A backend that records the (pos, n) of every forward() and always predicts token 0. */

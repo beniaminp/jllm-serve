@@ -324,8 +324,18 @@ issued back to back from one thread.
 ### Design
 
 - `threads − 1` daemon **workers**; the **caller participates** in every job (it would otherwise idle).
-- A job is published by writing one `volatile Job current` field. Workers grab chunks with
-  `next.getAndIncrement()` and count completions in `done`.
+- There is no job object. The pool holds one set of job fields (body, size, chunk) that the caller writes and
+  then publishes by setting one `AtomicLong next` to `epoch << 32 | tasks << 16`: the job's epoch, its task
+  count and (low 16 bits) the next task index in one word. Workers claim tasks with `next.getAndIncrement()`;
+  a claim is valid when its index is below the task count *of the same word*, and only then does the worker
+  read the job fields — at that moment the job is provably still running (its claimed task is not done), so
+  the fields are that job's. A worker that lagged behind the end of one job and claims a task of the next just
+  reloads the fields and runs it. (The first version read the fields right after seeing a new epoch, which can
+  race with the caller writing the *next* job's fields; `SmokeTest.threadPool` caught it.) Completions are
+  counted in `done`. Nothing is allocated per job.
+- The first exception a task throws is kept (`compareAndSet`) and rethrown on the caller once every task has been
+  claimed; tasks claimed after it are counted as done without running, so a failing chunk ends the job quickly
+  instead of after all its chunks. `SmokeTest.threadPool` hammers 20 000 back-to-back jobs and the failure path.
 - After finishing a job a worker **spins** for up to `SPIN_NANOS = 200 µs` waiting for the next one
   (`Thread.onSpinWait()`), then **parks**. Between two matmuls of the same layer the gap is microseconds, so
   workers are almost always still spinning and pick up the next job with no OS involvement.
@@ -357,14 +367,13 @@ The dangerous interleaving is: a worker decides to park *just as* the caller pub
 re-check after publishing `parked`:
 
 ```
-worker:   if (current == last)  { parked = true;  if (current == last) park(); parked = false; }
-caller:   current = job;        if (w.parked) unpark(w);
+worker:   if (epoch(next) == last)  { parked = true;  if (epoch(next) == last) park(); parked = false; }
+caller:   next.set(epoch << 32);    if (w.parked) unpark(w);
 ```
 
-Both `current` and `parked` are `volatile`, so the writes and reads are sequentially consistent: either the
-worker's second read of `current` sees the new job (and skips the park), or its write `parked = true` is
+`next` is atomic and `parked` is `volatile`, so the writes and reads are sequentially consistent: either the
+worker's second read of the epoch sees the new job (and skips the park), or its write `parked = true` is
 visible to the caller's read (which then unparks). A spurious wake-up is harmless — the loop re-checks.
-Exceptions thrown by a chunk are stored and rethrown on the caller after the job completes.
 
 ---
 
