@@ -5,8 +5,6 @@ import org.robomiri.jllm.model.MlaWeights;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 
-import java.lang.foreign.ValueLayout;
-
 /**
  * DeepSeek multi-head latent attention, expert router and shared experts on the GPU, driven by
  * {@link MetalBackend} (see {@code MlaCpu} for the math). Projections, norms and attention (the runtime-width
@@ -34,9 +32,10 @@ final class MlaMetal {
     }
 
     private final MetalBackend mb;
-    private final Metal metal;
+    private final MetalKernels k;
     private final ModelConfig c;
     private final DeepSeekConfig d;
+    private final int ctx;
     private final Bufs[] bufs;
     private final Metal.Buffer[] key;
     private final Metal.Buffer[] val;
@@ -49,38 +48,39 @@ final class MlaMetal {
 
     MlaMetal(MetalBackend mb, ModelWeights w, int ctx, int maxBatch) {
         this.mb = mb;
-        this.metal = mb.metal;
+        this.k = mb.k;
         this.c = w.cfg;
         this.d = c.deepseek();
+        this.ctx = ctx;
         if (d.qkDim() % 32 != 0 || d.qkDim() > 256 || d.vHeadDim() % 32 != 0 || d.vHeadDim() > 256
                 || d.qkRopeDim() / 2 > 256) {
             throw new IllegalArgumentException("Metal MLA needs qk (" + d.qkDim() + ") and v (" + d.vHeadDim()
                     + ") head dims that are multiples of 32 and <= 256");
         }
-        if (c.isMoe() && c.numExperts() > 1024) {
-            throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
+        if (c.isMoe() && c.numExperts() > MetalKernels.MAX_EXPERTS) {
+            throw new IllegalArgumentException("Metal router kernel supports at most " + MetalKernels.MAX_EXPERTS + " experts");
         }
         bufs = new Bufs[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
             MlaWeights m = w.layers[l].mla;
             Bufs b = new Bufs();
             if (m.qProj != null) {
-                b.qProj = metal.wrap(m.qProj.data);
+                b.qProj = k.wrap(m.qProj.data);
             } else {
-                b.qA = metal.wrap(m.qA.data);
-                b.qALn = mb.upload(m.qALayernorm);
-                b.qB = metal.wrap(m.qB.data);
+                b.qA = k.wrap(m.qA.data);
+                b.qALn = k.upload(m.qALayernorm);
+                b.qB = k.wrap(m.qB.data);
             }
-            b.kvA = metal.wrap(m.kvA.data);
-            b.kPe = metal.wrap(m.kPe.data);
-            b.kvALn = mb.upload(m.kvALayernorm);
-            b.kvB = metal.wrap(m.kvB.data);
+            b.kvA = k.wrap(m.kvA.data);
+            b.kPe = k.wrap(m.kPe.data);
+            b.kvALn = k.upload(m.kvALayernorm);
+            b.kvB = k.wrap(m.kvB.data);
             if (m.sharedGateUp != null) {
-                b.sharedGateUp = metal.wrap(m.sharedGateUp.data);
-                b.sharedDown = metal.wrap(m.sharedDown.data);
+                b.sharedGateUp = k.wrap(m.sharedGateUp.data);
+                b.sharedDown = k.wrap(m.sharedDown.data);
             }
             if (m.routerBias != null) {
-                b.routerBias = mb.upload(m.routerBias);
+                b.routerBias = k.upload(m.routerBias);
             }
             bufs[l] = b;
         }
@@ -91,15 +91,15 @@ final class MlaMetal {
         key = new Metal.Buffer[c.layers()];
         val = new Metal.Buffer[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
-            key[l] = metal.newBuffer((long) ctx * heads * d.qkDim() * 4, false);
-            val[l] = metal.newBuffer((long) ctx * heads * d.vHeadDim() * 4, false);
+            key[l] = k.scratch((long) ctx * heads * d.qkDim() * 4);
+            val[l] = k.scratch((long) ctx * heads * d.vHeadDim() * 4);
         }
-        qa = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4, false);
-        qaNorm = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4, false);
-        lat = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4, false);
-        latNorm = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4, false);
-        kpe = metal.newBuffer((long) maxBatch * d.qkRopeDim() * 4, false);
-        kvb = metal.newBuffer((long) maxBatch * heads * (d.qkNopeDim() + d.vHeadDim()) * 4, false);
+        qa = k.scratch((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4);
+        qaNorm = k.scratch((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4);
+        lat = k.scratch((long) maxBatch * d.kvLoraRank() * 4);
+        latNorm = k.scratch((long) maxBatch * d.kvLoraRank() * 4);
+        kpe = k.scratch((long) maxBatch * d.qkRopeDim() * 4);
+        kvb = k.scratch((long) maxBatch * heads * (d.qkNopeDim() + d.vHeadDim()) * 4);
     }
 
     /** Reads {@code xb}, writes the attention output {@code [n, heads*v]} to {@code att} (o_proj is the caller's). */
@@ -112,65 +112,40 @@ final class MlaMetal {
         int rd = d.qkRopeDim();
         int vd = d.vHeadDim();
         if (m.qProj != null) {
-            mb.matmul(m.qProj, b.qProj, mb.xb, 0, mb.q, 0, n, false, null);
+            k.matmul(m.qProj, b.qProj, mb.xb, 0, mb.q, 0, n, false, null, 0f);
         } else {
-            mb.matmul(m.qA, b.qA, mb.xb, 0, qa, 0, n, false, null);
-            mb.rmsnorm(qa, b.qALn, qaNorm, n, d.qLoraRank());
-            mb.matmul(m.qB, b.qB, qaNorm, 0, mb.q, 0, n, false, null);
+            k.matmul(m.qA, b.qA, mb.xb, 0, qa, 0, n, false, null, 0f);
+            k.rmsnorm(qa, 0, b.qALn, qaNorm, n, d.qLoraRank());
+            k.matmul(m.qB, b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
         }
-        mb.matmul(m.kvA, b.kvA, mb.xb, 0, lat, 0, n, false, null);
-        mb.matmul(m.kPe, b.kPe, mb.xb, 0, kpe, 0, n, false, null);
-        mb.rmsnorm(lat, b.kvALn, latNorm, n, d.kvLoraRank());
-        mb.matmul(m.kvB, b.kvB, latNorm, 0, kvb, 0, n, false, null);
+        k.matmul(m.kvA, b.kvA, mb.xb, 0, lat, 0, n, false, null, 0f);
+        k.matmul(m.kPe, b.kPe, mb.xb, 0, kpe, 0, n, false, null, 0f);
+        k.rmsnorm(lat, 0, b.kvALn, latNorm, n, d.kvLoraRank());
+        k.matmul(m.kvB, b.kvB, latNorm, 0, kvb, 0, n, false, null, 0f);
 
-        rope(mb.q, heads, qk, nope, rd, heads * qk, n, pos);
-        rope(kpe, 1, rd, 0, rd, rd, n, pos);
+        // interleaved rotation of the rd-wide slice after the nope part of every q head, and of the shared
+        // k_pe row, both in place through the q path of the rope kernel (no k heads)
+        k.rope(true, false, mb.q, mb.q, 0, mb.q, 0, null, null, mb.ropeCos, mb.ropeSin, qk, heads * qk, heads * qk,
+                heads, 0, pos, nope, rd / 2, n);
+        k.rope(true, false, kpe, kpe, 0, kpe, 0, null, null, mb.ropeCos, mb.ropeSin, rd, rd, rd, 1, 0, pos, 0, rd / 2, n);
 
-        mb.bind(0, kvb, 0);
-        mb.bind(1, kpe, 0);
-        mb.bind(2, key[l], (long) pos * heads * qk * 4);
-        mb.bind(3, val[l], (long) pos * heads * vd * 4);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 0, nope);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 1, rd);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 2, vd);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, heads * (nope + vd));
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, heads * qk);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 5, heads * vd);
-        metal.dispatch(metal.pipeline("mla_kv_store"), mb.bufArgs, mb.offArgs, 4, mb.params, 24, heads, n, 1, 64, 1, 1);
+        k.mlaKvStore(kvb, kpe, key[l], (long) pos * heads * qk * 4, val[l], (long) pos * heads * vd * 4, nope, rd, vd, heads, n);
 
         // the runtime-width attention kernel: keys heads * qk wide, values heads * vd, no GQA, window or cap
-        mb.attention("attention", 1, mb.q, key[l], val[l], mb.att, heads, heads, qk, vd, pos, (float) d.softmaxScale(),
-                heads * qk, heads * qk, heads * vd, heads * vd, 0, 0f, n);
-    }
-
-    /** Interleaved rotation of the rd-wide slice at `nope` of every head of the rows of v, in place (q path). */
-    private void rope(Metal.Buffer v, int heads, int qk, int nope, int rd, int rowStride, int n, int pos) {
-        mb.rope(true, v, v, 0, v, 0, null, null, mb.ropeCos, mb.ropeSin, qk, rowStride, rowStride, heads, 0, pos, nope, rd / 2, n);
+        k.attention("attention", 1, mb.q, key[l], val[l], mb.att, mb.scores, heads, heads, qk, vd, pos, ctx,
+                (float) d.softmaxScale(), heads * qk, heads * qk, heads * vd, heads * vd, 0, 0f, n);
     }
 
     /** Routes the n tokens of {@code xb}: fills the backend's assign / routeWeight buffers (scaling included). */
     void router(int l, Metal.Buffer routerW, int n) {
-        Bufs b = bufs[l];
-        mb.bind(0, mb.xb, 0);
-        mb.bind(1, routerW, 0);
-        mb.bind(2, mb.assign, 0);
-        mb.bind(3, mb.routeWeight, 0);
-        mb.bind(4, b.routerBias != null ? b.routerBias : routerW, 0); // dummy unless noaux_tc
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 0, c.numExperts());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 2, c.expertsPerTok());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, d.nGroup());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 5, d.topkGroup());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 6, d.sigmoid() ? 1 : 0);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 7, switch (d.topkMethod()) {
+        int method = switch (d.topkMethod()) {
             case "greedy" -> 0;
             case "group_limited_greedy" -> 1;
             default -> 2;
-        });
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 8, d.scaleAlways() ? 1 : 0);
-        mb.params.setAtIndex(ValueLayout.JAVA_FLOAT, 9, (float) d.routedScale());
-        metal.dispatch(metal.pipeline("router_ds"), mb.bufArgs, mb.offArgs, 5, mb.params, 40, n, 1, 1, 256, 1, 1);
+        };
+        k.routerDs(mb.xb, routerW, mb.assign, mb.routeWeight, bufs[l].routerBias, c.numExperts(), c.dim(),
+                c.expertsPerTok(), c.normTopK(), d.nGroup(), d.topkGroup(), d.sigmoid(), method, d.scaleAlways(),
+                (float) d.routedScale(), n);
     }
 
     /** Shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x. */
@@ -180,7 +155,7 @@ final class MlaMetal {
             return;
         }
         Bufs b = bufs[l];
-        mb.swiglu(m.sharedGateUp, b.sharedGateUp, mb.xb, null, n); // writes silu(gate) * up to hidden
-        mb.matmul(m.sharedDown, b.sharedDown, mb.hidden, 0, mb.x, 0, n, true, null);
+        k.swiglu(m.sharedGateUp, b.sharedGateUp, mb.xb, null, mb.hidden, false, n); // writes silu(gate) * up to hidden
+        k.matmul(m.sharedDown, b.sharedDown, mb.hidden, 0, mb.x, 0, n, true, null, 0f);
     }
 }
