@@ -460,7 +460,7 @@ public final class ApiServer implements AutoCloseable {
         maxTokens = Math.min(maxTokens, room); // the engine stops at the context edge anyway; this also avoids int overflow
         return new SamplingParams(
                 (float) Json.dbl(b, "temperature", d.temperature()),
-                (int) Json.num(b, "top_k", d.topK()),
+                intField(b, "top_k", d.topK()),
                 (float) Json.dbl(b, "top_p", d.topP()),
                 (float) Json.dbl(b, "min_p", d.minP()),
                 (float) Json.dbl(b, "repetition_penalty", d.repetitionPenalty()),
@@ -469,6 +469,22 @@ public final class ApiServer implements AutoCloseable {
                 Json.num(b, "seed", d.seed()),
                 (int) maxTokens,
                 stop);
+    }
+
+    /** An integer request field in {@code [0, Integer.MAX_VALUE]}; fractions, negatives and larger values are a 400. */
+    private static int intField(Map<String, Object> b, String key, int def) {
+        Object v = b.get(key);
+        if (v == null) {
+            return def;
+        }
+        if (!(v instanceof Number n) || (v instanceof Double x && x != Math.rint(x))) {
+            throw RequestError.invalid("'" + key + "' must be an integer");
+        }
+        double x = n.doubleValue(); // Long or Double; exact enough for the range check
+        if (x < 0 || x > Integer.MAX_VALUE) {
+            throw RequestError.invalid("'" + key + "' must be between 0 and " + Integer.MAX_VALUE);
+        }
+        return (int) x;
     }
 
     private static String error(String msg) {

@@ -130,6 +130,11 @@ public final class ServerTest {
         String msgs = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         Resp r = f.post("/v1/chat/completions", "{" + msgs + ",\"temperature\":1e400}");
         check(r.status == 400 && r.body.contains("finite"), "temperature 1e400 (infinite): 400");
+        // L13: integer fields are range-checked before the int cast
+        for (String topK : new String[]{"10000000000", "1.5", "-1", "\"5\""}) {
+            r = f.post("/v1/chat/completions", "{" + msgs + ",\"top_k\":" + topK + "}");
+            check(r.status == 400 && r.body.contains("top_k"), "top_k " + topK + ": 400");
+        }
         // L3: a chunk size that overflows when added to what was already received
         String chunked = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
                 + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7fffffffffffffff\r\n";
