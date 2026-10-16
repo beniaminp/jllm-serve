@@ -91,6 +91,14 @@ public final class ServerTest {
         r = f.exchange(("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
                 + "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
         check(r.status == 400 && r.body.contains("duplicate"), "two Transfer-Encoding headers: 400 (got " + r.status + ")");
+        // L8: unsupported request features
+        r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
+                + "{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]}");
+        check(r.status == 400 && r.body.contains("image_url"), "image content part: 400");
+        for (String field : new String[]{"\"logit_bias\":{\"1\":5}", "\"echo\":true", "\"suffix\":\"x\"", "\"best_of\":2"}) {
+            r = f.post("/v1/completions", "{\"prompt\":\"hi\"," + field + "}");
+            check(r.status == 400 && r.body.contains("not supported"), field + ": 400");
+        }
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */

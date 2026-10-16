@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
@@ -90,6 +91,7 @@ public final class ApiServer implements AutoCloseable {
     private final String modelId;
     private final HttpServer http;
     private final AtomicLong counter = new AtomicLong();
+    private final AtomicBoolean thinkingNoted = new AtomicBoolean();
     private final SamplingParams defaults;
     private final boolean thinkingDefault;
     private final long maxPromptBytes;
@@ -300,6 +302,19 @@ public final class ApiServer implements AutoCloseable {
         if (Boolean.TRUE.equals(logprobs) || logprobs instanceof Number n && n.intValue() != 0) {
             throw RequestError.invalid("'logprobs' is not supported");
         }
+        Map<String, Object> bias = Json.map(b, "logit_bias");
+        if (bias != null && !bias.isEmpty()) {
+            throw RequestError.invalid("'logit_bias' is not supported");
+        }
+        if (Boolean.TRUE.equals(b.get("echo"))) {
+            throw RequestError.invalid("'echo' is not supported");
+        }
+        if (b.get("suffix") != null) {
+            throw RequestError.invalid("'suffix' is not supported");
+        }
+        if (Json.num(b, "best_of", 1) != 1) {
+            throw RequestError.invalid("'best_of' other than 1 is not supported");
+        }
         if (!chat && b.get("prompt") instanceof List<?> l) {
             if (l.size() != 1 || !(l.getFirst() instanceof String)) {
                 throw RequestError.invalid("'prompt' must be a string or a single-element array of strings"
@@ -394,12 +409,15 @@ public final class ApiServer implements AutoCloseable {
             String text;
             if (content instanceof String s) {
                 text = s;
-            } else if (content instanceof List<?> parts) { // OpenAI multi-part content: concatenate text parts
+            } else if (content instanceof List<?> parts) { // OpenAI multi-part content: text parts only
                 StringBuilder sb = new StringBuilder();
                 for (Object p : parts) {
-                    if ("text".equals(Json.str(p, "type", "text"))) {
-                        sb.append(Json.str(p, "text", ""));
+                    String type = p instanceof Map<?, ?> ? Json.str(p, "type", "text") : "?";
+                    if (!type.equals("text")) {
+                        throw RequestError.invalid("message content parts must be of type \"text\" (got \"" + type
+                                + "\"); images and audio are not supported");
                     }
+                    sb.append(Json.str(p, "text", ""));
                 }
                 text = sb.toString();
             } else {
@@ -413,6 +431,12 @@ public final class ApiServer implements AutoCloseable {
         Map<String, Object> extra = Json.map(body, "chat_template_kwargs");
         if (extra != null) {
             thinking = Json.bool(extra, "enable_thinking", thinking);
+        }
+        boolean thinkingGiven = body.containsKey("enable_thinking") || (extra != null && extra.containsKey("enable_thinking"));
+        String template = engine.template().name();
+        if (thinkingGiven && !template.equals("chatml-qwen3") && thinkingNoted.compareAndSet(false, true)) {
+            System.err.println("note: enable_thinking only applies to the Qwen3 chat template; this model uses \""
+                    + template + "\", the field is ignored (reported once)");
         }
         return engine.renderChat(list, thinking);
     }
