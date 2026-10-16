@@ -53,7 +53,10 @@ public final class ServerTest {
             slowRequest(f);
             midStreamFailure(f);
         }
-        try (Fixture f = new Fixture(tok, "llama", 64)) {
+        // a tokenizer that adds BOS (as Llama/Mistral tokenizer configs do): the BOS rule is the tokenizer's, not the family's
+        Tokenizer tokBos = Tokenizer.fromJson(Files.readString(dir.resolve("tokenizer.json")),
+                "{\"add_bos_token\": true, \"bos_token\": \"<|im_start|>\"}");
+        try (Fixture f = new Fixture(tokBos, "llama", 64)) {
             bosContextCheck(f);
         }
         System.out.println("all server tests passed");
