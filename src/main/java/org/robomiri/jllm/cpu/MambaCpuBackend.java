@@ -72,7 +72,7 @@ public final class MambaCpuBackend implements Backend {
         xc = new float[maxBatch * di];
         dbc = new float[maxBatch * (m.dtRank() + 2 * m.dState())];
         y = new float[maxBatch * di];
-        mm = new CpuMatmul(pool, int8Activations, CpuBackend.DETERMINISTIC, 4 * Math.max(c.dim(), di));
+        mm = new CpuMatmul(pool, int8Activations, CpuBackend.DETERMINISTIC, 4 * CpuMatmul.maxCols(w));
     }
 
     @Override

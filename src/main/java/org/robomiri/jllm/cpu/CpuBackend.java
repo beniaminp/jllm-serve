@@ -126,8 +126,8 @@ public final class CpuBackend implements Backend {
             usedExperts = null;
             slotOrder = null;
         }
-        int scratchLen = Math.max(Math.max(ctx, c.numExperts()),
-                4 * Math.max(Math.max(c.maxMlpDim(), c.moeDim()), Math.max(c.dim(), c.qDim())));
+        // attention scores (ctx), router logits (experts), or four dequantized rows of the widest tensor
+        int scratchLen = Math.max(Math.max(ctx, c.numExperts()), 4 * CpuMatmul.maxCols(w));
         mm = new CpuMatmul(pool, int8Activations, DETERMINISTIC, scratchLen);
         scratch = mm.scratch;
     }

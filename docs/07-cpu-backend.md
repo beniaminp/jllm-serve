@@ -85,7 +85,8 @@ the arithmetic units. A loop that loads 1 byte per multiply-add is memory-bound 
 | `q`, `att` | `[batch × qDim]` | 512 KB each | queries; attention output |
 | `gateUp` | `[batch × 2·ffn]` | 1.5 MB | gate and up activations |
 | `hidden` | `[batch × ffn]` | 768 KB | `silu(gate) ⊙ up` |
-| `scratch` | thread-local `float[max(ctx, 4·max(ffn, dim, qDim))]` | 48 KB per thread | attention scores / dequantized rows |
+| `scratch` (`CpuMatmul`) | thread-local `float[max(ctx, experts, 4·maxCols)]`, `maxCols` the widest tensor of the model | 48 KB per thread | MLA attention scores, router logits, four dequantized rows |
+| `KvCache.scratch` | thread-local `float[tile·group·ctx + 2·headDim + tile·group]` | 128 KB per thread | attention scores of one tile ([7.5](#75-attention-kvcacheattention)) |
 | MoE: `routerLogits`, `assign`, `routeWeight`, `moeGateUp`, `moeHidden` | per-token | tiny | [12](12-mixture-of-experts.md) |
 
 All buffers are row-major `[token][feature]`, so token `t`'s vector starts at `t × width`. They are allocated
