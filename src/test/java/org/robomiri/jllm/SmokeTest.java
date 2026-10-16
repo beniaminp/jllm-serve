@@ -62,6 +62,7 @@ public final class SmokeTest {
         longRope();
         phi3Configs();
         GemmaChecks.run();
+        SpeculationTest.run(dir);
         mamba();
         kvCacheAttention();
         fastMath();

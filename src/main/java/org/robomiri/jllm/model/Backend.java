@@ -31,6 +31,23 @@ public interface Backend extends AutoCloseable {
     void forward(int[] tokens, int off, int n, int pos, float[] logits);
 
     /**
+     * Like {@link #forward} but returns the logits of <em>every</em> token of the chunk: row {@code i} (the
+     * distribution after {@code tokens[off + i]}) goes to {@code logitsOut[i * stride ..]}, {@code min(head rows,
+     * stride)} values each. The K/V of all {@code n} positions are appended, exactly as for {@code forward}; a
+     * caller that accepts only a prefix simply continues from the shorter position (later calls overwrite the
+     * rest). Used to verify speculative drafts in one pass. The default runs {@code n} single-token steps.
+     *
+     * @param stride row stride of {@code logitsOut} (normally the model's vocabulary size)
+     */
+    default void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
+        float[] row = new float[stride];
+        for (int i = 0; i < n; i++) {
+            forward(tokens, off + i, 1, pos + i, row);
+            System.arraycopy(row, 0, logitsOut, i * stride, stride);
+        }
+    }
+
+    /**
      * Whether the state after tokens {@code [0, N)} can be rewound to an earlier position. A KV cache can (positions
      * past {@code pos} are simply overwritten); a recurrent state (Mamba) cannot, so the engine then reuses the
      * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.

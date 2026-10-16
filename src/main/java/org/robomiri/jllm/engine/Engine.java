@@ -30,7 +30,16 @@ public final class Engine implements AutoCloseable {
         }
     }
 
-    public record Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs) {
+    /**
+     * @param draftedTokens  speculative tokens proposed for verification during this request (0 without speculation)
+     * @param acceptedTokens how many of them the target model accepted
+     */
+    public record Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs,
+                        int draftedTokens, int acceptedTokens) {
+        public Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs) {
+            this(promptTokens, cachedTokens, generatedTokens, prefillMs, decodeMs, 0, 0);
+        }
+
         public double tokPerSec() {
             return decodeMs > 0 ? generatedTokens / (decodeMs / 1000.0) : 0;
         }
@@ -56,6 +65,7 @@ public final class Engine implements AutoCloseable {
     private int[] cached = new int[0]; // tokens currently in the KV cache
     private int cachedLen;
     private final ChatTemplate.Format template;
+    private Speculator spec; // null = no speculative decoding
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
         this(backend, tokenizer, arch, eosIds, 0);
@@ -97,6 +107,32 @@ public final class Engine implements AutoCloseable {
             empty = this.eosIds.stream().mapToInt(Integer::intValue).min().orElse(-1);
         }
         this.emptyPromptToken = empty;
+    }
+
+    /**
+     * Turns on speculative decoding (docs/10 §10.9). Ignored, with a note, for a backend whose state cannot be
+     * rewound (Mamba). The engine owns {@code draft} and closes it.
+     *
+     * @return whether speculation is active
+     */
+    public boolean enableSpeculation(Speculator.Config cfg, DraftModel draft) {
+        if (cfg.mode() == Speculator.Mode.OFF) {
+            return false;
+        }
+        if (!Speculator.supported(backend)) {
+            System.err.println("note: engine.speculative is ignored: " + backend.name() + " cannot roll back its state");
+            if (draft != null) {
+                draft.close();
+            }
+            return false;
+        }
+        lock.lock();
+        try {
+            spec = new Speculator(cfg, backend, draft, model.vocabSize(), Math.min(model.vocabSize(), tokenizer.vocabSize()), eosIds);
+        } finally {
+            lock.unlock();
+        }
+        return true;
     }
 
     public Tokenizer tokenizer() {
@@ -224,19 +260,41 @@ public final class Engine implements AutoCloseable {
         boolean stopHit = false; // a stop string was found: everything after it is discarded
         int maxTokens = Math.min(p.maxTokens(), ctx - prompt.length);
         int[] one = new int[1];
+        Speculator sp = spec;
+        long drafted0 = 0;
+        long accepted0 = 0;
+        int[] ready = null; // tokens a verification pass already decided: ready[rIdx..rLen), the first rPre accepted
+        int rIdx = 0;
+        int rLen = 0;
+        int rPre = 0;
+        if (sp != null) {
+            sp.begin(prompt);
+            drafted0 = sp.drafted();
+            accepted0 = sp.accepted();
+        }
 
         for (int i = 0; i < maxTokens; i++) {
             if (cancelled.getAsBoolean()) {
                 finish = "cancelled";
                 break;
             }
-            int tok = sampler.sample(logits);
+            boolean queued = rIdx < rLen;
+            int tok = queued ? ready[rIdx] : sampler.sample(logits);
+            boolean preAccepted = queued && rIdx < rPre;
+            if (queued) {
+                rIdx++;
+            }
             if (eosIds.contains(tok)) {
                 finish = "stop";
                 break;
             }
-            sampler.accept(tok);
+            if (!preAccepted) {
+                sampler.accept(tok);
+            }
             out.add(tok);
+            if (sp != null) {
+                sp.onToken(tok);
+            }
             String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
             if (!piece.isEmpty()) {
                 pending += piece;
@@ -254,10 +312,18 @@ public final class Engine implements AutoCloseable {
                     pending = pending.substring(safe);
                 }
             }
-            if (i + 1 < maxTokens) {
-                one[0] = tok;
-                backend.forward(one, 0, 1, pos, logits);
-                pos++;
+            if (i + 1 < maxTokens && rIdx >= rLen) { // (a queued token's K/V is already in the cache)
+                if (sp != null && sp.step(tok, pos, ctx, maxTokens - i - 1, sampler)) {
+                    ready = sp.ready();
+                    rIdx = 0;
+                    rLen = sp.readyCount();
+                    rPre = sp.preAccepted();
+                    pos = sp.newPos();
+                } else {
+                    one[0] = tok;
+                    backend.forward(one, 0, 1, pos, logits);
+                    pos++;
+                }
             }
         }
         if (!stopHit) { // EOS, length or cancelled: release the held-back text plus any incomplete UTF-8 sequence
@@ -266,7 +332,7 @@ public final class Engine implements AutoCloseable {
         long t2 = System.nanoTime();
 
         // remember what is in the cache: prompt + generated tokens that were fed through forward()
-        int fed = pos; // positions [0, pos) hold valid K/V
+        int fed = Math.min(pos, prompt.length + out.size()); // positions [0, pos) hold valid K/V
         cached = new int[fed];
         System.arraycopy(prompt, 0, cached, 0, Math.min(fed, prompt.length));
         for (int i = 0; i < fed - prompt.length; i++) {
@@ -275,7 +341,8 @@ public final class Engine implements AutoCloseable {
         cachedLen = fed;
 
         int[] tokens = out.stream().mapToInt(Integer::intValue).toArray();
-        Stats stats = new Stats(prompt.length, reuse, tokens.length, (t1 - t0) / 1e6, (t2 - t1) / 1e6);
+        Stats stats = new Stats(prompt.length, reuse, tokens.length, (t1 - t0) / 1e6, (t2 - t1) / 1e6,
+                sp == null ? 0 : (int) (sp.drafted() - drafted0), sp == null ? 0 : (int) (sp.accepted() - accepted0));
         return new Result(text.toString(), tokens, finish, stats);
     }
 
@@ -305,6 +372,9 @@ public final class Engine implements AutoCloseable {
 
     @Override
     public void close() {
+        if (spec != null) {
+            spec.close();
+        }
         backend.close();
     }
 }

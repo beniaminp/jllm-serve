@@ -233,6 +233,17 @@ distributed exactly as in `transformers`.
 
 ---
 
+### Speculative verification
+
+`Sampler.verify(logits, draft)` is the sampling step used by speculative decoding
+([10 §10.9](10-engine-and-server.md#109-speculative-decoding)) for a draft token proposed deterministically (a
+one-hot proposal). It builds the same distribution `sample` draws from (penalties, temperature, top-k, top-p, min-p),
+accepts the draft with probability `p(draft)` and otherwise draws from that distribution with the draft's mass
+removed, so the returned token is distributed exactly like a plain `sample` result and equals the draft iff the
+draft was accepted. Greedy decoding returns the argmax.
+
+---
+
 ## 9.8 Randomness and seeds
 
 `Sampler` uses `java.util.SplittableRandom`: fast, good statistical quality, and seedable. With `seed >= 0`

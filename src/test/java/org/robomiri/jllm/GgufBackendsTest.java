@@ -196,7 +196,7 @@ public final class GgufBackendsTest {
 
     /** Prefill of the prompt in chunks of up to 40 tokens, then 4 greedy decode steps; logits after each call. */
     static float[][] run(org.robomiri.jllm.model.Backend b, int[] prompt) {
-        float[][] out = new float[3 + 4][VOCAB];
+        float[][] out = new float[2 + 4][VOCAB];
         int pos = 0;
         int call = 0;
         for (int off = 0; off < prompt.length; off += 40) {
@@ -209,6 +209,13 @@ public final class GgufBackendsTest {
             int next = GgufModelTest.argmax(out[call - 1]);
             b.forward(new int[]{next}, 0, 1, pos++, out[call++]);
         }
-        return java.util.Arrays.copyOf(out, call);
+        // forwardAll (speculative verification): the logits of every one of 6 tokens in one call
+        float[] all = new float[6 * VOCAB];
+        b.forwardAll(prompt, 0, 6, pos, all, VOCAB);
+        float[][] res = java.util.Arrays.copyOf(out, call + 6);
+        for (int i = 0; i < 6; i++) {
+            res[call + i] = java.util.Arrays.copyOfRange(all, i * VOCAB, (i + 1) * VOCAB);
+        }
+        return res;
     }
 }

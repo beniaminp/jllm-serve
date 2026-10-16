@@ -311,6 +311,16 @@ public final class CpuBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+        run(tokens, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
+        run(tokens, off, n, pos, logitsOut, stride);
+    }
+
+    /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
+    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
@@ -335,23 +345,48 @@ public final class CpuBackend implements Backend {
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
         }
-        if (logits != null) {
+        if (logits != null && stride == 0) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
             // the caller sizes logits by vocabSize; the LM head may have fewer (or, padded, more) rows
             int rows = Math.min(w.lmHead.rows, logits.length);
             mm.mul(w.lmHead, rows, xb, logits, 0, 1, false);
-            float cap = c.finalSoftcap();
-            if (cap > 0) {
-                pool.forRange(rows, 4096, (i0, i1) -> {
-                    if (VectorKernels.FASTMATH) {
-                        VectorKernels.softcapFast(logits, i0, i1 - i0, cap);
-                        return;
-                    }
-                    for (int i = i0; i < i1; i++) {
-                        logits[i] = GemmaMath.softcap(logits[i], cap);
-                    }
-                });
+            softcap(logits, 0, rows);
+        } else if (logits != null) {
+            lmHeadAll(n, logits, stride);
+        }
+    }
+
+    /** The LM head over all {@code n} rows of {@link #x}, row {@code i} stored at {@code out[i * stride ..]}. */
+    private void lmHeadAll(int n, float[] out, int stride) {
+        rmsnorm(x, xb, w.finalNorm, n, c.dim());
+        int headRows = w.lmHead.rows;
+        int rows = Math.min(headRows, stride);
+        if (headRows == stride) { // the usual case: the matmul writes the final layout directly
+            mm.mul(w.lmHead, rows, xb, out, 0, n, false);
+        } else {
+            float[] tmp = new float[n * headRows];
+            mm.mul(w.lmHead, rows, xb, tmp, 0, n, false);
+            for (int i = 0; i < n; i++) {
+                System.arraycopy(tmp, i * headRows, out, i * stride, rows);
             }
+        }
+        for (int i = 0; i < n; i++) {
+            softcap(out, i * stride, rows);
+        }
+    }
+
+    private void softcap(float[] logits, int base, int rows) {
+        float cap = c.finalSoftcap();
+        if (cap > 0) {
+            pool.forRange(rows, 4096, (i0, i1) -> {
+                if (VectorKernels.FASTMATH) {
+                    VectorKernels.softcapFast(logits, base + i0, i1 - i0, cap);
+                    return;
+                }
+                for (int i = base + i0; i < base + i1; i++) {
+                    logits[i] = GemmaMath.softcap(logits[i], cap);
+                }
+            });
         }
     }
 

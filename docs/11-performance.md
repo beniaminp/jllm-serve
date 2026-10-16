@@ -266,7 +266,78 @@ the model logic out of the kernel layer.
 
 ---
 
-## 11.6 Summary
+## 11.6 Speculative decoding
+
+Setting `engine.speculative` ([10 §10.9](10-engine-and-server.md#109-speculative-decoding)). Apple M1 Pro (32 GB),
+Metal, greedy, `--ctx 2048`. **The machine was heavily shared while this was measured** (load average 15 to 75 from
+other jobs, the 30B cache competing for memory), so tok/s below are the best of 2 to 5 interleaved runs and carry
+about ±15 % noise; the pass costs and acceptance counts are the reliable numbers.
+
+**Cost of a verification pass** (minimum over 60 interleaved rounds, `forwardAll` including the LM head over n rows):
+
+| tokens in the pass | 1 | 2 | 3 | 5 | 7 | 9 |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B, ms (× a 1-token pass) | 8.0 (1.0) | 10.0 (1.25) | 13.1 (1.64) | 19.5 (2.44) | 26.5 (3.3) | 26.0 (3.3) |
+| Qwen3-30B-A3B, ms (× a 1-token pass) | 39.2 (1.0) | 57.4 (1.47) | 80.4 (2.05) | 128 (3.3) | 175 (4.5) | 204 (5.2) |
+
+A pass is not "free" for extra tokens on this backend: the multi-token kernels scale roughly linearly in n (the
+dense model about 0.36, the MoE about 0.55 of a step per extra position), so drafting K tokens needs about
+`1 + 0.36 K` (dense) or `1 + 0.55 K` (MoE) accepted-tokens-per-pass-equivalents to break even.
+
+**Prompt lookup, 0.6B, 200 tokens max, best of 5 interleaved** (a: edit a 35-line Java class and print it again;
+b: haiku + explanation; c: long-form explanation; accepted/drafted tokens of the best run):
+
+| setting | a code edit | b haiku | c long-form |
+|---|---|---|---|
+| off | 102.5 tok/s | 98.5 | 115.8 |
+| ngram min 1, k 4 | 110.8 (54/138) | 96.4 (0/20) | 108.6 (10/87) |
+| ngram min 2, k 4 (default values) | 118.2 (62/123) | 115.8 | 113.1 (5/46) |
+| ngram min 3, k 4 | 120.1 (62/110) | 84.4 | 122.9 (4/12) |
+| ngram min 2, k 6 | 105.5 (64/161) | 113.6 | 112.5 (6/60) |
+
+Only the code-editing prompt, whose answer repeats the input, drafts successfully (about 50 % of drafted tokens
+accepted, +15 to +17 %); on b and c nothing is drafted or almost nothing is accepted and the differences are
+noise (b with min 3 never drafted at all and still reads 84 vs 98).
+
+**Qwen3-30B-A3B-Thinking-2507, 80 tokens, best of 2 interleaved, `engine.draft-model` = Qwen3-0.6B:**
+
+| setting | a code edit | b haiku | c long-form |
+|---|---|---|---|
+| off | 23.0 tok/s | 23.8 | 20.4 |
+| ngram min 2, k 4 | 20.2 (15/48) | 22.0 (5/24) | 20.6 (9/24) |
+| ngram min 3, k 4 | 22.3 (9/27) | 24.1 (3/8) | 13.4 (7/12) |
+| draft, k 2 | 14.4 (43/71) | 14.7 (38/80) | 18.3 (39/80) |
+| draft, k 4 | 2.5 (53/104) | 1.5 (45/129) | 14.5 (47/125) |
+| draft, k 6 | 7.1 (54/148) | 1.3 (45/189) | 11.8 (50/165) |
+
+(The 30B shared the 32 GB of memory with other jobs for the whole run; the k 4 / k 6 draft rows on a and b
+are far slower than their acceptance explains and are best read as "slow", not as a ratio.)
+The draft model agrees with the 30B on only 50 to 60 % of positions (the 30B is a *Thinking* model with a
+different output distribution), and every drafted token costs 0.55 of a 30B step, so the verification alone eats
+the gain even at 100 % acceptance: with K = 2 and 60 % acceptance a pass yields 1.96 tokens for 2.1 steps.
+With a perfectly agreeing draft (the 0.6B drafting for itself, only a correctness test) acceptance is 100 % and
+throughput still drops (56 vs 95 tok/s) because the verification pass and the draft's own K steps cost more than
+the K tokens saved.
+
+**Greedy exactness** (5 prompts, 100 to 150 tokens): Metal, `ngram` (min 1, k 4) and `draft` (self-draft, k 6): all
+5 outputs byte-identical to the non-speculative output, accepted 100 % for the self-draft, so `forwardAll` is bit-identical to
+the single-token pass on Metal. CPU, `-Djllm.cpu.deterministic=true --backend.cpu.int8-activations false`: 5 of 5
+identical. CPU float activations without the deterministic flag: 5 of 5 identical on these prompts. CPU default
+(int8 activations): 3 of 5 differ (the single-token decode path uses the int8 dot products, the multi-token
+verification path the float kernels, [07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history));
+both are valid greedy continuations of the same model. On the CPU, speculation also slows decode (int8 decode 49 tok/s vs
+the float multi-token path).
+
+**Default.** `engine.speculative=off`. Speculation never hurt by more than the noise on the dense 0.6B with the back-off, and helps
+(about +15 %) for text that copies its input, but it is neutral to harmful on the 30B MoE (the headline model: every verified
+position streams its own experts) and on the CPU, and no setting was a win everywhere. Enable `ngram` for editing, extraction
+and quoting workloads on dense models; `draft` needs a draft model that agrees with the target on 80 % or more of the tokens and
+a backend whose multi-token pass is much cheaper than K single steps, which the Metal kernels of this repository are not yet.
+`engine.draft-tokens=4`, `engine.ngram-max=3`, `engine.ngram-min=2` were the best of the grid above.
+
+---
+
+## 11.7 Summary
 
 - Decode is bound by **bytes per token**, not arithmetic: 452 MB (0.6B) or ~2 GB (30B-A3B) per token against
   ~200 GB/s. Quantization and batching are the only levers that move that ceiling.
@@ -275,4 +346,7 @@ the model logic out of the kernel layer.
 - The CPU path was instruction-bound at 128-bit SIMD; int8 activations with integer dot products took the
   row kernel from ~30 conversion-heavy instructions per block to ~31 single-cycle integer ops doing twice
   the lanes, 6× per kernel and ~4× per decoded token (13 → 51 tok/s).
+- Speculative decoding ([11.6](#116-speculative-decoding)) is off by default: a verification pass of n tokens costs
+  1 + 0.36 (n−1) single steps on the dense 0.6B and 1 + 0.55 (n−1) on the 30B MoE, so it gains only for text that
+  copies its input (+15 % for code editing with prompt lookup) and loses on the MoE.
 - Memory is dominated by the weights and the KV cache (`--ctx` and `backend.kv-dtype` are the knobs).

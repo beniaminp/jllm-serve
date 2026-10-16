@@ -1,5 +1,6 @@
 package org.robomiri.jllm.config;
 
+import org.robomiri.jllm.engine.Speculator;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -48,6 +49,9 @@ public final class Settings {
             Map.entry("rep-penalty", "sampling.repetition-penalty"),
             Map.entry("seed", "sampling.seed"),
             Map.entry("max-tokens", "sampling.max-tokens"),
+            Map.entry("speculative", "engine.speculative"),
+            Map.entry("draft-model", "engine.draft-model"),
+            Map.entry("draft-tokens", "engine.draft-tokens"),
             Map.entry("think", "chat.thinking"),
             Map.entry("system", "chat.system"),
             Map.entry("host", "server.host"),
@@ -192,6 +196,7 @@ public final class Settings {
                 "engine.max-prompt-bytes"}) {
             require(getLong(k) >= 0, k, "must be 0 or positive");
         }
+        speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "backend.cpu.int8-activations", "chat.thinking", "raw"}) {
             if (has(k)) {
@@ -282,6 +287,24 @@ public final class Settings {
             case "false", "no", "off", "0" -> false;
             default -> throw new IllegalArgumentException(key + " must be true or false, got '" + get(key) + "'");
         };
+    }
+
+    /** The speculative decoding settings ({@code engine.speculative}, {@code engine.draft-tokens}, {@code engine.ngram-*}). */
+    public Speculator.Config speculation() {
+        Speculator.Mode mode = Speculator.Mode.parse(get("engine.speculative"));
+        int k = getInt("engine.draft-tokens");
+        int max = getInt("engine.ngram-max");
+        int min = getInt("engine.ngram-min");
+        int window = getInt("engine.ngram-window");
+        require(k >= 1 && k <= 32, "engine.draft-tokens", "must be 1..32");
+        require(max >= 1, "engine.ngram-max", "must be at least 1");
+        require(min >= 1 && min <= max, "engine.ngram-min", "must be 1..engine.ngram-max");
+        require(window >= 1, "engine.ngram-window", "must be at least 1");
+        if (mode == Speculator.Mode.DRAFT) {
+            require(!get("engine.draft-model").isBlank(), "engine.draft-model",
+                    "is required when engine.speculative=draft");
+        }
+        return new Speculator.Config(mode, k, max, min, window);
     }
 
     public SamplingParams sampling() {
