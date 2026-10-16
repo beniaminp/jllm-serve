@@ -49,7 +49,7 @@ element `(r, c)` lives at flat index `r * cols + c`. A `[2, 3]` matrix
 
 For a 3-D `[E, R, C]` tensor the same rule nests: index `(e, r, c)` is at `e*R*C + r*C + c`. A useful
 consequence used by the converter: a `[E, R, C]` tensor *is already* an `[E·R, C]` matrix in memory — "reshaping"
-costs nothing (`ModelConverter.flatten`).
+costs nothing (`ModelConverter.flatten3d`).
 
 Row-major also means **a row is contiguous**. Every kernel in this project works a row at a time (one dot
 product per output), which is why rows are the unit of quantization, of thread scheduling, and of GPU simdgroups.
@@ -74,13 +74,17 @@ The real header of `Qwen3-0.6B/model.safetensors` begins like this (whitespace a
 ```json
 {
   "__metadata__": {"format": "pt"},
-  "lm_head.weight"            : …absent: tie_word_embeddings = true…
-  "model.embed_tokens.weight" : {"dtype": "BF16", "shape": [151936, 1024], "data_offsets": [0, 311164928]},
-  "model.layers.0.input_layernorm.weight" : {"dtype": "BF16", "shape": [1024], "data_offsets": [311164928, 311166976]},
-  "model.layers.0.mlp.down_proj.weight"   : {"dtype": "BF16", "shape": [1024, 3072], "data_offsets": [311166976, 317458432]},
+  "lm_head.weight"            : {"dtype": "BF16", "shape": [151936, 1024], "data_offsets": [0, 311164928]},
+  "model.embed_tokens.weight" : {"dtype": "BF16", "shape": [151936, 1024], "data_offsets": [311164928, 622329856]},
+  "model.layers.0.input_layernorm.weight" : {"dtype": "BF16", "shape": [1024], "data_offsets": [622329856, 622331904]},
+  "model.layers.0.mlp.down_proj.weight"   : {"dtype": "BF16", "shape": [1024, 3072], "data_offsets": [622331904, 628623360]},
   ...
 }
 ```
+
+(The names are sorted alphabetically, which is why `lm_head.weight` comes first. Qwen3-0.6B ties the head to the
+embedding, `tie_word_embeddings = true`, yet the file still stores a second copy of it — 311 MB that jllm never
+reads, because the converter only takes `lm_head.weight` from checkpoints whose head is untied.)
 
 Check the arithmetic: the embedding has 151 936 × 1024 = 155 582 464 numbers × 2 bytes (BF16) = 311 164 928
 bytes, which is exactly `data_offsets[1] − data_offsets[0]`. `data_offsets` are **relative to the start of the
@@ -174,11 +178,18 @@ models/Qwen_Qwen3-0.6B/
                                       "tensors": {name: {type, rows, cols, offset, size}}}
 ```
 
+The names follow `--quant`: `jllm-q8_0.bin/.json` for Q8_0, `jllm-q2_k.bin/.json` for Q2_K, so several formats of
+one model can sit side by side and be switched with a flag. In the index, `"model"` is the architecture's
+one-line description (`Architecture.core().description()`, e.g. `Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 ...`),
+and `"repo"`, `"revision"` and `"sha"` are the Hub name, the revision you asked for, and the commit it resolved to.
+
 Besides the tensor table the index records what the cache was made from: the file format `version`, the
 converter `layout` version (bumped whenever the converter changes what it writes — fused tensors, folded norms,
 names), the config description, and the `repo@revision` the model was requested as plus the Hub commit it
-resolved to. `ModelWeights.load` compares all of these (and every tensor shape against `config.json`) and, when
-anything differs, deletes the cache and converts again instead of loading stale weights.
+resolved to. `ModelWeights.load` compares all of these (and every tensor shape against the `Architecture` parsed from
+`config.json`) and, when anything differs — an older converter, another revision in the same directory, a
+different config — prints `Reconverting …`, deletes the cache and converts again instead of loading stale
+weights. The same happens to an index that cannot be parsed (`QuantFile.StaleCacheException`).
 
 Why a cache file instead of quantizing at every start?
 
@@ -222,6 +233,7 @@ Hugging Face layouts the source used ([12](12-mixture-of-experts.md)).
 |---|---|---|
 | header length sane, offsets inside file, `end − begin == numel × bytes` | `SafeTensors.readFile` | truncated / corrupt downloads |
 | SHA-256 of every LFS file | `HuggingFaceHub` | corrupted transfer |
-| every matrix shape against `config.json` | `ModelWeights.checkShapes` | wrong model / stale cache (reconverted automatically) |
+| every matrix shape against the `Architecture` | `ModelWeights` constructor, `DecoderLayer.matches` | wrong model / stale cache (reconverted automatically) |
 | duplicate tensor names (also across shards), overlapping `data_offsets` | `SafeTensors.readFile` | a header that does not describe one tensor per name |
-| cache version, converter layout version, `repo@revision` | `QuantFile.open`, `ModelWeights.load` | format / converter changes, another revision in the same directory (reconverted automatically) |
+| cache version (`QuantFile.VERSION`), converter layout version (`QuantFile.LAYOUT_VERSION`), `repo@revision`, config description | `QuantFile.open`, `ModelWeights.load` | format / converter changes, another revision in the same directory (reconverted automatically) |
+| index and sidecar written to a temporary file, fsynced, renamed | `QuantFile.Writer` | a crash can leave a half-written index; instead the cache is simply incomplete and the conversion resumes |
