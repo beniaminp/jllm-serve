@@ -140,7 +140,7 @@ public final class Main {
         if (model.toLowerCase(java.util.Locale.ROOT).endsWith(".gguf")) {
             Path file = Path.of(model).toAbsolutePath();
             if (!Files.isRegularFile(file)) {
-                throw new IOException("no such GGUF file: " + file);
+                throw new HuggingFaceHub.GgufSelectionException("no such GGUF file: " + file);
             }
             return new Source(file, file.getParent());
         }

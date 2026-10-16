@@ -357,6 +357,7 @@ public final class GgufModelTest {
                 family(dir, family);
             }
             malformed(dir);
+            metadata(dir);
         } finally {
             try (var s = Files.walk(dir)) {
                 s.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
@@ -470,6 +471,90 @@ public final class GgufModelTest {
         } catch (IOException e) {
             check(e.getMessage().contains("blk.0."), "missing layer tensors: " + e.getMessage());
         }
+    }
+
+    /** A llama GGUF of 8 heads x 64 dims, 1 layer, only the embedding as a tensor (enough to resolve the architecture). */
+    private static GgufWriter llamaMeta(String... name) {
+        GgufWriter w = new GgufWriter().str("general.architecture", "llama");
+        if (name.length > 0) {
+            w.str("general.name", name[0]);
+        }
+        return w.u32("llama.block_count", 1).u32("llama.embedding_length", 512).u32("llama.feed_forward_length", 1024)
+                .u32("llama.attention.head_count", 8).u32("llama.attention.head_count_kv", 2).u32("llama.context_length", 4096)
+                .f32("llama.rope.freq_base", 500000f).f32("llama.attention.layer_norm_rms_epsilon", 1e-5f)
+                .f32Tensor("token_embd.weight", new long[]{512, 96}, new float[512 * 96]);
+    }
+
+    private static org.robomiri.jllm.model.Decoder decoder(Path root, String file, GgufWriter w) throws IOException {
+        Path p = root.resolve(file);
+        w.write(p);
+        try (GgufModel g = GgufModel.open(p)) {
+            return (org.robomiri.jllm.model.Decoder) g.architecture();
+        }
+    }
+
+    /** The metadata -> Architecture mapping beyond the families above: rope scaling, mistral, partial rotary, rejections. */
+    private static void metadata(Path root) throws Exception {
+        // Llama 3.x: llama.cpp stores the scaled frequencies as rope_freqs.weight, computed by the converter's formula
+        int hd = 64;
+        double base = 500000;
+        float[] freqs = new float[hd / 2];
+        for (int i = 0; i < freqs.length; i++) {
+            double f = 1.0 / Math.pow(base, (2.0 * i) / hd);
+            double wavelen = 2 * Math.PI / f;
+            double low = 8192.0 / 1.0;
+            double high = 8192.0 / 4.0;
+            if (wavelen < high) {
+                freqs[i] = 1;
+            } else if (wavelen > low) {
+                freqs[i] = 8;
+            } else {
+                double smooth = (8192.0 / wavelen - 1.0) / (4.0 - 1.0);
+                freqs[i] = (float) (1 / ((1 - smooth) / 8 + smooth));
+            }
+        }
+        var d = decoder(root, "l3.gguf", llamaMeta().f32Tensor("rope_freqs.weight", new long[]{hd / 2}, freqs));
+        var sc = d.ropeTables().getFirst().scaling();
+        check(sc instanceof org.robomiri.jllm.model.Scaling.Llama3 l && l.factor() == 8 && l.lowFreqFactor() == 1
+                && l.highFreqFactor() == 4 && l.originalMaxPositions() == 8192, "rope_freqs.weight of Llama 3.1 is recognised: " + sc);
+        check(d.core().description().contains("rope=llama3x8.0") && d.core().description().contains("rope=interleaved/64"),
+                "llama3 description: " + d.core().description());
+        check(((org.robomiri.jllm.model.Attention.Gqa) d.attention()).heads() == 8 && ((org.robomiri.jllm.model.Attention.Gqa) d.attention()).kvHeads() == 2
+                && ((org.robomiri.jllm.model.Attention.Gqa) d.attention()).headDim() == 64,
+                "head dim defaults to dim / heads");
+        float[] other = freqs.clone();
+        other[3] *= 1.5f;
+        var dl = decoder(root, "lr.gguf", llamaMeta().f32Tensor("rope_freqs.weight", new long[]{hd / 2}, other));
+        sc = dl.ropeTables().getFirst().scaling();
+        check(sc instanceof org.robomiri.jllm.model.Scaling.LongRope, "another rope_freqs table becomes a longrope table: " + sc.getClass().getSimpleName());
+        double[] inv = org.robomiri.jllm.model.Rope.invFreq(dl.ropeTables().getFirst(), 4096);
+        double want = 1.0 / (other[3] * Math.pow(base, 6.0 / hd));
+        check(Math.abs(inv[3] - want) < 1e-12 * want && org.robomiri.jllm.model.Rope.amplitude(sc) == 1.0,
+                "the table divides the frequencies, as ggml's freq_factors do, with no amplitude change");
+        sc = decoder(root, "lin.gguf", llamaMeta().str("llama.rope.scaling.type", "linear").f32("llama.rope.scaling.factor", 4f))
+                .ropeTables().getFirst().scaling();
+        check(sc instanceof org.robomiri.jllm.model.Scaling.Linear l && l.factor() == 4, "linear rope scaling: " + sc);
+        check(decoder(root, "mis.gguf", llamaMeta("Mistral-7B-Instruct")).core().modelType().equals("mistral"), "mistral by name");
+        d = decoder(root, "sw.gguf", llamaMeta().u32("llama.attention.sliding_window", 4096));
+        check(d.core().modelType().equals("mistral") && d.core().description().contains("window=4096"), "sliding window: " + d.core().description());
+        d = decoder(root, "rot.gguf", llamaMeta().u32("llama.rope.dimension_count", 32).u32("llama.attention.key_length", 64));
+        check(d.core().description().contains("rope=interleaved/32"), "partial rotary: " + d.core().description());
+        check(d.core().vocabSize() == 96 && d.core().tiedEmbeddings(), "vocab from token_embd rows, tied without output.weight");
+        for (String bad : new String[]{"yarn", "unknown-scaling"}) {
+            Path p = root.resolve("bad.gguf");
+            llamaMeta().str("llama.rope.scaling.type", bad).write(p);
+            expectFail(p, "unsupported rope scaling type '" + bad + "'");
+        }
+        Path p = root.resolve("perlayer.gguf");
+        new GgufWriter().str("general.architecture", "llama").u32("llama.block_count", 2).u32("llama.embedding_length", 512)
+                .i32s("llama.attention.head_count", 8, 8).f32Tensor("token_embd.weight", new long[]{512, 96}, new float[512 * 96]).write(p);
+        expectFail(p, "per-layer array");
+        p = root.resolve("noembd.gguf");
+        new GgufWriter().str("general.architecture", "llama").u32("llama.block_count", 1).write(p);
+        expectFail(p, "no llama.embedding_length");
+        p = root.resolve("noarch.gguf");
+        new GgufWriter().u32("x", 1).write(p);
+        expectFail(p, "general.architecture");
     }
 
     private static void expectFail(Path p, String contains) {

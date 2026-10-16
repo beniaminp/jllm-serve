@@ -233,7 +233,7 @@ public final class HuggingFaceHub {
 
     private static final Pattern GGUF_SPLIT = Pattern.compile("^(.*)-(\\d{5})-of-(\\d{5})\\.gguf$");
 
-    /** No GGUF file, or more than one, fits the requested name / quantization: the message lists the choices. */
+    /** A usage problem with a GGUF source (no such local file; no file, or more than one, fits the requested name / quantization): the message says what to change. */
     public static final class GgufSelectionException extends IOException {
         public GgufSelectionException(String message) {
             super(message);
