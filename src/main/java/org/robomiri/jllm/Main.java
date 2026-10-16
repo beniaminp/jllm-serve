@@ -134,6 +134,15 @@ public final class Main {
             }
 
             @Override
+            public String commitSha() {
+                try {
+                    return hub.commitSha(model, revision);
+                } catch (IOException | InterruptedException e) {
+                    return null; // offline: the cache simply records no commit
+                }
+            }
+
+            @Override
             public void release(String name) throws IOException {
                 if (lowDisk) {
                     Files.deleteIfExists(dir.resolve(name));
@@ -141,7 +150,7 @@ public final class Main {
                 }
             }
         };
-        ModelWeights weights = ModelWeights.load(dir, cfg, quant, shards);
+        ModelWeights weights = ModelWeights.load(dir, cfg, quant, shards, model + "@" + revision);
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
