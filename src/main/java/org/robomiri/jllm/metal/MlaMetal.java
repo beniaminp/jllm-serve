@@ -57,8 +57,8 @@ final class MlaMetal {
             throw new IllegalArgumentException("Metal MLA needs qk (" + d.qkDim() + ") and v (" + d.vHeadDim()
                     + ") head dims that are multiples of 32 and <= 256");
         }
-        if (c.isMoe() && c.numExperts() > MetalKernels.MAX_EXPERTS) {
-            throw new IllegalArgumentException("Metal router kernel supports at most " + MetalKernels.MAX_EXPERTS + " experts");
+        if (c.isMoe() && c.numExperts() > MetalConstants.MAX_EXPERTS) {
+            throw new IllegalArgumentException("Metal router kernel supports at most " + MetalConstants.MAX_EXPERTS + " experts");
         }
         bufs = new Bufs[c.layers()];
         for (int l = 0; l < c.layers(); l++) {

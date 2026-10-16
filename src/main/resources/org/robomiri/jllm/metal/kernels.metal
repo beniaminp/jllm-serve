@@ -1,14 +1,43 @@
-// Compute kernels for the Qwen3 forward pass on Apple GPUs.
-// Compiled at runtime by libjllm_metal (newLibraryWithSource); dispatched from MetalBackend.java.
-// Parameter structs contain only 32-bit ints/floats so the Java side can pack them sequentially.
+// Compute kernels of the Metal backends (dense decoders, DeepSeek MLA, Mamba) for Apple GPUs.
+// Compiled at runtime by libjllm_metal (newLibraryWithSource); every dispatch is written by MetalKernels.java.
+// Parameter structs contain only 32-bit ints/floats so the Java side writes them field by field (KernelParams
+// lists the layouts, MetalParamsTest checks them against the structs below). Sections:
+//   0. constants   1. common (reductions, block formats)   2. matmul   3. norm + rope   4. attention
+//   5. mixture of experts   6. state space (Mamba)   7. elementwise (DeepSeek MLA cache store)
+// Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
+// `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
+// MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
 
 #include <metal_stdlib>
 using namespace metal;
 
-#define QK 32          // weights per quantization block
-#define TOK_TILE 8     // tokens processed per simdgroup in batched matmuls
+// ---------------------------------------------------------------------------------------------- 0. constants
+// Tile sizes, thread counts and limits. MetalConstants.java mirrors every value below and MetalParamsTest
+// checks the mirror against this block.
 
-// ---------------------------------------------------------------------------------------------- reductions
+#define QK 32                   // weights per quantization block (Q4_0 / Q8_0)
+#define QK_K 256                // weights per Q2_K super-block
+#define Q2K_BYTES 84            // bytes per Q2_K super-block
+#define TOK_TILE 8              // tokens per simdgroup of the single-row matmuls
+#define PF_ROWS 2               // rows per simdgroup of matmul_pf / matmul3_pf
+#define PF_UNITS 1              // gate + up units per simdgroup of matmul_swiglu_pf
+#define PF_TOKS 8               // tokens per simdgroup of the prefill matmuls
+#define MM_THREADS 128          // matmul threadgroup: 4 simdgroups = 4 rows (norm_scale_128 relies on it)
+#define ROW_THREADS 256         // rmsnorm / router / attention_combine threadgroup (one row each)
+#define ATT_THREADS 256         // attention threadgroup = ATT_SIMDGROUPS simdgroups
+#define ATT_SIMDGROUPS 8
+#define ATT_TILE 32             // tokens per attention dispatch (scores scratch rows per head)
+#define MAX_PER 8               // widest head in units of 32 lanes (headDim <= 256)
+#define CHANNEL_THREADS 64      // mla_kv_store / mamba_conv / mamba_scan threadgroup
+#define MAX_EXPERTS 1024        // router logits held in threadgroup memory
+#define MAX_GROUPS 64           // DeepSeek expert groups
+#define FLASH_MAX_SPLITS 64     // partials attention_combine can merge
+#define MAMBA_MAX_STATE 64      // SSM state width held in registers
+#define MAMBA_MAX_CONV 8        // conv kernel width held in registers
+#define TANH_CLAMP 20.0f        // |argument| bound of fast-math tanh (overflows to NaN beyond)
+#define SOFTPLUS_LINEAR 20.0f   // softplus(x) = x beyond this
+
+// ---------------------------------------------------------------------------------------------- 1. common: reductions
 
 static inline float tg_sum(float v, threadgroup float *buf, ushort sg, ushort lane, ushort nsg) {
     v = simd_sum(v);
@@ -30,7 +59,7 @@ static inline float tg_max(float v, threadgroup float *buf, ushort sg, ushort la
     return r;
 }
 
-// ---------------------------------------------------------------------------------------------- block dot
+// ---------------------------------------------------------------------------------------------- 1. common: block formats
 // scale * (32 quantized weights of global row `grow`, block `b`) . x4[0..8)   (QT = 4 or 8)
 
 template <int QT>
@@ -50,7 +79,39 @@ static inline float block_dot(device const uchar *wq, device const float *ws, ul
     return d * ws[grow * nb + b];
 }
 
-// ---------------------------------------------------------------------------------------------- matmul
+// llama.cpp's Q2_K: 256-weight super-blocks of 84 bytes = 16 scale/min bytes (low nibble = 4-bit scale sc,
+// high nibble = 4-bit min m) + 64 bytes of 2-bit quants + f16 d + f16 dmin; weight = d*sc*q - dmin*m.
+// Sub-block j (weights 16j .. 16j+15) is at qs + (j/8)*32 + (j%2)*16 with bit shift 2*((j%8)/2).
+// Scales live inside the block, so buffer(1) (ws) is unused by these kernels. See docs/13-q2k-quantization.md.
+
+// Dequantizes 16-weight sub-block u of global row `grow` (nsb super-blocks per row) into w[0..4).
+static inline void q2k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w) {
+    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q2K_BYTES;
+    const int j = u & 15;
+    const uchar s = blk[j];
+    const float2 dd = float2(as_type<half2>(*(device const uint *)(blk + 80)));   // d, dmin (4-byte aligned)
+    const float dl = dd.x * float(s & 15);
+    const float ml = dd.y * float(s >> 4);
+    const uchar shift = uchar(((j & 7) >> 1) << 1);
+    device const uchar4 *q = (device const uchar4 *)(blk + 16 + (j >> 3) * 32 + (j & 1) * 16);
+    for (int k = 0; k < 4; k++) w[k] = float4((q[k] >> uchar4(shift)) & uchar4(3)) * dl - ml;
+}
+
+// block_dot for the MoE kernels: 32-weight block b of a Q2_K row = sub-blocks 2b and 2b+1 (nb = cols / 32).
+template <>
+inline float block_dot<2>(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,
+                          device const float4 *x4) {
+    const int nsb = (nb + 7) >> 3;
+    float4 w[4];
+    float d = 0.0f;
+    q2k_sub_block(wq, grow, nsb, 2 * b, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+    q2k_sub_block(wq, grow, nsb, 2 * b + 1, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k + 4]);
+    return d;
+}
+
+// ---------------------------------------------------------------------------------------------- 2. matmul
 // out[t, row] (+)= sum_c W[row, c] * x[t, c]
 // One simdgroup per output row; each lane walks blocks lane, lane+32, ...; up to TOK_TILE tokens share the
 // dequantized block. Grid: (ceil(rows / simdgroups_per_tg), ceil(ntok / TOK_TILE)), 128 threads.
@@ -76,7 +137,7 @@ struct MatmulParams {
 
 // Gemma 2 / 3 soft-capping; the argument of tanh is clamped because fast-math tanh overflows for large inputs
 static inline float softcap_f(float v, float cap) {
-    return tanh(clamp(v / cap, -20.0f, 20.0f)) * cap;
+    return tanh(clamp(v / cap, -TANH_CLAMP, TANH_CLAMP)) * cap;
 }
 
 struct Matmul3Params {
@@ -100,7 +161,7 @@ struct SwigluParams {
 // gelu_pytorch_tanh; the argument of tanh is clamped because fast-math tanh overflows to NaN for large inputs
 static inline float gelu_tanh_f(float g) {
     const float a = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-    return 0.5f * g * (1.0f + tanh(clamp(a, -20.0f, 20.0f)));
+    return 0.5f * g * (1.0f + tanh(clamp(a, -TANH_CLAMP, TANH_CLAMP)));
 }
 
 // rmsnorm's scale for the row x[0..n), reduced exactly as the 256-thread rmsnorm kernel reduces it, on a
@@ -112,11 +173,11 @@ static inline float norm_scale_128(device const float *x, int n, float eps, thre
     const int v = sg * 32 + lane;
     float p1 = 0.0f;
     float p2 = 0.0f;
-    for (int i = v; i < n; i += 256) {
+    for (int i = v; i < n; i += ROW_THREADS) {
         float a = x[i];
         p1 += a * a;
     }
-    for (int i = v + 128; i < n; i += 256) {
+    for (int i = v + MM_THREADS; i < n; i += ROW_THREADS) {
         float a = x[i];
         p2 += a * a;
     }
@@ -124,10 +185,10 @@ static inline float norm_scale_128(device const float *x, int n, float eps, thre
     p2 = simd_sum(p2);
     if (lane == 0) {
         buf[sg] = p1;
-        buf[sg + 4] = p2;
+        buf[sg + MM_THREADS / 32] = p2;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float r = lane < 8 ? buf[lane] : 0.0f;
+    float r = lane < ROW_THREADS / 32 ? buf[lane] : 0.0f;
     r = simd_sum(r);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return rsqrt(r / n + eps);
@@ -137,18 +198,69 @@ static inline float norm_scale_128(device const float *x, int n, float eps, thre
 static inline void norm_row_128(device const float *x, device const float *w, int n, float eps,
                                 threadgroup float *xn, threadgroup float *buf, ushort sg, ushort lane) {
     const float scale = norm_scale_128(x, n, eps, buf, sg, lane);
-    for (int i = sg * 32 + lane; i < n; i += 128) xn[i] = x[i] * scale * w[i];
+    for (int i = sg * 32 + lane; i < n; i += MM_THREADS) xn[i] = x[i] * scale * w[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 static inline device const float4 *as_f4(device const float *p) { return (device const float4 *)p; }
 static inline threadgroup const float4 *as_f4(threadgroup const float *p) { return (threadgroup const float4 *)p; }
 
-// acc[t] += W[grow] . x[t * xstride ..] for t < nt; blocks walked in lane order, each dequantized once for
-// all tokens. XP is a device or threadgroup float pointer.
+// mm_row for QT == 2 (called from the generic mm_row, so every matmul / matmul3 / matmul_swiglu variant gets it):
+// a lane's unit of work is one 16-weight sub-block (cols / 16 units per row, nb = cols / 32) so all 32 lanes
+// stay busy on 1024-wide rows, which hold only 4 super-blocks.
 template <typename XP>
 static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
-                              thread float *acc, ushort lane); // Q2_K section at the end of the file
+                              thread float *acc, ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nsub = nb * 2;
+    for (int u = lane; u < nsub; u += 32) {
+        float4 w[4];
+        q2k_sub_block(wq, grow, nsb, u, w);
+        for (int t = 0; t < TOK_TILE; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
+                float d = 0.0f;
+                for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+                acc[t] += d;
+            }
+        }
+    }
+}
+
+// mm_tile for QT == 2: the sub-blocks of the NR rows are dequantized once per lane unit and used for TT tokens,
+// each row's unit walk and dot being those of mm_row_q2k.
+template <int NR, int TT>
+static inline void mm_tile_q2k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nsub = nb * 2;
+    for (int u = lane; u < nsub; u += 32) {
+        float4 w[NR][4];
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) q2k_sub_block(wq[r], grow[r], nsb, u, w[r]);
+        }
+        for (int t = 0; t < TT; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
+                float4 xv[4];
+                for (int k = 0; k < 4; k++) xv[k] = x4[k];
+                for (int r = 0; r < NR; r++) {
+                    if (r < nr) {
+                        float d = 0.0f;
+                        for (int k = 0; k < 4; k++) d += dot(w[r][k], xv[k]);
+                        acc[r][t] += d;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// mm_row: acc[t] += W[grow] . x[t * xstride ..] for t < nt; blocks walked in lane order, each dequantized
+// once for all tokens. XP is a device or threadgroup float pointer. mm_row_q2k is the Q2_K walk (16-weight
+// sub-blocks as the lane unit so all 32 lanes stay busy on 1024-wide rows); mm_tile / mm_tile_q2k are the
+// prefill tiles of the next section.
+
 
 // The dot of one packed 32-weight block with 32 activations: the one expression behind every matmul kernel
 // (mm_row below and the prefill mm_tile), so the compiler emits the same arithmetic for both families and
@@ -380,7 +492,7 @@ template [[host_name("matmul_swiglu_q8")]] kernel matmul_swiglu_t matmul_swiglu<
 template [[host_name("matmul_swiglu_q4_norm")]] kernel matmul_swiglu_t matmul_swiglu<4, true>;
 template [[host_name("matmul_swiglu_q8_norm")]] kernel matmul_swiglu_t matmul_swiglu<8, true>;
 
-// ---------------------------------------------------------------------------------------------- prefill matmul
+// ---------------------------------------------------------------------------------------------- 2. matmul: prefill tiles
 // The same three products for a chunk of tokens, with one simdgroup computing a tile of NR rows x TT tokens
 // (mm_tile): every x block is loaded once and used for NR rows, every weight block is unpacked once and used
 // for TT tokens, instead of one row per simdgroup re-reading x for each of its TOK_TILE tokens. The single-row
@@ -396,14 +508,6 @@ template [[host_name("matmul_swiglu_q8_norm")]] kernel matmul_swiglu_t matmul_sw
 // 6.2-6.7): 2 x 8 is the best for matmul / matmul3 (4.0: two adjacent rows per simdgroup coalesce into 1 KB
 // reads, four rows cost too many registers, 16 tokens gain nothing more), and one unit (gate + up = 2 rows)
 // x 8 tokens for matmul_swiglu (1.5 vs 2.2; two units are slower, 1.8).
-
-#define PF_ROWS 2      // rows per simdgroup of matmul_pf / matmul3_pf
-#define PF_UNITS 1     // units (gate + up rows) per simdgroup of matmul_swiglu_pf
-#define PF_TOKS 8      // tokens per simdgroup of the prefill kernels
-
-template <int NR, int TT>
-static inline void mm_tile_q2k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
-                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
 
 template <int QT, int NR, int TT>
 static inline void mm_tile(thread device const uchar *const *wq, thread device const float *const *ws,
@@ -631,7 +735,20 @@ typedef decltype(matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>) matmul_swiglu_pf_t;
 template [[host_name("matmul_swiglu_pf_q4")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>;
 template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<8, PF_UNITS, PF_TOKS>;
 
-// ---------------------------------------------------------------------------------------------- rmsnorm
+template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
+template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;
+template [[host_name("matmul_pf_q2k")]] kernel matmul_pf_t matmul_pf<2, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul3_pf_q2k")]] kernel matmul3_pf_t matmul3_pf<2, PF_ROWS, PF_TOKS, float>;
+template [[host_name("matmul3_pf_q2k_h")]] kernel matmul3_pf_h_t matmul3_pf<2, PF_ROWS, PF_TOKS, half>;
+template [[host_name("matmul_swiglu_pf_q2k")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<2, PF_UNITS, PF_TOKS>;
+template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false, float>;
+template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true, float>;
+template [[host_name("matmul3_q2k_h")]] kernel matmul3_h_t matmul3<2, false, half>;
+template [[host_name("matmul3_q2k_norm_h")]] kernel matmul3_h_t matmul3<2, true, half>;
+template [[host_name("matmul_swiglu_q2k")]] kernel matmul_swiglu_t matmul_swiglu<2, false>;
+template [[host_name("matmul_swiglu_q2k_norm")]] kernel matmul_swiglu_t matmul_swiglu<2, true>;
+
+// ---------------------------------------------------------------------------------------------- 3. norm + rope
 // One threadgroup per row of length n.
 
 struct NormParams {
@@ -662,7 +779,32 @@ kernel void rmsnorm(device const float *x [[buffer(0)]],
     for (int i = tid; i < p.n; i += tpg) ov[i] = xv[i] * scale * w[i];
 }
 
-// ---------------------------------------------------------------------------------------------- qk-norm + rope
+// rmsnorm_add: out[row] += rmsnorm(y[row]) * w, for Glm4's post-attention / post-MLP norms applied to the
+// sub-layer output before the residual add. One threadgroup per row of length n.
+kernel void rmsnorm_add(device const float *y [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device float *out [[buffer(2)]],
+                        constant NormParams &p [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_position_in_threadgroup]],
+                        ushort tpg [[threads_per_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    device const float *yv = y + (ulong)tg * p.n;
+    device float *ov = out + (ulong)tg * p.n;
+    float ss = 0.0f;
+    for (int i = tid; i < p.n; i += tpg) {
+        float v = yv[i];
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float scale = rsqrt(ss / p.n + p.eps);
+    for (int i = tid; i < p.n; i += tpg) ov[i] += yv[i] * scale * w[i];
+}
+
+
 // rope<KV, ADJACENT>: rotary embedding (optionally preceded by the per-head qk-norm) for the q rows
 // ([ntok, qStride], nHeads heads) and the k rows of the same tokens in one dispatch. Grid: (nHeads + k heads,
 // ntok); threadgroup x < nHeads handles q head x in place, otherwise k head x - nHeads: read from `k` (the
@@ -743,7 +885,7 @@ template [[host_name("rope_h")]] kernel decltype(rope<half, false>) rope<half, f
 template [[host_name("rope_il")]] kernel decltype(rope<float, true>) rope<float, true>;
 template [[host_name("rope_il_h")]] kernel decltype(rope<half, true>) rope<half, true>;
 
-// ---------------------------------------------------------------------------------------------- attention
+// ---------------------------------------------------------------------------------------------- 4. attention
 // Causal attention for the tokens t = tokenOffset + tgp.y of a tile at positions pos0 + t, 256 threads =
 // 8 simdgroups per threadgroup. attention_t<KV, G, PERK, PERV> is the one kernel behind every variant:
 //   KV          cache element type (float, or half for backend.kv-dtype=f16; converted on load, all arithmetic f32)
@@ -787,10 +929,10 @@ kernel void attention_t(device const float *q [[buffer(0)]],
                         ushort sg [[simdgroup_index_in_threadgroup]],
                         ushort lane [[thread_index_in_simdgroup]],
                         ushort nsg [[simdgroups_per_threadgroup]]) {
-    constexpr int MK = PERK > 0 ? PERK : 8;    // loop bounds (8 = 256 / 32, the widest head)
-    constexpr int MV = PERV > 0 ? PERV : 8;
-    threadgroup float red[G * 8];              // per-head cross-simdgroup reduction slots (nsg <= 8)
-    threadgroup float part[8][256];
+    constexpr int MK = PERK > 0 ? PERK : MAX_PER;    // loop bounds
+    constexpr int MV = PERV > 0 ? PERV : MAX_PER;
+    threadgroup float red[G * ATT_SIMDGROUPS];  // per-head cross-simdgroup reduction slots
+    threadgroup float part[ATT_SIMDGROUPS][ATT_THREADS];
     const ushort tid = tid2.x;
     const ushort tpg = tpg2.x;
     const int perK = PERK > 0 ? PERK : p.qkDim / 32;
@@ -907,7 +1049,7 @@ ATTN_INST(half, 2, 4, "attention_g2_d128_h")  ATTN_INST(half, 4, 4, "attention_g
 ATTN_INST(half, 2, 8, "attention_g2_d256_h")  ATTN_INST(half, 4, 8, "attention_g4_d256_h")  ATTN_INST(half, 8, 8, "attention_g8_d256_h")
 #endif
 
-// ---------------------------------------------------------------------------------------------- flash decoding
+// ---------------------------------------------------------------------------------------------- 4. attention: flash decoding
 // Optional (-Djllm.metal.flashDecode=true): a decode step (one token) over a long context splits the key range of
 // every head across nSplit threadgroups instead of one. attention_split<KV> runs the three phases of `attention`
 // on its sub-range [first + split * chunk, ...) with the softmax taken relative to the sub-range's own maximum,
@@ -946,7 +1088,7 @@ kernel void attention_split(device const float *q [[buffer(0)]],
                             ushort lane [[thread_index_in_simdgroup]],
                             ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[32];
-    threadgroup float red[8][256];
+    threadgroup float red[ATT_SIMDGROUPS][ATT_THREADS];
     const ushort tid = tid2.x;
     const ushort tpg = tpg2.x;
 
@@ -964,16 +1106,16 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     device const KV *vb = vc + kvh * p.headDim;
     device float *po = part + ((ulong)h * p.nSplit + split) * (p.headDim + 2);
 
-    float qr[8];
-    for (int i = 0; i < 8; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+    float qr[MAX_PER];
+    for (int i = 0; i < MAX_PER; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
 
     float mx = -INFINITY;
     for (int s = s0 + sg; s < s1; s += nsg) {
         device const KV *kv = kb + (ulong)s * p.kvStride;
         float d = 0.0f;
-        for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
+        for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
         d = simd_sum(d) * p.scale;
-        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
+        if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
         if (lane == 0) sc[s] = d;
         mx = max(mx, d);
     }
@@ -994,14 +1136,14 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     sum = tg_sum(sum, buf, sg, lane, nsg);
     threadgroup_barrier(mem_flags::mem_device);
 
-    float o[8];
-    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    float o[MAX_PER];
+    for (int i = 0; i < MAX_PER; i++) o[i] = 0.0f;
     for (int s = s0 + sg; s < s1; s += nsg) {
         const float pr = sc[s];
         device const KV *vv = vb + (ulong)s * p.kvStride;
-        for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
+        for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
     }
-    for (int i = 0; i < 8; i++) if (i < per) red[sg][lane + i * 32] = o[i];
+    for (int i = 0; i < MAX_PER; i++) if (i < per) red[sg][lane + i * 32] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int d = tid; d < p.headDim; d += tpg) {
         float acc = 0.0f;
@@ -1017,7 +1159,7 @@ kernel void attention_split(device const float *q [[buffer(0)]],
 struct AttnCombineParams {
     int nHeads;
     int headDim;
-    int nSplit;      // <= 64
+    int nSplit;      // <= FLASH_MAX_SPLITS
 };
 
 // out[h, d] = sum_s o_s[d] * exp(m_s - M) / sum_s l_s * exp(m_s - M), M = max_s m_s. Grid: (nHeads), 256 threads.
@@ -1027,7 +1169,7 @@ kernel void attention_combine(device const float *part [[buffer(0)]],
                               uint tg [[threadgroup_position_in_grid]],
                               ushort tid [[thread_position_in_threadgroup]],
                               ushort tpg [[threads_per_threadgroup]]) {
-    threadgroup float w[64];
+    threadgroup float w[FLASH_MAX_SPLITS];
     threadgroup float inv[1];
     const int h = int(tg);
     const int stride = p.headDim + 2;
@@ -1054,7 +1196,13 @@ kernel void attention_combine(device const float *part [[buffer(0)]],
 template [[host_name("attention_split")]] kernel decltype(attention_split<float>) attention_split<float>;
 template [[host_name("attention_split_h")]] kernel decltype(attention_split<half>) attention_split<half>;
 
-// ---------------------------------------------------------------------------------------------- mixture of experts
+// Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
+// (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
+// row, normalised and rotated there, and rounded once by rope<half, ..> when it writes the cache row
+// (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). The *_h attention instantiations
+// read half K/V with the same f32 arithmetic (attention_t<half, ...> above).
+
+// ---------------------------------------------------------------------------------------------- 5. mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
 // sg, sg + 8, ...: the 32 lanes stride over dim in float4 steps (each iteration reads 512 contiguous bytes of
 // the router row) and finish with simd_sum. The softmax max and sum are threadgroup reductions; the top-k
@@ -1078,7 +1226,7 @@ kernel void router(device const float *x [[buffer(0)]],
                    ushort sg [[simdgroup_index_in_threadgroup]],
                    ushort lane [[thread_index_in_simdgroup]],
                    ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float logits[1024];
+    threadgroup float logits[MAX_EXPERTS];
     threadgroup float buf[32];
     device const float *xv = x + (ulong)tg * p.dim;
     device const float4 *x4 = (device const float4 *)xv;
@@ -1205,54 +1353,136 @@ typedef decltype(moe_down<4>) moe_down_t;
 template [[host_name("moe_down_q4")]] kernel moe_down_t moe_down<4>;
 template [[host_name("moe_down_q8")]] kernel moe_down_t moe_down<8>;
 
-// ---------------------------------------------------------------------------------------------- f16 KV cache
-// Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
-// (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
-// row, normalised and rotated there, and rounded once by rope<half, ..> when it writes the cache row
-// (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). The *_h attention instantiations
-// read half K/V with the same f32 arithmetic (attention_t<half, ...> above).
+template [[host_name("moe_up_q2k")]] kernel moe_up_t moe_up<2>;
+template [[host_name("moe_down_q2k")]] kernel moe_down_t moe_down<2>;
 
-// ---------------------------------------------------------------------------------------------- GLM
-// The GLM / Phi partial, interleaved rotary embedding is the rope_il / rope kernel above.
+// router_ds: one threadgroup (256 threads = 8 simdgroups) per token. The logits are computed as in `router`
+// (simdgroup sg handles experts sg, sg + 8, ...; the 32 lanes read the router row in coalesced float4 steps and
+// finish with simd_sum), the softmax max and sum are threadgroup reductions, and thread 0 then applies the
+// DeepSeek rule serially (nExperts <= 1024; see DeepSeekRouter.java, which this mirrors): softmax or sigmoid
+// scores; method 0 = greedy, 1 = group_limited_greedy (group score = max), 2 = noaux_tc (selection on scores +
+// bias, group score = sum of the two best); the topkGroup best of nGroup (<= 64) groups are kept; top-k inside
+// them; weights are the uncorrected scores, renormalized if requested, times routedScale (always if scaleAlways,
+// otherwise only when not renormalized). Writes assign[t*topK+k] and rw[t*topK+k], consumed by moe_up / moe_down.
 
-// rmsnorm_add: out[row] += rmsnorm(y[row]) * w, for Glm4's post-attention / post-MLP norms applied to the
-// sub-layer output before the residual add. One threadgroup per row of length n.
-kernel void rmsnorm_add(device const float *y [[buffer(0)]],
-                        device const float *w [[buffer(1)]],
-                        device float *out [[buffer(2)]],
-                        constant NormParams &p [[buffer(3)]],
-                        uint tg [[threadgroup_position_in_grid]],
-                        ushort tid [[thread_position_in_threadgroup]],
-                        ushort tpg [[threads_per_threadgroup]],
-                        ushort sg [[simdgroup_index_in_threadgroup]],
-                        ushort lane [[thread_index_in_simdgroup]],
-                        ushort nsg [[simdgroups_per_threadgroup]]) {
+struct RouterDsParams {
+    int nExperts;
+    int dim;
+    int topK;
+    int normalize;
+    int nGroup;
+    int topkGroup;
+    int sigmoidScore;
+    int method;
+    int scaleAlways;
+    float routedScale;
+};
+
+kernel void router_ds(device const float *x [[buffer(0)]],
+                      device const float *w [[buffer(1)]],
+                      device int *assign [[buffer(2)]],
+                      device float *rw [[buffer(3)]],
+                      device const float *bias [[buffer(4)]],
+                      constant RouterDsParams &p [[buffer(5)]],
+                      uint tg [[threadgroup_position_in_grid]],
+                      ushort tid [[thread_position_in_threadgroup]],
+                      ushort tpg [[threads_per_threadgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float scores[MAX_EXPERTS];
+    threadgroup float choice[MAX_EXPERTS];
     threadgroup float buf[32];
-    device const float *yv = y + (ulong)tg * p.n;
-    device float *ov = out + (ulong)tg * p.n;
-    float ss = 0.0f;
-    for (int i = tid; i < p.n; i += tpg) {
-        float v = yv[i];
-        ss += v * v;
+    const int ne = p.nExperts;
+    device const float *xv = x + (ulong)tg * p.dim;
+    device const float4 *x4 = (device const float4 *)xv;
+    const int n4 = p.dim / 4;
+    for (int e = sg; e < ne; e += nsg) {
+        device const float *wv = w + (ulong)e * p.dim;
+        device const float4 *w4 = (device const float4 *)wv;
+        float d = 0.0f;
+        for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
+        for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
+        d = simd_sum(d);
+        if (lane == 0) scores[e] = d;
     }
-    ss = tg_sum(ss, buf, sg, lane, nsg);
-    const float scale = rsqrt(ss / p.n + p.eps);
-    for (int i = tid; i < p.n; i += tpg) ov[i] += yv[i] * scale * w[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (p.sigmoidScore) {
+        for (int e = tid; e < ne; e += tpg) scores[e] = 1.0f / (1.0f + exp(-scores[e]));
+    } else {
+        float mx = -INFINITY;
+        for (int e = tid; e < ne; e += tpg) mx = max(mx, scores[e]);
+        mx = tg_max(mx, buf, sg, lane, nsg);
+        float sum = 0.0f;
+        for (int e = tid; e < ne; e += tpg) {
+            const float v = exp(scores[e] - mx);
+            scores[e] = v;
+            sum += v;
+        }
+        sum = tg_sum(sum, buf, sg, lane, nsg);
+        for (int e = tid; e < ne; e += tpg) scores[e] /= sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < ne; e += tpg) choice[e] = p.method == 2 ? scores[e] + bias[e] : scores[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+
+    if (p.method != 0) {
+        const int gs = ne / p.nGroup;
+        float gsc[MAX_GROUPS];
+        bool keep[MAX_GROUPS];
+        for (int g = 0; g < p.nGroup; g++) {
+            float b1 = -INFINITY;
+            float b2 = -INFINITY;
+            for (int i = 0; i < gs; i++) {
+                float v = choice[g * gs + i];
+                if (v > b1) { b2 = b1; b1 = v; }
+                else if (v > b2) { b2 = v; }
+            }
+            gsc[g] = p.method == 2 && gs > 1 ? b1 + b2 : b1;
+            keep[g] = false;
+        }
+        for (int k = 0; k < p.topkGroup; k++) {
+            int best = -1;
+            for (int g = 0; g < p.nGroup; g++) {
+                if (!keep[g] && (best < 0 || gsc[g] > gsc[best])) best = g;
+            }
+            keep[best] = true;
+        }
+        for (int e = 0; e < ne; e++) {
+            if (!keep[e / gs]) choice[e] = -INFINITY;
+        }
+    }
+
+    float selected = 0.0f;
+    for (int k = 0; k < p.topK; k++) {
+        int best = -1;
+        float bv = -INFINITY;
+        for (int e = 0; e < ne; e++) {
+            if (choice[e] > bv) { bv = choice[e]; best = e; }
+        }
+        assign[tg * p.topK + k] = best;
+        rw[tg * p.topK + k] = scores[best];
+        selected += scores[best];
+        choice[best] = -INFINITY;
+    }
+    const bool renorm = p.topK > 1 && p.normalize != 0;
+    const float denom = selected + 1e-20f;
+    const bool scale = renorm ? p.scaleAlways != 0 : true;
+    for (int k = 0; k < p.topK; k++) {
+        float v = rw[tg * p.topK + k];
+        if (renorm) v /= denom;
+        if (scale) v *= p.routedScale;
+        rw[tg * p.topK + k] = v;
+    }
 }
 
-// ---------------------------------------------------------------------------------------------- Gemma 2 / 3
-// The sandwich norms reuse rmsnorm_add above, the GeGLU is the `gelu` flag of matmul_swiglu, the attention
-// soft-cap is AttnParams.softcap and the final-logit soft-cap is MatmulParams.softcap on the LM-head matmul.
-
-// ---------------------------------------------------------------------------------------------- Mamba
+// ---------------------------------------------------------------------------------------------- 6. state space (Mamba)
 // Mamba (v1) mixer pieces, used by MambaMetalBackend. The projections (in_proj, x_proj, out_proj) reuse the
 // matmul kernels above; the two kernels below are the parts that carry state across tokens. Both use one thread
 // per channel and run the tokens of the chunk sequentially inside the thread (the recurrence is inherently
 // sequential over tokens, independent over channels), so a layer costs one dispatch per kernel instead of one per
 // token. The price: parallelism is d_inner threads (1536 .. 5120), no more during a long prefill.
-
-#define MAMBA_MAX_STATE 64
-#define MAMBA_MAX_CONV 8
 
 struct MambaConvParams {
     int dInner;
@@ -1329,7 +1559,7 @@ kernel void mamba_scan(device const float *xc [[buffer(0)]],
         device const float *row = dbc + (ulong)t * stride;
         float raw = dtb[i];
         for (int r = 0; r < R; r++) raw += wi[r] * row[r];
-        const float dt = raw > 20.0f ? raw : precise::log(1.0f + precise::exp(raw));
+        const float dt = raw > SOFTPLUS_LINEAR ? raw : precise::log(1.0f + precise::exp(raw));
         const float u = xc[(ulong)t * p.dInner + i];
         const float du = dt * u;
         float acc = 0.0f;
@@ -1343,7 +1573,7 @@ kernel void mamba_scan(device const float *xc [[buffer(0)]],
     for (int n = 0; n < N; n++) st[n] = s[n];
 }
 
-// ---------------------------------------------------------------------------------------------- DeepSeek MLA
+// ---------------------------------------------------------------------------------------------- 7. elementwise: DeepSeek MLA cache store
 // Multi-head latent attention (DeepSeek-V2/V3). Projections, norms and the output projection use the generic
 // matmul / rmsnorm kernels; only what is specific to MLA is below. Keys and queries are qk = nope + rope wide, values
 // are vDim wide (not equal), so the cache has separate row strides for K and V.
@@ -1381,226 +1611,3 @@ kernel void mla_kv_store(device const float *kvb [[buffer(0)]],
     for (int i = tid; i < p.vDim; i += tpg) vd[i] = src[p.nope + i];
 }
 
-// ---------------------------------------------------------------------------------------------- DeepSeek router
-// router_ds: one threadgroup (256 threads = 8 simdgroups) per token. The logits are computed as in `router`
-// (simdgroup sg handles experts sg, sg + 8, ...; the 32 lanes read the router row in coalesced float4 steps and
-// finish with simd_sum), the softmax max and sum are threadgroup reductions, and thread 0 then applies the
-// DeepSeek rule serially (nExperts <= 1024; see DeepSeekRouter.java, which this mirrors): softmax or sigmoid
-// scores; method 0 = greedy, 1 = group_limited_greedy (group score = max), 2 = noaux_tc (selection on scores +
-// bias, group score = sum of the two best); the topkGroup best of nGroup (<= 64) groups are kept; top-k inside
-// them; weights are the uncorrected scores, renormalized if requested, times routedScale (always if scaleAlways,
-// otherwise only when not renormalized). Writes assign[t*topK+k] and rw[t*topK+k], consumed by moe_up / moe_down.
-
-struct RouterDsParams {
-    int nExperts;
-    int dim;
-    int topK;
-    int normalize;
-    int nGroup;
-    int topkGroup;
-    int sigmoidScore;
-    int method;
-    int scaleAlways;
-    float routedScale;
-};
-
-kernel void router_ds(device const float *x [[buffer(0)]],
-                      device const float *w [[buffer(1)]],
-                      device int *assign [[buffer(2)]],
-                      device float *rw [[buffer(3)]],
-                      device const float *bias [[buffer(4)]],
-                      constant RouterDsParams &p [[buffer(5)]],
-                      uint tg [[threadgroup_position_in_grid]],
-                      ushort tid [[thread_position_in_threadgroup]],
-                      ushort tpg [[threads_per_threadgroup]],
-                      ushort sg [[simdgroup_index_in_threadgroup]],
-                      ushort lane [[thread_index_in_simdgroup]],
-                      ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float scores[1024];
-    threadgroup float choice[1024];
-    threadgroup float buf[32];
-    const int ne = p.nExperts;
-    device const float *xv = x + (ulong)tg * p.dim;
-    device const float4 *x4 = (device const float4 *)xv;
-    const int n4 = p.dim / 4;
-    for (int e = sg; e < ne; e += nsg) {
-        device const float *wv = w + (ulong)e * p.dim;
-        device const float4 *w4 = (device const float4 *)wv;
-        float d = 0.0f;
-        for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
-        for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
-        d = simd_sum(d);
-        if (lane == 0) scores[e] = d;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (p.sigmoidScore) {
-        for (int e = tid; e < ne; e += tpg) scores[e] = 1.0f / (1.0f + exp(-scores[e]));
-    } else {
-        float mx = -INFINITY;
-        for (int e = tid; e < ne; e += tpg) mx = max(mx, scores[e]);
-        mx = tg_max(mx, buf, sg, lane, nsg);
-        float sum = 0.0f;
-        for (int e = tid; e < ne; e += tpg) {
-            const float v = exp(scores[e] - mx);
-            scores[e] = v;
-            sum += v;
-        }
-        sum = tg_sum(sum, buf, sg, lane, nsg);
-        for (int e = tid; e < ne; e += tpg) scores[e] /= sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = tid; e < ne; e += tpg) choice[e] = p.method == 2 ? scores[e] + bias[e] : scores[e];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid != 0) return;
-
-    if (p.method != 0) {
-        const int gs = ne / p.nGroup;
-        float gsc[64];
-        bool keep[64];
-        for (int g = 0; g < p.nGroup; g++) {
-            float b1 = -INFINITY;
-            float b2 = -INFINITY;
-            for (int i = 0; i < gs; i++) {
-                float v = choice[g * gs + i];
-                if (v > b1) { b2 = b1; b1 = v; }
-                else if (v > b2) { b2 = v; }
-            }
-            gsc[g] = p.method == 2 && gs > 1 ? b1 + b2 : b1;
-            keep[g] = false;
-        }
-        for (int k = 0; k < p.topkGroup; k++) {
-            int best = -1;
-            for (int g = 0; g < p.nGroup; g++) {
-                if (!keep[g] && (best < 0 || gsc[g] > gsc[best])) best = g;
-            }
-            keep[best] = true;
-        }
-        for (int e = 0; e < ne; e++) {
-            if (!keep[e / gs]) choice[e] = -INFINITY;
-        }
-    }
-
-    float selected = 0.0f;
-    for (int k = 0; k < p.topK; k++) {
-        int best = -1;
-        float bv = -INFINITY;
-        for (int e = 0; e < ne; e++) {
-            if (choice[e] > bv) { bv = choice[e]; best = e; }
-        }
-        assign[tg * p.topK + k] = best;
-        rw[tg * p.topK + k] = scores[best];
-        selected += scores[best];
-        choice[best] = -INFINITY;
-    }
-    const bool renorm = p.topK > 1 && p.normalize != 0;
-    const float denom = selected + 1e-20f;
-    const bool scale = renorm ? p.scaleAlways != 0 : true;
-    for (int k = 0; k < p.topK; k++) {
-        float v = rw[tg * p.topK + k];
-        if (renorm) v /= denom;
-        if (scale) v *= p.routedScale;
-        rw[tg * p.topK + k] = v;
-    }
-}
-
-// ============================================================================================== Q2_K
-// llama.cpp's Q2_K: 256-weight super-blocks of 84 bytes = 16 scale/min bytes (low nibble = 4-bit scale sc,
-// high nibble = 4-bit min m) + 64 bytes of 2-bit quants + f16 d + f16 dmin; weight = d*sc*q - dmin*m.
-// Sub-block j (weights 16j .. 16j+15) is at qs + (j/8)*32 + (j%2)*16 with bit shift 2*((j%8)/2).
-// Scales live inside the block, so buffer(1) (ws) is unused by these kernels. See docs/13-q2k-quantization.md.
-
-#define QK_K 256
-#define Q2K_BYTES 84
-
-// Dequantizes 16-weight sub-block u of global row `grow` (nsb super-blocks per row) into w[0..4).
-static inline void q2k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w) {
-    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q2K_BYTES;
-    const int j = u & 15;
-    const uchar s = blk[j];
-    const float2 dd = float2(as_type<half2>(*(device const uint *)(blk + 80)));   // d, dmin (4-byte aligned)
-    const float dl = dd.x * float(s & 15);
-    const float ml = dd.y * float(s >> 4);
-    const uchar shift = uchar(((j & 7) >> 1) << 1);
-    device const uchar4 *q = (device const uchar4 *)(blk + 16 + (j >> 3) * 32 + (j & 1) * 16);
-    for (int k = 0; k < 4; k++) w[k] = float4((q[k] >> uchar4(shift)) & uchar4(3)) * dl - ml;
-}
-
-// block_dot for the MoE kernels: 32-weight block b of a Q2_K row = sub-blocks 2b and 2b+1 (nb = cols / 32).
-template <>
-inline float block_dot<2>(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,
-                          device const float4 *x4) {
-    const int nsb = (nb + 7) >> 3;
-    float4 w[4];
-    float d = 0.0f;
-    q2k_sub_block(wq, grow, nsb, 2 * b, w);
-    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
-    q2k_sub_block(wq, grow, nsb, 2 * b + 1, w);
-    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k + 4]);
-    return d;
-}
-
-// mm_row for QT == 2 (called from the generic mm_row, so every matmul / matmul3 / matmul_swiglu variant gets it):
-// a lane's unit of work is one 16-weight sub-block (cols / 16 units per row, nb = cols / 32) so all 32 lanes
-// stay busy on 1024-wide rows, which hold only 4 super-blocks.
-template <typename XP>
-static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
-                              thread float *acc, ushort lane) {
-    const int nsb = (nb + 7) >> 3;
-    const int nsub = nb * 2;
-    for (int u = lane; u < nsub; u += 32) {
-        float4 w[4];
-        q2k_sub_block(wq, grow, nsb, u, w);
-        for (int t = 0; t < TOK_TILE; t++) {
-            if (t < nt) {
-                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
-                float d = 0.0f;
-                for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
-                acc[t] += d;
-            }
-        }
-    }
-}
-
-// mm_tile for QT == 2: the sub-blocks of the NR rows are dequantized once per lane unit and used for TT tokens,
-// each row's unit walk and dot being those of mm_row_q2k.
-template <int NR, int TT>
-static inline void mm_tile_q2k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
-                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
-    const int nsb = (nb + 7) >> 3;
-    const int nsub = nb * 2;
-    for (int u = lane; u < nsub; u += 32) {
-        float4 w[NR][4];
-        for (int r = 0; r < NR; r++) {
-            if (r < nr) q2k_sub_block(wq[r], grow[r], nsb, u, w[r]);
-        }
-        for (int t = 0; t < TT; t++) {
-            if (t < nt) {
-                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
-                float4 xv[4];
-                for (int k = 0; k < 4; k++) xv[k] = x4[k];
-                for (int r = 0; r < NR; r++) {
-                    if (r < nr) {
-                        float d = 0.0f;
-                        for (int k = 0; k < 4; k++) d += dot(w[r][k], xv[k]);
-                        acc[r][t] += d;
-                    }
-                }
-            }
-        }
-    }
-}
-
-template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
-template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;
-template [[host_name("matmul_pf_q2k")]] kernel matmul_pf_t matmul_pf<2, PF_ROWS, PF_TOKS>;
-template [[host_name("matmul3_pf_q2k")]] kernel matmul3_pf_t matmul3_pf<2, PF_ROWS, PF_TOKS, float>;
-template [[host_name("matmul3_pf_q2k_h")]] kernel matmul3_pf_h_t matmul3_pf<2, PF_ROWS, PF_TOKS, half>;
-template [[host_name("matmul_swiglu_pf_q2k")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<2, PF_UNITS, PF_TOKS>;
-template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false, float>;
-template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true, float>;
-template [[host_name("matmul3_q2k_h")]] kernel matmul3_h_t matmul3<2, false, half>;
-template [[host_name("matmul3_q2k_norm_h")]] kernel matmul3_h_t matmul3<2, true, half>;
-template [[host_name("matmul_swiglu_q2k")]] kernel matmul_swiglu_t matmul_swiglu<2, false>;
-template [[host_name("matmul_swiglu_q2k_norm")]] kernel matmul_swiglu_t matmul_swiglu<2, true>;
-template [[host_name("moe_up_q2k")]] kernel moe_up_t moe_up<2>;
-template [[host_name("moe_down_q2k")]] kernel moe_down_t moe_down<2>;

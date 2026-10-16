@@ -145,8 +145,8 @@ public final class MetalBackend implements Backend {
         int hd = c.headDim();
         String vh = kvHalf ? "_h" : "";
         attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
-        if (c.isMoe() && c.numExperts() > MetalKernels.MAX_EXPERTS) {
-            throw new IllegalArgumentException("Metal router kernel supports at most " + MetalKernels.MAX_EXPERTS + " experts");
+        if (c.isMoe() && c.numExperts() > MetalConstants.MAX_EXPERTS) {
+            throw new IllegalArgumentException("Metal router kernel supports at most " + MetalConstants.MAX_EXPERTS + " experts");
         }
         fusedNormFits = k.fusedNormFits(c.dim());
 
@@ -218,9 +218,9 @@ public final class MetalBackend implements Backend {
         att = k.scratch((long) maxBatch * (c.deepseek() == null ? c.qDim()
                 : Math.max(c.qDim(), c.heads() * c.deepseek().vHeadDim())) * 4);
         hidden = k.scratch((long) maxBatch * c.maxMlpDim() * 4);
-        scores = k.scratch((long) Math.min(MetalKernels.ATT_TILE, maxBatch) * c.heads() * ctx * 4);
+        scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * c.heads() * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
-        flashPart = flashDecode ? k.scratch((long) c.heads() * MetalKernels.FLASH_MAX_SPLITS * (c.headDim() + 2) * 4) : null;
+        flashPart = flashDecode ? k.scratch((long) c.heads() * MetalKernels.FLASH_SPLITS * (c.headDim() + 2) * 4) : null;
         if (c.isMoe()) {
             int slots = maxBatch * c.expertsPerTok();
             assign = k.scratch((long) slots * 4);

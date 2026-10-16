@@ -68,11 +68,13 @@ public final class MambaMetalBackend implements Backend {
         this.m = c.mamba();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
-        if (m.dState() > 64) {
-            throw new IllegalArgumentException("Metal Mamba scan supports state_size <= 64, got " + m.dState());
+        if (m.dState() > MetalConstants.MAMBA_MAX_STATE) {
+            throw new IllegalArgumentException("Metal Mamba scan supports state_size <= "
+                    + MetalConstants.MAMBA_MAX_STATE + ", got " + m.dState());
         }
-        if (m.dConv() > 8) {
-            throw new IllegalArgumentException("Metal Mamba conv supports conv_kernel <= 8, got " + m.dConv());
+        if (m.dConv() > MetalConstants.MAMBA_MAX_CONV) {
+            throw new IllegalArgumentException("Metal Mamba conv supports conv_kernel <= "
+                    + MetalConstants.MAMBA_MAX_CONV + ", got " + m.dConv());
         }
         this.k = new MetalKernels(Metal.create(metalLib), c.normEps());
         try { // owns the Metal context from here on: closed again if anything below throws
