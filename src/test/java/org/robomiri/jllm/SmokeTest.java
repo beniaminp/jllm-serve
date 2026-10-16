@@ -1015,7 +1015,9 @@ public final class SmokeTest {
                             }
                             String what = dtype + " window=" + window + " softcap=" + softcap;
                             check(maxRef < 2e-6, "kv attention " + what + " vs double reference: max diff " + maxRef);
-                            check(maxPd < 1e-7, "kv attention " + what + " tiled prefill vs decode: max diff " + maxPd
+                            // same kernels, so bit-identical once both run C2 code; while one of them still runs
+                            // the interpreter's sequential lane reduction a last-bit (1e-7) difference is expected
+                            check(maxPd < 5e-7, "kv attention " + what + " tiled prefill vs decode: max diff " + maxPd
                                     + ", " + exact + "/" + (n * qDim) + " bit-identical");
                         }
                     }

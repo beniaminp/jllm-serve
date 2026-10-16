@@ -1,6 +1,7 @@
 package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.DeepSeekConfig;
+import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.MlaWeights;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
@@ -19,7 +20,9 @@ import java.util.Arrays;
  *
  * <p>The cache holds the expanded per-head keys ({@code heads * (nope+rope)} floats) and values
  * ({@code heads * v}) in f32 - simple, but much larger than the compressed latent MLA is designed for
- * (DeepSeek-V2-Lite: 5120 floats = 20 KB per token and layer, 553 KB per token over 27 layers).
+ * (DeepSeek-V2-Lite: 5120 floats = 20 KB per token and layer, 553 KB per token over 27 layers). The norms run
+ * parallel over tokens, the rotation and cache scatter parallel over (token, head), the attention per
+ * (token, head) with the heaviest tokens handed out first.
  */
 final class MlaCpu {
 
@@ -69,52 +72,38 @@ final class MlaCpu {
         } else {
             int ql = d.qLoraRank();
             b.matmul(m.qA, b.xb, qa, 0, n, false);
-            for (int t = 0; t < n; t++) {
-                b.rmsnormRow(qa, t * ql, qa, t * ql, m.qALayernorm, ql);
-            }
+            b.rmsnorm(qa, qa, m.qALayernorm, n, ql);
             b.matmul(m.qB, qa, b.q, 0, n, false);
         }
         b.matmul(m.kvA, b.xb, lat, 0, n, false);
         b.matmul(m.kPe, b.xb, kpe, 0, n, false);
-        for (int t = 0; t < n; t++) {
-            b.rmsnormRow(lat, t * kvl, lat, t * kvl, m.kvALayernorm, kvl);
-        }
+        b.rmsnorm(lat, lat, m.kvALayernorm, n, kvl);
         b.matmul(m.kvB, lat, kvb, 0, n, false);
 
         int half = rd / 2;
         int kvbStride = heads * (nope + vd);
         float[] kc = key[l];
         float[] vc = val[l];
-        for (int t = 0; t < n; t++) {
-            int ro = (pos + t) * half;
-            for (int h = 0; h < heads; h++) {
-                rotate(b.q, t * kStride + h * qk + nope, ro, half);
-            }
-            rotate(kpe, t * rd, ro, half);
-            int kd = (pos + t) * kStride;
-            int vdst = (pos + t) * vStride;
-            for (int h = 0; h < heads; h++) {
-                int src = t * kvbStride + h * (nope + vd);
-                System.arraycopy(kvb, src, kc, kd + h * qk, nope);
-                System.arraycopy(kpe, t * rd, kc, kd + h * qk + nope, rd);
-                System.arraycopy(kvb, src + nope, vc, vdst + h * vd, vd);
-            }
-        }
-        attend(l, n, pos);
-    }
-
-    /** Rotates the pairs (2i, 2i+1) of {@code v[o .. o+2*half)} by the table row at {@code ro}. */
-    private void rotate(float[] v, int o, int ro, int half) {
         float[] cos = rope.cos;
         float[] sin = rope.sin;
-        for (int i = 0; i < half; i++) {
-            float a = v[o + 2 * i];
-            float bb = v[o + 2 * i + 1];
-            float cs = cos[ro + i];
-            float sn = sin[ro + i];
-            v[o + 2 * i] = a * cs - bb * sn;
-            v[o + 2 * i + 1] = bb * cs + a * sn;
-        }
+        float[] q = b.q;
+        // per (token, head): rotate q_pe in place; assemble the cached key [k_nope, k_pe] (the shared k_pe is
+        // copied unrotated and rotated in its slot, so no head waits for another) and copy v
+        b.pool.forRange(n * heads, 4, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int t = i / heads;
+                int h = i - t * heads;
+                int ro = (pos + t) * half;
+                InterleavedRope.rotate(q, t * kStride + h * qk + nope, rd, cos, sin, ro);
+                int src = t * kvbStride + h * (nope + vd);
+                int kd = (pos + t) * kStride + h * qk;
+                System.arraycopy(kvb, src, kc, kd, nope);
+                System.arraycopy(kpe, t * rd, kc, kd + nope, rd);
+                InterleavedRope.rotate(kc, kd + nope, rd, cos, sin, ro);
+                System.arraycopy(kvb, src + nope, vc, (pos + t) * vStride + h * vd, vd);
+            }
+        });
+        attend(l, n, pos);
     }
 
     private void attend(int l, int n, int pos) {
@@ -124,10 +113,11 @@ final class MlaCpu {
         float[] att = b.att;
         int vd = d.vHeadDim();
         float scale = (float) d.softmaxScale();
-        b.pool.forRange(n * heads, 1, (i0, i1) -> {
+        // one (token, head) per task, last tokens (most keys) first: a fine grain keeps the tail short
+        b.pool.forRangeFine(n * heads, 1, (i0, i1) -> {
             float[] sc = b.scratch.get();
             for (int i = i0; i < i1; i++) {
-                int t = i / heads;
+                int t = n - 1 - i / heads;
                 int h = i % heads;
                 int qo = t * kStride + h * qk;
                 int ko = h * qk;
