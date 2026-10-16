@@ -70,20 +70,20 @@ Short prompts decode at ~110 tok/s on Metal (less attention work). Both backends
 
 ### CPU int8 activations (`backend.cpu.int8-activations`, [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels))
 
-Measured with `./jllm bench --backend cpu --ctx 1024` on the same M1 Pro while the machine was shared with
-other heavy jobs (load average 50–100, so the absolute numbers are far below the idle-machine row above);
-the two settings were run interleaved, best of two runs each:
+Measured with `./jllm bench --backend cpu --ctx 1024` on the same M1 Pro (f32 KV cache, after the prefill
+tiling and parallel norm/rope/SiLU work landed), the two settings run interleaved, best of two runs each,
+with a few other processes on the machine (load average 5–17):
 
 | | prefill | decode | decode speedup |
 |---|---|---|---|
-| float activations (`false`) | 38.8 tok/s | 4.2 tok/s | — |
-| int8 activations (`true`) | 36.8 tok/s | 16.0 tok/s | **3.8×** |
+| float activations (`false`) | 237 tok/s | 13.4 tok/s | — |
+| int8 activations (`true`) | 276 tok/s | 53.7 tok/s | **4.0×** |
 
-Prefill is unchanged (it keeps the float `dot4` path). Per kernel, single-threaded and undisturbed, the
-Q4 row dot product goes from 3.5 ms to 0.59 ms per 8 192 × 1 024 rows (6×) and the Q8 (LM head) row dot
-from 1.3–3.7 ms to 0.92 ms; the end-to-end decode gain is smaller because attention, norms, SiLU and the
-thread-pool synchronization are untouched (Amdahl), and because under this load the 10 threads did not get
-10 cores. The accuracy cost is an RMS relative error of ~0.9 % on each dot product
+Prefill does not use the int8 path (it keeps the float `dot4` tiles); the prefill difference is run-to-run
+noise from the shared machine. Per kernel, single-threaded and undisturbed, the Q4 row dot product goes
+from 3.5 ms to 0.59 ms per 8 192 × 1 024 rows (6×) and the Q8 (LM head) row dot from 1.3–3.7 ms to 0.92 ms;
+the end-to-end decode gain is smaller because attention, norms, SiLU and the thread-pool synchronization
+are untouched (Amdahl). The accuracy cost is an RMS relative error of ~0.9 % on each dot product
 (`SmokeTest.int8Kernels`, activations with outliers; ~0.6 % without). Greedy outputs with the switch on and
 off: *"What is the capital of France? Answer in one sentence."* gives the identical sentence; the haiku
 prompt gives a different but equally coherent continuation (the int8 run actually produces a haiku, the
@@ -187,7 +187,7 @@ round for that reason.
 | # | change | expected effect | where |
 |---|---|---|---|
 | 1 | **Kernel fusion on Metal**: fold `rmsnorm` into the following matmul, launch q/k/v as one dispatch, fuse `silu_mul` into the gate/up matmul epilogue | ~340 → ~150 dispatches per token; decode toward 120–150 tok/s on the 0.6B model | `kernels.metal`, `MetalBackend.forward` |
-| 2 | **Int8 activations on CPU** — done: the activation vector is quantized to Q8 per block and multiplied on 8 short lanes per 128-bit register with no byte→float conversions ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | measured: Q4 row kernel 6× faster, decode 4.2 → 16.0 tok/s (3.8×) under the same load, prefill unchanged, ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuBackend.matmul` (`n == 1`) and `moe`, `backend.cpu.int8-activations` |
+| 2 | **Int8 activations on CPU** — done: the activation vector is quantized to Q8 per block and multiplied on 8 short lanes per 128-bit register with no byte→float conversions ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | measured: Q4 row kernel 6× faster, decode 13.4 → 53.7 tok/s (4.0×) on the 0.6B model, prefill unchanged, ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuBackend.matmul` (`n == 1`) and `moe`, `backend.cpu.int8-activations` |
 | 3 | **f16 KV cache** — done: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; decode speed unchanged to slightly better at 400–600-token contexts, greedy outputs unchanged on the test prompts | `cpu/KvCache`, `kv_store_half`/`attention_h` in `kernels.metal` |
 | 4 | **Flash-style attention**: compute scores and the weighted value sum in one pass with an online softmax, never writing `scores` to device memory; one threadgroup per head *and* query tile | removes the score round trip; large win at long context | `attention` kernel, `CpuBackend.attention` |
 | 5 | **Continuous batching**: several sequences per forward pass so each weight read serves many tokens | turns decode from memory-bound toward compute-bound: near-linear throughput scaling with concurrent users | `Backend.forward` (batch of sequences), per-sequence KV cache slots, `Engine` scheduler, `ApiServer` lock |
