@@ -50,9 +50,52 @@ public final class Sampler {
 
     /** Samples the next token. {@code logits} is modified in place. */
     public int sample(float[] logits) {
+        if (!prepare(logits)) {
+            return argmax(logits);
+        }
+        return draw(logits);
+    }
+
+    /**
+     * Speculative-sampling step for a deterministic draft token (a prompt-lookup match or a greedy draft model:
+     * its proposal distribution is one-hot, q(draft) = 1). Greedy: returns the target's argmax, which equals
+     * {@code draft} exactly when the draft is right. Sampling: accepts {@code draft} with probability
+     * min(1, p(draft) / q(draft)) = p(draft), where p is the distribution {@link #sample} would draw from
+     * (penalties, temperature, top-k, top-p, min-p applied); otherwise draws from norm(max(0, p - q)), i.e. p
+     * with the draft's mass removed. The returned token is then distributed exactly as a plain sample would be,
+     * and it equals {@code draft} iff the draft was accepted. {@code logits} is modified in place.
+     */
+    public int verify(float[] logits, int draft) {
+        if (!prepare(logits)) {
+            return argmax(logits);
+        }
+        for (int i = 0; i < keep; i++) {
+            if (idx[i] == draft) {
+                if (val[i] > 0 && rng.nextDouble() * total < val[i]) {
+                    return draft;
+                }
+                total -= val[i];
+                val[i] = 0f;
+                break;
+            }
+        }
+        return draw(logits);
+    }
+
+    /** Candidate count and total weight of the distribution {@link #prepare} built. */
+    private int keep;
+    private double total;
+
+    /**
+     * Applies the penalties and builds the sampling distribution into {@code idx}/{@code val} (weights, not yet
+     * normalized; {@code keep} candidates, {@code total} their sum).
+     *
+     * @return false when decoding is greedy (the distribution is the argmax)
+     */
+    private boolean prepare(float[] logits) {
         applyPenalties(logits);
         if (p.temperature() == 0f || p.topK() == 1) {
-            return argmax(logits);
+            return false;
         }
         float invT = 1f / p.temperature();
         int n;
@@ -90,13 +133,13 @@ public final class Sampler {
             sum = nucleusSum;
         }
         // top-p on the sorted candidates
-        int keep = n;
+        int kept = n;
         if (sorted && p.topP() < 1f) {
             double cum = 0;
             for (int i = 0; i < n; i++) {
                 cum += val[i] / sum;
                 if (cum >= p.topP()) {
-                    keep = i + 1;
+                    kept = i + 1;
                     break;
                 }
             }
@@ -104,16 +147,23 @@ public final class Sampler {
         // min-p relative to the most likely token (whose unnormalized weight is exp(0) = 1)
         if (p.minP() > 0f) {
             float threshold = p.minP();
-            for (int i = 0; i < keep; i++) {
+            for (int i = 0; i < kept; i++) {
                 if (val[i] < threshold) {
                     val[i] = 0f;
                 }
             }
         }
-        double total = 0;
-        for (int i = 0; i < keep; i++) {
-            total += val[i];
+        double t = 0;
+        for (int i = 0; i < kept; i++) {
+            t += val[i];
         }
+        keep = kept;
+        total = t;
+        return true;
+    }
+
+    /** One categorical draw from the distribution {@link #prepare} built. */
+    private int draw(float[] logits) {
         double r = rng.nextDouble() * total;
         double acc = 0;
         for (int i = 0; i < keep; i++) {
