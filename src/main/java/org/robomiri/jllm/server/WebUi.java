@@ -29,16 +29,26 @@ final class WebUi {
               msgs.push({role:'user',content:text});
               log.insertAdjacentHTML('beforeend','<div class="u">you: '+esc(text)+'</div>');
               const a=document.createElement('div');a.className='a';a.textContent='assistant: ';log.appendChild(a);
-              const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({messages:msgs,stream:true,enable_thinking:document.getElementById('think').checked})});
-              const rd=r.body.getReader(),dec=new TextDecoder();let buf='',full='',usage=null;
-              for(;;){const{value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
-                let i;while((i=buf.indexOf('\\n\\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+2);
-                  if(!line.startsWith('data: '))continue;const d=line.slice(6);if(d==='[DONE]')continue;
-                  const j=JSON.parse(d);const c=j.choices?.[0]?.delta?.content;if(c){full+=c;a.textContent='assistant: '+full;}
-                  if(j.usage)usage=j.usage;window.scrollTo(0,document.body.scrollHeight);}}
-              msgs.push({role:'assistant',content:full});
+              let full='',usage=null,err=null;
+              try{
+                const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify({messages:msgs,stream:true,enable_thinking:document.getElementById('think').checked})});
+                if(!r.ok){err='HTTP '+r.status;try{const j=await r.json();if(j.error?.message)err=j.error.message;}catch(_){}}
+                else{
+                  const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+                  read:for(;;){const{value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
+                    let i;while((i=buf.indexOf('\\n\\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+2);
+                      if(!line.startsWith('data: '))continue;const d=line.slice(6);if(d==='[DONE]')continue;
+                      const j=JSON.parse(d);if(j.error){err=j.error.message||'error';break read;}
+                      const c=j.choices?.[0]?.delta?.content;if(c){full+=c;a.textContent='assistant: '+full;}
+                      if(j.usage)usage=j.usage;window.scrollTo(0,document.body.scrollHeight);}}
+                }
+              }catch(e){err=String(e);}
+              // keep the history consistent: no empty assistant turn, and a failed user turn is not re-sent
+              if(full)msgs.push({role:'assistant',content:full});else{msgs.pop();a.remove();}
+              if(err)log.insertAdjacentHTML('beforeend','<div class="s">error: '+esc(err)+'</div>');
               if(usage)log.insertAdjacentHTML('beforeend','<div class="s">'+usage.completion_tokens+' tokens, '+usage.tokens_per_second+' tok/s, prefill '+usage.prefill_ms+' ms</div>');
+              window.scrollTo(0,document.body.scrollHeight);
             };
             function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
             </script></body></html>
