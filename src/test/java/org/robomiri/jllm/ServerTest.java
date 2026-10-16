@@ -1,5 +1,6 @@
 package org.robomiri.jllm;
 
+import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.Backend;
@@ -40,6 +41,7 @@ public final class ServerTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args.length > 0 ? args[0] : "models/Qwen_Qwen3-0.6B");
+        settings();
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
         try (Fixture f = new Fixture(tok, "qwen3", 1 << 20)) {
             basics(f);
@@ -58,6 +60,25 @@ public final class ServerTest {
     }
 
     // ------------------------------------------------------------------ checks
+
+    /** L9: every typed setting is validated up front, with a message naming the key. */
+    static void settings() throws Exception {
+        Settings ok = Settings.load(new String[]{"serve", "--ctx", "2048", "--port=9000"}).validate();
+        check(ok.getInt("backend.ctx") == 2048 && ok.getInt("server.port") == 9000, "settings: aliases and --key=value");
+        for (String[] bad : new String[][]{{"--ctx", "abc"}, {"--ctx", "0"}, {"--backend", "gpu"}, {"--quant", "q3"},
+                {"--backend.kv-dtype", "f64"}, {"--hub.timeout-ms", "0"}, {"--top-p", "2"}, {"--temp", "x"},
+                {"--server.port", "70000"}}) {
+            String[] args = {"serve", bad[0], bad[1]};
+            String key = Settings.ALIASES.getOrDefault(bad[0].substring(2), bad[0].substring(2));
+            try {
+                Settings.load(args).validate();
+                check(false, "settings: " + bad[0] + " " + bad[1] + " rejected");
+            } catch (IllegalArgumentException e) {
+                check(e.getMessage().contains(key.startsWith("sampling.") ? "sampling." : key),
+                        "settings: " + bad[0] + " " + bad[1] + " rejected up front: " + e.getMessage());
+            }
+        }
+    }
 
     static void basics(Fixture f) throws Exception {
         Resp r = f.get("/health");

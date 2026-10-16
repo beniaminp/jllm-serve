@@ -1,5 +1,7 @@
 package org.robomiri.jllm.config;
 
+import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.sampling.SamplingParams;
 
 import java.io.IOException;
@@ -128,6 +130,57 @@ public final class Settings {
         }
         props.setProperty(key, value.trim());
         sources.put(key, source);
+    }
+
+    /**
+     * Parses every typed setting once, so that a typo fails here, before the (slow) weight load, instead of
+     * minutes later when the value is first used. {@link org.robomiri.jllm.Main} prints the message and exits
+     * with status 2, as for an unknown key.
+     *
+     * @return this
+     * @throws IllegalArgumentException naming the offending key and value
+     */
+    public Settings validate() {
+        for (String k : new String[]{"backend.ctx", "backend.batch", "bench.max-tokens", "bench.rounds",
+                "server.max-connections"}) {
+            require(getInt(k) >= 1, k, "must be at least 1");
+        }
+        require(getInt("backend.threads") >= 0, "backend.threads", "must be 0 (= all processors) or positive");
+        require(getInt("server.port") >= 0 && getInt("server.port") <= 65535, "server.port", "must be 0..65535");
+        for (String k : new String[]{"server.read-timeout-ms", "server.write-timeout-ms"}) {
+            require(getInt(k) >= 0, k, "must be 0 (= none) or positive");
+        }
+        for (String k : new String[]{"server.max-body-bytes", "server.queue-timeout-ms", "server.request-timeout-ms",
+                "engine.max-prompt-bytes"}) {
+            require(getLong(k) >= 0, k, "must be 0 or positive");
+        }
+        require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
+        for (String k : new String[]{"model.low-disk", "backend.cpu.int8-activations", "chat.thinking", "raw"}) {
+            if (has(k)) {
+                getBool(k);
+            }
+        }
+        try {
+            sampling(); // numbers plus the SamplingParams range checks
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("sampling.*: " + e.getMessage());
+        }
+        try {
+            QType.parse(get("model.quant"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("model.quant: " + e.getMessage());
+        }
+        KvDtype.parse(get("backend.kv-dtype")); // its message names the key
+        String backend = get("backend");
+        require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
+                "must be cpu, metal or auto");
+        return this;
+    }
+
+    private void require(boolean ok, String key, String what) {
+        if (!ok) {
+            throw new IllegalArgumentException(key + " " + what + ", got '" + get(key) + "'");
+        }
     }
 
     // ------------------------------------------------------------------ typed access

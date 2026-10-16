@@ -58,7 +58,7 @@ public final class Main {
         String cmd = args[0];
         Settings s;
         try {
-            s = Settings.load(args);
+            s = Settings.load(args).validate(); // every typed value is checked here, before the weights load
         } catch (IllegalArgumentException e) {
             System.err.println(e.getMessage());
             System.exit(2);

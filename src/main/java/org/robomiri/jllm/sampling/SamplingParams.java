@@ -30,13 +30,24 @@ public record SamplingParams(
 
     public SamplingParams {
         stop = stop == null ? List.of() : List.copyOf(stop);
+        // (the record's fields are not assigned yet inside a compact constructor: describe the arguments instead)
         if (!Float.isFinite(temperature) || !Float.isFinite(topP) || !Float.isFinite(minP)
                 || !Float.isFinite(repetitionPenalty) || !Float.isFinite(presencePenalty) || !Float.isFinite(frequencyPenalty)) {
-            throw new IllegalArgumentException("sampling parameters must be finite numbers: " + this);
+            throw new IllegalArgumentException("sampling parameters must be finite numbers: "
+                    + describe(temperature, topK, topP, minP, repetitionPenalty, presencePenalty, frequencyPenalty));
         }
         if (temperature < 0 || topK < 0 || topP <= 0 || topP > 1 || minP < 0 || minP > 1 || repetitionPenalty <= 0) {
-            throw new IllegalArgumentException("invalid sampling parameters: " + this);
+            throw new IllegalArgumentException("invalid sampling parameters (temperature >= 0, top_k >= 0, 0 < top_p <= 1,"
+                    + " 0 <= min_p <= 1, repetition_penalty > 0): "
+                    + describe(temperature, topK, topP, minP, repetitionPenalty, presencePenalty, frequencyPenalty));
         }
+    }
+
+    private static String describe(float temperature, int topK, float topP, float minP, float repetitionPenalty,
+                                   float presencePenalty, float frequencyPenalty) {
+        return "temperature=" + temperature + ", top_k=" + topK + ", top_p=" + topP + ", min_p=" + minP
+                + ", repetition_penalty=" + repetitionPenalty + ", presence_penalty=" + presencePenalty
+                + ", frequency_penalty=" + frequencyPenalty;
     }
 
     public static SamplingParams defaults() {
