@@ -114,7 +114,8 @@ Short flags:
 ```
 --model REPO          Hugging Face repository (default Qwen/Qwen3-0.6B), --revision REV, --dir PATH (model directory)
 --backend cpu|metal   default: metal on macOS when the native lib builds, else cpu
---quant q4|q8|q2k     weight format (default q4; q2k = 2.625-bit Q2_K; embeddings/LM head are always q8); cached per model
+--quant q4|q8|q2k|q6k weight format (default q4; q2k = 2.625-bit Q2_K, q6k = 6.5625-bit Q6_K); cached per model
+--head-quant q8|q6k   format of the embedding / LM head (default q8; q6k = Q6_K, a separate jllm-q4_0-h6k cache)
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
