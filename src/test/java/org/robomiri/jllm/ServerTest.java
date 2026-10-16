@@ -130,6 +130,20 @@ public final class ServerTest {
         String msgs = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         Resp r = f.post("/v1/chat/completions", "{" + msgs + ",\"temperature\":1e400}");
         check(r.status == 400 && r.body.contains("finite"), "temperature 1e400 (infinite): 400");
+        r = f.get("/nope");
+        check(r.status == 404 && r.headers.get("content-type").equals("application/json") && r.body.contains("\"message\""),
+                "unknown route: 404 JSON error");
+        // L16: HttpServer's own fallback for a handler that does not answer uses the same JSON error shape
+        try (HttpServer bare = new HttpServer("127.0.0.1", 0, (q, s) -> { })) {
+            Thread.ofPlatform().daemon().start(bare::serve);
+            try (Socket s = new Socket("127.0.0.1", bare.port())) {
+                s.getOutputStream().write(request("GET", "/x", null));
+                s.getOutputStream().flush();
+                r = readResponse(s.getInputStream());
+                check(r.status == 404 && r.headers.get("content-type").equals("application/json") && r.body.contains("not found: /x"),
+                        "handler without a response: 404 JSON error");
+            }
+        }
         // L13: integer fields are range-checked before the int cast
         for (String topK : new String[]{"10000000000", "1.5", "-1", "\"5\""}) {
             r = f.post("/v1/chat/completions", "{" + msgs + ",\"top_k\":" + topK + "}");

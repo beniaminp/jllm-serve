@@ -489,8 +489,8 @@ public final class HttpServer implements AutoCloseable {
                         req.method.equals("HEAD"), !req.http10);
                 try {
                     handler.handle(req, res);
-                    if (!res.started()) {
-                        res.send(404, "text/plain", "not found");
+                    if (!res.started()) { // the handler had nothing to say: same JSON shape as every other error
+                        res.send(404, "application/json", errorJson("invalid_request_error", "not found: " + req.path));
                     }
                     res.end();
                 } catch (Exception e) {
