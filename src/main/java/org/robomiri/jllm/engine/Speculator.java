@@ -73,6 +73,8 @@ public final class Speculator implements AutoCloseable {
     private int readyCount;
     private int preAccepted;
     private int newPos;
+    private int misses;   // consecutive passes in which no draft token was accepted
+    private int cooldown; // plain steps still to take before drafting again
     private long draftedTotal;
     private long acceptedTotal;
 
@@ -111,6 +113,8 @@ public final class Speculator implements AutoCloseable {
     /** Starts a request: the history is the (prepared) prompt. */
     public void begin(int[] prompt) {
         len = 0;
+        misses = 0;
+        cooldown = 0;
         for (int t : prompt) {
             onToken(t);
         }
@@ -139,6 +143,10 @@ public final class Speculator implements AutoCloseable {
         if (want < 1) {
             return false;
         }
+        if (cooldown > 0) { // recent passes accepted nothing: plain steps for a while
+            cooldown--;
+            return false;
+        }
         int m = cfg.mode() == Mode.NGRAM ? lookup(want) : draft.propose(hist, len, want, drafts, vocab, stopIds);
         if (m < 1) {
             return false;
@@ -161,6 +169,11 @@ public final class Speculator implements AutoCloseable {
                 continue;
             }
             break;
+        }
+        if (acc > 0) {
+            misses = 0;
+        } else { // a pass that gained nothing costs more than a plain step: back off exponentially (1, 3, 7, 15 steps)
+            cooldown = (1 << Math.min(++misses, 4)) - 1;
         }
         preAccepted = acc;
         newPos = pos + 1 + acc;
