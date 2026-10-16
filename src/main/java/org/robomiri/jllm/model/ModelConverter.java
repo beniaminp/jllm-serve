@@ -7,8 +7,10 @@ import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -16,6 +18,11 @@ import java.util.stream.Stream;
 /**
  * Converts a Hugging Face checkpoint into a {@link QuantFile}, one unit (embedding, layer, final norm + head)
  * at a time.
+ *
+ * <p>Every cache tensor is described by one {@link Rule}: the checkpoint tensors it is computed from and the
+ * transform that computes it (quantize, split rows, stack, flatten a 3-D tensor, keep as f32, fold the Gemma
+ * {@code 1 + w}, {@code -exp}). A unit is an ordered list of rules; the checkpoint tensors it needs are derived
+ * from those rules, so the shard bookkeeping below can never disagree with what the conversion reads.
  *
  * <p>Shards are opened only when a tensor in them is needed and closed (and {@link ShardProvider#release
  * released}) as soon as every tensor the converter will ever read from them has been consumed, so at most two
@@ -29,13 +36,29 @@ public final class ModelConverter {
     private static final String FINAL_NORM = "model.norm.weight";
     private static final String LM_HEAD = "lm_head.weight";
 
-    /** One conversion step: {@code inputs} are the checkpoint tensors it reads, {@code step} writes its outputs. */
-    private record Unit(String id, List<String> inputs, Step step) {
+    /** Computes one cache tensor, a {@link QTensor} allocated in the arena or a {@code float[]}, from its sources. */
+    @FunctionalInterface
+    private interface Transform {
+        Object apply(Arena a, List<SafeTensors.Tensor> sources) throws IOException;
     }
 
-    @FunctionalInterface
-    private interface Step {
-        void run(QuantFile.Writer w, Arena a) throws IOException;
+    /**
+     * One cache tensor: {@code sources} are the checkpoint tensors it is computed from, in the order the
+     * transform expects them; {@code transform} only ever sees those.
+     */
+    private record Rule(String cacheName, List<String> sources, Transform transform) {
+    }
+
+    /** One resumable step of the conversion: its rules, in cache order. */
+    private record Unit(String id, List<Rule> rules) {
+        /** Every checkpoint tensor the unit reads, derived from its rules. */
+        List<String> inputs() {
+            LinkedHashSet<String> in = new LinkedHashSet<>();
+            for (Rule r : rules) {
+                in.addAll(r.sources());
+            }
+            return List.copyOf(in);
+        }
     }
 
     private final Path dir;
@@ -114,7 +137,9 @@ public final class ModelConverter {
             Unit u = units.get(i);
             if (i >= skip) {
                 try (Arena a = Arena.ofShared()) {
-                    u.step().run(w, a);
+                    for (Rule r : u.rules()) {
+                        apply(w, a, r);
+                    }
                 }
                 w.commitUnit(u.id());
             }
@@ -129,104 +154,257 @@ public final class ModelConverter {
         }
     }
 
+    /** Reads the rule's sources, computes the cache tensor and writes it. */
+    private void apply(QuantFile.Writer w, Arena a, Rule r) throws IOException {
+        List<SafeTensors.Tensor> src = new ArrayList<>(r.sources().size());
+        for (String name : r.sources()) {
+            src.add(tensor(name));
+        }
+        Object v = r.transform().apply(a, src);
+        if (v instanceof QTensor t) {
+            w.put(r.cacheName(), t);
+        } else {
+            w.putFloats(r.cacheName(), (float[]) v);
+        }
+    }
+
+    // ------------------------------------------------------------------ rules
+
+    /** Quantizes a 2-D checkpoint tensor to {@code type} under the same name. */
+    private static Rule quantize(String name, QType type) {
+        return quantize(name, name, type, 0, 0);
+    }
+
+    /** Quantizes the 2-D tensor {@code source} to {@code type}; {@code rows} / {@code cols} are checked unless 0. */
+    private static Rule quantize(String cacheName, String source, QType type, int rows, int cols) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            SafeTensors.Tensor t = matrix(s.getFirst());
+            if ((rows > 0 && t.dim(0) != rows) || (cols > 0 && t.dim(1) != cols)) {
+                throw new IOException(t + " does not match [" + (rows > 0 ? rows : "*") + ", " + (cols > 0 ? cols : "*") + "]");
+            }
+            return quantize(a, type, t, 0, t.dim(0));
+        });
+    }
+
+    /**
+     * Quantizes rows {@code [start, start + rows)} of {@code source}, which must be {@code [totalRows, cols]}.
+     * A row slice quantizes exactly like the whole matrix because quantization blocks run along a row.
+     */
+    private static Rule splitRows(String cacheName, String source, QType type, int start, int rows, int totalRows, int cols) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            SafeTensors.Tensor t = matrix(s.getFirst());
+            if (t.dim(0) != totalRows || t.dim(1) != cols) {
+                throw new IOException(t + " does not match [" + totalRows + ", " + cols + "]");
+            }
+            return quantize(a, type, t, start, rows);
+        });
+    }
+
+    /**
+     * Quantizes several 2-D {@code [rows_i, cols]} tensors as one {@code [Σ rows_i, cols]} tensor, in order.
+     * Every part must have {@code rowsEach} rows and {@code cols} columns where those are not 0.
+     */
+    private static Rule stack(String cacheName, List<String> sources, QType type, int rowsEach, int cols) {
+        return new Rule(cacheName, List.copyOf(sources), (a, s) -> {
+            int width = matrix(s.getFirst()).dim(1);
+            int[] starts = new int[s.size() + 1];
+            for (int i = 0; i < s.size(); i++) {
+                SafeTensors.Tensor t = matrix(s.get(i));
+                if (t.dim(1) != width || (cols > 0 && t.dim(1) != cols) || (rowsEach > 0 && t.dim(0) != rowsEach)) {
+                    throw new IOException("cannot stack " + t + ": expected [" + (rowsEach > 0 ? rowsEach : "*") + ", "
+                            + (cols > 0 ? cols : width) + "]");
+                }
+                starts[i + 1] = starts[i] + t.dim(0);
+            }
+            SafeTensors.Tensor[] arr = s.toArray(new SafeTensors.Tensor[0]);
+            return QTensor.quantize(a, type, starts[s.size()], width, (r, dst) -> {
+                int i = Arrays.binarySearch(starts, r);
+                if (i < 0) {
+                    i = -i - 2;
+                }
+                arr[i].toFloat((long) (r - starts[i]) * width, dst, 0, width);
+            });
+        });
+    }
+
+    /** Quantizes a 3-D {@code [a, b, c]} tensor of exactly {@code shape} as {@code [a*b, c]} (row-major, no data moves). */
+    private static Rule flatten3d(String cacheName, String source, QType type, long[] shape) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            SafeTensors.Tensor t = s.getFirst();
+            if (!Arrays.equals(t.shape(), shape)) {
+                throw new IOException(t + " does not match " + Arrays.toString(shape));
+            }
+            SafeTensors.Tensor flat = new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{shape[0] * shape[1], shape[2]}, t.data());
+            return quantize(a, type, flat, 0, flat.dim(0));
+        });
+    }
+
+    /** Stores a tensor of any rank as a flat f32 vector under {@code cacheName}. */
+    private static Rule f32(String cacheName, String source) {
+        return new Rule(cacheName, List.of(source), (a, s) -> s.getFirst().toFloatArray());
+    }
+
+    /** Gemma norm gains: the checkpoint stores {@code w}, the model applies {@code 1 + w} (exact in f32, as in transformers). */
+    private static Rule f32PlusOne(String cacheName, String source) {
+        return new Rule(cacheName, List.of(source), (a, s) -> GemmaMath.foldNormGain(s.getFirst().toFloatArray()));
+    }
+
+    /** Mamba's {@code A = -exp(A_log)}: the scan only ever uses that form. */
+    private static Rule negExp(String cacheName, String source) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            float[] v = s.getFirst().toFloatArray();
+            for (int i = 0; i < v.length; i++) {
+                v[i] = (float) -Math.exp(v[i]);
+            }
+            return v;
+        });
+    }
+
+    /** A norm weight under its own name, with the Gemma {@code 1 + w} folded in where the family needs it. */
+    private Rule norm(String name) {
+        return cfg.normPlusOne() ? f32PlusOne(name, name) : f32(name, name);
+    }
+
+    private static SafeTensors.Tensor matrix(SafeTensors.Tensor t) throws IOException {
+        if (t.shape().length != 2) {
+            throw new IOException("expected a 2-D tensor, got " + t);
+        }
+        return t;
+    }
+
+    private static QTensor quantize(Arena a, QType type, SafeTensors.Tensor t, int start, int rows) {
+        int cols = t.dim(1);
+        return QTensor.quantize(a, type, rows, cols, (r, dst) -> t.toFloat((long) (start + r) * cols, dst, 0, cols));
+    }
+
     // ------------------------------------------------------------------ plan
 
-    /** The ordered conversion units together with every checkpoint tensor each of them reads. */
+    /** The ordered conversion units; each lists its cache tensors as rules. */
     private List<Unit> plan() {
         if (cfg.isMamba()) {
             return planMamba();
         }
         List<Unit> units = new ArrayList<>();
         // Embedding first: it is the largest single tensor and lives in the first shard.
-        units.add(new Unit("embed", List.of(EMBED), (w, a) -> w.put(EMBED, quantize(a, QType.Q8_0, tensor(EMBED)))));
+        units.add(new Unit("embed", List.of(quantize(EMBED, QType.Q8_0))));
         for (int l = 0; l < cfg.layers(); l++) {
-            int layer = l;
             String p = "model.layers." + l + ".";
-            List<String> in = new ArrayList<>(layerNorms(p));
+            List<Rule> rules = new ArrayList<>();
+            for (String n : layerNorms(p)) {
+                rules.add(norm(n));
+            }
+            if (cfg.attentionBias()) {
+                // q/k/v projection biases (Qwen2, GLM), stored as f32 under their checkpoint names
+                for (String n : new String[]{"q_proj", "k_proj", "v_proj"}) {
+                    rules.add(f32(p + "self_attn." + n + ".bias", p + "self_attn." + n + ".bias"));
+                }
+            }
             if (cfg.deepseek() != null) {
-                in.addAll(mlaInputs(p));
+                rules.addAll(mlaRules(p));
             } else if (fusedQkv(p)) {
-                in.add(p + "self_attn.qkv_proj.weight");
-                in.add(p + "self_attn.o_proj.weight");
+                // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
+                String qkv = p + "self_attn.qkv_proj.weight";
+                int q = cfg.qDim();
+                int kv = cfg.kvDim();
+                rules.add(splitRows(p + "self_attn.q_proj.weight", qkv, quant, 0, q, q + 2 * kv, cfg.dim()));
+                rules.add(splitRows(p + "self_attn.k_proj.weight", qkv, quant, q, kv, q + 2 * kv, cfg.dim()));
+                rules.add(splitRows(p + "self_attn.v_proj.weight", qkv, quant, q + kv, kv, q + 2 * kv, cfg.dim()));
+                rules.add(quantize(p + "self_attn.o_proj.weight", quant));
             } else {
                 for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                    in.add(p + "self_attn." + n + ".weight");
+                    rules.add(quantize(p + "self_attn." + n + ".weight", quant));
                 }
             }
             if (cfg.isMoeLayer(l)) {
-                in.add(routerName(p));
-                if (fusedExperts(p)) {
-                    in.add(p + "mlp.experts.gate_up_proj");
-                    in.add(p + "mlp.experts.down_proj");
-                } else {
-                    for (int i = 0; i < cfg.numExperts(); i++) {
-                        String ep = p + "mlp.experts." + i + ".";
-                        in.add(ep + "gate_proj.weight");
-                        in.add(ep + "up_proj.weight");
-                        in.add(ep + "down_proj.weight");
-                    }
-                }
-                in.addAll(deepseekMoeInputs(p));
+                rules.addAll(moeRules(p));
             } else if (fusedGateUp(p)) {
-                in.add(p + "mlp.gate_up_proj.weight");
-                in.add(p + "mlp.down_proj.weight");
+                // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
+                rules.add(quantize(p + "mlp.gate_up", p + "mlp.gate_up_proj.weight", quant, 0, 0));
+                rules.add(quantize(p + "mlp.down_proj.weight", quant));
             } else {
-                in.add(p + "mlp.gate_proj.weight");
-                in.add(p + "mlp.up_proj.weight");
-                in.add(p + "mlp.down_proj.weight");
+                rules.add(stack(p + "mlp.gate_up", List.of(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"), quant, 0, 0));
+                rules.add(quantize(p + "mlp.down_proj.weight", quant));
             }
-            units.add(new Unit("layer." + l, List.copyOf(in), (w, a) -> convertLayer(w, a, layer, p)));
+            units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
-        List<String> fin = new ArrayList<>(List.of(FINAL_NORM));
-        if (hasLmHead()) {
-            fin.add(LM_HEAD);
-        }
-        units.add(new Unit("final", List.copyOf(fin), (w, a) -> {
-            w.putFloats(FINAL_NORM, normGain(tensor(FINAL_NORM)));
-            if (hasLmHead()) {
-                w.put(LM_HEAD, quantize(a, QType.Q8_0, tensor(LM_HEAD)));
-            }
-        }));
+        units.add(new Unit("final", finalRules(norm(FINAL_NORM))));
         return units;
     }
 
-    /** q/k/v projection biases (Qwen2), stored as f32 under their checkpoint names. */
-    private List<String> biasNames(String p) {
-        if (!cfg.attentionBias()) {
-            return List.of();
+    /** Final norm, plus the LM head (Q8_0) when the checkpoint has an untied one. */
+    private List<Rule> finalRules(Rule finalNorm) {
+        List<Rule> rules = new ArrayList<>(List.of(finalNorm));
+        if (hasLmHead()) {
+            rules.add(quantize(LM_HEAD, QType.Q8_0));
         }
-        return List.of(p + "self_attn.q_proj.bias", p + "self_attn.k_proj.bias", p + "self_attn.v_proj.bias");
+        return List.copyOf(rules);
     }
 
-    /** DeepSeek attention tensors of a layer (o_proj included). */
-    private List<String> mlaInputs(String p) {
-        String a = p + "self_attn.";
-        List<String> in = new ArrayList<>();
-        if (cfg.deepseek().qLoraRank() > 0) {
-            in.addAll(List.of(a + "q_a_proj.weight", a + "q_a_layernorm.weight", a + "q_b_proj.weight"));
+    /**
+     * DeepSeek attention. {@code kv_a_proj_with_mqa [kvLora + rope, dim]} is stored as two tensors,
+     * {@code kv_a_latent.weight} (first kvLora rows) and {@code k_pe_proj.weight} (last rope rows).
+     */
+    private List<Rule> mlaRules(String p) {
+        DeepSeekConfig d = cfg.deepseek();
+        String at = p + "self_attn.";
+        List<Rule> rules = new ArrayList<>();
+        if (d.qLoraRank() > 0) {
+            rules.add(f32(at + "q_a_layernorm.weight", at + "q_a_layernorm.weight"));
+            rules.add(quantize(at + "q_a_proj.weight", quant));
+            rules.add(quantize(at + "q_b_proj.weight", quant));
         } else {
-            in.add(a + "q_proj.weight");
+            rules.add(quantize(at + "q_proj.weight", quant));
         }
-        in.addAll(List.of(a + "kv_a_proj_with_mqa.weight", a + "kv_a_layernorm.weight", a + "kv_b_proj.weight",
-                a + "o_proj.weight"));
-        return in;
+        rules.add(f32(at + "kv_a_layernorm.weight", at + "kv_a_layernorm.weight"));
+        String kva = at + "kv_a_proj_with_mqa.weight";
+        int total = d.kvLoraRank() + d.qkRopeDim();
+        rules.add(splitRows(at + "kv_a_latent.weight", kva, quant, 0, d.kvLoraRank(), total, cfg.dim()));
+        rules.add(splitRows(at + "k_pe_proj.weight", kva, quant, d.kvLoraRank(), d.qkRopeDim(), total, cfg.dim()));
+        rules.add(quantize(at + "kv_b_proj.weight", quant));
+        rules.add(quantize(at + "o_proj.weight", quant));
+        return rules;
     }
 
-    /** Shared experts and the V3 correction bias of a DeepSeek MoE layer. */
-    private List<String> deepseekMoeInputs(String p) {
-        if (cfg.deepseek() == null) {
-            return List.of();
-        }
-        List<String> in = new ArrayList<>();
-        if (cfg.deepseek().nShared() > 0) {
-            for (String n : new String[]{"gate_proj", "up_proj", "down_proj"}) {
-                in.add(p + "mlp.shared_experts." + n + ".weight");
+    /**
+     * A MoE layer: the f32 router, DeepSeek's shared experts (stacked gate/up, down) and V3 correction bias,
+     * then the experts. Two checkpoint layouts exist: per-expert 2-D tensors ({@code mlp.experts.N.gate_proj.weight},
+     * router {@code mlp.gate.weight}; transformers <= 4.53) and fused 3-D tensors ({@code mlp.experts.gate_up_proj}
+     * {@code [E, 2m, dim]}, {@code mlp.experts.down_proj [E, dim, m]}, router {@code mlp.router.weight}).
+     * Both end up as the same stacked {@code [E*2m, dim]} and {@code [E*dim, m]} matrices.
+     */
+    private List<Rule> moeRules(String p) {
+        int e = cfg.numExperts();
+        int m = cfg.moeDim();
+        List<Rule> rules = new ArrayList<>();
+        rules.add(f32(p + "mlp.router", routerName(p)));
+        DeepSeekConfig d = cfg.deepseek();
+        if (d != null) {
+            if (d.nShared() > 0) {
+                String sp = p + "mlp.shared_experts.";
+                int sh = d.nShared() * cfg.moeDim();
+                rules.add(stack(p + "mlp.shared.gate_up", List.of(sp + "gate_proj.weight", sp + "up_proj.weight"), quant, sh, 0));
+                rules.add(quantize(p + "mlp.shared.down", sp + "down_proj.weight", quant, 0, sh));
+            }
+            if (d.topkMethod().equals("noaux_tc")) {
+                rules.add(f32(p + "mlp.router_bias", p + "mlp.gate.e_score_correction_bias"));
             }
         }
-        if (cfg.deepseek().topkMethod().equals("noaux_tc")) {
-            in.add(p + "mlp.gate.e_score_correction_bias");
+        if (fusedExperts(p)) {
+            rules.add(flatten3d(p + "mlp.experts.gate_up", p + "mlp.experts.gate_up_proj", quant, new long[]{e, 2L * m, cfg.dim()}));
+            rules.add(flatten3d(p + "mlp.experts.down", p + "mlp.experts.down_proj", quant, new long[]{e, cfg.dim(), m}));
+            return rules;
         }
-        return in;
+        List<String> gateUp = new ArrayList<>(2 * e);
+        List<String> downs = new ArrayList<>(e);
+        for (int i = 0; i < e; i++) {
+            String ep = p + "mlp.experts." + i + ".";
+            gateUp.add(ep + "gate_proj.weight");   // rows [i*2m, i*2m+m) = gate_i
+            gateUp.add(ep + "up_proj.weight");     // rows [i*2m+m, (i+1)*2m) = up_i
+            downs.add(ep + "down_proj.weight");
+        }
+        rules.add(stack(p + "mlp.experts.gate_up", gateUp, quant, m, 0));
+        rules.add(stack(p + "mlp.experts.down", downs, quant, 0, m));
+        return rules;
     }
 
     private List<String> layerNorms(String p) {
@@ -264,153 +442,6 @@ public final class ModelConverter {
         return !cfg.tiedEmbeddings() && shardOf.containsKey(LM_HEAD);
     }
 
-    // ------------------------------------------------------------------ steps
-
-    private void convertLayer(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
-        for (String n : layerNorms(p)) {
-            w.putFloats(n, normGain(tensor(n)));
-        }
-        for (String n : biasNames(p)) {
-            w.putFloats(n, tensor(n).toFloatArray());
-        }
-        if (cfg.deepseek() != null) {
-            convertMla(w, a, p);
-        } else if (fusedQkv(p)) {
-            // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
-            String name = p + "self_attn.qkv_proj.weight";
-            SafeTensors.Tensor qkv = tensor(name);
-            int q = cfg.qDim();
-            int kv = cfg.kvDim();
-            if (qkv.shape().length != 2 || qkv.dim(0) != q + 2 * kv || qkv.dim(1) != cfg.dim()) {
-                throw new IOException("layer " + l + ": " + qkv + " does not match [" + (q + 2 * kv) + ", " + cfg.dim() + "]");
-            }
-            w.put(p + "self_attn.q_proj.weight", quantizeRows(a, quant, qkv, 0, q));
-            w.put(p + "self_attn.k_proj.weight", quantizeRows(a, quant, qkv, q, kv));
-            w.put(p + "self_attn.v_proj.weight", quantizeRows(a, quant, qkv, q + kv, kv));
-            String o = p + "self_attn.o_proj.weight";
-            w.put(o, quantize(a, quant, tensor(o)));
-        } else {
-            for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                String name = p + "self_attn." + n + ".weight";
-                w.put(name, quantize(a, quant, tensor(name)));
-            }
-        }
-        if (cfg.isMoeLayer(l)) {
-            convertMoe(w, a, l, p);
-        } else if (fusedGateUp(p)) {
-            // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
-            w.put(p + "mlp.gate_up", quantize(a, quant, tensor(p + "mlp.gate_up_proj.weight")));
-            String d = p + "mlp.down_proj.weight";
-            w.put(d, quantize(a, quant, tensor(d)));
-        } else {
-            String g = p + "mlp.gate_proj.weight";
-            String u = p + "mlp.up_proj.weight";
-            String d = p + "mlp.down_proj.weight";
-            w.put(p + "mlp.gate_up", stack(a, quant, List.of(tensor(g), tensor(u))));
-            w.put(d, quantize(a, quant, tensor(d)));
-        }
-    }
-
-    /**
-     * DeepSeek attention. {@code kv_a_proj_with_mqa [kvLora + rope, dim]} is stored as two tensors,
-     * {@code kv_a_latent.weight} (first kvLora rows) and {@code k_pe_proj.weight} (last rope rows); a row
-     * slice quantizes exactly like the whole matrix because quantization blocks run along a row.
-     */
-    private void convertMla(QuantFile.Writer w, Arena a, String p) throws IOException {
-        DeepSeekConfig d = cfg.deepseek();
-        String at = p + "self_attn.";
-        if (d.qLoraRank() > 0) {
-            w.putFloats(at + "q_a_layernorm.weight", tensor(at + "q_a_layernorm.weight").toFloatArray());
-            w.put(at + "q_a_proj.weight", quantize(a, quant, tensor(at + "q_a_proj.weight")));
-            w.put(at + "q_b_proj.weight", quantize(a, quant, tensor(at + "q_b_proj.weight")));
-        } else {
-            w.put(at + "q_proj.weight", quantize(a, quant, tensor(at + "q_proj.weight")));
-        }
-        w.putFloats(at + "kv_a_layernorm.weight", tensor(at + "kv_a_layernorm.weight").toFloatArray());
-        SafeTensors.Tensor kva = tensor(at + "kv_a_proj_with_mqa.weight");
-        if (kva.shape().length != 2 || kva.dim(0) != d.kvLoraRank() + d.qkRopeDim() || kva.dim(1) != cfg.dim()) {
-            throw new IOException("unexpected " + kva + ", expected [" + (d.kvLoraRank() + d.qkRopeDim()) + ", " + cfg.dim() + "]");
-        }
-        w.put(at + "kv_a_latent.weight", quantize(a, quant, rows(kva, 0, d.kvLoraRank())));
-        w.put(at + "k_pe_proj.weight", quantize(a, quant, rows(kva, d.kvLoraRank(), d.qkRopeDim())));
-        w.put(at + "kv_b_proj.weight", quantize(a, quant, tensor(at + "kv_b_proj.weight")));
-        w.put(at + "o_proj.weight", quantize(a, quant, tensor(at + "o_proj.weight")));
-    }
-
-    private static SafeTensors.Tensor rows(SafeTensors.Tensor t, int first, int n) {
-        long rowBytes = (long) t.dim(1) * t.dtype().bytes;
-        return new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{n, t.dim(1)},
-                t.data().asSlice(first * rowBytes, n * rowBytes));
-    }
-
-    /** DeepSeek shared experts (stacked gate/up, down) and the V3 {@code e_score_correction_bias}. */
-    private void convertDeepseekMoe(QuantFile.Writer w, Arena a, String p) throws IOException {
-        DeepSeekConfig d = cfg.deepseek();
-        if (d.nShared() > 0) {
-            String sp = p + "mlp.shared_experts.";
-            int sh = d.nShared() * cfg.moeDim();
-            SafeTensors.Tensor g = tensor(sp + "gate_proj.weight");
-            SafeTensors.Tensor u = tensor(sp + "up_proj.weight");
-            SafeTensors.Tensor dn = tensor(sp + "down_proj.weight");
-            if (g.dim(0) != sh || u.dim(0) != sh || dn.dim(1) != sh) {
-                throw new IOException(sp + " does not match n_shared_experts * moe_intermediate_size = " + sh);
-            }
-            w.put(p + "mlp.shared.gate_up", stack(a, quant, List.of(g, u)));
-            w.put(p + "mlp.shared.down", quantize(a, quant, dn));
-        }
-        if (d.topkMethod().equals("noaux_tc")) {
-            w.putFloats(p + "mlp.router_bias", tensor(p + "mlp.gate.e_score_correction_bias").toFloatArray());
-        }
-    }
-
-    /**
-     * Two checkpoint layouts exist: per-expert 2-D tensors ({@code mlp.experts.N.gate_proj.weight}, router
-     * {@code mlp.gate.weight}; transformers <= 4.53) and fused 3-D tensors ({@code mlp.experts.gate_up_proj}
-     * {@code [E, 2m, dim]}, {@code mlp.experts.down_proj [E, dim, m]}, router {@code mlp.router.weight}).
-     * Both end up as the same stacked {@code [E*2m, dim]} and {@code [E*dim, m]} matrices.
-     */
-    private void convertMoe(QuantFile.Writer w, Arena a, int l, String p) throws IOException {
-        int e = cfg.numExperts();
-        int m = cfg.moeDim();
-        w.putFloats(p + "mlp.router", tensor(routerName(p)).toFloatArray());
-        convertDeepseekMoe(w, a, p);
-
-        if (fusedExperts(p)) {
-            SafeTensors.Tensor gu = tensor(p + "mlp.experts.gate_up_proj");
-            SafeTensors.Tensor dn = tensor(p + "mlp.experts.down_proj");
-            if (gu.shape().length != 3 || gu.dim(0) != e || gu.dim(1) != 2 * m || gu.dim(2) != cfg.dim()
-                    || dn.shape().length != 3 || dn.dim(0) != e || dn.dim(1) != cfg.dim() || dn.dim(2) != m) {
-                throw new IOException("layer " + l + ": unexpected fused expert shapes " + gu + " / " + dn);
-            }
-            w.put(p + "mlp.experts.gate_up", quantize(a, quant, flatten(gu)));
-            w.put(p + "mlp.experts.down", quantize(a, quant, flatten(dn)));
-            return;
-        }
-
-        List<SafeTensors.Tensor> gu = new ArrayList<>(2 * e);
-        List<SafeTensors.Tensor> downs = new ArrayList<>(e);
-        for (int i = 0; i < e; i++) {
-            String ep = p + "mlp.experts." + i + ".";
-            SafeTensors.Tensor gate = tensor(ep + "gate_proj.weight");
-            SafeTensors.Tensor up = tensor(ep + "up_proj.weight");
-            SafeTensors.Tensor down = tensor(ep + "down_proj.weight");
-            if (gate.dim(0) != m || up.dim(0) != m || down.dim(1) != m) {
-                throw new IOException("expert " + i + " of layer " + l + " does not match moe_intermediate_size " + m);
-            }
-            gu.add(gate);   // rows [i*2m, i*2m+m) = gate_i
-            gu.add(up);     // rows [i*2m+m, (i+1)*2m) = up_i
-            downs.add(down);
-        }
-        w.put(p + "mlp.experts.gate_up", stack(a, quant, gu));
-        w.put(p + "mlp.experts.down", stack(a, quant, downs));
-    }
-
-    /** Views a {@code [a, b, c]} tensor as {@code [a*b, c]} (row-major, so no data moves). */
-    private static SafeTensors.Tensor flatten(SafeTensors.Tensor t) {
-        long[] s = t.shape();
-        return new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{s[0] * s[1], s[2]}, t.data());
-    }
-
     // ------------------------------------------------------------------ Mamba
 
     private static final String M_EMBED = "backbone.embeddings.weight";
@@ -420,89 +451,31 @@ public final class ModelConverter {
     private List<Unit> planMamba() {
         ModelConfig.MambaParams m = cfg.mamba();
         List<Unit> units = new ArrayList<>();
-        units.add(new Unit("embed", List.of(M_EMBED), (w, a) -> w.put(M_EMBED, quantize(a, QType.Q8_0, tensor(M_EMBED)))));
+        units.add(new Unit("embed", List.of(quantize(M_EMBED, QType.Q8_0))));
         for (int l = 0; l < cfg.layers(); l++) {
             String p = "backbone.layers." + l + ".";
             String q = p + "mixer.";
-            List<String> in = new ArrayList<>(List.of(p + "norm.weight", q + "in_proj.weight", q + "conv1d.weight",
-                    q + "x_proj.weight", q + "dt_proj.weight", q + "dt_proj.bias", q + "A_log", q + "D",
-                    q + "out_proj.weight"));
+            List<Rule> rules = new ArrayList<>();
+            rules.add(f32(p + "norm.weight", p + "norm.weight"));
+            rules.add(quantize(q + "in_proj.weight", quant));
+            rules.add(f32(q + "conv1d.weight", q + "conv1d.weight"));
             if (m.convBias()) {
-                in.add(q + "conv1d.bias");
+                rules.add(f32(q + "conv1d.bias", q + "conv1d.bias"));
             }
-            units.add(new Unit("layer." + l, List.copyOf(in), (w, a) -> {
-                w.putFloats(p + "norm.weight", tensor(p + "norm.weight").toFloatArray());
-                w.put(q + "in_proj.weight", quantize(a, quant, tensor(q + "in_proj.weight")));
-                w.putFloats(q + "conv1d.weight", tensor(q + "conv1d.weight").toFloatArray());
-                if (m.convBias()) {
-                    w.putFloats(q + "conv1d.bias", tensor(q + "conv1d.bias").toFloatArray());
-                }
-                w.put(q + "x_proj.weight", quantize(a, quant, tensor(q + "x_proj.weight")));
-                // dt_proj has dt_rank columns (48 for mamba-130m: not a multiple of the block size): stays f32
-                w.putFloats(q + "dt_proj.weight", tensor(q + "dt_proj.weight").toFloatArray());
-                w.putFloats(q + "dt_proj.bias", tensor(q + "dt_proj.bias").toFloatArray());
-                // the scan only ever uses A = -exp(A_log)
-                float[] aLog = tensor(q + "A_log").toFloatArray();
-                for (int i = 0; i < aLog.length; i++) {
-                    aLog[i] = (float) -Math.exp(aLog[i]);
-                }
-                w.putFloats(q + "A", aLog);
-                w.putFloats(q + "D", tensor(q + "D").toFloatArray());
-                w.put(q + "out_proj.weight", quantize(a, quant, tensor(q + "out_proj.weight")));
-            }));
+            rules.add(quantize(q + "x_proj.weight", quant));
+            // dt_proj has dt_rank columns (48 for mamba-130m: not a multiple of the block size): stays f32
+            rules.add(f32(q + "dt_proj.weight", q + "dt_proj.weight"));
+            rules.add(f32(q + "dt_proj.bias", q + "dt_proj.bias"));
+            rules.add(negExp(q + "A", q + "A_log"));
+            rules.add(f32(q + "D", q + "D"));
+            rules.add(quantize(q + "out_proj.weight", quant));
+            units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
-        List<String> fin = new ArrayList<>(List.of(M_FINAL_NORM));
-        if (hasLmHead()) {
-            fin.add(LM_HEAD);
-        }
-        units.add(new Unit("final", List.copyOf(fin), (w, a) -> {
-            w.putFloats(M_FINAL_NORM, tensor(M_FINAL_NORM).toFloatArray());
-            if (hasLmHead()) {
-                w.put(LM_HEAD, quantize(a, QType.Q8_0, tensor(LM_HEAD)));
-            }
-        }));
+        units.add(new Unit("final", finalRules(f32(M_FINAL_NORM, M_FINAL_NORM))));
         return units;
     }
 
-    // ------------------------------------------------------------------ helpers
-
-    /** Norm weights as f32. Gemma applies {@code 1 + w}, so the 1 is added here (exact in f32, as in transformers). */
-    private float[] normGain(SafeTensors.Tensor t) {
-        float[] v = t.toFloatArray();
-        return cfg.normPlusOne() ? GemmaMath.foldNormGain(v) : v;
-    }
-
-    private static QTensor quantize(Arena a, QType type, SafeTensors.Tensor t) {
-        int rows = t.dim(0);
-        int cols = t.dim(1);
-        return QTensor.quantize(a, type, rows, cols, (r, dst) -> t.toFloat((long) r * cols, dst, 0, cols));
-    }
-
-    /** Quantizes rows {@code [start, start + rows)} of a 2-D tensor. */
-    private static QTensor quantizeRows(Arena a, QType type, SafeTensors.Tensor t, int start, int rows) {
-        int cols = t.dim(1);
-        return QTensor.quantize(a, type, rows, cols, (r, dst) -> t.toFloat((long) (start + r) * cols, dst, 0, cols));
-    }
-
-    /** Quantizes several {@code [rows_i, cols]} matrices as one {@code [Σ rows_i, cols]} tensor. */
-    private static QTensor stack(Arena a, QType type, List<SafeTensors.Tensor> parts) {
-        int cols = parts.getFirst().dim(1);
-        int[] starts = new int[parts.size() + 1];
-        for (int i = 0; i < parts.size(); i++) {
-            if (parts.get(i).dim(1) != cols) {
-                throw new IllegalArgumentException("cannot stack " + parts.get(i) + ": cols differ");
-            }
-            starts[i + 1] = starts[i] + parts.get(i).dim(0);
-        }
-        SafeTensors.Tensor[] arr = parts.toArray(new SafeTensors.Tensor[0]);
-        return QTensor.quantize(a, type, starts[parts.size()], cols, (r, dst) -> {
-            int i = java.util.Arrays.binarySearch(starts, r);
-            if (i < 0) {
-                i = -i - 2;
-            }
-            arr[i].toFloat((long) (r - starts[i]) * cols, dst, 0, cols);
-        });
-    }
+    // ------------------------------------------------------------------ shards
 
     private SafeTensors.Tensor tensor(String name) throws IOException {
         String shard = shardOf.get(name);
