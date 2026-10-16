@@ -1,7 +1,8 @@
 # 13. Q2_K: 2-bit weights with sub-block scales and mins
 
-Code: `model/Q2K.java`, `model/QType.java`, `model/QTensor.java`, `cpu/Q2KKernels.java`, the `Q2_K` section of
-`metal/kernels.metal`, `metal/MetalBackend.java`
+Code: `model/Q2K.java`, `model/QType.java`, `model/QTensor.java`, `cpu/Q2KKernels.java` (reached through
+`cpu/VectorKernels.java` and `cpu/CpuMatmul.java`), the `Q2_K` section of `metal/kernels.metal`,
+`metal/MetalKernels.java`
 
 [06](06-quantization.md) stored every weight as `integer × scale` with 4 or 8 bits per integer. This chapter goes
 down to **2 bits** — four levels per weight — which is where the simple "one scale per block" recipe stops
@@ -13,10 +14,11 @@ Two bits per weight is meant for large models, where the many thousands of terms
 the error away. On Qwen3-0.6B, applied to every linear layer, it does not merely degrade the model — it breaks
 it (13.7 has the measurements and the per-tensor analysis of why); the point of implementing it is the 30B
 MoE, whose experts dominate the memory footprint ([12](12-mixture-of-experts.md)): 9.8 GB instead of 18.7 GB.
-Note that `--quant q2k` applies the format to **every** linear layer — attention, dense MLPs and experts alike;
-only the embedding / LM head stay Q8_0, as for every quant. A mixed recipe that keeps the fragile tensors
-(`down_proj`, the first layers) at 4 bits is analysed in 13.7 as the natural next step, but is not what the
-converter does today.
+Note that `--quant q2k` applies the format to **every** linear layer — attention (including DeepSeek's MLA
+projections), dense MLPs, experts and shared experts alike; only the embedding / LM head stay Q8_0, as for every
+quant. There is a single `--quant` per conversion and no mixed recipe: a conversion that keeps the fragile
+tensors (`down_proj`, the first layers) at 4 bits is analysed in 13.7 as the natural next step, but does not
+exist today.
 
 ---
 
@@ -176,10 +178,15 @@ price of 0.5 bits/weight for the scales and the reason k-quants with more bits u
 **Recomputing the codes.** The stored `d·sc_j` differs slightly from the searched `scale_j`, so the final codes
 are recomputed against the *dequantized* scale and min, `q_l = clamp(round((w_l + dmin·m_j) / (d·sc_j)), 0, 3)`.
 Storage is therefore self-consistent: decoding uses exactly the numbers the codes were chosen for. A sub-block
-whose `sc_j` rounds to 0 gets codes 0 (all its weights decode to `−dmin·m_j`).
+whose `sc_j` rounds to 0 is skipped in this recomputation and **keeps the codes of the `make_qkx2_quants` fit**
+(as llama.cpp's `if (!d) continue;` does): every code of such a sub-block decodes to the same value, `−dmin·m_j`,
+so this changes no decoded weight and only keeps the bytes identical to llama.cpp's. (Sub-blocks beyond the end
+of a partial super-block are written as zero bytes.)
 
-Conversion speed: the search is ~20 passes over each sub-block; Qwen3-0.6B converts in a few seconds on all
-cores (`QTensor.quantize` is parallel over rows, with a per-thread scratch so nothing is allocated per block).
+Conversion speed: the search is ~20 passes over each sub-block; Qwen3-0.6B converts in about ten seconds on all
+cores (13.7). `QTensor.quantize` is parallel over rows; each worker stages its row in thread-local arrays (the
+source floats, the quantized bytes) and `Q2K.quantizeBlock` keeps its working arrays in a per-thread `Scratch`,
+so nothing is allocated per block ([06 §6.7](06-quantization.md#67-quantizing-when-and-how)).
 
 ---
 
@@ -285,10 +292,13 @@ dot = d · Σ_j sc_j · (q·x)_j   −   dmin · Σ_j m_j · (Σx)_j
 
 so the per-weight work is "convert a 0…3 code to float, multiply-add with x" — the same as Q4_0 minus the
 `−8`. (With int8 activations, as llama.cpp uses on ARM, this is a much bigger win: `q·x` becomes an integer
-dot product and `Σx` per sub-block is precomputed once per activation vector as the "block sums". With f32
-activations as in this project, the saving is the per-weight `fma(dl, q, −ml)` that direct dequantization
-would need; the `Σx` adds cost about as much, so the two forms are close — the trick's real value here is that
-the code lines up with the int8 path described in [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels).)
+dot product and `Σx` per sub-block is precomputed once per activation vector as the "block sums". This project
+does **not** do that for Q2_K: `Int8Kernels` has kernels for Q4_0 and Q8_0 only (`CpuMatmul.useInt8`), so with
+`backend.cpu.int8-activations=true` (the default) Q4_0 / Q8_0 matmuls take the integer path
+([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) while Q2_K rows still use the
+f32 kernel below. In the f32 kernel the saving is the per-weight `fma(dl, q, −ml)` that direct dequantization
+would need; the `Σx` adds cost about as much, so the two forms are close — the algebra is what an int8 Q2_K
+kernel would reuse.)
 
 ### CPU: `Q2KKernels.dot`
 
@@ -314,7 +324,9 @@ return acc.reduceLanes(ADD)           once per row
 and codes are small integers, so all these products are exact in f32; the rounding differences between this
 kernel and the scalar `Q2K.dotRow` are at the 1e-7 level (the smoke test allows 1e-4 of `Σ|w·x|`).
 `Q2KKernels.dequant` is the same unpacking with `q.fma(dl, −ml)` written to a float buffer for the prefill
-path ([07 §7.4](07-cpu-backend.md#74-decode-vs-prefill-matmul-cpubackendmatmul)).
+path (`CpuMatmul.mul` with `n > 1` dequantizes four rows and reuses them for every token of the chunk,
+[07 §7.4](07-cpu-backend.md#74-decode-vs-prefill-matmul-cpubackendmatmul)). Both entry points are reached from
+`VectorKernels.dotRow` / `dequantRow`, which dispatch on `QType.Q2_K` first.
 
 ### Metal: `mm_row_q2k`, `block_dot<2>`
 
@@ -324,15 +336,17 @@ as the Q4_0 path does with its `lo/hi`. Every quantized matmul on Metal — the 
 `matmul3`, the fused `matmul_swiglu`, with and without the folded rmsnorm — is one template on the
 quantization type `QT` whose inner loop is `mm_row<QT>`; `mm_row` hands `QT == 2` to `mm_row_q2k`, so one
 function covers all of them and the `_q2k` / `_q2k_norm` pipelines are plain instantiations
-(`matmul<2, false>`, `matmul3<2, true>`, …). The one Q2_K-specific decision is the **work unit**: the Q4_0
+(`matmul<2, false>`, `matmul3<2, true>`, …). The tiled prefill kernels (`matmul_pf_q2k`, `matmul3_pf_q2k`,
+`matmul_swiglu_pf_q2k`) get the same treatment through `mm_tile_q2k`, which dequantizes a sub-block of each of
+its rows once and uses it for a tile of tokens. The one Q2_K-specific decision is the **work unit**: the Q4_0
 loop gives each lane of a simdgroup one 32-weight block, and a 1024-wide row has 32 of them — a perfect fit. A
 1024-wide Q2_K row has only **4 super-blocks**; one super-block per lane would leave 28 of 32 lanes idle.
 `mm_row_q2k` therefore strides over 16-weight sub-blocks (`u = lane, lane + 32, …`, 64 per 1024-wide row),
 computing `blk = wq + (row·nsb + u/16)·84` and `j = u % 16` for each. For the MoE kernels, `block_dot<2>`
 keeps the 32-weight block interface (`moe_up`/`moe_down` are templates on it) and dequantizes sub-blocks `2b`
-and `2b+1`. The `ws` scale buffer argument is unused — `MetalBackend.scaleOff` binds offset 0 for Q2_K tensors
-because there is no scale region to point at, and `MetalBackend.byType` picks the `_q2k` pipeline from the
-tensor's type (the Mamba backend reuses both).
+and `2b+1`. The `ws` scale buffer argument is unused — `MetalKernels.scaleOff` binds offset 0 for Q2_K tensors
+because there is no scale region to point at, and `MetalKernels.kernel(base, type, suffix)` picks the `_q2k`
+pipeline from the tensor's type (the Mamba backend issues its matmuls through the same `MetalKernels`).
 
 ---
 
@@ -350,7 +364,8 @@ byteSize       = align(scalesOffset, 16384)
 
 **Partial super-blocks.** Every linear layer of Qwen3-0.6B (cols 1024, 2048, 3072) and Qwen3-30B-A3B
 (2048, 4096, 768) is a multiple of 256, and such rows are laid out exactly as llama.cpp would (llama.cpp
-refuses other shapes). jllm additionally accepts any `cols` that is a multiple of 32: the last super-block of a
+refuses other shapes). jllm additionally accepts any `cols` that is a multiple of 32 (`QTensor.quantize`'s only
+requirement for every format): the last super-block of a
 row then holds only `(cols mod 256) / 16` sub-blocks and the rest of its 84 bytes are zero. The SIMD and GPU
 loops only touch whole super-blocks (or, on the GPU, only sub-blocks below `cols/16`); the tail goes through
 the scalar helpers. This is what lets the 64-wide tiny MoE test model run with `--quant q2k` (at 10.5
@@ -365,7 +380,10 @@ bits/weight — a test, not a use case).
 
 For the 0.6B the Q8_0 embedding is now the largest tensor (55 % of the file), so the overall saving is only
 29 %. For the 30B MoE the experts are 97 % of the weights and the file nearly halves; at 10.5 GB the model
-fits comfortably next to a 4096-token KV cache in 16 GB of unified memory.
+fits comfortably next to a 4096-token KV cache in 16 GB of unified memory. The file is `jllm-q2_k.bin` /
+`jllm-q2_k.json`, with the same layout version, checkpoint identity and automatic reconversion as the other formats
+([06 §6.7](06-quantization.md#67-quantizing-when-and-how)); switching `--quant` converts a second cache next to
+the first instead of replacing it.
 
 ---
 
@@ -395,7 +413,11 @@ conversion      11 s on 10 cores (Q4_0: ~2 s — the make_qkx2 search is ~20 pas
 
 ### Speed
 
-`jllm bench` (413-token prefill, 128-token decode, 3 rounds). **Caveat:** these were measured while two
+`jllm bench` (413-token prefill, 128-token decode, 3 rounds). **Caveat 1:** this table is from the first
+Q2_K implementation and was **not repeated** after the Metal kernels were fused and tiled and the CPU gained int8
+activations, both of which sped up Q4_0 and (for Metal) Q2_K but left the CPU Q2_K path on float activations; the
+current Q4_0 figures on a quiet machine are Metal ~533 tok/s prefill / ~111 tok/s decode and CPU (int8) ~275 /
+~51 ([11 §11.1](11-performance.md#111-measured)). **Caveat 2:** these were measured while two
 unrelated conversions kept the machine at a load average of 67–143 on 10 cores, so absolute numbers are 2–10×
 below the quiet-machine figures in [11](11-performance.md) and swing by 2× between rounds; `q4` and `q2k`
 were interleaved so they saw the same conditions, and ranges over all rounds are given.
@@ -409,9 +431,11 @@ were interleaved so they saw the same conditions, and ranges over all rounds are
 
 Reading fewer bytes did not buy speed on this model, and that is expected from [11](11-performance.md):
 
-- On Metal the 0.6B decode is bound by the ≈ 340 kernel dispatches per token (12 per layer), not by the
-  450 MB of weights (which at 200 GB/s would take 2.3 ms, i.e. > 400 tok/s); on a quiet machine Q4_0 reaches
-  75 tok/s = 17 % of the bandwidth roof. Shrinking the weights to 321 MB cannot help a
+- On Metal the 0.6B decode was bound by the ≈ 340 kernel dispatches per token (12 per layer) of that first
+  kernel version, not by the 450 MB of weights (which at 200 GB/s would take 2.3 ms, i.e. > 400 tok/s); on a
+  quiet machine Q4_0 reached 75 tok/s = 17 % of the bandwidth roof. (Fusing the norms and projections has since
+  cut a decode step to 170 dispatches, [08 §8.4](08-metal-backend.md#84-recording-a-forward-pass-metalbackendforward),
+  and Q4_0 to ~111 tok/s = 25 % of the roof.) Shrinking the weights to 321 MB cannot help a
   latency-bound loop; the Q2_K kernel also does a little more per lane (scale byte, `d`/`dmin`, shift and
   mask) and runs 2 sub-blocks per lane where `matmul_q4` runs 1 block. Where bandwidth *is* the limit — the
   30B MoE's 10–19 GB of expert weights — the byte count is what matters and Q2_K's 47 % should translate
@@ -419,9 +443,11 @@ Reading fewer bytes did not buy speed on this model, and that is expected from [
 - On the CPU the kernel is conversion-bound ([07 §7.9](07-cpu-backend.md#79-measured-numbers-and-the-bottleneck)):
   each weight still costs one byte→float `castShape` and one FMA regardless of its bit width, and Q2_K adds the
   four shift-and-mask steps per 32 bytes and the `Σx` accumulation. Fewer bytes to load, same amount of
-  arithmetic — slightly slower. The int8-activation path in [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)
-  is where 2-bit codes would pay off on the CPU, because the min term then folds into precomputed block sums
-  and the codes feed integer dot products directly.
+  arithmetic — slightly slower. Since this was measured, Q4_0 decode on the CPU has moved to the int8-activation
+  path ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels), ~4× faster), which
+  Q2_K does not use, so the CPU gap between Q2_K and Q4_0 is now wider than the ≈ 30 % above. Giving Q2_K an
+  integer kernel — the min term folds into precomputed block sums and the codes feed integer dot products
+  directly — is where 2-bit codes would pay off on the CPU.
 
 ### Quality — the honest part
 
@@ -444,7 +470,7 @@ greedy, pure Q2_K on every linear layer (embedding/LM head Q8_0 as always):
 ```
 
 Not "degraded" — destroyed. To quantify it, teacher-forced perplexity on a 97-token English paragraph
-(`PplProbe`, one forward per token):
+(a throw-away probe that ran one forward per token; it is not part of the tree):
 
 | weights | perplexity | top-1 agreement with Q8_0 |
 |---|---|---|
@@ -477,10 +503,12 @@ The damage multiplies across groups, `down_proj` and the first layers are by far
 barely notice 2 bits. This is precisely why llama.cpp's "Q2_K" *model preset* is not pure Q2_K: it keeps
 `attn_v` at Q4_K, `ffn_down` of the early layers at Q4_K/Q3_K, `output` at Q6_K, and strongly recommends an
 importance matrix (calibration data that re-weights the `make_qkx2` search per column). Qwen3-0.6B is also the
-worst case for 2 bits — 1024-wide dot products, no redundancy. The format in this project is the pure one; a
-mixed recipe (`down_proj` and the first layers at Q4_0, the rest Q2_K) would be a 10-line change in
-`ModelConverter` and is the obvious next step before using `q2k` on the 30B MoE, where the experts (97 % of
-the bytes) are the ones to shrink and the attention/down projections can stay Q4_0 at little cost.
+worst case for 2 bits — 1024-wide dot products, no redundancy. The format in this project is the pure one, applied to every linear layer by the converter's single
+`--quant`; a mixed recipe (`down_proj` and the first layers at Q4_0, the rest Q2_K) does not exist. It would be
+a change in `ModelConverter`, whose per-tensor rules already take the format as a parameter (the embedding rule
+is hard-wired to Q8_0 that way), and is the obvious next step before using `q2k` on the 30B MoE, where the
+experts (97 % of the bytes) are the ones to shrink and the attention/down projections can stay Q4_0 at little
+cost.
 
 ---
 
@@ -516,8 +544,9 @@ different unpacking in the kernels.
 | per-type block arithmetic, `quantize`/`dequantizeRow` dispatch | `model/QTensor.java` |
 | SIMD `dot` and `dequant` | `cpu/Q2KKernels.java` (called from `VectorKernels.dotRow`/`dequantRow`) |
 | `q2k_sub_block`, `mm_row_q2k` (hooked from `mm_row` for `QT == 2`), `block_dot<2>`, the `_q2k`/`_q2k_norm` instantiations of `matmul`, `matmul3`, `matmul_swiglu`, `moe_up`, `moe_down` | `metal/kernels.metal`, section `Q2_K` at the end |
-| pipeline selection by `QTensor.type` (`byType`), scale binding (`scaleOff`) | `metal/MetalBackend.java`, `metal/MambaMetalBackend.java` (the MLA and shared-expert paths call `MetalBackend.matmul`/`swiglu`) |
-| `jllm-q2_k.bin` / `.json` (type name per tensor; embeddings stay `Q8_0`) | `model/QuantFile.java`, `model/ModelConverter.java` (unchanged) |
+| pipeline selection by `QTensor.type` (`MetalKernels.kernel`), scale binding (`MetalKernels.scaleOff`) | `metal/MetalKernels.java`, used by `metal/MetalBackend.java` and `metal/MambaMetalBackend.java` (the MLA and shared-expert paths call the same matmul/swiglu writers) |
+| CPU dispatch: Q2_K rows stay on the float kernels (`CpuMatmul.useInt8` is Q4_0 / Q8_0 only) | `cpu/CpuMatmul.java`, `cpu/VectorKernels.java` (`dotRow`, `dequantRow`) |
+| `jllm-q2_k.bin` / `.json` (type name per tensor; embeddings stay `Q8_0`) | `model/QuantFile.java`, `model/ModelConverter.java`, `model/ModelWeights.java` (no Q2_K-specific code) |
 | round trip, error bound, SIMD vs scalar | `src/test/java/org/robomiri/jllm/Q2KCheck.java` (from `SmokeTest`) |
 
 ---
