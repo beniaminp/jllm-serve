@@ -1,7 +1,8 @@
 # 12. Mixture of Experts (Qwen3-30B-A3B)
 
-Code: `model/ModelConverter.convertMoe`, `cpu/CpuBackend.moe/route`, `kernels.metal` (`router`, `moe_up`,
-`moe_down`), `metal/MetalBackend.moe`
+Code: `model/Mlp.Moe` + `model/Router` (the typed spec, built by `model/Families`), `model/MlpWeights.Moe`,
+`model/ModelConverter.moeRules`, `cpu/CpuBackend.MoeFfn` (`moeToken`, `moeBatched`, `expertMatmul`, `routeSoftmax`),
+`metal/MetalBackend.MoeStep`, `kernels.metal` section 5 (`router`, `moe_up`, `moe_down`)
 
 ## 12.1 The idea
 
@@ -31,7 +32,7 @@ Qwen3-30B-A3B-Thinking-2507 in numbers:
 | `num_experts` / `num_experts_per_tok` / `moe_intermediate_size` | 128 / 8 / 768 |
 | parameters: experts | 48 × 128 × 3 × (768 × 2048) ≈ 29.0 B |
 | parameters: attention + router + embeddings | ≈ 1.5 B |
-| Q4_0 cache file | ≈ 19 GB (experts) + 0.7 GB (two Q8 embedding-sized matrices: `tie_word_embeddings` is false) |
+| Q4_0 cache file | 19.4 GB measured: ≈ 18 GB of experts, the rest attention + two Q8_0 embedding-sized matrices (`tie_word_embeddings` is false) |
 | weights read per generated token | ≈ 2 GB (8 of 128 experts per layer + attention + LM head) |
 
 ## 12.2 The router, precisely
@@ -45,11 +46,15 @@ top      = indices of the 8 largest p_e
 w_e      = p_e / Σ_{e' ∈ top} p_e'             only if norm_topk_prob = true (it is): the 8 weights sum to 1
 ```
 
-`CpuBackend.route()` and the `router` Metal kernel implement this; both follow transformers'
-`Qwen3MoeSparseMoeBlock` to the letter (softmax *before* top-k, then renormalize). The router is tiny (1 MB per
-layer) and is kept in float32, unquantized: a wrong expert choice costs more than a slightly wrong matmul.
+`CpuBackend.MoeFfn.routeSoftmax` and the `router` Metal kernel implement this (`Router.Softmax`, with
+`Mlp.Moe.normTopK` as the `norm_topk_prob` flag); both follow transformers' `Qwen3MoeSparseMoeBlock` to the letter
+(softmax *before* top-k, then renormalize). The router is tiny (1 MB per layer) and is stored in the cache as the f32
+tensor `mlp.router`, unquantized: a wrong expert choice costs more than a slightly wrong matmul. DeepSeek-V2/V3
+models use the other `Router` variant, `Router.DeepSeek` (sigmoid or softmax scores, group-limited selection, a
+correction bias, a scaling factor): see [14.11.4](14-model-families.md#14114-the-three-routing-rules). It plugs into
+the same stacked experts, the same `moe_up` / `moe_down` kernels and the same prefill grouping described below.
 
-Each expert is an ordinary SwiGLU FFN ([05 §3](05-transformer-math.md#3-feed-forward-network-with-swiglu)) with
+Each expert is an ordinary SwiGLU FFN ([05 §5.8](05-transformer-math.md#58-steps-68--the-feed-forward-network-swiglu)) with
 `moe_intermediate_size = 768`:
 
 ```
@@ -76,18 +81,25 @@ repo, transformers ≤ 4.53) and fused 3-D tensors `mlp.experts.gate_up_proj [E,
 `mlp.experts.down_proj [E, dim, m]` + router `mlp.router.weight` (newer checkpoints). A `[E, 2m, dim]` tensor is
 already the stacked matrix in memory, so the converter merely re-labels its shape (`flatten`).
 
-Dense-MLP exceptions (`mlp_only_layers`, `decoder_sparse_step`) are honoured per layer via
-a layer's `Mlp` being `Mlp.Moe`; Qwen3-30B has none.
+Which layers are MoE is decided once, when `Families` builds the `LayerSpec` list: a layer is `Mlp.Moe` if the
+config has `num_experts` > 0, the layer is not listed in `mlp_only_layers` and `(l + 1) % decoder_sparse_step == 0`,
+otherwise it is an `Mlp.Dense`; the converter and both backends just switch on the variant. Qwen3-30B has no dense
+layers (DeepSeek's rule, `first_k_dense_replace` and `moe_layer_freq`, is in [14.11.3](14-model-families.md#14113-mixture-of-experts-dense-prefix-routed--shared-experts)).
+The cache tensors of a layer are `mlp.router` (f32), `mlp.experts.gate_up` and `mlp.experts.down`
+(`MlpWeights.Moe`; `mlp.shared.*` and `mlp.router_bias` exist only for DeepSeek).
 
 ## 12.4 CPU implementation
 
-Per token (`CpuBackend.moe`):
+Decode and prefill take different paths (`MoeFfn.run`).
 
-1. `route()` — 128 dot products with the SIMD `dot`, softmax, 8 passes of argmax (128 entries: a sort would be
-   slower), renormalize.
+**One token** (decode, `moeToken`):
+
+1. route: 128 dot products with the SIMD `dot` (parallel over experts), softmax, 8 passes of argmax (128 entries: a
+   sort would be slower), renormalize.
 2. **gate/up for all 8 experts in one parallel loop** over `8 × 1536` output rows: index `i` → expert slot
    `k = i / 1536`, row `r = i % 1536`, weight row `assign[k]·1536 + r`. Threads stream quantized rows through
-   `dotRow` exactly as in the dense matmul.
+   `dotRow` exactly as in the dense matmul, or through the int8 `Int8Kernels.dotRow` when
+   `backend.cpu.int8-activations` is on ([07](07-cpu-backend.md)).
 3. SwiGLU per slot: `h[k][i] = silu(g[k][i]) · u[k][i]`.
 4. **down for all 8 experts in one parallel loop** over the 2048 output rows: each row sums
    `w_k · dotRow(down, assign[k]·2048 + r, h[k])` over the 8 slots and adds the result to `x[t][r]`. Looping
@@ -95,32 +107,51 @@ Per token (`CpuBackend.moe`):
 
 Two `forRange` calls per token per layer instead of 16 keeps thread-pool overhead low.
 
+**Many tokens** (prefill, `moeBatched`): doing the above per token would stream every selected expert's weights once
+per token. Instead the whole chunk is grouped by expert:
+
+1. route every token, one token per thread (the router logits are then computed serially inside the thread);
+2. a counting sort turns the `ntok × 8` (token, expert) slots into per-expert lists (`expertStart`, `slotOrder`) and
+   collects the experts that were hit at all (`usedExperts`);
+3. `expertMatmul` for gate/up: parallel over (expert, group of 4 rows) pairs; the four rows are dequantized once and
+   multiplied with the inputs of *all* slots routed to that expert, four slots at a time (`dot4x4`), so a weight row
+   is read once per chunk instead of once per token;
+4. SwiGLU per slot, then `expertMatmul` for down (input = that slot's hidden vector);
+5. `VectorKernels.combine` adds `Σ_k w_k · y_k` to `x[t]` per token in slot order: one writer per element again.
+
+This is the "expert-parallel batching" that the first version of this chapter listed as future work. With
+`-Djllm.cpu.deterministic=true` prefill goes token by token through the single-token path, for bit-reproducible
+output.
+
 ## 12.5 Metal implementation
 
-Four dispatches per MoE layer (versus three for a dense layer), all recorded into the same command buffer:
+Three dispatches per MoE layer after the pre-FFN RMSNorm, all recorded into the same command buffer:
 
 | kernel | grid | what each threadgroup does |
 |---|---|---|
-| `router` | `ntok` groups × 128 threads | thread `e` computes logit `e`; thread 0 does softmax + top-8 in threadgroup memory, writes `assign[t·8+k]`, `rw[t·8+k]` |
-| `moe_up_q4` | `(1536/4, ntok·8)` | one simdgroup per output row of slot `s`: expert `assign[s]`, token `s/8`; writes `gateUp[s]` |
-| `silu_mul` | `ntok·8·768` threads | SwiGLU per slot |
-| `moe_down_q4` | `(2048/4, ntok)` | one simdgroup per `(token, row)`: loops over the 8 slots, `x[t][row] += Σ rw·dot` — single writer |
+| `router` (`router_ds` for DeepSeek) | `ntok` groups × 256 threads | the 8 simdgroups compute the logits (simdgroup `sg` takes experts `sg, sg+8, …`; its 32 lanes read the router row in coalesced `float4` steps and `simd_sum`); softmax max and sum are threadgroup reductions; thread 0 does the top-8 and writes `assign[t·8+k]`, `rw[t·8+k]` (at most 1024 experts) |
+| `moe_up_q4` / `_q8` / `_q2k` | `(ceil(768/4), ntok·8)` | one simdgroup per output row of slot `s`: expert `assign[s]`, token `s/8`. It computes the gate row `row` **and** the up row `row + 768` of that expert and applies `silu(g)·u` in the epilogue, writing `h[s]` directly |
+| `moe_down_q4` / `_q8` / `_q2k` | `(ceil(2048/4), ntok)` | one simdgroup per `(token, row)`: loops over the 8 slots, `x[t][row] += Σ rw·dot` — single writer |
 
-`moe_up`/`moe_down` reuse `block_dot<QT>`, the same 32-weight block kernel the dense `matmul_q4` uses; the
-only difference is the *global row* `assign[s] × rowsPerExpert + row` used to address the stacked tensor.
-`Q4_0` and `Q8_0` variants are explicit template instantiations (`template [[host_name("moe_up_q4")]] …`).
+Fusing the SwiGLU into `moe_up` removed the separate `silu_mul` pass and the gate/up scratch buffer; each of the two
+dot products is accumulated in the same order as before, so the results did not change.
 
-The stacked expert tensors are bound as single buffers (252 MB and 126 MB per layer), wrapped zero-copy from
+`moe_up`/`moe_down` reuse `block_dot<QT>`, the same block kernel the dense `matmul` uses; the only difference is the
+*global row* `assign[s] × rowsPerExpert + row` used to address the stacked tensor. The `Q4_0`, `Q8_0` and `Q2_K`
+variants are explicit template instantiations (`template [[host_name("moe_up_q4")]] …`).
+
+The stacked expert tensors are bound as single buffers (252 MB and 126 MB per layer at Q4_0), wrapped zero-copy from
 the memory-mapped cache file. Metal's `recommendedMaxWorkingSetSize` is checked at start-up and a warning is
-printed when the weights exceed it.
+printed when the weights exceed it. DeepSeek's shared experts (always-on, one dense SwiGLU) run after `moe_down`
+through the ordinary fused SwiGLU and down matmul.
 
 ## 12.6 Memory and disk on a 32 GB laptop
 
 | | |
 |---|---|
 | Download | 61 GB of bf16 shards, 16 files |
-| Disk needed during conversion with `--low-disk` | ≈ 2 shards (8 GB) + growing cache (19.7 GB) ≈ 28 GB |
-| RAM at run time | 19.7 GB weights (mmap'd, paged in on first touch) + KV cache (48 layers × ctx × 512 × 8 B: 0.4 GB at `--ctx 2048`) + ~0.5 GB activations/JVM |
+| Disk needed during conversion with `--low-disk` | ≈ 2 shards (8 GB) + growing cache (19.4 GB) ≈ 28 GB |
+| RAM at run time | 19.4 GB weights (mmap'd, paged in on first touch) + KV cache (48 layers × ctx × 512 × 8 B: 0.4 GB at `--ctx 2048`) + ~0.5 GB activations/JVM |
 
 ```sh
 ./jllm run --model Qwen/Qwen3-30B-A3B-Thinking-2507 --low-disk --ctx 2048 --prompt "..."
@@ -149,7 +180,22 @@ and thinking mode produces coherent step-by-step reasoning.
 ## 12.8 Why decode is fast and prefill is not
 
 Decode reads ~2 GB of weights per token (8 active experts), so the bandwidth ceiling is ~10× lower than for the
-0.6B model but the same as a dense 3B model. Prefill, however, cannot share weights between tokens the way a
-dense matmul does: 64 tokens in a batch typically touch *all* 128 experts, so the whole 19 GB is streamed per
-chunk, and the `moe_up` kernel processes one token per simdgroup with no reuse. Grouping tokens by expert
-("expert-parallel batching") is the standard fix and the natural next optimization.
+0.6B model but the same as a dense 3B model. Prefill cannot share weights between tokens the way a dense matmul
+does: 64 tokens in a batch typically touch *all* 128 experts, so the whole 19 GB is streamed per chunk.
+
+The CPU path fixes the reuse side of this by grouping tokens by expert (section 12.4): a weight row is dequantized once
+per chunk and used for every token routed to that expert. The Metal `moe_up` / `moe_down` kernels still process one
+(token, expert) slot per simdgroup and re-read the expert's rows for every slot, relying on the GPU caches, so
+Metal prefill is only about twice its decode speed (49 vs 25 tok/s in 12.7), where a dense model gains far more.
+Grouping slots by expert on the GPU is the natural next optimization.
+
+The same code serves DeepSeek-V2/V3 ([14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)):
+only the router (`Router.DeepSeek`) and the extra shared-expert matmul differ.
+
+## 12.9 Testing
+
+`ConverterTest` converts a tiny random `Qwen3MoeForCausalLM` checkpoint (both the per-expert and the fused 3-D expert
+layouts are accepted) and checks the stacked tensors; the DeepSeek tiny models of `scripts/arch-smoke.sh` (8 routed
+experts, shared experts, three routing rules; [14.11.8](14-model-families.md#14118-testing)) run the MoE kernels and the
+router on CPU and Metal and require identical tokens and logits within 1e-3, and `DeepSeekRef` compares them with an
+independent float64 reference. The Qwen3-30B numbers above come from the real model.
