@@ -125,24 +125,43 @@ public final class SafeTensors implements AutoCloseable {
         this.metadata = metadata;
     }
 
+    /** True for a plain {@code .safetensors} file name: no directory components, no {@code ..}, not blank. */
+    public static boolean isShardName(String s) {
+        return s != null && !s.isBlank() && !s.contains("/") && !s.contains("\\") && !s.contains("..")
+                && s.indexOf('\0') < 0 && s.endsWith(".safetensors");
+    }
+
+    /**
+     * Reads the {@code weight_map} of a {@code model.safetensors.index.json}: tensor name -> shard file name.
+     * The index is downloaded data, so every shard name must satisfy {@link #isShardName}.
+     */
+    public static Map<String, String> readWeightMap(Path index) throws IOException {
+        Map<String, Object> weightMap;
+        try {
+            weightMap = Json.map(Json.parse(Files.readString(index)), "weight_map");
+        } catch (RuntimeException e) {
+            throw new IOException(index + ": " + e.getMessage(), e);
+        }
+        if (weightMap == null) {
+            throw new IOException(index + " has no weight_map");
+        }
+        Map<String, String> m = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : weightMap.entrySet()) {
+            if (!(e.getValue() instanceof String s) || !isShardName(s)) {
+                throw new IOException(index + ": invalid shard file name " + e.getValue() + " for " + e.getKey());
+            }
+            m.put(e.getKey(), s);
+        }
+        return m;
+    }
+
     /** Opens a single {@code .safetensors} file or a model directory (single file, sharded index or all files). */
     public static SafeTensors open(Path path) throws IOException {
         List<Path> files;
         if (Files.isDirectory(path)) {
             Path index = path.resolve("model.safetensors.index.json");
             if (Files.isRegularFile(index)) {
-                Map<String, Object> weightMap = Json.map(Json.parse(Files.readString(index)), "weight_map");
-                if (weightMap == null) {
-                    throw new IOException(index + " has no weight_map");
-                }
-                TreeSet<String> shards = new TreeSet<>();
-                for (Object v : weightMap.values()) {
-                    if (!(v instanceof String s) || s.isBlank() || s.contains("/") || s.contains("\\") || s.contains("..")) {
-                        throw new IOException(index + ": invalid shard file name " + v);
-                    }
-                    shards.add(s);
-                }
-                files = shards.stream().map(path::resolve).toList();
+                files = new TreeSet<>(readWeightMap(index).values()).stream().map(path::resolve).toList();
             } else {
                 try (Stream<Path> s = Files.list(path)) {
                     files = s.filter(p -> p.getFileName().toString().endsWith(".safetensors")).sorted().toList();

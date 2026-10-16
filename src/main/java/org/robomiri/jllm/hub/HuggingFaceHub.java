@@ -1,6 +1,7 @@
 package org.robomiri.jllm.hub;
 
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.safetensors.SafeTensors;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,6 +25,7 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -132,14 +134,27 @@ public final class HuggingFaceHub {
         }
     }
 
-    /** True for the files an inference engine needs: configs, tokenizer and safetensors weights. */
-    public static boolean isInferenceFile(String name) {
+    /** True for the small files every model needs: configs, tokenizer and the shard index. */
+    public static boolean isMetadataFile(String name) {
         return name.equals("config.json")
                 || name.equals("generation_config.json")
                 || name.equals("tokenizer.json")
                 || name.equals("tokenizer_config.json")
-                || name.equals("model.safetensors.index.json")
-                || name.endsWith(".safetensors");
+                || name.equals("model.safetensors.index.json");
+    }
+
+    /**
+     * The weight shards the checkpoint in {@code dir} consists of: exactly the files named by its
+     * {@code model.safetensors.index.json} when there is one, otherwise {@code model.safetensors}. Other
+     * {@code .safetensors} files of a repository (consolidated or duplicate checkpoints, adapters) are not part
+     * of it and are never downloaded; the converter reads the same set.
+     */
+    public static List<String> weightFileNames(Path dir) throws IOException {
+        Path index = dir.resolve("model.safetensors.index.json");
+        if (Files.isRegularFile(index)) {
+            return List.copyOf(new TreeSet<>(SafeTensors.readWeightMap(index).values()));
+        }
+        return List.of("model.safetensors");
     }
 
     private final Map<String, List<RepoFile>> listings = new HashMap<>();
@@ -193,19 +208,29 @@ public final class HuggingFaceHub {
     }
 
     /**
-     * Downloads all inference files of {@code repo} into {@code dir}, skipping files that are already complete.
+     * Downloads the inference files of {@code repo} into {@code dir}, skipping files that are already complete:
+     * the metadata files first, then exactly the weight shards {@link #weightFileNames} derives from them. The
+     * free-space check covers that same set of shards.
      *
      * @return {@code dir}
      */
     public Path download(String repo, String revision, Path dir) throws IOException, InterruptedException {
-        Files.createDirectories(dir);
-        List<RepoFile> files = listFiles(repo, revision).stream().filter(f -> isInferenceFile(f.name())).toList();
-        if (files.stream().noneMatch(f -> f.name().endsWith(".safetensors"))) {
-            throw new IOException(repo + " has no .safetensors weights");
+        downloadMetadata(repo, revision, dir);
+        Map<String, RepoFile> byName = new HashMap<>();
+        for (RepoFile f : listFiles(repo, revision)) {
+            byName.put(f.name(), f);
         }
+        List<RepoFile> weights = new ArrayList<>();
         long total = 0;
-        for (RepoFile f : files) {
-            Path t = dir.resolve(f.name());
+        for (String name : weightFileNames(dir)) {
+            RepoFile f = byName.get(name);
+            if (f == null) {
+                throw new IOException(repo + " has no " + name + (Files.isRegularFile(dir.resolve("model.safetensors.index.json"))
+                        ? " although model.safetensors.index.json lists it" : " (and no model.safetensors.index.json): "
+                        + "only safetensors checkpoints are supported"));
+            }
+            weights.add(f);
+            Path t = dir.resolve(name);
             if (!(Files.isRegularFile(t) && Files.size(t) == f.size())) {
                 total += Math.max(0, f.size());
             }
@@ -216,18 +241,18 @@ public final class HuggingFaceHub {
                     + "use 'run/serve ... --low-disk' to download, quantize and delete shards one at a time",
                     total / 1e9, repo, free / 1e9));
         }
-        System.err.printf("Downloading %s@%s (%d files, %.1f MB) into %s%n", repo, revision, files.size(), total / 1e6, dir);
-        for (RepoFile f : files) {
+        System.err.printf("Downloading %s@%s (%d shards, %.1f MB) into %s%n", repo, revision, weights.size(), total / 1e6, dir);
+        for (RepoFile f : weights) {
             downloadFile(repo, revision, f, dir);
         }
         return dir;
     }
 
-    /** Downloads the small config/tokenizer files only (shards are fetched on demand by {@link #ensure}). */
+    /** Downloads the small config/tokenizer/index files only (shards are fetched on demand by {@link #ensure}). */
     public Path downloadMetadata(String repo, String revision, Path dir) throws IOException, InterruptedException {
         Files.createDirectories(dir);
         for (RepoFile f : listFiles(repo, revision)) {
-            if (isInferenceFile(f.name()) && !f.name().endsWith(".safetensors")) {
+            if (isMetadataFile(f.name())) {
                 downloadFile(repo, revision, f, dir);
             }
         }

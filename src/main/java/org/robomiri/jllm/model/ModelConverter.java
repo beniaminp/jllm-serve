@@ -13,7 +13,6 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Stream;
 
 /**
  * Converts a Hugging Face checkpoint into a {@link QuantFile}, one unit (embedding, layer, final norm + head)
@@ -546,39 +545,27 @@ public final class ModelConverter {
         }
     }
 
-    /** tensor name -> shard file name, from the index file or by opening the single safetensors file. */
+    /**
+     * tensor name -> shard file name: the {@code weight_map} of {@code model.safetensors.index.json} when there
+     * is one, otherwise the contents of {@code model.safetensors} (the same set {@code HuggingFaceHub.download}
+     * fetches; other {@code .safetensors} files in the directory are not part of the checkpoint).
+     */
     private Map<String, String> shardMap() throws IOException {
         Path index = dir.resolve("model.safetensors.index.json");
         if (Files.isRegularFile(index)) {
-            Map<String, Object> wm = org.robomiri.jllm.json.Json.map(
-                    org.robomiri.jllm.json.Json.parse(Files.readString(index)), "weight_map");
-            if (wm == null) {
-                throw new IOException(index + " has no weight_map");
-            }
             // The index is downloaded data: every shard name is validated before it reaches the provider,
             // whose low-disk implementation deletes dir/name.
             Map<String, String> m = new LinkedHashMap<>();
-            for (Map.Entry<String, Object> e : wm.entrySet()) {
-                if (!(e.getValue() instanceof String shard)) {
-                    throw new IOException(index + ": weight_map entry for " + e.getKey() + " is not a file name");
-                }
-                m.put(e.getKey(), ShardProvider.checkName(dir, shard));
+            for (Map.Entry<String, String> e : SafeTensors.readWeightMap(index).entrySet()) {
+                m.put(e.getKey(), ShardProvider.checkName(dir, e.getValue()));
             }
             return canonical(m);
         }
-        List<Path> files;
-        try (Stream<Path> s = Files.list(dir)) {
-            files = s.filter(f -> f.getFileName().toString().endsWith(".safetensors")).sorted().toList();
-        }
-        if (files.isEmpty()) {
-            files = List.of(provider.ensure("model.safetensors"));
-        }
+        Path single = provider.ensure("model.safetensors");
         Map<String, String> m = new LinkedHashMap<>();
-        for (Path f : files) {
-            try (SafeTensors st = SafeTensors.open(f)) {
-                for (String name : st.tensors().keySet()) {
-                    m.put(name, f.getFileName().toString());
-                }
+        try (SafeTensors st = SafeTensors.open(single)) {
+            for (String name : st.tensors().keySet()) {
+                m.put(name, single.getFileName().toString());
             }
         }
         return canonical(m);
