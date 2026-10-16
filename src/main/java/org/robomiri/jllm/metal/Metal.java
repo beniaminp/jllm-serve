@@ -36,6 +36,7 @@ public final class Metal implements AutoCloseable {
     private final MethodHandle destroy;
     private final MethodHandle deviceName;
     private final MethodHandle workingSet;
+    private final MethodHandle maxTgMem;
     private final MethodHandle pipeline;
     private final MethodHandle pipelineMaxThreads;
     private final MethodHandle bufferNew;
@@ -58,7 +59,8 @@ public final class Metal implements AutoCloseable {
         destroy = handle(l, "jm_destroy", FunctionDescriptor.ofVoid(ADDRESS));
         deviceName = handle(l, "jm_device_name", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
         workingSet = handle(l, "jm_recommended_working_set", FunctionDescriptor.of(JAVA_LONG, ADDRESS));
-        pipeline = handle(l, "jm_pipeline", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
+        maxTgMem = handle(l, "jm_device_max_tg_mem", FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+        pipeline =handle(l, "jm_pipeline", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
         pipelineMaxThreads = handle(l, "jm_pipeline_max_threads", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
         bufferNew = handle(l, "jm_buffer_new", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT));
         bufferWrap = handle(l, "jm_buffer_wrap", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_LONG));
@@ -165,6 +167,15 @@ public final class Metal implements AutoCloseable {
     public long recommendedWorkingSet() {
         try {
             return (long) workingSet.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** Threadgroup memory limit in bytes (static arrays and the dynamic [[threadgroup(0)]] argument combined). */
+    public long maxThreadgroupMemory() {
+        try {
+            return (long) maxTgMem.invokeExact(ctx);
         } catch (Throwable t) {
             throw rethrow(t);
         }

@@ -77,6 +77,13 @@ uint64_t jm_recommended_working_set(void *ctx) {
     return c.device.recommendedMaxWorkingSetSize;
 }
 
+// Bytes of threadgroup memory one threadgroup may use (static arrays plus the dynamic [[threadgroup(0)]]
+// argument together); 32 KB on every Apple GPU so far.
+uint64_t jm_device_max_tg_mem(void *ctx) {
+    JMContext *c = (__bridge JMContext *) ctx;
+    return c.device.maxThreadgroupMemoryLength;
+}
+
 // Returns a pipeline index, or -1 with a message in err.
 int jm_pipeline(void *ctx, const char *name, char *err, int errlen) {
     @autoreleasepool {

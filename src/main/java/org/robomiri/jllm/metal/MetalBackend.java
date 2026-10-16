@@ -70,6 +70,12 @@ public final class MetalBackend implements Backend {
     // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
     // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
+    /**
+     * Whether the *_norm matmul variants may be used: they keep the normalised input row (dim floats) in dynamic
+     * threadgroup memory next to their 32-byte reduction scratch, which must fit the device's threadgroup memory
+     * limit (32 KB: dim <= 8176). Otherwise a decode step runs rmsnorm + plain matmul like a prefill chunk.
+     */
+    private boolean fusedNormFits;
     private int pKvStoreHalf;
     private Metal.Buffer kStage;
     private Metal.Buffer vStage;
@@ -223,6 +229,7 @@ public final class MetalBackend implements Backend {
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
+        fusedNormFits = (long) c.dim() * 4 + NORM_STATIC_TG_BYTES <= metal.maxThreadgroupMemory();
 
         embedQ = metal.wrap(w.embed.data);
         lmHeadQ = w.lmHead == w.embed ? embedQ : metal.wrap(w.lmHead.data);
@@ -366,7 +373,7 @@ public final class MetalBackend implements Backend {
         try {
             // For a single token the rmsnorm preceding a projection is folded into the projection kernel
             // (the *_norm variants read x and normalise on the fly); otherwise it writes xb first.
-            boolean fuseNorm = n == 1;
+            boolean fuseNorm = n == 1 && fusedNormFits;
             for (int l = 0; l < c.layers(); l++) {
                 LayerBufs L = layers[l];
                 ModelWeights.Layer W = w.layers[l];
@@ -458,6 +465,8 @@ public final class MetalBackend implements Backend {
     }
 
     private static final int SG_PER_TG = 4; // 128 threads = 4 rows per matmul threadgroup (kernels assume it)
+    /** Static threadgroup memory of the *_norm matmul kernels (their `threadgroup float buf[8]`). */
+    private static final int NORM_STATIC_TG_BYTES = 32;
 
     /**
      * out[t, row] (+)= W[row] . in[t]. With {@code norm != null} (single token only) the kernel first
