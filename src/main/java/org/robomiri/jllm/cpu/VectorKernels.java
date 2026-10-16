@@ -36,6 +36,9 @@ public final class VectorKernels {
         if (w.type == QType.Q2_K) {
             return Q2KKernels.dot(w, r, x, xo);
         }
+        if (w.type == QType.Q6_K) {
+            return Q6KKernels.dot(w, r, x, xo);
+        }
         int nb = w.blocksPerRow();
         if (FL < 4 || FL > 16) {
             return dotRowScalar(w, r, x, xo);
@@ -109,6 +112,10 @@ public final class VectorKernels {
     static void dequantRow(QTensor w, int r, float[] dst, int off) {
         if (w.type == QType.Q2_K) {
             Q2KKernels.dequant(w, r, dst, off);
+            return;
+        }
+        if (w.type == QType.Q6_K) {
+            Q6KKernels.dequant(w, r, dst, off);
             return;
         }
         if (FL < 4 || FL > 16) {

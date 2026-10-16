@@ -113,7 +113,7 @@ public final class Q2KKernels {
     }
 
     /** {@code dst[o .. o+16) = q * scale + negMin} for the 16 byte lanes of {@code q}. */
-    private static void store16(ByteVector q, float scale, float negMin, float[] dst, int o) {
+    static void store16(ByteVector q, float scale, float negMin, float[] dst, int o) {
         FloatVector s = FloatVector.broadcast(F, scale);
         FloatVector m = FloatVector.broadcast(F, negMin);
         for (int p = 0; p < 16 / FL; p++) {
@@ -122,7 +122,7 @@ public final class Q2KKernels {
     }
 
     /** sum(q[0..16) * x[xb .. xb+16)) as a float vector (lanes not yet reduced). */
-    private static FloatVector subDot(ByteVector q, float[] x, int xb) {
+    static FloatVector subDot(ByteVector q, float[] x, int xb) {
         if (FL == 16) {
             return ((FloatVector) q.castShape(F, 0)).mul(FloatVector.fromArray(F, x, xb));
         } else if (FL == 8) {
