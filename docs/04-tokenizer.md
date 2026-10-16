@@ -294,7 +294,12 @@ Mamba's whitespace tokens), `clean_up_tokenization_spaces`, and tool-calling par
 with `render(...)`, `renderTokens(tok, ...)` and `stopIds(tok)`. Pass the tokenizer when you can: `phi3` is the
 `model_type` of both Phi-3 (SentencePiece vocabulary, newline-delimited roles) and Phi-4-mini (byte-level, no
 newlines), and DeepSeek-R1-Distill reports `qwen2` or `llama` although its template is different; the tokenizer
-tells them apart. Message content is always encoded with special tokens disabled.
+tells them apart. Message content is always encoded with special tokens disabled: `encode(text, false)` and the
+content pieces of a template leave every token flagged `special` as plain text, but still match the *non-special*
+added tokens (`<think>`, `<tool_call>`, Gemma's `<unused0>`, Mamba's whitespace-run tokens) exactly as the
+reference does with `encode_special_tokens`. A format whose control markers are not flagged special lists them
+in `Format.protectedTokens()` (DeepSeek-R1's `<｜User｜>` / `<｜Assistant｜>`), and content cannot produce those
+either.
 
 | `model_type` | Prompt layout (generation prompt in bold) | Stop ids (tokens) |
 |---|---|---|

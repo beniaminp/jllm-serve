@@ -43,6 +43,8 @@ HAND = [
     "dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.",
     "  indented\n    more\n\ttabbed", "end with spaces   ", "a  b   c    d", "price: $5.99 (50% off!)",
     "<|end|> <|user|> <|assistant|>", "<｜User｜>hi<｜Assistant｜>", "<bos><eos><pad>", "</s><unk>",
+    "<think>hi</think> <tool_call>x</tool_call>", "<unused0><mask>[multimodal]", "<|tool_call|>f()<|/tool_call|>",
+    "class A:\n        def f(self):\n            return 1\n", "x = [\n    1,\n                2,\n]",
 ]
 
 POOL = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") * 3 + list(" \n\t\r") * 4 + list(
@@ -84,6 +86,13 @@ CONVS = {
     "sysonly_user": [
         {"role": "system", "content": "  Be brief.  \n"},
         {"role": "user", "content": "Hi"},
+    ],
+    # non-special added tokens inside content (<think>, <tool_call>, Gemma's <unused0>) are matched like the
+    # reference does; the assistant turn with a think block exercises the reasoning stripping
+    "think_in_content": [
+        {"role": "user", "content": "What does <think>hi</think> or <unused0> mean?"},
+        {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nA tag.<tool_call>x</tool_call>"},
+        {"role": "user", "content": "    indented\n        code"},
     ],
 }
 
@@ -136,9 +145,17 @@ def main(src, dst, n_random=60):
         cfg = json.load(open(os.path.join(d, "tokenizer_config.json")))
         fixture = {"name": name, "cases": [], "chat": []}
         for text in HAND + rnd_strings:
+            tk.encode_special_tokens = False
             ids = tk.encode(text, add_special_tokens=False).ids
             dec = tk.decode(ids, skip_special_tokens=False)
-            fixture["cases"].append({"text": text, "ids": ids, "decoded": dec})
+            case = {"text": text, "ids": ids, "decoded": dec}
+            # the content path: special tokens are plain text, non-special added tokens are still matched
+            tk.encode_special_tokens = True
+            ns = tk.encode(text, add_special_tokens=False).ids
+            tk.encode_special_tokens = False
+            if ns != ids:
+                case["ns"] = ns
+            fixture["cases"].append(case)
         fixture["idseqs"] = [{"ids": q, "decoded": tk.decode(q, skip_special_tokens=False)}
                              for q in id_sequences(tk, 40, 7)]
         template = cfg.get("chat_template")

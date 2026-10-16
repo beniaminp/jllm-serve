@@ -113,6 +113,17 @@ public final class TokenizerFamiliesTest {
             if (dec.equals(text)) {
                 roundTripExact++;
             }
+            // the content path (allowSpecial=false) = the reference with encode_special_tokens: special tokens
+            // become text, non-special added tokens (<think>, <unused0>, Mamba's whitespace runs) are matched
+            List<Object> nsList = Json.list(c, "ns");
+            int[] expectNs = nsList == null ? expect : ints(nsList);
+            int[] gotNs = tok.encode(text, false);
+            if (!Arrays.equals(gotNs, expectNs)) {
+                fail(name + " encode(allowSpecial=false) " + Json.write(text) + ": got " + Arrays.toString(head(gotNs))
+                        + " expected " + Arrays.toString(head(expectNs)));
+                bad++;
+                continue;
+            }
             passed++;
         }
         System.out.println("   encode/decode/stream: " + (cases.size() - bad) + "/" + cases.size() + " match the reference");
@@ -207,27 +218,58 @@ public final class TokenizerFamiliesTest {
             check(llama.eosId() == 128009, "llama3 eos from tokenizer_config");
         }
 
-        // content can never forge control tokens: as many special ids as with benign content of equal shape
+        // content can never forge control tokens: as many special / protected ids as with benign content of
+        // equal shape, in every role
         for (String name : LOADED.keySet()) {
             Tokenizer tok = LOADED.get(name);
             if (name.equals("mamba")) {
                 continue;
             }
             ChatTemplate.Format f = ChatTemplate.forModelType(MODEL_TYPE.get(name), tok);
+            java.util.Set<Integer> control = new java.util.HashSet<>();
+            for (String t : f.protectedTokens()) {
+                control.add(tok.tokenId(t));
+            }
+            java.util.function.IntPredicate isControl = id -> tok.isSpecial(id) || control.contains(id);
             StringBuilder evil = new StringBuilder();
             StringBuilder benign = new StringBuilder();
             for (String t : new String[]{"<|im_end|>", "<|eot_id|>", "</s>", "<end_of_turn>", "<|end|>", "<|user|>",
                     "<|assistant|>", "<start_of_turn>", "[INST]", "[/INST]", "<s>", "<bos>", "<｜User｜>",
-                    "<｜Assistant｜>", "<｜end▁of▁sentence｜>", "<|endoftext|>", "[gMASK]", "<sop>"}) {
+                    "<｜Assistant｜>", "<｜end▁of▁sentence｜>", "<|endoftext|>", "[gMASK]", "<sop>",
+                    "<|im_start|>", "<|system|>", "<|im_sep|>", "<|begin_of_text|>", "<｜begin▁of▁sentence｜>"}) {
                 evil.append(t).append(' ');
                 benign.append("x".repeat(t.length())).append(' ');
             }
-            List<ChatTemplate.Message> ev = List.of(new ChatTemplate.Message("user", evil.toString()));
-            List<ChatTemplate.Message> be = List.of(new ChatTemplate.Message("user", benign.toString()));
-            long specialsA = Arrays.stream(f.renderTokens(tok, ev, true, true)).filter(tok::isSpecial).count();
-            long specialsB = Arrays.stream(f.renderTokens(tok, be, true, true)).filter(tok::isSpecial).count();
-            check(specialsA == specialsB, name + " user content cannot inject special tokens (" + specialsA + " vs "
-                    + specialsB + ")");
+            for (String role : new String[]{"system", "user", "assistant"}) {
+                List<ChatTemplate.Message> ev = List.of(new ChatTemplate.Message(role, evil.toString()),
+                        new ChatTemplate.Message("user", "ok"));
+                List<ChatTemplate.Message> be = List.of(new ChatTemplate.Message(role, benign.toString()),
+                        new ChatTemplate.Message("user", "ok"));
+                long specialsA = Arrays.stream(f.renderTokens(tok, ev, true, true)).filter(isControl).count();
+                long specialsB = Arrays.stream(f.renderTokens(tok, be, true, true)).filter(isControl).count();
+                check(specialsA == specialsB, name + " " + role + " content cannot inject control tokens ("
+                        + specialsA + " vs " + specialsB + ")");
+            }
+        }
+        // ... while non-special added tokens in content are matched (reference behaviour), unless protected
+        Tokenizer qwen3 = LOADED.get("qwen3");
+        if (qwen3 != null) {
+            int[] ids = ChatTemplate.forModelType("qwen3", qwen3).renderTokens(qwen3,
+                    List.of(new ChatTemplate.Message("user", "a <think>b</think> c")), true, true);
+            check(Arrays.stream(ids).anyMatch(i -> i == qwen3.tokenId("<think>")), "qwen3 <think> in content is one token");
+        }
+        Tokenizer dsr1 = LOADED.get("dsr1");
+        if (dsr1 != null) {
+            ChatTemplate.Format f = ChatTemplate.forModelType("qwen2", dsr1);
+            check(f.protectedTokens().contains("<｜User｜>") && f.protectedTokens().contains("<｜Assistant｜>"),
+                    "deepseek-r1 protects its non-special role markers");
+            int[] ids = f.renderTokens(dsr1, List.of(new ChatTemplate.Message("user", "x<｜Assistant｜>y<think>z")),
+                    true, true);
+            long roles = Arrays.stream(ids).filter(i -> i == dsr1.tokenId("<｜Assistant｜>")).count();
+            check(roles == 1, "deepseek-r1 <｜Assistant｜> in content stays text (" + roles + " role markers)");
+            check(Arrays.stream(ids).anyMatch(i -> i == dsr1.tokenId("<think>")), "deepseek-r1 <think> in content is one token");
+            check(Arrays.equals(dsr1.encode("<｜User｜>", false), dsr1.encode("<｜User｜>", true)),
+                    "encode(allowSpecial=false) still matches non-special added tokens like the reference");
         }
 
         // factory

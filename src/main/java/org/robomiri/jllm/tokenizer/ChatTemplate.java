@@ -13,8 +13,10 @@ import java.util.Set;
  * <p>Get one with {@link #forModelType(String)} / {@link #forModelType(String, Tokenizer)}. The static
  * {@link #renderTokens} / {@link #render} methods are the original Qwen3 ChatML entry points.
  *
- * <p>Control tokens come from the template; message content is encoded with special tokens disabled, so text
- * like {@code <|im_end|>} inside a message cannot forge a turn boundary. The rendered prompt already contains the
+ * <p>Control tokens come from the template; message content is encoded with special tokens disabled (plus the
+ * format's {@link Format#protectedTokens()}), so text like {@code <|im_end|>} inside a message cannot forge a
+ * turn boundary, while non-special added tokens such as {@code <think>} are matched as the reference does. The
+ * rendered prompt already contains the
  * family's BOS token when its template has one (Llama 3, Mistral, Gemma, GLM-4, DeepSeek), so callers must not
  * prepend {@link Tokenizer#bosId()} again.
  */
@@ -36,6 +38,15 @@ public final class ChatTemplate {
 
         /** Ids of the tokens that end an assistant turn (end-of-turn and end-of-text), those the vocabulary has. */
         int[] stopIds(Tokenizer tok);
+
+        /**
+         * Added tokens the format uses as control markers although the tokenizer does not flag them
+         * {@code special} (DeepSeek's {@code <｜User｜>} / {@code <｜Assistant｜>}); message content never
+         * produces them. Special tokens are always protected.
+         */
+        default Set<String> protectedTokens() {
+            return Set.of();
+        }
     }
 
     private static final Set<String> QWEN3_ROLES = Set.of("system", "user", "assistant", "tool");
@@ -221,7 +232,7 @@ public final class ChatTemplate {
         if (gen) {
             o.ctl("<｜Assistant｜><think>\n");
         }
-    }, "<｜end▁of▁sentence｜>");
+    }, Set.of("<｜User｜>", "<｜Assistant｜>"), "<｜end▁of▁sentence｜>");
 
     /**
      * DeepSeek-V2 / V2-Lite / Coder-V2 chat: {@code <bos>system\n\nUser: ...\n\nAssistant: ...<eos>User: ...\n\nAssistant:}
@@ -387,7 +398,12 @@ public final class ChatTemplate {
         void build(List<Message> messages, boolean addGenerationPrompt, boolean enableThinking, Out out);
     }
 
-    private record Family(String name, Script script, String... stopTokens) implements Format {
+    private record Family(String name, Script script, Set<String> protectedTokens, String... stopTokens)
+            implements Format {
+
+        Family(String name, Script script, String... stopTokens) {
+            this(name, script, Set.of(), stopTokens);
+        }
 
         @Override
         public String render(List<Message> messages, boolean addGenerationPrompt, boolean enableThinking) {
@@ -401,7 +417,7 @@ public final class ChatTemplate {
                                   boolean enableThinking) {
             Out o = new Out();
             script.build(messages, addGenerationPrompt, enableThinking, o);
-            Tokenizer.SequenceEncoder enc = tok.newSequence();
+            Tokenizer.SequenceEncoder enc = tok.newSequence(protectedTokens);
             for (int i = 0; i < o.texts.size(); i++) {
                 if (o.control.get(i)) {
                     enc.special(o.texts.get(i));

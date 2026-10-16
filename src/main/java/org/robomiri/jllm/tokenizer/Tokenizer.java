@@ -53,6 +53,8 @@ public final class Tokenizer {
     private final Set<Integer> rstripIds = new HashSet<>();
     private final AddedTokenTrie addedTrie;
     private static final IntPredicate ANY_TOKEN = id -> true;
+    /** The content-path default: everything but the tokens flagged {@code special}. */
+    private final IntPredicate nonSpecial = this::isNotSpecial;
     private final UnaryOperator<String> normalizer;
     private final PreTokenizers.Chain preTokenizer;
     private final boolean byteLevel;
@@ -265,11 +267,13 @@ public final class Tokenizer {
     }
 
     /**
-     * @param allowSpecial when false, added/special tokens written literally in the text are tokenized as
-     *                     ordinary characters (use this for untrusted content such as chat messages)
+     * @param allowSpecial when false, special tokens written literally in the text are tokenized as ordinary
+     *                     characters (use this for untrusted content such as chat messages); non-special added
+     *                     tokens ({@code <think>}, {@code <tool_call>}, Mamba's whitespace runs) are still matched,
+     *                     exactly like the reference with {@code encode_special_tokens}
      */
     public int[] encode(String text, boolean allowSpecial) {
-        SequenceEncoder e = new SequenceEncoder();
+        SequenceEncoder e = new SequenceEncoder(nonSpecial);
         if (allowSpecial) {
             e.special(text);
         } else {
@@ -287,17 +291,35 @@ public final class Tokenizer {
      * tokens (Phi's {@code <|user|>}) is swallowed across pieces too.
      */
     public SequenceEncoder newSequence() {
-        return new SequenceEncoder();
+        return new SequenceEncoder(nonSpecial);
+    }
+
+    /**
+     * @param protectedTokens added tokens that, although not flagged {@code special}, act as control markers of
+     *                        the chat format (DeepSeek's {@code <｜User｜>}) and so must not be matched in content
+     */
+    public SequenceEncoder newSequence(Set<String> protectedTokens) {
+        Set<Integer> ids = new HashSet<>();
+        for (String t : protectedTokens) {
+            Integer id = addedTokens.get(t);
+            if (id != null) {
+                ids.add(id);
+            }
+        }
+        return new SequenceEncoder(ids.isEmpty() ? nonSpecial : id -> !specialIds.contains(id) && !ids.contains(id));
     }
 
     public final class SequenceEncoder {
         private final IntList out = new IntList(64);
         private final StringBuilder run = new StringBuilder();
+        /** Which added tokens the content path may match. */
+        private final IntPredicate contentTokens;
         private boolean consumed; // anything (text or token) precedes the current run
         private boolean runAtStart;
         private boolean pendingRstrip;
 
-        private SequenceEncoder() {
+        private SequenceEncoder(IntPredicate contentTokens) {
+            this.contentTokens = contentTokens;
         }
 
         /** Appends a control string; added tokens in it become their ids. */
@@ -305,16 +327,16 @@ public final class Tokenizer {
             return scan(text, ANY_TOKEN);
         }
 
-        /** Appends ordinary text; added tokens in it are NOT recognized. */
+        /** Appends untrusted text: special (and protected) tokens in it stay text, other added tokens are matched. */
         public SequenceEncoder text(String text) {
-            appendRun(text);
-            return this;
+            return scan(text, contentTokens);
         }
 
         /** Leftmost-longest scan for the added tokens accepted by {@code allowed}; the rest is ordinary text. */
         private SequenceEncoder scan(String text, IntPredicate allowed) {
             if (addedTrie == null) {
-                return text(text);
+                appendRun(text);
+                return this;
             }
             int len = text.length();
             int last = 0; // start of the plain text not yet appended
@@ -434,6 +456,10 @@ public final class Tokenizer {
 
     public boolean isSpecial(int id) {
         return specialIds.contains(id);
+    }
+
+    private boolean isNotSpecial(int id) {
+        return !specialIds.contains(id);
     }
 
     /** One past the largest token id known to the tokenizer (may be smaller than the model's embedding rows). */
