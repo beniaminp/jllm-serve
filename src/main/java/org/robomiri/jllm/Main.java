@@ -232,6 +232,7 @@ public final class Main {
     /** A GGUF file: architecture, tokenizer and weights all come from it, nothing is converted or cached. */
     private static Loaded loadGguf(Settings s, HuggingFaceHub hub, Source src) throws Exception {
         long t0 = System.nanoTime();
+        long tokNanos;
         GgufModel gm = GgufModel.open(src.gguf());
         ModelWeights weights;
         Architecture arch;
@@ -245,13 +246,14 @@ public final class Main {
                 System.err.println("warning: " + warn);
             }
             tok = ggufTokenizer(s, hub, gm);
+            tokNanos = System.nanoTime() - t0;
             weights = gm.weights();
         } catch (Exception e) {
             gm.close();
             throw e;
         }
-        System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs%n", arch.core().architecture(), weights.quant,
-                weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
+        System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs (tokenizer %.2fs)%n", arch.core().architecture(),
+                weights.quant, weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9, tokNanos / 1e9);
         return start(s, arch, tok, weights, null);
     }
 

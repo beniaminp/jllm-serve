@@ -185,6 +185,45 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <execution>
+                        <id>gguf-backends-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.GgufBackendsTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>gguf-hub-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.GgufHubTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- llama.cpp's tokenizer test for a vocabulary-only GGUF (src/test/resources/gguf/vocab, MIT licensed) -->
                     <execution>
                         <id>gguf-tokenizer-test</id>
