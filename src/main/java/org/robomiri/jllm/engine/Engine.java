@@ -119,23 +119,33 @@ public final class Engine implements AutoCloseable {
      * @throws OverloadedException if the engine stayed busy with other requests for longer than the queue timeout
      */
     public Result generate(int[] promptTokens, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
-        int bos = cfg.promptBosId();
-        if (bos >= 0 && (promptTokens.length == 0 || promptTokens[0] != bos)) {
-            // Llama / Mistral models were trained with a BOS token in front of every sequence.
-            int[] withBos = new int[promptTokens.length + 1];
-            withBos[0] = bos;
-            System.arraycopy(promptTokens, 0, withBos, 1, promptTokens.length);
-            promptTokens = withBos;
-        }
-        if (promptTokens.length == 0) {
-            promptTokens = new int[]{eosIds.iterator().next()};
-        }
+        promptTokens = preparePrompt(promptTokens);
         acquire();
         try {
             return generateLocked(promptTokens, p, sink, cancelled);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * The ids the model will actually see for a prompt: the family's BOS token is put in front when the model
+     * expects one (Llama, Mistral, Gemma, DeepSeek were trained with it at the start of every sequence) and an
+     * empty prompt becomes a single EOS. {@link #generate} applies this itself; callers that enforce the context
+     * limit must measure the prepared prompt rather than the raw ids. Idempotent.
+     */
+    public int[] preparePrompt(int[] promptTokens) {
+        int bos = cfg.promptBosId();
+        if (bos >= 0 && (promptTokens.length == 0 || promptTokens[0] != bos)) {
+            int[] withBos = new int[promptTokens.length + 1];
+            withBos[0] = bos;
+            System.arraycopy(promptTokens, 0, withBos, 1, promptTokens.length);
+            return withBos;
+        }
+        if (promptTokens.length == 0) {
+            return new int[]{eosIds.iterator().next()};
+        }
+        return promptTokens;
     }
 
     private void acquire() {

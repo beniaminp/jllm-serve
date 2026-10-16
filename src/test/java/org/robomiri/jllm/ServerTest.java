@@ -49,6 +49,9 @@ public final class ServerTest {
             disconnectedClient(f, true);
             slowRequest(f);
         }
+        try (Fixture f = new Fixture(tok, "llama", 64)) {
+            bosContextCheck(f);
+        }
         System.out.println("all server tests passed");
     }
 
@@ -190,6 +193,31 @@ public final class ServerTest {
             check(c == -1 && ms >= READ_TIMEOUT - 50 && ms < 3 * READ_TIMEOUT,
                     "idle keep-alive: closed silently after " + ms + " ms");
         }
+    }
+
+    /**
+     * M3: for a family with a prompt BOS token (here a llama config, ctx 64) the context check must count the
+     * BOS the engine prepends: a raw prompt of ctx-1 tokens is a 400, not a 500 from the engine.
+     */
+    static void bosContextCheck(Fixture f) throws Exception {
+        int ctx = f.backend.contextLength();
+        Resp r = f.post("/v1/completions", "{\"prompt\":" + Json.write(promptOf(f.tok, ctx - 1)) + ",\"max_tokens\":1,\"temperature\":0}");
+        check(r.status == 400 && r.body.contains("context_length_exceeded"),
+                "prompt of ctx-1 tokens plus BOS: 400 context_length_exceeded (got " + r.status + ")");
+        r = f.post("/v1/completions", "{\"prompt\":" + Json.write(promptOf(f.tok, ctx - 2)) + ",\"max_tokens\":5,\"temperature\":0}");
+        Map<String, Object> usage = Json.map(Json.parseObject(r.body), "usage");
+        check(r.status == 200 && Json.num(usage, "prompt_tokens", -1) == ctx - 1 && Json.num(usage, "completion_tokens", -1) == 1,
+                "prompt of ctx-2 tokens plus BOS: served, one token of room");
+    }
+
+    /** Text that the tokenizer encodes to exactly {@code n} tokens. */
+    static String promptOf(Tokenizer tok, int n) {
+        StringBuilder sb = new StringBuilder("x");
+        while (tok.encode(sb.toString()).length < n) {
+            sb.append(" x");
+        }
+        check(tok.encode(sb.toString()).length == n, "built a " + n + "-token prompt");
+        return sb.toString();
     }
 
     // ------------------------------------------------------------------ fixture: engine on a fake backend

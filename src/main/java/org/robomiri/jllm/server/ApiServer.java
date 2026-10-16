@@ -170,7 +170,7 @@ public final class ApiServer implements AutoCloseable {
         SamplingParams params;
         try {
             checkUnsupported(body, chat);
-            prompt = chat ? chatPrompt(body) : rawPrompt(body);
+            prompt = engine.preparePrompt(chat ? chatPrompt(body) : rawPrompt(body)); // with the family BOS, if any
             int ctx = engine.backend().contextLength();
             if (prompt.length >= ctx) {
                 throw new RequestError(400, "prompt has " + prompt.length + " tokens, context is " + ctx
@@ -202,6 +202,9 @@ public final class ApiServer implements AutoCloseable {
                 r = engine.generate(prompt, params, null, () -> req.clientGone() || deadline.getAsBoolean());
             } catch (Engine.OverloadedException e) {
                 res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+                return;
+            } catch (IllegalArgumentException e) { // the engine's own context check (should not get past ours)
+                res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
                 return;
             }
             String finish = deadline.finishReason(r);
@@ -238,6 +241,12 @@ public final class ApiServer implements AutoCloseable {
                 throw e;
             }
             res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+            return;
+        } catch (IllegalArgumentException e) {
+            if (res.started()) {
+                throw e;
+            }
+            res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
             return;
         }
         if (failure[0] != null) {
