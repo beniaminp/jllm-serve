@@ -382,6 +382,31 @@ public final class VectorKernels {
         }
     }
 
+    /**
+     * MoE combine of one token: {@code x[xo + i] += Σ_k w[wo + k] · d[dOff + k * stride + i]} for {@code i < n}.
+     * Each lane follows the scalar evaluation exactly - the products are summed in {@code k} order starting from
+     * {@code w_0 · d_0}, with separate multiply and add (no FMA), and the total is added to {@code x} last - so the
+     * result is bit-identical to the scalar triple loop it replaces.
+     */
+    static void combine(float[] w, int wo, int topK, float[] d, int dOff, int stride, float[] x, int xo, int n) {
+        int i = 0;
+        int ub = F.loopBound(n);
+        for (; i < ub; i += FL) {
+            FloatVector acc = FloatVector.fromArray(F, d, dOff + i).mul(w[wo]);
+            for (int k = 1; k < topK; k++) {
+                acc = acc.add(FloatVector.fromArray(F, d, dOff + k * stride + i).mul(w[wo + k]));
+            }
+            acc.add(FloatVector.fromArray(F, x, xo + i)).intoArray(x, xo + i);
+        }
+        for (; i < n; i++) {
+            float sum = 0;
+            for (int k = 0; k < topK; k++) {
+                sum += w[wo + k] * d[dOff + k * stride + i];
+            }
+            x[xo + i] += sum;
+        }
+    }
+
     static float sumSquares(float[] x, int xo, int n) {
         return dot(x, xo, x, xo, n);
     }

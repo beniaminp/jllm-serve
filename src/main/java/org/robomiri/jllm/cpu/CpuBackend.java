@@ -51,12 +51,12 @@ public final class CpuBackend implements Backend {
     private final float[] hidden;
 
     // MoE scratch (null for dense models); per-slot buffers are indexed by slot = t * topK + k
-    private final float[] routerLogits;
     private final int[] assign;
     private final float[] routeWeight;
     private final float[] moeGateUp;
     private final float[] moeHidden;
-    private final float[] dsScratch;
+    /** DeepSeek router working space, one per thread (null for other models). */
+    private final ThreadLocal<DsBuf> dsBuf;
     private final float[] moeDown;
     private final int[] expertStart;
     private final int[] expertFill;
@@ -112,20 +112,18 @@ public final class CpuBackend implements Backend {
         hidden = new float[maxBatch * c.maxMlpDim()];
         if (c.isMoe()) {
             int slots = maxBatch * c.expertsPerTok();
-            routerLogits = new float[c.numExperts()];
             assign = new int[slots];
             routeWeight = new float[slots];
             moeGateUp = new float[slots * 2 * c.moeDim()];
             moeHidden = new float[slots * c.moeDim()];
-            dsScratch = new float[c.numExperts()];
+            dsBuf = c.deepseek() != null ? ThreadLocal.withInitial(() -> new DsBuf(c.numExperts(), c.expertsPerTok())) : null;
             moeDown = new float[slots * c.dim()];
             expertStart = new int[c.numExperts() + 1];
             expertFill = new int[c.numExperts()];
             usedExperts = new int[c.numExperts()];
             slotOrder = new int[slots];
         } else {
-            dsScratch = null;
-            routerLogits = null;
+            dsBuf = null;
             assign = null;
             routeWeight = null;
             moeGateUp = null;
@@ -362,9 +360,9 @@ public final class CpuBackend implements Backend {
         int gu = 2 * m;
         int xo = t * dim;
         if (L.mla != null) {
-            routeDeepseek(L, xo, e, topK);
+            routeDeepseek(L, xo, e, topK, 0, true);
         } else {
-            route(L.router, xo, e, topK, routerLogits, 0);
+            route(L.router, xo, e, topK, scratch.get(), 0, true);
         }
         // all selected experts' gate/up rows in one parallel loop
         if (mm.useInt8(L.expGateUp)) {
@@ -432,22 +430,17 @@ public final class CpuBackend implements Backend {
         int gu = 2 * m;
         int slots = n * topK;
 
-        if (L.mla != null) {
-            // DeepSeekRouter.select writes slots [0, topK): route the last token first and move each result to
-            // its own slots, so token 0 (which stays at offset 0) is written last
-            for (int t = n - 1; t >= 0; t--) {
-                routeDeepseek(L, t * dim, e, topK);
-                System.arraycopy(assign, 0, assign, t * topK, topK);
-                System.arraycopy(routeWeight, 0, routeWeight, t * topK, topK);
-            }
-        } else {
-            pool.forRange(n, 1, (t0, t1) -> {
-                float[] logits = scratch.get();
-                for (int t = t0; t < t1; t++) {
-                    route(L.router, t * dim, e, topK, logits, t * topK);
+        // one token per thread; each routes in its own scratch
+        pool.forRange(n, 1, (t0, t1) -> {
+            float[] logits = scratch.get();
+            for (int t = t0; t < t1; t++) {
+                if (L.mla != null) {
+                    routeDeepseek(L, t * dim, e, topK, t * topK, false);
+                } else {
+                    route(L.router, t * dim, e, topK, logits, t * topK, false);
                 }
-            });
-        }
+            }
+        });
 
         Arrays.fill(expertStart, 0, e + 1, 0);
         for (int s = 0; s < slots; s++) {
@@ -481,15 +474,8 @@ public final class CpuBackend implements Backend {
 
         pool.forRange(n, 1, (t0, t1) -> {
             for (int t = t0; t < t1; t++) {
-                int xo = t * dim;
                 int s0 = t * topK;
-                for (int r = 0; r < dim; r++) {
-                    float sum = 0;
-                    for (int k = 0; k < topK; k++) {
-                        sum += routeWeight[s0 + k] * moeDown[(s0 + k) * dim + r];
-                    }
-                    x[xo + r] += sum;
-                }
+                VectorKernels.combine(routeWeight, s0, topK, moeDown, s0 * dim, dim, x, t * dim, dim);
             }
         });
     }
@@ -547,29 +533,63 @@ public final class CpuBackend implements Backend {
     }
 
     /**
-     * DeepSeek router for one token at {@code xb[xo..]} (see {@link DeepSeekRouter}): fills
-     * {@code assign[0..topK)} / {@code routeWeight[0..topK)}. Uses the backend's own scratch, so one token at a time.
+     * Router logits of the token at {@code xb[xo..]}: {@code logits[i] = dot(router[i], xb[t])} for the {@code e}
+     * experts, parallel over experts for a single token (decode) or serial when the caller already runs one token
+     * per thread (prefill).
      */
-    private void routeDeepseek(ModelWeights.Layer L, int xo, int e, int topK) {
+    private void routerLogits(float[] router, int xo, int e, float[] logits, boolean parallel) {
         int dim = c.dim();
-        for (int i = 0; i < e; i++) {
-            routerLogits[i] = VectorKernels.dot(L.router, i * dim, xb, xo, dim);
+        if (parallel) {
+            pool.forRange(e, 4, (i0, i1) -> {
+                for (int i = i0; i < i1; i++) {
+                    logits[i] = VectorKernels.dot(router, i * dim, xb, xo, dim);
+                }
+            });
+            return;
         }
-        DeepSeekRouter.select(routerLogits, L.mla.routerBias, c.deepseek(), topK, c.normTopK(), assign, routeWeight,
-                dsScratch);
+        for (int i = 0; i < e; i++) {
+            logits[i] = VectorKernels.dot(router, i * dim, xb, xo, dim);
+        }
     }
 
     /**
-     * Router for one token at {@code xb[xo..]}: fills {@code assign[ao..ao+topK)} / {@code routeWeight[ao..]}
+     * DeepSeek router for the token at {@code xb[xo..]} (see {@link DeepSeekRouter}): fills
+     * {@code assign[ao..ao+topK)} / {@code routeWeight[ao..]}. Works in the calling thread's own buffers
+     * ({@link #dsBuf}: logits, the router's working space, and the top-k ids / weights), so tokens can be routed
+     * in parallel.
+     */
+    private void routeDeepseek(ModelWeights.Layer L, int xo, int e, int topK, int ao, boolean parallel) {
+        DsBuf b = dsBuf.get();
+        routerLogits(L.router, xo, e, b.logits, parallel);
+        DeepSeekRouter.select(b.logits, L.mla.routerBias, c.deepseek(), topK, c.normTopK(), b.idx, b.weight, b.work);
+        System.arraycopy(b.idx, 0, assign, ao, topK);
+        System.arraycopy(b.weight, 0, routeWeight, ao, topK);
+    }
+
+    /** Per-thread working space of {@link #routeDeepseek}; {@code DeepSeekRouter.select} sizes the experts by {@code logits.length}. */
+    private static final class DsBuf {
+        final float[] logits;
+        final float[] work;
+        final int[] idx;
+        final float[] weight;
+
+        DsBuf(int e, int topK) {
+            logits = new float[e];
+            work = new float[e];
+            idx = new int[topK];
+            weight = new float[topK];
+        }
+    }
+
+    /**
+     * Router for the token at {@code xb[xo..]}: fills {@code assign[ao..ao+topK)} / {@code routeWeight[ao..]}
      * (same rule as transformers' Qwen3MoeSparseMoeBlock). {@code logits} is scratch of at least {@code e} floats.
      */
-    private void route(float[] router, int xo, int e, int topK, float[] logits, int ao) {
-        int dim = c.dim();
+    private void route(float[] router, int xo, int e, int topK, float[] logits, int ao, boolean parallel) {
+        routerLogits(router, xo, e, logits, parallel);
         float max = Float.NEGATIVE_INFINITY;
         for (int i = 0; i < e; i++) {
-            float v = VectorKernels.dot(router, i * dim, xb, xo, dim);
-            logits[i] = v;
-            max = Math.max(max, v);
+            max = Math.max(max, logits[i]);
         }
         float sum = 0;
         for (int i = 0; i < e; i++) {

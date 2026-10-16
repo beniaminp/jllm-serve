@@ -286,8 +286,10 @@ Together they are < 3 % of a decode step; they could be vectorized but it would 
 
 ## 7.7 Mixture of experts on CPU (`CpuBackend.moe`, `route`)
 
-Per token: `route` computes 128 router logits with `VectorKernels.dot`, a softmax, then 8 passes of argmax
-(128 entries — cheaper than sorting), and renormalizes. Then two parallel loops:
+Per token: `route` computes 128 router logits with `VectorKernels.dot` (parallel over the experts for a decode
+token; in prefill every token is routed by its own thread, DeepSeek's router included, which keeps its logits,
+working space and top-k buffers per thread), a softmax, then 8 passes of argmax (128 entries — cheaper than
+sorting), and renormalizes. Then two parallel loops:
 
 1. `forRange(topK * 2m, 32, …)` — all 8 experts' gate/up rows at once; index `i` → slot `k = i / 2m`, row
    `r = i % 2m`, weight row `assign[k] * 2m + r` in the stacked tensor.
@@ -295,7 +297,11 @@ Per token: `route` computes 128 router logits with `VectorKernels.dot`, a softma
 3. `forRange(dim, 8, …)` — each output row sums `routeWeight[k] · dotRow(expDown, assign[k]*dim + r, h, k*m)`
    over the 8 slots and adds to `x`. One writer per element, no synchronization.
 
-Two pool jobs per token-layer instead of sixteen. Details and the math in [12](12-mixture-of-experts.md).
+Three pool jobs per token-layer (router, gate/up, down) instead of sixteen. Prefill groups the slots by expert
+and runs each expert once over its tokens with the four-row kernel; the per-token combine
+`x[t] += Σ_k w_k · down_k` is `VectorKernels.combine`, lanes that follow the scalar sum order exactly (product
+rounded, added in `k` order from zero, no FMA, total added last) so it is bit-identical to the loop it replaced.
+Details and the math in [12](12-mixture-of-experts.md).
 
 ---
 
