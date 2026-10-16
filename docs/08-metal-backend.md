@@ -325,7 +325,7 @@ no struct is without a writer, and that the constants `MetalConstants` mirrors e
 | `AttnSplitParams`, `AttnCombineParams` | flash decoding ([8.11](#811-flash-decoding-opt-in)) | 48, 12 |
 | `RouterParams` / `RouterDsParams` | nExperts, dim, topK, normalize (+ DeepSeek's groups, method, scale) | 16 / 40 |
 | `MoeParams` | rowsPerExpert, cols, topK | 12 |
-| `MlaStoreParams`, `MambaConvParams`, `MambaScanParams` | MLA cache store, Mamba conv and scan | 24, 12, 16 |
+| `MlaParams`, `MambaConvParams`, `MambaScanParams` | MLA latent store / absorption (nope, rope, kvLora, vDim, heads), Mamba conv and scan | 20, 12, 16 |
 
 Buffers are bound at indices `0 … nbuf−1` and the params at index `nbuf`, matching the `[[buffer(i)]]`
 attributes in the kernel signature; a buffer a kernel declares but the dispatch does not use (norm weights,
@@ -463,8 +463,9 @@ One template behind every attention variant: `KV` is the cache element type (`fl
 load), `G` the query heads sharing a threadgroup (1 unless `-Djllm.metal.attnGroup` asks for 2/4/8, which are
 then compiled on demand), `PERK` / `PERV` the key and value head widths in units of 32 lanes — compile-time for
 head dims 64 / 128 / 256 (`attention_g1_d128`), or 0 for the widths in the params (`attention`: other head
-dims, and DeepSeek MLA with 192-wide keys and 128-wide values). Per head the arithmetic is the same whatever the
-arguments.
+dims; `attention_mla`: DeepSeek's absorbed queries, `kv_lora_rank + rope` = 576-wide keys and 512-wide values over
+one shared kv head, with the width bound raised to `MLA_MAX_PER` = 18 lanes of 32). Per head the arithmetic is the
+same whatever the arguments.
 
 Three phases, following the formula `softmax(q·K / √hd) · V`:
 

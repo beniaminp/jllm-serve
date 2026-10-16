@@ -487,9 +487,10 @@ Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
-Code: `model/DeepSeekConfig`, `model/DeepSeekRouter`, `model/MlaWeights`, `model/Rope.deepseek/yarnInvFreq`,
-`model/ModelConverter.convertMla/convertDeepseekMoe`, `cpu/MlaCpu`, `metal/MlaMetal`, kernels `mla_rope`,
-`mla_kv_store`, `attention_mla`, `router_ds` (appended to `kernels.metal`), `tokenizer/ChatTemplate` (`deepseek-v2`).
+Code: `model/DeepSeekConfig`, `model/DeepSeekRouter`, `model/MlaWeights` (+ `kvBKeys` / `kvBValues`),
+`model/Rope.deepseek/yarnInvFreq`, `model/ModelConverter.convertMla/convertDeepseekMoe`, `cpu/MlaCpu`, `metal/MlaMetal`,
+kernels `mla_lat_store`, `mla_absorb_q`, `mla_apply_v`, the `attention_mla` instantiation and `router_ds` (section 7 of
+`kernels.metal`), `tokenizer/ChatTemplate` (`deepseek-v2`).
 
 | `model_type` | Architecture class | Examples | Weights |
 |---|---|---|---|
@@ -506,10 +507,25 @@ those files.
 
 ### 14.11.1 Multi-head Latent Attention
 
-Standard attention projects `x` to per-head `q`, `k`, `v`. MLA (DeepSeek-V2) squeezes keys and values through a small
-shared *latent* so that a cache of `kv_lora_rank + qk_rope_head_dim` numbers per token would suffice (the paper's
-point). A head's query/key has two parts: `qk_nope_head_dim` dimensions without position and `qk_rope_head_dim`
-dimensions that are rotated by RoPE. The rotated key part is a single vector shared by all heads.
+Standard attention projects `x` to per-head `q`, `k`, `v` and caches `k` and `v` of every head. MLA (DeepSeek-V2)
+squeezes keys and values through a small shared *latent* `c` of `kv_lora_rank` numbers; the whole point of the design is
+that the cache holds `c` plus one shared rotary key, `kv_lora_rank + qk_rope_head_dim` numbers per token, instead of
+`H · (qk + v_dim)`. A head's query/key has two parts: `qk_nope_head_dim` dimensions without position and
+`qk_rope_head_dim` dimensions that are rotated by RoPE; the rotated key part is a single vector shared by all heads.
+
+The paper writes the per-head key and value as `k_nope_h = W_kb_k[h] · c` and `v_h = W_kb_v[h] · c` (`W_kb_k[h]`,
+`W_kb_v[h]` the `nope` resp. `v_dim` rows of `kv_b_proj` that belong to head `h`). The engine never forms them: with the
+*absorbed* formulation the two matrices move to the query side and to the output side, which is the same arithmetic in
+a different order,
+
+```
+score_h(s) = q_nope_h · (W_kb_k[h] c_s) + q_pe_h · k_pe_s  =  (W_kb_k[h]ᵀ q_nope_h) · c_s + q_pe_h · k_pe_s
+out_h      = Σ_s w_s (W_kb_v[h] c_s)                       =  W_kb_v[h] (Σ_s w_s c_s)
+```
+
+so attention runs over the latent directly: query `[W_kb_k[h]ᵀ q_nope_h | rope(q_pe_h)]` (`kv_lora + rope` wide), key
+`[c_s | rope(k_pe_s)]` (one row per position, shared by all heads: multi-query attention with a single kv head), value
+`c_s` (the first `kv_lora` entries of the same row), followed by one small `v_dim × kv_lora` matmul per head.
 
 ```
                       x [dim]
@@ -519,14 +535,15 @@ dimensions that are rotated by RoPE. The rotated key part is a single vector sha
    or q_a_proj [q_lora, dim]          ├────────────┬──────────────┐
      → q_a_layernorm                  │ latent     │ k_pe [rope]  │
      → q_b_proj [H·qk, q_lora]        │ [kv_lora]  │ (one vector) │
-        │                             │ kv_a_layernorm              │
-        │                             │ kv_b_proj [H·(nope+v), kv_lora]
-   q [H, qk]                          │ → per head: k_nope [nope] | v [v_dim]
-   = q_nope | q_pe                    │              │                 │
-        │ rope(q_pe)                  │              │  rope(k_pe)     │
-        ▼                             ▼              ▼                 ▼
-   query_h = [q_nope_h | rope(q_pe_h)]     key_h = [k_nope_h | rope(k_pe)]   value_h = v_h
-        └──────────── softmax(query_h · key_s · scale) · value_s  (causal) ───────────┘
+        │                             │ kv_a_layernorm   rope(k_pe) │
+   q [H, qk] = q_nope | q_pe          ▼            ▼
+        │ rope(q_pe)              cache row_s = [c_s | rope(k_pe_s)]       (kv_lora + rope per token, f32 or f16)
+        │ q_abs_h = W_kb_kᵀ[h] q_nope_h    │
+        ▼                                 │
+   query_h = [q_abs_h | rope(q_pe_h)]     │  key_s = row_s      value_s = row_s[:kv_lora]
+        └──── o_h = softmax(query_h · key_s · scale) · value_s  (causal; one kv head for all H) ────┘
+                                   │
+                         out_h = W_kb_v[h] · o_h   (per head v_dim × kv_lora, mla_apply_v)
                                    │
                          concat heads [H·v_dim] → o_proj [dim, H·v_dim]
 ```
@@ -554,21 +571,33 @@ Implementation notes:
   `modeling_deepseek.py` first de-interleaves (`view(d/2, 2).transpose`) and then applies the usual rotate-half. Because the
   same permutation is applied to the query and the key, the dot product is identical to rotating the pairs `(2i, 2i+1)`
   in place by `pos · inv_freq[i]`, which is what `MlaCpu.rotate` and `mla_rope` do (no permutation is needed).
-- **Different widths.** Query/key are `qk` = 192 wide and the value is `v_dim` = 128 wide. The CPU loops use the two widths
-  directly; Metal has the separate kernel `attention_mla` (a copy of `attention` with `qkDim` and `vDim`, no grouping and no
-  window, dispatched in the same 32-token tiles with `tokenOffset` as `attention`, each lane owns `qk/32 ≤ 8` resp. `v/32 ≤ 8` dimensions) rather than padding V to 192. Both widths must be
-  multiples of 32 on Metal.
+- **Absorbed `kv_b_proj`.** `MlaWeights.kvBKeys` / `kvBValues` dequantize the two halves of `kv_b_proj` per head to f32
+  once at load (`H · (nope + v_dim) · kv_lora` floats per layer: 8 MB for V2-Lite, 216 MB over 27 layers; on Metal they
+  are uploaded as f32 buffers, laid out so that the absorb / apply kernels read them coalesced). The absorption
+  `q_abs_h = W_kb_k[h]ᵀ q_nope_h` costs `H · nope · kv_lora` multiply-adds per token (1 M for V2-Lite, a sixth of
+  `q_proj`), the output step `H · v_dim · kv_lora` the same; the expanded form's `kv_b_proj` matmul was exactly as large,
+  so no work is added, it is only moved.
+- **Attention widths.** The absorbed query / cached row is `kv_lora + rope` = 576 wide (V2-Lite and V3 alike) and the value
+  is the `kv_lora` = 512 wide prefix of the same row. The CPU attention in `MlaCpu` is a tiled multi-query loop (every
+  cached row is read, or expanded from f16, once per tile of tokens for all heads of the task); Metal uses the generic
+  `attention_t` template as `attention_mla` / `attention_mla_h`: one kv head, runtime widths up to
+  `MLA_MAX_PER · 32` = 576 lanes (the other instantiations keep `MAX_PER` = 8, i.e. head dims ≤ 256), the key and value
+  buffers bound to the same cache. Metal needs `kv_lora` and `kv_lora + rope` to be multiples of 32 and ≤ 576.
 - **Softmax scale** is `qk^-0.5` (192, not the 128 of an ordinary head) times `mscale²` with
   `mscale = 0.1 · mscale_all_dim · ln(factor) + 1` when `rope_scaling.mscale_all_dim` is set (V2-Lite: 0.707 → 1.2608²;
   V3: 1.0 → 1.3689²), see `DeepSeekConfig.softmaxScale`.
-- **KV cache.** The engine stores the *expanded* keys (`H·qk`) and values (`H·v_dim`) per layer in f32, like the other
-  families, instead of the compressed latent. This is the simplest correct choice and costs memory: V2-Lite needs
-  `(16·192 + 16·128) · 4 B` = 20 KB per layer and token, **553 KB per token over 27 layers** (2.2 GB at `--ctx 4096`),
-  against 62 KB per token for a latent cache (`(512 + 64) · 4 B · 27`). `backend.kv-dtype=f16` is rejected for these
-  models. (An absorbed-matrix latent cache, where `kv_b` is folded into the query and the output projection, is the known
-  way to shrink this and is not implemented.)
+- **KV cache.** One row `[c | rope(k_pe)]` of `kv_lora + rope` values per token and layer, f32 or (`backend.kv-dtype=f16`)
+  half with the arithmetic in f32, exactly as the dense families' caches: V2-Lite needs `576 · 4 B` = 2.3 KB per layer and
+  token, **62 KB per token over 27 layers (255 MB at `--ctx 4096`), 31 KB / 127 MB at f16**. The expanded per-head
+  keys and values the first version cached (`(16·192 + 16·128) · 4 B` = 20 KB per layer and token, 553 KB per token,
+  2.2 GB at `--ctx 4096`) were 9× that, and the value of MLA was lost: the whole reason for the latent is a cache
+  that does not grow with `H`. Changing the order of the floating-point operations moves the logits in the last bits
+  only: on the three tiny models the largest difference between the two cache layouts is 3.1e-5 (relative 1.7e-6 of
+  the largest logit) on CPU and Metal, Q4_0 and Q8_0, with the same argmax, and the f16 cache differs from f32 by
+  2e-3 relative (the half rounding of the latent, as on the dense families).
 - `ModelConfig` reports `headDim = qk` (192), `kvHeads = heads`, so `qDim = H·qk` and the Metal "multiple of 32, ≤ 256"
-  check applies to 192. The BOS id (`bos_token_id`, 100000 for V2) is put in front of raw prompts; the chat template has it.
+  check applies to 192 (the rope kernel's slice). The BOS id (`bos_token_id`, 100000 for V2) is put in front of raw
+  prompts; the chat template has it.
 
 ### 14.11.2 YaRN rotary scaling
 
@@ -668,13 +697,17 @@ the non-reasoning V3 chat model. V3's BOS/EOS ids are 0 and 1 (its vocabulary ha
 ### 14.11.6 Memory on this machine
 
 DeepSeek-V2-Lite at Q4_0: 15.3 B linear weights at 5 bits (4-bit values plus an f32 scale per 32) = 9.6 GB, plus the
-Q8_0 embedding and head (2 × 102400 × 2048 at 9 bits) = 0.47 GB: about **10 GB**, so it fits a 32 GB machine, plus the f32
-KV cache of 553 KB per token. Decode touches the 6 routed + 2 shared experts of each of 26 layers, about 2.4 B parameters per
-token, so it is far cheaper than the weight size suggests (as for Qwen3-MoE, chapter 12).
+Q8_0 embedding and head (2 × 102400 × 2048 at 9 bits) = 0.47 GB: about **10 GB**, so it fits a 32 GB machine, plus the
+dequantized `kv_b_proj` halves (216 MB f32) and the latent KV cache of `(512 + 64) · 4 B · 27` = **62 KB per token**
+(255 MB at `--ctx 4096`; 31 KB per token and 127 MB with `backend.kv-dtype=f16`). Decode touches the 6 routed + 2 shared
+experts of each of 26 layers, about 2.4 B parameters per token, so it is far cheaper than the weight size suggests (as for
+Qwen3-MoE, chapter 12).
 
 DeepSeek-V3 / R1 has 671 B parameters (the Hub lists 685 B including the multi-token-prediction module, which the converter skips): at Q4_0 that is 671 B × 5/8 B ≈ **420 GB** (+ 2 GB of
-Q8_0 embedding and head), and its expanded f32 KV cache would be `128·(192 + 128)·4 B · 61` = **10 MB per token** (40 GB at
-`--ctx 4096`). It cannot run on a 32 GB laptop (not even on 128 GB; the 1.37 TB FP8 download alone exceeds the disk).
+Q8_0 embedding and head); its latent KV cache is the same 576 numbers per token and layer, `576·4 B · 61` = **140 KB per
+token** (f32; 574 MB at `--ctx 4096`), where the expanded per-head cache would have been `128·(192 + 128)·4 B · 61` =
+10 MB per token (40 GB at `--ctx 4096`); the dequantized `kv_b_proj` halves are 64 MB per layer, 4 GB in all. It cannot
+run on a 32 GB laptop (not even on 128 GB; the 1.37 TB FP8 download alone exceeds the disk).
 
 ### 14.11.7 FP8 checkpoints (V3, R1) are not supported
 
@@ -693,10 +726,12 @@ re-uploads (e.g. a community bf16 conversion works as is), and a machine with mo
 `deepseek_v2` (`q_lora_rank: null`, 2 groups with `group_limited_greedy`, 2 shared experts, yarn with equal mscales),
 `deepseek_v2q` (q LoRA, `norm_topk_prob`, `routed_scaling_factor` 2.5, yarn with `mscale` ≠ `mscale_all_dim`) and
 `deepseek_v3` (sigmoid, `noaux_tc` with bias, 4 groups, the stray layer 4). `scripts/arch-smoke.sh` runs each on CPU and
-Metal (q4 and q8; equal tokens, final logits within 1e-3 relative, measured below 1e-5) and `src/test/.../DeepSeekRef` compares the CPU and Metal logits of the
+Metal (q4, q8 and q2k; equal tokens, final logits within 1e-3 relative, measured below 1e-4) and `src/test/.../DeepSeekRef` compares the CPU and Metal logits of the
 12-token prompt with `scripts/deepseek-ref.py`, an independent float64 re-implementation of `modeling_deepseek.py`
-(explicit de-interleave + rotate-half, `MoEGate`, YaRN) run on weights rounded to Q8_0 the same way the converter does: the
-largest difference is 1e-5 of the logit range. (Without the rounding the engine is 1 – 6 % off, which is plain quantization
-noise: random weights with sharp attention are sensitive.) `mvn test` checks the YaRN frequencies against hand-computed values
+(explicit de-interleave + rotate-half, `MoEGate`, YaRN, and the paper's expanded `kv_b_proj` keys and values, so the
+engine's absorbed form is checked against the formulation it rearranges) run on weights rounded to Q8_0 the same way the
+converter does: the largest difference is 1.3e-5 of the logit range. (Without the rounding the engine is 1 – 6 % off,
+which is plain quantization noise: random weights with sharp attention are sensitive.) `mvn test` checks the YaRN
+frequencies against hand-computed values
 (14.11.2), the routing rules on hand-made score matrices (14.11.4), the V2-Lite and V3 configs, the V2 chat template and the
 FP8 refusal.
