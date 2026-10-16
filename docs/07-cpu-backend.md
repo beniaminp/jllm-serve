@@ -102,19 +102,26 @@ size ([7.13](#713-the-f16-kv-cache-kvcache)).
 
 ```java
 for t < n:  embed.dequantizeRow(tokens[off+t], x, t*dim)              // 5.2
-for each layer L:
+for each layer l, with its LayerPlan p = (attention, residual, ffn):
     rmsnorm(x, xb, L.attnNorm, n, dim)                                  // 5.3
-    matmul(L.wq, xb, q, 0, n, false)                                    // 5.4
-    matmul(L.wk, xb, kStage, 0, n, false)                               //     k/v of the chunk, [n, kvDim] staging
-    matmul(L.wv, xb, vStage, 0, n, false)
-    normRope(q, ...);  normRope(kStage, 0, ...)                         // 5.5
-    kv.store(l, pos, kStage, vStage, n)                                 //     into the KvCache: f32 copy or f16 rounding (7.13)
-    attention(l, n, pos)                                                // 5.6
-    matmul(L.wo, att, x, 0, n, true)                                    // 5.7  acc=true: x += ...
+    p.attention.run(l, L, n, pos)                                       // 5.4-5.6: Gqa (below) or MlaCpu.run
+    p.residual.add(L.wo, att, L.postAttnNorm, n)                        // 5.7  x += o_proj(att)   (post-norm families: x += rmsnorm(o_proj(att)))
     rmsnorm(x, xb, L.ffnNorm, n, dim)
-    if L.moe: moe(L, n)  else: matmul(wGateUp); siluMul(n); matmul(wDown, hidden, x, acc=true)   // 5.8 / 12
+    p.ffn.run(L, n)                                                     // 5.8 / 12: DenseGlu, moe, or moe + shared experts
 if logits != null: rmsnormRow(last token); matmul(lmHead, xb, logits, 0, 1, false)             // 5.10
+
+Gqa.run:   matmul(L.wq, xb, q);  matmul(L.wk, xb, kStage);  matmul(L.wv, xb, vStage)          // k/v of the chunk, [n, kvDim] staging
+           (+ bias)  normRope(q);  normRope(kStage)                                            // 5.5
+           kv.store(l, pos, kStage, vStage, n)                           // into the KvCache: f32 copy or f16 rounding (7.13)
+           kv.attention(pool, l, n, pos, q, att, window, scale, softcap)                        // 5.6, 7.5
+DenseGlu.run:  matmul(L.wGateUp, xb, gateUp);  siluMul | geluMul;  residual.add(L.wDown, hidden, L.postMlpNorm, n)
 ```
+
+The three strategy objects of a layer (`LayerPlan`) are resolved once in the constructor from the config and
+the weights - which attention (GQA or DeepSeek MLA), which residual rule (plain add, or the Glm4 / Gemma
+post-norm add), which feed-forward (dense GLU with SiLU or GELU, routed experts, routed plus shared experts) -
+so the per-layer loop has no conditionals on optional pieces; each strategy runs exactly the statements the
+straight-line code ran, in the same order.
 
 Two things to notice. `k` and `v` are produced into two small staging buffers (`[batch × kvDim]`), normalized
 and rotated there, and only then stored into the `KvCache` at row `pos` — an `arraycopy` for f32, a rounding pass

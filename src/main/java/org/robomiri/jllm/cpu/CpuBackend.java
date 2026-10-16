@@ -66,6 +66,8 @@ public final class CpuBackend implements Backend {
     /** The quantized matmul (float and int8 paths) and the thread-local float scratch, shared with {@link MlaCpu}. */
     final CpuMatmul mm;
     final ThreadLocal<float[]> scratch;
+    /** What each layer does (attention, residual, feed-forward), resolved once from the config and weights. */
+    private final LayerPlan[] plans;
 
     /**
      * @param int8Activations quantize activations to int8 per 32-block and use integer dot products for the
@@ -130,6 +132,118 @@ public final class CpuBackend implements Backend {
         int scratchLen = Math.max(Math.max(ctx, c.numExperts()), 4 * CpuMatmul.maxCols(w));
         mm = new CpuMatmul(pool, int8Activations, DETERMINISTIC, scratchLen);
         scratch = mm.scratch;
+        plans = new LayerPlan[c.layers()];
+        for (int l = 0; l < c.layers(); l++) {
+            plans[l] = plan(l, w.layers[l]);
+        }
+    }
+
+    // ------------------------------------------------------------------ layer plans
+
+    /**
+     * One decoder layer as three strategy objects, so {@link #forward} contains no per-layer dispatch on the
+     * family's optional pieces: attention (GQA over the {@link KvCache}, or DeepSeek MLA), how a projection joins
+     * the residual stream (plain add, or Glm4 / Gemma post-norm add), and the feed-forward (dense GLU with SiLU
+     * or GELU, routed experts, or routed plus shared experts). Every implementation runs exactly the statements
+     * the straight-line code ran before, in the same order.
+     */
+    private record LayerPlan(Attention attention, Residual residual, Ffn ffn) {
+    }
+
+    /** Reads the normalized hidden states {@link #xb}, writes the attention output {@link #att}. */
+    private interface Attention {
+        void run(int layer, ModelWeights.Layer L, int n, int pos);
+    }
+
+    /** {@code x += proj(in)}, or {@code x += rmsnorm(proj(in)) * norm} where the family normalizes the output. */
+    private interface Residual {
+        void add(QTensor proj, float[] in, float[] norm, int n);
+    }
+
+    /** Reads {@link #xb}, adds the feed-forward output to {@link #x}. */
+    private interface Ffn {
+        void run(ModelWeights.Layer L, int n);
+    }
+
+    private LayerPlan plan(int l, ModelWeights.Layer L) {
+        Attention attention = mla != null ? mla::run : new Gqa(c.usesLocalRope(l) ? ropeLocal : rope);
+        Residual residual = L.postAttnNorm != null ? this::addPostNormed : this::addPlain;
+        Ffn ffn;
+        if (!L.moe) {
+            ffn = new DenseGlu(c.isGemma(), residual);
+        } else if (L.mla != null && L.mla.sharedGateUp != null) {
+            ffn = this::moeWithShared;
+        } else {
+            ffn = this::moe;
+        }
+        return new LayerPlan(attention, residual, ffn);
+    }
+
+    /** Grouped-query attention: q/k/v projections (+ bias), QK-norm and RoPE, store into the cache, attend. */
+    private final class Gqa implements Attention {
+        private final Rope rope;
+
+        Gqa(Rope rope) {
+            this.rope = rope;
+        }
+
+        @Override
+        public void run(int layer, ModelWeights.Layer L, int n, int pos) {
+            int kvDim = c.kvDim();
+            matmul(L.wq, xb, q, 0, n, false);
+            matmul(L.wk, xb, kStage, 0, n, false);
+            matmul(L.wv, xb, vStage, 0, n, false);
+            if (L.bq != null) {
+                addBias(q, 0, L.bq, n);
+                addBias(kStage, 0, L.bk, n);
+                addBias(vStage, 0, L.bv, n);
+            }
+            normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos, rope);
+            normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos, rope);
+            kv.store(layer, pos, kStage, vStage, n);
+            kv.attention(pool, layer, n, pos, q, att, c.windowFor(layer), c.attnScale(), c.attnSoftcap());
+        }
+    }
+
+    private void addPlain(QTensor proj, float[] in, float[] norm, int n) {
+        matmul(proj, in, x, 0, n, true);
+    }
+
+    /** Glm4 / Gemma: {@code x += rmsnorm(proj(in)) * norm}; {@link #xb} is free as the temporary at both call sites. */
+    private void addPostNormed(QTensor proj, float[] in, float[] norm, int n) {
+        matmul(proj, in, xb, 0, n, false);
+        addNormed(xb, norm, n);
+    }
+
+    /** Dense gated MLP: {@code x += down(act(gate(xb)) * up(xb))} through the layer's residual rule. */
+    private final class DenseGlu implements Ffn {
+        private final boolean gelu;
+        private final Residual residual;
+
+        DenseGlu(boolean gelu, Residual residual) {
+            this.gelu = gelu;
+            this.residual = residual;
+        }
+
+        @Override
+        public void run(ModelWeights.Layer L, int n) {
+            matmul(L.wGateUp, xb, gateUp, 0, n, false);
+            if (gelu) {
+                geluMul(n);
+            } else {
+                siluMul(n);
+            }
+            residual.add(L.wDown, hidden, L.postMlpNorm, n);
+        }
+    }
+
+    /** DeepSeek: the routed experts plus a dense SwiGLU of every token over the shared experts. */
+    private void moeWithShared(ModelWeights.Layer L, int n) {
+        moe(L, n);
+        int sh = c.deepseek().nShared() * c.moeDim();
+        matmul(L.mla.sharedGateUp, xb, gateUp, 0, n, false);
+        siluMul(n, sh);
+        matmul(L.mla.sharedDown, hidden, x, 0, n, true);
     }
 
     private static boolean anyLocalRope(ModelConfig c) {
@@ -164,7 +278,6 @@ public final class CpuBackend implements Backend {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
         int dim = c.dim();
-        int kvDim = c.kvDim();
         for (int t = 0; t < n; t++) {
             w.embed.dequantizeRow(tokens[off + t], x, t * dim);
         }
@@ -178,57 +291,12 @@ public final class CpuBackend implements Backend {
         }
         for (int l = 0; l < c.layers(); l++) {
             ModelWeights.Layer L = w.layers[l];
+            LayerPlan p = plans[l];
             rmsnorm(x, xb, L.attnNorm, n, dim);
-            if (mla != null) {
-                mla.run(l, L, n, pos);
-            } else {
-                matmul(L.wq, xb, q, 0, n, false);
-                matmul(L.wk, xb, kStage, 0, n, false);
-                matmul(L.wv, xb, vStage, 0, n, false);
-                if (L.bq != null) {
-                    addBias(q, 0, L.bq, n);
-                    addBias(kStage, 0, L.bk, n);
-                    addBias(vStage, 0, L.bv, n);
-                }
-                Rope r = c.usesLocalRope(l) ? ropeLocal : rope;
-                normRope(q, 0, c.qDim(), c.heads(), L.qNorm, n, pos, r);
-                normRope(kStage, 0, kvDim, c.kvHeads(), L.kNorm, n, pos, r);
-                kv.store(l, pos, kStage, vStage, n);
-                attention(l, n, pos);
-            }
-            if (L.postAttnNorm != null) {
-                // Glm4: x += rmsnorm(o_proj(attention))
-                matmul(L.wo, att, xb, 0, n, false);
-                addNormed(xb, L.postAttnNorm, n);
-            } else {
-                matmul(L.wo, att, x, 0, n, true);
-            }
-
+            p.attention().run(l, L, n, pos);
+            p.residual().add(L.wo, att, L.postAttnNorm, n);
             rmsnorm(x, xb, L.ffnNorm, n, dim);
-            if (L.moe) {
-                moe(L, n);
-                if (L.mla != null && L.mla.sharedGateUp != null) {
-                    // DeepSeek shared experts: a dense SwiGLU of every token, added to the routed output
-                    int sh = c.deepseek().nShared() * c.moeDim();
-                    matmul(L.mla.sharedGateUp, xb, gateUp, 0, n, false);
-                    siluMul(n, sh);
-                    matmul(L.mla.sharedDown, hidden, x, 0, n, true);
-                }
-            } else {
-                matmul(L.wGateUp, xb, gateUp, 0, n, false);
-                if (c.isGemma()) {
-                    geluMul(n);
-                } else {
-                    siluMul(n);
-                }
-                if (L.postMlpNorm != null) {
-                    // Glm4: x += rmsnorm(down_proj(mlp)); xb is free again once gate/up are computed
-                    matmul(L.wDown, hidden, xb, 0, n, false);
-                    addNormed(xb, L.postMlpNorm, n);
-                } else {
-                    matmul(L.wDown, hidden, x, 0, n, true);
-                }
-            }
+            p.ffn().run(L, n);
         }
         if (logits != null) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
@@ -331,11 +399,6 @@ public final class CpuBackend implements Backend {
                 VectorKernels.rope(v, o, half, cos, sin, ro);
             }
         }
-    }
-
-    /** Causal grouped-query attention for tokens at positions [pos, pos+n): {@link KvCache#attention}. */
-    private void attention(int layer, int n, int pos) {
-        kv.attention(pool, layer, n, pos, q, att, c.windowFor(layer), c.attnScale(), c.attnSoftcap());
     }
 
     /**
