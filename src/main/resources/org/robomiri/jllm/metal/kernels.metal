@@ -1892,8 +1892,8 @@ kernel void mla_apply_v(device const float *o [[buffer(0)]],
 //   ql byte  64h + 32*(g&1) + 16*lb + k, nibble (g < 2 ? low : high)
 //   qh byte  32h + 16*lb + k, bits 2g..2g+1 -> bits 4..5 of q
 // Blocks are 210 bytes, so only 2-byte aligned: the quants are read through packed_uchar4 (alignment 1) and d as
-// a half. Scales live inside the block, so buffer(1) (ws) is unused. Same lane unit as Q2_K: one 16-weight
-// sub-block (cols / 16 units per row, nb = cols / 32). See docs/06-quantization.md.
+// a half. Scales live inside the block, so buffer(1) (ws) is unused. The matmul kernels walk the row in
+// 16-weight units (cols / 16 per row, nb = cols / 32), as Q2_K does; the MoE block_dot uses sub-blocks.
 
 // Dequantizes 16-weight sub-block u of global row `grow` (nsb super-blocks per row) into w[0..4).
 static inline void q6k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w) {
@@ -1928,19 +1928,72 @@ inline float block_dot<6>(device const uchar *wq, device const float *ws, ulong 
     return d;
 }
 
+// The matmul lane unit of Q6_K is a "column quad", not a sub-block: unit u = (super-block u/16, half h = (u%16)/8,
+// quad lq = u%8) covers weights 4lq .. 4lq+3 of the half's four 32-weight groups, i.e. the 16 weights
+// 128h + 32g + 4lq + k (g = 0..3, k = 0..3). Those are exactly the weights that share three 4-byte pieces of the
+// block (ql[4lq ..], ql[32 + 4lq ..], qh[4lq ..]), so a unit reads 12 quant bytes (as 2-byte loads: blocks are
+// only 2-byte aligned) instead of the 32 a sub-block unit re-reads, and neighbouring lanes read neighbouring bytes
+// and activations. Group g has scale scales[8h + 2g + lq/4]. Same unit count as the sub-block walk (16 per block).
+// w[g] holds the four weights of group g; the activations are x4[(blk * 64 + h * 32 + g * 8 + lq)].
+static inline void q6k_unit(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w, thread float *dl) {
+    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q6K_BYTES;
+    const int h = (u >> 3) & 1;
+    const int lq = u & 7;
+    device const ushort *ql0 = (device const ushort *)(blk + 64 * h + 4 * lq);
+    device const ushort *ql1 = (device const ushort *)(blk + 64 * h + 32 + 4 * lq);
+    device const ushort *qh = (device const ushort *)(blk + 128 + 32 * h + 4 * lq);
+    device const ushort *sc = (device const ushort *)(blk + 192 + 8 * h);
+    const float d = float(*(device const half *)(blk + 208));
+    const uchar4 qa = as_type<uchar4>(uint(ql0[0]) | (uint(ql0[1]) << 16));
+    const uchar4 qb = as_type<uchar4>(uint(ql1[0]) | (uint(ql1[1]) << 16));
+    const uchar4 qc = as_type<uchar4>(uint(qh[0]) | (uint(qh[1]) << 16));
+    const uchar4 m15 = uchar4(15);
+    const uchar4 m3 = uchar4(3);
+    const uchar4 s4 = uchar4(4);
+    const int shift = (lq >> 2) << 3;
+    w[0] = float4((qa & m15) | ((qc & m3) << s4)) - 32.0f;
+    w[1] = float4((qb & m15) | (((qc >> uchar4(2)) & m3) << s4)) - 32.0f;
+    w[2] = float4((qa >> s4) | (((qc >> s4) & m3) << s4)) - 32.0f;
+    w[3] = float4((qb >> s4) | ((qc >> uchar4(6)) << s4)) - 32.0f;
+    dl[0] = d * float(char((sc[0] >> shift) & 0xFF));
+    dl[1] = d * float(char((sc[1] >> shift) & 0xFF));
+    dl[2] = d * float(char((sc[2] >> shift) & 0xFF));
+    dl[3] = d * float(char((sc[3] >> shift) & 0xFF));
+}
+
+// Number of 32-weight groups of the unit's half that exist: a row whose width is not a multiple of 256 ends with a
+// partial super-block holding cols % 256 weights (a multiple of 32), whose missing groups are skipped.
+static inline int q6k_groups(int u, int cols) {
+    const int n = min(256, cols - (u >> 4) * 256) - 128 * ((u >> 3) & 1);
+    return clamp(n >> 5, 0, 4);
+}
+
 template <typename XP>
 static inline void mm_row_q6k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
                               thread float *acc, ushort lane) {
     const int nsb = (nb + 7) >> 3;
-    const int nsub = nb * 2;
-    for (int u = lane; u < nsub; u += 32) {
+    const int nunit = nsb * 16;
+    for (int u = lane; u < nunit; u += 32) {
+        const int ng = q6k_groups(u, nb * QK);
+        if (ng == 0) continue;
         float4 w[4];
-        q6k_sub_block(wq, grow, nsb, u, w);
+        float dl[4];
+        q6k_unit(wq, grow, nsb, u, w, dl);
+        const int xo = (u >> 4) * 64 + ((u >> 3) & 1) * 32 + (u & 7);
         for (int t = 0; t < TOK_TILE; t++) {
             if (t < nt) {
-                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
-                float d = 0.0f;
-                for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+                auto x4 = as_f4(x + (ulong)t * xstride);
+                float d = dot(w[0], x4[xo]) * dl[0];
+                if (ng == 4) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                    d += dot(w[2], x4[xo + 16]) * dl[2];
+                    d += dot(w[3], x4[xo + 24]) * dl[3];
+                } else if (ng == 2) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                } else if (ng == 3) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                    d += dot(w[2], x4[xo + 16]) * dl[2];
+                }
                 acc[t] += d;
             }
         }
@@ -1951,21 +2004,30 @@ template <int NR, int TT>
 static inline void mm_tile_q6k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
                                device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
     const int nsb = (nb + 7) >> 3;
-    const int nsub = nb * 2;
-    for (int u = lane; u < nsub; u += 32) {
+    const int nunit = nsb * 16;
+    for (int u = lane; u < nunit; u += 32) {
+        const int ng = q6k_groups(u, nb * QK);
+        if (ng == 0) continue;
         float4 w[NR][4];
+        float dl[NR][4];
         for (int r = 0; r < NR; r++) {
-            if (r < nr) q6k_sub_block(wq[r], grow[r], nsb, u, w[r]);
+            if (r < nr) q6k_unit(wq[r], grow[r], nsb, u, w[r], dl[r]);
         }
+        const int xo = (u >> 4) * 64 + ((u >> 3) & 1) * 32 + (u & 7);
         for (int t = 0; t < TT; t++) {
             if (t < nt) {
-                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
+                auto x4 = as_f4(x + (ulong)t * xstride);
                 float4 xv[4];
-                for (int k = 0; k < 4; k++) xv[k] = x4[k];
+                xv[0] = x4[xo];
+                if (ng > 1) xv[1] = x4[xo + 8];
+                if (ng > 2) xv[2] = x4[xo + 16];
+                if (ng > 3) xv[3] = x4[xo + 24];
                 for (int r = 0; r < NR; r++) {
                     if (r < nr) {
-                        float d = 0.0f;
-                        for (int k = 0; k < 4; k++) d += dot(w[r][k], xv[k]);
+                        float d = dot(w[r][0], xv[0]) * dl[r][0];
+                        if (ng > 1) d += dot(w[r][1], xv[1]) * dl[r][1];
+                        if (ng > 2) d += dot(w[r][2], xv[2]) * dl[r][2];
+                        if (ng > 3) d += dot(w[r][3], xv[3]) * dl[r][3];
                         acc[r][t] += d;
                     }
                 }
