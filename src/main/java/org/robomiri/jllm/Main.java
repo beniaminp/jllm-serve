@@ -169,7 +169,13 @@ public final class Main {
             throw e;
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + kvDtype);
-        return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok, cfg), s.getLong("server.queue-timeout-ms")));
+        try {
+            return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok, cfg), s.getLong("server.queue-timeout-ms")));
+        } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
+            backend.close();
+            weights.close();
+            throw e;
+        }
     }
 
     private static Set<Integer> eosIds(Path dir, Tokenizer tok, ModelConfig cfg) throws Exception {
