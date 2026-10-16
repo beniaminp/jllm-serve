@@ -176,9 +176,10 @@ public final class SafeTensors implements AutoCloseable {
         Arena arena = Arena.ofShared();
         try {
             Map<String, Tensor> tensors = new LinkedHashMap<>();
+            Map<String, Path> definedIn = new java.util.HashMap<>();
             Map<String, String> metadata = new LinkedHashMap<>();
             for (Path f : files) {
-                readFile(f, arena, tensors, metadata);
+                readFile(f, arena, tensors, definedIn, metadata);
             }
             return new SafeTensors(arena, Collections.unmodifiableMap(tensors), Collections.unmodifiableMap(metadata));
         } catch (IOException | RuntimeException e) {
@@ -187,8 +188,17 @@ public final class SafeTensors implements AutoCloseable {
         }
     }
 
-    private static void readFile(Path file, Arena arena, Map<String, Tensor> tensors, Map<String, String> metadata)
-            throws IOException {
+    /** A tensor's byte range in the data section, for the overlap check. */
+    private record Range(String name, long begin, long end) {
+    }
+
+    /**
+     * Parses one file's header into {@code tensors}. A name already defined (by this file or an earlier shard)
+     * and tensors whose {@code data_offsets} overlap are rejected: both mean the file does not describe one
+     * tensor per name, and loading it would silently read the wrong data.
+     */
+    private static void readFile(Path file, Arena arena, Map<String, Tensor> tensors, Map<String, Path> definedIn,
+                                 Map<String, String> metadata) throws IOException {
         MemorySegment mapped;
         try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
             mapped = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size(), arena);
@@ -209,6 +219,7 @@ public final class SafeTensors implements AutoCloseable {
         }
         long dataStart = 8 + headerLen;
         long dataSize = mapped.byteSize() - dataStart;
+        List<Range> ranges = new java.util.ArrayList<>(header.size());
         for (Map.Entry<String, Object> e : header.entrySet()) {
             String name = e.getKey();
             if (name.equals("__metadata__")) {
@@ -216,6 +227,10 @@ public final class SafeTensors implements AutoCloseable {
                     m.forEach((k, v) -> metadata.put(String.valueOf(k), String.valueOf(v)));
                 }
                 continue;
+            }
+            Path other = definedIn.get(name);
+            if (other != null) {
+                throw new IOException(file + ": duplicate tensor " + name + (other.equals(file) ? "" : " (also in " + other + ")"));
             }
             Object info = e.getValue();
             if (!(info instanceof Map)) {
@@ -261,6 +276,19 @@ public final class SafeTensors implements AutoCloseable {
                 throw new IOException(file + ": cannot map tensor " + name, ex);
             }
             tensors.put(name, new Tensor(name, dtype, shape, slice));
+            definedIn.put(name, file);
+            if (end > begin) {
+                ranges.add(new Range(name, begin, end));
+            }
+        }
+        ranges.sort(java.util.Comparator.comparingLong(Range::begin));
+        for (int i = 1; i < ranges.size(); i++) {
+            Range prev = ranges.get(i - 1);
+            Range cur = ranges.get(i);
+            if (cur.begin() < prev.end()) {
+                throw new IOException(file + ": data_offsets of " + prev.name() + " (" + prev.begin() + ".." + prev.end()
+                        + ") and " + cur.name() + " (" + cur.begin() + ".." + cur.end() + ") overlap");
+            }
         }
     }
 
