@@ -107,6 +107,22 @@ Short flags:
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)
 ```
 
+## Security
+
+The server is meant for your own machine. Keep these in mind before changing the defaults:
+
+- It binds to `127.0.0.1`; `server.host=0.0.0.0` exposes it to everyone on the network.
+- There is no authentication. Anyone who can reach the port can run completions and keep the single engine
+  busy; `Authorization` headers are accepted and ignored.
+- `server.cors-origin=*` lets any web page open in a browser on a machine that can reach the server call the API
+  (with `server.host=0.0.0.0`, that is any page on any machine on the network). Set it to the exact origin of
+  your own web app or leave it empty.
+- Requests have limits (`server.max-body-bytes`, `engine.max-prompt-bytes`, `server.max-connections`,
+  `server.queue-timeout-ms`, `server.request-timeout-ms`), a request must arrive within
+  `server.read-timeout-ms` of its first byte (408 otherwise) and a streaming client that stops reading is
+  dropped after `server.write-timeout-ms`. For anything beyond localhost put a reverse proxy in front for TLS,
+  authentication and request buffering.
+
 ## Measured on an Apple M1 Pro (10 cores, 32 GB)
 
 | Model | Backend | Prefill | Decode |
