@@ -80,6 +80,7 @@ struct Matmul3Params {
     int cols;
     int ntok;
     float eps;
+    int hasBias;    // 1: out_i[t, r] = W_i[r] . x[t] + b_i[r] (Qwen2 / GLM q/k/v bias), the b_i bound at 11..13
 };
 
 struct SwigluParams {
@@ -241,7 +242,8 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
 }
 
 // q, k and v projections of the same input in one dispatch: rows [0, rows0) come from W0 into out0,
-// [rows0, rows0 + rows1) from W1 into out1, the rest from W2 into out2. All three share cols and QT.
+// [rows0, rows0 + rows1) from W1 into out1, the rest from W2 into out2. All three share cols and QT. With
+// hasBias the per-row bias is added in the epilogue (out = v + b, the same float as a separate v += b pass).
 template <int QT, bool NORM>
 kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
                     device const float *ws0 [[buffer(1)]],
@@ -254,7 +256,10 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
                     device float *out1 [[buffer(8)]],
                     device float *out2 [[buffer(9)]],
                     device const float *nw [[buffer(10)]],
-                    constant Matmul3Params &p [[buffer(11)]],
+                    device const float *b0 [[buffer(11)]],
+                    device const float *b1 [[buffer(12)]],
+                    device const float *b2 [[buffer(13)]],
+                    constant Matmul3Params &p [[buffer(14)]],
                     threadgroup float *xn [[threadgroup(0)]],
                     uint2 tgp [[threadgroup_position_in_grid]],
                     ushort sg [[simdgroup_index_in_threadgroup]],
@@ -271,14 +276,15 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
     device const uchar *wq;
     device const float *ws;
     device float *out;
+    device const float *bias;
     int rows;
     int r;
     if (row < p.rows0) {
-        wq = wq0; ws = ws0; out = out0; rows = p.rows0; r = row;
+        wq = wq0; ws = ws0; out = out0; bias = b0; rows = p.rows0; r = row;
     } else if (row < p.rows0 + p.rows1) {
-        wq = wq1; ws = ws1; out = out1; rows = p.rows1; r = row - p.rows0;
+        wq = wq1; ws = ws1; out = out1; bias = b1; rows = p.rows1; r = row - p.rows0;
     } else {
-        wq = wq2; ws = ws2; out = out2; rows = p.rows2; r = row - p.rows0 - p.rows1;
+        wq = wq2; ws = ws2; out = out2; bias = b2; rows = p.rows2; r = row - p.rows0 - p.rows1;
     }
     float acc[TOK_TILE];
     for (int t = 0; t < TOK_TILE; t++) acc[t] = 0.0f;
@@ -287,10 +293,11 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
     } else {
         mm_row<QT>(wq, ws, (ulong)r, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
     }
+    const float b = p.hasBias ? bias[r] : 0.0f;
     for (int t = 0; t < TOK_TILE; t++) {
         if (t < nt) {
             float v = simd_sum(acc[t]);
-            if (lane == 0) out[(ulong)(t0 + t) * rows + r] = v;
+            if (lane == 0) out[(ulong)(t0 + t) * rows + r] = p.hasBias ? v + b : v;
         }
     }
 }
@@ -491,7 +498,10 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
                        device float *out1 [[buffer(8)]],
                        device float *out2 [[buffer(9)]],
                        device const float *nw [[buffer(10)]],
-                       constant Matmul3Params &p [[buffer(11)]],
+                       device const float *b0 [[buffer(11)]],
+                       device const float *b1 [[buffer(12)]],
+                       device const float *b2 [[buffer(13)]],
+                       constant Matmul3Params &p [[buffer(14)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        ushort sg [[simdgroup_index_in_threadgroup]],
                        ushort lane [[thread_index_in_simdgroup]],
@@ -506,16 +516,20 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
     device const uchar *wqs[NR];
     device const float *wss[NR];
     device float *outs[NR];
+    float bias[NR];
     int rows[NR];
     ulong grow[NR];
     for (int r = 0; r < NR; r++) {
         const int row = row0 + min(r, nr - 1);
         if (row < p.rows0) {
             wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; rows[r] = p.rows0; grow[r] = (ulong)row;
+            bias[r] = p.hasBias ? b0[grow[r]] : 0.0f;
         } else if (row < p.rows0 + p.rows1) {
             wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; rows[r] = p.rows1; grow[r] = (ulong)(row - p.rows0);
+            bias[r] = p.hasBias ? b1[grow[r]] : 0.0f;
         } else {
             wqs[r] = wq2; wss[r] = ws2; outs[r] = out2; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
+            bias[r] = p.hasBias ? b2[grow[r]] : 0.0f;
         }
     }
     float acc[NR][TT];
@@ -527,7 +541,7 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
             for (int t = 0; t < TT; t++) {
                 if (t < nt) {
                     float v = simd_sum(acc[r][t]);
-                    if (lane == 0) outs[r][(ulong)(t0 + t) * rows[r] + grow[r]] = v;
+                    if (lane == 0) outs[r][(ulong)(t0 + t) * rows[r] + grow[r]] = p.hasBias ? v + bias[r] : v;
                 }
             }
         }
@@ -1299,22 +1313,6 @@ kernel void attention_kv(device const float *q [[buffer(0)]],
 
 typedef decltype(attention_kv<half>) attention_kv_t;
 template [[host_name("attention_h")]] kernel attention_kv_t attention_kv<half>;
-
-// ---------------------------------------------------------------------------------------------- bias
-// v[i] += b[i % width] for i < total (Qwen2 q/k/v projection bias; v is [ntok, width] row-major).
-
-struct BiasParams {
-    int width;
-    int total;
-};
-
-kernel void add_bias(device float *v [[buffer(0)]],
-                     device const float *b [[buffer(1)]],
-                     constant BiasParams &p [[buffer(2)]],
-                     uint gid [[thread_position_in_grid]]) {
-    if (int(gid) >= p.total) return;
-    v[gid] += b[int(gid) % p.width];
-}
 
 // ---------------------------------------------------------------------------------------------- GLM
 // norm_rope_il: GLM (and rotate-half partial rotary, rotateHalf = 1) rotary embedding for the q rows and the k rows in one dispatch (like norm_rope, no qk-norm).

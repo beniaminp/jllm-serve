@@ -43,7 +43,7 @@ public final class MetalBackend implements Backend {
      * instead of one per (batch token, head). 32 keeps a 64-token prefill chunk at two dispatches per layer.
      */
     private static final int ATT_TILE = 32;
-    private static final int MAX_BUFS = 16; // matmul3 binds 11 buffers
+    private static final int MAX_BUFS = 16; // matmul3 binds 14 buffers
     /**
      * Layers per command buffer: the dispatches of every COMMIT_LAYERS layers are submitted (without waiting)
      * while the following layers are still being encoded, so GPU execution overlaps the CPU-side encoding
@@ -79,7 +79,6 @@ public final class MetalBackend implements Backend {
     private int pAttnSplit = -1;   // flash decoding, -1 when off
     private int pAttnCombine = -1;
     private Metal.Buffer flashPart;
-    private int pAddBias;
     private int pSoftcap;     // Gemma 2 final-logit cap, -1 otherwise
     private int pRouter;
     private int pMoeUpQ4;
@@ -252,7 +251,6 @@ public final class MetalBackend implements Backend {
             pAttnSplit = metal.pipeline(kvHalf ? "attention_split_h" : "attention_split");
             pAttnCombine = metal.pipeline("attention_combine");
         }
-        pAddBias = metal.pipeline("add_bias");
         pSoftcap = c.finalSoftcap() > 0 ? metal.pipeline("softcap") : -1;
         pRouter = metal.pipeline("router");
         pMoeUpQ4 = metal.pipeline("moe_up_q4");
@@ -443,11 +441,6 @@ public final class MetalBackend implements Backend {
                         rmsnorm(x, L.attnNorm, xb, n, dim);
                         qkv(W, L, xb, null, kDst, vDst, kvOff, n);
                     }
-                    if (L.bq != null) {
-                        addBias(q, 0, L.bq, n, c.qDim());
-                        addBias(kDst, kvOff, L.bk, n, kvDim);
-                        addBias(vDst, kvOff, L.bv, n, kvDim);
-                    }
                     normRope(L, kDst, kvOff, n, pos, c.usesLocalRope(l));
                     if (kvHalf) {
                         kvStore(l, n, pos);
@@ -594,15 +587,16 @@ public final class MetalBackend implements Backend {
         };
     }
 
-    /** q, k and v projections of {@code in} in one dispatch (k and v straight into the caches at pos). */
+    /**
+     * q, k and v projections of {@code in} in one dispatch (k and v straight into the caches at pos), with the
+     * q/k/v biases added in the kernel's epilogue when the layer has them.
+     */
     private void qkv(ModelWeights.Layer W, LayerBufs L, Metal.Buffer in, Metal.Buffer norm,
                      Metal.Buffer kDst, Metal.Buffer vDst, long kvOff, int n) {
         if (W.wq.type != W.wk.type || W.wk.type != W.wv.type || W.wq.cols != W.wk.cols || W.wk.cols != W.wv.cols) {
-            matmul(W.wq, L.wq, in, 0, q, 0, n, false, norm);
-            matmul(W.wk, L.wk, in, 0, kDst, kvOff, n, false, norm);
-            matmul(W.wv, L.wv, in, 0, vDst, kvOff, n, false, norm);
-            return;
+            throw new IllegalStateException("q/k/v projections differ in type or width"); // the loader guarantees they match
         }
+        boolean bias = L.bq != null;
         bind(0, L.wq, 0);
         bind(1, L.wq, scaleOff(W.wq));
         bind(2, L.wk, 0);
@@ -614,23 +608,27 @@ public final class MetalBackend implements Backend {
         bind(8, kDst, kvOff);
         bind(9, vDst, kvOff);
         bind(10, norm != null ? norm : finalNorm, 0);
+        bind(11, bias ? L.bq : finalNorm, 0); // dummy bindings without bias
+        bind(12, bias ? L.bk : finalNorm, 0);
+        bind(13, bias ? L.bv : finalNorm, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, W.wq.rows);
         params.setAtIndex(ValueLayout.JAVA_INT, 1, W.wk.rows);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, W.wv.rows);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, W.wq.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 4, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, bias ? 1 : 0);
         int rows = W.wq.rows + W.wk.rows + W.wv.rows;
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int pipe = byType(W.wq.type, pMatmul3PfQ4, pMatmul3PfQ8, pMatmul3PfQ2K);
-            metal.dispatch(pipe, bufArgs, offArgs, 11, params, 24, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            metal.dispatch(pipe, bufArgs, offArgs, 14, params, 28, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
             return;
         }
         int pipe = norm != null ? byType(W.wq.type, pMatmul3Q4Norm, pMatmul3Q8Norm, pMatmul3Q2KNorm)
                                 : byType(W.wq.type, pMatmul3Q4, pMatmul3Q8, pMatmul3Q2K);
         int gx = (rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 11, params, 24, normTgMem(norm, W.wq.cols), gx, gy, 1,
+        metal.dispatch(pipe, bufArgs, offArgs, 14, params, 28, normTgMem(norm, W.wq.cols), gx, gy, 1,
                 32 * SG_PER_TG, 1, 1);
     }
 
@@ -663,14 +661,6 @@ public final class MetalBackend implements Backend {
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1,
                 32 * SG_PER_TG, 1, 1);
-    }
-
-    private void addBias(Metal.Buffer v, long off, Metal.Buffer bias, int n, int width) {
-        bind(0, v, off);
-        bind(1, bias, 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, n * width);
-        metal.dispatch(pAddBias, bufArgs, offArgs, 2, params, 8, (n * width + 255) / 256, 1, 1, 256, 1, 1);
     }
 
     void rmsnorm(Metal.Buffer in, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
