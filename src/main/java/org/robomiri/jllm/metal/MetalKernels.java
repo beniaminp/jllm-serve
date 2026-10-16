@@ -165,7 +165,7 @@ final class MetalKernels implements AutoCloseable {
         metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
-    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k, and q4g / q8g / q4k / q5k for GGUF tensors). */
+    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k / q6k, and q4g / q8g / q4k / q5k for GGUF tensors). */
     static String kernel(String base, QType type, String suffix) {
         String qt = switch (type) {
             case Q4_0 -> "q4";
@@ -175,6 +175,7 @@ final class MetalKernels implements AutoCloseable {
             case Q8_0G -> "q8g";
             case Q4_K -> "q4k";
             case Q5_K -> "q5k";
+            case Q6_K -> "q6k";
         };
         return base + "_" + qt + suffix;
     }
@@ -186,7 +187,7 @@ final class MetalKernels implements AutoCloseable {
         return upBuffers.computeIfAbsent(t, x -> wrap(x.second.data));
     }
 
-    /** Offset of the f32 scale region to bind as buffer(1); Q2_K keeps its scales inside the blocks (unused binding). */
+    /** Offset of the f32 scale region to bind as buffer(1); Q2_K / Q6_K keep their scales inside the blocks (unused binding). */
     private static long scaleOff(QTensor t) {
         return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
     }
@@ -196,8 +197,14 @@ final class MetalKernels implements AutoCloseable {
         return (rows + SG_PER_TG * PF_ROWS - 1) / (SG_PER_TG * PF_ROWS);
     }
 
-    private static boolean useMma(int n) {
-        return MMA_PREFILL && n >= MMA_MIN_TOKENS;
+    /**
+     * True if a chunk of n tokens of weights of type {@code type} runs on the simdgroup-matrix prefill kernels. Only
+     * the formats with an MMA instantiation qualify ({@code matmul_mma_q4/q8/q2k}); the others (Q6_K, ...) use the
+     * tiled scalar kernels.
+     */
+    private static boolean useMma(int n, QType type) {
+        return MMA_PREFILL && n >= MMA_MIN_TOKENS
+                && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type.gguf);
     }
 
     /** Threadgroups along the row axis for the MMA prefill matmuls (MMA_BR rows per threadgroup). */
@@ -252,7 +259,7 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, outOff);
         bindOrDummy(4, norm);
         p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);
-        if (norm == null && useMma(n)) {
+        if (norm == null && useMma(n, t.type)) {
             dispatch(kernel("matmul_mma", t.type, ""), 5, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul_pf", t.type, ""), 5, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
@@ -302,7 +309,7 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.MATMUL3).i(wq.rows).i(wk.rows).i(wv.rows).i(wq.cols).i(n).f(eps).i(bq != null);
         int rows = wq.rows + wk.rows + wv.rows;
         String vh = vHalf ? "_h" : "";
-        if (norm == null && useMma(n)) {
+        if (norm == null && useMma(n, wq.type)) {
             dispatch(kernel("matmul3_mma", wq.type, vh), 14, 0, mmaGrid(rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", wq.type, vh), 14, 0, pfGrid(rows), pfTiles(n), 1, MM_THREADS, 1, 1);
@@ -342,7 +349,7 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.MATMUL3).i(which == 0 ? w.rows : 0).i(which == 1 ? w.rows : 0).i(which == 2 ? w.rows : 0)
                 .i(w.cols).i(n).f(eps).i(bias != null);
         String vh = which == 2 && vHalf ? "_h" : "";
-        if (norm == null && useMma(n)) {
+        if (norm == null && useMma(n, w.type)) {
             dispatch(kernel("matmul3_mma", w.type, vh), 14, 0, mmaGrid(w.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", w.type, vh), 14, 0, pfGrid(w.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
@@ -371,7 +378,7 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, 0);
         bindOrDummy(4, norm);
         p.reset(KernelParams.SWIGLU).i(hidden).i(t.cols).i(n).f(eps).i(gelu);
-        if (norm == null && useMma(n)) {
+        if (norm == null && useMma(n, t.type)) {
             dispatch(kernel("matmul_swiglu_mma", t.type, ""), 5, 0, mmaGrid(hidden, MMA_BR / 2), mmaTiles(n), 1,
                     MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {

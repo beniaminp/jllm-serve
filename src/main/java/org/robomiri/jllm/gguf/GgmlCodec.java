@@ -28,6 +28,7 @@ final class GgmlCodec {
             case Q4_K -> QType.Q4_K;
             case Q5_K -> QType.Q5_K;
             case Q2_K -> QType.Q2_K;
+            case Q6_K -> QType.Q6_K;
             default -> null;
         };
     }

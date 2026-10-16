@@ -16,7 +16,7 @@ import java.util.Random;
 
 /**
  * The CPU and Metal backends on tiny random GGUF models whose tensors are random blocks of the ggml formats read in
- * place (Q4_0, Q8_0, Q4_K, Q5_K) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
+ * place (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
  * down, LM head) on every family, with all matrices of one format and with the formats mixed per tensor (which makes
  * the q/k/v dispatch and the gate|up pair mixed too) -- must give the same logits within float rounding. Skipped
  * when Metal is not available.
@@ -36,7 +36,7 @@ public final class GgufBackendsTest {
         }
     }
 
-    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K};
+    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K, GgmlType.Q6_K};
 
     /** Random valid blocks: random quant bytes, f16 scales small enough that the weights are about +-0.1. */
     static byte[] blocks(Random r, GgmlType t, long elements) {
@@ -49,6 +49,7 @@ public final class GgufBackendsTest {
             switch (t) {
                 case Q4_0 -> bb.putShort(o, Float.floatToFloat16(0.004f + 0.012f * r.nextFloat()));
                 case Q8_0 -> bb.putShort(o, Float.floatToFloat16(0.0004f + 0.0012f * r.nextFloat()));
+                case Q6_K -> bb.putShort(o + 208, Float.floatToFloat16(0.00001f + 0.00004f * r.nextFloat()));
                 default -> {
                     bb.putShort(o, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
                     bb.putShort(o + 2, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
@@ -152,7 +153,7 @@ public final class GgufBackendsTest {
                 prompt[i] = 1 + (i * 37 + 11) % (VOCAB - 1);
             }
             for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe"}) {
-                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "mixed"}) {
+                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "mixed"}) {
                     Path p = dir.resolve(family + "-" + mode + ".gguf");
                     write(p, family, mode, 100 + family.hashCode() + mode.hashCode());
                     float[][] cpu;

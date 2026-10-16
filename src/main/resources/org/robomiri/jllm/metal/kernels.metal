@@ -4,6 +4,7 @@
 // lists the layouts, MetalParamsTest checks them against the structs below). Sections:
 //   0. constants   1. common (reductions, block formats)   2. matmul   3. norm + rope   4. attention
 //   5. mixture of experts   6. state space (Mamba)   7. DeepSeek MLA (latent cache store, query absorption)
+//   8. Q6_K (block format, row / tile walks and the _q6k instantiations of every matmul / moe kernel)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -18,6 +19,7 @@ using namespace metal;
 #define QK 32                   // weights per quantization block (Q4_0 / Q8_0)
 #define QK_K 256                // weights per Q2_K super-block
 #define Q2K_BYTES 84            // bytes per Q2_K super-block
+#define Q6K_BYTES 210           // bytes per Q6_K super-block (QK_K weights)
 #define TOK_TILE 8              // tokens per simdgroup of the single-row matmuls
 #define PF_ROWS 2               // rows per simdgroup of matmul_pf / matmul3_pf
 #define PF_UNITS 1              // gate + up units per simdgroup of matmul_swiglu_pf
@@ -259,6 +261,14 @@ static inline void mm_tile_q2k(thread device const uchar *const *wq, thread cons
     }
 }
 
+// Q6_K walks (defined in section 8 at the end of this file), declared here for the generic mm_row / mm_tile.
+template <typename XP>
+static inline void mm_row_q6k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                              thread float *acc, ushort lane);
+template <int NR, int TT>
+static inline void mm_tile_q6k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
+
 // mm_row: acc[t] += W[grow] . x[t * xstride ..] for t < nt; blocks walked in lane order, each dequantized
 // once for all tokens. XP is a device or threadgroup float pointer. mm_row_q2k is the Q2_K walk (16-weight
 // sub-blocks as the lane unit so all 32 lanes stay busy on 1024-wide rows); mm_tile / mm_tile_q2k are the
@@ -299,6 +309,10 @@ static inline void mm_row(device const uchar *wq, device const float *ws, ulong 
                           XP x, ulong xstride, int nt, thread float *acc, ushort lane) {
     if (QT == 2) {
         mm_row_q2k(wq, grow, nb, x, xstride, nt, acc, lane);
+        return;
+    }
+    if (QT == 6) {
+        mm_row_q6k(wq, grow, nb, x, xstride, nt, acc, lane);
         return;
     }
     if (QT >= GG_FIRST) {
@@ -536,6 +550,10 @@ static inline void mm_tile(thread device const uchar *const *wq, thread device c
                            thread float (*acc)[TT], ushort lane) {
     if (QT == 2) {
         mm_tile_q2k<NR, TT>(wq, grow, nr, nb, x, xstride, nt, acc, lane);
+        return;
+    }
+    if (QT == 6) {
+        mm_tile_q6k<NR, TT>(wq, grow, nr, nb, x, xstride, nt, acc, lane);
         return;
     }
     if (QT >= GG_FIRST) {
@@ -1901,6 +1919,172 @@ kernel void mla_apply_v(device const float *o [[buffer(0)]],
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------- 8. Q6_K
+// llama.cpp's Q6_K: 256-weight super-blocks of 210 bytes = ql[128] (low 4 bits, two per byte) + qh[64] (high
+// 2 bits, four per byte) + int8 scales[16] + f16 d; weight = d * scales[j] * (q - 32), q in 0..63.
+// Sub-block j (weights 16j .. 16j+15): half h = j/8, group g = (j%8)/2 (weights 32g.. of the half), lb = j%2;
+//   ql byte  64h + 32*(g&1) + 16*lb + k, nibble (g < 2 ? low : high)
+//   qh byte  32h + 16*lb + k, bits 2g..2g+1 -> bits 4..5 of q
+// Blocks are 210 bytes, so only 2-byte aligned: the quants are read through packed_uchar4 (alignment 1) and d as
+// a half. Scales live inside the block, so buffer(1) (ws) is unused. The matmul kernels walk the row in
+// 16-weight units (cols / 16 per row, nb = cols / 32), as Q2_K does; the MoE block_dot uses sub-blocks.
+
+// Dequantizes 16-weight sub-block u of global row `grow` (nsb super-blocks per row) into w[0..4).
+static inline void q6k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w) {
+    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q6K_BYTES;
+    const int j = u & 15;
+    const int h = j >> 3;
+    const int g = (j & 7) >> 1;
+    const int lb = j & 1;
+    const float dl = float(*(device const half *)(blk + 208)) * float(((device const char *)blk)[192 + j]);
+    const uchar nshift = uchar((g >> 1) << 2);
+    const uchar hshift = uchar(g << 1);
+    device const packed_uchar4 *ql = (device const packed_uchar4 *)(blk + 64 * h + 32 * (g & 1) + 16 * lb);
+    device const packed_uchar4 *qh = (device const packed_uchar4 *)(blk + 128 + 32 * h + 16 * lb);
+    for (int k = 0; k < 4; k++) {
+        const uchar4 lo = (uchar4(ql[k]) >> uchar4(nshift)) & uchar4(15);
+        const uchar4 hi = (uchar4(qh[k]) >> uchar4(hshift)) & uchar4(3);
+        w[k] = (float4(lo | (hi << uchar4(4))) - 32.0f) * dl;
+    }
+}
+
+// block_dot for the MoE kernels: 32-weight block b of a Q6_K row = sub-blocks 2b and 2b+1 (nb = cols / 32).
+template <>
+inline float block_dot<6>(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,
+                          device const float4 *x4) {
+    const int nsb = (nb + 7) >> 3;
+    float4 w[4];
+    float d = 0.0f;
+    q6k_sub_block(wq, grow, nsb, 2 * b, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k]);
+    q6k_sub_block(wq, grow, nsb, 2 * b + 1, w);
+    for (int k = 0; k < 4; k++) d += dot(w[k], x4[k + 4]);
+    return d;
+}
+
+// The matmul lane unit of Q6_K is a "column quad", not a sub-block: unit u = (super-block u/16, half h = (u%16)/8,
+// quad lq = u%8) covers weights 4lq .. 4lq+3 of the half's four 32-weight groups, i.e. the 16 weights
+// 128h + 32g + 4lq + k (g = 0..3, k = 0..3). Those are exactly the weights that share three 4-byte pieces of the
+// block (ql[4lq ..], ql[32 + 4lq ..], qh[4lq ..]), so a unit reads 12 quant bytes (as 2-byte loads: blocks are
+// only 2-byte aligned) instead of the 32 a sub-block unit re-reads, and neighbouring lanes read neighbouring bytes
+// and activations. Group g has scale scales[8h + 2g + lq/4]. Same unit count as the sub-block walk (16 per block).
+// w[g] holds the four weights of group g; the activations are x4[(blk * 64 + h * 32 + g * 8 + lq)].
+static inline void q6k_unit(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w, thread float *dl) {
+    device const uchar *blk = wq + (grow * nsb + (u >> 4)) * Q6K_BYTES;
+    const int h = (u >> 3) & 1;
+    const int lq = u & 7;
+    device const ushort *ql0 = (device const ushort *)(blk + 64 * h + 4 * lq);
+    device const ushort *ql1 = (device const ushort *)(blk + 64 * h + 32 + 4 * lq);
+    device const ushort *qh = (device const ushort *)(blk + 128 + 32 * h + 4 * lq);
+    device const ushort *sc = (device const ushort *)(blk + 192 + 8 * h);
+    const float d = float(*(device const half *)(blk + 208));
+    const uchar4 qa = as_type<uchar4>(uint(ql0[0]) | (uint(ql0[1]) << 16));
+    const uchar4 qb = as_type<uchar4>(uint(ql1[0]) | (uint(ql1[1]) << 16));
+    const uchar4 qc = as_type<uchar4>(uint(qh[0]) | (uint(qh[1]) << 16));
+    const uchar4 m15 = uchar4(15);
+    const uchar4 m3 = uchar4(3);
+    const uchar4 s4 = uchar4(4);
+    const int shift = (lq >> 2) << 3;
+    w[0] = float4((qa & m15) | ((qc & m3) << s4)) - 32.0f;
+    w[1] = float4((qb & m15) | (((qc >> uchar4(2)) & m3) << s4)) - 32.0f;
+    w[2] = float4((qa >> s4) | (((qc >> s4) & m3) << s4)) - 32.0f;
+    w[3] = float4((qb >> s4) | ((qc >> uchar4(6)) << s4)) - 32.0f;
+    dl[0] = d * float(char((sc[0] >> shift) & 0xFF));
+    dl[1] = d * float(char((sc[1] >> shift) & 0xFF));
+    dl[2] = d * float(char((sc[2] >> shift) & 0xFF));
+    dl[3] = d * float(char((sc[3] >> shift) & 0xFF));
+}
+
+// Number of 32-weight groups of the unit's half that exist: a row whose width is not a multiple of 256 ends with a
+// partial super-block holding cols % 256 weights (a multiple of 32), whose missing groups are skipped.
+static inline int q6k_groups(int u, int cols) {
+    const int n = min(256, cols - (u >> 4) * 256) - 128 * ((u >> 3) & 1);
+    return clamp(n >> 5, 0, 4);
+}
+
+template <typename XP>
+static inline void mm_row_q6k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                              thread float *acc, ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nunit = nsb * 16;
+    for (int u = lane; u < nunit; u += 32) {
+        const int ng = q6k_groups(u, nb * QK);
+        if (ng == 0) continue;
+        float4 w[4];
+        float dl[4];
+        q6k_unit(wq, grow, nsb, u, w, dl);
+        const int xo = (u >> 4) * 64 + ((u >> 3) & 1) * 32 + (u & 7);
+        for (int t = 0; t < TOK_TILE; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride);
+                float d = dot(w[0], x4[xo]) * dl[0];
+                if (ng == 4) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                    d += dot(w[2], x4[xo + 16]) * dl[2];
+                    d += dot(w[3], x4[xo + 24]) * dl[3];
+                } else if (ng == 2) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                } else if (ng == 3) {
+                    d += dot(w[1], x4[xo + 8]) * dl[1];
+                    d += dot(w[2], x4[xo + 16]) * dl[2];
+                }
+                acc[t] += d;
+            }
+        }
+    }
+}
+
+template <int NR, int TT>
+static inline void mm_tile_q6k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nunit = nsb * 16;
+    for (int u = lane; u < nunit; u += 32) {
+        const int ng = q6k_groups(u, nb * QK);
+        if (ng == 0) continue;
+        float4 w[NR][4];
+        float dl[NR][4];
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) q6k_unit(wq[r], grow[r], nsb, u, w[r], dl[r]);
+        }
+        const int xo = (u >> 4) * 64 + ((u >> 3) & 1) * 32 + (u & 7);
+        for (int t = 0; t < TT; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride);
+                float4 xv[4];
+                xv[0] = x4[xo];
+                if (ng > 1) xv[1] = x4[xo + 8];
+                if (ng > 2) xv[2] = x4[xo + 16];
+                if (ng > 3) xv[3] = x4[xo + 24];
+                for (int r = 0; r < NR; r++) {
+                    if (r < nr) {
+                        float d = dot(w[r][0], xv[0]) * dl[r][0];
+                        if (ng > 1) d += dot(w[r][1], xv[1]) * dl[r][1];
+                        if (ng > 2) d += dot(w[r][2], xv[2]) * dl[r][2];
+                        if (ng > 3) d += dot(w[r][3], xv[3]) * dl[r][3];
+                        acc[r][t] += d;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template [[host_name("matmul_q6k")]] kernel matmul_t matmul<6, false>;
+template [[host_name("matmul_q6k_norm")]] kernel matmul_t matmul<6, true>;
+template [[host_name("matmul_pf_q6k")]] kernel matmul_pf_t matmul_pf<6, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul3_pf_q6k")]] kernel matmul3_pf_t matmul3_pf<6, PF_ROWS, PF_TOKS, float>;
+template [[host_name("matmul3_pf_q6k_h")]] kernel matmul3_pf_h_t matmul3_pf<6, PF_ROWS, PF_TOKS, half>;
+template [[host_name("matmul_swiglu_pf_q6k")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<6, PF_UNITS, PF_TOKS>;
+template [[host_name("matmul3_q6k")]] kernel matmul3_t matmul3<6, false, float>;
+template [[host_name("matmul3_q6k_norm")]] kernel matmul3_t matmul3<6, true, float>;
+template [[host_name("matmul3_q6k_h")]] kernel matmul3_h_t matmul3<6, false, half>;
+template [[host_name("matmul3_q6k_norm_h")]] kernel matmul3_h_t matmul3<6, true, half>;
+template [[host_name("matmul_swiglu_q6k")]] kernel matmul_swiglu_t matmul_swiglu<6, false>;
+template [[host_name("matmul_swiglu_q6k_norm")]] kernel matmul_swiglu_t matmul_swiglu<6, true>;
+template [[host_name("moe_up_q6k")]] kernel moe_up_t moe_up<6>;
+template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 
 // ============================================================================================== GGUF block types
 // llama.cpp's own block layouts, read in place from a memory-mapped GGUF file (docs/16-gguf.md). The scales live

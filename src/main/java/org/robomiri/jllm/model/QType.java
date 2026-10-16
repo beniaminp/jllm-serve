@@ -25,13 +25,15 @@ public enum QType {
     /** ggml Q4_K: 144-byte super-blocks of 256 weights (4-bit quants, 6-bit scales and mins). */
     Q4_K(Ggml.Q4_K_BYTES, Ggml.QK_K, 0, true),
     /** ggml Q5_K: 176-byte super-blocks of 256 weights (5-bit quants, 6-bit scales and mins). */
-    Q5_K(Ggml.Q5_K_BYTES, Ggml.QK_K, 0, true);
+    Q5_K(Ggml.Q5_K_BYTES, Ggml.QK_K, 0, true),
+    /** llama.cpp Q6_K: 256-weight super-blocks of 210 bytes carrying their own int8 sub-block scales ({@link Q6K}). */
+    Q6_K(Q6K.BLOCK_BYTES, Q6K.BLOCK, 0);
 
     public static final int BLOCK = 32;
 
     /** Bytes of quantized data per block (scales are stored separately). */
     public final int blockBytes;
-    /** Weights per block: 32 for Q4_0/Q8_0, 256 (a super-block) for Q2_K. */
+    /** Weights per block: 32 for Q4_0/Q8_0, 256 (a super-block) for Q2_K / Q6_K. */
     public final int blockSize;
     /** Bytes of separately stored f32 scale per block; 0 when the scales live inside the block. */
     public final int scaleBytes;
@@ -56,12 +58,27 @@ public enum QType {
         this.gguf = gguf;
     }
 
+    /** The format of the embedding / LM head: {@code q8} (the default) or {@code q6k}. */
+    public static QType parseHead(String s) {
+        QType t;
+        try {
+            t = parse(s);
+        } catch (IllegalArgumentException e) {
+            t = null;
+        }
+        if (t != Q8_0 && t != Q6_K) {
+            throw new IllegalArgumentException("unknown head quantization '" + s + "' (use q8 or q6k)");
+        }
+        return t;
+    }
+
     public static QType parse(String s) {
         return switch (s.toLowerCase()) {
             case "q4", "q4_0" -> Q4_0;
             case "q8", "q8_0" -> Q8_0;
             case "q2k", "q2_k" -> Q2_K;
-            default -> throw new IllegalArgumentException("unknown quantization '" + s + "' (use q4, q8 or q2k)");
+            case "q6k", "q6_k" -> Q6_K;
+            default -> throw new IllegalArgumentException("unknown quantization '" + s + "' (use q4, q8, q2k or q6k)");
         };
     }
 }

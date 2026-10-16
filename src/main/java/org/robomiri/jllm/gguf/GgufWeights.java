@@ -18,11 +18,10 @@ import java.util.regex.Pattern;
  * ({@code blk.N.attn_q.weight}, ...), and the tensors are handed over as follows.
  *
  * <ul>
- *   <li><b>Q4_0, Q8_0, Q4_K, Q5_K, Q2_K</b>: viewed in place, no copy ({@link QTensor#mapped}); the kernels read the
+ *   <li><b>Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K</b>: viewed in place, no copy ({@link QTensor#mapped}); the kernels read the
  *       file's pages.</li>
- *   <li><b>Q6_K, Q3_K, Q4_1, Q5_0, Q5_1, F16, BF16, F32 matrices</b>: dequantized row by row and quantized to Q8_0
- *       in memory at load. Q6_K is a temporary fallback (TODO: use {@code QType.Q6_K} once it has kernels);
- *       the float types are meant for small models, since an F16 model becomes a Q8_0 one in RAM.</li>
+ *   <li><b>Q3_K, Q4_1, Q5_0, Q5_1, F16, BF16, F32 matrices</b>: dequantized row by row and quantized to Q8_0
+ *       in memory at load; *       the float types are meant for small models, since an F16 model becomes a Q8_0 one in RAM.</li>
  *   <li><b>gate and up of a dense MLP</b> (separate tensors in a GGUF, one stacked {@code [2·hidden, dim]} matrix in
  *       the engine): both are viewed in place and joined as a {@linkplain QTensor#split split} tensor (the GPU
  *       kernels bind the two halves separately, the CPU kernels route each row). Only Q2_K, whose kernels read

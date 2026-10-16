@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Architecture smoke test: Llama / Mistral / Qwen2 / GLM / Phi-3 / Gemma / Mamba / DeepSeek pipeline on tiny random checkpoints.
 #
-# For every model it converts to q4, q8 and q2k, loads, generates 8 tokens greedily
+# For every model it converts to q4, q8, q2k and q6k (plus q4 with a q6k embedding / LM head), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
 #
 # Models (under $ARCH_MODELS, default /tmp/jllm-arch-models):

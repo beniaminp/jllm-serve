@@ -63,6 +63,8 @@ public final class ModelConverter {
     private final Path dir;
     private final Architecture arch;
     private final QType quant;
+    /** Format of the embedding and the LM head (Q8_0 unless the head-quant setting says otherwise). */
+    private final QType head;
     private final ShardProvider provider;
     private final Map<String, String> shardOf;
     /** Canonical tensor name -> name in the checkpoint, only where they differ (multimodal Gemma prefixes). */
@@ -72,10 +74,12 @@ public final class ModelConverter {
     private final Map<String, Integer> remaining = new HashMap<>();
     private final Map<String, SafeTensors> open = new LinkedHashMap<>();
 
-    private ModelConverter(Path dir, Architecture arch, QType quant, ShardProvider provider) throws IOException {
+    private ModelConverter(Path dir, Architecture arch, QType quant, QType head, ShardProvider provider)
+            throws IOException {
         this.dir = dir;
         this.arch = arch;
         this.quant = quant;
+        this.head = head;
         this.provider = provider;
         this.shardOf = shardMap();
         if (shardOf.keySet().stream().anyMatch(n -> n.endsWith(".weight_scale_inv"))) {
@@ -108,14 +112,20 @@ public final class ModelConverter {
      */
     public static void convert(Path dir, Architecture arch, QType quant, ShardProvider provider, String identity)
             throws IOException {
+        convert(dir, arch, quant, QuantFile.DEFAULT_HEAD, provider, identity);
+    }
+
+    /** As above, storing the embedding and LM head as {@code head} ({@code jllm-<quant>-h6k.bin} for Q6_K). */
+    public static void convert(Path dir, Architecture arch, QType quant, QType head, ShardProvider provider,
+                               String identity) throws IOException {
         long t0 = System.nanoTime();
-        ModelConverter c = new ModelConverter(dir, arch, quant, provider);
+        ModelConverter c = new ModelConverter(dir, arch, quant, head, provider);
         QuantFile.Identity id = QuantFile.Identity.parse(identity, provider.commitSha());
-        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, arch.toString(), id, c.unitIds())) {
+        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, head, arch.toString(), id, c.unitIds())) {
             c.run(w);
             w.finish();
             System.err.printf("\rConverted %s to %s in %.0fs (%.0f MB) -> %s%n", arch.core().architecture(), quant,
-                    (System.nanoTime() - t0) / 1e9, w.bytesWritten() / 1e6, QuantFile.binPath(dir, quant));
+                    (System.nanoTime() - t0) / 1e9, w.bytesWritten() / 1e6, QuantFile.binPath(dir, quant, head));
         } finally {
             c.open.values().forEach(SafeTensors::close);
             c.open.clear();
@@ -299,7 +309,7 @@ public final class ModelConverter {
         int dim = d.core().dim();
         List<Unit> units = new ArrayList<>();
         // Embedding first: it is the largest single tensor and lives in the first shard.
-        units.add(new Unit("embed", List.of(quantize(EMBED, QType.Q8_0))));
+        units.add(new Unit("embed", List.of(quantize(EMBED, head))));
         for (int l = 0; l < d.core().layers(); l++) {
             LayerSpec spec = d.layers().get(l);
             String p = "model.layers." + l + ".";
@@ -350,11 +360,11 @@ public final class ModelConverter {
         return units;
     }
 
-    /** Final norm, plus the LM head (Q8_0) when the checkpoint has an untied one. */
+    /** Final norm, plus the LM head (in the head format) when the checkpoint has an untied one. */
     private List<Rule> finalRules(Rule finalNorm) {
         List<Rule> rules = new ArrayList<>(List.of(finalNorm));
         if (hasLmHead()) {
-            rules.add(quantize(LM_HEAD, QType.Q8_0));
+            rules.add(quantize(LM_HEAD, head));
         }
         return List.copyOf(rules);
     }
@@ -465,7 +475,7 @@ public final class ModelConverter {
     /** embedding, one unit per Mamba block, final norm (+ lm_head if the checkpoint has an untied one). */
     private List<Unit> planMamba(MambaArch m) {
         List<Unit> units = new ArrayList<>();
-        units.add(new Unit("embed", List.of(quantize(M_EMBED, QType.Q8_0))));
+        units.add(new Unit("embed", List.of(quantize(M_EMBED, head))));
         for (int l = 0; l < m.core().layers(); l++) {
             String p = "backbone.layers." + l + ".";
             String q = p + "mixer.";

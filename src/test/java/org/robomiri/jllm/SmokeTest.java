@@ -46,6 +46,7 @@ public final class SmokeTest {
         Path dir = Path.of(args.length > 0 ? args[0] : "models/Qwen_Qwen3-0.6B");
         json();
         Q2KCheck.run();
+        Q6KCheck.run();
         tokenizer(dir);
         tokenizerErrors();
         bpeEquivalence(dir);

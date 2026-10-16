@@ -268,8 +268,8 @@ per tensor.
 
 | tensor | format | why |
 |---|---|---|
-| embedding / LM head | **Q8_0 always** | the LM head's error goes straight into the logits; small models are measurably worse with a Q4 head. Also only read once per token (one row for the embedding; all rows for the head). |
-| attention `q/k/v/o` (or the MLA projections), FFN `gate/up/down`, MoE experts incl. DeepSeek's shared experts | `--quant` (`model.quant`): Q4_0 default, `q8`, or `q2k` | the bulk of the bytes; errors average out over many dot products. The converter applies the one chosen format to **every** one of these tensors; there is no mixed recipe (e.g. `down_proj` at 4 bits, the rest at 2) |
+| embedding / LM head | **Q8_0** by default; `model.head-quant=q6k` (`--head-quant q6k`) stores them as Q6_K | the LM head's error goes straight into the logits; small models are measurably worse with a Q4 head. Also only read once per token (one row for the embedding; all rows for the head). Q6_K is 6.5625 instead of 8.5 bits per weight and near-lossless; see 6.5.1 |
+| attention `q/k/v/o` (or the MLA projections), FFN `gate/up/down`, MoE experts incl. DeepSeek's shared experts | `--quant` (`model.quant`): Q4_0 default, `q8`, `q2k` or `q6k` | the bulk of the bytes; errors average out over many dot products. The converter applies the one chosen format to **every** one of these tensors; there is no mixed recipe (e.g. `down_proj` at 4 bits, the rest at 2) |
 | norms (incl. QK-norm and post-norm gains), q/k/v biases, MoE router (and DeepSeek's router bias) | f32 | tiny (1 KB – 1 MB each); the router decides which experts run, so its precision matters |
 | activations | f32; on the CPU decode path quantized on the fly to Q8_0 (6.8) | computed per token, never stored on disk |
 | KV cache | f32, or f16 with `backend.kv-dtype=f16` | in RAM only; for DeepSeek's MLA it holds just the latent row ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)) |
@@ -282,6 +282,43 @@ Sizes that result (`ModelWeights.byteSize()`):
 | Qwen3-30B-A3B (separate `lm_head`) | 30.5 B | 61 000 MB | **≈ 19.4 GB** (2 × 350 MB Q8 embed/head + 18.1 GB Q4 experts + 0.6 GB Q4 attention) | would not fit in 32 GB |
 
 With `--quant q2k` the same 0.6B cache is 321 MB and the 30B's about 10.5 GB ([13 §13.6](13-q2k-quantization.md#136-a-q2_k-qtensor)).
+
+### 6.5.1 The head format and Q6_K
+
+`model.head-quant` (`q8`, the default, or `q6k`) selects the format of the embedding and the LM head. The head is
+read in full for every decoded token, so for Qwen3-0.6B its 175 MB (Q8_0) are 39 % of the 452 MB read per token;
+as Q6_K (`model/Q6K.java`, llama.cpp's `block_q6_K`: 256 weights in 210 bytes = `ql[128]` low nibbles, `qh[64]`
+high 2-bit pairs, 16 int8 sub-block scales, one f16 `d`; `w = d·scale_j·(q − 32)`) it is 128 MB and the cache
+405 MB. The format is byte-compatible with llama.cpp (the dequantizer is bit-identical to `gguf.quants`; the
+quantizer is a port of `quantize_row_q6_K_ref` / `make_qx_quants`). `q6k` is also accepted by `model.quant` for every
+linear layer, and rows that are not a multiple of 256 end with a partial super-block as for Q2_K.
+
+The head format is part of the cache identity: a Q6_K head is converted into `jllm-q4_0-h6k.bin/.json` (the index
+records `"head": "Q6_K"`) next to the unchanged Q8_0-head `jllm-q4_0.bin`, and a cache whose embedding is not the
+requested format is reconverted. `LAYOUT_VERSION` is untouched, so existing caches stay valid.
+
+Measured on Qwen3-0.6B (Q4_0 layers; M1 Pro, 10 cores, a machine that was heavily loaded by other jobs, so the
+timings are best-of-many micro-benchmarks, not averages):
+
+| | Q8_0 head | Q6_K head |
+|---|---|---|
+| head tensor / cache | 175 MB / 452 MB | 128 MB / 405 MB |
+| Metal head matmul, 1 token (151 936 × 1 024) | 1.2 – 1.3 ms | 1.8 – 2.0 ms |
+| CPU head matmul, 1 token, default `int8-activations` | 3.4 – 4.0 ms (integer dot) | 18 ms (float path) |
+| teacher-forced perplexity, 514-token English passage | 35.738 | 35.837 (+0.28 %) |
+| greedy top-1 vs the Q8_0 head, same passage | — | 494 / 513, mean KL 0.0017 |
+| greedy text (haiku, capital of France, process vs thread) | — | identical; one binary-search answer adds "O(log n)" |
+
+The head is *not* bandwidth-bound at decode (a Metal decode step reads ~450 MB in ~10 – 16 ms, a quarter of the
+memory bandwidth), so the 47 MB saved do not buy speed, while Q6_K's extra unpacking costs more than they save: about
+0.6 ms per token on Metal, and on the CPU the int8 path (Q4_0 / Q8_0 only, see 6.8) is lost for the head, which makes it
+~14 ms slower per token. `q6k` is therefore a memory saving (and the basis for a Q6_K-all-layers recipe), not a speed
+setting, and the default stays `q8`.
+
+Kernels: `cpu/Q6KKernels.java` (byte-vector codes `lo | hi<<4 − 32` times the activation, scaled per sub-block; no int8
+activations: `CpuMatmul.useInt8` is Q4_0 / Q8_0 only) and a `Q6_K` section at the end of `kernels.metal` whose matmul
+lane unit is a *column quad* (four weights of each of a half's four 32-weight groups = 12 quant bytes) and whose MoE
+`block_dot<6>` walks 16-weight sub-blocks.
 ---
 
 ## 6.6 Stacked matrices and row arithmetic
@@ -397,7 +434,8 @@ default and optionally f16 (`backend.kv-dtype`, [05 §5.9](05-transformer-math.m
 | format | idea | not in this project because |
 |---|---|---|
 | **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | *done*: `--quant q2k`, see [13](13-q2k-quantization.md) (applied to every linear layer; pure Q2_K breaks a 0.6B model) |
-| **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | the engine does not *produce* them (the simplest format that works is Q4_0, [13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them), but it *reads* Q4_K and Q5_K from llama.cpp GGUF files in place, and Q6_K by converting to Q8_0 at load ([16](16-gguf.md)) |
+| **Q6_K** (llama.cpp "K-quant") | super-blocks of 256, 6-bit codes with int8 sub-block scales, 6.5625 bits/weight | *done*: `--head-quant q6k` for the embedding / LM head, `--quant q6k` for all layers (6.5.1) |
+| **Q4_K / Q5_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | the engine does not *produce* them (the simplest format that works is Q4_0, [13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them), but it *reads* Q4_K and Q5_K from llama.cpp GGUF files in place, and Q6_K in place as well ([16](16-gguf.md)) |
 | **GPTQ / AWQ** | choose the quantized values by minimizing the *output* error on calibration data, not per-weight rounding | needs calibration runs and a solver at conversion time |
 | **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, twice the lanes per SIMD register and no byte→float conversions | *done* on the CPU decode path for Q4_0 / Q8_0 weights, `backend.cpu.int8-activations` ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) |
 | **fp8 / NF4** | 8-bit floats; 4-bit non-uniform "normal float" levels | GPU-oriented; no hardware fp8 on Apple M1 |

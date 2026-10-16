@@ -100,7 +100,7 @@ public final class Main {
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
-                  --model <repo|file.gguf>  --revision <rev>  --dir <path>      --quant q4|q8|q2k   --low-disk
+                  --model <repo|file.gguf>  --revision <rev>  --dir <path>  --quant q4|q8|q2k|q6k  --head-quant q8|q6k  --low-disk
                   --gguf-file <name>    --gguf-quant <label> (a GGUF repo: pick the file; the file is used as it is)
                   --backend cpu|metal   --ctx <n>            --batch <n>         --threads <n>
                   --temp <t> --top-k <k> --top-p <p> --min-p <p> --rep-penalty <r> --seed <s> --max-tokens <n>
@@ -192,6 +192,7 @@ public final class Main {
         System.err.println("Model: " + arch);
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
         QType quant = QType.parse(s.get("model.quant"));
+        QType head = QType.parseHead(s.get("model.head-quant"));
         boolean lowDisk = s.getBool("model.low-disk");
         ShardProvider shards = new ShardProvider() {
             @Override
@@ -225,7 +226,7 @@ public final class Main {
                 }
             }
         };
-        ModelWeights weights = ModelWeights.load(dir, arch, quant, shards, model + "@" + revision);
+        ModelWeights weights = ModelWeights.load(dir, arch, quant, head, shards, model + "@" + revision);
         return start(s, arch, tok, weights, dir);
     }
 

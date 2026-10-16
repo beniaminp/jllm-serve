@@ -218,8 +218,8 @@ dmin·Σ m·(Σx)` per sub-block; the GPU kernel dequantizes a 32-weight unit in
 
 Six bits per weight, 16 scales (int8, one per 16 weights) and one f16 `d`. `ql[128]` holds the low 4 bits (two per
 byte) and `qh[64]` the high 2 bits (four per byte) of 256 weights in two halves of 128; `w = d·sc·(q − 32)`. It is
-the format that `Q4_K_M` files use for half of `attn_v`, half of `ffn_down` and the embedding: the engine has no
-Q6_K kernel yet — see 16.6.
+the format that `Q4_K_M` files use for half of `attn_v`, half of `ffn_down` and the embedding. It is the engine's own
+`QType.Q6_K` (chapter 06), byte-compatible with the file, so these tensors are used in place too.
 
 The other llama.cpp formats that small or old files contain (Q4_1, Q5_0, Q5_1, Q3_K) have scalar dequantizers
 (`Ggml.dequantQ4_1` ...), used only to convert at load (16.6). IQ\*, TQ\* and MXFP4 are refused by name.
@@ -299,12 +299,11 @@ one single-matrix dispatch per projection, each with the kernel of its own type,
 
 **What is converted at load.** Anything the kernels cannot read is dequantized row by row and quantized to the
 engine's own Q8_0 in memory (`QTensor.quantize`, in parallel), and reported:
-`GGUF weights: 215 MB of weights used in place, 176 MB converted or copied at load (requantized to Q8_0: 29 x Q6_K)`.
+`GGUF weights: ... (requantized to Q8_0: 3 x Q4_1, 1 x Q6_K)` (the line is absent when everything is used in place).
 
 | in the file | used |
 |---|---|
-| Q4_0, Q8_0, Q4_K, Q5_K, Q2_K | **in place** (zero copy, both backends) |
-| Q6_K | requantized to Q8_0 in memory. **Temporary fallback**: TODO replace by a byte-compatible `QType.Q6_K` with kernels, which a parallel branch adds; then `GgufWeights.matrix` maps it like the others |
+| Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K | **in place** (zero copy, both backends) |
 | Q3_K, Q4_1, Q5_0, Q5_1 | requantized to Q8_0 in memory (rare: files mix them in for tensors whose row length is not a multiple of 256) |
 | F16, BF16, F32 matrices | quantized to Q8_0 in memory — meant for small models: a BF16 file becomes a Q8_0 model in RAM, and loading it costs a pass over all weights |
 | F32 vectors (norms, biases, router) | copied into `float[]` |
@@ -405,25 +404,32 @@ views, `moe_down`) against a double-precision reference: relative error < 5e-5.
 The GGUF Q8_0 file and the engine's Q8_0 differ only in the f16 versus f32 block scale (relative 2^-11), which did
 not change a single token in these runs.
 
-**Load time and memory** (Q4_K_M GGUF, 397 MB, versus the converted `q4` cache, 452 MB; best of 3 on a machine
-that other jobs kept at load average 30+, so read the ratios, not the seconds; Metal; peak resident set of the process):
+**Load time and memory** (Q4_K_M GGUF, 397 MB, entirely in place now that Q6_K is native, versus the converted `q4`
+cache, 452 MB; Metal; the machine was shared with other jobs, load average 12-30, so read the ratios):
 
 | | map + tokenizer | wall to first token | peak RSS |
 |---|---|---|---|
-| GGUF Q4_K_M | 1.4 s (tokenizer 0.5 s; most of the rest is the Q6_K → Q8_0 fallback of 29 tensors) | 2.7 s | ~510 MB |
+| GGUF Q4_K_M | 0.3-0.5 s (0.3 s of it the tokenizer; the weights take 30 ms) | 2.0-2.1 s | ~195 MB |
+| converted q4 cache | 0.04 s | 1.9 s | ~300 MB |
+| *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
+
+Before `QType.Q6_K` existed the 29 Q6_K tensors of this file were requantized to Q8_0 at load: 1.4 s to map, 510 MB
+RSS. The output is token for token the same (md5 `1a5dc189...` for the haiku prompt, Metal and CPU). With a file
+that holds Q3_K, Q4_1/Q5_x or float matrices those tensors are still converted (`GGUF weights:` reports it).
+
+---|---|---|---|
 | converted q4 cache | 0.02 s | 1.7 s | ~230 MB |
 | *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
 
-The cost of the GGUF column is the Q6_K fallback: its 176 MB of Q8_0 copies are the difference in resident memory
-and about a second of the load. The 215 MB of Q4_K tensors are used in place. With a `Q8_0` file nothing is converted
-(`GGUF weights:` is not printed) and the load is dominated by the tokenizer.
+*Measured before `QType.Q6_K` was merged, when the 29 Q6_K tensors of this file were requantized to Q8_0 at load.* That
+fallback (176 MB of copies) accounted for the difference in resident memory and about a second of the load; with Q6_K
+used in place a `Q4_K_M` file is mapped entirely as it is (see the numbers re-measured below), and with a `Q8_0` file
+the load is dominated by the tokenizer.
 
 ---
 
 ## 16.10 Limits and what is next
 
-* **Q6_K kernels** (CPU and Metal) are being added on a parallel branch as `QType.Q6_K`; until they land, Q6_K tensors
-  are requantized to Q8_0 at load (16.6). After that a `Q4_K_M` file is used entirely in place.
 * **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe` only. Gemma 2/3, Phi-3, GLM-4, DeepSeek-2 and Mamba are
   supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are not mapped yet.
 * **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.

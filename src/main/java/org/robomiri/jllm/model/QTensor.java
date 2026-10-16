@@ -110,7 +110,7 @@ public final class QTensor {
         return blocksPerRow(type, cols);
     }
 
-    /** Blocks per row; a Q2_K row that is not a multiple of 256 ends with a partial super-block. */
+    /** Blocks per row; a Q2_K / Q6_K row that is not a multiple of 256 ends with a partial super-block. */
     private static int blocksPerRow(QType type, int cols) {
         return (cols + type.blockSize - 1) / type.blockSize;
     }
@@ -212,6 +212,11 @@ public final class QTensor {
                     int off = b * Q2K.BLOCK;
                     Q2K.quantizeBlock(row, off, Math.min(Q2K.BLOCK, cols - off), q, b * Q2K.BLOCK_BYTES);
                 }
+            } else if (type == QType.Q6_K) {
+                for (int b = 0; b < nb; b++) {
+                    int off = b * Q6K.BLOCK;
+                    Q6K.quantizeBlock(row, off, Math.min(Q6K.BLOCK, cols - off), q, b * Q6K.BLOCK_BYTES);
+                }
             } else if (type == QType.Q4_0) {
                 for (int b = 0; b < nb; b++) {
                     s[b] = quantizeBlockQ4(row, b * QType.BLOCK, q, b * 16);
@@ -293,6 +298,10 @@ public final class QTensor {
                 case Q5_K -> Ggml.dequantQ5_K(data, row, cols, dst, off);
                 default -> throw new IllegalStateException(type.name());
             }
+            return;
+        }
+        if (type == QType.Q6_K) {
+            Q6K.dequantizeRow(data, rowOffset(r), cols, dst, off);
             return;
         }
         int nb = blocksPerRow();

@@ -66,12 +66,13 @@ public final class GgufKernelsCheck {
             native_(a, "Q4_K", QType.Q4_K);
             native_(a, "Q5_K", QType.Q5_K);
             native_(a, "Q2_K", QType.Q2_K);
+            native_(a, "Q6_K", QType.Q6_K);
             // formats that are only converted to Q8_0 at load: scalar dequantizer == reference
             scalarOnly(a, "Q4_1", Ggml::dequantQ4_1);
             scalarOnly(a, "Q5_0", Ggml::dequantQ5_0);
             scalarOnly(a, "Q5_1", Ggml::dequantQ5_1);
             scalarOnly(a, "Q3_K", Ggml::dequantQ3_K);
-            scalarOnly(a, "Q6_K", Ggml::dequantQ6_K);
+            scalarOnly(a, "Q6_K", Ggml::dequantQ6_K); // the scalar definition used by the converting fallbacks
         }
         System.out.println("ggml kernels: " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {

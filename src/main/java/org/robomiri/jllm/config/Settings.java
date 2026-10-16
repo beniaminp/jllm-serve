@@ -32,6 +32,7 @@ public final class Settings {
             Map.entry("revision", "model.revision"),
             Map.entry("dir", "model.dir"),
             Map.entry("quant", "model.quant"),
+            Map.entry("head-quant", "model.head-quant"),
             Map.entry("low-disk", "model.low-disk"),
             Map.entry("gguf-file", "model.gguf-file"),
             Map.entry("gguf-quant", "model.gguf-quant"),
@@ -212,6 +213,11 @@ public final class Settings {
                 "must be the exact name of a .gguf file in the repository (or empty)");
         require(get("model.gguf-quant").matches("[A-Za-z0-9_.-]*"), "model.gguf-quant",
                 "must be a quantization label such as Q4_K_M or Q8_0 (or empty)");
+        try {
+            QType.parseHead(get("model.head-quant"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("model.head-quant: " + e.getMessage());
+        }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",

@@ -42,6 +42,9 @@ public final class VectorKernels {
         if (w.type.gguf) {
             return GgufKernels.dot(w, r, x, xo);
         }
+        if (w.type == QType.Q6_K) {
+            return Q6KKernels.dot(w, r, x, xo);
+        }
         int nb = w.blocksPerRow();
         if (FL < 4 || FL > 16) {
             return dotRowScalar(w, r, x, xo);
@@ -123,6 +126,10 @@ public final class VectorKernels {
         }
         if (w.type.gguf) {
             GgufKernels.dequant(w, r, dst, off);
+            return;
+        }
+        if (w.type == QType.Q6_K) {
+            Q6KKernels.dequant(w, r, dst, off);
             return;
         }
         if (FL < 4 || FL > 16) {
