@@ -445,7 +445,7 @@ public final class ApiServer implements AutoCloseable {
                 (float) Json.dbl(b, "repetition_penalty", d.repetitionPenalty()),
                 (float) Json.dbl(b, "presence_penalty", d.presencePenalty()),
                 (float) Json.dbl(b, "frequency_penalty", d.frequencyPenalty()),
-                Json.num(b, "seed", -1),
+                Json.num(b, "seed", d.seed()),
                 (int) maxTokens,
                 stop);
     }
