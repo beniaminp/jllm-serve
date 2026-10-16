@@ -30,7 +30,26 @@ import java.util.function.UnaryOperator;
  *
  * <p>The normalizer, pre-tokenizer, added-token (lstrip / rstrip) and post-processor (BOS) constructs found in
  * the tokenizers of the common model families are interpreted from the JSON; unknown constructs fail loudly
- * rather than silently tokenizing differently. Unigram models are not supported.
+ * ({@link IllegalArgumentException}) rather than silently tokenizing differently. Not supported:
+ *
+ * <ul>
+ *   <li>models other than {@code BPE} (Unigram, WordPiece, WordLevel);</li>
+ *   <li>BPE options {@code continuing_subword_prefix}, {@code end_of_word_suffix} (WordPiece-style affixes) and
+ *       {@code dropout};</li>
+ *   <li>normalizers other than {@code Sequence}, {@code NFC/NFD/NFKC/NFKD}, {@code Lowercase}, {@code Prepend},
+ *       {@code Strip}, {@code Replace} (in particular {@code Precompiled} SentencePiece blobs and
+ *       {@code BertNormalizer});</li>
+ *   <li>pre-tokenizers other than {@code Sequence}, {@code Split}, {@code ByteLevel}, {@code Metaspace},
+ *       {@code Digits}, {@code WhitespaceSplit}, {@code Whitespace} ({@code BertPreTokenizer}, {@code Punctuation},
+ *       {@code UnicodeScripts}, {@code CharDelimiterSplit});</li>
+ *   <li>decoders other than {@code ByteLevel}, {@code ByteFallback}, {@code Fuse}, {@code Metaspace},
+ *       {@code Replace} of {@code ▁} by a space and {@code Strip} of leading spaces after a {@code Fuse}
+ *       ({@code WordPiece}, {@code BPEDecoder}, {@code CTC}, other {@code Replace} / {@code Strip} forms);</li>
+ *   <li>post-processors other than {@code TemplateProcessing} and {@code ByteLevel} ({@code RobertaProcessing},
+ *       {@code BertProcessing}); of a template only a leading BOS is read, {@code encode} never adds it;</li>
+ *   <li>added tokens with {@code single_word}; the {@code normalized} flag (all added tokens are matched on
+ *       the raw text); {@code clean_up_tokenization_spaces}.</li>
+ * </ul>
  */
 public final class Tokenizer {
 
@@ -87,6 +106,17 @@ public final class Tokenizer {
         ignoreMerges = Json.bool(model, "ignore_merges", false);
         byteFallback = Json.bool(model, "byte_fallback", false);
         fuseUnk = Json.bool(model, "fuse_unk", false);
+        for (String flag : new String[]{"continuing_subword_prefix", "end_of_word_suffix"}) {
+            String v = Json.str(model, flag, "");
+            if (!v.isEmpty()) {
+                throw new IllegalArgumentException("unsupported BPE model option " + flag + "=" + Json.write(v)
+                        + " (WordPiece-style affixes are not implemented)");
+            }
+        }
+        if (model.get("dropout") instanceof Number d && d.doubleValue() != 0) {
+            throw new IllegalArgumentException("unsupported BPE model option dropout=" + d
+                    + " (stochastic merges are not implemented)");
+        }
 
         Map<String, Object> v = Json.map(model, "vocab");
         if (v == null) {
@@ -176,6 +206,8 @@ public final class Tokenizer {
                     "behavior", "Isolated"));
         }
         preTokenizer = pre;
+        validateDecoder(decoderNode, false);
+        validatePostProcessor(Json.map(json, "post_processor"));
         stripOnDecode = decodeStrip(decoderNode);
         metaspaceDecoder = metaspacePrefixDecoder(decoderNode);
 
@@ -252,8 +284,8 @@ public final class Tokenizer {
         if (tokenizerConfigJson != null) {
             try {
                 config = Json.parseObject(tokenizerConfigJson);
-            } catch (RuntimeException e) {
-                config = null; // a broken tokenizer_config.json must not stop the tokenizer from loading
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("tokenizer_config.json is not a JSON object: " + e.getMessage(), e);
             }
         }
         return new Tokenizer(Json.parseObject(tokenizerJson), config);
@@ -757,6 +789,69 @@ public final class Tokenizer {
             }
         }
         return false;
+    }
+
+    /**
+     * Rejects decoder constructs the decode path does not reproduce. Accepted: {@code ByteLevel},
+     * {@code ByteFallback}, {@code Fuse}, {@code Metaspace}, {@code Replace} of {@code ▁} by a space, and
+     * {@code Strip} of leading spaces applied to the fused text (i.e. after a {@code Fuse}).
+     *
+     * @return whether the chain so far ends in fused text
+     */
+    private static boolean validateDecoder(Map<String, Object> node, boolean fused) {
+        if (node == null) {
+            return fused;
+        }
+        String type = Json.str(node, "type", "");
+        switch (type) {
+            case "Sequence" -> {
+                List<Object> children = Json.list(node, "decoders");
+                if (children != null) {
+                    for (Object c : children) {
+                        fused = validateDecoder(asMap(c), fused);
+                    }
+                }
+            }
+            case "ByteLevel", "ByteFallback", "Metaspace" -> {
+            }
+            case "Fuse" -> fused = true;
+            case "Replace" -> {
+                String literal = Json.str(Json.map(node, "pattern"), "String", null);
+                if (!"▁".equals(literal) || !" ".equals(Json.str(node, "content", null))) {
+                    throw new IllegalArgumentException("unsupported Replace decoder " + Json.write(node)
+                            + " (only \"▁\" -> \" \" is implemented)");
+                }
+            }
+            case "Strip" -> {
+                if (!fused || !" ".equals(Json.str(node, "content", " ")) || Json.num(node, "stop", 0) != 0) {
+                    throw new IllegalArgumentException("unsupported Strip decoder " + Json.write(node)
+                            + " (only leading spaces of the fused text are implemented)");
+                }
+            }
+            default -> throw new IllegalArgumentException("unsupported decoder type: " + type);
+        }
+        return fused;
+    }
+
+    /** Rejects post-processors other than {@code TemplateProcessing} / {@code ByteLevel} (BERT / RoBERTa pairs). */
+    private static void validatePostProcessor(Map<String, Object> node) {
+        if (node == null) {
+            return;
+        }
+        String type = Json.str(node, "type", "");
+        switch (type) {
+            case "Sequence" -> {
+                List<Object> children = Json.list(node, "processors");
+                if (children != null) {
+                    for (Object c : children) {
+                        validatePostProcessor(asMap(c));
+                    }
+                }
+            }
+            case "ByteLevel", "TemplateProcessing" -> {
+            }
+            default -> throw new IllegalArgumentException("unsupported post_processor type: " + type);
+        }
     }
 
     /** How many leading spaces a {@code Strip} decoder (start>0) removes from the fused text. */

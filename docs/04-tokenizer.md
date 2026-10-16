@@ -289,11 +289,14 @@ loop is the same O(n log n) heap, so this stays fast, but such chunks are too lo
   prepends BOS; the caller decides. Chat-template output already contains BOS for the families whose template
   starts with it.
 
-Unknown normalizer or pre-tokenizer types throw `IllegalArgumentException` instead of silently tokenizing
-differently. Not supported: the Unigram model, `Precompiled` normalizers (SentencePiece `.model` blobs), `BPE`
-dropout, `continuing_subword_prefix` / `end_of_word_suffix` (WordPiece-style BPE), `single_word` added tokens,
-the `normalized: true` added-token flag (those tokens are matched on the raw text, which is identical for
-Mamba's whitespace tokens), `clean_up_tokenization_spaces`, and tool-calling parts of the chat templates.
+Unknown normalizer, pre-tokenizer, decoder or post-processor types throw `IllegalArgumentException` instead of
+silently tokenizing differently, as do a non-empty `continuing_subword_prefix` / `end_of_word_suffix`
+(WordPiece-style BPE), a non-zero `dropout`, a `Replace` decoder other than `▁ → " "`, a `Strip` decoder that is
+not "leading spaces of the fused text", and a `tokenizer_config.json` that is not valid JSON. Not supported (the
+`Tokenizer` javadoc keeps the list): the Unigram model, `Precompiled` normalizers (SentencePiece `.model`
+blobs), `single_word` added tokens, the `normalized: true` added-token flag (those tokens are matched on the raw
+text, which is identical for Mamba's whitespace tokens), `clean_up_tokenization_spaces`, and tool-calling parts
+of the chat templates.
 
 ### Chat templates per family
 

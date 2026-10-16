@@ -327,6 +327,33 @@ public final class TokenizerFamiliesTest {
                 "unsupported pre_tokenizer", "unknown pre-tokenizer");
         expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"Unigram\",\"vocab\":[]}}"),
                 "only BPE", "Unigram model");
+        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
+                + "\"continuing_subword_prefix\":\"##\"}}"), "continuing_subword_prefix", "WordPiece-style prefix");
+        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
+                + "\"end_of_word_suffix\":\"</w>\"}}"), "end_of_word_suffix", "end-of-word suffix");
+        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
+                + "\"dropout\":0.1}}"), "dropout", "BPE dropout");
+        check(Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],\"dropout\":null,"
+                + "\"byte_fallback\":true,\"continuing_subword_prefix\":\"\",\"end_of_word_suffix\":null}}") != null,
+                "empty / null model options are accepted");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"WordPiece\"}}"),
+                "unsupported decoder", "unknown decoder");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"Sequence\",\"decoders\":["
+                + "{\"type\":\"Replace\",\"pattern\":{\"String\":\"_\"},\"content\":\" \"}]}}"),
+                "unsupported Replace decoder", "Replace decoder of another character");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"Strip\",\"content\":\" \","
+                + "\"start\":1,\"stop\":0}}"), "unsupported Strip decoder", "Strip decoder without a Fuse");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"post_processor\":{\"type\":\"RobertaProcessing\"}}"),
+                "unsupported post_processor", "RoBERTa post-processor");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"post_processor\":{\"type\":\"Sequence\",\"processors\":["
+                + "{\"type\":\"ByteLevel\"},{\"type\":\"BertProcessing\"}]}}"),
+                "unsupported post_processor", "BERT post-processor inside a Sequence");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + "}", "{\"add_bos_token\": tru"),
+                "tokenizer_config.json", "broken tokenizer_config.json");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + "}", "[]"),
+                "tokenizer_config.json", "tokenizer_config.json that is not an object");
+        check(Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],\"byte_fallback\":true}}",
+                "{}") != null, "empty tokenizer_config.json is fine");
 
         // a tiny SentencePiece-style tokenizer: byte fallback, fused unknowns, Metaspace prefix, decode strip
         String sp = "{\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"fuse_unk\":true,\"byte_fallback\":true,"
