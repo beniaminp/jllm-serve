@@ -49,8 +49,7 @@ public final class MambaLayer {
                 && L.a.length == m.dInner() * m.dState() && L.d.length == m.dInner()
                 && L.outProj.rows == c.dim() && L.outProj.cols == m.dInner();
         if (!ok) {
-            throw new IllegalArgumentException(p + " weight shapes do not match config " + c
-                    + " (stale jllm-*.bin cache? delete it to reconvert)");
+            throw new IllegalArgumentException(p + " weight shapes do not match config " + c + ModelWeights.STALE_HINT);
         }
         return L;
     }

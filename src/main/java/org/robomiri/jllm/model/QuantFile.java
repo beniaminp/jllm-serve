@@ -23,12 +23,35 @@ import java.util.Map;
  *
  * <p>Two files: {@code jllm-<quant>.bin} holds page-aligned blobs in exactly the {@link QTensor} memory layout
  * (so a mapped slice can be used directly, even zero-copy by Metal), and {@code jllm-<quant>.json} describes
- * them: {@code {"tensors": {name: {type, rows, cols, offset, size}}}}. The JSON is written last and acts as the
- * "conversion complete" marker.
+ * them: {@code {"version", "layout", "quant", "model", "tensors": {name: {type, rows, cols, offset, size}}}}.
+ * The JSON is written last and acts as the "conversion complete" marker.
+ *
+ * <p>A cache that cannot be used — unparseable or malformed index, another {@link #VERSION} or
+ * {@link #LAYOUT_VERSION}, a blob that does not fit the file — is reported as a {@link StaleCacheException},
+ * which {@link ModelWeights#load} answers by deleting the files and converting again.
  */
 public final class QuantFile implements AutoCloseable {
 
+    /** Format of the two files themselves (blob layout, index schema). */
     public static final int VERSION = 1;
+
+    /**
+     * What the {@link ModelConverter} puts into a cache: tensor names, which tensors are fused, split or folded
+     * and how. Bumped whenever that changes so caches written by an older converter are reconverted instead of
+     * being loaded with wrong contents. 1 = caches written before the key existed (they carry no {@code layout}).
+     */
+    public static final int LAYOUT_VERSION = 2;
+
+    /** The cache on disk cannot be used as it is; deleting and reconverting it is the remedy. */
+    public static final class StaleCacheException extends IOException {
+        public StaleCacheException(String message) {
+            super(message);
+        }
+
+        public StaleCacheException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 
     public record Entry(String type, int rows, int cols, long offset, long size) {
     }
@@ -55,10 +78,26 @@ public final class QuantFile implements AutoCloseable {
         return dir.resolve("jllm-" + quant.name().toLowerCase() + ".json");
     }
 
+    /** Removes the cache files of {@code quant} in {@code dir} (index, blobs and any resume sidecar). */
+    public static void delete(Path dir, QType quant) throws IOException {
+        Files.deleteIfExists(jsonPath(dir, quant));
+        Files.deleteIfExists(binPath(dir, quant));
+        Files.deleteIfExists(partialPath(dir, quant));
+    }
+
+    /**
+     * Maps the cache of {@code quant} in {@code dir}.
+     *
+     * @throws StaleCacheException if the index is unparseable or malformed, was written by another version or
+     *                             converter layout, or describes blobs the {@code .bin} does not hold
+     */
     public static QuantFile open(Path dir, QType quant) throws IOException {
         Path json = jsonPath(dir, quant);
         Map<String, Entry> entries = readIndex(json, Json.map(parseJson(json), "tensors"));
         Path bin = binPath(dir, quant);
+        if (!Files.isRegularFile(bin)) {
+            throw new StaleCacheException(bin + " is missing");
+        }
         Arena arena = Arena.ofShared();
         try {
             MemorySegment mapped;
@@ -80,24 +119,35 @@ public final class QuantFile implements AutoCloseable {
         try {
             header = Json.parseObject(Files.readString(json));
         } catch (RuntimeException e) {
-            throw new IOException(json + " is not a valid jllm cache index: " + e.getMessage() + "; delete it to reconvert", e);
+            throw new StaleCacheException(json + " is not a valid jllm cache index: " + e.getMessage(), e);
         }
-        if (Json.num(header, "version", 0) != VERSION) {
-            throw new IOException("unsupported jllm cache version; delete " + json);
-        }
+        checkVersions(json, header);
         return header;
+    }
+
+    /** Rejects an index or sidecar written by another file version or converter layout. */
+    static void checkVersions(Path file, Map<String, Object> header) throws StaleCacheException {
+        long version = Json.num(header, "version", 0);
+        if (version != VERSION) {
+            throw new StaleCacheException(file + " has cache version " + version + ", this build reads " + VERSION);
+        }
+        long layout = Json.num(header, "layout", 1);
+        if (layout != LAYOUT_VERSION) {
+            throw new StaleCacheException(file + " was written by converter layout " + layout + ", this build needs "
+                    + LAYOUT_VERSION);
+        }
     }
 
     /** Parses a {@code {name: {type, rows, cols, offset, size}}} map, rejecting anything malformed. */
     static Map<String, Entry> readIndex(Path json, Map<String, Object> tensors) throws IOException {
         if (tensors == null) {
-            throw new IOException(json + " has no \"tensors\" map; delete it to reconvert");
+            throw new StaleCacheException(json + " has no \"tensors\" map");
         }
         Map<String, Entry> entries = new LinkedHashMap<>();
         for (Map.Entry<String, Object> e : tensors.entrySet()) {
             Object v = e.getValue();
             if (!(v instanceof Map)) {
-                throw new IOException(json + ": malformed entry for " + e.getKey());
+                throw new StaleCacheException(json + ": malformed entry for " + e.getKey());
             }
             entries.put(e.getKey(), new Entry(Json.str(v, "type", "?"), (int) Json.num(v, "rows", -1),
                     (int) Json.num(v, "cols", -1), Json.num(v, "offset", -1), Json.num(v, "size", -1)));
@@ -139,8 +189,7 @@ public final class QuantFile implements AutoCloseable {
             }
         }
         if (problem != null) {
-            throw new IOException("corrupt jllm cache entry " + name + ": " + problem + "; delete " + bin
-                    + " and its .json to reconvert");
+            throw new StaleCacheException("corrupt jllm cache entry " + name + ": " + problem + " (" + bin + ")");
         }
     }
 
@@ -190,12 +239,12 @@ public final class QuantFile implements AutoCloseable {
      * Streams tensors into a new cache; call {@link #finish()} to write the index.
      *
      * <p>A conversion is a sequence of units (one layer each). After every unit {@link #commitUnit} forces the
-     * data to disk and rewrites the sidecar {@code jllm-<quant>.partial.json} ({@code version, quant, model,
-     * units, tensors}) atomically, so a crash loses at most the unit in progress. {@link #openOrResume} picks a
-     * consistent sidecar up again: the recorded units must be a prefix of the planned ones, the recorded
-     * entries must form a contiguous, well-formed prefix of the {@code .bin}, and the {@code .bin} must hold at
-     * least that many bytes (a longer tail from an interrupted unit is truncated). On any doubt the conversion
-     * starts over.
+     * data to disk and rewrites the sidecar {@code jllm-<quant>.partial.json} ({@code version, layout, quant,
+     * model, units, tensors}) atomically, so a crash loses at most the unit in progress. {@link #openOrResume}
+     * picks a consistent sidecar up again: it must come from this file version and converter layout, the
+     * recorded units must be a prefix of the planned ones, the recorded entries must form a contiguous,
+     * well-formed prefix of the {@code .bin}, and the {@code .bin} must hold at least that many bytes (a longer
+     * tail from an interrupted unit is truncated). On any doubt the conversion starts over.
      */
     public static final class Writer implements AutoCloseable {
         private final Path dir;
@@ -273,8 +322,9 @@ public final class QuantFile implements AutoCloseable {
             String reason;
             try {
                 Map<String, Object> side = Json.parseObject(Files.readString(partial));
+                checkVersions(partial, side);
                 List<Object> unitObjs = Json.list(side, "units");
-                if (Json.num(side, "version", 0) != VERSION || !quant.name().equals(Json.str(side, "quant", null))
+                if (!quant.name().equals(Json.str(side, "quant", null))
                         || !model.equals(Json.str(side, "model", null)) || unitObjs == null) {
                     reason = "it was written for a different model or format";
                 } else if (!Files.isRegularFile(bin)) {
@@ -360,15 +410,16 @@ public final class QuantFile implements AutoCloseable {
             units.add(unitId);
             committed = offset;
             Path tmp = partial.resolveSibling(partial.getFileName() + ".tmp");
-            Files.writeString(tmp, Json.write(Json.obj("version", VERSION, "quant", quant.name(), "model", model,
-                    "units", units, "tensors", index)));
+            Files.writeString(tmp, Json.write(Json.obj("version", VERSION, "layout", LAYOUT_VERSION, "quant", quant.name(),
+                    "model", model, "units", units, "tensors", index)));
             Files.move(tmp, partial, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         }
 
         public void finish() throws IOException {
             ch.force(true);
             ch.close();
-            Files.writeString(jsonPath(dir, quant), Json.write(Json.obj("version", VERSION, "quant", quant.name(), "tensors", index)));
+            Files.writeString(jsonPath(dir, quant), Json.write(Json.obj("version", VERSION, "layout", LAYOUT_VERSION,
+                    "quant", quant.name(), "model", model, "tensors", index)));
             Files.deleteIfExists(partial);
         }
 

@@ -157,25 +157,51 @@ public final class ModelWeights implements AutoCloseable {
         return m;
     }
 
-    private static final String STALE_HINT = " (stale jllm-*.bin cache? delete it to reconvert)";
+    static final String STALE_HINT = " (stale cache)";
 
     /**
      * Opens the quantized cache in {@code dir}, converting the Hugging Face checkpoint first if there is none.
+     *
+     * <p>A cache that exists but cannot be used — written by another {@link QuantFile#LAYOUT_VERSION}, an
+     * unparseable or corrupt index, or tensors whose shapes do not match {@code cfg} — is deleted and converted
+     * again. The second attempt must succeed: a shape mismatch after a fresh conversion is a real inconsistency
+     * between the checkpoint and its config and is reported as such.
      */
     public static ModelWeights load(Path dir, ModelConfig cfg, QType quant, ShardProvider shards) throws IOException {
+        boolean converted = false;
         if (!QuantFile.exists(dir, quant)) {
             ModelConverter.convert(dir, cfg, quant, shards);
+            converted = true;
         }
-        long t0 = System.nanoTime();
-        QuantFile file = QuantFile.open(dir, quant);
-        try {
-            ModelWeights w = new ModelWeights(cfg, quant, file);
-            System.err.printf("Mapped %s weights (%s, %.0f MB) in %.2fs%n", cfg.architecture(), quant,
-                    file.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
-            return w;
-        } catch (RuntimeException e) {
-            file.close();
-            throw e;
+        while (true) {
+            long t0 = System.nanoTime();
+            String stale = null;
+            try {
+                QuantFile file = QuantFile.open(dir, quant);
+                try {
+                    ModelWeights w = new ModelWeights(cfg, quant, file);
+                    System.err.printf("Mapped %s weights (%s, %.0f MB) in %.2fs%n", cfg.architecture(), quant,
+                            file.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
+                    return w;
+                } catch (IllegalArgumentException e) {
+                    // a tensor is missing or has the wrong shape: the cache was written for another checkpoint or config
+                    file.close();
+                    stale = e.getMessage();
+                } catch (RuntimeException e) {
+                    file.close();
+                    throw e;
+                }
+            } catch (QuantFile.StaleCacheException e) {
+                stale = e.getMessage();
+            }
+            if (converted) {
+                throw new IOException("the freshly converted cache " + QuantFile.binPath(dir, quant)
+                        + " does not match the config: " + stale);
+            }
+            System.err.println("Reconverting " + QuantFile.binPath(dir, quant).getFileName() + ": " + stale);
+            QuantFile.delete(dir, quant);
+            ModelConverter.convert(dir, cfg, quant, shards);
+            converted = true;
         }
     }
 
