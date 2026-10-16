@@ -1,6 +1,7 @@
 # 7. The CPU backend: SIMD with the Vector API — in detail
 
-Code: `cpu/VectorKernels.java`, `cpu/ThreadPool.java`, `cpu/CpuBackend.java`
+Code: `cpu/VectorKernels.java`, `cpu/ThreadPool.java`, `cpu/CpuMatmul.java`, `cpu/CpuBackend.java`, `cpu/KvCache.java`,
+`cpu/Int8Kernels.java`, `cpu/MlaCpu.java`, `cpu/MambaCpuBackend.java`
 
 This chapter explains how the 25 lines of math from [05](05-transformer-math.md#513-the-whole-thing-in-25-lines)
 run fast on a CPU, using nothing but the JDK: the Vector API for SIMD arithmetic, the FFM API to read
@@ -104,21 +105,21 @@ size ([7.13](#713-the-f16-kv-cache-kvcache)).
 for t < n:  embed.dequantizeRow(tokens[off+t], x, t*dim)              // 5.2
 for each layer l, with its LayerPlan p = (attention, residual, ffn):
     rmsnorm(x, xb, L.attnNorm, n, dim)                                  // 5.3
-    p.attention.run(l, L, n, pos)                                       // 5.4-5.6: Gqa (below) or MlaCpu.run
+    p.attention.run(l, n, pos)                                          // 5.4-5.6: GqaStep (below) or MlaCpu.run
     p.residual.add(L.wo, att, L.postAttnNorm, n)                        // 5.7  x += o_proj(att)   (post-norm families: x += rmsnorm(o_proj(att)))
     rmsnorm(x, xb, L.ffnNorm, n, dim)
     p.ffn.run(L, n)                                                     // 5.8 / 12: DenseGlu, moe, or moe + shared experts
-if logits != null: rmsnormRow(last token); matmul(lmHead, xb, logits, 0, 1, false)             // 5.10
+if logits != null: rmsnormRow(last token); mm.mul(lmHead, xb, logits, 0, 1, false)             // 5.10  (+ Gemma's final soft-cap)
 
-Gqa.run:   matmul(L.wq, xb, q);  matmul(L.wk, xb, kStage);  matmul(L.wv, xb, vStage)          // k/v of the chunk, [n, kvDim] staging
+GqaStep.run: matmul(w.wq, xb, q);  matmul(w.wk, xb, kStage);  matmul(w.wv, xb, vStage)         // k/v of the chunk, [n, kvDim] staging
            (+ bias)  normRope(q);  normRope(kStage)                                            // 5.5
            kv.store(l, pos, kStage, vStage, n)                           // into the KvCache: f32 copy or f16 rounding (7.13)
            kv.attention(pool, l, n, pos, q, att, window, scale, softcap)                        // 5.6, 7.5
-DenseGlu.run:  matmul(L.wGateUp, xb, gateUp);  siluMul | geluMul;  residual.add(L.wDown, hidden, L.postMlpNorm, n)
+DenseGlu.run:  matmul(w.gateUp, xb, gateUp);  siluMul | geluMul;  residual.add(w.down, hidden, postMlpNorm, n)
 ```
 
-The three strategy objects of a layer (`LayerPlan`) are resolved once in the constructor from the config and
-the weights - which attention (GQA or DeepSeek MLA), which residual rule (plain add, or the Glm4 / Gemma
+The three strategy objects of a layer (`LayerPlan`) are resolved once in the constructor from the layer's
+`LayerSpec` and its weights - which attention (GQA or DeepSeek MLA), which residual rule (plain add, or the Glm4 / Gemma
 post-norm add), which feed-forward (dense GLU with SiLU or GELU, routed experts, routed plus shared experts) -
 so the per-layer loop has no conditionals on optional pieces; each strategy runs exactly the statements the
 straight-line code ran, in the same order.
@@ -183,6 +184,10 @@ floats out (`mul(scale).intoArray`) for the prefill path.
 
 ## 7.4 Decode vs prefill matmul (`CpuBackend.matmul`)
 
+`CpuBackend.matmul` is a one-line wrapper around `CpuMatmul.mul`. `CpuMatmul` is the one quantized matmul shared by
+`CpuBackend`, `MlaCpu` and `MambaCpuBackend`, so everything below (and the int8 path of [7.10](#710-int8-activations-integer-dot-products-int8kernels))
+applies to all three. It also owns the thread-local row scratch.
+
 ### Decode: `n == 1`, parallel over rows
 
 ```java
@@ -194,7 +199,7 @@ pool.forRange(rows, 16, (r0, r1) -> {
 });
 ```
 
-Each output element is one `dotRow`; the rows are split across threads in chunks of ≥ 16. Every weight byte is
+Each output element is one `dotRow` (or `Int8Kernels.dotRow` when int8 activations apply, 7.10); the rows are split across threads in chunks of ≥ 16. Every weight byte is
 loaded exactly once, which is optimal for traffic. **Arithmetic intensity:** per 32 weights we load 16 bytes of
 weights + 128 bytes of `x` (but `x` is 4 KB and stays in L1 cache) and do 32 multiply-adds → 2 FMAs per
 weight byte from DRAM. At that ratio the loop *would* be memory-bound if the instruction count per block were
@@ -210,12 +215,14 @@ pool.forRange(groups, 1, (g0, g1) -> {              // groups = rows / 4
     float[] tmp = scratch.get();
     for (int g = g0; g < g1; g++) {
         for k < 4:  VectorKernels.dequantRow(wt, r + k, tmp, k * cols);   // 4 rows → floats, once
-        for t < n:  VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, outOff + t * rows + r, acc);
+        for t < n:  dot4x4 four tokens at a time, dot4 for the last ones      // out[t, r..r+4) (+)= ...
     }
 });
 ```
 
-`dot4` computes four dot products at once, sharing each load of `x`:
+`dot4` computes four dot products at once, sharing each load of `x`; `dot4x4` does the same for four rows against
+four tokens (16 accumulators, each row load shared by four tokens), and the loop above uses it for every group of
+four tokens and `dot4` for the remainder:
 
 ```java
 for (i = 0; i < n; i += FL) {
@@ -226,8 +233,9 @@ for (i = 0; i < n; i += FL) {
 ```
 
 Arithmetic intensity now: per 4 × 64 = 256 FMAs we loaded the 4 rows once (dequantized, from L2/L1) and `x`
-once per 4 rows. The expensive unpack happens `1/n` as often — this is why prefill reaches ~150 tok/s where
-decode reaches ~17 on the same hardware. Rows left over when `rows % 4 != 0` fall back to `dotRow`.
+once per 4 rows. The expensive unpack happens `1/n` as often — this is why prefill reaches ~240 tok/s where
+float decode reaches ~13 on the same hardware. Rows left over when `rows % 4 != 0` fall back to `dotRow`. With `-Djllm.cpu.deterministic` the prefill branch
+is skipped and the tokens go one by one through the decode path ([7.14](#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)).
 
 ---
 
@@ -245,8 +253,8 @@ for s < len:  VectorKernels.axpy(sc[s] * (1 / sum), V[s], att, qo, hd)          
 ```
 
 `dot` is a two-accumulator SIMD dot product (two independent FMA chains hide the FMA latency); `axpy` is
-`y += a·x` over 128 floats (32 FMA instructions). `Math.exp` is scalar and ~20 ns each — at `len = 4096` and
-16 heads that is 1.3 ms per layer per token, a visible share of the step ([7.15](#715-fast-math-jllmcpufastmath)
+`y += a·x` over 128 floats (32 FMA instructions). `Math.exp` is scalar and ~6 ns each — at `len = 4096` and
+16 heads that is 0.4 ms per layer per token, a visible share of the step ([7.15](#715-fast-math-jllmcpufastmath)
 has the vectorized alternative). `ko = (h / group) * hd` selects the shared KV head (GQA).
 
 **Decode (`n == 1`, f32)** runs exactly that loop with one task per query head (16 tasks), the finest split a
@@ -277,6 +285,12 @@ when `group × ctx` score rows fit in 32 K floats per thread (`ctx ≤ 2048` at 
 token at long contexts, so the per-thread scratch stays near 128 KB. Tasks are handed out heaviest tile first
 (`forRangeFine`, chunk 1): later tokens see more keys, and the fine grain keeps the tail short.
 
+**MLA (DeepSeek).** `MlaCpu` replaces the q/k/v projections and this attention for latent-attention models. Its
+cache holds one row per token and layer of `kvLora + rope` numbers (576 floats for DeepSeek-V2-Lite instead of the
+20 KB of expanded per-head keys and values; half the bytes with `backend.kv-dtype=f16`). `W_kb_k` is absorbed into
+the query, the softmax runs over the latent rows with the same tiling (all heads share the one cached row), and
+`W_kb_v` is applied once to the weighted latent sum. Its matmuls are the shared `CpuMatmul` ([14](14-model-families.md)).
+
 ---
 
 ## 7.6 RMSNorm, RoPE, SiLU
@@ -304,13 +318,13 @@ working space and top-k buffers per thread), a softmax, then 8 passes of argmax 
 sorting), and renormalizes. Then two parallel loops:
 
 1. `forRange(topK * 2m, 32, …)` — all 8 experts' gate/up rows at once; index `i` → slot `k = i / 2m`, row
-   `r = i % 2m`, weight row `assign[k] * 2m + r` in the stacked tensor.
-2. SwiGLU per slot (scalar).
-3. `forRange(dim, 8, …)` — each output row sums `routeWeight[k] · dotRow(expDown, assign[k]*dim + r, h, k*m)`
+   `r = i % 2m`, weight row `assign[k] * 2m + r` in the stacked tensor. (Between the two loops: SwiGLU per slot, scalar.)
+2. `forRange(dim, 8, …)` — each output row sums `routeWeight[k] · dotRow(expDown, assign[k]*dim + r, h, k*m)`
    over the 8 slots and adds to `x`. One writer per element, no synchronization.
 
-Three pool jobs per token-layer (router, gate/up, down) instead of sixteen. Prefill groups the slots by expert
-and runs each expert once over its tokens with the four-row kernel; the per-token combine
+Three pool jobs per token-layer (router, gate/up, down) instead of sixteen. Prefill (`moeBatched`) routes the
+tokens in parallel, groups the `n × topK` slots by expert with a counting sort and runs each used expert once over
+all its slots (`expertMatmul`: four rows dequantized once, `dot4x4` over four slots at a time); the per-token combine
 `x[t] += Σ_k w_k · down_k` is `VectorKernels.combine`, lanes that follow the scalar sum order exactly (product
 rounded, added in `k` order from zero, no FMA, total added last) so it is bit-identical to the loop it replaced.
 Details and the math in [12](12-mixture-of-experts.md).
@@ -333,7 +347,8 @@ issued back to back from one thread.
 - `threads − 1` daemon **workers**; the **caller participates** in every job (it would otherwise idle).
 - There is no job object. The pool holds one set of job fields (body, size, chunk) that the caller writes and
   then publishes by setting one `AtomicLong next` to `epoch << 32 | tasks << 16`: the job's epoch, its task
-  count and (low 16 bits) the next task index in one word. Workers claim tasks with `next.getAndIncrement()`;
+  count and (low 16 bits) the next task index in one word (tasks per job are capped at `MAX_TASKS` so the index can
+  never carry into the count). Workers claim tasks with `next.getAndIncrement()`;
   a claim is valid when its index is below the task count *of the same word*, and only then does the worker
   read the job fields — at that moment the job is provably still running (its claimed task is not done), so
   the fields are that job's. A worker that lagged behind the end of one job and claims a task of the next just
@@ -363,6 +378,9 @@ chunk = ceil(n / tasks)                              → 52 rows per task
 task t covers [t·chunk, min(n, (t+1)·chunk))
 ```
 
+`forRangeFine(n, chunk, body)` is the variant with chunks of exactly `chunk` items and no cap on the task count, for
+loops whose items cost very different amounts (causal attention, [7.5](#75-attention-kvcacheattention)).
+
 More tasks than threads (4×) lets a thread that finishes early take another chunk, evening out imbalance (e.g.
 when one core is also running the JIT). `grain` prevents splitting trivially small loops; `tasks ≤ 1` runs
 inline without touching the pool.
@@ -375,7 +393,7 @@ re-check after publishing `parked`:
 
 ```
 worker:   if (epoch(next) == last)  { parked = true;  if (epoch(next) == last) park(); parked = false; }
-caller:   next.set(epoch << 32);    if (w.parked) unpark(w);
+caller:   next.set(epoch << 32 | tasks << 16);    if (w.parked) unpark(w);
 ```
 
 `next` is atomic and `parked` is `volatile`, so the writes and reads are sequentially consistent: either the
@@ -386,19 +404,20 @@ visible to the caller's read (which then unparks). A spurious wake-up is harmles
 
 ## 7.9 Measured numbers and the bottleneck
 
-Apple M1 Pro, 10 threads, 128-bit NEON, Qwen3-0.6B Q4_0, 413-token prompt:
+Apple M1 Pro, 10 threads, 128-bit NEON, Qwen3-0.6B Q4_0, 413-token prompt (`./jllm bench`; the full table with
+Metal and the MoE model is in [11.1](11-performance.md#111-measured)):
 
-| | tok/s | ms/token | weight bytes per token | implied traffic |
+| | prefill tok/s | decode tok/s | decode ms/token | implied decode traffic (450 MB/token) |
 |---|---|---|---|---|
-| prefill | ~153 | 6.5 | 450 MB / 64 tokens | — |
-| decode | ~17 | 59 | 450 MB | 7.6 GB/s |
+| float activations (`--backend.cpu.int8-activations false`) | ~237 | ~13 | 77 | 5.9 GB/s |
+| int8 activations (default, [7.10](#710-int8-activations-integer-dot-products-int8kernels)) | ~275 | ~51 | 20 | 23 GB/s |
 
-7.6 GB/s is far below the ~200 GB/s the chip can deliver, so decode is **not** memory-bound here. Count the
-work instead: 450 MB of Q4 weights = 14 million 32-weight blocks per token; at ~30 instructions per block
-(7.3) that is ~420 M instructions, spread over 10 cores at ~3 GHz with maybe 2 vector instructions per cycle
-→ ~7 ms if perfectly scheduled, ~59 ms observed — the gap is the `castShape` conversions (not single
+For the float path, 5.9 GB/s is far below the ~200 GB/s the chip can deliver, so decode is **not** memory-bound here. Count the
+work instead: 596 M weights = ~19 million 32-weight blocks per token; at ~30 instructions per block
+(7.3) that is ~560 M instructions, spread over 10 cores at ~3 GHz with maybe 2 vector instructions per cycle
+→ ~9 ms if perfectly scheduled, ~77 ms observed — the gap is the `castShape` conversions (not single
 instructions on NEON), the thread-pool synchronization of 225 jobs, and the scalar `exp` in attention at
-this context length. On AVX-512 the same source code needs 4× fewer instructions per block.
+this context length. On AVX-512 the same source code needs 4× fewer instructions per block. The int8 path (7.10) removes the conversions and lifts decode to ~51 tok/s (23 GB/s), still well under the memory limit.
 
 ---
 
@@ -519,8 +538,8 @@ near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 
 In order of expected payoff on this CPU:
 
-1. **Vectorized exp** in attention and SiLU (a polynomial approximation on `FloatVector`), removing the scalar
-   `Math.exp` that dominates at long contexts.
+1. **Vectorized exp** — done for attention and the soft-caps, opt-in: `-Djllm.cpu.fastmath`
+   ([7.15](#715-fast-math-jllmcpufastmath)). SiLU still uses the scalar `Math.exp`.
 2. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.13](#713-the-f16-kv-cache-kvcache)). What remains is
    a fused f16 dot product that converts inside the SIMD loop instead of expanding each row to scratch first.
 3. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
@@ -538,13 +557,13 @@ In order of expected payoff on this CPU:
 - `dotQ4` loads 16 bytes, splits nibbles into two 16-lane vectors, converts to floats in parts, FMAs with `x`,
   applies the block scale once; weights are read exactly once per token.
 - Decode parallelizes over output rows; prefill dequantizes four rows once and reuses them for all tokens
-  (`dot4`), which is why it is ~9× faster per token.
+  (`dot4`), which is why it is more than an order of magnitude faster per token than float decode.
 - Attention runs per query head for decode and per (kv head, token tile) for prefill, with thread-local scratch;
   MoE adds a router and two loops per token.
 - A spin-then-park pool with caller participation makes ~225 micro-jobs per token cheap; the lost-wakeup race is
   closed by a volatile re-check.
-- On 128-bit NEON the kernel is instruction-bound (byte→float conversions), not memory-bound; integer dot
-  products are the fix.
+- On 128-bit NEON the float kernel is instruction-bound (byte→float conversions), not memory-bound; integer dot
+  products (int8 activations, the default) are the fix: ~4× the decode speed.
 
 ---
 
@@ -646,7 +665,7 @@ default path - that is why it is a switch - but they are close:
   [7.10](#710-int8-activations-integer-dot-products-int8kernels), so the kernel has no lane conversions. Input
   clamped to `[-87, 88]`: the softmax's `exp(s - max)` then bottoms out at `1.6e-38` instead of 0, which is
   invisible after the `1/sum` scaling. Relative error 2.2e-7 over the range (`SmokeTest.fastMath`).
-- `tanhFast(x) = 1 - 2 / (expFast(2x) + 1)`, absolute error 1.7e-7, saturating correctly at both ends.
+- `tanhFast(x) = 1 - 2 / (expFast(2x) + 1)`, absolute error below 2e-6 (`SmokeTest.fastMath` checks it), saturating correctly at both ends.
 - The softmax sum is accumulated lane-wise and reduced once (the default path sums in order).
 - The lane kernels and their scalar tails use the same arithmetic, so a row's result does not depend on where
   the vector loop stops.
