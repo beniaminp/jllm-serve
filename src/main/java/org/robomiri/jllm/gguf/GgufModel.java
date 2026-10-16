@@ -78,6 +78,11 @@ public final class GgufModel implements AutoCloseable {
      * @throws IOException for a file without usable tokenizer metadata
      */
     public Tokenizer tokenizer() throws IOException {
+        return tokenizer(file);
+    }
+
+    /** The tokenizer described by the {@code tokenizer.ggml.*} keys of any GGUF file (also a vocabulary-only one). */
+    public static Tokenizer tokenizer(GgufFile file) throws IOException {
         String[] tokens = file.strings("tokenizer.ggml.tokens");
         if (tokens == null) {
             throw new IOException("the GGUF file has no tokenizer.ggml.tokens");

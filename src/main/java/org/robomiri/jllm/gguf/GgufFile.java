@@ -388,6 +388,9 @@ public final class GgufFile implements AutoCloseable {
             infos.add(new Info(name, dims, type, offset, size));
         }
         long dataStart = (c.pos + alignment - 1) / alignment * alignment;
+        if (infos.isEmpty()) {
+            dataStart = Math.min(dataStart, map.byteSize()); // a vocabulary-only file ends at the header, unpadded
+        }
         if (dataStart < c.pos || dataStart > map.byteSize()) {
             throw new IOException(file + ": the tensor data would start at " + dataStart + ", beyond the end of the file ("
                     + map.byteSize() + " bytes); the file is truncated");

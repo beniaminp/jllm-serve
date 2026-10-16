@@ -213,9 +213,16 @@ public final class GgufTokenizer {
         }
         Map<String, Object> model = Json.obj("type", "BPE", "unk_token", unk, "fuse_unk", true, "byte_fallback", true,
                 "ignore_merges", false, "vocab", vocab, "merges", merges);
+        // SentencePiece's normalization: the dummy prefix is always added (a text that starts with a space gets a
+        // second one), then every space becomes U+2581 -- the normalizer of Llama 2's tokenizer.json, not Metaspace
+        // (which does not prepend when the text already starts with a space)
+        List<Object> norms = new ArrayList<>();
+        if (s.addSpacePrefix()) {
+            norms.add(Json.obj("type", "Prepend", "prepend", "▁"));
+        }
+        norms.add(Json.obj("type", "Replace", "pattern", Json.obj("String", " "), "content", "▁"));
         Map<String, Object> json = Json.obj("model", model, "added_tokens", added,
-                "pre_tokenizer", Json.obj("type", "Metaspace", "replacement", "▁",
-                        "prepend_scheme", s.addSpacePrefix() ? "first" : "never", "split", false),
+                "normalizer", Json.obj("type", "Sequence", "normalizers", norms),
                 "decoder", Json.obj("type", "Sequence", "decoders", List.of(
                         Json.obj("type", "Replace", "pattern", Json.obj("String", "▁"), "content", " "),
                         Json.obj("type", "ByteFallback"),
