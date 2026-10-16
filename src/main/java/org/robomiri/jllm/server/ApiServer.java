@@ -236,26 +236,23 @@ public final class ApiServer implements AutoCloseable {
                     failure[0] = e; // client disconnected: stop generating
                 }
             }, () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
-        } catch (Engine.OverloadedException e) {
-            if (res.started()) {
-                throw e;
-            }
-            res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
-            return;
-        } catch (IllegalArgumentException e) {
-            if (res.started()) {
-                throw e;
-            }
-            res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
-            return;
         } catch (RuntimeException e) {
             if (res.started()) {
                 // The status line is long gone: tell the client in-band (OpenAI SDKs raise on an "error" event),
                 // then end the stream without [DONE]. HttpServer logs the exception and drops the connection.
                 sse(res, Json.obj("error", Json.obj("message", "internal server error", "type", "server_error")));
                 res.end();
+                throw e;
             }
-            throw e;
+            // nothing was sent yet: the engine refused the request before producing a token
+            if (e instanceof Engine.OverloadedException) {
+                res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+            } else if (e instanceof IllegalArgumentException) {
+                res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
+            } else {
+                throw e;
+            }
+            return;
         }
         if (failure[0] != null) {
             throw failure[0];
