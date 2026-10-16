@@ -271,9 +271,22 @@ public record ModelConfig(
         int kvHeads = (int) Json.num(c, "num_key_value_heads", heads);
         int headDim = (int) Json.num(c, "head_dim", dim / heads);
         boolean isDeepseek = modelType.startsWith("deepseek");
+        // transformers >= 5 nests rope_theta / partial_rotary_factor and the scaling keys in rope_parameters
+        // (keyed by layer type for Gemma 3); configs written by transformers 4 use the top-level keys and
+        // rope_scaling. The legacy keys win when both are present; the scaling map is resolved once for every
+        // family here and parsed by parseRopeScaling / DeepSeekConfig.parse.
+        Map<String, Object> ropeParams = Json.map(c, "rope_parameters");
+        Map<String, Object> fullRope = Json.map(ropeParams, "full_attention");
+        Map<String, Object> globalRope = fullRope != null ? fullRope : ropeParams;
+        Map<String, Object> localRope = Json.map(ropeParams, "sliding_attention");
+        Map<String, Object> ropeScaling = Json.map(c, "rope_scaling");
+        if (ropeScaling == null && globalRope != null
+                && (globalRope.containsKey("rope_type") || globalRope.containsKey("type"))) {
+            ropeScaling = globalRope;
+        }
         DeepSeekConfig ds = null;
         if (isDeepseek) {
-            ds = DeepSeekConfig.parse(c, modelType.equals("deepseek_v3"));
+            ds = DeepSeekConfig.parse(c, ropeScaling, modelType.equals("deepseek_v3"));
             headDim = ds.qkDim();   // per-head query/key width; MLA has no grouped KV heads
             kvHeads = heads;
         }
@@ -310,15 +323,12 @@ public record ModelConfig(
             // transformers also adds a bias to o_proj in that case, which this engine does not implement
             throw new IllegalArgumentException("attention_bias=true is only supported for qwen2 and glm (q/k/v bias)");
         }
-        // newer transformers nest rope_theta / partial_rotary_factor in rope_parameters; Hub configs use top level
-        Map<String, Object> ropeParams = Json.map(c, "rope_parameters");
         double partialRotary = Json.dbl(c, "partial_rotary_factor",
-                ropeParams != null ? Json.dbl(ropeParams, "partial_rotary_factor", glm ? 0.5 : 1.0) : glm ? 0.5 : 1.0);
+                Json.dbl(globalRope, "partial_rotary_factor", glm ? 0.5 : 1.0));
         if (partialRotary <= 0 || partialRotary > 1 || (int) (headDim * partialRotary) < 2) {
             throw new IllegalArgumentException("invalid partial_rotary_factor " + partialRotary);
         }
-        double ropeTheta = Json.dbl(c, "rope_theta",
-                ropeParams != null ? Json.dbl(ropeParams, "rope_theta", 10000.0) : 10000.0);
+        double ropeTheta = Json.dbl(c, "rope_theta", Json.dbl(globalRope, "rope_theta", 10000.0));
         int window = 0;
         int windowFrom = 0;
         long sw = Json.num(c, "sliding_window", 0);
@@ -333,22 +343,9 @@ public record ModelConfig(
                 windowFrom = (int) Json.num(c, "max_window_layers", layers);
             }
         }
-        double localTheta = Json.dbl(c, "rope_local_base_freq", 0);
-        Map<String, Object> ropeSource = c;
-        Map<String, Object> rp = Json.map(c, "rope_parameters");
-        if (gemma && rp != null) {
-            // transformers >= 5: rope_parameters, either flat or keyed by layer type
-            Map<String, Object> full = Json.map(rp, "full_attention");
-            Map<String, Object> slide = Json.map(rp, "sliding_attention");
-            Map<String, Object> g = full != null ? full : rp;
-            ropeTheta = Json.dbl(g, "rope_theta", ropeTheta);
-            if (slide != null) {
-                localTheta = Json.dbl(slide, "rope_theta", localTheta);
-            }
-            ropeSource = Json.obj("rope_scaling", g.containsKey("rope_type") ? g : null);
-        }
+        double localTheta = Json.dbl(c, "rope_local_base_freq", Json.dbl(localRope, "rope_theta", 0));
         ModelConfig.RopeScaling scaling = isDeepseek ? null // DeepSeek: yarn lives in ds
-                : parseRopeScaling(ropeSource, (int) (headDim * partialRotary) & ~1);
+                : parseRopeScaling(ropeScaling, c, (int) (headDim * partialRotary) & ~1);
         List<Integer> eos = new java.util.ArrayList<>();
         Object eosRaw = c.get("eos_token_id");
         if (eosRaw instanceof Number n) {
@@ -483,8 +480,11 @@ public record ModelConfig(
                 (float) Json.dbl(c, "layer_norm_epsilon", 1e-5), 0, Json.bool(c, "tie_word_embeddings", true), 0, 0, 0, false, 1, Set.of(), 1.0, null, mp, null);
     }
 
-    private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> c, int rotaryDim) {
-        Map<String, Object> rs = Json.map(c, "rope_scaling");
+    /**
+     * @param rs the scaling map ({@code rope_scaling}, or the {@code rope_parameters} entry), null for plain RoPE
+     * @param c  the config, for the position limits longrope derives its factor from
+     */
+    private static ModelConfig.RopeScaling parseRopeScaling(Map<String, Object> rs, Map<String, Object> c, int rotaryDim) {
         if (rs == null) {
             return null;
         }

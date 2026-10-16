@@ -65,8 +65,12 @@ public record DeepSeekConfig(
         return !topkMethod.equals("greedy");
     }
 
-    /** Parses and validates the DeepSeek keys; {@code v3} is true for {@code model_type: deepseek_v3}. */
-    static DeepSeekConfig parse(Map<String, Object> c, boolean v3) {
+    /**
+     * Parses and validates the DeepSeek keys; {@code v3} is true for {@code model_type: deepseek_v3}.
+     *
+     * @param rs the RoPE scaling map ({@code rope_scaling} or {@code rope_parameters}), null for plain RoPE
+     */
+    static DeepSeekConfig parse(Map<String, Object> c, Map<String, Object> rs, boolean v3) {
         int qLora = (int) Json.num(c, "q_lora_rank", 0);
         int kvLora = (int) Json.num(c, "kv_lora_rank", 0);
         int nope = (int) Json.num(c, "qk_nope_head_dim", 0);
@@ -104,7 +108,6 @@ public record DeepSeekConfig(
 
         Yarn yarn = null;
         double scale = 1.0 / Math.sqrt(nope + rope);
-        Map<String, Object> rs = Json.map(c, "rope_scaling");
         if (rs != null) {
             String type = Json.str(rs, "type", Json.str(rs, "rope_type", "default"));
             if (type.equals("yarn")) {
