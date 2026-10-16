@@ -8,6 +8,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -133,11 +134,33 @@ public final class QuantFile implements AutoCloseable {
         return dir.resolve("jllm-" + quant.name().toLowerCase() + ".json");
     }
 
-    /** Removes the cache files of {@code quant} in {@code dir} (index, blobs and any resume sidecar). */
+    /** Removes the cache files of {@code quant} in {@code dir} (index, blobs, any resume sidecar and temp files). */
     public static void delete(Path dir, QType quant) throws IOException {
-        Files.deleteIfExists(jsonPath(dir, quant));
-        Files.deleteIfExists(binPath(dir, quant));
-        Files.deleteIfExists(partialPath(dir, quant));
+        for (Path p : new Path[]{jsonPath(dir, quant), binPath(dir, quant), partialPath(dir, quant)}) {
+            Files.deleteIfExists(p);
+            Files.deleteIfExists(tmpPath(p));
+        }
+    }
+
+    private static Path tmpPath(Path target) {
+        return target.resolveSibling(target.getFileName() + ".tmp");
+    }
+
+    /**
+     * Writes {@code content} to {@code target} atomically: into a sibling {@code .tmp} file, forced to disk,
+     * then renamed over the target, so a crash leaves either the old file or the complete new one.
+     */
+    static void writeAtomic(Path target, String content) throws IOException {
+        Path tmp = tmpPath(target);
+        try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            ByteBuffer bb = ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8));
+            while (bb.hasRemaining()) {
+                ch.write(bb);
+            }
+            ch.force(true);
+        }
+        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     /**
@@ -476,12 +499,10 @@ public final class QuantFile implements AutoCloseable {
             ch.force(false);
             units.add(unitId);
             committed = offset;
-            Path tmp = partial.resolveSibling(partial.getFileName() + ".tmp");
             Map<String, Object> side = header();
             side.put("units", units);
             side.put("tensors", index);
-            Files.writeString(tmp, Json.write(side));
-            Files.move(tmp, partial, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            writeAtomic(partial, Json.write(side));
         }
 
         /** The common head of the index and the sidecar: versions, quant, model description and identity. */
@@ -492,12 +513,13 @@ public final class QuantFile implements AutoCloseable {
             return h;
         }
 
+        /** Forces the blobs to disk and publishes the index (atomically: it is the "conversion complete" marker). */
         public void finish() throws IOException {
             ch.force(true);
             ch.close();
             Map<String, Object> h = header();
             h.put("tensors", index);
-            Files.writeString(jsonPath(dir, quant), Json.write(h));
+            writeAtomic(jsonPath(dir, quant), Json.write(h));
             Files.deleteIfExists(partial);
         }
 
