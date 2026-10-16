@@ -3,7 +3,9 @@ package org.robomiri.jllm;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.cpu.CpuBackend;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
+import org.robomiri.jllm.engine.DraftModel;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.Speculator;
 import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
@@ -120,7 +122,32 @@ public final class Main {
         QType quant = QType.parse(s.get("model.quant"));
         QType head = QType.parseHead(s.get("model.head-quant"));
         boolean lowDisk = s.getBool("model.low-disk");
-        ShardProvider shards = new ShardProvider() {
+        ShardProvider shards = shardProvider(hub, model, revision, dir, lowDisk);
+        ModelWeights weights = ModelWeights.load(dir, arch, quant, head, shards, model + "@" + revision);
+        int ctx = s.getInt("backend.ctx");
+        int batch = s.getInt("backend.batch");
+        Backend backend = createBackend(s, arch, weights);
+        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
+        try {
+            Engine engine = new Engine(backend, tok, arch, eosIds(dir, tok, arch), s.getLong("server.queue-timeout-ms"));
+            Speculator.Config spec = s.speculation();
+            if (spec.mode() != Speculator.Mode.OFF) {
+                DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch) : null;
+                if (engine.enableSpeculation(spec, draft)) {
+                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase() + ", up to " + spec.k()
+                            + " tokens per pass" + (draft != null ? ", draft " + s.get("engine.draft-model") : ""));
+                }
+            }
+            return new Loaded(weights, engine);
+        } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
+            backend.close();
+            weights.close();
+            throw e;
+        }
+    }
+
+    private static ShardProvider shardProvider(HuggingFaceHub hub, String model, String revision, Path dir, boolean lowDisk) {
+        return new ShardProvider() {
             @Override
             public Path ensure(String name) throws IOException {
                 Path p = dir.resolve(name);
@@ -152,7 +179,9 @@ public final class Main {
                 }
             }
         };
-        ModelWeights weights = ModelWeights.load(dir, arch, quant, head, shards, model + "@" + revision);
+    }
+
+    private static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
@@ -184,14 +213,33 @@ public final class Main {
             weights.close();
             throw e;
         }
-        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + kvDtype);
-        try {
-            return new Loaded(weights, new Engine(backend, tok, arch, eosIds(dir, tok, arch), s.getLong("server.queue-timeout-ms")));
-        } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
-            backend.close();
-            weights.close();
-            throw e;
+        return backend;
+    }
+
+    /** Loads the draft model of {@code engine.draft-model} on the same backend type; it must share the target's tokenizer. */
+    private static DraftModel loadDraft(Settings s, HuggingFaceHub hub, Tokenizer targetTok, Architecture targetArch) throws Exception {
+        String repo = s.get("engine.draft-model");
+        String revision = s.get("model.revision");
+        Path dir = Path.of(s.get("model.dir")).resolve(repo.replace('/', '_'));
+        if (!Files.isRegularFile(dir.resolve("config.json"))) {
+            hub.downloadMetadata(repo, revision, dir);
         }
+        Architecture arch = Architecture.load(dir);
+        if (arch instanceof MambaArch || targetArch instanceof MambaArch) {
+            throw new IllegalArgumentException("engine.draft-model: speculation needs attention (KV cache) models");
+        }
+        System.err.println("Draft model: " + arch);
+        Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
+        String probe = "Hello, world! The quick brown fox \u00e9\u4e2d 123\n\tdef f(x): return x";
+        if (tok.vocabSize() != targetTok.vocabSize() || !java.util.Arrays.equals(tok.encode(probe), targetTok.encode(probe))) {
+            throw new IllegalArgumentException("engine.draft-model " + repo + " does not share the target's tokenizer");
+        }
+        ShardProvider shards = shardProvider(hub, repo, revision, dir, s.getBool("model.low-disk"));
+        ModelWeights weights = ModelWeights.load(dir, arch, QType.parse(s.get("model.quant")),
+                QType.parseHead(s.get("model.head-quant")), shards, repo + "@" + revision);
+        Backend backend = createBackend(s, arch, weights); // closes the weights if it fails
+        System.err.println("Draft backend: " + backend.name());
+        return new DraftModel(backend, arch.core().vocabSize(), weights::close);
     }
 
     private static Set<Integer> eosIds(Path dir, Tokenizer tok, Architecture arch) throws Exception {
@@ -320,7 +368,9 @@ public final class Main {
     }
 
     private static String statsLine(Engine.Stats s) {
-        return String.format("%d prompt tok (%d cached), prefill %.0f ms, %d generated in %.0f ms = %.1f tok/s",
-                s.promptTokens(), s.cachedTokens(), s.prefillMs(), s.generatedTokens(), s.decodeMs(), s.tokPerSec());
+        String spec = s.draftedTokens() == 0 ? "" : String.format(", speculation accepted %d of %d drafted (%.0f%%)",
+                s.acceptedTokens(), s.draftedTokens(), 100.0 * s.acceptedTokens() / s.draftedTokens());
+        return String.format("%d prompt tok (%d cached), prefill %.0f ms, %d generated in %.0f ms = %.1f tok/s%s",
+                s.promptTokens(), s.cachedTokens(), s.prefillMs(), s.generatedTokens(), s.decodeMs(), s.tokPerSec(), spec);
     }
 }

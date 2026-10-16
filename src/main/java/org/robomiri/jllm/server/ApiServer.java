@@ -357,6 +357,8 @@ public final class ApiServer implements AutoCloseable {
                 "cached_tokens", s.cachedTokens(),
                 "prefill_ms", Math.round(s.prefillMs()),
                 "decode_ms", Math.round(s.decodeMs()),
+                "drafted_tokens", s.draftedTokens(),
+                "accepted_draft_tokens", s.acceptedTokens(),
                 "tokens_per_second", Math.round(s.tokPerSec() * 10) / 10.0);
     }
 
