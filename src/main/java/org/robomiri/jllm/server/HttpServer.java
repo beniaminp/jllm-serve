@@ -518,14 +518,36 @@ public final class HttpServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Overall deadline for receiving one request, started at its first byte: {@code readTimeoutMs} bounds each
+     * individual read, this bounds the whole request (headers and body), so a client trickling one byte per
+     * read timeout cannot hold a connection open indefinitely. 408 when exceeded.
+     */
+    private final class RequestClock {
+        private long deadline; // nanoTime; 0 = no byte received yet
+
+        void tick() throws HttpError {
+            if (options.readTimeoutMs() <= 0) {
+                return;
+            }
+            long now = System.nanoTime();
+            if (deadline == 0) {
+                deadline = now + options.readTimeoutMs() * 1_000_000L;
+            } else if (now - deadline > 0) {
+                throw new HttpError(408, "request not received within " + options.readTimeoutMs() + " ms");
+            }
+        }
+    }
+
     /** Returns null at EOF before any request bytes. */
     private Request readRequest(InputStream in, OutputStream out) throws IOException {
-        String requestLine = readLine(in);
+        RequestClock clock = new RequestClock();
+        String requestLine = readLine(in, clock);
         if (requestLine == null) {
             return null;
         }
         while (requestLine.isEmpty()) { // tolerate stray CRLFs between keep-alive requests
-            requestLine = readLine(in);
+            requestLine = readLine(in, clock);
             if (requestLine == null) {
                 return null;
             }
@@ -541,7 +563,7 @@ public final class HttpServer implements AutoCloseable {
         Map<String, String> headers = new LinkedHashMap<>();
         int total = 0;
         String line;
-        while ((line = readLine(in)) != null && !line.isEmpty()) {
+        while ((line = readLine(in, clock)) != null && !line.isEmpty()) {
             total += line.length();
             if (total > MAX_HEADER) {
                 throw new HttpError(431, "request headers too large");
@@ -584,20 +606,17 @@ public final class HttpServer implements AutoCloseable {
             out.flush();
         }
         if (cl != null) {
-            body = in.readNBytes((int) len);
-            if (body.length != len) {
-                throw new EOFException();
-            }
+            body = readFully(in, (int) len, clock);
         } else if (chunked) {
-            body = readChunked(in);
+            body = readChunked(in, clock);
         }
         return new Request(parts[0], parts[1], headers, body, http10);
     }
 
-    private byte[] readChunked(InputStream in) throws IOException {
+    private byte[] readChunked(InputStream in, RequestClock clock) throws IOException {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         while (true) {
-            String sizeLine = readLine(in);
+            String sizeLine = readLine(in, clock);
             if (sizeLine == null) {
                 throw new EOFException();
             }
@@ -612,7 +631,7 @@ public final class HttpServer implements AutoCloseable {
                 throw new HttpError(400, "malformed chunk size");
             }
             if (size == 0) {
-                while ((sizeLine = readLine(in)) != null && !sizeLine.isEmpty()) {
+                while ((sizeLine = readLine(in, clock)) != null && !sizeLine.isEmpty()) {
                     // trailers ignored
                 }
                 return bos.toByteArray();
@@ -620,21 +639,33 @@ public final class HttpServer implements AutoCloseable {
             if (bos.size() + size > options.maxBodyBytes()) {
                 throw new HttpError(413, "request body larger than " + options.maxBodyBytes() + " bytes");
             }
-            byte[] chunk = in.readNBytes((int) size);
-            if (chunk.length != size) {
-                throw new EOFException();
-            }
-            bos.write(chunk);
-            if (!"".equals(readLine(in))) { // CRLF after chunk
+            bos.write(readFully(in, (int) size, clock));
+            if (!"".equals(readLine(in, clock))) { // CRLF after chunk
                 throw new HttpError(400, "malformed chunk");
             }
         }
     }
 
-    private static String readLine(InputStream in) throws IOException {
+    /** Reads exactly {@code n} body bytes (EOF before that is an {@link EOFException}), checking the deadline. */
+    private static byte[] readFully(InputStream in, int n, RequestClock clock) throws IOException {
+        byte[] body = new byte[n];
+        int off = 0;
+        while (off < n) {
+            int r = in.read(body, off, Math.min(8192, n - off));
+            if (r < 0) {
+                throw new EOFException();
+            }
+            off += r;
+            clock.tick();
+        }
+        return body;
+    }
+
+    private static String readLine(InputStream in, RequestClock clock) throws IOException {
         StringBuilder sb = new StringBuilder(64);
         int c;
         while ((c = in.read()) >= 0) {
+            clock.tick();
             if (c == '\n') {
                 int n = sb.length();
                 if (n > 0 && sb.charAt(n - 1) == '\r') {

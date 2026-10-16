@@ -47,6 +47,7 @@ public final class ServerTest {
             stalledStreamClient(f);
             disconnectedClient(f, false);
             disconnectedClient(f, true);
+            slowRequest(f);
         }
         System.out.println("all server tests passed");
     }
@@ -152,6 +153,42 @@ public final class ServerTest {
             check(settled - atClose < 50, what + ": stopped within a few tokens (" + (settled - atClose) + " forwards after the close)");
         } finally {
             f.backend.delayMs = 0;
+        }
+    }
+
+    /**
+     * M2: a client that keeps a request alive by sending one header byte at a time (each within the per-read
+     * timeout) gets a 408 once the request as a whole has taken longer than the read timeout; and a keep-alive
+     * connection that goes quiet after a response is closed silently.
+     */
+    static void slowRequest(Fixture f) throws Exception {
+        try (Socket s = f.connect()) {
+            OutputStream out = s.getOutputStream();
+            out.write("GET /health HTTP/1.1\r\nHost: x\r\nX-Slow: ".getBytes(StandardCharsets.ISO_8859_1));
+            out.flush();
+            long t0 = System.nanoTime();
+            try {
+                for (int i = 0; i < 10; i++) { // 3 s of trickling, one byte every 300 ms < READ_TIMEOUT
+                    Thread.sleep(300);
+                    out.write('x');
+                    out.flush();
+                }
+            } catch (IOException e) {
+                // the server has already answered and closed: expected
+            }
+            Resp r = readHeaders(s.getInputStream());
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            check(r.status == 408, "slow request: 408 after " + ms + " ms (per-read timeout never fired)");
+        }
+        try (Socket s = f.connect()) {
+            s.getOutputStream().write(request("GET", "/health", null));
+            s.getOutputStream().flush();
+            check(readResponse(s.getInputStream()).status == 200, "idle keep-alive: first request served");
+            long t0 = System.nanoTime();
+            int c = s.getInputStream().read(); // nothing sent: the server closes after the idle timeout
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            check(c == -1 && ms >= READ_TIMEOUT - 50 && ms < 3 * READ_TIMEOUT,
+                    "idle keep-alive: closed silently after " + ms + " ms");
         }
     }
 
