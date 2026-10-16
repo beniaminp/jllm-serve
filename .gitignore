@@ -41,3 +41,4 @@ build/
 models/
 *.incomplete
 .claude/
+/jllm.properties
