@@ -117,9 +117,11 @@ public final class MambaCpuBackend implements Backend {
         }
         for (int l = 0; l < c.layers(); l++) {
             MambaLayer L = w.layers[l].mamba;
-            for (int t = 0; t < n; t++) {
-                rmsnormRow(x, t * dim, xb, t * dim, L.norm, dim);
-            }
+            pool.forRange(n, 1, (t0, t1) -> {
+                for (int t = t0; t < t1; t++) {
+                    rmsnormRow(x, t * dim, xb, t * dim, L.norm, dim);
+                }
+            });
             mm.mul(L.inProj, xb, xz, 0, n, false);
             conv(L, l, n);
             mm.mul(L.xProj, xc, dbc, 0, n, false);

@@ -169,9 +169,12 @@ public final class CpuBackend implements Backend {
             w.embed.dequantizeRow(tokens[off + t], x, t * dim);
         }
         if (c.embedScale() != 1f) {
-            for (int i = 0, m = n * dim; i < m; i++) {
-                x[i] *= c.embedScale();
-            }
+            float es = c.embedScale();
+            pool.forRange(n, 1, (t0, t1) -> {
+                for (int i = t0 * dim, m = t1 * dim; i < m; i++) {
+                    x[i] *= es;
+                }
+            });
         }
         for (int l = 0; l < c.layers(); l++) {
             ModelWeights.Layer L = w.layers[l];
@@ -261,13 +264,17 @@ public final class CpuBackend implements Backend {
         });
     }
 
-    /** x[t] += rmsnorm(y[t]) * weight for n rows; y is overwritten with the normalized rows. */
+    /** x[t] += rmsnorm(y[t]) * weight for n rows, parallel over tokens; y is overwritten with the normalized rows. */
     private void addNormed(float[] y, float[] weight, int n) {
         int dim = c.dim();
-        rmsnorm(y, y, weight, n, dim);
-        for (int i = 0; i < n * dim; i++) {
-            x[i] += y[i];
-        }
+        pool.forRange(n, 1, (t0, t1) -> {
+            for (int t = t0; t < t1; t++) {
+                rmsnormRow(y, t * dim, y, t * dim, weight, dim);
+                for (int i = t * dim, m = i + dim; i < m; i++) {
+                    x[i] += y[i];
+                }
+            }
+        });
     }
 
     void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
@@ -281,14 +288,16 @@ public final class CpuBackend implements Backend {
         mm.mul(wt, wt.rows, in, out, outOff, n, acc);
     }
 
-    /** buf[off + t*bias.length + i] += bias[i] for n rows (Qwen2 q/k/v bias). */
-    private static void addBias(float[] buf, int off, float[] bias, int n) {
-        for (int t = 0; t < n; t++) {
-            int o = off + t * bias.length;
-            for (int i = 0; i < bias.length; i++) {
-                buf[o + i] += bias[i];
+    /** buf[off + t*bias.length + i] += bias[i] for n rows (Qwen2 q/k/v bias), parallel over tokens. */
+    private void addBias(float[] buf, int off, float[] bias, int n) {
+        pool.forRange(n, 1, (t0, t1) -> {
+            for (int t = t0; t < t1; t++) {
+                int o = off + t * bias.length;
+                for (int i = 0; i < bias.length; i++) {
+                    buf[o + i] += bias[i];
+                }
             }
-        }
+        });
     }
 
     /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
