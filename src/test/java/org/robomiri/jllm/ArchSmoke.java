@@ -17,6 +17,7 @@ import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
+import org.robomiri.jllm.model.QuantFile;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
@@ -42,7 +43,7 @@ public final class ArchSmoke {
         if (!metal) {
             System.out.println("note: Metal unavailable, comparing nothing on the GPU");
         }
-        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K);
+        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K, QType.Q6_K);
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
@@ -53,8 +54,9 @@ public final class ArchSmoke {
                 continue;
             }
             for (QType q : quants) {
-                failures += run(dir, cfg, q, metal, lib);
+                failures += run(dir, cfg, q, QuantFile.DEFAULT_HEAD, metal, lib);
             }
+            failures += run(dir, cfg, QType.Q4_0, QType.Q6_K, metal, lib);
             if (cfg.core().modelType().equals("phi3")) {
                 failures += checkFusedSplit(dir, cfg);
             }
@@ -132,11 +134,11 @@ public final class ArchSmoke {
         return bad;
     }
 
-    private static int run(Path dir, Architecture cfg, QType quant, boolean metal, String lib) throws Exception {
-        String label = dir.getFileName() + " " + quant;
+    private static int run(Path dir, Architecture cfg, QType quant, QType head, boolean metal, String lib) throws Exception {
+        String label = dir.getFileName() + " " + quant + (head == QuantFile.DEFAULT_HEAD ? "" : " head " + head);
         int failures = 0;
         boolean mamba = cfg instanceof MambaArch;
-        try (ModelWeights w = ModelWeights.load(dir, cfg, quant, ShardProvider.local(dir))) {
+        try (ModelWeights w = ModelWeights.load(dir, cfg, quant, head, ShardProvider.local(dir), null)) {
             int[] cpu;
             float[] cpuLogits = new float[cfg.core().vocabSize()];
             try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {

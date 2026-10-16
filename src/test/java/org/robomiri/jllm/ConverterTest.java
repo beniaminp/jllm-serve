@@ -71,6 +71,7 @@ public final class ConverterTest {
         resumeAfterCrash(dir.resolve(QWEN));
         staleCacheReconversion(dir.resolve(MOE));
         identityMismatch(dir.resolve(MOE));
+        headQuant(dir.resolve(MOE));
         biasShardRelease(dir);
         rankCheck(dir);
         duplicateAndOverlap(dir);
@@ -389,6 +390,56 @@ public final class ConverterTest {
         check(other.ensured > 0 && "refs/pr/1".equals(header.get("revision")), "other revision: reconverted and recorded");
         CountingProvider repo = loadCounting(dir, cfg, q, "someone-else/model@refs/pr/1");
         check(repo.ensured > 0, "other repo: reconverted");
+    }
+
+    // ------------------------------------------------------------------ head format (model.head-quant)
+
+    /**
+     * The embedding / LM head format is part of the cache name: a Q6_K head converts {@code jllm-q4_0-h6k.*} next to
+     * the untouched Q8_0-head {@code jllm-q4_0.*}, each holds its own head type, and a cache whose embedding is not
+     * the requested head (a renamed file) is reconverted instead of used.
+     */
+    static void headQuant(Path dir) throws Exception {
+        QType q = QType.Q4_0;
+        Architecture cfg = Architecture.load(dir);
+        QuantFile.delete(dir, q);
+        QuantFile.delete(dir, q, QType.Q6_K);
+        try (ModelWeights w = ModelWeights.load(dir, cfg, q, ShardProvider.local(dir))) {
+            check(w.embed.type == QType.Q8_0, "default head is Q8_0");
+        }
+        String q8Hash = sha256(QuantFile.binPath(dir, q));
+        Path q8Json = QuantFile.jsonPath(dir, q);
+        String q8Index = Files.readString(q8Json);
+        check(!q8Index.contains("\"head\""), "a Q8_0-head index carries no head key");
+        check(QuantFile.binPath(dir, q).getFileName().toString().equals("jllm-q4_0.bin"), "Q8_0-head cache keeps its name");
+        check(!QuantFile.exists(dir, q, QType.Q6_K), "no Q6_K-head cache before it is asked for");
+
+        CountingProvider p = new CountingProvider(dir, false);
+        try (ModelWeights w = ModelWeights.load(dir, cfg, q, QType.Q6_K, p, null)) {
+            check(w.embed.type == QType.Q6_K && (w.lmHead.type == QType.Q6_K), "Q6_K head: embedding / LM head are Q6_K");
+            check(w.decoderLayer(0).wo().type == QType.Q4_0, "Q6_K head: the layers stay Q4_0");
+        }
+        check(p.ensured > 0 && QuantFile.binPath(dir, q, QType.Q6_K).getFileName().toString().equals("jllm-q4_0-h6k.bin"),
+                "Q6_K-head cache is converted under its own name");
+        check(sha256(QuantFile.binPath(dir, q)).equals(q8Hash) && Files.readString(q8Json).equals(q8Index),
+                "the Q8_0-head cache is untouched by the Q6_K-head conversion");
+        check("Q6_K".equals(Json.parseObject(Files.readString(QuantFile.jsonPath(dir, q, QType.Q6_K))).get("head")),
+                "Q6_K-head index records head");
+        CountingProvider again = new CountingProvider(dir, false);
+        try (ModelWeights w = ModelWeights.load(dir, cfg, q, QType.Q6_K, again, null)) {
+            check(w.embed.type == QType.Q6_K, "Q6_K-head cache reloads");
+        }
+        check(again.ensured == 0, "valid Q6_K-head cache is mapped without conversion");
+
+        // a Q8_0-head file posing as the Q6_K-head cache is detected by its embedding type and replaced
+        Files.copy(QuantFile.binPath(dir, q), QuantFile.binPath(dir, q, QType.Q6_K), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(q8Json, QuantFile.jsonPath(dir, q, QType.Q6_K), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        CountingProvider wrong = new CountingProvider(dir, false);
+        try (ModelWeights w = ModelWeights.load(dir, cfg, q, QType.Q6_K, wrong, null)) {
+            check(w.embed.type == QType.Q6_K, "wrong-head cache reconverted to Q6_K");
+        }
+        check(wrong.ensured > 0, "wrong-head cache: reconverted");
+        QuantFile.delete(dir, q, QType.Q6_K);
     }
 
     private static CountingProvider loadCounting(Path dir, Architecture cfg, QType q, String identity) throws IOException {
