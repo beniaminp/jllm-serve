@@ -101,7 +101,7 @@ public final class TokenizerFamiliesTest {
             StreamDecoder sd = new StreamDecoder(tok);
             StringBuilder sb = new StringBuilder();
             for (int id : got) {
-                sb.append(sd.push(tok.tokenBytes(id)));
+                sb.append(sd.push(id));
             }
             sb.append(sd.flush());
             if (!sb.toString().equals(dec)) {
@@ -323,6 +323,32 @@ public final class TokenizerFamiliesTest {
         checkEq(t.encode("zz"), new int[]{1, 0}, "unknown characters fuse into one <unk> (after the prefix)");
         check(t.decode(new int[]{1, 7, 8}).equals("é"), "byte fallback decodes to bytes; first space stripped");
         check(!t.isByteLevel(), "SentencePiece-style tokenizer is not byte-level");
+
+        // a Metaspace decoder drops every ▁ of the first token (reference: decode_chain of Metaspace), not one
+        // space of the text; with prepend_scheme "never" nothing is dropped
+        String msVocab = "{\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"byte_fallback\":true,\"vocab\":{\"<unk>\":0,"
+                + "\"▁\":1,\"▁▁a\":2,\"▁b\":3,\"a\":4,\"b▁\":5,\"<0x41>\":6},\"merges\":[]},"
+                + "\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"▁\",\"prepend_scheme\":\"first\",\"split\":false},";
+        Tokenizer ms = Tokenizer.fromJson(msVocab + "\"decoder\":{\"type\":\"Sequence\",\"decoders\":[{\"type\":\"Metaspace\","
+                + "\"replacement\":\"▁\",\"prepend_scheme\":\"always\",\"split\":false},{\"type\":\"ByteFallback\"},"
+                + "{\"type\":\"Fuse\"}]}}");
+        int[][] seqs = {{2, 3}, {1, 3}, {1, 1, 3}, {5, 3}, {6, 3}, {4, 2}};
+        String[] want = {"a b", " b", "  b", "b b", "A b", "a  a"};
+        for (int i = 0; i < seqs.length; i++) {
+            check(ms.decode(seqs[i]).equals(want[i]), "metaspace decoder " + Arrays.toString(seqs[i]) + ": got "
+                    + Json.write(ms.decode(seqs[i])) + " expected " + Json.write(want[i]));
+            StreamDecoder sd = new StreamDecoder(ms);
+            StringBuilder sb = new StringBuilder();
+            for (int id : seqs[i]) {
+                sb.append(sd.push(id));
+            }
+            sb.append(sd.flush());
+            check(sb.toString().equals(want[i]), "metaspace stream decoder " + Arrays.toString(seqs[i]) + ": got "
+                    + Json.write(sb.toString()));
+        }
+        Tokenizer msNever = Tokenizer.fromJson(msVocab + "\"decoder\":{\"type\":\"Metaspace\",\"replacement\":\"▁\","
+                + "\"prepend_scheme\":\"never\",\"split\":false}}");
+        check(msNever.decode(new int[]{2, 3}).equals("  a b"), "metaspace decoder without prefix keeps all spaces");
     }
 
     private static void expectStops(String name, int... ids) {

@@ -63,6 +63,8 @@ public final class Tokenizer {
     private final int unkId;
     private final int[] byteTokenIds = new int[256];
     private final int stripOnDecode;
+    /** A Metaspace decoder with a prefix: every {@code ▁} of the first decoded token is dropped. */
+    private final boolean metaspaceDecoder;
     private final int bosId;
     private final int eosId;
     private final boolean addBos;
@@ -175,6 +177,7 @@ public final class Tokenizer {
         }
         preTokenizer = pre;
         stripOnDecode = decodeStrip(decoderNode);
+        metaspaceDecoder = metaspacePrefixDecoder(decoderNode);
 
         // ---- id tables
         idToBytes = new byte[maxId + 1][];
@@ -421,14 +424,26 @@ public final class Tokenizer {
     }
 
     /**
+     * Bytes of a token at a given position of the output: with a {@code Metaspace} decoder that prepends a prefix,
+     * the reference drops every {@code ▁} of the <em>first</em> token (not one space of the text), so
+     * {@code decode(["▁▁a", "▁b"])} is {@code "a b"}. Elsewhere identical to {@link #tokenBytes(int)}.
+     */
+    public byte[] tokenBytes(int id, boolean first) {
+        if (!first || !metaspaceDecoder || id < 0 || id >= idToString.length || idToString[id] == null) {
+            return tokenBytes(id);
+        }
+        return decodeSentencePiece(idToString[id].replace("▁", ""));
+    }
+
+    /**
      * Concatenates the token bytes and decodes them as UTF-8. Special tokens are written out literally. For
      * SentencePiece-style tokenizers whose decoder strips the leading space (Mistral, Phi-3) the first space
      * is dropped, like the reference implementation.
      */
     public String decode(int[] ids) {
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
-        for (int id : ids) {
-            bos.writeBytes(tokenBytes(id));
+        for (int i = 0; i < ids.length; i++) {
+            bos.writeBytes(tokenBytes(ids[i], i == 0));
         }
         byte[] all = bos.toByteArray();
         int skip = 0;
@@ -744,7 +759,7 @@ public final class Tokenizer {
         return false;
     }
 
-    /** How many leading spaces the decoder removes: a {@code Strip} decoder with start>0, or Metaspace with a prefix. */
+    /** How many leading spaces a {@code Strip} decoder (start>0) removes from the fused text. */
     private static int decodeStrip(Map<String, Object> node) {
         if (node == null) {
             return 0;
@@ -753,10 +768,6 @@ public final class Tokenizer {
         int n = 0;
         if (type.equals("Strip") && " ".equals(Json.str(node, "content", " "))) {
             n = (int) Json.num(node, "start", 0);
-        } else if (type.equals("Metaspace")) {
-            String scheme = Json.str(node, "prepend_scheme", null);
-            boolean prefix = scheme != null ? !scheme.equals("never") : Json.bool(node, "add_prefix_space", true);
-            n = prefix ? 1 : 0;
         }
         List<Object> children = Json.list(node, "decoders");
         if (children != null) {
@@ -765,6 +776,26 @@ public final class Tokenizer {
             }
         }
         return n;
+    }
+
+    /** True when a {@code Metaspace} decoder with a prefix scheme other than {@code never} is in the chain. */
+    private static boolean metaspacePrefixDecoder(Map<String, Object> node) {
+        if (node == null) {
+            return false;
+        }
+        if (Json.str(node, "type", "").equals("Metaspace")) {
+            String scheme = Json.str(node, "prepend_scheme", null);
+            return scheme != null ? !scheme.equals("never") : Json.bool(node, "add_prefix_space", true);
+        }
+        List<Object> children = Json.list(node, "decoders");
+        if (children != null) {
+            for (Object c : children) {
+                if (metaspacePrefixDecoder(asMap(c))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** @return {bosId or -1} from a TemplateProcessing {@code single} template that starts with a special token */

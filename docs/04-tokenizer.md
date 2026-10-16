@@ -263,9 +263,11 @@ family (Mistral, Gemma, Phi-3) never touches bytes in the vocabulary strings. In
 - **Decoding** turns `▁` back into a space and `<0xXX>` tokens into the raw byte (`tokenBytes(id)` returns that
   single byte, so `StreamDecoder` reassembles multi-byte characters as before). Mistral's and Phi-3's decoder
   ends with `Strip(start=1)`, which removes the first space of the whole text (the one the prefix added);
-  `Tokenizer.decode` does the same and `new StreamDecoder(tokenizer)` does it for streams. Consequently
-  `decode(encode(" x"))` is `"x"` for those two, exactly like the reference. `clean_up_tokenization_spaces` is
-  never applied.
+  `Tokenizer.decode` does the same and `new StreamDecoder(tokenizer)` does it for streams (feed it ids with
+  `push(int)`). Consequently `decode(encode(" x"))` is `"x"` for those two, exactly like the reference. A
+  `Metaspace` *decoder* (older Llama-2-style conversions) is different: the reference drops every `▁` of the
+  **first token** — `decode(["▁▁a", "▁b"])` is `"a b"` — which `tokenBytes(id, first)` reproduces.
+  `clean_up_tokenization_spaces` is never applied.
 
 Gemma deserves one remark: after the normalizer there are no spaces left, so its `Split` does nothing and the
 **whole text is a single BPE chunk** (merges can cross punctuation and newlines; `\n\n` is one token). The merge

@@ -13,17 +13,34 @@ public final class StreamDecoder {
     private int len;
     /** Leading spaces still to be dropped (SentencePiece decoders such as Mistral's strip the first one). */
     private int strip;
+    private final Tokenizer tokenizer;
+    private boolean first = true;
 
     public StreamDecoder() {
+        this.tokenizer = null;
     }
 
-    /** A decoder that, like {@link Tokenizer#decode}, drops the leading space the tokenizer's decoder strips. */
+    /**
+     * A decoder that reproduces {@link Tokenizer#decode} token by token: it drops the leading space the
+     * tokenizer's decoder strips and, with a Metaspace decoder, the {@code ▁} of the first token (use
+     * {@link #push(int)}).
+     */
     public StreamDecoder(Tokenizer tokenizer) {
+        this.tokenizer = tokenizer;
         this.strip = tokenizer.decodeStripLeading();
+    }
+
+    /** Appends one token and returns the text that is now complete; needs the {@link Tokenizer} constructor. */
+    public String push(int id) {
+        if (tokenizer == null) {
+            throw new IllegalStateException("push(id) needs a StreamDecoder built with a Tokenizer");
+        }
+        return push(tokenizer.tokenBytes(id, first));
     }
 
     /** Appends token bytes and returns the text that is now complete (possibly empty). */
     public String push(byte[] bytes) {
+        first = false;
         if (len + bytes.length > buf.length) {
             buf = Arrays.copyOf(buf, Math.max(buf.length * 2, len + bytes.length));
         }
