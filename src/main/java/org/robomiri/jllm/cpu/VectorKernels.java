@@ -266,6 +266,122 @@ public final class VectorKernels {
         }
     }
 
+    // ------------------------------------------------------------------ fast math (opt-in, not bit-exact)
+
+    /**
+     * {@code -Djllm.cpu.fastmath=true}: the attention softmax and the soft-capping use the polynomial
+     * {@link #expFast} / {@link #tanhFast} on float lanes instead of scalar {@link Math#exp} / {@link Math#tanh}.
+     * Relative error about 2e-7 (exp) and 1e-6 (tanh), so not bit-identical to the default path; off by default.
+     */
+    public static final boolean FASTMATH = Boolean.getBoolean("jllm.cpu.fastmath");
+
+    private static final float LOG2E = 1.4426950408889634f;
+    private static final float LN2_HI = 0.693145751953125f;    // ln 2 split so that n * LN2_HI is exact for |n| < 2^10
+    private static final float LN2_LO = 1.428606765330187e-6f;
+    private static final float EXP_MIN = -87.0f;               // e^-87 = 1.6e-38, the smallest normal magnitude
+    private static final float EXP_MAX = 88.0f;
+    private static final float ROUND_MAGIC = 12582912f;        // 1.5 * 2^23: v + MAGIC - MAGIC rounds v to the nearest integer
+    private static final int ROUND_MAGIC_BITS = Float.floatToRawIntBits(ROUND_MAGIC);
+
+    /**
+     * {@code e^x} per lane: {@code x = n ln 2 + r} with {@code |r| <= ln 2 / 2}, a degree-6 Taylor polynomial for
+     * {@code e^r} (Horner, FMAs) and {@code 2^n} built from the exponent bits. {@code x} is clamped to
+     * {@code [-87, 88]}, so underflow stops at {@code 1.6e-38} instead of 0 (harmless in a softmax). The integer
+     * {@code n} comes out of the 1.5 * 2^23 rounding trick as in {@link Int8Kernels}, without a conversion node.
+     */
+    public static FloatVector expFast(FloatVector x) {
+        x = x.max(EXP_MIN).min(EXP_MAX);
+        FloatVector t = x.mul(LOG2E).add(ROUND_MAGIC);
+        FloatVector n = t.sub(ROUND_MAGIC);
+        FloatVector r = n.fma(FloatVector.broadcast(F, -LN2_HI), x);
+        r = n.fma(FloatVector.broadcast(F, -LN2_LO), r);
+        FloatVector p = FloatVector.broadcast(F, 1f / 720);
+        p = p.fma(r, FloatVector.broadcast(F, 1f / 120));
+        p = p.fma(r, FloatVector.broadcast(F, 1f / 24));
+        p = p.fma(r, FloatVector.broadcast(F, 1f / 6));
+        p = p.fma(r, FloatVector.broadcast(F, 0.5f));
+        p = p.fma(r, FloatVector.broadcast(F, 1f));
+        p = p.fma(r, FloatVector.broadcast(F, 1f));
+        FloatVector scale = t.reinterpretAsInts().sub(ROUND_MAGIC_BITS).add(127).lanewise(VectorOperators.LSHL, 23)
+                .reinterpretAsFloats();
+        return p.mul(scale);
+    }
+
+    /** Scalar twin of {@link #expFast} (same arithmetic, for loop tails). */
+    public static float expFast(float x) {
+        x = Math.min(Math.max(x, EXP_MIN), EXP_MAX);
+        float t = x * LOG2E + ROUND_MAGIC;
+        float n = t - ROUND_MAGIC;
+        float r = Math.fma(n, -LN2_HI, x);
+        r = Math.fma(n, -LN2_LO, r);
+        float p = 1f / 720;
+        p = Math.fma(p, r, 1f / 120);
+        p = Math.fma(p, r, 1f / 24);
+        p = Math.fma(p, r, 1f / 6);
+        p = Math.fma(p, r, 0.5f);
+        p = Math.fma(p, r, 1f);
+        p = Math.fma(p, r, 1f);
+        return p * Float.intBitsToFloat((Float.floatToRawIntBits(t) - ROUND_MAGIC_BITS + 127) << 23);
+    }
+
+    /** {@code tanh(x) = 1 - 2 / (e^{2x} + 1)} per lane with {@link #expFast}; saturates correctly at both ends. */
+    public static FloatVector tanhFast(FloatVector x) {
+        FloatVector e = expFast(x.add(x));
+        return FloatVector.broadcast(F, 1f).sub(FloatVector.broadcast(F, 2f).div(e.add(1f)));
+    }
+
+    public static float tanhFast(float x) {
+        return 1f - 2f / (expFast(x + x) + 1f);
+    }
+
+    /**
+     * Softmax numerator in place: {@code x[i] = exp(x[i] - max)} for {@code i in [o, o + n)}, returning the sum.
+     * {@link #FASTMATH}: vector lanes and {@link #expFast}, the sum accumulated lane-wise and reduced once;
+     * otherwise scalar {@link Math#exp} summed in order, which is what the attention loops always did.
+     */
+    public static float softmaxExp(float[] x, int o, int n, float max) {
+        if (!FASTMATH) {
+            float sum = 0;
+            for (int i = o; i < o + n; i++) {
+                float e = (float) Math.exp(x[i] - max);
+                x[i] = e;
+                sum += e;
+            }
+            return sum;
+        }
+        FloatVector mv = FloatVector.broadcast(F, max);
+        FloatVector acc = FloatVector.zero(F);
+        int i = o;
+        int ub = o + F.loopBound(n);
+        for (; i < ub; i += FL) {
+            FloatVector e = expFast(FloatVector.fromArray(F, x, i).sub(mv));
+            e.intoArray(x, i);
+            acc = acc.add(e);
+        }
+        float sum = acc.reduceLanes(VectorOperators.ADD);
+        for (; i < o + n; i++) {
+            float e = expFast(x[i] - max);
+            x[i] = e;
+            sum += e;
+        }
+        return sum;
+    }
+
+    /** {@code x[i] = tanh(x[i] * (1 / cap)) * cap} for {@code i in [o, o + n)} with {@link #tanhFast} (callers check {@link #FASTMATH}). */
+    public static void softcapFast(float[] x, int o, int n, float cap) {
+        float inv = 1f / cap; // lanes and the scalar tail both multiply by the reciprocal, so they agree bit for bit
+        FloatVector iv = FloatVector.broadcast(F, inv);
+        FloatVector cv = FloatVector.broadcast(F, cap);
+        int i = o;
+        int ub = o + F.loopBound(n);
+        for (; i < ub; i += FL) {
+            tanhFast(FloatVector.fromArray(F, x, i).mul(iv)).mul(cv).intoArray(x, i);
+        }
+        for (; i < o + n; i++) {
+            x[i] = tanhFast(x[i] * inv) * cap;
+        }
+    }
+
     static float sumSquares(float[] x, int xo, int n) {
         return dot(x, xo, x, xo, n);
     }

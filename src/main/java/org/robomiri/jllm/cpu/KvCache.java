@@ -91,6 +91,25 @@ public abstract class KvCache {
     /** Expands the {@code headDim} values of kv head slice {@code ko} of row {@code s} into {@code dst[d ..]}. */
     abstract void expand(int layer, boolean values, int s, int ko, float[] dst, int d);
 
+    private static final boolean FASTMATH = VectorKernels.FASTMATH;
+
+    /**
+     * Softmax numerator of the {@code n} scaled scores at {@code sc[o ..]} in place, returning their sum: the
+     * max in ascending order, {@code exp(s - max)} and the sum in ascending order. Fast math
+     * ({@link VectorKernels#FASTMATH}) applies the soft-cap here on lanes (the score pass left it out) and uses the
+     * polynomial exp; otherwise the scalar {@code Math.exp} of the original loop.
+     */
+    static float softmax(float[] sc, int o, int n, float softcap) {
+        if (softcap > 0 && FASTMATH) {
+            VectorKernels.softcapFast(sc, o, n, softcap);
+        }
+        float max = Float.NEGATIVE_INFINITY;
+        for (int i = o; i < o + n; i++) {
+            max = Math.max(max, sc[i]);
+        }
+        return VectorKernels.softmaxExp(sc, o, n, max);
+    }
+
     /** The tiled kernel described in the class comment, for every (kv head, token tile) pair of the chunk. */
     final void attentionTiled(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
                               float scale, float softcap) {
@@ -129,7 +148,7 @@ public abstract class KvCache {
                         int row = (t - t0) * group;
                         for (int h = 0; h < group; h++) {
                             float d = VectorKernels.dot(q, qo + h * hd, kArr, koff, hd) * scale;
-                            sc[(row + h) * ctx + s] = softcap > 0 ? (float) Math.tanh(d / softcap) * softcap : d;
+                            sc[(row + h) * ctx + s] = softcap > 0 && !FASTMATH ? (float) Math.tanh(d / softcap) * softcap : d;
                         }
                     }
                 }
@@ -140,17 +159,7 @@ public abstract class KvCache {
                     for (int h = 0; h < group; h++) {
                         int row = (t - t0) * group + h;
                         int so = row * ctx;
-                        float max = Float.NEGATIVE_INFINITY;
-                        for (int s = first; s < len; s++) {
-                            max = Math.max(max, sc[so + s]);
-                        }
-                        float sum = 0;
-                        for (int s = first; s < len; s++) {
-                            float e = (float) Math.exp(sc[so + s] - max);
-                            sc[so + s] = e;
-                            sum += e;
-                        }
-                        sc[invOff + row] = 1f / sum;
+                        sc[invOff + row] = 1f / softmax(sc, so + first, len - first, softcap);
                         Arrays.fill(att, qo + h * hd, qo + (h + 1) * hd, 0f);
                     }
                 }
@@ -226,22 +235,11 @@ public abstract class KvCache {
                 for (int h = h0; h < h1; h++) {
                     int ko = (h / group) * hd;
                     int qo = h * hd;
-                    float max = Float.NEGATIVE_INFINITY;
                     for (int s = first; s < len; s++) {
                         float d = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;
-                        if (softcap > 0) {
-                            d = (float) Math.tanh(d / softcap) * softcap;
-                        }
-                        sc[s] = d;
-                        max = Math.max(max, d);
+                        sc[s] = softcap > 0 && !FASTMATH ? (float) Math.tanh(d / softcap) * softcap : d;
                     }
-                    float sum = 0;
-                    for (int s = first; s < len; s++) {
-                        float e = (float) Math.exp(sc[s] - max);
-                        sc[s] = e;
-                        sum += e;
-                    }
-                    float inv = 1f / sum;
+                    float inv = 1f / softmax(sc, first, len - first, softcap);
                     Arrays.fill(att, qo, qo + hd, 0f);
                     for (int s = first; s < len; s++) {
                         VectorKernels.axpy(sc[s] * inv, vc, s * kvDim + ko, att, qo, hd);

@@ -600,3 +600,32 @@ results). Within one tier the results are exact: with `-Xint` (tiny models only;
 about 1 000× slower) the same prompt gives bit-identical logits run after run, and under
 `jllm.cpu.deterministic` also for `--batch 1` versus `--batch 16`. For greedy text this noise only matters at a
 near-tie; the `run` gates in [11](11-performance.md) have been stable across hundreds of runs.
+
+---
+
+## 7.15 Fast math (`jllm.cpu.fastmath`)
+
+`-Djllm.cpu.fastmath=true` (system property, default off; the backend name reports `fastmath`) replaces the
+scalar `Math.exp` of the attention softmax and the `Math.tanh` of the attention and final-logit soft-caps with
+polynomial kernels on float lanes (`VectorKernels.expFast` / `tanhFast`, used through `softmaxExp` and
+`softcapFast`). Everything else, including SiLU, keeps `Math.exp`. The results are *not* bit-identical to the
+default path - that is why it is a switch - but they are close:
+
+- `expFast`: `x = n·ln 2 + r` with `|r| ≤ ln 2 / 2`, a degree-6 Taylor polynomial in `r` (Horner with FMAs) and
+  `2^n` assembled from the exponent bits; `n` comes from the `1.5 · 2^23` rounding trick of
+  [7.10](#710-int8-activations-integer-dot-products-int8kernels), so the kernel has no lane conversions. Input
+  clamped to `[-87, 88]`: the softmax's `exp(s - max)` then bottoms out at `1.6e-38` instead of 0, which is
+  invisible after the `1/sum` scaling. Relative error 2.2e-7 over the range (`SmokeTest.fastMath`).
+- `tanhFast(x) = 1 - 2 / (expFast(2x) + 1)`, absolute error 1.7e-7, saturating correctly at both ends.
+- The softmax sum is accumulated lane-wise and reduced once (the default path sums in order).
+- The lane kernels and their scalar tails use the same arithmetic, so a row's result does not depend on where
+  the vector loop stops.
+
+In isolation one exp costs 0.8 ns instead of 6.3 ns (8×). In a decode step the softmax is `heads × len` exps
+per layer against `heads × len × headDim × 2` FMAs for the scores and values, so the gain is bounded: measured
+on the M1 Pro (10 threads, Qwen3-0.6B Q4_0, int8 on, machine shared with other jobs), decode after a
+3 023-token prompt went from 21.6 / 20.8 tok/s to 22.7 / 22.7 tok/s (two interleaved runs each, +5–9 %), the
+`bench` decode at ctx 4096 from 57 to 60–62 tok/s, and prefill did not change beyond the noise (the long
+prefill is dominated by the attention dot products, [7.5](#75-attention-kvcacheattention)). Greedy text was
+identical with the switch on and off in these runs. Soft-capped models (Gemma) additionally save the per-score
+`Math.tanh`, which costs about as much as the exp.

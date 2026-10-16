@@ -154,7 +154,8 @@ public final class CpuBackend implements Backend {
     @Override
     public String name() {
         return "cpu (" + VectorKernels.describe() + (mm.int8() ? ", " + Int8Kernels.describe() : "")
-                + (DETERMINISTIC ? ", deterministic" : "") + ", " + pool.threads() + " threads)";
+                + (DETERMINISTIC ? ", deterministic" : "") + (VectorKernels.FASTMATH ? ", fastmath" : "")
+                + ", " + pool.threads() + " threads)";
     }
 
     @Override
@@ -244,6 +245,10 @@ public final class CpuBackend implements Backend {
             float cap = c.finalSoftcap();
             if (cap > 0) {
                 pool.forRange(rows, 4096, (i0, i1) -> {
+                    if (VectorKernels.FASTMATH) {
+                        VectorKernels.softcapFast(logits, i0, i1 - i0, cap);
+                        return;
+                    }
                     for (int i = i0; i < i1; i++) {
                         logits[i] = GemmaMath.softcap(logits[i], cap);
                     }

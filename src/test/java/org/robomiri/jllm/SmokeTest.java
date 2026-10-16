@@ -56,6 +56,7 @@ public final class SmokeTest {
         GemmaChecks.run();
         mamba();
         kvCacheAttention();
+        fastMath();
         prefixReuse(dir);
         deepseekConfigs();
         System.out.println("all smoke tests passed");
@@ -1027,6 +1028,53 @@ public final class SmokeTest {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);
         }
+    }
+
+    /**
+     * The opt-in polynomial exp / tanh of {@code -Djllm.cpu.fastmath} ({@code VectorKernels.expFast} / {@code tanhFast}):
+     * relative error against {@code Math.exp} inside the clamp range, saturation outside it, absolute error of tanh,
+     * and lane-wise results identical to the scalar twins.
+     */
+    static void fastMath() {
+        double maxRelExp = 0;
+        double maxAbsTanh = 0;
+        boolean saturates = true;
+        int n = 40001;
+        float[] xs = new float[n];
+        for (int i = 0; i < n; i++) {
+            float x = -100f + i * (200f / (n - 1));
+            xs[i] = x;
+            float e = org.robomiri.jllm.cpu.VectorKernels.expFast(x);
+            if (x >= -87f && x <= 88f) {
+                maxRelExp = Math.max(maxRelExp, Math.abs(e - Math.exp(x)) / Math.exp(x));
+            } else {
+                saturates &= x < 0 ? e > 0 && e <= 2e-38f : e >= 1e38f && e < Float.POSITIVE_INFINITY;
+            }
+            maxAbsTanh = Math.max(maxAbsTanh, Math.abs(org.robomiri.jllm.cpu.VectorKernels.tanhFast(x) - Math.tanh(x)));
+        }
+        check(maxRelExp < 3e-7, "fastmath exp relative error " + maxRelExp + " on [-87, 88]");
+        check(saturates, "fastmath exp saturates outside the clamp range");
+        check(maxAbsTanh < 2e-6, "fastmath tanh absolute error " + maxAbsTanh);
+        // lanes vs scalar: softcapFast runs full lanes plus a scalar tail
+        float[] capped = xs.clone();
+        org.robomiri.jllm.cpu.VectorKernels.softcapFast(capped, 3, n - 3, 30f);
+        int lanesDiffer = 0;
+        double maxCap = 0;
+        for (int i = 3; i < n; i++) {
+            if (capped[i] != org.robomiri.jllm.cpu.VectorKernels.tanhFast(xs[i] * (1f / 30f)) * 30f) {
+                lanesDiffer++;
+            }
+            maxCap = Math.max(maxCap, Math.abs(capped[i] - Math.tanh(xs[i] / 30f) * 30f));
+        }
+        check(lanesDiffer == 0 && capped[0] == xs[0], "fastmath lanes match the scalar twin (" + lanesDiffer + " differ)");
+        check(maxCap < 1e-4, "fastmath soft-cap(30) absolute error " + maxCap);
+        float[] sm = {1f, -2f, 0.5f, 3f, -1f, 0.25f, 2f, -0.5f, 1.5f};
+        float ref = 0;
+        for (float v : sm) {
+            ref += (float) Math.exp(v - 3f);
+        }
+        float got = org.robomiri.jllm.cpu.VectorKernels.softmaxExp(sm.clone(), 0, sm.length, 3f);
+        check(Math.abs(got - ref) < 1e-6f, "softmaxExp sum " + got + " vs " + ref);
     }
 
     /** A backend that records the (pos, n) of every forward() and always predicts token 0. */

@@ -123,19 +123,10 @@ final class MlaCpu {
                 int ko = h * qk;
                 int ao = t * vStride + h * vd;
                 int len = pos + t + 1;
-                float max = Float.NEGATIVE_INFINITY;
                 for (int s = 0; s < len; s++) {
-                    float dot = VectorKernels.dot(q, qo, kc, s * kStride + ko, qk) * scale;
-                    sc[s] = dot;
-                    max = Math.max(max, dot);
+                    sc[s] = VectorKernels.dot(q, qo, kc, s * kStride + ko, qk) * scale;
                 }
-                float sum = 0;
-                for (int s = 0; s < len; s++) {
-                    float e = (float) Math.exp(sc[s] - max);
-                    sc[s] = e;
-                    sum += e;
-                }
-                float inv = 1f / sum;
+                float inv = 1f / KvCache.softmax(sc, 0, len, 0f);
                 Arrays.fill(att, ao, ao + vd, 0f);
                 for (int s = 0; s < len; s++) {
                     VectorKernels.axpy(sc[s] * inv, vc, s * vStride + h * vd, att, ao, vd);
