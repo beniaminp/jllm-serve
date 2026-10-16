@@ -162,7 +162,14 @@ public final class QTensor {
         return d;
     }
 
-    /** Writes 32 signed bytes at {@code q[qOff..]} and returns the block scale. */
+    /**
+     * Writes 32 signed bytes at {@code q[qOff..]} and returns the block scale.
+     *
+     * <p>Same scheme as llama.cpp Q8_0 except for the rounding of exact halves: {@code Math.round} rounds them
+     * up ({@code -2.5 -> -2}), C's {@code roundf} away from zero ({@code -2.5 -> -3}). It only affects weights
+     * whose scaled value is exactly {@code k + 0.5} in float, so quality is unchanged, but Q8_0 bytes are not
+     * guaranteed to match llama.cpp's; changing it would alter every existing cache.
+     */
     private static float quantizeBlockQ8(float[] x, int off, byte[] q, int qOff) {
         float amax = 0;
         for (int j = 0; j < QType.BLOCK; j++) {

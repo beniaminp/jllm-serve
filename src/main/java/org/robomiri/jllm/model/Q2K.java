@@ -30,7 +30,8 @@ import java.util.Arrays;
  * between {@code (max − min)/4} and {@code (max − min)/2.5}, each refined by a weighted least-squares fit of
  * (scale, min) to the rounded codes and kept if it lowers the |x|-weighted absolute error). The 16 scales and mins
  * are then quantized to 4 bits with {@code d = max(scale)/15}, {@code dmin = max(min)/15}, and the codes are
- * recomputed from the <i>dequantized</i> sub-block scale/min so the stored values are self-consistent.
+ * recomputed from the <i>dequantized</i> sub-block scale/min so the stored values are self-consistent (a
+ * sub-block whose 4-bit scale is 0 keeps the codes of the fit, as llama.cpp does, so the bytes match it).
  */
 public final class Q2K {
 
@@ -126,14 +127,17 @@ public final class Q2K {
         out[outOff + DMIN_OFFSET] = (byte) dminBits;
         out[outOff + DMIN_OFFSET + 1] = (byte) (dminBits >>> 8);
 
-        // final codes from the dequantized (4-bit) sub-block scale and min, so storage is self-consistent
+        // final codes from the dequantized (4-bit) sub-block scale and min, so storage is self-consistent. A
+        // sub-block whose 4-bit scale rounds to 0 keeps the codes of the make_qkx2_quants fit, exactly as
+        // llama.cpp's `if (!d) continue;` does: every code reconstructs to -dmin*m there, so only byte-level
+        // parity with llama.cpp depends on it. Sub-blocks beyond a partial super-block are zero.
         float d = Float.float16ToFloat(dBits);
         float dmin = Float.float16ToFloat(dminBits);
-        Arrays.fill(s.L, (byte) 0);
+        Arrays.fill(s.L, n, BLOCK, (byte) 0);
         for (int j = 0; j < nsub; j++) {
             float dl = d * sc[j];
             if (dl == 0) {
-                continue; // every code reconstructs to -dmin*m; leave q = 0
+                continue;
             }
             float ml = dmin * mn[j];
             for (int l = 0; l < SUB; l++) {
