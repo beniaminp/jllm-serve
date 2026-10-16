@@ -7,17 +7,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntPredicate;
 import java.util.function.UnaryOperator;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
  * BPE tokenizer that reads a Hugging Face {@code tokenizer.json}. Two flavours of the same model type are
@@ -54,7 +51,8 @@ public final class Tokenizer {
     private final Set<Integer> specialIds;
     private final Set<Integer> lstripIds = new HashSet<>();
     private final Set<Integer> rstripIds = new HashSet<>();
-    private final Pattern addedPattern;
+    private final AddedTokenTrie addedTrie;
+    private static final IntPredicate ANY_TOKEN = id -> true;
     private final UnaryOperator<String> normalizer;
     private final PreTokenizers.Chain preTokenizer;
     private final boolean byteLevel;
@@ -215,11 +213,8 @@ public final class Tokenizer {
         Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
         unkId = unk == null ? -1 : unk;
 
-        // Longest-first alternation so e.g. "<|im_start|>" wins over any shorter overlapping token.
-        addedPattern = addedTokens.isEmpty() ? null : Pattern.compile(addedTokens.keySet().stream()
-                .sorted(Comparator.comparingInt(String::length).reversed())
-                .map(Pattern::quote)
-                .collect(Collectors.joining("|")));
+        // Leftmost-longest matching, so e.g. "<|im_start|>" wins over any shorter overlapping token.
+        addedTrie = AddedTokenTrie.build(addedTokens);
 
         // ---- BOS / EOS: tokenizer_config.json (when available) wins over the post-processor template
         int[] template = findTemplateBos(Json.map(json, "post_processor"));
@@ -307,15 +302,35 @@ public final class Tokenizer {
 
         /** Appends a control string; added tokens in it become their ids. */
         public SequenceEncoder special(String text) {
-            if (addedPattern == null) {
+            return scan(text, ANY_TOKEN);
+        }
+
+        /** Appends ordinary text; added tokens in it are NOT recognized. */
+        public SequenceEncoder text(String text) {
+            appendRun(text);
+            return this;
+        }
+
+        /** Leftmost-longest scan for the added tokens accepted by {@code allowed}; the rest is ordinary text. */
+        private SequenceEncoder scan(String text, IntPredicate allowed) {
+            if (addedTrie == null) {
                 return text(text);
             }
             int len = text.length();
-            Matcher m = addedPattern.matcher(text);
-            int last = 0;
-            while (last <= len && m.find(last)) {
-                int id = addedTokens.get(m.group());
-                appendRun(text.substring(last, m.start()));
+            int last = 0; // start of the plain text not yet appended
+            int i = 0;
+            while (i < len) {
+                if (!addedTrie.mayStart(text.charAt(i))) {
+                    i++;
+                    continue;
+                }
+                long m = addedTrie.longest(text, i, allowed);
+                if (m < 0) {
+                    i++;
+                    continue;
+                }
+                int id = (int) m;
+                appendRun(text.substring(last, i));
                 if (lstripIds.contains(id)) {
                     int n = run.length();
                     while (n > 0 && isWhitespace(run.charAt(n - 1))) {
@@ -326,7 +341,7 @@ public final class Tokenizer {
                 flushRun();
                 out.add(id);
                 consumed = true;
-                int end = m.end();
+                int end = i + (int) (m >>> 32);
                 boolean rs = rstripIds.contains(id);
                 if (rs) {
                     while (end < len && isWhitespace(text.charAt(end))) {
@@ -335,16 +350,11 @@ public final class Tokenizer {
                 }
                 pendingRstrip = rs && end == len;
                 last = end;
+                i = end;
             }
             if (last < len) {
                 appendRun(text.substring(last));
             }
-            return this;
-        }
-
-        /** Appends ordinary text; added tokens in it are NOT recognized. */
-        public SequenceEncoder text(String text) {
-            appendRun(text);
             return this;
         }
 

@@ -156,9 +156,11 @@ Three more implementation details keep this fast:
 
 ## 4.7 Added and special tokens
 
-Before any of the above, the text is split on a regex that matches every added token *literally* (longest
-first, each `Pattern.quote`d so `|` is not an alternation). Matches map straight to their id; the text between
-them goes through stages 1–3:
+Before any of the above, the text is scanned for added tokens with a **leftmost-longest** match
+(`AddedTokenTrie`: a trie over the token strings, indexed by first character, so a character that starts no
+added token costs one array read; at a candidate position the deepest terminal node wins, so `<|im_start|>` beats
+any shorter token with the same prefix). Matches map straight to their id; the text between them goes through
+stages 1–3:
 
 ```
 "<|im_start|>user\nhi<|im_end|>\n"
