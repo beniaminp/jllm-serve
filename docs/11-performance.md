@@ -64,9 +64,32 @@ Qwen3-0.6B, 413-token prompt, 128 generated tokens, after JIT warm-up (`./jllm b
 |---|---|---|---|---|
 | Metal Q4_0 | 344 tok/s | 75 tok/s | 34 GB/s | 17 % |
 | Metal Q8_0 | 338 tok/s | 77 tok/s | 54 GB/s | 27 % |
-| CPU Q4_0 (NEON 128-bit, 10 threads) | 153 tok/s | 17 tok/s | 7.6 GB/s | 4 % |
+| CPU Q4_0 (NEON 128-bit, 10 threads), float activations | 153 tok/s | 17 tok/s | 7.6 GB/s | 4 % |
 
 Short prompts decode at ~110 tok/s on Metal (less attention work). Both backends produce identical greedy text.
+
+### CPU int8 activations (`backend.cpu.int8-activations`, [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels))
+
+Measured with `./jllm bench --backend cpu --ctx 1024` on the same M1 Pro while the machine was shared with
+other heavy jobs (load average 50–100, so the absolute numbers are far below the idle-machine row above);
+the two settings were run interleaved, best of two runs each:
+
+| | prefill | decode | decode speedup |
+|---|---|---|---|
+| float activations (`false`) | 38.8 tok/s | 4.2 tok/s | — |
+| int8 activations (`true`) | 36.8 tok/s | 16.0 tok/s | **3.8×** |
+
+Prefill is unchanged (it keeps the float `dot4` path). Per kernel, single-threaded and undisturbed, the
+Q4 row dot product goes from 3.5 ms to 0.59 ms per 8 192 × 1 024 rows (6×) and the Q8 (LM head) row dot
+from 1.3–3.7 ms to 0.92 ms; the end-to-end decode gain is smaller because attention, norms, SiLU and the
+thread-pool synchronization are untouched (Amdahl), and because under this load the 10 threads did not get
+10 cores. The accuracy cost is an RMS relative error of ~0.9 % on each dot product
+(`SmokeTest.int8Kernels`, activations with outliers; ~0.6 % without). Greedy outputs with the switch on and
+off: *"What is the capital of France? Answer in one sentence."* gives the identical sentence; the haiku
+prompt gives a different but equally coherent continuation (the int8 run actually produces a haiku, the
+float run a prose paragraph) — with a 0.6B model, greedy decoding amplifies any logit perturbation of this
+size into a different continuation after the first near-tie, which is the expected behaviour of two
+equally valid quantization noises, not a degradation.
 
 Qwen3-30B-A3B: *to be measured* (expected: decode a few tens of tok/s on Metal; prefill bandwidth-limited by
 streaming all experts per chunk).
@@ -92,12 +115,15 @@ GPU path is **not** at the memory roof yet — something else dominates.
 5. **CPU-side work per token**: sampling over 151 936 logits (~0.3 ms), the embedding row copy, and the
    `commitAndWait` round trip.
 
-### CPU decode (~59 ms per token)
+### CPU decode (~59 ms per token with float activations)
 
 `dotQ4` with 4 float lanes: per 32-weight block, one 16-byte load, two byte-wise ops, eight `castShape`
 conversions and eight FMAs — ~20 instructions for 32 multiply-adds. 450 MB / 20 B per block = 22.6 M blocks →
 ~450 M instructions per token per core-equivalent. The CPU is **instruction-bound**, not memory-bound (7.6 GB/s
-used of ~200). AVX-512 would run the same source with 4× fewer instructions per block.
+used of ~200). AVX-512 would run the same source with 4× fewer instructions per block. The int8 activation
+path ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) replaces the
+conversions with shift-and-mask unpacking on 8 short lanes and cuts the kernel's time by 6×; what remains
+of the decode step is attention, the element-wise passes and pool synchronization.
 
 ### CPU prefill (153 tok/s)
 
@@ -161,7 +187,7 @@ round for that reason.
 | # | change | expected effect | where |
 |---|---|---|---|
 | 1 | **Kernel fusion on Metal**: fold `rmsnorm` into the following matmul, launch q/k/v as one dispatch, fuse `silu_mul` into the gate/up matmul epilogue | ~340 → ~150 dispatches per token; decode toward 120–150 tok/s on the 0.6B model | `kernels.metal`, `MetalBackend.forward` |
-| 2 | **Int8 activations on CPU**: quantize the input vector to Q8 per block and use integer multiply-adds (16 lanes per 128-bit register instead of 4 floats) | 2–4× CPU decode; this is llama.cpp's core trick | `VectorKernels.dotQ4/dotQ8`, a `quantizeActivation` helper in `CpuBackend` |
+| 2 | **Int8 activations on CPU** — done: the activation vector is quantized to Q8 per block and multiplied on 8 short lanes per 128-bit register with no byte→float conversions ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | measured: Q4 row kernel 6× faster, decode 4.2 → 16.0 tok/s (3.8×) under the same load, prefill unchanged, ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuBackend.matmul` (`n == 1`) and `moe`, `backend.cpu.int8-activations` |
 | 3 | **f16 KV cache** — done: `backend.kv-dtype=f16` ([07 §7.12](07-cpu-backend.md#712-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; decode speed unchanged to slightly better at 400–600-token contexts, greedy outputs unchanged on the test prompts | `cpu/KvCache`, `kv_store_half`/`attention_h` in `kernels.metal` |
 | 4 | **Flash-style attention**: compute scores and the weighted value sum in one pass with an online softmax, never writing `scores` to device memory; one threadgroup per head *and* query tile | removes the score round trip; large win at long context | `attention` kernel, `CpuBackend.attention` |
 | 5 | **Continuous batching**: several sequences per forward pass so each weight read serves many tokens | turns decode from memory-bound toward compute-bound: near-linear throughput scaling with concurrent users | `Backend.forward` (batch of sequences), per-sequence KV cache slots, `Engine` scheduler, `ApiServer` lock |
@@ -177,5 +203,7 @@ round for that reason.
   ~200 GB/s. Quantization and batching are the only levers that move that ceiling.
 - Today's Metal decode reaches ~17 % of the bandwidth roof; the gap is dispatch overhead and latency-bound small
   matmuls, which kernel fusion attacks first.
-- The CPU path is instruction-bound at 128-bit SIMD; integer dot products are the fix.
+- The CPU path was instruction-bound at 128-bit SIMD; int8 activations with integer dot products took the
+  row kernel from ~30 conversion-heavy instructions per block to ~31 single-cycle integer ops doing twice
+  the lanes, 6× per kernel and ~4× per decoded token.
 - Memory is dominated by the weights and the KV cache (`--ctx` and `backend.kv-dtype` are the knobs).

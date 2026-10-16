@@ -345,20 +345,131 @@ this context length. On AVX-512 the same source code needs 4× fewer instruction
 
 ---
 
-## 7.10 What to optimize next
+## 7.10 Int8 activations: integer dot products (`Int8Kernels`)
+
+Code: `cpu/Int8Kernels.java`; switch: `backend.cpu.int8-activations` (default `true`); used by
+`CpuBackend.matmul` for `n == 1` (decode) and by the MoE per-token loops. This is llama.cpp's
+`q4_0 × q8_0` scheme, and it removes the bottleneck of 7.9.
+
+### The idea
+
+`dotQ4` spends most of its ~30 instructions per block converting bytes to floats so that 4-lane float FMAs
+can consume them. Instead, quantize the *activation* vector `x` to 8-bit integers as well (once per matmul,
+not per row — `x` is one vector of 1 024–3 072 floats, the weights are millions of rows), and multiply
+integers with integers:
+
+```
+x block b (32 floats)  →  d_b = max|x| / 127,   q_i = rint(x_i / d_b)          (Int8Kernels.quantize)
+row block b            →  s_b (the weight scale), w_i = nibble_i − 8
+dot                    =  Σ_b  (s_b · d_b) · Σ_{i<32} w_i · q_i
+```
+
+The inner sum `Σ w_i q_i` is an exact integer: |w| ≤ 8 and |q| ≤ 127, so each product is at most 1 016
+and 32 of them fit easily in a 16-bit lane sum. One 128-bit register holds **8 short lanes**, so one
+multiply does 8 products where a float FMA does 4 — and, more importantly, the inputs need no conversion
+to float at all: bytes are unpacked to 16-bit lanes with shifts and masks, which are single instructions.
+Only the per-block integer total is converted to float, once per block instead of once per lane-group.
+
+### One block, 128-bit lanes
+
+```
+ShortVector v = 16 packed Q4 bytes loaded as 8 shorts    lane k = byte 2k | byte 2k+1 << 8
+w_even_lo = (v        & 0xF) − 8     weights  0, 2, …, 14     (low nibbles of the even bytes)
+w_odd_lo  = (v >>> 8  & 0xF) − 8     weights  1, 3, …, 15
+w_even_hi = (v >>> 4  & 0xF) − 8     weights 16, 18, …, 30    (high nibbles of the even bytes)
+w_odd_hi  = (v >>> 12 & 0xF) − 8     weights 17, 19, …, 31
+p  = w_even_lo·x[0..8) + w_odd_lo·x[8..16) + w_even_hi·x[16..24) + w_odd_hi·x[24..32)   (8 short lanes, exact)
+i  = widen(p)                                     4 int lanes: lane j = p[2j] + p[2j+1]
+acc = float(i) · (s_b · d_b) + acc                4 float lanes, reduced once per row
+```
+
+The quantized activations are stored in exactly the order the unpack produces — per block
+`[x0 x2 … x14] [x1 x3 … x15] [x16 x18 … x30] [x17 x19 … x31]` — so the kernel loads them with four
+plain 8-short loads and never shuffles (`Int8Kernels.permutedIndex`). Q8_0 rows use the same structure
+with the even/odd bytes of each 16-byte half sign-extended by shifts; their products reach 127 × 127, so
+only two are summed per short lane before widening.
+
+Per block that is: 1 weight load, 4 activation loads, 11 shift/mask/subtract ops, 4 multiplies, 3 adds,
+4 ops to widen, 3 to convert to float, 1 FMA — about 31 instructions for 32 multiply-adds, all of them
+single-cycle-throughput integer or float ops with no cross-lane work. The float path's ~30 instructions
+include 8 `castShape` conversions that are 2–3 instructions each on NEON.
+
+### Error analysis
+
+Rounding `x` to 8 bits adds an error of at most `d_b / 2` per element, uniformly distributed, i.e. an RMS
+error of `d_b / √12`. With `d_b = max|x| / 127` and the typical block maximum of a Gaussian vector at
+~2.5 σ, that is ≈ 0.6 % of σ per element — the same order as the Q4 weight error the model already
+tolerates, and independent across elements, so it averages out over a 1 024-long dot product.
+`SmokeTest.int8Kernels` measures it: on random rows and activations with outliers (one in 97 elements 8× larger,
+which inflates that block's scale) the RMS relative error of the dot product is **0.9 %** for both Q4 and Q8
+weights, the integer lanes match a scalar reference exactly, and the SIMD quantizer is bit-identical to its
+scalar reference. Greedy outputs with the switch on and off are compared in [11](11-performance.md#111-measured).
+
+### What the JIT needs from a Vector API kernel
+
+Three things were learned the hard way while writing this kernel; they apply to `VectorKernels` too.
+
+1. **Only C2 code is fast.** The interpreter and C1 execute every `lanewise`/`fromArray` call through the
+   Java fallback (a boxed vector object and a lambda per lane): the same kernel runs **500–1 000× slower**
+   until C2 has compiled it. A kernel that is "slow" is almost always one that has not been compiled yet, or
+   whose C2 compilation bailed out or was deoptimized. `bench` discards a warm-up round for this reason, and
+   the first second of a `run` is dominated by it.
+2. **C2 compile time is the real cost, and it depends on the loop shape.** The inlined form of one block of
+   this kernel is thousands of IR nodes, and C2 unrolls small loop bodies before range-check elimination on
+   the `long` memory-segment offsets. `-XX:+LogCompilation` showed the Q4 kernel's C2 task taking **40 ms**,
+   while the same Q8 arithmetic written as one iteration per block — i.e. *two* `fromMemorySegment` loads
+   per iteration — had not finished compiling after 20 s and ran at C1 speed the whole time
+   (`-XX:LoopUnrollLimit=0` brought it back to seconds). Rewritten as one 16-byte load per iteration, the
+   Q8 kernel compiles in 26 ms. Keep one segment load per loop iteration, and call each helper from one
+   site only: a helper used at two sites in the same loop body did not stay inlined and cost 8×.
+3. **Lane conversions share one profiled template.** `convertShape`, `castShape`, `convert` and the
+   reinterpret views all go through `AbstractVector.convert0`, which reads the operand's element type and
+   the target species through virtual calls the JDK source marks `// (profile)`. A process that mixes many
+   conversion kinds (the float kernels' byte→float plus byte→short, short→int, int→float, …) pollutes those
+   shared profiles. To stay clear of it the kernel uses only loads, lanewise arithmetic, same-size
+   reinterprets and one reduction per row: widening is done with shifts (`(i << 16) >> 16` and `i >> 16` on
+   the int view of the short lanes), int→float with the 2²³ magic constant (`bits(i + 1.5·2²³) − bits(1.5·2²³)`
+   is exact for |i| < 2²²), and the activation quantizer rounds the same way (`rint`, ties to even).
+
+Measured in isolation on the M1 Pro (one thread, 8 192 rows × 1 024 columns, best of 30–40): Q4 row dot
+**0.59 ms** int8 vs **3.5 ms** float (6×); Q8 row dot **0.92 ms** int8 (the half-block form; 0.60 ms for the
+slow-to-compile full-block form) vs 1.3–3.7 ms float.
+
+### Where it is used
+
+- **Decode** (`n == 1`): every Q4_0 / Q8_0 linear layer and the LM head (`CpuBackend.useInt8`: Q2_K rows and
+  any width that is not a multiple of 32 keep the float `dotRow`). Quantize `in` once, then the parallel row
+  loop calls `Int8Kernels.dotRow` instead of `VectorKernels.dotRow`. The MLA, shared-expert and Mamba code
+  paths reach the kernel only through this same `matmul`, so the format check covers them.
+- **MoE** (per token, any `n`): `xb` is quantized once per token for the gate/up rows, and the 8 expert
+  hidden vectors once for the down rows (`k * m` is a multiple of 32, so a slot offset is a block offset).
+- **Prefill** stays on the float path: measured per (row, token), the int8 kernel is slightly *slower* than
+  the dequantize-4-rows-once + `dot4` path (~88 ns vs ~77 ns per 1 024-long dot, single thread), because
+  `dot4` already amortizes the expensive unpack over the 64 tokens and shares each activation load across
+  four rows; a second code path for a loss is not worth it (see 7.11 for the kernel that could change that).
+
+Measured numbers are in [11.1](11-performance.md#111-measured).
+
+**CPU vs Metal agreement.** The Metal backend computes with float activations, so the bit-for-bit
+CPU == Metal checks (`scripts/arch-smoke.sh`, `ArchSmoke`, `DeepSeekRef`) construct the CPU backend with
+int8 activations off; with the default `true`, CPU and Metal greedy outputs can diverge after the first
+near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
+`--backend.cpu.int8-activations false` whenever an exact CPU/Metal comparison is wanted.
+
+## 7.11 What to optimize next
 
 In order of expected payoff on this CPU:
 
-1. **Int8 activations with integer dot products.** Quantize `x` to Q8 per 32-block too, then multiply bytes
-   with bytes using 16-lane `ShortVector` multiplies and widen to int — 16 lanes instead of 4, and no
-   byte→float conversions. This is what llama.cpp's `vec_dot_q4_0_q8_0` does and is worth 2–4×.
-2. **Vectorized exp** in attention and SiLU (a polynomial approximation on `FloatVector`), removing the scalar
+1. **Vectorized exp** in attention and SiLU (a polynomial approximation on `FloatVector`), removing the scalar
    `Math.exp` that dominates at long contexts.
-3. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.12](#712-the-f16-kv-cache-kvcache)). What remains is
+2. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.12](#712-the-f16-kv-cache-kvcache)). What remains is
    a fused f16 dot product that converts inside the SIMD loop instead of expanding each row to scratch first.
-4. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
+3. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
    activation and the number of pool jobs.
-5. **Batch decode across requests** (continuous batching) so the weight read serves several tokens.
+4. **Batch decode across requests** (continuous batching) so the weight read serves several tokens.
+5. **Int8 prefill with a shared-activation kernel**: a `dot4`-style int8 kernel that unpacks 4 rows once and
+   streams the quantized tokens through them; on NEON the instruction counts are a tie with the float
+   `dot4`, so this only pays on wider SIMD (AVX2/AVX-512, 16 or 32 short lanes).
 
 ---
 
