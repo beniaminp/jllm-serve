@@ -7,12 +7,18 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
+import static org.robomiri.jllm.metal.MetalConstants.PF_ROWS;
+import static org.robomiri.jllm.metal.MetalConstants.PF_TOKS;
+import static org.robomiri.jllm.metal.MetalConstants.PF_UNITS;
+import static org.robomiri.jllm.metal.MetalConstants.TOK_TILE;
+
 /**
  * The kernel-side half of the Metal backends: owns the {@link Metal} context, the dispatch argument scratch and
  * a writer per kernel of {@code kernels.metal} (buffers, parameter struct, grid). {@link MetalBackend},
  * {@link MlaMetal} and {@link MambaMetalBackend} own the model's buffers and orchestrate the forward pass by
  * calling these writers; nothing else touches parameter layouts, so each kernel's struct has exactly one writer
- * here (checked by {@code MetalParamsTest}).
+ * here, written through {@link Params} against its {@link KernelParams} layout (checked at the dispatch and, against
+ * the shader source, by {@code MetalParamsTest}).
  *
  * <p>Kernels are looked up by name at dispatch time ({@link Metal#pipeline} memoizes and compiles on first use),
  * so only the variants a model runs are built.
@@ -20,12 +26,6 @@ import java.lang.foreign.ValueLayout;
 final class MetalKernels implements AutoCloseable {
 
     // ---------------------------------------------------------------- constants shared with kernels.metal
-    /** Tokens per simdgroup of the single-row matmuls (TOK_TILE in kernels.metal). */
-    static final int TOK_TILE = 8;
-    /** Rows (matmul_swiglu_pf: units) and tokens per simdgroup of the *_pf prefill matmuls (PF_* in kernels.metal). */
-    static final int PF_ROWS = 2;
-    static final int PF_UNITS = 1;
-    static final int PF_TOKS = 8;
     /** Simdgroups per matmul threadgroup: 128 threads = 4 rows (the kernels assume it). */
     static final int SG_PER_TG = 4;
     /** Tokens per attention dispatch; the scores scratch holds one row of ctx floats per (tile token, head). */
@@ -71,7 +71,7 @@ final class MetalKernels implements AutoCloseable {
     // dispatch argument scratch (re-used; the native side copies params and records the bindings at dispatch time)
     private final MemorySegment bufArgs;
     private final MemorySegment offArgs;
-    private final MemorySegment params;
+    private final Params p;
     /** Bound wherever a kernel declares a buffer the dispatch does not use (norm weights, biases, ...). */
     private final Metal.Buffer dummy;
 
@@ -81,7 +81,7 @@ final class MetalKernels implements AutoCloseable {
         this.eps = normEps;
         bufArgs = arena.allocate(ValueLayout.ADDRESS, MAX_BUFS);
         offArgs = arena.allocate(ValueLayout.JAVA_LONG, MAX_BUFS);
-        params = arena.allocate(64);
+        p = new Params(arena.allocate(64));
         dummy = metal.newBuffer(64, true);
     }
 
@@ -147,16 +147,10 @@ final class MetalKernels implements AutoCloseable {
         bind(i, b != null ? b : dummy, 0);
     }
 
-    private void dispatch(String kernel, int nbuf, int plen, int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
-        metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, params, plen, tgmem, gx, gy, gz, tx, ty, tz);
-    }
-
-    private void i(int index, int v) {
-        params.setAtIndex(ValueLayout.JAVA_INT, index, v);
-    }
-
-    private void f(int index, float v) {
-        params.setAtIndex(ValueLayout.JAVA_FLOAT, index, v);
+    /** Records {@code kernel} with the buffers bound so far and the params written since the last reset. */
+    private void dispatch(String kernel, int nbuf, int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
+        int plen = p.done();
+        metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
     /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k). */
@@ -213,16 +207,11 @@ final class MetalKernels implements AutoCloseable {
         bind(2, in, inOff);
         bind(3, out, outOff);
         bindOrDummy(4, norm);
-        i(0, t.rows);
-        i(1, t.cols);
-        i(2, n);
-        i(3, acc ? 1 : 0);
-        f(4, eps);
-        f(5, softcap);
+        p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            dispatch(kernel("matmul_pf", t.type, ""), 5, 24, 0, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            dispatch(kernel("matmul_pf", t.type, ""), 5, 0, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         } else {
-            dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 5, 24, normTgMem(norm, t.cols),
+            dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(t.rows), tokTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         }
     }
@@ -241,7 +230,6 @@ final class MetalKernels implements AutoCloseable {
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
         }
-        boolean bias = bq != null;
         bind(0, bwq, 0);
         bind(1, bwq, scaleOff(wq));
         bind(2, bwk, 0);
@@ -256,19 +244,13 @@ final class MetalKernels implements AutoCloseable {
         bindOrDummy(11, bq);
         bindOrDummy(12, bk);
         bindOrDummy(13, bv);
-        i(0, wq.rows);
-        i(1, wk.rows);
-        i(2, wv.rows);
-        i(3, wq.cols);
-        i(4, n);
-        f(5, eps);
-        i(6, bias ? 1 : 0);
+        p.reset(KernelParams.MATMUL3).i(wq.rows).i(wk.rows).i(wv.rows).i(wq.cols).i(n).f(eps).i(bq != null);
         int rows = wq.rows + wk.rows + wv.rows;
         String vh = vHalf ? "_h" : "";
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            dispatch(kernel("matmul3_pf", wq.type, vh), 14, 28, 0, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            dispatch(kernel("matmul3_pf", wq.type, vh), 14, 0, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         } else {
-            dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, 28, normTgMem(norm, wq.cols),
+            dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
                     rowGrid(rows), tokTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         }
     }
@@ -287,16 +269,12 @@ final class MetalKernels implements AutoCloseable {
         bind(2, in, 0);
         bind(3, out, 0);
         bindOrDummy(4, norm);
-        i(0, hidden);
-        i(1, t.cols);
-        i(2, n);
-        f(3, eps);
-        i(4, gelu ? 1 : 0);
+        p.reset(KernelParams.SWIGLU).i(hidden).i(t.cols).i(n).f(eps).i(gelu);
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int gx = (hidden + SG_PER_TG * PF_UNITS - 1) / (SG_PER_TG * PF_UNITS);
-            dispatch(kernel("matmul_swiglu_pf", t.type, ""), 5, 20, 0, gx, pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            dispatch(kernel("matmul_swiglu_pf", t.type, ""), 5, 0, gx, pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         } else {
-            dispatch(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""), 5, 20, normTgMem(norm, t.cols),
+            dispatch(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(hidden), tokTiles(n), 1, 32 * SG_PER_TG, 1, 1);
         }
     }
@@ -308,9 +286,8 @@ final class MetalKernels implements AutoCloseable {
         bind(0, in, inOff);
         bind(1, weight, 0);
         bind(2, out, 0);
-        i(0, width);
-        f(1, eps);
-        dispatch("rmsnorm", 3, 8, 0, n, 1, 1, 256, 1, 1);
+        p.reset(KernelParams.NORM).i(width).f(eps);
+        dispatch("rmsnorm", 3, 0, n, 1, 1, 256, 1, 1);
     }
 
     /** out[t] += rmsnorm(y[t]) * weight for n rows of the given width (Glm4's post-norms). */
@@ -318,9 +295,8 @@ final class MetalKernels implements AutoCloseable {
         bind(0, y, 0);
         bind(1, weight, 0);
         bind(2, out, 0);
-        i(0, width);
-        f(1, eps);
-        dispatch("rmsnorm_add", 3, 8, 0, n, 1, 1, 256, 1, 1);
+        p.reset(KernelParams.NORM).i(width).f(eps);
+        dispatch("rmsnorm_add", 3, 0, n, 1, 1, 256, 1, 1);
     }
 
     /**
@@ -338,16 +314,8 @@ final class MetalKernels implements AutoCloseable {
         bind(4, cos, 0);
         bind(5, sin, 0);
         bind(6, kOut, kOutOff);
-        i(0, headDim);
-        i(1, qStride);
-        i(2, kvStride);
-        i(3, nHeads);
-        i(4, pos);
-        f(5, eps);
-        i(6, qw != null ? 1 : 0);
-        i(7, rotOff);
-        i(8, rotHalf);
-        dispatch((adjacent ? "rope_il" : "rope") + (kHalf && nKHeads > 0 ? "_h" : ""), 7, 36, 0,
+        p.reset(KernelParams.ROPE).i(headDim).i(qStride).i(kvStride).i(nHeads).i(pos).f(eps).i(qw != null).i(rotOff).i(rotHalf);
+        dispatch((adjacent ? "rope_il" : "rope") + (kHalf && nKHeads > 0 ? "_h" : ""), 7, 0,
                 nHeads + nKHeads, n, 1, rotHalf, 1, 1);
     }
 
@@ -366,22 +334,10 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, out, 0);
         bind(4, scores, 0);
-        i(0, nHeads);
-        i(1, nKvHeads);
-        i(2, qkDim);
-        i(3, vDim);
-        i(4, pos);
-        i(5, ctx);
-        f(6, scale);
-        i(7, qStride);
-        i(8, kStride);
-        i(9, vStride);
-        i(10, oStride);
-        i(11, window);
-        f(13, softcap);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
-            i(12, t0);
-            dispatch(kernel, 5, 56, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
+            p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
+                    .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap);
+            dispatch(kernel, 5, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
     }
 
@@ -402,25 +358,13 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, scores, 0);
-        i(0, nHeads);
-        i(1, nKvHeads);
-        i(2, headDim);
-        i(3, pos);
-        i(4, ctx);
-        f(5, scale);
-        i(6, qStride);
-        i(7, kvStride);
-        i(8, window);
-        f(9, softcap);
-        i(10, nSplit);
-        i(11, chunk);
-        dispatch(kvHalf ? "attention_split_h" : "attention_split", 5, 48, 0, nHeads, nSplit, 1, 256, 1, 1);
+        p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
+                .i(window).f(softcap).i(nSplit).i(chunk);
+        dispatch(kvHalf ? "attention_split_h" : "attention_split", 5, 0, nHeads, nSplit, 1, 256, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
-        i(0, nHeads);
-        i(1, headDim);
-        i(2, nSplit);
-        dispatch("attention_combine", 2, 12, 0, nHeads, 1, 1, 256, 1, 1);
+        p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+        dispatch("attention_combine", 2, 0, nHeads, 1, 1, 256, 1, 1);
     }
 
     // ---------------------------------------------------------------- mixture of experts
@@ -432,11 +376,8 @@ final class MetalKernels implements AutoCloseable {
         bind(1, w, 0);
         bind(2, assign, 0);
         bind(3, rw, 0);
-        i(0, nExperts);
-        i(1, dim);
-        i(2, topK);
-        i(3, normalize ? 1 : 0);
-        dispatch("router", 4, 16, 0, n, 1, 1, 256, 1, 1);
+        p.reset(KernelParams.ROUTER).i(nExperts).i(dim).i(topK).i(normalize);
+        dispatch("router", 4, 0, n, 1, 1, 256, 1, 1);
     }
 
     /** DeepSeek routing (see router_ds in kernels.metal and DeepSeekRouter.java); {@code bias} only for noaux_tc. */
@@ -448,17 +389,9 @@ final class MetalKernels implements AutoCloseable {
         bind(2, assign, 0);
         bind(3, rw, 0);
         bindOrDummy(4, bias);
-        i(0, nExperts);
-        i(1, dim);
-        i(2, topK);
-        i(3, normalize ? 1 : 0);
-        i(4, nGroup);
-        i(5, topkGroup);
-        i(6, sigmoid ? 1 : 0);
-        i(7, method);
-        i(8, scaleAlways ? 1 : 0);
-        f(9, routedScale);
-        dispatch("router_ds", 5, 40, 0, n, 1, 1, 256, 1, 1);
+        p.reset(KernelParams.ROUTER_DS).i(nExperts).i(dim).i(topK).i(normalize).i(nGroup).i(topkGroup).i(sigmoid)
+                .i(method).i(scaleAlways).f(routedScale);
+        dispatch("router_ds", 5, 0, n, 1, 1, 256, 1, 1);
     }
 
     /** Per-slot gate/up projections with SwiGLU: out[slot, :] for the n * topK slots of assign (moe_up). */
@@ -469,10 +402,8 @@ final class MetalKernels implements AutoCloseable {
         bind(2, x, 0);
         bind(3, assign, 0);
         bind(4, out, 0);
-        i(0, 2 * moeDim); // rows per expert in the stacked tensor (gate | up)
-        i(1, gateUp.cols);
-        i(2, topK);
-        dispatch(kernel("moe_up", gateUp.type, ""), 5, 12, 0, rowGrid(moeDim), n * topK, 1, 32 * SG_PER_TG, 1, 1);
+        p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK); // rows per expert: gate | up
+        dispatch(kernel("moe_up", gateUp.type, ""), 5, 0, rowGrid(moeDim), n * topK, 1, 32 * SG_PER_TG, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */
@@ -484,10 +415,8 @@ final class MetalKernels implements AutoCloseable {
         bind(3, assign, 0);
         bind(4, rw, 0);
         bind(5, x, 0);
-        i(0, dim);
-        i(1, down.cols);
-        i(2, topK);
-        dispatch(kernel("moe_down", down.type, ""), 6, 12, 0, rowGrid(dim), n, 1, 32 * SG_PER_TG, 1, 1);
+        p.reset(KernelParams.MOE).i(dim).i(down.cols).i(topK);
+        dispatch(kernel("moe_down", down.type, ""), 6, 0, rowGrid(dim), n, 1, 32 * SG_PER_TG, 1, 1);
     }
 
     // ---------------------------------------------------------------- DeepSeek MLA
@@ -499,13 +428,8 @@ final class MetalKernels implements AutoCloseable {
         bind(1, kpe, 0);
         bind(2, kc, kOff);
         bind(3, vc, vOff);
-        i(0, nope);
-        i(1, rope);
-        i(2, vDim);
-        i(3, heads * (nope + vDim));
-        i(4, heads * (nope + rope));
-        i(5, heads * vDim);
-        dispatch("mla_kv_store", 4, 24, 0, heads, n, 1, 64, 1, 1);
+        p.reset(KernelParams.MLA_STORE).i(nope).i(rope).i(vDim).i(heads * (nope + vDim)).i(heads * (nope + rope)).i(heads * vDim);
+        dispatch("mla_kv_store", 4, 0, heads, n, 1, 64, 1, 1);
     }
 
     // ---------------------------------------------------------------- Mamba
@@ -518,10 +442,8 @@ final class MetalKernels implements AutoCloseable {
         bind(2, bias, 0);
         bind(3, state, 0);
         bind(4, xc, 0);
-        i(0, dInner);
-        i(1, dConv);
-        i(2, n);
-        dispatch("mamba_conv", 5, 12, 0, (dInner + 63) / 64, 1, 1, 64, 1, 1);
+        p.reset(KernelParams.MAMBA_CONV).i(dInner).i(dConv).i(n);
+        dispatch("mamba_conv", 5, 0, (dInner + 63) / 64, 1, 1, 64, 1, 1);
     }
 
     /** Selective scan over the chunk with the carried SSM state (mamba_scan). */
@@ -536,10 +458,7 @@ final class MetalKernels implements AutoCloseable {
         bind(6, d, 0);
         bind(7, state, 0);
         bind(8, y, 0);
-        i(0, dInner);
-        i(1, dState);
-        i(2, dtRank);
-        i(3, n);
-        dispatch("mamba_scan", 9, 16, 0, (dInner + 63) / 64, 1, 1, 64, 1, 1);
+        p.reset(KernelParams.MAMBA_SCAN).i(dInner).i(dState).i(dtRank).i(n);
+        dispatch("mamba_scan", 9, 0, (dInner + 63) / 64, 1, 1, 64, 1, 1);
     }
 }
