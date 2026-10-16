@@ -8,6 +8,9 @@ and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`m
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
 **DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16 checkpoints only) and **Mamba** (`mamba`).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
+llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
+conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
+place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)).
 
 | Piece | Where | Written from scratch |
 |---|---|---|
@@ -16,6 +19,7 @@ Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterward
 | Byte-level and SentencePiece-style BPE tokenizers + per-family chat templates | `tokenizer/` | yes |
 | Typed model description (`Architecture`, `LayerSpec`, `RopeTable`, one parser per family) | `model/Architecture.java`, `model/Families.java`, ... | yes |
 | Q4_0 / Q8_0 / Q2_K block quantization + versioned, mmap'd quantized cache file, shard-by-shard resumable conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
+| GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q8_0, Q4_K, Q5_K; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `tokenizer/GgufTokenizer.java` | yes |
 | Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16 KV cache) | `cpu/` | yes |
 | Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
@@ -58,6 +62,22 @@ Only the shards listed in the model's `model.safetensors.index.json` (or `model.
 ./jllm chat --model THUDM/GLM-4-9B-0414 --backend.kv-dtype f16  # GLM-4 with a half-precision KV cache
 ./jllm run  --model state-spaces/mamba-130m-hf --raw --prompt "The capital of France is"
 ```
+
+### GGUF files
+
+```sh
+./jllm run  --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q4_K_M --prompt "Why is the sky blue?"   # downloads that one file
+./jllm chat --model Qwen/Qwen3-0.6B-GGUF                         # one .gguf in the repo: no selection needed
+./jllm serve --model unsloth/Qwen3-0.6B-GGUF --gguf-file Qwen3-0.6B-Q8_0.gguf
+./jllm chat --model ~/models/Llama-3.2-1B-Instruct-Q8_0.gguf     # a local file
+```
+
+A repository with several `.gguf` files needs `--gguf-quant` (a label such as `Q4_K_M`) or `--gguf-file` (exact name);
+without either the error lists the files. Only the chosen file (and the `-0000i-of-0000N` parts of a split model) is
+downloaded, with the usual resume and SHA-256 check. Nothing is converted or cached: the weights are read from the
+mapped file. Tensors in a format the kernels cannot read directly (Q6_K for now, F16/BF16) are requantized to Q8_0 in
+memory at load. See [docs/16](docs/16-gguf.md) for the file format, the llama q/k permutation, the zero-copy mapping
+and the verification.
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
@@ -112,9 +132,10 @@ and the `server.*` limits listed under Security below.
 Short flags:
 
 ```
---model REPO          Hugging Face repository (default Qwen/Qwen3-0.6B), --revision REV, --dir PATH (model directory)
+--model REPO|FILE    Hugging Face repository (default Qwen/Qwen3-0.6B) or a local .gguf file, --revision REV, --dir PATH (model directory)
 --backend cpu|metal   default: metal on macOS when the native lib builds, else cpu
 --quant q4|q8|q2k     weight format (default q4; q2k = 2.625-bit Q2_K; embeddings/LM head are always q8); cached per model
+--gguf-quant LABEL    GGUF repository: the file whose name carries LABEL (Q4_K_M, Q8_0, ...); --gguf-file NAME: exact file name
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
@@ -162,7 +183,7 @@ The MLA latent KV cache of DeepSeek models is much smaller than a plain one (V2-
 ## Tests
 
 ```sh
-mvn test                   # SmokeTest + ServerTest + MetalParamsTest (plain main() classes, no test framework)
+mvn test                   # SmokeTest + ServerTest + MetalParamsTest + the GGUF checks (plain main() classes, no test framework)
 sh scripts/arch-smoke.sh   # 20 synthetic models x Q4/Q8/Q2_K, CPU == Metal; DeepSeek checked against a float64 reference
 ```
 

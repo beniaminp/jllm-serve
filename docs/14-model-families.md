@@ -876,3 +876,12 @@ and the quantized cache index records; it is compared on resume, so for an exist
 If the family only combines existing `Attention`, `Mlp`, `Norms` and `Scaling` variants, no backend changes. A new
 variant (a new attention kind, say) adds a case to the sealed type, which makes every `switch` over it a compile error
 until the CPU and Metal backends, `LayerWeights` and the converter handle it.
+
+### Loading a family from a GGUF file
+
+The same parsers run on a GGUF file: `GgufArchitecture` writes the `config.json` that the file's llama.cpp metadata
+describes (`qwen3.block_count` → `num_hidden_layers`, ...) and calls `Architecture.parse`, so the description and the
+defaults are those of the safetensors load. Four architectures are mapped today (`llama`, `qwen2`, `qwen3`,
+`qwen3moe`); adding one means its metadata keys in `GgufArchitecture`, its tensor names in `GgufWeights.resolve` and,
+if llama.cpp's converter permutes or folds something for it (Llama's q/k rows, Gemma's `1 + w` norms), the matching
+switch in the `Architecture`. See [16](16-gguf.md).

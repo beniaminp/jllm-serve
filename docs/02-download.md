@@ -253,6 +253,16 @@ commitSha()   → hub.commitSha(model, revision), recorded in the cache index (n
 The shard names come from the downloaded index, i.e. from the network, so `ShardProvider.checkName` accepts only
 plain `.safetensors` file names that live directly in the model directory before anything is fetched or deleted.
 
+### A GGUF repository: one file out of many
+
+A `*-GGUF` repository (`unsloth/Qwen3-0.6B-GGUF`) holds the same model quantized many ways, one `.gguf` file each. A
+repository with `.gguf` files and no safetensors checkpoint, or any run with `model.gguf-file` / `model.gguf-quant`
+set, goes through `downloadGguf` instead: `selectGguf` picks the file from the listing (the exact name, or the one
+whose name carries the quantization label as a whole word, or the only one — an error listing the choices when none or
+several fit; split `-00001-of-0000N.gguf` files count as one and are fetched together; `mmproj-*` vision projectors
+are skipped), the free-space check covers only that file, and `downloadFile` fetches it with the usual resume and
+SHA-256 verification. See [16 §16.8](16-gguf.md#168-downloading-and-selecting-a-file).
+
 and hands it to `ModelWeights.load` → `ModelConverter`, which asks for shards only when it needs a tensor in them
 and releases each shard once every tensor in it has been consumed ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)).
 

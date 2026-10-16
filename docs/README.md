@@ -23,5 +23,6 @@ Suggested reading order:
 | 13 | [Q2_K quantization](13-q2k-quantization.md) | 2-bit weights: sub-block scales and mins, the 84-byte super-block, the quantizer search, the Σx dot product, measured size/speed/quality |
 | 14 | [Model families](14-model-families.md) | One table of every supported family (Qwen3, Qwen2, Llama 3.x, Mistral, GLM / GLM-4, Phi-3 / 4, Gemma 2 / 3, DeepSeek-V2 / V3, Mamba): what differs (bias, QK-norm, sliding window, RoPE pairing and scaling, sandwich norms, GeLU, soft-capping, MoE routing, multi-head latent attention, BOS), verified tensor names, the typed `Architecture` model and how to add a family |
 | 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, why the prefix cache changes |
+| 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format: header, metadata and tensor directory byte by byte, the Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K block layouts, mapping metadata and tensor names onto the typed `Architecture`, why Llama's q/k rows are permuted (and how interleaved RoPE undoes it), zero-copy mapping on CPU and Metal, the tokenizer stored in the file, choosing and downloading one file of a GGUF repository |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

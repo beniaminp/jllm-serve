@@ -397,7 +397,7 @@ default and optionally f16 (`backend.kv-dtype`, [05 §5.9](05-transformer-math.m
 | format | idea | not in this project because |
 |---|---|---|
 | **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | *done*: `--quant q2k`, see [13](13-q2k-quantization.md) (applied to every linear layer; pure Q2_K breaks a 0.6B model) |
-| **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | more complex kernels; Q4_0 is the simplest format that works ([13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them) |
+| **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | the engine does not *produce* them (the simplest format that works is Q4_0, [13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them), but it *reads* Q4_K and Q5_K from llama.cpp GGUF files in place, and Q6_K by converting to Q8_0 at load ([16](16-gguf.md)) |
 | **GPTQ / AWQ** | choose the quantized values by minimizing the *output* error on calibration data, not per-weight rounding | needs calibration runs and a solver at conversion time |
 | **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, twice the lanes per SIMD register and no byte→float conversions | *done* on the CPU decode path for Q4_0 / Q8_0 weights, `backend.cpu.int8-activations` ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) |
 | **fp8 / NF4** | 8-bit floats; 4-bit non-uniform "normal float" levels | GPU-oriented; no hardware fp8 on Apple M1 |
