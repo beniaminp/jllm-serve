@@ -1,6 +1,8 @@
 # 8. The Metal backend: GPU compute through Panama FFM — in detail
 
-Code: `metal/MetalBackend.java` (records the forward pass), `metal/Metal.java` (FFM bindings),
+Code: `metal/MetalBackend.java` (records the forward pass; `MlaMetal.java` and `MambaMetalBackend.java` for the
+other two families), `metal/MetalKernels.java` (one writer per kernel), `metal/KernelParams.java` / `Params.java` /
+`MetalConstants.java` (parameter structs and constants), `metal/Metal.java` (FFM bindings),
 `src/main/native/jllm_metal.m` (Objective-C shim with a C ABI), `src/main/resources/org/robomiri/jllm/metal/kernels.metal`
 (the GPU programs), `scripts/build-native.sh` (one `clang` command).
 
@@ -58,7 +60,7 @@ Threads find their place through attributes on the kernel's parameters, e.g.
 
 - **device memory**: pointers marked `device const float *x`. The weights, the KV cache, activations. Large,
   shared by everything, comparatively slow (hundreds of cycles).
-- **threadgroup memory**: `threadgroup float part[8][256]`, declared inside the kernel. Tiny (we use < 10 KB),
+- **threadgroup memory**: `threadgroup float part[8][256]`, declared inside the kernel. Tiny (32 KB per threadgroup at most; the kernels use a few KB, the fused-norm matmuls up to the whole 32 KB),
   very fast, visible only to the threads of one threadgroup. Used to combine partial results.
 - **registers**: ordinary local variables (`float acc[8]`). Fastest; private to one thread.
 - **constant memory**: `constant MatmulParams &p` — small read-only parameter structs.
@@ -98,8 +100,8 @@ from `jllm-q4_0.bin`, and the GPU reads them in place. The only requirement is t
 ### Where MLX fits
 
 MLX is Apple's machine-learning framework (arrays, autograd, a compiler) written in C++ on top of **this same
-Metal API**. We skip the framework and use Metal directly: the project only needs ten kernels, and the whole
-native layer is ~200 lines. The GPU work — writing kernels, managing buffers and command buffers — is the layer
+Metal API**. We skip the framework and use Metal directly: the project only needs a few dozen kernel templates, and the whole
+native layer is ~270 lines. The GPU work — writing kernels, managing buffers and command buffers — is the layer
 MLX would otherwise do for us.
 
 ---
@@ -122,7 +124,7 @@ MLX would otherwise do for us.
 │ jllm_metal.m        Objective-C: talks to the Metal framework; 16 C functions        │  native
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │ kernels.metal       Metal Shading Language (C++ dialect): the code the GPU runs;     │  GPU
-│                     compiled at start-up from source, in seven sections             │
+│                     compiled at start-up from source, in eight sections (0-7)             │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,14 +154,14 @@ The 16 exported functions:
 
 | C function | does | called from |
 |---|---|---|
-| `jm_create(source, err, len)` | `MTLCreateSystemDefaultDevice()`, a command queue, and `newLibraryWithSource:` — compiles the entire `kernels.metal` text at run time with `MTLMathModeRelaxed` (fast math that preserves the `-INFINITY` sentinels of the reductions). Returns an opaque context pointer, or NULL with the compiler's message in `err` | `Metal.<init>` |
+| `jm_create(source, err, len)` | `MTLCreateSystemDefaultDevice()`, a command queue, and `newLibraryWithSource:` — compiles the entire `kernels.metal` text at run time with `MTLMathModeRelaxed` (fast math that preserves the `-INFINITY` sentinels of the reductions; macOS 15+, older systems keep the default mode). Returns an opaque context pointer, or NULL with the compiler's message in `err` | `Metal.<init>` |
 | `jm_destroy(ctx)` | releases everything | `Metal.close` |
 | `jm_device_name(ctx, out, len)` | e.g. "Apple M1 Pro" | `MetalBackend.name` |
 | `jm_recommended_working_set(ctx)` | how many bytes the GPU can keep resident without paging | start-up warning |
-| `jm_device_max_tg_mem(ctx)` | `maxThreadgroupMemoryLength` (32 KB): the fused rmsnorm+matmul kernels keep `dim` floats in threadgroup memory, so they are only used when that fits (`dim ≤ 8176`) | `MetalBackend.init` |
+| `jm_device_max_tg_mem(ctx)` | `maxThreadgroupMemoryLength` (32 KB): the fused rmsnorm+matmul kernels keep `dim` floats in threadgroup memory next to 32 bytes of static scratch, so they are only used when `dim·4 + 32` fits | `MetalKernels.fusedNormFits`, called by `MetalBackend.init` |
 | `jm_pipeline(ctx, name, err, len)` | looks up kernel `name` in the compiled library, builds a `MTLComputePipelineState`, stores it in an array and returns its **index** (so Java never holds Objective-C objects) | once per kernel |
 | `jm_pipeline_max_threads(ctx, idx)` | the pipeline's `maxTotalThreadsPerThreadgroup` | available for sanity checks |
-| `jm_buffer_new(ctx, len, zero)` | `newBufferWithLength:options:Shared`; `zero != 0` clears it with `memset`, otherwise the pages are left untouched and only committed when first written. Every buffer the backends allocate is written before it is read (KV rows by the projections, activations per chunk), so they pass `zero = 0` and a 4 096-token context does not clear a gigabyte at start-up | KV cache, activations, norm weights |
+| `jm_buffer_new(ctx, len, zero)` | `newBufferWithLength:options:Shared`; `zero != 0` clears it with `memset`, otherwise the pages are left untouched and only committed when first written. Every scratch buffer the backends allocate is written before it is read (KV rows by the projections, activations per chunk), so they pass `zero = 0` and a 4 096-token context does not clear a gigabyte at start-up | KV cache, activations, norm weights |
 | `jm_buffer_wrap(ctx, ptr, len)` | `newBufferWithBytesNoCopy:` — wraps memory **owned by Java** (the mmap'd cache file) without copying. If Metal refuses (`ptr` or `len` not page aligned) it prints the reason to stderr and returns NULL, and `Metal.wrap` throws: there is deliberately no copying fallback, which would silently double the memory of a multi-gigabyte model | every quantized weight tensor |
 | `jm_buffer_contents(buf)` | the CPU pointer to a buffer's bytes | Java reads logits / writes embeddings |
 | `jm_buffer_release(buf)` | drop the reference | `Metal.close` |
@@ -219,12 +221,12 @@ dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, tgmem, gx, gy
 ```
 
 `bufs` is a native array of `MAX_BUFS = 16` pointers (`arena.allocate(ValueLayout.ADDRESS, 16)`; the fused
-q/k/v projection binds 11), `offsets` an array of 16 longs, `params` a 64-byte scratch block. `MetalBackend.bind(i, buffer, offset)` writes slot `i` of the
-first two with `setAtIndex`; the parameter struct is written field by field (next section). Because the native
+q/k/v projection binds 14), `offsets` an array of 16 longs, `params` a 64-byte scratch block, all owned by
+`MetalKernels`. Its `bind(i, buffer, offset)` writes slot `i` of the first two with `setAtIndex`; the parameter struct is written field by field (next section). Because the native
 side copies the params (`setBytes`) and records the buffer bindings at dispatch time, the same three scratch
 segments are reused for every dispatch.
 
-**Getting a Java array into GPU memory.** `MetalBackend.upload(float[] data)`:
+**Getting a Java array into GPU memory.** `MetalKernels.upload(float[] data)`:
 
 ```java
 Metal.Buffer b = metal.newBuffer((long) data.length * 4, false);                 // shared buffer, not zeroed
@@ -234,7 +236,7 @@ MemorySegment.copy(data, 0, b.contents(), ValueLayout.JAVA_FLOAT, 0, data.length
 `b.contents()` is the `jm_buffer_contents` pointer reinterpreted to the buffer's size. The same path in reverse
 reads the logits back (`MemorySegment.copy(logitsBuf.contents(), JAVA_FLOAT, 0, logits, 0, rows)`), and the
 embedding rows are written straight into the `x` buffer before each forward. Quantized weights never go through
-a copy at all: `metal.wrap(tensor.data)` passes the mmap'd segment's address and size to `jm_buffer_wrap`.
+a copy at all: `MetalKernels.wrap(tensor.data)` (which is `Metal.wrap`) passes the mmap'd segment's address and size to `jm_buffer_wrap`.
 
 Every `invokeExact` is wrapped by `rethrow`, which converts the checked `Throwable` into a runtime exception;
 a NULL result is turned into a descriptive exception using the `err` buffer. The JVM needs
@@ -271,7 +273,7 @@ the projection that follows it (the `*_norm` kernel variants normalise the input
 | 1 | — | `rmsnorm` | `xb` | — / 64 | 256 |
 | 2 | `matmul3_q4_norm` | `matmul3_pf_q4` | `q`; k and v rows **straight into the caches** at `pos` (bias in the epilogue) | (1024, 1) / (512, 8) | 128 |
 | 3 | `rope` (16 q heads + 8 k heads, qk-norm) | `rope` | `q` in place, the k cache rows | (24, 1) / (24, 64) | 64 |
-| 4 | `attention_g1_d128` | `attention_g1_d128` (2 tiles of 32 tokens) | `att` | (16, 1) / (16, 32) × 2 | 256 |
+| 4 | `attention_g1_d128` | `attention_g1_d128` (2 tiles of `ATT_TILE` = 32 tokens) | `att` | (16, 1) / (16, 32) × 2 | 256 |
 | 5 | `matmul_q4` (Wo, accumulate) | `matmul_pf_q4` | `x +=` | (256, 1) / (128, 8) | 128 |
 | 6 | — | `rmsnorm` | `xb` | — / 64 | 256 |
 | 7 | `matmul_swiglu_q4_norm` (Wgate∥Wup) | `matmul_swiglu_pf_q4` | `hidden = silu(g)·u` | (768, 1) / (768, 8) | 128 |
@@ -344,7 +346,7 @@ wrong buffer and silently produces garbage, which is why the CPU backend exists 
 | `scores` (`32·heads·ctx·4`: one row per tile token and head) | 8.4 MB | 8.4 MB |
 | `logitsBuf` | 608 KB | 608 KB |
 | MoE: `assign`, `routeWeight`, `moeHidden` | — | 2 KB, 2 KB, 1.6 MB |
-| `kStage` (f16 cache only, `batch·kvDim·4`), `flashPart` (flash decoding only) | 256 KB, 266 KB | 128 KB, 266 KB |
+| `kStage` (f16 cache only, `batch·kvDim·4`), `flashPart` (flash decoding only, `heads·32·(headDim+2)·4`) | 256 KB, 266 KB | 128 KB, 532 KB |
 | norm gains, RoPE tables (uploaded copies) | ~2 MB | ~3 MB |
 
 None of the scratch buffers is zeroed at allocation (`jm_buffer_new` with `zero = 0`): every element is written
@@ -362,8 +364,9 @@ compute, write*. We go through them in the order they appear in `kernels.metal`.
 
 ### `tg_sum`, `tg_max` — threadgroup reductions
 
-Shown in 8.0. Used by `rmsnorm` (sum of squares), `rope` (per-head sum of squares), `attention_t` (max and
-sum of the softmax). `buf` has 32 entries because a threadgroup has at most 1024 / 32 = 32 simdgroups.
+Shown in 8.0. Used by `rmsnorm` / `rmsnorm_add` (sum of squares), `rope` (per-head sum of squares),
+`attention_split` / `attention_combine` and the routers (max and sum of a softmax). `attention_t` does the same
+two-level reduction inline, with one slot per grouped head (`red[G * 8]`). `buf` has 32 entries because a threadgroup has at most 1024 / 32 = 32 simdgroups.
 
 ### `block_dot<QT>` — the inner loop of every matmul
 
@@ -379,6 +382,10 @@ float block_dot(wq, ws, grow, nb, b, x4):
         for k in 0..7:  d += dot(float4(4 signed bytes), x4[k])
     return d * ws[grow * nb + b]                // apply the block's scale once
 ```
+
+(`block_dot<2>`, the Q2_K specialisation, dequantizes two 16-weight sub-blocks per 32-weight block and keeps its
+scales inside the block, see [13](13-q2k-quantization.md); the tiled prefill kernels of
+[8.10](#810-the-tiled-prefill-matmuls) use the equivalent `q4_block_dot` / `q8_block_dot`.)
 
 `uchar4`, `float4` are 4-wide vector types; `dot()` on `float4` is one instruction. The nibble layout matches
 `QTensor` (byte `j` → weights `j` and `j+16`): the low nibbles of bytes 0–15 are weights 0–15, the high nibbles
@@ -420,8 +427,9 @@ For `n = 1024` each thread handles 4 elements. `MetalKernels.rmsnorm` binds the 
 the final norm can read only the last token's row (`(n−1)·dim·4`) and write row 0 of `xb`. At decode the
 norm before a projection is not a dispatch at all: the `matmul_*_norm` variants recompute the row's scale in
 every threadgroup with `norm_scale_128`, which reproduces the 256-thread reduction of `rmsnorm` lane for lane
-on 128 threads, so the fused result is bit-identical to `rmsnorm` + `matmul` (used only while `dim·4` bytes of
-normalised row fit the 32 KB of threadgroup memory, `jm_device_max_tg_mem`).
+on 128 threads, so the fused result is bit-identical to `rmsnorm` + `matmul` (used only while the normalised row fits the 32 KB of
+threadgroup memory, `jm_device_max_tg_mem`). `rmsnorm_add` is the same kernel ending in `out[row] += …`: Glm4 and
+Gemma normalise the output of a sub-layer before the residual add.
 
 ### `matmul3` and `matmul_swiglu` — the fused projections
 
@@ -457,15 +465,17 @@ Threadgroups `x < nHeads` rotate q heads in place; the others read a k head from
 rotation. The `cos`/`sin` tables are the `Rope` arrays uploaded once (`[ctx × rotHalf]` each); DeepSeek rotates
 its q heads and the shared `k_pe` row through the q path (`rotOff = nope`, no k heads).
 
-### `attention_t<KV, G, PERK, PERV>` — one threadgroup (256 threads = 8 simdgroups) per (head, token)
+### `attention_t<KV, G, PERK, PERV, MAXP>` — one threadgroup (256 threads = 8 simdgroups) per (head group, token)
 
 One template behind every attention variant: `KV` is the cache element type (`float`, or `half` converted on
 load), `G` the query heads sharing a threadgroup (1 unless `-Djllm.metal.attnGroup` asks for 2/4/8, which are
 then compiled on demand), `PERK` / `PERV` the key and value head widths in units of 32 lanes — compile-time for
 head dims 64 / 128 / 256 (`attention_g1_d128`), or 0 for the widths in the params (`attention`: other head
 dims; `attention_mla`: DeepSeek's absorbed queries, `kv_lora_rank + rope` = 576-wide keys and 512-wide values over
-one shared kv head, with the width bound raised to `MLA_MAX_PER` = 18 lanes of 32). Per head the arithmetic is the
-same whatever the arguments.
+one shared kv head), and `MAXP` the bound of those runtime widths (`MAX_PER` = 8, or `MLA_MAX_PER` = 18 lanes of 32
+for `attention_mla`). Per head the arithmetic is the same whatever the arguments. The tokens of a chunk are
+dispatched in tiles of `ATT_TILE` = 32 (`MetalKernels.attention` loops over them), so the scores scratch needs
+only 32 rows per head.
 
 Three phases, following the formula `softmax(q·K / √hd) · V`:
 
@@ -484,13 +494,14 @@ phase 3  values:    simdgroup sg again takes positions sg, sg+8, ...: o[i] += sc
 
 **Worked example** with `pos0 = 412`, token `t = 0` of a decode step: `len = 413` cached positions; each of
 the 8 simdgroups handles ~52 of them in phase 1 and 3; each phase-1 iteration is 4 multiplies per lane plus one
-`simd_sum`. The `scores` buffer is indexed `[(t·heads + h)·ctx + s]` so every (token, head) has its own row of
-`ctx` floats — putting scores in device memory rather than threadgroup memory is what allows `ctx = 4096`
+`simd_sum`. The `scores` buffer is indexed `[(tl·heads + h)·ctx + s]` with `tl` the token's index inside its tile, so
+every (token, head) of the tile has its own row of `ctx` floats — putting scores in device memory rather than threadgroup memory is what allows `ctx = 4096`
 (16 KB per row would not fit the 32 KB threadgroup limit for several rows). Causality is `len = pos0 + t + 1`.
 GQA: `kvh = h / (nHeads / nKvHeads)` selects the shared KV head.
 
-The two `threadgroup_barrier(mem_flags::mem_device)` calls make the scratch writes of phase 1 visible to
-phase 2, and phase 2's to phase 3.
+The two `threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)` calls make the scratch writes
+of phase 1 visible to phase 2, and phase 2's to phase 3. With `softcap > 0` (Gemma 2) each score goes through
+`tanh(s / cap) · cap` before the max.
 
 ### `router` / `router_ds` — one threadgroup (256 threads = 8 simdgroups) per token
 
@@ -503,22 +514,24 @@ thread 0:   8 times: pick the largest remaining, assign[t·8+k] = e, rw[t·8+k] 
 ```
 
 Thread 0 doing 8 passes over 128 entries is ~1 000 operations — trivial next to a 1 MB read, and it keeps the
-selection exactly identical to `CpuBackend.route` (softmax first, then top-k, then renormalize, like
+selection exactly identical to the CPU backend's router (softmax first, then top-k, then renormalize, like
 transformers). `router_ds` computes the logits the same way and applies DeepSeek's rule on thread 0 (sigmoid or
 softmax scores, group-limited selection, bias for `noaux_tc`, scaling; see `DeepSeekRouter.java`). The logits
 live in threadgroup memory (`MAX_EXPERTS = 1024`, checked in the constructors).
 
-### `moe_up<QT>` — one simdgroup per (slot, expert row)
+### `moe_up<QT>` — one simdgroup per (slot, hidden unit)
 
-A **slot** is `s = t·topK + k`: the `k`-th chosen expert of token `t`. Grid `(ceil(1536/4), n·8)`:
+A **slot** is `s = t·topK + k`: the `k`-th chosen expert of token `t`. Grid `(ceil(768/4), n·8)`:
 
 ```
-row  = tgp.x·4 + sg                      which of the expert's 1536 gate/up rows
-s    = tgp.y;  t = s / 8;  e = assign[s]
-grow = e·1536 + row                      the row inside the stacked [128·1536, 2048] tensor
-acc  = Σ_blocks block_dot<QT>(…, grow, …, x[t])   over nb = 64 blocks, 2 per lane
-simd_sum;  lane 0 writes moeGateUp[s·1536 + row]
+row   = tgp.x·4 + sg                     which of the expert's 768 hidden units
+s     = tgp.y;  t = s / 8;  e = assign[s]
+growG = e·1536 + row;  growU = growG + 768   gate row and up row inside the stacked [128·1536, 2048] tensor
+g, u  = Σ_blocks block_dot<QT>(…, growG / growU, …, x[t])   over nb = 64 blocks, 2 per lane
+simd_sum both;  lane 0 writes moeHidden[s·768 + row] = silu(g) · u
 ```
+
+The SwiGLU is in the epilogue, so there is no gate/up scratch and no activation pass.
 
 Selecting an expert is purely arithmetic on the row index — the stacked layout from
 [12 §12.3](12-mixture-of-experts.md#123-weight-layout-experts-stacked-into-two-matrices) means no per-expert
@@ -551,9 +564,11 @@ template [[host_name("moe_up_q8")]] kernel moe_up_t moe_up<8>;
 ```
 
 `host_name` is the string `jm_pipeline` looks up, and `Metal.pipeline(name)` looks it up lazily: a pipeline
-is created the first time a dispatch names it and memoized, so only the variants a model runs are built. Every
-quantized kernel is a template on `QT` (4 = Q4_0, 8 = Q8_0, 2 = Q2_K), the matmul family additionally on the
-fused-norm flag (and `matmul3` on the v output type), the attention and rope kernels on the cache element type.
+is created the first time a dispatch names it and memoized, so only the variants a model runs are built, and
+`MetalKernels.kernel(base, type, suffix)` assembles the name (`matmul3` + `q4` + `_norm_h`). Every quantized
+kernel is a template on `QT` (4 = Q4_0, 8 = Q8_0, 2 = Q2_K), the matmul family additionally on the fused-norm
+flag (and `matmul3` on the v output type), the attention, rope and `mla_lat_store` kernels on the cache element
+type, `rope` also on the pairing (`ADJACENT`).
 The grouped attention instantiations (`attention_g{2,4,8}_*`) sit behind `#ifdef JLLM_ATTN_GROUPS`, which
 `MetalBackend` defines (through `Metal.create`'s preamble) only when `-Djllm.metal.attnGroup` asks for them.
 
@@ -588,12 +603,15 @@ The grouped attention instantiations (`attention_g{2,4,8}_*`) sit behind `#ifdef
 
 ## 8.7 Measured numbers and where the time goes
 
-Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt (`bench --ctx 1024`): **~540 tok/s prefill, ~105 tok/s
-decode** (the same at `--ctx 4096`); Qwen3-30B-A3B Q4_0: **~49 tok/s prefill, ~24 tok/s decode**. Greedy
-output is byte-identical to the CPU backend. Before the tiled prefill matmuls and the pipelined command buffers
-the 0.6B model prefilled at ~380 tok/s and the 30B at ~44 tok/s; decode was within noise of today's numbers.
+Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt (`bench`): **~533 tok/s prefill, ~111 tok/s decode** (the f16
+cache is similar); Qwen3-30B-A3B Q4_0: **~49 tok/s prefill, ~25 tok/s decode**. The CPU backend on the same
+machine does ~275 / ~51 (0.6B, int8 activations) and ~12 / ~6 (30B); the full table is in
+[11.1](11-performance.md#111-measured). Greedy output is byte-identical to the CPU backend with float
+activations (the int8 CPU path can diverge at a near-tie). Before the tiled prefill matmuls and the pipelined
+command buffers the 0.6B model prefilled at ~380 tok/s and the 30B at ~44 tok/s; decode was within noise of
+today's numbers.
 
-Where a decode step of the 0.6B model (~9.5 ms) goes:
+Where a decode step of the 0.6B model (~9 ms) goes:
 
 | cost | evidence |
 |---|---|
@@ -610,35 +628,38 @@ reading the whole prefix) dominates instead.
 
 ### What remains, by expected payoff
 
-1. **Expert-grouped MoE prefill** — `moe_up` handles one token per simdgroup, so a 64-token chunk reads every
-   chosen expert's weights once *per token*. Sorting slots by expert and running a `TOK_TILE`-style loop over
-   the tokens that share an expert gives the reuse the dense matmul already has (the 30B prefills at 49 tok/s
-   against 540 for the 0.6B).
+1. **Expert-grouped MoE prefill** — the CPU backend already sorts slots by expert and runs each expert once over
+   its tokens ([7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)), but `moe_up` /
+   `moe_down` still handle one token per simdgroup, so a 64-token chunk reads every chosen expert's weights once
+   *per token*. A `TOK_TILE`-style loop over the tokens that share an expert would give the reuse the dense
+   matmul already has (the 30B prefills at 49 tok/s against 533 for the 0.6B).
 2. **Prefill attention** — a tile of query tokens per threadgroup sharing each K/V row, or an online-softmax
    pass that never writes `scores` to device memory (flash decoding does the split for decode only).
 3. **Simdgroup matrix instructions** (`simdgroup_multiply_accumulate` on 8×8 tiles) for prefill matmuls — a
-   different accumulation order, so it would be opt-in like flash decoding.
+   different accumulation order, so it would be opt-in like flash decoding (not started).
 4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
 5. **Overlap** — pipeline the CPU's sampling with the next step's GPU work, or sample on the GPU.
 
 ---
 
-## 8.8 Summary
+## 8.8 Summary of the core design
 
 - The GPU runs *one function per output element*; we express every transformer operation as such a function
   and launch grids of threadgroups (`kernels.metal`).
 - Dot products end with `simd_sum`; threadgroup-wide sums use a two-level reduction through threadgroup memory
   and barriers.
 - Unified memory lets the memory-mapped quantized cache be used by the GPU in place (`jm_buffer_wrap`).
-- A ~250-line Objective-C shim exposes 16 C functions; `Metal.java` binds them with the FFM API (`Linker`,
+- A ~270-line Objective-C shim exposes 16 C functions; `Metal.java` binds them with the FFM API (`Linker`,
   `FunctionDescriptor`, `MethodHandle.invokeExact`, `MemorySegment`), no JNI, no generated code.
 - `MetalBackend.forward` records the whole forward pass (170 dispatches for 0.6B, 386 for 30B-A3B) through
-  the writers of `MetalKernels`, submitting every 8 layers so the GPU runs them while the rest is encoded, and
+  the writers of `MetalKernels` (per-layer strategy objects picked once from the `LayerSpec`), submitting every 8 layers so the GPU runs them while the rest is encoded, and
   waits once at the end.
 - Every parameter struct has one Java writer, checked against the shader source by `MetalParamsTest`.
 - Decode on the M1 Pro is limited by dispatch count and small grids rather than by bandwidth; prefill by the
   matmuls' activation reads (tiled kernels) and, at long contexts, by attention.
+- The sections that follow cover the pieces layered on top of this design: the f16 KV cache (8.9), the tiled
+  prefill matmuls (8.10), flash decoding (8.11) and the DeepSeek MLA / Mamba kernels (8.12).
 
 ---
 
@@ -685,7 +706,7 @@ the same order and the results are **bit-identical** — checked element-wise fo
 Tile shape, measured per layer at the 0.6B shapes with 64 tokens: two adjacent rows per simdgroup coalesce
 into 1 KB reads and halve the x gathers (4.0 ms per layer against 6.2–6.7 for the single-row kernels), four
 rows cost too many registers, 16 tokens gain nothing more; the SwiGLU kernel is fastest with one unit
-(1.5 ms against 2.2). End to end: 0.6B prefill 380 → 540 tok/s, 30B 44 → 49 tok/s (its prefill is dominated
+(1.5 ms against 2.2). End to end: 0.6B prefill 380 → 533 tok/s, 30B 44 → 49 tok/s (its prefill is dominated
 by the MoE kernels, which still handle one token per simdgroup).
 
 ---
@@ -703,3 +724,34 @@ by default: on Qwen3-0.6B with a 3 176-token prompt at `--ctx 4096` (M1 Pro) dec
 with the f32 cache (+3–5 % with f16), the greedy output is identical and the largest logit difference is
 4.4e-6 (relative 3.7e-7) with the same argmax on every step. Dense attention only; DeepSeek MLA keeps the
 single-pass kernel.
+
+---
+
+## 8.12 DeepSeek MLA and Mamba on the GPU
+
+Both families reuse the generic kernels for their projections, norms and rotary embedding and add only the pieces
+that carry their own state. Their parameter structs are `MlaParams`, `MambaConvParams` and `MambaScanParams` in
+the table of [8.4](#84-recording-a-forward-pass-metalbackendforward).
+
+**MLA** (`MlaMetal`, see `MlaCpu` and [14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)
+for the math). The cache holds the *latent* row `[c | k_pe]` (`kv_lora_rank + rope` = 576 numbers per token and
+layer for DeepSeek-V2-Lite, f32 or half) instead of per-head keys and values, and `W_kb` is absorbed into the
+query. Per layer after the projections and the two rotations (`rope_il` through the q path, `rotOff = nope`):
+
+| kernel | grid | does |
+|---|---|---|
+| `mla_lat_store` (`_h`) | `(n)`, 64 threads | writes the cache row `[c, k_pe]` of every token |
+| `mla_absorb_q` | `(heads, n)`, 256 threads | `qa[t, h] = [W_kb_k[h]ᵀ q_nope, q_pe]` |
+| `attention_mla` (`_h`) | `(heads, tile)`, 256 threads | the generic `attention_t` with 576-wide keys, 512-wide values, one kv head shared by all heads |
+| `mla_apply_v` | `(heads, n)`, 256 threads | `att[t, h] = W_kb_v[h] · o[t, h]` |
+
+`W_kb_k` / `W_kb_v` live on the GPU dequantized to f32 (8 MB per layer for V2-Lite). The flash-decoding path is
+dense attention only; MLA keeps the single-pass kernel.
+
+**Mamba** (`MambaMetalBackend`): per layer RMSNorm, `in_proj`, `mamba_conv`, `x_proj`, `mamba_scan`, `out_proj`
+(the projections are the ordinary matmul kernels). `mamba_conv` and `mamba_scan` run one thread per channel
+(`d_inner` threads) and loop over the chunk's tokens inside the thread, because the recurrence is sequential over
+tokens and independent over channels. The conv window and the channel's weights (`mamba_conv`) and the SSM state
+row (`mamba_scan`, up to `MAMBA_MAX_STATE` = 64) stay in registers for the whole chunk and are written back once,
+so a layer is one dispatch per stage regardless of the chunk size. The price is that a long prefill has only
+`d_inner` threads of parallelism. See [15](15-mamba.md).
