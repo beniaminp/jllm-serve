@@ -29,6 +29,16 @@ public final class MetalBackend implements Backend {
      */
     static final int PREFILL_MIN_TOKENS = Integer.getInteger("jllm.metal.prefillMinTokens", 8);
     /**
+     * Flash decoding (see the "flash decoding" section of kernels.metal): a decode step over at least
+     * FLASH_MIN_LEN cached positions splits every head's key range across up to FLASH_MAX_SPLITS threadgroups of
+     * FLASH_CHUNK keys and combines the partial softmaxes. Opt-in because the combine sums in a different order
+     * from the single-pass kernel (results differ at the 1e-6 level, not bit-identical).
+     */
+    static final boolean FLASH_DECODE = Boolean.getBoolean("jllm.metal.flashDecode");
+    static final int FLASH_MIN_LEN = Integer.getInteger("jllm.metal.flashMinLen", 512);
+    static final int FLASH_CHUNK = Integer.getInteger("jllm.metal.flashChunk", 128); // 64-128 measured best, 256+ slower
+    static final int FLASH_MAX_SPLITS = 32; // the combine kernel holds 64 weights
+    /**
      * Tokens per attention dispatch; the scores scratch holds one row of ctx floats per (tile token, head)
      * instead of one per (batch token, head). 32 keeps a 64-token prefill chunk at two dispatches per layer.
      */
@@ -66,6 +76,9 @@ public final class MetalBackend implements Backend {
     private int pRmsnormAdd;  // Glm4: post-norms, -1 otherwise
     private int pAttention;
     private int attnGroup; // query heads per attention threadgroup
+    private int pAttnSplit = -1;   // flash decoding, -1 when off
+    private int pAttnCombine = -1;
+    private Metal.Buffer flashPart;
     private int pAddBias;
     private int pSoftcap;     // Gemma 2 final-logit cap, -1 otherwise
     private int pRouter;
@@ -235,6 +248,10 @@ public final class MetalBackend implements Backend {
             attnGroup = 1;
             pAttention = metal.pipeline(kvHalf ? "attention_h" : "attention");
         }
+        if (FLASH_DECODE && c.deepseek() == null) {
+            pAttnSplit = metal.pipeline(kvHalf ? "attention_split_h" : "attention_split");
+            pAttnCombine = metal.pipeline("attention_combine");
+        }
         pAddBias = metal.pipeline("add_bias");
         pSoftcap = c.finalSoftcap() > 0 ? metal.pipeline("softcap") : -1;
         pRouter = metal.pipeline("router");
@@ -336,6 +353,7 @@ public final class MetalBackend implements Backend {
         hidden = metal.newBuffer((long) maxBatch * c.maxMlpDim() * 4, false);
         scores = metal.newBuffer((long) Math.min(ATT_TILE, maxBatch) * c.heads() * ctx * 4, false);
         logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4, false);
+        flashPart = pAttnSplit >= 0 ? metal.newBuffer((long) c.heads() * FLASH_MAX_SPLITS * (c.headDim() + 2) * 4, false) : null;
         if (c.isMoe()) {
             int slots = maxBatch * c.expertsPerTok();
             assign = metal.newBuffer((long) slots * 4, false);
@@ -717,6 +735,10 @@ public final class MetalBackend implements Backend {
 
     /** One dispatch per tile of ATT_TILE tokens; the scores scratch is indexed by the tile-local token. */
     private void attention(int l, int n, int pos) {
+        if (pAttnSplit >= 0 && n == 1 && pos + 1 >= FLASH_MIN_LEN) {
+            flashAttention(l, pos);
+            return;
+        }
         bind(0, q, 0);
         bind(1, keyCache[l], 0);
         bind(2, valCache[l], 0);
@@ -737,6 +759,40 @@ public final class MetalBackend implements Backend {
             metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 44, c.heads() / attnGroup,
                     Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
+    }
+
+    /** Flash decoding for the single token at pos: attention_split over (heads, nSplit), then attention_combine. */
+    private void flashAttention(int l, int pos) {
+        int len = pos + 1;
+        int window = c.windowFor(l);
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int keys = len - first;
+        int nSplit = Math.min(FLASH_MAX_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
+        int chunk = (keys + nSplit - 1) / nSplit;
+        bind(0, q, 0);
+        bind(1, keyCache[l], 0);
+        bind(2, valCache[l], 0);
+        bind(3, flashPart, 0);
+        bind(4, scores, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.kvHeads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.headDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, pos);
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, ctx);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.attnScale());
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 8, window);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 9, c.attnSoftcap());
+        params.setAtIndex(ValueLayout.JAVA_INT, 10, nSplit);
+        params.setAtIndex(ValueLayout.JAVA_INT, 11, chunk);
+        metal.dispatch(pAttnSplit, bufArgs, offArgs, 5, params, 48, c.heads(), nSplit, 1, 256, 1, 1);
+        bind(0, flashPart, 0);
+        bind(1, att, 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.headDim());
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, nSplit);
+        metal.dispatch(pAttnCombine, bufArgs, offArgs, 2, params, 12, c.heads(), 1, 1, 256, 1, 1);
     }
 
     /** f16 cache: rounds the n staged k/v rows into rows [pos, pos+n) of layer l's half caches. */

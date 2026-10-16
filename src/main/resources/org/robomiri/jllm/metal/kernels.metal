@@ -899,6 +899,153 @@ ATTN_INST(half, 4, 4, "attention_g4_d128_h")  ATTN_INST(half, 8, 4, "attention_g
 ATTN_INST(half, 1, 8, "attention_g1_d256_h")  ATTN_INST(half, 2, 8, "attention_g2_d256_h")
 ATTN_INST(half, 4, 8, "attention_g4_d256_h")  ATTN_INST(half, 8, 8, "attention_g8_d256_h")
 
+// ---------------------------------------------------------------------------------------------- flash decoding
+// Optional (-Djllm.metal.flashDecode=true): a decode step (one token) over a long context splits the key range of
+// every head across nSplit threadgroups instead of one. attention_split<KV> runs the three phases of `attention`
+// on its sub-range [first + split * chunk, ...) with the softmax taken relative to the sub-range's own maximum,
+// and writes the unnormalised partial (o[headDim], max, sum) to `part`; attention_combine then rescales the
+// partials to the global maximum and divides by the combined sum. The combine adds the sub-ranges' sums and
+// value accumulations in a different order from the single-pass kernel, so the results are not bit-identical to
+// it (max |delta logit| ~1e-6 on Qwen3-0.6B at 3 500 tokens, same greedy tokens), hence the opt-in.
+// part layout: [(h * nSplit + split) * (headDim + 2)]: o[0..headDim), max, sum. Grid: (nHeads, nSplit), 256 threads.
+
+struct AttnSplitParams {
+    int nHeads;
+    int nKvHeads;
+    int headDim;
+    int pos0;
+    int ctx;
+    float scale;
+    int qStride;
+    int kvStride;
+    int window;
+    float softcap;
+    int nSplit;
+    int chunk;       // keys per split
+};
+
+template <typename KV>
+kernel void attention_split(device const float *q [[buffer(0)]],
+                            device const KV *kc [[buffer(1)]],
+                            device const KV *vc [[buffer(2)]],
+                            device float *part [[buffer(3)]],
+                            device float *scores [[buffer(4)]],
+                            constant AttnSplitParams &p [[buffer(5)]],
+                            uint2 tgp [[threadgroup_position_in_grid]],
+                            ushort2 tid2 [[thread_position_in_threadgroup]],
+                            ushort2 tpg2 [[threads_per_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]],
+                            ushort lane [[thread_index_in_simdgroup]],
+                            ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    threadgroup float red[8][256];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+
+    const int h = int(tgp.x);
+    const int split = int(tgp.y);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int len = p.pos0 + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    const int s0 = first + split * p.chunk;
+    const int s1 = min(len, s0 + p.chunk);
+    const int per = p.headDim / 32;
+    device const float *qv = q + h * p.headDim;
+    device float *sc = scores + (ulong)h * p.ctx;
+    device const KV *kb = kc + kvh * p.headDim;
+    device const KV *vb = vc + kvh * p.headDim;
+    device float *po = part + ((ulong)h * p.nSplit + split) * (p.headDim + 2);
+
+    float qr[8];
+    for (int i = 0; i < 8; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+
+    float mx = -INFINITY;
+    for (int s = s0 + sg; s < s1; s += nsg) {
+        device const KV *kv = kb + (ulong)s * p.kvStride;
+        float d = 0.0f;
+        for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
+        d = simd_sum(d) * p.scale;
+        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
+        if (lane == 0) sc[s] = d;
+        mx = max(mx, d);
+    }
+    mx = tg_max(mx, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (s0 >= s1) { // empty split (fewer keys than nSplit * chunk): contributes nothing
+        for (int d = tid; d < p.headDim; d += tpg) po[d] = 0.0f;
+        if (tid == 0) { po[p.headDim] = -INFINITY; po[p.headDim + 1] = 0.0f; }
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int s = s0 + tid; s < s1; s += tpg) {
+        float e = exp(sc[s] - mx);
+        sc[s] = e;
+        sum += e;
+    }
+    sum = tg_sum(sum, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float o[8];
+    for (int i = 0; i < 8; i++) o[i] = 0.0f;
+    for (int s = s0 + sg; s < s1; s += nsg) {
+        const float pr = sc[s];
+        device const KV *vv = vb + (ulong)s * p.kvStride;
+        for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
+    }
+    for (int i = 0; i < 8; i++) if (i < per) red[sg][lane + i * 32] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = tid; d < p.headDim; d += tpg) {
+        float acc = 0.0f;
+        for (int g = 0; g < nsg; g++) acc += red[g][d];
+        po[d] = acc;
+    }
+    if (tid == 0) {
+        po[p.headDim] = mx;
+        po[p.headDim + 1] = sum;
+    }
+}
+
+struct AttnCombineParams {
+    int nHeads;
+    int headDim;
+    int nSplit;      // <= 64
+};
+
+// out[h, d] = sum_s o_s[d] * exp(m_s - M) / sum_s l_s * exp(m_s - M), M = max_s m_s. Grid: (nHeads), 256 threads.
+kernel void attention_combine(device const float *part [[buffer(0)]],
+                              device float *out [[buffer(1)]],
+                              constant AttnCombineParams &p [[buffer(2)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              ushort tid [[thread_position_in_threadgroup]],
+                              ushort tpg [[threads_per_threadgroup]]) {
+    threadgroup float w[64];
+    threadgroup float inv[1];
+    const int h = int(tg);
+    const int stride = p.headDim + 2;
+    device const float *ph = part + (ulong)h * p.nSplit * stride;
+    if (tid == 0) {
+        float m = -INFINITY;
+        for (int s = 0; s < p.nSplit; s++) m = max(m, ph[s * stride + p.headDim]);
+        float l = 0.0f;
+        for (int s = 0; s < p.nSplit; s++) {
+            const float ws = exp(ph[s * stride + p.headDim] - m);
+            w[s] = ws;
+            l += ws * ph[s * stride + p.headDim + 1];
+        }
+        inv[0] = 1.0f / l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = tid; d < p.headDim; d += tpg) {
+        float acc = 0.0f;
+        for (int s = 0; s < p.nSplit; s++) acc += w[s] * ph[s * stride + d];
+        out[(ulong)h * p.headDim + d] = acc * inv[0];
+    }
+}
+
+template [[host_name("attention_split")]] kernel decltype(attention_split<float>) attention_split<float>;
+template [[host_name("attention_split_h")]] kernel decltype(attention_split<half>) attention_split<half>;
+
 // ---------------------------------------------------------------------------------------------- mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
 // sg, sg + 8, ...: the 32 lanes stride over dim in float4 steps (each iteration reads 512 contiguous bytes of
