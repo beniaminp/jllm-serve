@@ -568,9 +568,16 @@ public final class MetalBackend implements Backend {
         return (n + PF_TOKS - 1) / PF_TOKS;
     }
 
-    /** Dynamic threadgroup memory for the normalised input row of the *_norm kernels (0 when unused). */
+    /**
+     * Length bound to the matmul kernels' [[threadgroup(0)]] argument when the instantiation does not use it:
+     * the plain (non-NORM) variants still declare the argument, and Metal requires every declared threadgroup
+     * argument to have a length set before the dispatch.
+     */
+    static final int UNUSED_TG_BYTES = 16;
+
+    /** Dynamic threadgroup memory for the normalised input row of the *_norm kernels (a dummy length otherwise). */
     private static int normTgMem(Metal.Buffer norm, int cols) {
-        return norm != null ? cols * 4 : 0;
+        return norm != null ? cols * 4 : UNUSED_TG_BYTES;
     }
 
     /** Offset of the f32 scale region to bind as buffer(1); Q2_K keeps its scales inside the blocks (unused binding). */

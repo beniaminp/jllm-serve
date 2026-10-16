@@ -253,7 +253,7 @@ public final class MambaMetalBackend implements Backend {
         int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + sgPerTg - 1) / sgPerTg;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, gx, gy, 1, 32 * sgPerTg, 1, 1);
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, MetalBackend.UNUSED_TG_BYTES, gx, gy, 1, 32 * sgPerTg, 1, 1);
     }
 
     private void rmsnorm(Metal.Buffer in, long inOff, Metal.Buffer weight, Metal.Buffer out, int n, int width) {
