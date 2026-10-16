@@ -147,8 +147,13 @@ public final class GgufMetalCheck {
             compare(read(kk, n * ROWS), y, mag, ROWS, tag + " matmul3 k");
             compare(read(v, n * ROWS), y, mag, ROWS, tag + " matmul3 v");
 
-            // swiglu: hidden = 2, gate rows 0..1, up rows 2..3
+            // swiglu: hidden = 2, gate = rows 0..1 and up = rows 2..3, two separate views joined as a split tensor
             int hidden = ROWS / 2;
+            long rb = (long) COLS / qt.blockSize * qt.blockBytes;
+            QTensor gate = QTensor.mapped(qt, hidden, COLS, seg.asSlice(0, hidden * rb));
+            QTensor upT = QTensor.mapped(qt, hidden, COLS, seg.asSlice(hidden * rb, hidden * rb));
+            QTensor gu = QTensor.split(gate, upT, 0);
+            Metal.Buffer wg = k.wrap(gate.data);
             double[][] ys = new double[n][hidden];
             double[][] ms = new double[n][hidden];
             for (int tok = 0; tok < n; tok++) {
@@ -160,29 +165,82 @@ public final class GgufMetalCheck {
             }
             Metal.Buffer sw = k.scratch((long) n * hidden * 4);
             k.begin();
-            k.swiglu(t, w, in, null, sw, false, n);
+            k.swiglu(gu, wg, in, null, sw, false, n);
             k.commitAndWait();
-            compare(read(sw, n * hidden), ys, ms, hidden, tag + " swiglu");
+            compare(read(sw, n * hidden), ys, ms, hidden, tag + " swiglu (split gate|up)");
+            if (n == 1) {
+                Metal.Buffer nw = k.upload(ones(COLS));
+                double ss = 0;
+                for (float xv : x) {
+                    ss += (double) xv * xv;
+                }
+                double scale = 1.0 / Math.sqrt(ss / COLS + 1e-6);
+                double[][] yn = new double[1][hidden];
+                double[][] mn = new double[1][hidden];
+                for (int r = 0; r < hidden; r++) {
+                    double gg = 0;
+                    double uu = 0;
+                    for (int c = 0; c < COLS; c++) {
+                        gg += (double) ref[r * COLS + c] * x[c] * scale;
+                        uu += (double) ref[(hidden + r) * COLS + c] * x[c] * scale;
+                    }
+                    yn[0][r] = gg / (1 + Math.exp(-gg)) * uu;
+                    mn[0][r] = Math.abs(yn[0][r]) + 1e-3 * (mag[0][r] + mag[0][hidden + r]);
+                }
+                Metal.Buffer swn = k.scratch(hidden * 4L);
+                k.begin();
+                k.swiglu(gu, wg, in, nw, swn, false, 1);
+                k.commitAndWait();
+                compare(read(swn, hidden), yn, mn, hidden, tag + " swiglu+rmsnorm (split gate|up)");
+            }
 
-            // MoE: one expert (assign = 0) whose stacked gate|up tensor is t: moe_up == swiglu of the same rows
+            // MoE: two experts of width m = 1; gate experts = rows 0..1, up experts = rows 2..3 (interleave = m);
+            // token t routes to expert t % 2, so moe_up is swiglu of gate row e and up row e
+            QTensor experts = QTensor.split(gate, upT, 1);
             Metal.Buffer assign = k.scratch((long) n * 4);
             for (int i = 0; i < n; i++) {
-                assign.contents().setAtIndex(ValueLayout.JAVA_INT, i, 0);
+                assign.contents().setAtIndex(ValueLayout.JAVA_INT, i, i % 2);
             }
-            Metal.Buffer up = k.scratch((long) n * hidden * 4);
+            double[][] ye = new double[n][1];
+            double[][] me = new double[n][1];
+            for (int tok = 0; tok < n; tok++) {
+                int e = tok % 2;
+                double g = y[tok][e];
+                ye[tok][0] = g / (1 + Math.exp(-g)) * y[tok][2 + e];
+                me[tok][0] = Math.abs(ye[tok][0]) + 1e-3 * (mag[tok][e] + mag[tok][2 + e]);
+            }
+            Metal.Buffer up = k.scratch(n * 4L);
             k.begin();
-            k.moeUp(t, w, in, assign, up, hidden, 1, n);
+            k.moeUp(experts, wg, in, assign, up, 1, 1, n);
             k.commitAndWait();
-            compare(read(up, n * hidden), ys, ms, hidden, tag + " moe_up");
+            compare(read(up, n), ye, me, 1, tag + " moe_up (split experts)");
+            // the CPU routes the same logical rows to the same weights
+            float[] row = new float[COLS];
+            for (int e = 0; e < 2; e++) {
+                experts.dequantizeRow(e * 2, row, 0);          // expert e, gate row
+                boolean same = true;
+                for (int c = 0; c < COLS; c++) {
+                    same &= row[c] == ref[e * COLS + c];
+                }
+                experts.dequantizeRow(e * 2 + 1, row, 0);      // expert e, up row
+                for (int c = 0; c < COLS; c++) {
+                    same &= row[c] == ref[(2 + e) * COLS + c];
+                }
+                check(same, tag + " split expert rows e=" + e + " dequantize to the stacked layout");
+            }
 
             // moe_down with t as the [dim = 4, moeDim = 512] down matrix of expert 0 and weight 1: x += W h
             float[] zeros = new float[n * ROWS];
+            Metal.Buffer assign0 = k.scratch((long) n * 4);
+            for (int i = 0; i < n; i++) {
+                assign0.contents().setAtIndex(ValueLayout.JAVA_INT, i, 0);
+            }
             Metal.Buffer xres = k.upload(zeros);
             float[] rwv = new float[n];
             java.util.Arrays.fill(rwv, 1f);
             Metal.Buffer rw = k.upload(rwv);
             k.begin();
-            k.moeDown(t, w, in, assign, rw, xres, ROWS, 1, n);
+            k.moeDown(t, w, in, assign0, rw, xres, ROWS, 1, n);
             k.commitAndWait();
             compare(read(xres, n * ROWS), y, mag, ROWS, tag + " moe_down");
         }

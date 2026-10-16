@@ -471,12 +471,15 @@ kernel void matmul_swiglu(device const uchar *wq [[buffer(0)]],
         accg[t] = 0.0f;
         accu[t] = 0.0f;
     }
+    // GGUF types: the up rows are a separate view of the file, bound as buffer(1) (ws is unused by these types)
+    device const uchar *wqU = QT >= GG_FIRST ? (device const uchar *)ws : wq;
+    const ulong rowU = QT >= GG_FIRST ? (ulong)row : (ulong)(p.hidden + row);
     if (NORM) {
         mm_row<QT>(wq, ws, (ulong)row, nb, (threadgroup const float *)xn, 0, 1, accg, lane);
-        mm_row<QT>(wq, ws, (ulong)(p.hidden + row), nb, (threadgroup const float *)xn, 0, 1, accu, lane);
+        mm_row<QT>(wqU, ws, rowU, nb, (threadgroup const float *)xn, 0, 1, accu, lane);
     } else {
         mm_row<QT>(wq, ws, (ulong)row, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, accg, lane);
-        mm_row<QT>(wq, ws, (ulong)(p.hidden + row), nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, accu, lane);
+        mm_row<QT>(wqU, ws, rowU, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, accu, lane);
     }
     for (int t = 0; t < TOK_TILE; t++) {
         if (t < nt) {
@@ -720,7 +723,11 @@ kernel void matmul_swiglu_pf(device const uchar *wq [[buffer(0)]],
     for (int r = 0; r < NR; r++) {
         const int unit = unit0 + min(r, nu - 1);
         wqs[r] = wq; wss[r] = ws; grow[r] = (ulong)unit;
-        wqs[NR + r] = wq; wss[NR + r] = ws; grow[NR + r] = (ulong)(p.hidden + unit);
+        if (QT >= GG_FIRST) {   // GGUF types: the up rows are the separate view bound as buffer(1)
+            wqs[NR + r] = (device const uchar *)ws; wss[NR + r] = ws; grow[NR + r] = (ulong)unit;
+        } else {
+            wqs[NR + r] = wq; wss[NR + r] = ws; grow[NR + r] = (ulong)(p.hidden + unit);
+        }
     }
     float acc[2 * NR][TT];
     for (int r = 0; r < 2 * NR; r++)
@@ -1520,15 +1527,17 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
     if (row >= m) return;
     const int s = int(tgp.y);
     const int t = s / p.topK;
-    const ulong growG = (ulong)assign[s] * p.rowsPerExpert + row;
-    const ulong growU = growG + m;
+    // GGUF types: gate and up experts are two [experts * m, cols] views (wq, and buffer(1) = ws), same row in both
+    const ulong growG = QT >= GG_FIRST ? (ulong)assign[s] * m + row : (ulong)assign[s] * p.rowsPerExpert + row;
+    const ulong growU = QT >= GG_FIRST ? growG : growG + m;
+    device const uchar *wqU = QT >= GG_FIRST ? (device const uchar *)ws : wq;
     const int nb = p.cols / QK;
     device const float4 *x4 = (device const float4 *)(x + (ulong)t * p.cols);
     float g = 0.0f;
     float u = 0.0f;
     for (int b = lane; b < nb; b += 32) {
         g += block_dot<QT>(wq, ws, growG, nb, b, x4 + b * 8);
-        u += block_dot<QT>(wq, ws, growU, nb, b, x4 + b * 8);
+        u += block_dot<QT>(wqU, ws, growU, nb, b, x4 + b * 8);
     }
     g = simd_sum(g);
     u = simd_sum(u);

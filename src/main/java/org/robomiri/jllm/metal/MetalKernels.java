@@ -179,6 +179,13 @@ final class MetalKernels implements AutoCloseable {
         return base + "_" + qt + suffix;
     }
 
+    /** Zero-copy buffers of the second views of split (GGUF gate | up) tensors, created on first use. */
+    private final java.util.Map<QTensor, Metal.Buffer> upBuffers = new java.util.IdentityHashMap<>();
+
+    private Metal.Buffer upBuffer(QTensor t) {
+        return upBuffers.computeIfAbsent(t, x -> wrap(x.second.data));
+    }
+
     /** Offset of the f32 scale region to bind as buffer(1); Q2_K keeps its scales inside the blocks (unused binding). */
     private static long scaleOff(QTensor t) {
         return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
@@ -235,6 +242,9 @@ final class MetalKernels implements AutoCloseable {
                 int n, boolean acc, Metal.Buffer norm, float softcap) {
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
+        }
+        if (t.isSplit()) {
+            throw new IllegalStateException("a split gate|up tensor is only multiplied by swiglu / moe_up");
         }
         bind(0, wbuf, 0);
         bind(1, wbuf, scaleOff(t));
@@ -350,7 +360,11 @@ final class MetalKernels implements AutoCloseable {
         }
         int hidden = t.rows / 2;
         bind(0, wbuf, 0);
-        bind(1, wbuf, scaleOff(t));
+        if (t.isSplit()) {
+            bind(1, upBuffer(t), 0);   // the up rows' view of a GGUF file (the kernels read it in place of the scales)
+        } else {
+            bind(1, wbuf, scaleOff(t));
+        }
         bind(2, in, 0);
         bind(3, out, 0);
         bindOrDummy(4, norm);
@@ -486,7 +500,11 @@ final class MetalKernels implements AutoCloseable {
     void moeUp(QTensor gateUp, Metal.Buffer wbuf, Metal.Buffer x, Metal.Buffer assign, Metal.Buffer out, int moeDim,
                int topK, int n) {
         bind(0, wbuf, 0);
-        bind(1, wbuf, scaleOff(gateUp));
+        if (gateUp.isSplit()) {
+            bind(1, upBuffer(gateUp), 0);   // the up experts' view of a GGUF file
+        } else {
+            bind(1, wbuf, scaleOff(gateUp));
+        }
         bind(2, x, 0);
         bind(3, assign, 0);
         bind(4, out, 0);
