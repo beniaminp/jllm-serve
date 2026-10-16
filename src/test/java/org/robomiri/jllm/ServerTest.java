@@ -77,6 +77,11 @@ public final class ServerTest {
         String msgs = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
         Resp r = f.post("/v1/chat/completions", "{" + msgs + ",\"temperature\":1e400}");
         check(r.status == 400 && r.body.contains("finite"), "temperature 1e400 (infinite): 400");
+        // L3: a chunk size that overflows when added to what was already received
+        String chunked = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7fffffffffffffff\r\n";
+        r = f.exchange(chunked.getBytes(StandardCharsets.ISO_8859_1));
+        check(r.status == 413, "chunk size 0x7fffffffffffffff after 5 bytes: 413 (got " + r.status + ")");
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */

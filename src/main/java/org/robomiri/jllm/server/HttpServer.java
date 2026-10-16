@@ -49,6 +49,7 @@ public final class HttpServer implements AutoCloseable {
             if (corsOrigin != null && corsOrigin.isBlank()) {
                 corsOrigin = null;
             }
+            maxBodyBytes = Math.min(maxBodyBytes, Integer.MAX_VALUE - 8); // a body is read into one byte[]
         }
 
         public static Options defaults() {
@@ -638,7 +639,7 @@ public final class HttpServer implements AutoCloseable {
                 }
                 return bos.toByteArray();
             }
-            if (bos.size() + size > options.maxBodyBytes()) {
+            if (size > options.maxBodyBytes() - bos.size()) { // subtract, never add: the size can be near Long.MAX_VALUE
                 throw new HttpError(413, "request body larger than " + options.maxBodyBytes() + " bytes");
             }
             bos.write(readFully(in, (int) size, clock));
