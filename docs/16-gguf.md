@@ -433,3 +433,27 @@ and about a second of the load. The 215 MB of Q4_K tensors are used in place. Wi
   (Qwen2-MoE, DeepSeek) are not mapped.
 * **Tokenizer**: pre-tokenizers other than `qwen2`, `llama-bpe`, `gpt-2` need the original repository's
   `tokenizer.json`.
+
+---
+
+## 16.11 Running the checks
+
+`mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
+(block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
+Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
+permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
+selection, settings) and `GgufTokenizerTest` on the `llama-spm` vocabulary. With the Qwen3-0.6B files downloaded by
+`./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:
+
+```sh
+J="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/classes:target/test-classes org.robomiri.jllm"
+G=models/unsloth_Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf
+$J.GgufVsSafetensors $G models/Qwen_Qwen3-0.6B                       # every tensor against the bf16 original
+python3 -m venv v && v/bin/pip install gguf numpy                     # byte parity with gguf.quants on real blocks
+mkdir -p /tmp/parity && v/bin/python src/test/python/gguf_parity.py $G /tmp/parity 256
+$J.GgufRealParity $G /tmp/parity
+$J.metal.GgufMetalReal $G                                             # Metal matmul of every tensor vs its dequantization
+$J.GgufTokenizerTest --gguf $G --hf models/Qwen_Qwen3-0.6B --fixture src/test/resources/tokenizers/qwen3.json
+$J.GgufTokenizerTest --vocab DIR       # llama.cpp's models/ggml-vocab-*.gguf with their .inp / .out files
+```
+
