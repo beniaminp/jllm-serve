@@ -76,6 +76,33 @@ public final class QTensor {
         return new QTensor(type, rows, cols, data);
     }
 
+    /**
+     * Per-thread scratch for {@link #quantize}: each row is quantized into on-heap arrays and copied out with
+     * two bulk copies, instead of one bounds-checked segment access per quantized byte. The arrays are grown on
+     * demand and kept, so quantizing a model's thousands of tensors allocates them once per worker thread.
+     */
+    private static final ThreadLocal<float[]> ROW_BUF = ThreadLocal.withInitial(() -> new float[0]);
+    private static final ThreadLocal<byte[]> Q_BUF = ThreadLocal.withInitial(() -> new byte[0]);
+    private static final ThreadLocal<float[]> SCALE_BUF = ThreadLocal.withInitial(() -> new float[0]);
+
+    private static float[] floats(ThreadLocal<float[]> tl, int n) {
+        float[] a = tl.get();
+        if (a.length < n) {
+            a = new float[n];
+            tl.set(a);
+        }
+        return a;
+    }
+
+    private static byte[] bytes(ThreadLocal<byte[]> tl, int n) {
+        byte[] a = tl.get();
+        if (a.length < n) {
+            a = new byte[n];
+            tl.set(a);
+        }
+        return a;
+    }
+
     public static QTensor quantize(Arena arena, QType type, int rows, int cols, RowSource src) {
         if (cols % QType.BLOCK != 0) {
             throw new IllegalArgumentException("cols " + cols + " is not a multiple of " + QType.BLOCK);
@@ -84,15 +111,10 @@ public final class QTensor {
         QTensor t = new QTensor(type, rows, cols, seg);
         int nb = t.blocksPerRow();
         int rowBytes = nb * type.blockBytes;
-        // Each row is quantized into on-heap scratch arrays and copied out with two bulk copies, instead of one
-        // bounds-checked segment access per quantized byte.
-        ThreadLocal<float[]> rowBuf = ThreadLocal.withInitial(() -> new float[cols]);
-        ThreadLocal<byte[]> qBuf = ThreadLocal.withInitial(() -> new byte[rowBytes]);
-        ThreadLocal<float[]> sBuf = ThreadLocal.withInitial(() -> new float[nb]);
         IntStream.range(0, rows).parallel().forEach(r -> {
-            float[] row = rowBuf.get();
-            byte[] q = qBuf.get();
-            float[] s = sBuf.get();
+            float[] row = floats(ROW_BUF, cols);
+            byte[] q = bytes(Q_BUF, rowBytes);
+            float[] s = floats(SCALE_BUF, nb);
             src.row(r, row);
             if (type == QType.Q2_K) {
                 for (int b = 0; b < nb; b++) {
