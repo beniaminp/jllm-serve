@@ -94,7 +94,33 @@ CONVS = {
         {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nA tag.<tool_call>x</tool_call>"},
         {"role": "user", "content": "    indented\n        code"},
     ],
+    # conversations ending with the assistant: Qwen3 re-renders the reasoning of turns after the last query
+    "ends_assistant": [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "<think>\n\nI should greet.\n\n</think>\n\n\nHello!"},
+    ],
+    "ends_assistant_multi": [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "<think>\nr1\n</think>\n\nA1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "A2"},
+    ],
+    # tool results (families whose template renders a tool role; see TOOL_FAMILIES)
+    "tool": [
+        {"role": "user", "content": "Weather?"},
+        {"role": "assistant", "content": "<tool_call>\n{\"name\": \"weather\"}\n</tool_call>"},
+        {"role": "tool", "content": "Sunny"},
+        {"role": "tool", "content": "20C"},
+        {"role": "user", "content": "Thanks"},
+    ],
+    "tool_end": [
+        {"role": "system", "content": "Use tools."},
+        {"role": "user", "content": "Weather?"},
+        {"role": "assistant", "content": "<think>\nneed a tool\n</think>\n\n<tool_call>\n{\"name\": \"weather\"}\n</tool_call>"},
+        {"role": "tool", "content": "Sunny"},
+    ],
 }
+TOOL_FAMILIES = {"qwen3", "qwen2"}
 
 
 def cfg_token(cfg, key):
@@ -167,6 +193,8 @@ def main(src, dst, n_random=60):
             if name == "qwen3":
                 think_variants = [True, False]
             for cname, msgs in CONVS.items():
+                if cname.startswith("tool") and name not in TOOL_FAMILIES:
+                    continue
                 for gen in (True, False):
                     for think in think_variants:
                         kw = dict(messages=msgs, add_generation_prompt=gen, bos_token=cfg_token(cfg, "bos_token"),

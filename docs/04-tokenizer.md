@@ -211,8 +211,13 @@ is a Jinja template inside `tokenizer_config.json`; ours is the same logic in Ja
 **Thinking mode.** Qwen3 can reason before answering, wrapped in `<think> … </think>`. When thinking is
 *disabled* the template appends an empty block, `<think>\n\n</think>\n\n`, so the model sees that the thinking
 phase is already over and answers directly. When enabled, the model emits its own `<think>` block first — the
-API returns it inline in `content`. Previous assistant turns have their `<think>` blocks stripped before being
-fed back (as the official template does) so the context is not flooded with old reasoning.
+API returns it inline in `content`. Assistant turns before the last user query have their `<think>` blocks
+stripped before being fed back (as the official template does) so the context is not flooded with old
+reasoning; an assistant turn *after* the last query (a conversation that ends with the assistant, rendered
+without a generation prompt) keeps its reasoning as `<think>\n…\n</think>\n\n` — the template's
+`last_query_index` rule. Only newlines are stripped around the pieces (`lstrip('\n')`), never other
+whitespace. Messages with role `tool` become `<|im_start|>user\n<tool_response>\n…\n</tool_response><|im_end|>`,
+consecutive ones sharing a single user turn.
 
 ## 4.10 Verifying correctness
 
@@ -303,8 +308,8 @@ either.
 
 | `model_type` | Prompt layout (generation prompt in bold) | Stop ids (tokens) |
 |---|---|---|
-| `qwen3` | `<\|im_start\|>user\n…<\|im_end\|>\n` … **`<\|im_start\|>assistant\n`** (+ empty `<think>` block when thinking is off) | `<\|im_end\|>`, `<\|endoftext\|>` |
-| `qwen2` | same ChatML, default system prompt "You are Qwen, created by Alibaba Cloud…", no think block | `<\|im_end\|>`, `<\|endoftext\|>` |
+| `qwen3` | `<\|im_start\|>user\n…<\|im_end\|>\n` … **`<\|im_start\|>assistant\n`** (+ empty `<think>` block when thinking is off); tool results as `<tool_response>` blocks in a user turn | `<\|im_end\|>`, `<\|endoftext\|>` |
+| `qwen2` | same ChatML, default system prompt "You are Qwen, created by Alibaba Cloud…", no think block, same tool-result turns | `<\|im_end\|>`, `<\|endoftext\|>` |
 | `qwen2`/`llama` + R1 vocabulary | `<｜begin▁of▁sentence｜>{system}<｜User｜>…<｜Assistant｜>…<｜end▁of▁sentence｜>` … **`<｜Assistant｜><think>\n`** | `<｜end▁of▁sentence｜>` |
 | `llama` (3.x) | `<\|begin_of_text\|><\|start_header_id\|>system<\|end_header_id\|>\n\nCutting Knowledge Date…Today Date: …\n\n{system}<\|eot_id\|>` then `<\|start_header_id\|>user<\|end_header_id\|>\n\n…<\|eot_id\|>` … **`<\|start_header_id\|>assistant<\|end_header_id\|>\n\n`**; contents trimmed | `<\|eot_id\|>`, `<\|end_of_text\|>`, `<\|eom_id\|>` |
 | `mistral` | `<s>[INST] …[/INST] reply</s>[INST] …[/INST]`; the system prompt is prefixed (`sys\n\n`) to the last user turn | `</s>` |

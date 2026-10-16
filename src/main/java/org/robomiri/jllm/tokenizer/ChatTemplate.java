@@ -161,22 +161,57 @@ public final class ChatTemplate {
 
     // ------------------------------------------------------------------ the families
 
+    /**
+     * Qwen3 ChatML with thinking. Assistant turns before the last user query drop their reasoning; those after it
+     * (a conversation that ends with the assistant) keep it as {@code <think>...</think>} the way the official
+     * template re-renders them ({@code last_query_index}). Tool results become {@code <tool_response>} blocks in
+     * a user turn.
+     */
     private static final Format QWEN3 = new Family("chatml-qwen3", (m, gen, think, o) -> {
         for (Message msg : m) {
+            if (msg.role() == null || !QWEN3_ROLES.contains(msg.role())) {
+                throw new IllegalArgumentException("invalid role: " + msg.role());
+            }
+        }
+        // the last user message that is not a tool response is the last query
+        int lastQuery = m.size() - 1;
+        for (int i = m.size() - 1; i >= 0; i--) {
+            String c = content(m.get(i));
+            if (m.get(i).role().equals("user")
+                    && !(c.startsWith("<tool_response>") && c.endsWith("</tool_response>"))) {
+                lastQuery = i;
+                break;
+            }
+        }
+        for (int i = 0; i < m.size(); i++) {
+            Message msg = m.get(i);
             String role = msg.role();
-            if (role == null || !QWEN3_ROLES.contains(role)) {
-                throw new IllegalArgumentException("invalid role: " + role);
-            }
             String content = content(msg);
-            if (role.equals("assistant")) { // previous turns drop their reasoning, like the official template
-                int end = content.lastIndexOf("</think>");
-                if (end >= 0) {
-                    content = content.substring(end + "</think>".length()).stripLeading();
+            boolean last = i == m.size() - 1;
+            if (role.equals("assistant")) {
+                String reasoning = "";
+                int end = content.indexOf("</think>");
+                if (end >= 0) { // content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
+                    String before = rstripNl(content.substring(0, end));
+                    int open = before.lastIndexOf("<think>");
+                    reasoning = lstripNl(open >= 0 ? before.substring(open + "<think>".length()) : before);
+                    content = lstripNl(content.substring(content.lastIndexOf("</think>") + "</think>".length()));
                 }
+                o.ctl("<|im_start|>assistant\n");
+                if (i > lastQuery && (last || !reasoning.isEmpty())) {
+                    o.ctl("<think>\n");
+                    o.txt(stripNl(reasoning));
+                    o.ctl("\n</think>\n\n");
+                }
+                o.txt(content);
+                o.ctl("<|im_end|>\n");
+            } else if (role.equals("tool")) {
+                toolResponse(m, i, o);
+            } else {
+                o.ctl("<|im_start|>" + role + "\n");
+                o.txt(content);
+                o.ctl("<|im_end|>\n");
             }
-            o.ctl("<|im_start|>" + role + "\n");
-            o.txt(content);
-            o.ctl("<|im_end|>\n");
         }
         if (gen) {
             o.ctl("<|im_start|>assistant\n");
@@ -193,8 +228,14 @@ public final class ChatTemplate {
             o.txt("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.");
             o.ctl("<|im_end|>\n");
         }
-        for (Message msg : m) {
-            o.ctl("<|im_start|>" + role(msg, "system", "user", "assistant") + "\n");
+        for (int i = 0; i < m.size(); i++) {
+            Message msg = m.get(i);
+            String role = role(msg, "system", "user", "assistant", "tool");
+            if (role.equals("tool")) {
+                toolResponse(m, i, o);
+                continue;
+            }
+            o.ctl("<|im_start|>" + role + "\n");
             o.txt(content(msg));
             o.ctl("<|im_end|>\n");
         }
@@ -202,6 +243,19 @@ public final class ChatTemplate {
             o.ctl("<|im_start|>assistant\n");
         }
     }, "<|im_end|>", "<|endoftext|>");
+
+    /** Qwen's tool results: consecutive tool messages share one user turn, each in a {@code <tool_response>} block. */
+    private static void toolResponse(List<Message> m, int i, Out o) {
+        if (i == 0 || !"tool".equals(m.get(i - 1).role())) {
+            o.ctl("<|im_start|>user");
+        }
+        o.ctl("\n<tool_response>\n");
+        o.txt(content(m.get(i)));
+        o.ctl("\n</tool_response>");
+        if (i == m.size() - 1 || !"tool".equals(m.get(i + 1).role())) {
+            o.ctl("<|im_end|>\n");
+        }
+    }
 
     /** DeepSeek-R1-Distill: the system prompt follows BOS directly; the answer starts inside an open think block. */
     private static final Format DEEPSEEK = new Family("deepseek-r1", (m, gen, think, o) -> {
@@ -456,6 +510,29 @@ public final class ChatTemplate {
             }
         }
         throw new IllegalArgumentException("invalid role: " + r);
+    }
+
+    /** Python {@code str.lstrip('\n')}. */
+    static String lstripNl(String s) {
+        int a = 0;
+        while (a < s.length() && s.charAt(a) == '\n') {
+            a++;
+        }
+        return s.substring(a);
+    }
+
+    /** Python {@code str.rstrip('\n')}. */
+    static String rstripNl(String s) {
+        int b = s.length();
+        while (b > 0 && s.charAt(b - 1) == '\n') {
+            b--;
+        }
+        return s.substring(0, b);
+    }
+
+    /** Python {@code str.strip('\n')}. */
+    static String stripNl(String s) {
+        return lstripNl(rstripNl(s));
     }
 
     /** Jinja's {@code trim} filter, i.e. Python {@code str.strip()}. */
