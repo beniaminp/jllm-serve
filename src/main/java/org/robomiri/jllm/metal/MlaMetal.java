@@ -39,10 +39,6 @@ final class MlaMetal {
     private final ModelConfig c;
     private final DeepSeekConfig d;
     private final int ctx;
-    private final int pRope;
-    private final int pKvStore;
-    private final int pAttention;
-    private final int pRouter;
     private final Bufs[] bufs;
     private final Metal.Buffer[] key;
     private final Metal.Buffer[] val;
@@ -64,16 +60,8 @@ final class MlaMetal {
             throw new IllegalArgumentException("Metal MLA needs qk (" + d.qkDim() + ") and v (" + d.vHeadDim()
                     + ") head dims that are multiples of 32 and <= 256");
         }
-        pRope = metal.pipeline("mla_rope");
-        pKvStore = metal.pipeline("mla_kv_store");
-        pAttention = metal.pipeline("attention_mla");
-        if (c.isMoe()) {
-            pRouter = metal.pipeline("router_ds");
-            if (c.numExperts() > 1024) {
-                throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
-            }
-        } else {
-            pRouter = -1;
+        if (c.isMoe() && c.numExperts() > 1024) {
+            throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
         bufs = new Bufs[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
@@ -151,7 +139,7 @@ final class MlaMetal {
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, heads * (nope + vd));
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, heads * qk);
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 5, heads * vd);
-        metal.dispatch(pKvStore, mb.bufArgs, mb.offArgs, 4, mb.params, 24, heads, n, 1, 64, 1, 1);
+        metal.dispatch(metal.pipeline("mla_kv_store"), mb.bufArgs, mb.offArgs, 4, mb.params, 24, heads, n, 1, 64, 1, 1);
 
         mb.bind(0, mb.q, 0);
         mb.bind(1, key[l], 0);
@@ -170,7 +158,7 @@ final class MlaMetal {
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 9, heads * vd);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) { // same token tiling as MetalBackend.attention
             mb.params.setAtIndex(ValueLayout.JAVA_INT, 10, t0);
-            metal.dispatch(pAttention, mb.bufArgs, mb.offArgs, 5, mb.params, 44, heads, Math.min(ATT_TILE, n - t0), 1,
+            metal.dispatch(metal.pipeline("attention_mla"), mb.bufArgs, mb.offArgs, 5, mb.params, 44, heads, Math.min(ATT_TILE, n - t0), 1,
                     256, 1, 1);
         }
     }
@@ -184,7 +172,7 @@ final class MlaMetal {
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 2, rd);
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, rowStride);
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
-        metal.dispatch(pRope, mb.bufArgs, mb.offArgs, 3, mb.params, 20, heads, n, 1, rd / 2, 1, 1);
+        metal.dispatch(metal.pipeline("mla_rope"), mb.bufArgs, mb.offArgs, 3, mb.params, 20, heads, n, 1, rd / 2, 1, 1);
     }
 
     /** Routes the n tokens of {@code xb}: fills the backend's assign / routeWeight buffers (scaling included). */
@@ -209,7 +197,7 @@ final class MlaMetal {
         });
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 8, d.scaleAlways() ? 1 : 0);
         mb.params.setAtIndex(ValueLayout.JAVA_FLOAT, 9, (float) d.routedScale());
-        metal.dispatch(pRouter, mb.bufArgs, mb.offArgs, 5, mb.params, 40, n, 1, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("router_ds"), mb.bufArgs, mb.offArgs, 5, mb.params, 40, n, 1, 1, 256, 1, 1);
     }
 
     /** Shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x. */

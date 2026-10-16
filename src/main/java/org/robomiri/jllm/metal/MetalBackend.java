@@ -58,55 +58,17 @@ public final class MetalBackend implements Backend {
     final Metal metal;
     private final Arena arena = Arena.ofShared();
 
-    private int pMatmulQ4;
-    private int pMatmulQ8;
-    private int pMatmulQ4Norm;
-    private int pMatmulQ8Norm;
-    private int pMatmul3Q4;
-    private int pMatmul3Q8;
-    private int pMatmul3Q4Norm;
-    private int pMatmul3Q8Norm;
-    private int pSwigluQ4;
-    private int pSwigluQ8;
-    private int pSwigluQ4Norm;
-    private int pSwigluQ8Norm;
-    private int pRmsnorm;
-    private int pNormRope;
-    private int pNormRopeIl;  // GLM: interleaved partial rope, -1 otherwise
-    private int pRmsnormAdd;  // Glm4: post-norms, -1 otherwise
-    private int pAttention;
-    private int attnGroup; // query heads per attention threadgroup
-    private int pAttnSplit = -1;   // flash decoding, -1 when off
-    private int pAttnCombine = -1;
+    // Kernels are looked up by name at dispatch time (Metal.pipeline memoizes and compiles on first use), so
+    // only the variants a model runs are built; the names that depend on the model are fixed here.
+    private String attnKernel;     // attention variant for headDim / attnGroup / cache type
+    private int attnGroup;         // query heads per attention threadgroup
+    private final boolean flashDecode; // M6 flash decoding enabled for this model (dense attention only)
     private Metal.Buffer flashPart;
-    private int pRouter;
-    private int pMoeUpQ4;
-    private int pMoeUpQ8;
-    private int pMoeDownQ4;
-    private int pMoeDownQ8;
-    // Q2_K variants of every quantized matmul (see the Q2_K section of kernels.metal)
-    private int pMatmulQ2K;
-    private int pMatmulQ2KNorm;
-    private int pMatmul3Q2K;
-    private int pMatmul3Q2KNorm;
-    private int pSwigluQ2K;
-    private int pSwigluQ2KNorm;
-    private int pMoeUpQ2K;
-    private int pMoeDownQ2K;
-    // tiled prefill variants (see the prefill section of kernels.metal)
-    private int pMatmulPfQ4;
-    private int pMatmulPfQ8;
-    private int pMatmulPfQ2K;
-    private int pMatmul3PfQ4;
-    private int pMatmul3PfQ8;
-    private int pMatmul3PfQ2K;
-    private int pSwigluPfQ4;
-    private int pSwigluPfQ8;
-    private int pSwigluPfQ2K;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
     // through an f32 staging row and norm_rope_h rounds it into the cache after the rotation, attention_h
     // reads half; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
+    private final String vh;       // "_h" kernel-name suffix for the half-cache variants, "" otherwise
     /**
      * Whether the *_norm matmul variants may be used: they keep the normalised input row (dim floats) in dynamic
      * threadgroup memory next to their 32-byte reduction scratch, which must fit the device's threadgroup memory
@@ -182,7 +144,23 @@ public final class MetalBackend implements Backend {
         if (c.headDim() % 32 != 0 || c.headDim() > 256) {
             throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
         }
-        return Metal.create(metalLib);
+        // the grouped attention instantiations (G = 2, 4, 8) are only compiled when the override asks for them
+        return Metal.create(metalLib, attnGroupOverride(c) > 1 ? "#define JLLM_ATTN_GROUPS 1\n" : "");
+    }
+
+    /**
+     * Query heads per attention threadgroup. Sharing K/V rows across the group (> 1) measured no faster on
+     * Qwen3-0.6B (G=2) and slower on Qwen3-30B-A3B (G=4/8: 20-22 tok/s vs 25 with G=1) because only kvHeads
+     * threadgroups run per decode token and each one's serial work grows with the group, so the default is 1;
+     * -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads; headDim 64, 128 or 256 only).
+     */
+    private static int attnGroupOverride(ModelConfig c) {
+        int group = c.heads() / c.kvHeads();
+        int override = Integer.getInteger("jllm.metal.attnGroup", 0);
+        int hd = c.headDim();
+        boolean specialised = hd == 64 || hd == 128 || hd == 256;
+        return specialised && override > 0 && override <= 8 && Integer.bitCount(override) == 1 && group % override == 0
+                ? override : 1;
     }
 
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
@@ -192,6 +170,8 @@ public final class MetalBackend implements Backend {
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.kvHalf = kvDtype == KvDtype.F16;
+        this.vh = kvHalf ? "_h" : "";
+        this.flashDecode = FLASH_DECODE && c.deepseek() == null;
         this.metal = metal;
         try {
             init(kvDtype);
@@ -210,68 +190,10 @@ public final class MetalBackend implements Backend {
         if (c.deepseek() != null && kvDtype != KvDtype.F32) {
             throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
         }
-        pMatmulQ4 = metal.pipeline("matmul_q4");
-        pMatmulQ8 = metal.pipeline("matmul_q8");
-        pMatmulQ4Norm = metal.pipeline("matmul_q4_norm");
-        pMatmulQ8Norm = metal.pipeline("matmul_q8_norm");
-        String vh = kvHalf ? "_h" : ""; // matmul3 variants writing v as half, rope variants writing k as half
-        pMatmul3Q4 = metal.pipeline("matmul3_q4" + vh);
-        pMatmul3Q8 = metal.pipeline("matmul3_q8" + vh);
-        pMatmul3Q4Norm = metal.pipeline("matmul3_q4_norm" + vh);
-        pMatmul3Q8Norm = metal.pipeline("matmul3_q8_norm" + vh);
-        pSwigluQ4 = metal.pipeline("matmul_swiglu_q4");
-        pSwigluQ8 = metal.pipeline("matmul_swiglu_q8");
-        pSwigluQ4Norm = metal.pipeline("matmul_swiglu_q4_norm");
-        pSwigluQ8Norm = metal.pipeline("matmul_swiglu_q8_norm");
-        pRmsnorm = metal.pipeline("rmsnorm");
-        pNormRope = metal.pipeline("norm_rope" + vh);
-        pNormRopeIl = c.ropeInterleaved() || c.ropePartialHalf() ? metal.pipeline("norm_rope_il" + vh) : -1;
-        pRmsnormAdd = c.postNorms() ? metal.pipeline("rmsnorm_add") : -1;
-        // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
-        // rows across the group (attnGroup > 1) measured no faster on Qwen3-0.6B (G=2) and slower on
-        // Qwen3-30B-A3B (G=4/8: 20-22 tok/s vs 25 with G=1) because only kvHeads threadgroups run per decode
-        // token and each one's serial work grows with the group, so the default is 1;
-        // -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads).
-        int group = c.heads() / c.kvHeads();
-        int g = 1;
-        int override = Integer.getInteger("jllm.metal.attnGroup", 0);
-        if (override > 0 && override <= 8 && Integer.bitCount(override) == 1 && group % override == 0) {
-            g = override;
-        }
+        // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
+        attnGroup = attnGroupOverride(c);
         int hd = c.headDim();
-        if (hd == 64 || hd == 128 || hd == 256) {
-            attnGroup = g;
-            pAttention = metal.pipeline("attention_g" + g + "_d" + hd + (kvHalf ? "_h" : ""));
-        } else {
-            attnGroup = 1;
-            pAttention = metal.pipeline(kvHalf ? "attention_h" : "attention");
-        }
-        if (FLASH_DECODE && c.deepseek() == null) {
-            pAttnSplit = metal.pipeline(kvHalf ? "attention_split_h" : "attention_split");
-            pAttnCombine = metal.pipeline("attention_combine");
-        }
-        pRouter = metal.pipeline("router");
-        pMoeUpQ4 = metal.pipeline("moe_up_q4");
-        pMoeUpQ8 = metal.pipeline("moe_up_q8");
-        pMoeDownQ4 = metal.pipeline("moe_down_q4");
-        pMoeDownQ8 = metal.pipeline("moe_down_q8");
-        pMatmulQ2K = metal.pipeline("matmul_q2k");
-        pMatmulQ2KNorm = metal.pipeline("matmul_q2k_norm");
-        pMatmul3Q2K = metal.pipeline("matmul3_q2k" + vh);
-        pMatmul3Q2KNorm = metal.pipeline("matmul3_q2k_norm" + vh);
-        pSwigluQ2K = metal.pipeline("matmul_swiglu_q2k");
-        pSwigluQ2KNorm = metal.pipeline("matmul_swiglu_q2k_norm");
-        pMoeUpQ2K = metal.pipeline("moe_up_q2k");
-        pMoeDownQ2K = metal.pipeline("moe_down_q2k");
-        pMatmulPfQ4 = metal.pipeline("matmul_pf_q4");
-        pMatmulPfQ8 = metal.pipeline("matmul_pf_q8");
-        pMatmulPfQ2K = metal.pipeline("matmul_pf_q2k");
-        pMatmul3PfQ4 = metal.pipeline("matmul3_pf_q4" + vh);
-        pMatmul3PfQ8 = metal.pipeline("matmul3_pf_q8" + vh);
-        pMatmul3PfQ2K = metal.pipeline("matmul3_pf_q2k" + vh);
-        pSwigluPfQ4 = metal.pipeline("matmul_swiglu_pf_q4");
-        pSwigluPfQ8 = metal.pipeline("matmul_swiglu_pf_q8");
-        pSwigluPfQ2K = metal.pipeline("matmul_swiglu_pf_q2k");
+        attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
@@ -347,7 +269,7 @@ public final class MetalBackend implements Backend {
         hidden = metal.newBuffer((long) maxBatch * c.maxMlpDim() * 4, false);
         scores = metal.newBuffer((long) Math.min(ATT_TILE, maxBatch) * c.heads() * ctx * 4, false);
         logitsBuf = metal.newBuffer((long) w.lmHead.rows * 4, false);
-        flashPart = pAttnSplit >= 0 ? metal.newBuffer((long) c.heads() * FLASH_MAX_SPLITS * (c.headDim() + 2) * 4, false) : null;
+        flashPart = flashDecode ? metal.newBuffer((long) c.heads() * FLASH_MAX_SPLITS * (c.headDim() + 2) * 4, false) : null;
         if (c.isMoe()) {
             int slots = maxBatch * c.expertsPerTok();
             assign = metal.newBuffer((long) slots * 4, false);
@@ -531,12 +453,11 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, softcap);
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            int pipe = byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
+            int pipe = metal.pipeline(kernel("matmul_pf", t.type, ""));
             metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
             return;
         }
-        int pipe = norm != null ? byType(t.type, pMatmulQ4Norm, pMatmulQ8Norm, pMatmulQ2KNorm)
-                                : byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
+        int pipe = metal.pipeline(kernel("matmul", t.type, norm != null ? "_norm" : ""));
         int gx = (t.rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
@@ -573,13 +494,14 @@ public final class MetalBackend implements Backend {
         return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
     }
 
-    /** The pipeline variant for a tensor's quantization type. */
-    static int byType(QType type, int q4, int q8, int q2k) {
-        return switch (type) {
-            case Q4_0 -> q4;
-            case Q8_0 -> q8;
-            case Q2_K -> q2k;
+    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k). */
+    static String kernel(String base, QType type, String suffix) {
+        String qt = switch (type) {
+            case Q4_0 -> "q4";
+            case Q8_0 -> "q8";
+            case Q2_K -> "q2k";
         };
+        return base + "_" + qt + suffix;
     }
 
     /**
@@ -615,12 +537,11 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 6, bias ? 1 : 0);
         int rows = W.wq.rows + W.wk.rows + W.wv.rows;
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            int pipe = byType(W.wq.type, pMatmul3PfQ4, pMatmul3PfQ8, pMatmul3PfQ2K);
+            int pipe = metal.pipeline(kernel("matmul3_pf", W.wq.type, vh));
             metal.dispatch(pipe, bufArgs, offArgs, 14, params, 28, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
             return;
         }
-        int pipe = norm != null ? byType(W.wq.type, pMatmul3Q4Norm, pMatmul3Q8Norm, pMatmul3Q2KNorm)
-                                : byType(W.wq.type, pMatmul3Q4, pMatmul3Q8, pMatmul3Q2K);
+        int pipe = metal.pipeline(kernel("matmul3", W.wq.type, (norm != null ? "_norm" : "") + vh));
         int gx = (rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 14, params, 28, normTgMem(norm, W.wq.cols), gx, gy, 1,
@@ -646,12 +567,11 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_INT, 4, c.isGemma() ? 1 : 0);
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            int pipe = byType(t.type, pSwigluPfQ4, pSwigluPfQ8, pSwigluPfQ2K);
+            int pipe = metal.pipeline(kernel("matmul_swiglu_pf", t.type, ""));
             metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, pfUnitGrid(hiddenDim), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
             return;
         }
-        int pipe = norm != null ? byType(t.type, pSwigluQ4Norm, pSwigluQ8Norm, pSwigluQ2KNorm)
-                                : byType(t.type, pSwigluQ4, pSwigluQ8, pSwigluQ2K);
+        int pipe = metal.pipeline(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""));
         int gx = (hiddenDim + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1,
@@ -668,7 +588,7 @@ public final class MetalBackend implements Backend {
         bind(2, out, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.normEps());
-        metal.dispatch(pRmsnorm, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("rmsnorm"), bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
     /** out[t] += rmsnorm(y[t]) * weight for n rows of the given width. */
@@ -678,7 +598,7 @@ public final class MetalBackend implements Backend {
         bind(2, out, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.normEps());
-        metal.dispatch(pRmsnormAdd, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("rmsnorm_add"), bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
     /** GLM interleaved pairs, or rotate-half pairs for partial rotary (Phi-4-mini): the first rotaryDim dims of every q and k head (no qk-norm). */
@@ -695,7 +615,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_INT, 5, c.rotaryDim() / 2);
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.ropeInterleaved() ? 0 : 1);
-        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 5, params, 28, c.heads() + c.kvHeads(), n, 1,
+        metal.dispatch(metal.pipeline("norm_rope_il" + vh), bufArgs, offArgs, 5, params, 28, c.heads() + c.kvHeads(), n, 1,
                 c.rotaryDim() / 2, 1, 1);
     }
 
@@ -728,13 +648,13 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_INT, 6, useNorm ? 1 : 0);
-        metal.dispatch(pNormRope, bufArgs, offArgs, 7, params, 28, c.heads() + c.kvHeads(), n, 1,
+        metal.dispatch(metal.pipeline("norm_rope" + vh), bufArgs, offArgs, 7, params, 28, c.heads() + c.kvHeads(), n, 1,
                 c.headDim() / 2, 1, 1);
     }
 
     /** One dispatch per tile of ATT_TILE tokens; the scores scratch is indexed by the tile-local token. */
     private void attention(int l, int n, int pos) {
-        if (pAttnSplit >= 0 && n == 1 && pos + 1 >= FLASH_MIN_LEN) {
+        if (flashDecode && n == 1 && pos + 1 >= FLASH_MIN_LEN) {
             flashAttention(l, pos);
             return;
         }
@@ -755,7 +675,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 10, c.attnSoftcap());
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             params.setAtIndex(ValueLayout.JAVA_INT, 9, t0);
-            metal.dispatch(pAttention, bufArgs, offArgs, 5, params, 44, c.heads() / attnGroup,
+            metal.dispatch(metal.pipeline(attnKernel), bufArgs, offArgs, 5, params, 44, c.heads() / attnGroup,
                     Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
     }
@@ -785,13 +705,13 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 9, c.attnSoftcap());
         params.setAtIndex(ValueLayout.JAVA_INT, 10, nSplit);
         params.setAtIndex(ValueLayout.JAVA_INT, 11, chunk);
-        metal.dispatch(pAttnSplit, bufArgs, offArgs, 5, params, 48, c.heads(), nSplit, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("attention_split" + vh), bufArgs, offArgs, 5, params, 48, c.heads(), nSplit, 1, 256, 1, 1);
         bind(0, flashPart, 0);
         bind(1, att, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.heads());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, nSplit);
-        metal.dispatch(pAttnCombine, bufArgs, offArgs, 2, params, 12, c.heads(), 1, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("attention_combine"), bufArgs, offArgs, 2, params, 12, c.heads(), 1, 1, 256, 1, 1);
     }
 
     /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */
@@ -812,7 +732,7 @@ public final class MetalBackend implements Backend {
             params.setAtIndex(ValueLayout.JAVA_INT, 1, c.dim());
             params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
             params.setAtIndex(ValueLayout.JAVA_INT, 3, c.normTopK() ? 1 : 0);
-            metal.dispatch(pRouter, bufArgs, offArgs, 4, params, 16, n, 1, 1, 256, 1, 1);
+            metal.dispatch(metal.pipeline("router"), bufArgs, offArgs, 4, params, 16, n, 1, 1, 256, 1, 1);
         }
 
         // gate/up projections with SwiGLU fused in: one simdgroup per (slot, hidden unit) writes moeHidden
@@ -825,7 +745,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 0, 2 * m); // rows per expert in the stacked tensor (gate | up)
         params.setAtIndex(ValueLayout.JAVA_INT, 1, gu.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
-        metal.dispatch(byType(gu.type, pMoeUpQ4, pMoeUpQ8, pMoeUpQ2K), bufArgs, offArgs, 5, params, 12,
+        metal.dispatch(metal.pipeline(kernel("moe_up", gu.type, "")), bufArgs, offArgs, 5, params, 12,
                 (m + sgPerTg - 1) / sgPerTg, slots, 1, 32 * sgPerTg, 1, 1);
 
         QTensor dn = W.expDown;
@@ -838,7 +758,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.dim());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, dn.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 2, topK);
-        metal.dispatch(byType(dn.type, pMoeDownQ4, pMoeDownQ8, pMoeDownQ2K), bufArgs, offArgs, 6, params, 12,
+        metal.dispatch(metal.pipeline(kernel("moe_down", dn.type, "")), bufArgs, offArgs, 6, params, 12,
                 (c.dim() + sgPerTg - 1) / sgPerTg, n, 1, 32 * sgPerTg, 1, 1);
     }
 

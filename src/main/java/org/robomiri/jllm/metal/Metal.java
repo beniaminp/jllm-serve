@@ -12,7 +12,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
@@ -53,6 +55,7 @@ public final class Metal implements AutoCloseable {
     private final MemorySegment err = arena.allocate(ERR_LEN);
     private final MemorySegment ctx;
     private final List<Buffer> buffers = new ArrayList<>();
+    private final Map<String, Integer> pipelines = new HashMap<>();
 
     private Metal(Path lib, String shaderSource) {
         SymbolLookup l = SymbolLookup.libraryLookup(lib, arena);
@@ -94,6 +97,14 @@ public final class Metal implements AutoCloseable {
 
     /** @param explicitLib path of libjllm_metal.dylib, or null to search the usual locations */
     public static Metal create(String explicitLib) {
+        return create(explicitLib, "");
+    }
+
+    /**
+     * @param defines preprocessor lines (e.g. {@code "#define X 1\n"}) prepended to the kernel source; they select
+     *                optional kernel instantiations. Compiler line numbers still refer to kernels.metal.
+     */
+    public static Metal create(String explicitLib, String defines) {
         Path lib = findLibrary(explicitLib);
         String src;
         try (InputStream in = Metal.class.getResourceAsStream("kernels.metal")) {
@@ -104,7 +115,7 @@ public final class Metal implements AutoCloseable {
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
-        return new Metal(lib, src);
+        return new Metal(lib, defines.isEmpty() ? src : defines + "#line 1\n" + src);
     }
 
     /** True if this looks like a machine where the Metal backend can work. */
@@ -183,12 +194,21 @@ public final class Metal implements AutoCloseable {
         }
     }
 
+    /**
+     * The pipeline index of kernel {@code name}, created (compiled for the GPU) on first use and memoized, so
+     * callers look kernels up by name at dispatch time and only the kernels a model actually runs get built.
+     */
     public int pipeline(String name) {
+        Integer cached = pipelines.get(name);
+        if (cached != null) {
+            return cached;
+        }
         try {
             int idx = (int) pipeline.invokeExact(ctx, arena.allocateFrom(name), err, ERR_LEN);
             if (idx < 0) {
                 throw new IllegalStateException("pipeline " + name + ": " + error());
             }
+            pipelines.put(name, idx);
             return idx;
         } catch (Throwable t) {
             throw rethrow(t);

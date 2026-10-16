@@ -37,16 +37,6 @@ public final class MambaMetalBackend implements Backend {
     private final Metal metal;
     private final Arena arena = Arena.ofShared();
 
-    private int pMatmulQ4;
-    private int pMatmulQ8;
-    private int pMatmulQ2K;
-    private int pMatmulPfQ4;
-    private int pMatmulPfQ8;
-    private int pMatmulPfQ2K;
-    private int pRmsnorm;
-    private int pConv;
-    private int pScan;
-
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
     private LayerBufs[] layers;
@@ -110,16 +100,6 @@ public final class MambaMetalBackend implements Backend {
     }
 
     private void init() {
-        pMatmulQ4 = metal.pipeline("matmul_q4");
-        pMatmulQ8 = metal.pipeline("matmul_q8");
-        pMatmulQ2K = metal.pipeline("matmul_q2k");
-        pMatmulPfQ4 = metal.pipeline("matmul_pf_q4");
-        pMatmulPfQ8 = metal.pipeline("matmul_pf_q8");
-        pMatmulPfQ2K = metal.pipeline("matmul_pf_q2k");
-        pRmsnorm = metal.pipeline("rmsnorm");
-        pConv = metal.pipeline("mamba_conv");
-        pScan = metal.pipeline("mamba_scan");
-
         embedQ = metal.wrap(w.embed.data);
         lmHeadQ = w.lmHead == w.embed ? embedQ : metal.wrap(w.lmHead.data);
         int di = m.dInner();
@@ -264,12 +244,12 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, 0f); // no soft-cap
         int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
         if (n >= MetalBackend.PREFILL_MIN_TOKENS) {
-            int pipe = MetalBackend.byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
+            int pipe = metal.pipeline(MetalBackend.kernel("matmul_pf", t.type, ""));
             metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, MetalBackend.pfGrid(t.rows), MetalBackend.pfTiles(n), 1,
                     32 * sgPerTg, 1, 1);
             return;
         }
-        int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
+        int pipe = metal.pipeline(MetalBackend.kernel("matmul", t.type, ""));
         int gx = (t.rows + sgPerTg - 1) / sgPerTg;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, MetalBackend.UNUSED_TG_BYTES, gx, gy, 1, 32 * sgPerTg, 1, 1);
@@ -281,7 +261,7 @@ public final class MambaMetalBackend implements Backend {
         bind(2, out, 0);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, width);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.normEps());
-        metal.dispatch(pRmsnorm, bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
+        metal.dispatch(metal.pipeline("rmsnorm"), bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
     private void conv(LayerBufs L, int layer, int n) {
@@ -293,7 +273,7 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 0, m.dInner());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, m.dConv());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
-        metal.dispatch(pConv, bufArgs, offArgs, 5, params, 12, (m.dInner() + 63) / 64, 1, 1, 64, 1, 1);
+        metal.dispatch(metal.pipeline("mamba_conv"), bufArgs, offArgs, 5, params, 12, (m.dInner() + 63) / 64, 1, 1, 64, 1, 1);
     }
 
     private void scan(LayerBufs L, int layer, int n) {
@@ -310,7 +290,7 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 1, m.dState());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, m.dtRank());
         params.setAtIndex(ValueLayout.JAVA_INT, 3, n);
-        metal.dispatch(pScan, bufArgs, offArgs, 9, params, 16, (m.dInner() + 63) / 64, 1, 1, 64, 1, 1);
+        metal.dispatch(metal.pipeline("mamba_scan"), bufArgs, offArgs, 9, params, 16, (m.dInner() + 63) / 64, 1, 1, 64, 1, 1);
     }
 
     @Override

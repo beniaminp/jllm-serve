@@ -944,18 +944,21 @@ kernel void attention_g(device const float *q [[buffer(0)]],
 // as attention_h: half values are converted on load, everything else is f32).
 #define ATTN_INST(KV, G, PER, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_g<KV, G, PER>) attention_g<KV, G, PER>;
-ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(float, 2, 2, "attention_g2_d64")
-ATTN_INST(float, 4, 2, "attention_g4_d64")    ATTN_INST(float, 8, 2, "attention_g8_d64")
-ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(float, 2, 4, "attention_g2_d128")
-ATTN_INST(float, 4, 4, "attention_g4_d128")   ATTN_INST(float, 8, 4, "attention_g8_d128")
-ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(float, 2, 8, "attention_g2_d256")
-ATTN_INST(float, 4, 8, "attention_g4_d256")   ATTN_INST(float, 8, 8, "attention_g8_d256")
-ATTN_INST(half, 1, 2, "attention_g1_d64_h")   ATTN_INST(half, 2, 2, "attention_g2_d64_h")
-ATTN_INST(half, 4, 2, "attention_g4_d64_h")   ATTN_INST(half, 8, 2, "attention_g8_d64_h")
-ATTN_INST(half, 1, 4, "attention_g1_d128_h")  ATTN_INST(half, 2, 4, "attention_g2_d128_h")
-ATTN_INST(half, 4, 4, "attention_g4_d128_h")  ATTN_INST(half, 8, 4, "attention_g8_d128_h")
-ATTN_INST(half, 1, 8, "attention_g1_d256_h")  ATTN_INST(half, 2, 8, "attention_g2_d256_h")
-ATTN_INST(half, 4, 8, "attention_g4_d256_h")  ATTN_INST(half, 8, 8, "attention_g8_d256_h")
+ATTN_INST(float, 1, 2, "attention_g1_d64")
+ATTN_INST(float, 1, 4, "attention_g1_d128")
+ATTN_INST(float, 1, 8, "attention_g1_d256")
+ATTN_INST(half, 1, 2, "attention_g1_d64_h")
+ATTN_INST(half, 1, 4, "attention_g1_d128_h")
+ATTN_INST(half, 1, 8, "attention_g1_d256_h")
+// The grouped variants are only instantiated when the host defines JLLM_ATTN_GROUPS (-Djllm.metal.attnGroup).
+#ifdef JLLM_ATTN_GROUPS
+ATTN_INST(float, 2, 2, "attention_g2_d64")    ATTN_INST(float, 4, 2, "attention_g4_d64")    ATTN_INST(float, 8, 2, "attention_g8_d64")
+ATTN_INST(float, 2, 4, "attention_g2_d128")   ATTN_INST(float, 4, 4, "attention_g4_d128")   ATTN_INST(float, 8, 4, "attention_g8_d128")
+ATTN_INST(float, 2, 8, "attention_g2_d256")   ATTN_INST(float, 4, 8, "attention_g4_d256")   ATTN_INST(float, 8, 8, "attention_g8_d256")
+ATTN_INST(half, 2, 2, "attention_g2_d64_h")   ATTN_INST(half, 4, 2, "attention_g4_d64_h")   ATTN_INST(half, 8, 2, "attention_g8_d64_h")
+ATTN_INST(half, 2, 4, "attention_g2_d128_h")  ATTN_INST(half, 4, 4, "attention_g4_d128_h")  ATTN_INST(half, 8, 4, "attention_g8_d128_h")
+ATTN_INST(half, 2, 8, "attention_g2_d256_h")  ATTN_INST(half, 4, 8, "attention_g4_d256_h")  ATTN_INST(half, 8, 8, "attention_g8_d256_h")
+#endif
 
 // ---------------------------------------------------------------------------------------------- flash decoding
 // Optional (-Djllm.metal.flashDecode=true): a decode step (one token) over a long context splits the key range of
