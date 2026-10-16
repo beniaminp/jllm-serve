@@ -135,8 +135,10 @@ public final class ModelConverter {
         for (int i = 0; i < units.size(); i++) {
             Unit u = units.get(i);
             if (i >= skip) {
-                try (Arena a = Arena.ofShared()) {
-                    for (Rule r : u.rules()) {
+                for (Rule r : u.rules()) {
+                    // One arena per cache tensor, closed as soon as it is written: peak off-heap memory is the
+                    // largest tensor (the stacked experts of a MoE layer), not the whole unit.
+                    try (Arena a = Arena.ofShared()) {
                         apply(w, a, r);
                     }
                 }
