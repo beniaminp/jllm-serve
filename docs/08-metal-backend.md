@@ -114,7 +114,7 @@ MLX would otherwise do for us.
 │ Metal.java          knows NOTHING about models: compile shader source, make/wrap     │  Java (FFM)
 │                     buffers, begin / dispatch / commitAndWait; owns the handles      │
 ├───────────────────────────── C function calls (jm_*) ───────────────────────────────┤
-│ jllm_metal.m        Objective-C: talks to the Metal framework; 13 C functions        │  native
+│ jllm_metal.m        Objective-C: talks to the Metal framework; 16 C functions        │  native
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │ kernels.metal       Metal Shading Language (C++ dialect): the code the GPU runs;     │  GPU
 │                     compiled at start-up from source                                 │
@@ -143,26 +143,30 @@ Just enough Objective-C to read the file:
 | `MTLComputeCommandEncoder` | the object you record dispatches into |
 | `MTLComputePipelineState` | a compiled kernel ready to run (like a `MethodHandle` for GPU code) |
 
-The 13 exported functions:
+The 16 exported functions:
 
 | C function | does | called from |
 |---|---|---|
-| `jm_create(source, err, len)` | `MTLCreateSystemDefaultDevice()`, a command queue, and `newLibraryWithSource:` — compiles the entire `kernels.metal` text at run time. Returns an opaque context pointer, or NULL with the compiler's message in `err` | `Metal.<init>` |
+| `jm_create(source, err, len)` | `MTLCreateSystemDefaultDevice()`, a command queue, and `newLibraryWithSource:` — compiles the entire `kernels.metal` text at run time with `MTLMathModeRelaxed` (fast math that preserves the `-INFINITY` sentinels of the reductions). Returns an opaque context pointer, or NULL with the compiler's message in `err` | `Metal.<init>` |
 | `jm_destroy(ctx)` | releases everything | `Metal.close` |
 | `jm_device_name(ctx, out, len)` | e.g. "Apple M1 Pro" | `MetalBackend.name` |
 | `jm_recommended_working_set(ctx)` | how many bytes the GPU can keep resident without paging | start-up warning |
+| `jm_device_max_tg_mem(ctx)` | `maxThreadgroupMemoryLength` (32 KB): the fused rmsnorm+matmul kernels keep `dim` floats in threadgroup memory, so they are only used when that fits (`dim ≤ 8176`) | `MetalBackend.init` |
 | `jm_pipeline(ctx, name, err, len)` | looks up kernel `name` in the compiled library, builds a `MTLComputePipelineState`, stores it in an array and returns its **index** (so Java never holds Objective-C objects) | once per kernel |
-| `jm_pipeline_max_threads(ctx, idx)` | the pipeline's `maxTotalThreadsPerThreadgroup` | MoE sanity check (router needs `numExperts` threads) |
-| `jm_buffer_new(ctx, len)` | `newBufferWithLength:options:Shared`, zeroed | KV cache, activations, norm weights |
-| `jm_buffer_wrap(ctx, ptr, len)` | `newBufferWithBytesNoCopy:` — wraps memory **owned by Java** (the mmap'd cache file). Falls back to a copying `newBufferWithBytes:` if Metal refuses (misaligned) | every quantized weight tensor |
+| `jm_pipeline_max_threads(ctx, idx)` | the pipeline's `maxTotalThreadsPerThreadgroup` | available for sanity checks |
+| `jm_buffer_new(ctx, len, zero)` | `newBufferWithLength:options:Shared`; `zero != 0` clears it with `memset`, otherwise the pages are left untouched and only committed when first written. Every buffer the backends allocate is written before it is read (KV rows by the projections, activations per chunk), so they pass `zero = 0` and a 4 096-token context does not clear a gigabyte at start-up | KV cache, activations, norm weights |
+| `jm_buffer_wrap(ctx, ptr, len)` | `newBufferWithBytesNoCopy:` — wraps memory **owned by Java** (the mmap'd cache file) without copying. If Metal refuses (`ptr` or `len` not page aligned) it prints the reason to stderr and returns NULL, and `Metal.wrap` throws: there is deliberately no copying fallback, which would silently double the memory of a multi-gigabyte model | every quantized weight tensor |
 | `jm_buffer_contents(buf)` | the CPU pointer to a buffer's bytes | Java reads logits / writes embeddings |
 | `jm_buffer_release(buf)` | drop the reference | `Metal.close` |
 | `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels | start of `forward` |
-| `jm_dispatch(ctx, pipe, bufs[], offsets[], nbuf, params, plen, gx,gy,gz, tx,ty,tz)` | `setComputePipelineState`, `setBuffer:offset:atIndex:` for `i < nbuf`, `setBytes:` for the params at index `nbuf`, then `dispatchThreadgroups:threadsPerThreadgroup:` | once per kernel launch |
-| `jm_commit_wait(ctx, err, len)` | `endEncoding`, `commit`, `waitUntilCompleted`; returns −1 with the error text if the command buffer's status is `MTLCommandBufferStatusError` (a GPU fault) | end of `forward` |
+| `jm_dispatch(ctx, pipe, bufs[], offsets[], nbuf, params, plen, tgmem, gx,gy,gz, tx,ty,tz)` | `setComputePipelineState`, `setBuffer:offset:atIndex:` for `i < nbuf`, `setBytes:` for the params at index `nbuf`, `setThreadgroupMemoryLength:` for the kernel's dynamic `[[threadgroup(0)]]` argument when `tgmem > 0`, then `dispatchThreadgroups:threadsPerThreadgroup:` | once per kernel launch |
+| `jm_commit(ctx)` | `endEncoding`, `commit` **without waiting**, then opens a fresh command buffer and encoder: the GPU starts on the layers recorded so far while Java encodes the next ones. The queue runs command buffers in submission order, so the serial guarantee of `jm_begin` carries across the split | every 8 layers (`-Djllm.metal.commitLayers`) |
+| `jm_abort(ctx)` | ends and drops the command buffer being recorded without running it (Metal aborts the process if an encoder is released un-ended), after waiting for the parts `jm_commit` already submitted | `forward` when recording throws |
+| `jm_commit_wait(ctx, err, len)` | `endEncoding`, `commit`, `waitUntilCompleted`; returns −1 with the error text if any command buffer of the pass has status `MTLCommandBufferStatusError` (a GPU fault) | end of `forward` |
 
 "Unretained references" means the command buffer does not reference-count the buffers it uses — slightly
-cheaper, and safe because `Metal.java` keeps every buffer alive in its `buffers` list until `close()`.
+cheaper, and safe because `Metal.java` keeps every buffer alive in its `buffers` list until `close()`
+(which is idempotent).
 
 Building it: `scripts/build-native.sh` runs
 `clang -O2 -fobjc-arc -dynamiclib -framework Metal -framework Foundation src/main/native/jllm_metal.m -o target/native/libjllm_metal.dylib`.
@@ -192,7 +196,7 @@ Function & Memory API** (`java.lang.foreign`, project "Panama") does it from pur
 
 ```c
 void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, int nbuf,
-                 const void *params, int plen, int gx, int gy, int gz, int tx, int ty, int tz);
+                 const void *params, int plen, int tgmem, int gx, int gy, int gz, int tx, int ty, int tz);
 ```
 
 Java describes it once in the constructor:
@@ -200,17 +204,17 @@ Java describes it once in the constructor:
 ```java
 dispatch = LINKER.downcallHandle(lookup.findOrThrow("jm_dispatch"),
     FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT,
-                              ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                              ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
 ```
 
 and calls it per kernel launch:
 
 ```java
-dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, gx, gy, gz, tx, ty, tz);
+dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, tgmem, gx, gy, gz, tx, ty, tz);
 ```
 
-`bufs` is a native array of `MAX_BUFS = 8` pointers (`arena.allocate(ValueLayout.ADDRESS, 8)`), `offsets` an
-array of 8 longs, `params` a 64-byte scratch block. `MetalBackend.bind(i, buffer, offset)` writes slot `i` of the
+`bufs` is a native array of `MAX_BUFS = 16` pointers (`arena.allocate(ValueLayout.ADDRESS, 16)`; the fused
+q/k/v projection binds 11), `offsets` an array of 16 longs, `params` a 64-byte scratch block. `MetalBackend.bind(i, buffer, offset)` writes slot `i` of the
 first two with `setAtIndex`; the parameter struct is written field by field (next section). Because the native
 side copies the params (`setBytes`) and records the buffer bindings at dispatch time, the same three scratch
 segments are reused for every dispatch.
@@ -218,7 +222,7 @@ segments are reused for every dispatch.
 **Getting a Java array into GPU memory.** `MetalBackend.upload(float[] data)`:
 
 ```java
-Metal.Buffer b = metal.newBuffer((long) data.length * 4);                        // shared buffer
+Metal.Buffer b = metal.newBuffer((long) data.length * 4, false);                 // shared buffer, not zeroed
 MemorySegment.copy(data, 0, b.contents(), ValueLayout.JAVA_FLOAT, 0, data.length); // one bulk copy
 ```
 
@@ -242,8 +246,9 @@ picks Metal.
 
 ```
 1. CPU: for each of the n tokens, dequantize its embedding row (Q8 → float) into buffer x      (≈ 4 KB each)
-2. metal.begin()                                            ← one command buffer for everything below
-3. for each layer: record 12 (dense) or 13 (MoE) dispatches
+2. metal.begin()                                            ← a command buffer for the layers below
+3. for each layer: record the layer's dispatches; after every 8 layers metal.commit() submits them
+   (no wait) and opens the next command buffer, so the GPU runs them while the rest is encoded
 4. if logits wanted: final rmsnorm of the last token, LM-head matmul
 5. metal.commitAndWait()                                    ← the ONLY CPU↔GPU synchronization
 6. CPU: copy the logits out of logitsBuf
@@ -522,13 +527,17 @@ written out twice; folding them into the template is a pending clean-up.)
   compiler rejects it. Hence `ushort2 tid2` and `tid2.x` in `norm_rope` and `attention`. `simdgroup_index…`
   and `thread_index_in_simdgroup` are not position attributes and may stay scalar.
 - **Struct layout**: only `int`/`float` members, in the order Java writes them; `plen` must match the struct size.
-- **`newBufferWithBytesNoCopy` needs page alignment**; otherwise it returns nil and the shim silently copies —
-  fine for small buffers, catastrophic for a 19 GB model (double memory). All `QTensor`/`QuantFile` blobs are
-  16 KiB-aligned so the fast path is always taken. Read-only `mmap`'d pages work (this is what llama.cpp does).
+- **`newBufferWithBytesNoCopy` needs page alignment**; otherwise it returns nil, the shim prints why to stderr
+  and `Metal.wrap` throws — a silent copying fallback would be fine for small buffers and catastrophic for a
+  19 GB model (double memory). All `QTensor`/`QuantFile` blobs are 16 KiB-aligned so the fast path is always
+  taken. Read-only `mmap`'d pages work (this is what llama.cpp does).
 - **Unretained command buffers**: every buffer used in a dispatch must outlive the command buffer. `Metal.java`
   keeps all buffers in a list until `close()`; `ModelWeights` (the mmap) must be closed *after* the backend.
 - **Shader errors arrive at run time**, as text in `jm_create`'s `err` buffer, with line numbers relative to
   the source string — `kernels.metal` is compiled when the backend starts, not when the Java code is built.
+- **Every declared `[[threadgroup(0)]]` argument needs a length.** The plain matmul instantiations share their
+  signature with the fused-norm ones and so declare the dynamic threadgroup argument without using it; the
+  dispatch still binds a 16-byte dummy length (`UNUSED_TG_BYTES`) for them.
 - **GPU faults** (out-of-bounds reads, usually from a wrong `bind` index or grid size) show up as
   `MTLCommandBufferStatusError` from `jm_commit_wait`, often with an unhelpful message. The reliable debugging
   method is the CPU backend: run the same prompt with `--backend cpu --temp 0` and compare outputs token by
@@ -580,7 +589,7 @@ clearly slower. So the ~13 ms per token go elsewhere:
 - Dot products end with `simd_sum`; threadgroup-wide sums use a two-level reduction through threadgroup memory
   and barriers.
 - Unified memory lets the memory-mapped quantized cache be used by the GPU in place (`jm_buffer_wrap`).
-- A ~200-line Objective-C shim exposes 13 C functions; `Metal.java` binds them with the FFM API (`Linker`,
+- A ~250-line Objective-C shim exposes 16 C functions; `Metal.java` binds them with the FFM API (`Linker`,
   `FunctionDescriptor`, `MethodHandle.invokeExact`, `MemorySegment`), no JNI, no generated code.
 - `MetalBackend.forward` records the whole forward pass (338 dispatches for 0.6B, 626 for 30B-A3B) into one
   serial command buffer and waits once.
