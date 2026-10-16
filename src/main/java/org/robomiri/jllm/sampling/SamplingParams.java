@@ -30,6 +30,10 @@ public record SamplingParams(
 
     public SamplingParams {
         stop = stop == null ? List.of() : List.copyOf(stop);
+        if (!Float.isFinite(temperature) || !Float.isFinite(topP) || !Float.isFinite(minP)
+                || !Float.isFinite(repetitionPenalty) || !Float.isFinite(presencePenalty) || !Float.isFinite(frequencyPenalty)) {
+            throw new IllegalArgumentException("sampling parameters must be finite numbers: " + this);
+        }
         if (temperature < 0 || topK < 0 || topP <= 0 || topP > 1 || minP < 0 || minP > 1 || repetitionPenalty <= 0) {
             throw new IllegalArgumentException("invalid sampling parameters: " + this);
         }

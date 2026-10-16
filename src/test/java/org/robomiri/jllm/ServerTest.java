@@ -43,6 +43,7 @@ public final class ServerTest {
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
         try (Fixture f = new Fixture(tok, "qwen3", 1 << 20)) {
             basics(f);
+            badRequests(f);
             keepAlive(f);
             stalledStreamClient(f);
             disconnectedClient(f, false);
@@ -69,6 +70,13 @@ public final class ServerTest {
         check(r.status == 200 && r.headers.getOrDefault("transfer-encoding", "").equals("chunked")
                 && r.body.endsWith("data: [DONE]\n\n") && r.body.contains("\"finish_reason\":\"length\""),
                 "stream chat: chunked SSE ending in [DONE]");
+    }
+
+    /** Request validation: each of these must be a 400 with a JSON error, never a 500 or a dropped connection. */
+    static void badRequests(Fixture f) throws Exception {
+        String msgs = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        Resp r = f.post("/v1/chat/completions", "{" + msgs + ",\"temperature\":1e400}");
+        check(r.status == 400 && r.body.contains("finite"), "temperature 1e400 (infinite): 400");
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */
