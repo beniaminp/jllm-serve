@@ -79,7 +79,7 @@ the arithmetic units. A loop that loads 1 byte per multiply-add is memory-bound 
 
 | field | shape | size at ctx = 4096, batch = 64 (Qwen3-0.6B) | purpose |
 |---|---|---|---|
-| `keyCache[layer]`, `valCache[layer]` | `float[ctx × kvDim]` each | 28 × 2 × 4096 × 1024 × 4 B = **940 MB** | the KV cache ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)) |
+| `kv.key[layer]`, `kv.val[layer]` (`KvCache`) | `float[ctx × kvDim]` each | 28 × 2 × 4096 × 1024 × 4 B = **940 MB** | the KV cache ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)) |
 | `x` | `[batch × dim]` | 256 KB | the residual stream of the batch |
 | `xb` | `[batch × dim]` | 256 KB | normalized copy |
 | `q`, `att` | `[batch × qDim]` | 512 KB each | queries; attention output |
@@ -273,14 +273,18 @@ token at long contexts, so the per-thread scratch stays near 128 KB. Tasks are h
 
 ## 7.6 RMSNorm, RoPE, SiLU
 
-These touch `dim` or `headDim` values per token and are scalar loops:
+These touch `dim` or `headDim` values per token:
 
-- `rmsnormRow`: `sumSquares` (SIMD `dot(x, x)`), then `out[i] = in[i] * scale * weight[i]`.
-- `normRope`: per head, optional `rmsnormRow` in place (QK-norm), then the 64 rotation pairs using the
-  precomputed `rope.cos/sin` tables at row `(pos + t) * 64`.
-- `siluMul`: `hidden[i] = g / (1 + exp(−g)) * up[i]` over `ffn` values.
+- `rmsnormRow`: `sumSquares` (SIMD `dot(x, x)`), then `VectorKernels.scaleMul`, `out[i] = (in[i] * scale) * weight[i]`
+  on float lanes with the same two roundings as the scalar expression.
+- `normRope`: per head, optional `rmsnormRow` in place (QK-norm), then the 64 rotation pairs
+  (`VectorKernels.rope`, lanes with separate multiplies and add/subtract so the bits match the scalar formula)
+  using the precomputed `rope.cos/sin` tables at row `(pos + t) * 64`. GLM's interleaved pairs
+  (`InterleavedRope.rotate`) stay scalar.
+- `siluMul`: `hidden[i] = g / (1 + exp(−g)) * up[i]` over `ffn` values; the `Math.exp` is scalar.
 
-Together they are < 3 % of a decode step; they could be vectorized but it would not show up.
+Together they are < 3 % of a decode step. For one token (`n == 1`) the norms and RoPE run inline on the calling
+thread; for a chunk they are pool jobs over tokens or (token, head) pairs.
 
 ---
 
@@ -309,7 +313,9 @@ Details and the math in [12](12-mixture-of-experts.md).
 
 ### Why not `ForkJoinPool` / `parallelStream`
 
-A decode step issues roughly **340 parallel loops** (12 per layer × 28 + the LM head), each lasting 20–200 µs.
+A decode step of Qwen3-0.6B issues **225 parallel loops** (8 per layer — the q, k, v and o projections,
+attention, gate/up, SiLU, down; the norms and RoPE of a single token run inline — × 28 layers + the LM head),
+each lasting 20–200 µs.
 Standard executors hand off work through queues and park/unpark OS threads; the ~50 µs wake-up latency of a
 parked thread would exceed the work itself. `ThreadPool` is built for exactly this pattern: many tiny jobs,
 issued back to back from one thread.
@@ -374,7 +380,7 @@ Apple M1 Pro, 10 threads, 128-bit NEON, Qwen3-0.6B Q4_0, 413-token prompt:
 work instead: 450 MB of Q4 weights = 14 million 32-weight blocks per token; at ~30 instructions per block
 (7.3) that is ~420 M instructions, spread over 10 cores at ~3 GHz with maybe 2 vector instructions per cycle
 → ~7 ms if perfectly scheduled, ~59 ms observed — the gap is the `castShape` conversions (not single
-instructions on NEON), the thread-pool synchronization of 340 jobs, and the scalar `exp` in attention at
+instructions on NEON), the thread-pool synchronization of 225 jobs, and the scalar `exp` in attention at
 this context length. On AVX-512 the same source code needs 4× fewer instructions per block.
 
 ---
@@ -516,8 +522,9 @@ In order of expected payoff on this CPU:
   applies the block scale once; weights are read exactly once per token.
 - Decode parallelizes over output rows; prefill dequantizes four rows once and reuses them for all tokens
   (`dot4`), which is why it is ~9× faster per token.
-- Attention runs per `(token, head)` with thread-local scratch; MoE adds a router and two loops per token.
-- A spin-then-park pool with caller participation makes 340 micro-jobs per token cheap; the lost-wakeup race is
+- Attention runs per query head for decode and per (kv head, token tile) for prefill, with thread-local scratch;
+  MoE adds a router and two loops per token.
+- A spin-then-park pool with caller participation makes ~225 micro-jobs per token cheap; the lost-wakeup race is
   closed by a volatile re-check.
 - On 128-bit NEON the kernel is instruction-bound (byte→float conversions), not memory-bound; integer dot
   products are the fix.
