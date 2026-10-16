@@ -1,6 +1,7 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MambaMetalBackend;
@@ -112,7 +113,7 @@ public final class ArchSmoke {
         try (ModelWeights w = ModelWeights.load(dir, cfg, quant, ShardProvider.local(dir))) {
             int[] cpu;
             float[] cpuLogits = new float[cfg.vocabSize()];
-            try (Backend b = cfg.isMamba() ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4)) {
+            try (Backend b = cfg.isMamba() ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                 cpu = generate(b, cpuLogits);
                 failures += cfg.isMamba() ? stateChecks(b, cfg, "cpu") : 0;
             }

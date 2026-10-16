@@ -1,6 +1,7 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
@@ -42,7 +43,7 @@ public final class DeepSeekRef {
             }
             try (ModelWeights w = ModelWeights.load(dir, cfg, QType.Q8_0, ShardProvider.local(dir))) {
                 float[] cpu = new float[cfg.vocabSize()];
-                try (Backend b = new CpuBackend(w, 64, 16, 4)) {
+                try (Backend b = new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                     b.forward(PROMPT, 0, PROMPT.length, 0, cpu);
                 }
                 failures += compare(dir.getFileName() + " cpu", expect, cpu);

@@ -749,7 +749,7 @@ in f32, rounded **once** (round-to-nearest-even) when they are stored, and expan
 attention, so the arithmetic is unchanged and only the stored values lose precision (~3 significant decimal
 digits instead of ~7). That halves the cache — 470 MB instead of 940 MB at `ctx = 4096` for the 0.6B model —
 and the bytes attention reads per token; greedy outputs on the test prompts are unchanged
-([07 §7.12](07-cpu-backend.md#712-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
+([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
 [11 §11.3](11-performance.md#113-memory-footprint)).
 
 **The prefix cache on top** ([10](10-engine-and-server.md)): the engine remembers which token ids currently

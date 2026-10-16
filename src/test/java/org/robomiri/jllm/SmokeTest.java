@@ -91,13 +91,16 @@ public final class SmokeTest {
             }
             check(amax == 127, "int8 quantizer uses the full range (max |q| = " + amax + ")");
             double err4 = 0, ref4 = 0, err8 = 0, ref8 = 0, kern = 0;
+            int inexact = 0;
             for (int r = 0; r < rows; r++) {
                 for (QTensor w : new QTensor[]{w4, w8}) {
                     long exact = 0;
                     for (int b = 0; b < cols / 32; b++) {
                         exact += Int8Kernels.blockDotScalar(w, r, b, xq, 0);
                     }
-                    check(Int8Kernels.intDotRow(w, r, xq, 0) == exact, "int8 " + w.type + " integer lanes exact, row " + r);
+                    if (Int8Kernels.intDotRow(w, r, xq, 0) != exact) {
+                        inexact++;
+                    }
                     float i8 = Int8Kernels.dotRow(w, r, xq, xs, 0);
                     kern = Math.max(kern, Math.abs(i8 - Int8Kernels.dotRowScalar(w, r, xq, xs, 0)));
                     float[] wrow = new float[cols];
@@ -117,6 +120,7 @@ public final class SmokeTest {
             }
             double rel4 = Math.sqrt(err4 / ref4);
             double rel8 = Math.sqrt(err8 / ref8);
+            check(inexact == 0, "int8 integer lanes exact on " + rows + " Q4_0 and Q8_0 rows (" + inexact + " mismatches)");
             check(kern < 1e-4, "int8 SIMD kernel matches the scalar scale arithmetic (max abs diff " + kern + ")");
             check(rel4 < 0.02 && rel8 < 0.02, String.format("int8 dot product error vs float: q4 %.3f %%, q8 %.3f %% (rms, relative)",
                     rel4 * 100, rel8 * 100));

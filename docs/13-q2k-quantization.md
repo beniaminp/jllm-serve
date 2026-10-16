@@ -285,7 +285,7 @@ so the per-weight work is "convert a 0…3 code to float, multiply-add with x" �
 dot product and `Σx` per sub-block is precomputed once per activation vector as the "block sums". With f32
 activations as in this project, the saving is the per-weight `fma(dl, q, −ml)` that direct dequantization
 would need; the `Σx` adds cost about as much, so the two forms are close — the trick's real value here is that
-the code lines up with the int8 path described in [07 §7.10](07-cpu-backend.md#710-what-to-optimize-next).)
+the code lines up with the int8 path described in [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels).)
 
 ### CPU: `Q2KKernels.dot`
 
@@ -416,7 +416,7 @@ Reading fewer bytes did not buy speed on this model, and that is expected from [
 - On the CPU the kernel is conversion-bound ([07 §7.9](07-cpu-backend.md#79-measured-numbers-and-the-bottleneck)):
   each weight still costs one byte→float `castShape` and one FMA regardless of its bit width, and Q2_K adds the
   four shift-and-mask steps per 32 bytes and the `Σx` accumulation. Fewer bytes to load, same amount of
-  arithmetic — slightly slower. The int8-activation path in [07 §7.10](07-cpu-backend.md#710-what-to-optimize-next)
+  arithmetic — slightly slower. The int8-activation path in [07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)
   is where 2-bit codes would pay off on the CPU, because the min term then folds into precomputed block sums
   and the codes feed integer dot products directly.
 

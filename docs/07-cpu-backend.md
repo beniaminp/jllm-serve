@@ -93,7 +93,7 @@ once; a forward pass allocates nothing (important for the thread pool and for av
 
 The KV cache lives on the Java heap, which is why the launcher passes `-Xmx4g`. Weights are off-heap
 (`MemorySegment`) and do not count against it. With `backend.kv-dtype=f16` the cache is `short[]` and half the
-size ([7.12](#712-the-f16-kv-cache-kvcache)).
+size ([7.13](#713-the-f16-kv-cache-kvcache)).
 
 ---
 
@@ -107,7 +107,7 @@ for each layer L:
     matmul(L.wk, xb, kStage, 0, n, false)                               //     k/v of the chunk, [n, kvDim] staging
     matmul(L.wv, xb, vStage, 0, n, false)
     normRope(q, ...);  normRope(kStage, 0, ...)                         // 5.5
-    kv.store(l, pos, kStage, vStage, n)                                 //     into the KvCache: f32 copy or f16 rounding (7.12)
+    kv.store(l, pos, kStage, vStage, n)                                 //     into the KvCache: f32 copy or f16 rounding (7.13)
     attention(l, n, pos)                                                // 5.6
     matmul(L.wo, att, x, 0, n, true)                                    // 5.7  acc=true: x += ...
     rmsnorm(x, xb, L.ffnNorm, n, dim)
@@ -117,7 +117,7 @@ if logits != null: rmsnormRow(last token); matmul(lmHead, xb, logits, 0, 1, fals
 
 Two things to notice. `k` and `v` are produced into two small staging buffers (`[batch × kvDim]`), normalized
 and rotated there, and only then stored into the `KvCache` at row `pos` — an `arraycopy` for f32, a rounding pass
-for f16 ([7.12](#712-the-f16-kv-cache-kvcache)). And the `acc` flag turns a matmul into "add to the destination", which implements the residual connections without
+for f16 ([7.13](#713-the-f16-kv-cache-kvcache)). And the `acc` flag turns a matmul into "add to the destination", which implements the residual connections without
 a separate addition pass.
 
 ---
@@ -462,7 +462,7 @@ In order of expected payoff on this CPU:
 
 1. **Vectorized exp** in attention and SiLU (a polynomial approximation on `FloatVector`), removing the scalar
    `Math.exp` that dominates at long contexts.
-2. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.12](#712-the-f16-kv-cache-kvcache)). What remains is
+2. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.13](#713-the-f16-kv-cache-kvcache)). What remains is
    a fused f16 dot product that converts inside the SIMD loop instead of expanding each row to scratch first.
 3. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
    activation and the number of pool jobs.
@@ -473,7 +473,7 @@ In order of expected payoff on this CPU:
 
 ---
 
-## 7.11 Summary
+## 7.12 Summary
 
 - The Vector API gives Java explicit SIMD: `FloatVector`/`ByteVector` lanes, `fma`, one `reduceLanes` per row.
 - `dotQ4` loads 16 bytes, splits nibbles into two 16-lane vectors, converts to floats in parts, FMAs with `x`,
@@ -488,7 +488,7 @@ In order of expected payoff on this CPU:
 
 ---
 
-## 7.12 The f16 KV cache (`KvCache`)
+## 7.13 The f16 KV cache (`KvCache`)
 
 `backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation. The storage lives in `cpu/KvCache.java`
 with two implementations; `CpuBackend` only knows `kv.store(...)` and, for f32, the raw arrays:
