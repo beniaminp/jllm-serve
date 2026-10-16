@@ -107,8 +107,8 @@ Reading left to right, with the Java type at each arrow:
 
 | from → to | type | who | what happens |
 |---|---|---|---|
-| JSON body → prompt | `String` | `ApiServer.chatPrompt`, `ChatTemplate.render` | messages are laid out in the ChatML format the model was trained on |
-| prompt → ids | `int[]` | `Tokenizer.encode` | regex split, byte-level BPE merges |
+| JSON body → prompt ids | `int[]` | `ApiServer.chatPrompt` → `Engine.renderChat` → `ChatTemplate.Format.renderTokens` | messages are laid out in the chat template of the model's family (ChatML for Qwen3) and tokenized; message text cannot inject control tokens |
+| (plain text → ids) | `int[]` | `Tokenizer.encode` | `/v1/completions`, `run --raw`: regex split, BPE merges |
 | ids → logits | `float[vocab]` | `Backend.forward` (`CpuBackend` or `MetalBackend`) | the transformer: 28 layers of attention + feed-forward, reading quantized weights |
 | logits → id | `int` | `Sampler.sample` | penalties, temperature, top-k/top-p, random draw |
 | id → bytes | `byte[]` | `Tokenizer.tokenBytes` | table lookup |
@@ -116,7 +116,8 @@ Reading left to right, with the Java type at each arrow:
 | text → wire | chunked HTTP | `Engine.TextSink` → `ApiServer.sse` → `HttpServer.Response.write` | one `data:` event per piece |
 
 Before any of that can run, the **weights** must exist in memory. That is the loading path, executed once at
-start-up (`Main.load`):
+start-up (`Main.load`); the cache file is rebuilt automatically if it was made by an older converter or from
+another revision ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)):
 
 ```
 Hub ──HuggingFaceHub──▶ models/<repo>/*.safetensors ──ModelConverter──▶ jllm-q4_0.bin ──QuantFile (mmap)──▶ ModelWeights ──▶ Backend
@@ -132,13 +133,13 @@ What happens, in order, when a client sends `POST /v1/chat/completions` with `"s
 
 | # | class · method | step |
 |---|---|---|
-| 1 | `HttpServer.serve` → `connection` | `ServerSocket.accept()` hands the socket to a **virtual thread** |
-| 2 | `HttpServer.readRequest` | parses the request line, headers, reads `Content-Length` bytes of body |
+| 1 | `HttpServer.serve` → `connection` | waits for a free slot (`server.max-connections`), `ServerSocket.accept()` hands the socket to a **virtual thread** |
+| 2 | `HttpServer.readRequest` | parses the request line, headers, reads `Content-Length` bytes of body (limits: `server.max-body-bytes`, `server.read-timeout-ms`) |
 | 3 | `ApiServer.handle` → `completion` | routes on the path; `Json.parseObject` turns the body into a `Map` |
-| 4 | `ApiServer.chatPrompt` → `ChatTemplate.render` | `[{"role":"user","content":"hi"}]` becomes `<\|im_start\|>user\nhi<\|im_end\|>\n<\|im_start\|>assistant\n` (plus the empty think block when thinking is off) |
+| 4 | `ApiServer.chatPrompt` → `Engine.renderChat` | `[{"role":"user","content":"hi"}]` becomes `<\|im_start\|>user\nhi<\|im_end\|>\n<\|im_start\|>assistant\n` for Qwen3 (plus the empty think block when thinking is off); other families use their own template; `Engine.preparePrompt` adds the BOS token where the family expects one |
 | 5 | `ApiServer.params` | builds a `SamplingParams` from the request, falling back to `jllm.properties` defaults |
 | 6 | `HttpServer.Response.startStream` | sends `200`, `Content-Type: text/event-stream`, `Transfer-Encoding: chunked` |
-| 7 | `Engine.generate` | `Tokenizer.encode(prompt)` → `int[]`; takes the engine lock (one KV cache = one request at a time) |
+| 7 | `Engine.generate` | takes the engine lock (one KV cache = one request at a time; a request that waits longer than `server.queue-timeout-ms` gets a 503) |
 | 8 | `Engine.generateLocked` | compares the ids with what is already in the KV cache (**prefix cache**), skips the shared prefix |
 | 9 | `Backend.forward(prompt, pos, n, …)` in chunks of `backend.batch` | **prefill**: the new prompt tokens go through all 28 layers; their keys/values are written into the cache; logits only for the last token |
 | 10 | `Sampler.sample(logits)` | first generated token |
@@ -147,8 +148,8 @@ What happens, in order, when a client sends `POST /v1/chat/completions` with `"s
 | 13 | `Backend.forward(tok, pos, 1, …)` | **decode**: one token through the model, one more KV entry; back to 10 |
 | 14 | end-of-turn id or `max_tokens` | final chunk with `finish_reason` and `usage`, then `data: [DONE]`; `Response.end` writes the terminating `0\r\n\r\n` |
 
-Between 12 and 13 the socket is checked: if the client went away, the next write fails and the engine stops
-generating. Chapter [10](10-engine-and-server.md) covers the engine and server; [07](07-cpu-backend.md) and
+Between 12 and 13 the socket is checked: if the client went away, or stopped reading for longer than
+`server.write-timeout-ms`, the next write fails and the engine stops generating. Chapter [10](10-engine-and-server.md) covers the engine and server; [07](07-cpu-backend.md) and
 [08](08-metal-backend.md) cover what happens inside step 9/13.
 
 ---
@@ -174,10 +175,18 @@ From `config.json` (`Architecture`):
 | weights read per generated token | 452 MB | ≈ 2 GB (only the 8 chosen experts per layer) |
 
 How the 0.6B parameter count arises: the embedding is 151 936 × 1024 ≈ 155.6 M; each of the 28 layers holds
-≈ 15.7 M (attention 6.3 M + feed-forward 9.4 M) → 440 M; total ≈ 596 M. At 2 bytes each (bfloat16) that is the
-1.5 GB file. After Q4_0 quantization the layers take 0.625 bytes per weight and the embedding 1.125 (Q8_0), giving
+≈ 15.7 M (attention 6.3 M + feed-forward 9.4 M) → 440 M; total ≈ 596 M. At 2 bytes each (bfloat16) that is
+1.19 GB; the downloaded `model.safetensors` is 1.5 GB because it also stores `lm_head.weight`, a second copy of
+the tied embedding that jllm never reads. After Q4_0 quantization the layers take 0.625 bytes per weight and the embedding 1.125 (Q8_0), giving
 the 452 MB cache. The MoE model keeps 128 experts per layer in memory but runs only 8 of them per token
 ([12](12-mixture-of-experts.md)), which is why it is 40× larger on disk but only ~4× slower per token.
+
+Qwen3 is the running example, but the same pipeline runs the other supported families: Qwen2 / 2.5 (and the
+DeepSeek-R1 distills of Qwen2 and Llama), Llama 3.x, Mistral, GLM-4, Phi-3 / 3.5 / 4, Gemma 2 / 3 (text),
+DeepSeek V2 / V3 (bf16 only; the FP8 checkpoints are refused) and Mamba. What differs between them is parsed from
+`config.json` once into a typed `Architecture` ([14](14-model-families.md), [15](15-mamba.md)); the backends never
+look at the `model_type`. Weights can be stored as Q4_0 (default), Q8_0 or Q2_K (`model.quant`), and the KV cache
+as f32 or f16 (`backend.kv-dtype`).
 
 The "meaning" of the numbers: `dim` is how many features describe a token at every stage; `layers` is how many
 times the token is refined; heads split attention into independent lookups; `vocab_size` sets the width of the
@@ -192,13 +201,13 @@ one of those is replaced here by a small Java class, so there is no layer you ca
 
 | normally | here | lines |
 |---|---|---|
-| `huggingface_hub` | `hub/HuggingFaceHub` on `java.net.http` | ~330 |
-| `safetensors` | `safetensors/SafeTensors` on `FileChannel.map` + FFM | ~200 |
-| `tokenizers` (Rust) | `tokenizer/Tokenizer` | ~330 |
-| PyTorch / GGML kernels | `cpu/VectorKernels` + `cpu/CpuBackend` | ~450 |
-| MLX / Metal Performance Shaders | `kernels.metal` + `jllm_metal.m` + `metal/*` | ~900 |
-| Jackson / Gson | `json/Json` | ~300 |
-| Spring / Netty / FastAPI | `server/HttpServer` + `ApiServer` | ~550 |
+| `huggingface_hub` | `hub/HuggingFaceHub` on `java.net.http` | ~680 |
+| `safetensors` | `safetensors/SafeTensors` on `FileChannel.map` + FFM | ~330 |
+| `tokenizers` (Rust) + `jinja2` chat templates | `tokenizer/*` | ~2 300 |
+| PyTorch / GGML kernels | `cpu/*` (`VectorKernels`, `Int8Kernels`, `Q2KKernels`, `CpuBackend`, ...) | ~2 750 |
+| MLX / Metal Performance Shaders | `kernels.metal` + `jllm_metal.m` + `metal/*` | ~3 800 |
+| Jackson / Gson | `json/Json` | ~450 |
+| Spring / Netty / FastAPI | `server/HttpServer` + `ApiServer` | ~1 250 |
 
 You can follow one request from the socket down to the individual multiply-add that computes an attention
 score. Each piece is the simplest version that is still correct and reasonably fast; the docs point to the
@@ -213,32 +222,36 @@ org.robomiri.jllm
 ├── Main                 commands: download | run | chat | serve | bench | config
 ├── config.Settings      jllm.properties defaults → external file → command line flags
 ├── json.Json            recursive-descent JSON parser and writer
-├── hub.HuggingFaceHub   lists a repo, downloads files (resumable, SHA-256 verified), one shard on demand
+├── hub.HuggingFaceHub   lists a repo, downloads files (resumable, SHA-256 verified, retries), one shard on demand
 ├── safetensors.SafeTensors   memory-mapped tensor views over .safetensors files
 ├── tokenizer
-│   ├── Tokenizer        byte-level BPE: String ⇄ int[]
-│   ├── ChatTemplate     Qwen3 ChatML prompt format, thinking on/off
+│   ├── Tokenizer        BPE (byte-level and SentencePiece-style): String ⇄ int[]
+│   ├── Normalizers, PreTokenizers, AddedTokenTrie, LongLongMap   the tokenizer.json pieces
+│   ├── ChatTemplate     one prompt format per family (ChatML for Qwen3/Qwen2, Llama 3, Gemma, ...), thinking on/off
 │   └── StreamDecoder    emits text only when a UTF-8 character is complete
 ├── model
 │   ├── Architecture     sealed: Decoder | MambaArch, plus the shared Core (parsed from config.json)
 │   ├── Families         one parser per model family, holding its defaults
 │   ├── Decoder, DecoderLayer, LayerSpec   per-layer Attention (Gqa | Mla), Mlp (Dense | Moe), norms
 │   ├── Attention, Mlp, Router, RopeTable, Scaling, MambaArch   the typed vocabulary
-│   ├── LayerWeights, AttnWeights, MlpWeights   sealed weights mirroring LayerSpec
-│   ├── QType, QTensor   Q4_0 / Q8_0 block quantization, page-aligned off-heap layout
-│   ├── QuantFile        jllm-<quant>.bin/.json: quantized weights on disk, memory-mapped
-│   ├── ModelConverter   safetensors → QuantFile, one layer at a time, shards on demand
+│   ├── LayerWeights, AttnWeights, MlpWeights   sealed weights mirroring LayerSpec (DecoderLayer | MambaLayer)
+│   ├── QType, QTensor, Q2K   Q4_0 / Q8_0 / Q2_K block quantization, page-aligned off-heap layout
+│   ├── KvDtype          f32 | f16 KV cache element type
+│   ├── QuantFile        jllm-<quant>.bin/.json (+ .partial.json while converting): quantized weights on disk, memory-mapped
+│   ├── ModelConverter   safetensors → QuantFile, one layer at a time, shards on demand, resumable
 │   ├── ShardProvider    "give me shard N" / "I'm done with shard N" (used for --low-disk)
-│   ├── ModelWeights     maps the cache file into QTensors (dense + MoE layers)
-│   ├── Rope             cos/sin tables for rotary position embedding
+│   ├── ModelWeights     maps the cache file into QTensors (dense, MoE, MLA and Mamba layers)
+│   ├── Rope, InterleavedRope, GemmaMath   position-embedding and family-specific math shared by the backends
 │   └── Backend          interface: forward(tokens, off, n, pos, logits)
 ├── cpu
-│   ├── VectorKernels    SIMD dot products on quantized rows (Vector API)
+│   ├── VectorKernels, Int8Kernels, Q2KKernels   SIMD dot products on quantized rows (Vector API), int8 activations
 │   ├── ThreadPool       spin-then-park fork/join for small parallel loops
-│   └── CpuBackend       the forward pass on CPU, f32 KV cache on the heap
+│   ├── CpuBackend       the forward pass on CPU; KvCache holds the f32 or f16 KV cache on the heap
+│   └── MlaCpu, MambaCpuBackend   DeepSeek latent attention and the Mamba recurrence
 ├── metal
 │   ├── Metal            FFM bindings to libjllm_metal.dylib (compile shaders, buffers, dispatch)
-│   └── MetalBackend     the forward pass as GPU dispatches, zero-copy weights
+│   ├── MetalBackend     the forward pass as GPU dispatches, zero-copy weights
+│   └── MlaMetal, MambaMetalBackend   the same for latent attention and Mamba
 ├── sampling
 │   ├── SamplingParams   temperature, top-k, top-p, min-p, penalties, seed, max tokens, stop
 │   └── Sampler          float[] logits → int token
@@ -271,6 +284,9 @@ depend on `model` and nothing depends on them except `Main`. `json` and `config`
 | the loop and the HTTP layer | [10](10-engine-and-server.md) |
 | what limits speed | [11](11-performance.md) |
 | the 30B mixture-of-experts model | [12](12-mixture-of-experts.md) |
+| 2-bit weights | [13](13-q2k-quantization.md) |
+| Llama, Mistral, Qwen2, GLM, Phi, Gemma, DeepSeek: what differs between families | [14](14-model-families.md) |
+| state-space models (Mamba) | [15](15-mamba.md) |
 
 ---
 
@@ -312,7 +328,7 @@ depend on `model` and nothing depends on them except `Main`. `json` and `config`
 - **Prefill** — the forward pass over the whole prompt, many tokens per call.
 - **Decode** — generating one token per forward call.
 - **KV cache** — the keys and values of all previous tokens, stored per layer so they are not recomputed.
-- **Context length (`ctx`)** — the maximum number of tokens the KV cache can hold.
+- **Context length (`ctx`)** — the maximum number of tokens the KV cache can hold. `backend.kv-dtype=f16` stores it in half precision (half the memory).
 - **Prefix cache** — reusing KV entries across requests that share the same beginning (chat history).
 - **Sampling** — choosing the next token from the probabilities; **temperature**, **top-k**, **top-p**, **min-p** shape the choice; **greedy** always takes the best.
 - **Stop string** — text that ends generation when it appears in the output.
@@ -323,7 +339,8 @@ depend on `model` and nothing depends on them except `Main`. `json` and `config`
 - **bfloat16** — 16-bit float with float32's range and 3 significant digits; what the download uses.
 - **Quantization** — storing weights with fewer bits (4 or 8 here) to cut memory and bandwidth.
 - **Block** — 32 consecutive weights that share one **scale**; `value ≈ integer × scale`.
-- **Q4_0 / Q8_0** — the 4-bit and 8-bit block formats (same scheme as llama.cpp).
+- **Q4_0 / Q8_0 / Q2_K** — the 4-bit, 8-bit and 2.625-bit block formats (same schemes as llama.cpp; Q2_K is for large models, [13](13-q2k-quantization.md)).
+- **Quantized cache** — `jllm-<quant>.bin/.json` in the model directory: the weights quantized once, memory-mapped on every later start.
 - **mmap** (memory mapping) — making a file appear as memory; the OS loads **pages** (16 KiB on Apple Silicon) on first access.
 - **Arena** — the FFM object that owns native memory segments and frees them all when closed.
 - **`MemorySegment`** — a bounds-checked view of native or mapped memory.
