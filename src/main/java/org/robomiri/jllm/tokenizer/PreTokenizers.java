@@ -38,7 +38,6 @@ final class PreTokenizers {
         final List<Stage> stages = new ArrayList<>();
         boolean byteLevel;
         boolean metaspace;
-        boolean splitRegex; // a Split stage with a regex exists
 
         List<String> apply(String text, boolean first) {
             List<String> pieces = new ArrayList<>(1);
@@ -81,9 +80,6 @@ final class PreTokenizers {
                 Pattern p = Pattern.compile(regex != null ? regex : Pattern.quote(literal), FLAGS);
                 String behavior = Json.str(node, "behavior", "Isolated");
                 boolean invert = Json.bool(node, "invert", false);
-                if (regex != null) {
-                    chain.splitRegex = true;
-                }
                 chain.stages.add((pieces, first) -> splitAll(pieces, p, behavior, invert));
             }
             case "ByteLevel" -> {

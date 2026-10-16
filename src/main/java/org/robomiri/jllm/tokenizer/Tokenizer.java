@@ -34,7 +34,7 @@ import java.util.function.UnaryOperator;
  */
 public final class Tokenizer {
 
-    /** Qwen2/3 pre-tokenizer, used when tokenizer.json does not carry any pre-tokenizer. */
+    /** Qwen2/3 pre-tokenizer, used only when a byte-level tokenizer.json carries no pre-tokenizer at all. */
     private static final String DEFAULT_SPLIT =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
@@ -171,7 +171,7 @@ public final class Tokenizer {
                 || containsType(decoderNode, "Metaspace") || containsType(decoderNode, "ByteFallback")
                 || containsType(normalizerNode, "Replace") || containsType(normalizerNode, "Prepend");
         byteLevel = pre.byteLevel || !spSignal; // tokenizers with no hints at all keep the historical byte-level default
-        if (byteLevel && !pre.byteLevel && !pre.splitRegex) { // legacy default: Qwen's regex
+        if (byteLevel && preNode == null) { // no pre-tokenizer at all: the historical default, Qwen's regex
             pre = PreTokenizers.build(Json.obj("type", "Split", "pattern", Json.obj("Regex", DEFAULT_SPLIT),
                     "behavior", "Isolated"));
         }

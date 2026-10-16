@@ -34,6 +34,7 @@ public final class TokenizerFamiliesTest {
 
     private static final Map<String, Tokenizer> LOADED = new java.util.HashMap<>();
     private static final Map<String, String> MODEL_TYPE = new java.util.HashMap<>();
+    private static Path ROOT;
 
     static int passed;
     static int failed;
@@ -46,9 +47,9 @@ public final class TokenizerFamiliesTest {
         for (String[] f : FAMILIES) {
             MODEL_TYPE.put(f[0], f[1]);
         }
-        Path root = Path.of(args.length > 0 ? args[0] : "/tmp/jllm-tokenizers");
+        ROOT = Path.of(args.length > 0 ? args[0] : "/tmp/jllm-tokenizers");
         for (String[] f : FAMILIES) {
-            Path dir = root.resolve(f[0]);
+            Path dir = ROOT.resolve(f[0]);
             if (!Files.isRegularFile(dir.resolve("tokenizer.json"))) {
                 System.out.println("SKIP " + f[0] + " (no tokenizer.json in " + dir + ")");
                 skipped++;
@@ -297,6 +298,26 @@ public final class TokenizerFamiliesTest {
         check(ChatTemplate.render(sysUser, true, false).equals("<|im_start|>system\nBe brief.<|im_end|>\n"
                         + "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
                 "static ChatTemplate.render is still Qwen3 ChatML");
+
+        // the Qwen regex is the fallback for a byte-level tokenizer WITHOUT any pre-tokenizer; a chain that merely
+        // lacks a regex Split (a literal Split, Digits) must be used as written
+        Tokenizer qwen = LOADED.get("qwen3");
+        if (qwen != null) {
+            try {
+                String text = Files.readString(ROOT.resolve("qwen3").resolve("tokenizer.json"));
+                Map<String, Object> json = Json.parseObject(text);
+                json.put("pre_tokenizer", Json.obj("type", "Split", "pattern", Json.obj("String", " "),
+                        "behavior", "Removed"));
+                Tokenizer literal = Tokenizer.fromJson(Json.write(json));
+                checkEq(literal.encode("a b"), new int[]{qwen.tokenId("a"), qwen.tokenId("b")},
+                        "a literal Split pre-tokenizer is used as written, not replaced by the Qwen regex");
+                json.put("pre_tokenizer", null);
+                Tokenizer none = Tokenizer.fromJson(Json.write(json));
+                checkEq(none.encode("a b"), qwen.encode("a b"), "no pre-tokenizer at all falls back to the Qwen regex");
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }
 
         // unsupported constructs fail loudly
         String base = "\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}";
