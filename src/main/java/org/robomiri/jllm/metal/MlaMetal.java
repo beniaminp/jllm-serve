@@ -69,7 +69,7 @@ final class MlaMetal {
         pAttention = metal.pipeline("attention_mla");
         if (c.isMoe()) {
             pRouter = metal.pipeline("router_ds");
-            if (c.numExperts() > 1024 || c.numExperts() > metal.maxThreads(pRouter)) {
+            if (c.numExperts() > 1024) {
                 throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
             }
         } else {
@@ -209,7 +209,7 @@ final class MlaMetal {
         });
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 8, d.scaleAlways() ? 1 : 0);
         mb.params.setAtIndex(ValueLayout.JAVA_FLOAT, 9, (float) d.routedScale());
-        metal.dispatch(pRouter, mb.bufArgs, mb.offArgs, 5, mb.params, 40, n, 1, 1, c.numExperts(), 1, 1);
+        metal.dispatch(pRouter, mb.bufArgs, mb.offArgs, 5, mb.params, 40, n, 1, 1, 256, 1, 1);
     }
 
     /** Shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x. */

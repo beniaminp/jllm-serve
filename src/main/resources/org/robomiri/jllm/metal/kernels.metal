@@ -1245,12 +1245,14 @@ kernel void attention_mla(device const float *q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- DeepSeek router
-// router_ds: one threadgroup per token with nExperts threads (<= 1024). Thread e computes logit e; thread 0 then
-// applies the DeepSeek rule (see DeepSeekRouter.java, which this mirrors): softmax or sigmoid scores; method 0 =
-// greedy, 1 = group_limited_greedy (group score = max), 2 = noaux_tc (selection on scores + bias, group score = sum
-// of the two best); the topkGroup best of nGroup (<= 64) groups are kept; top-k inside them; weights are the
-// uncorrected scores, renormalized if requested, times routedScale (always if scaleAlways, otherwise only when not
-// renormalized). Writes assign[t*topK+k] and rw[t*topK+k], consumed by moe_up / moe_down.
+// router_ds: one threadgroup (256 threads = 8 simdgroups) per token. The logits are computed as in `router`
+// (simdgroup sg handles experts sg, sg + 8, ...; the 32 lanes read the router row in coalesced float4 steps and
+// finish with simd_sum), the softmax max and sum are threadgroup reductions, and thread 0 then applies the
+// DeepSeek rule serially (nExperts <= 1024; see DeepSeekRouter.java, which this mirrors): softmax or sigmoid
+// scores; method 0 = greedy, 1 = group_limited_greedy (group score = max), 2 = noaux_tc (selection on scores +
+// bias, group score = sum of the two best); the topkGroup best of nGroup (<= 64) groups are kept; top-k inside
+// them; weights are the uncorrected scores, renormalized if requested, times routedScale (always if scaleAlways,
+// otherwise only when not renormalized). Writes assign[t*topK+k] and rw[t*topK+k], consumed by moe_up / moe_down.
 
 struct RouterDsParams {
     int nExperts;
@@ -1272,31 +1274,47 @@ kernel void router_ds(device const float *x [[buffer(0)]],
                       device const float *bias [[buffer(4)]],
                       constant RouterDsParams &p [[buffer(5)]],
                       uint tg [[threadgroup_position_in_grid]],
-                      ushort tid [[thread_position_in_threadgroup]]) {
+                      ushort tid [[thread_position_in_threadgroup]],
+                      ushort tpg [[threads_per_threadgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float scores[1024];
     threadgroup float choice[1024];
-    device const float *xv = x + (ulong)tg * p.dim;
-    device const float *wv = w + (ulong)tid * p.dim;
-    float d = 0.0f;
-    for (int i = 0; i < p.dim; i++) d += wv[i] * xv[i];
-    scores[tid] = d;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid != 0) return;
-
+    threadgroup float buf[32];
     const int ne = p.nExperts;
+    device const float *xv = x + (ulong)tg * p.dim;
+    device const float4 *x4 = (device const float4 *)xv;
+    const int n4 = p.dim / 4;
+    for (int e = sg; e < ne; e += nsg) {
+        device const float *wv = w + (ulong)e * p.dim;
+        device const float4 *w4 = (device const float4 *)wv;
+        float d = 0.0f;
+        for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
+        for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
+        d = simd_sum(d);
+        if (lane == 0) scores[e] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (p.sigmoidScore) {
-        for (int e = 0; e < ne; e++) scores[e] = 1.0f / (1.0f + exp(-scores[e]));
+        for (int e = tid; e < ne; e += tpg) scores[e] = 1.0f / (1.0f + exp(-scores[e]));
     } else {
         float mx = -INFINITY;
-        for (int e = 0; e < ne; e++) mx = max(mx, scores[e]);
+        for (int e = tid; e < ne; e += tpg) mx = max(mx, scores[e]);
+        mx = tg_max(mx, buf, sg, lane, nsg);
         float sum = 0.0f;
-        for (int e = 0; e < ne; e++) {
-            scores[e] = exp(scores[e] - mx);
-            sum += scores[e];
+        for (int e = tid; e < ne; e += tpg) {
+            const float v = exp(scores[e] - mx);
+            scores[e] = v;
+            sum += v;
         }
-        for (int e = 0; e < ne; e++) scores[e] /= sum;
+        sum = tg_sum(sum, buf, sg, lane, nsg);
+        for (int e = tid; e < ne; e += tpg) scores[e] /= sum;
     }
-    for (int e = 0; e < ne; e++) choice[e] = p.method == 2 ? scores[e] + bias[e] : scores[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < ne; e += tpg) choice[e] = p.method == 2 ? scores[e] + bias[e] : scores[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
 
     if (p.method != 0) {
         const int gs = ne / p.nGroup;
