@@ -142,7 +142,7 @@ whatever is still pending is flushed (unless a stop string was hit).
   `Engine.OverloadedException`, which the API turns into a 503 `overloaded` instead of letting requests pile up.
   Serving many users at once would require batching several sequences per forward pass ([11](11-performance.md)).
 - **Statistics** (`Engine.Stats`): `promptTokens`, `cachedTokens`, `generatedTokens`, `prefillMs`, `decodeMs`,
-  `tokPerSec()`. The CLI prints them after each answer; the API returns them inside `usage`.
+  `draftedTokens`, `acceptedTokens` (speculation, 10.9), `tokPerSec()`. The CLI prints them after each answer; the API returns them inside `usage`.
 
 ---
 
@@ -262,6 +262,7 @@ server's defaults ([09 §9.10](09-sampling.md#910-where-each-setting-comes-from)
 ```
 
 `usage` carries the standard three counters plus jllm's extras (`cached_tokens`, `prefill_ms`, `decode_ms`,
+`drafted_tokens`, `accepted_draft_tokens` (speculative decoding, [10.9](#109-speculative-decoding), 0 when off),
 `tokens_per_second`), which OpenAI clients ignore.
 
 ### Chat, streaming (`"stream": true`)
@@ -386,7 +387,68 @@ cheap. After each answer it prints the token count and tok/s from the final `usa
 
 ---
 
-## 10.9 Configuration
+## 10.9 Speculative decoding
+
+Decoding streams every weight once per token, so a token costs the same whether the pass computes one position or
+several. Speculative decoding exploits that: guess the next few tokens, feed *all* of them in one pass, and keep
+the guesses the model itself would have produced. Code: `engine/Speculator.java`, `engine/DraftModel.java`,
+`Sampler.verify`, `Backend.forwardAll`. It is off by default (`engine.speculative=off`, measurements below).
+
+```
+tok  = sample(logits)                       # a normal step: the next token is always the target's own choice
+drafts d1..dm = propose(history + tok)      # prompt lookup or a draft model, m <= engine.draft-tokens
+rows = backend.forwardAll([tok, d1..dm], pos)        # ONE pass, the logits of all m+1 positions
+for j in 0..m:                              # rows[j] = the distribution after tok, d1..dj
+    s = verify(rows[j], d[j+1]) if j < m else sample(rows[m])
+    emit s;  if s != d[j+1]: break          # the first disagreement ends the chain, s is the correction
+pos += 1 + (accepted drafts)                # K/V of rejected positions is simply overwritten by the next pass
+```
+
+**Exactness.** A draft token is *accepted* only if it is what the target would have sampled there.
+Greedy: `verify` returns the argmax, so the draft is kept iff it is the argmax and the output is the
+non-speculative output. Sampling: both proposers are deterministic (a prompt-lookup continuation, a greedy draft
+model), i.e. a one-hot proposal distribution q, and the speculative-sampling rule `accept x with probability
+min(1, p(x)/q(x))`, else draw from `norm(max(0, p − q))`, reduces to "accept the draft with probability p(x), else
+draw from p with x's mass removed". `p` is the very distribution `sample` draws from (penalties, temperature,
+top-k, top-p, min-p), so the result is distributed exactly like a plain sample; the tests check this on a toy
+vocabulary with 200 000 seeded draws and on a fake-backend engine run. The penalties see accepted tokens in order:
+`Speculator` calls `Sampler.accept` for every accepted draft before it samples the next row.
+
+**Bookkeeping.** The engine's cached-token list contains only tokens that were really emitted
+(`min(positions fed, prompt + output)`), so a rejected or end-of-sequence draft never enters the prefix cache.
+Mamba backends (`supportsPrefixReuse() == false`) cannot rewind their state: speculation is refused for them
+with a note.
+
+**Prompt lookup (`ngram`).** The longest suffix of prompt + output (at most `engine.ngram-max`, at least
+`engine.ngram-min` tokens) is searched backwards (last `engine.ngram-window` tokens); the tokens that followed
+its most recent earlier occurrence are the draft. It needs no second model and no memory, and works when the
+output copies the input: editing code, quoting a document, extracting fields, structured output.
+
+**Draft model (`draft`).** `engine.draft-model` names a smaller model of the same tokenizer (checked at start-up
+with a probe string), e.g. Qwen3-0.6B for Qwen3-30B-A3B. It gets its own backend (same `backend`, `backend.ctx`,
+`model.quant`) and KV cache in the same process, remembers which tokens that cache holds and re-feeds only the
+difference to the new history, then proposes `engine.draft-tokens` tokens greedily.
+
+**Back-off.** A pass whose drafts are all rejected cost more than a plain step, so after it the proposer
+sits out 1, 3, 7, then 15 steps (reset by the next accepted draft).
+
+**What a verification pass costs.** `forwardAll(n)` runs the n positions through the multi-token kernels and the
+LM head over n rows (`CpuBackend`: one `mm.mul` with n rows; `MetalBackend`: `rmsnorm` and `matmul` over n rows
+into an n-row buffer, copied back whole). On the Metal backend a pass of n tokens measured **1 + 0.36 (n−1)** single
+steps for Qwen3-0.6B (n=5: 2.4×) and **1 + 0.55 (n−1)** for Qwen3-30B-A3B (n=5: 3.3×: each extra position
+routes to its own experts, which are streamed again). Speculation pays off only if the accepted tokens per pass
+exceed that factor, see [11 §11.6](11-performance.md#116-speculative-decoding). Greedy output with
+speculation equals the plain greedy output bit for bit on Metal (the tiled kernels are bit-identical to the
+single-token ones, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)); on the CPU prefill and decode
+kernels differ in the last bits, so it holds only with `-Djllm.cpu.deterministic=true
+--backend.cpu.int8-activations false` ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)).
+
+Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
+`usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
+
+---
+
+## 10.10 Configuration
 
 Every tunable is a key in the bundled `src/main/resources/jllm.properties`, each with a comment. `Settings.load`
 layers three sources, later ones winning:
@@ -401,7 +463,7 @@ layers three sources, later ones winning:
 
 Flags come in two spellings: short aliases (`Settings.ALIASES`: `--model`, `--revision`, `--dir`, `--quant`,
 `--low-disk`, `--backend`, `--ctx`, `--batch`, `--threads`, `--temp`/`--temperature`, `--top-k`, `--top-p`,
-`--min-p`, `--rep-penalty`, `--seed`, `--max-tokens`, `--think`, `--system`, `--host`, `--port`) or the
+`--min-p`, `--rep-penalty`, `--seed`, `--max-tokens`, `--speculative`, `--draft-model`, `--draft-tokens`, `--think`, `--system`, `--host`, `--port`) or the
 property key itself (`--server.port 9000`, `--bench.rounds=5`). `--key=value` also works and is the only way
 to pass a value that itself starts with `--`. A boolean flag may stand alone (`--think` means `true`); it only
 consumes the next argument when that is a boolean literal (`true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`), so
@@ -441,10 +503,14 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
 | `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
 | `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
+| `engine.speculative` | `off` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative` |
+| `engine.draft-model` | empty | Hub repo of the draft model for `draft` (same tokenizer); flag `--draft-model` |
+| `engine.draft-tokens` | `4` | most tokens proposed per verification pass; flag `--draft-tokens` |
+| `engine.ngram-max` / `engine.ngram-min` / `engine.ngram-window` | `3` / `2` / `4096` | prompt lookup: suffix lengths tried and how many recent tokens are searched |
 
 ---
 
-## 10.10 `Main`: wiring it all together
+## 10.11 `Main`: wiring it all together
 
 | command | what it does |
 |---|---|
@@ -465,7 +531,7 @@ backend and weights closed again.
 
 ---
 
-## 10.11 Summary
+## 10.12 Summary
 
 - The engine is a loop: prefill the prompt in chunks, then sample → feed → sample, streaming complete UTF-8
   characters and holding back possible stop-string prefixes.
@@ -477,4 +543,7 @@ backend and weights closed again.
   write deadlines, queue wait) turn hostile or broken clients into plain JSON errors.
 - The API mirrors OpenAI's chat and completion endpoints closely enough for the official SDKs and the bundled
   web page.
+- Speculative decoding (off by default) proposes tokens by prompt lookup or with a small draft model, verifies them
+  in one multi-token pass (`Backend.forwardAll`) and keeps what the target would have produced: identical greedy
+  output, the target's distribution when sampling; it pays only when a pass of n tokens is much cheaper than n steps.
 - Configuration is one properties file with three override layers and a `config` command to inspect them.
