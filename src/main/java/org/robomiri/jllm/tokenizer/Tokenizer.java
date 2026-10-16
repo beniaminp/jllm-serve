@@ -46,7 +46,7 @@ public final class Tokenizer {
     private final byte[][] idToBytes;
     private final String[] idToString;
     /** key = (left id << 32 | right id), value = (rank << 32 | merged id). */
-    private final Map<Long, Long> merges;
+    private final LongLongMap merges;
     private final Map<String, Integer> addedTokens;
     private final Set<Integer> specialIds;
     private final Set<Integer> lstripIds = new HashSet<>();
@@ -101,7 +101,7 @@ public final class Tokenizer {
         }
 
         List<Object> mergeList = Json.list(model, "merges");
-        merges = new HashMap<>(mergeList == null ? 16 : mergeList.size() * 2);
+        merges = new LongLongMap(mergeList == null ? 16 : mergeList.size());
         if (mergeList != null) {
             int rank = 0;
             for (Object m : mergeList) {
@@ -603,11 +603,11 @@ public final class Tokenizer {
             if (sym[i] < 0 || j < 0) {
                 continue;
             }
-            Long v = merges.get(pairKey(sym[i], sym[j]));
-            if (v == null || (v >>> 32) != (e >>> 32)) {
+            long v = merges.get(pairKey(sym[i], sym[j]));
+            if (v == LongLongMap.MISSING || (v >>> 32) != (e >>> 32)) {
                 continue;
             }
-            sym[i] = (int) (long) v;
+            sym[i] = (int) v;
             sym[j] = -1;
             int k = next[j];
             next[i] = k;
@@ -629,8 +629,8 @@ public final class Tokenizer {
     }
 
     private void offer(LongHeap heap, int[] sym, int left, int right) {
-        Long v = merges.get(pairKey(sym[left], sym[right]));
-        if (v != null) {
+        long v = merges.get(pairKey(sym[left], sym[right]));
+        if (v != LongLongMap.MISSING) {
             heap.push((v & 0xFFFFFFFF00000000L) | left);
         }
     }

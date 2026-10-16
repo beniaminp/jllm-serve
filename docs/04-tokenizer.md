@@ -146,8 +146,10 @@ milliseconds).
 
 Three more implementation details keep this fast:
 
-1. **No strings.** Symbols are token ids; the merge table is `HashMap<Long, Long>` keyed by
-   `(leftId << 32) | rightId` with value `(rank << 32) | mergedId`. One hash lookup per pair, no concatenation.
+1. **No strings.** Symbols are token ids; the merge table is `LongLongMap`, an open-addressed primitive map
+   keyed by `(leftId << 32) | rightId` with value `(rank << 32) | mergedId`. One hash lookup per pair, no
+   concatenation, no boxing. (A `HashMap<Long, Long>` would fold the key to `leftId ^ rightId` — every pair
+   with the same xor lands in one bin — so the slot comes from a 64-bit multiplicative mix of the whole key.)
 2. **`ignore_merges`** (true for Qwen): if the whole chunk is already a vocabulary entry, return it directly.
    Common words skip the loop entirely.
 3. **Memoization.** The result for each chunk is cached in a `ConcurrentHashMap` (capped at 100 000 entries,
