@@ -20,6 +20,10 @@ public final class MetalConstants {
     public static final int PF_UNITS = 1;
     /** Tokens per simdgroup of the prefill matmuls. */
     public static final int PF_TOKS = 8;
+    /** Output rows per threadgroup of the MMA prefill matmuls. */
+    public static final int MMA_BR = 64;
+    /** Tokens per threadgroup of the MMA prefill matmuls. */
+    public static final int MMA_BT = 32;
     /** Matmul threadgroup: 4 simdgroups = 4 rows. */
     public static final int MM_THREADS = 128;
     /** rmsnorm / router / attention_combine threadgroup (one row each). */
@@ -56,6 +60,8 @@ public final class MetalConstants {
         m.put("PF_ROWS", (double) PF_ROWS);
         m.put("PF_UNITS", (double) PF_UNITS);
         m.put("PF_TOKS", (double) PF_TOKS);
+        m.put("MMA_BR", (double) MMA_BR);
+        m.put("MMA_BT", (double) MMA_BT);
         m.put("MM_THREADS", (double) MM_THREADS);
         m.put("ROW_THREADS", (double) ROW_THREADS);
         m.put("ATT_THREADS", (double) ATT_THREADS);

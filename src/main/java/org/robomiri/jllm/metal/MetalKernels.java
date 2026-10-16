@@ -13,6 +13,8 @@ import static org.robomiri.jllm.metal.MetalConstants.ATT_TILE;
 import static org.robomiri.jllm.metal.MetalConstants.CHANNEL_THREADS;
 import static org.robomiri.jllm.metal.MetalConstants.FLASH_MAX_SPLITS;
 import static org.robomiri.jllm.metal.MetalConstants.MM_THREADS;
+import static org.robomiri.jllm.metal.MetalConstants.MMA_BR;
+import static org.robomiri.jllm.metal.MetalConstants.MMA_BT;
 import static org.robomiri.jllm.metal.MetalConstants.PF_ROWS;
 import static org.robomiri.jllm.metal.MetalConstants.PF_TOKS;
 import static org.robomiri.jllm.metal.MetalConstants.PF_UNITS;
@@ -51,6 +53,12 @@ final class MetalKernels implements AutoCloseable {
      * section of kernels.metal); smaller ones the single-row kernels. A huge value disables the tiled kernels.
      */
     static final int PREFILL_MIN_TOKENS = Integer.getInteger("jllm.metal.prefillMinTokens", 8);
+    /**
+     * Chunks of at least MMA_MIN_TOKENS tokens use the simdgroup-matrix (8x8 MMA) prefill matmuls; the summation
+     * order differs from the scalar kernels (f32 rounding level). -Djllm.metal.mmaPrefill=false turns them off.
+     */
+    static final boolean MMA_PREFILL = Boolean.parseBoolean(System.getProperty("jllm.metal.mmaPrefill", "true"));
+    static final int MMA_MIN_TOKENS = Integer.getInteger("jllm.metal.mmaMinTokens", 32);
     /**
      * Layers per command buffer: the dispatches of every COMMIT_LAYERS layers are submitted (without waiting)
      * while the following layers are still being encoded, so GPU execution overlaps the CPU-side encoding
@@ -176,6 +184,19 @@ final class MetalKernels implements AutoCloseable {
         return (rows + SG_PER_TG * PF_ROWS - 1) / (SG_PER_TG * PF_ROWS);
     }
 
+    private static boolean useMma(int n) {
+        return MMA_PREFILL && n >= MMA_MIN_TOKENS;
+    }
+
+    /** Threadgroups along the row axis for the MMA prefill matmuls (MMA_BR rows per threadgroup). */
+    private static int mmaGrid(int rows, int perTg) {
+        return (rows + perTg - 1) / perTg;
+    }
+
+    private static int mmaTiles(int n) {
+        return (n + MMA_BT - 1) / MMA_BT;
+    }
+
     private static int pfTiles(int n) {
         return (n + PF_TOKS - 1) / PF_TOKS;
     }
@@ -216,7 +237,9 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, outOff);
         bindOrDummy(4, norm);
         p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);
-        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+        if (norm == null && useMma(n)) {
+            dispatch(kernel("matmul_mma", t.type, ""), 5, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul_pf", t.type, ""), 5, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {
             dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
@@ -255,7 +278,9 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.MATMUL3).i(wq.rows).i(wk.rows).i(wv.rows).i(wq.cols).i(n).f(eps).i(bq != null);
         int rows = wq.rows + wk.rows + wv.rows;
         String vh = vHalf ? "_h" : "";
-        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+        if (norm == null && useMma(n)) {
+            dispatch(kernel("matmul3_mma", wq.type, vh), 14, 0, mmaGrid(rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", wq.type, vh), 14, 0, pfGrid(rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {
             dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
@@ -278,7 +303,10 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, 0);
         bindOrDummy(4, norm);
         p.reset(KernelParams.SWIGLU).i(hidden).i(t.cols).i(n).f(eps).i(gelu);
-        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+        if (norm == null && useMma(n)) {
+            dispatch(kernel("matmul_swiglu_mma", t.type, ""), 5, 0, mmaGrid(hidden, MMA_BR / 2), mmaTiles(n), 1,
+                    MM_THREADS, 1, 1);
+        } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int gx = (hidden + SG_PER_TG * PF_UNITS - 1) / (SG_PER_TG * PF_UNITS);
             dispatch(kernel("matmul_swiglu_pf", t.type, ""), 5, 0, gx, pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {

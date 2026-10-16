@@ -22,6 +22,8 @@ using namespace metal;
 #define PF_ROWS 2               // rows per simdgroup of matmul_pf / matmul3_pf
 #define PF_UNITS 1              // gate + up units per simdgroup of matmul_swiglu_pf
 #define PF_TOKS 8               // tokens per simdgroup of the prefill matmuls
+#define MMA_BR 64               // output rows per threadgroup of the MMA prefill matmuls
+#define MMA_BT 32               // tokens per threadgroup of the MMA prefill matmuls
 #define MM_THREADS 128          // matmul threadgroup: 4 simdgroups = 4 rows (norm_scale_128 relies on it)
 #define ROW_THREADS 256         // rmsnorm / router / attention_combine threadgroup (one row each)
 #define ATT_THREADS 256         // attention threadgroup = ATT_SIMDGROUPS simdgroups
@@ -735,6 +737,201 @@ template [[host_name("matmul3_pf_q8_h")]] kernel matmul3_pf_h_t matmul3_pf<8, PF
 typedef decltype(matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>) matmul_swiglu_pf_t;
 template [[host_name("matmul_swiglu_pf_q4")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>;
 template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<8, PF_UNITS, PF_TOKS>;
+
+// ---------------------------------------------------------------------------------------------- 2b. matmul: MMA prefill
+// Prefill chunks of at least MMA_MIN_TOKENS tokens use the matrix units: one threadgroup (4 simdgroups) computes a
+// MMA_BR rows x MMA_BT tokens output tile with 8x8 simdgroup_float8x8 multiply-accumulates. Per 32-wide k step
+// (one quantization block) the threads dequantize the tile's MMA_BR weight rows (value * scale, f32) into
+// threadgroup memory sa[row][k] and stage MMA_BT activation rows into sb[token][k]; each simdgroup owns a
+// 32 row x 16 token quarter (4 x 2 accumulators) and runs four k8 steps. C[token][row] = sum_k sb[token][k] *
+// sa[row][k], so the weight operand is loaded transposed. The tile lands in threadgroup memory sc[token][row]
+// (aliasing sa) and the epilogue of each shape writes it out with the guards. The summation order differs from
+// the scalar kernels (results agree to f32 rounding, not bit for bit).
+
+#define MMA_SA_FLOATS (MMA_BR * 32)
+#define MMA_SB_FLOATS (MMA_BT * 32)
+
+template <int QT>
+static inline void mma_core(device const uchar *rwq, device const float *rws, ulong rgrow, int nb,
+                            device const float *x, int cols, int ntRem,
+                            threadgroup float *sa, threadgroup float *sb, threadgroup float *sc,
+                            ushort tid, ushort sg) {
+    simdgroup_float8x8 acc[8];
+    for (int i = 0; i < 8; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const int lr = tid >> 1;
+    const int h = tid & 1;
+    const int lt = tid >> 2;
+    const int lp = tid & 3;
+    device const float4 *xr = (device const float4 *)(x + (ulong)min(lt, ntRem - 1) * cols) + lp * 2;
+    const int nsb = (nb + 7) >> 3;
+    const ushort sr = sg & 1;
+    const ushort st = sg >> 1;
+    threadgroup float *wd = sa + lr * 32;
+    for (int b = 0; b < nb; b++) {
+        if (QT == 4) {
+            device const uchar4 *q = (device const uchar4 *)(rwq + rgrow * nb * 16 + b * 16 + h * 8);
+            const float s = rws[rgrow * nb + b];
+            for (int k = 0; k < 2; k++) {
+                uchar4 v = q[k];
+                *(threadgroup float4 *)(wd + h * 8 + k * 4) = (float4(v & uchar4(15)) - 8.0f) * s;
+                *(threadgroup float4 *)(wd + 16 + h * 8 + k * 4) = (float4(v >> uchar4(4)) - 8.0f) * s;
+            }
+        } else if (QT == 8) {
+            device const char4 *q = (device const char4 *)(rwq + rgrow * nb * 32 + b * 32 + h * 16);
+            const float s = rws[rgrow * nb + b];
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = float4(q[k]) * s;
+        } else {
+            float4 w[4];
+            q2k_sub_block(rwq, rgrow, nsb, 2 * b + h, w);
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[k];
+        }
+        threadgroup float4 *xd = (threadgroup float4 *)(sb + lt * 32 + lp * 8);
+        xd[0] = xr[b * 8];
+        xd[1] = xr[b * 8 + 1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 4; kk++) {
+            simdgroup_float8x8 a[2];
+            simdgroup_float8x8 w[4];
+            for (int i = 0; i < 2; i++) simdgroup_load(a[i], sb + (st * 16 + i * 8) * 32 + kk * 8, 32);
+            for (int j = 0; j < 4; j++) simdgroup_load(w[j], sa + (sr * 32 + j * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i * 4 + j], a[i], w[j], acc[i * 4 + j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 4; j++)
+            simdgroup_store(acc[i * 4 + j], sc + (st * 16 + i * 8) * MMA_BR + sr * 32 + j * 8, MMA_BR);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <int QT>
+kernel void matmul_mma(device const uchar *wq [[buffer(0)]],
+                       device const float *ws [[buffer(1)]],
+                       device const float *x [[buffer(2)]],
+                       device float *out [[buffer(3)]],
+                       device const float *nw [[buffer(4)]],
+                       constant MatmulParams &p [[buffer(5)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort tid [[thread_index_in_threadgroup]],
+                       ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMA_SA_FLOATS];
+    threadgroup float sb[MMA_SB_FLOATS];
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int nb = p.cols / QK;
+    const ulong grow = (ulong)min(row0 + (tid >> 1), p.rows - 1);
+    mma_core<QT>(wq, ws, grow, nb, x + (ulong)t0 * p.cols, p.cols, p.ntok - t0, sa, sb, sa, tid, sg);
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, r = i % MMA_BR;
+        if (t0 + t < p.ntok && row0 + r < p.rows) {
+            const float v = sa[t * MMA_BR + r];
+            const ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
+            out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
+        }
+    }
+}
+
+template <int QT, typename VT>
+kernel void matmul3_mma(device const uchar *wq0 [[buffer(0)]],
+                        device const float *ws0 [[buffer(1)]],
+                        device const uchar *wq1 [[buffer(2)]],
+                        device const float *ws1 [[buffer(3)]],
+                        device const uchar *wq2 [[buffer(4)]],
+                        device const float *ws2 [[buffer(5)]],
+                        device const float *x [[buffer(6)]],
+                        device float *out0 [[buffer(7)]],
+                        device float *out1 [[buffer(8)]],
+                        device VT *out2 [[buffer(9)]],
+                        device const float *nw [[buffer(10)]],
+                        device const float *b0 [[buffer(11)]],
+                        device const float *b1 [[buffer(12)]],
+                        device const float *b2 [[buffer(13)]],
+                        constant Matmul3Params &p [[buffer(14)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMA_SA_FLOATS];
+    threadgroup float sb[MMA_SB_FLOATS];
+    const int total = p.rows0 + p.rows1 + p.rows2;
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int nb = p.cols / QK;
+    const int lrow = min(row0 + (tid >> 1), total - 1);
+    device const uchar *rwq;
+    device const float *rws;
+    ulong grow;
+    if (lrow < p.rows0) { rwq = wq0; rws = ws0; grow = (ulong)lrow; }
+    else if (lrow < p.rows0 + p.rows1) { rwq = wq1; rws = ws1; grow = (ulong)(lrow - p.rows0); }
+    else { rwq = wq2; rws = ws2; grow = (ulong)(lrow - p.rows0 - p.rows1); }
+    mma_core<QT>(rwq, rws, grow, nb, x + (ulong)t0 * p.cols, p.cols, p.ntok - t0, sa, sb, sa, tid, sg);
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, r = i % MMA_BR;
+        const int row = row0 + r;
+        if (t0 + t < p.ntok && row < total) {
+            float v = sa[t * MMA_BR + r];
+            if (row < p.rows0) {
+                if (p.hasBias) v += b0[row];
+                out0[(ulong)(t0 + t) * p.rows0 + row] = v;
+            } else if (row < p.rows0 + p.rows1) {
+                const int g = row - p.rows0;
+                if (p.hasBias) v += b1[g];
+                out1[(ulong)(t0 + t) * p.rows1 + g] = v;
+            } else {
+                const int g = row - p.rows0 - p.rows1;
+                if (p.hasBias) v += b2[g];
+                out2[(ulong)(t0 + t) * p.rows2 + g] = VT(v);
+            }
+        }
+    }
+}
+
+// Tile rows [0, 32) = gate units [unit0, unit0 + 32), rows [32, 64) = the matching up rows.
+template <int QT>
+kernel void matmul_swiglu_mma(device const uchar *wq [[buffer(0)]],
+                              device const float *ws [[buffer(1)]],
+                              device const float *x [[buffer(2)]],
+                              device float *out [[buffer(3)]],
+                              device const float *nw [[buffer(4)]],
+                              constant SwigluParams &p [[buffer(5)]],
+                              uint2 tgp [[threadgroup_position_in_grid]],
+                              ushort tid [[thread_index_in_threadgroup]],
+                              ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMA_SA_FLOATS];
+    threadgroup float sb[MMA_SB_FLOATS];
+    const int unit0 = int(tgp.x) * (MMA_BR / 2);
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int nb = p.cols / QK;
+    const int lr = tid >> 1;
+    const int unit = min(unit0 + (lr & 31), p.hidden - 1);
+    const ulong grow = (ulong)(lr < 32 ? unit : p.hidden + unit);
+    mma_core<QT>(wq, ws, grow, nb, x + (ulong)t0 * p.cols, p.cols, p.ntok - t0, sa, sb, sa, tid, sg);
+    for (int i = tid; i < (MMA_BR / 2) * MMA_BT; i += MM_THREADS) {
+        const int t = i / (MMA_BR / 2), j = i % (MMA_BR / 2);
+        if (t0 + t < p.ntok && unit0 + j < p.hidden) {
+            const float g = sa[t * MMA_BR + j];
+            const float u = sa[t * MMA_BR + 32 + j];
+            out[(ulong)(t0 + t) * p.hidden + unit0 + j] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+typedef decltype(matmul_mma<4>) matmul_mma_t;
+typedef decltype(matmul3_mma<4, float>) matmul3_mma_t;
+typedef decltype(matmul3_mma<4, half>) matmul3_mma_h_t;
+typedef decltype(matmul_swiglu_mma<4>) matmul_swiglu_mma_t;
+template [[host_name("matmul_mma_q4")]] kernel matmul_mma_t matmul_mma<4>;
+template [[host_name("matmul_mma_q8")]] kernel matmul_mma_t matmul_mma<8>;
+template [[host_name("matmul_mma_q2k")]] kernel matmul_mma_t matmul_mma<2>;
+template [[host_name("matmul3_mma_q4")]] kernel matmul3_mma_t matmul3_mma<4, float>;
+template [[host_name("matmul3_mma_q8")]] kernel matmul3_mma_t matmul3_mma<8, float>;
+template [[host_name("matmul3_mma_q2k")]] kernel matmul3_mma_t matmul3_mma<2, float>;
+template [[host_name("matmul3_mma_q4_h")]] kernel matmul3_mma_h_t matmul3_mma<4, half>;
+template [[host_name("matmul3_mma_q8_h")]] kernel matmul3_mma_h_t matmul3_mma<8, half>;
+template [[host_name("matmul3_mma_q2k_h")]] kernel matmul3_mma_h_t matmul3_mma<2, half>;
+template [[host_name("matmul_swiglu_mma_q4")]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<4>;
+template [[host_name("matmul_swiglu_mma_q8")]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<8>;
+template [[host_name("matmul_swiglu_mma_q2k")]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<2>;
 
 template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
 template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;

@@ -85,11 +85,11 @@ gen deepseek_v3 DeepseekV3ForCausalLM
 for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
   REF_Q8=1 python3 scripts/deepseek-ref.py "$M/${P}-$n" >/dev/null
 done
-"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef target/native/libjllm_metal.dylib \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
-exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
