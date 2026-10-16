@@ -603,7 +603,7 @@ The grouped attention instantiations (`attention_g{2,4,8}_*`) sit behind `#ifdef
 
 ## 8.7 Measured numbers and where the time goes
 
-Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt (`bench`): **~533 tok/s prefill, ~111 tok/s decode** (the f16
+Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt (`bench`): **~1 360 tok/s prefill, ~111 tok/s decode** (the f16
 cache is similar); Qwen3-30B-A3B Q4_0: **~49 tok/s prefill, ~25 tok/s decode**. The CPU backend on the same
 machine does ~275 / ~51 (0.6B, int8 activations) and ~12 / ~6 (30B); the full table is in
 [11.1](11-performance.md#111-measured). Greedy output is byte-identical to the CPU backend with float
@@ -635,8 +635,8 @@ reading the whole prefix) dominates instead.
    matmul already has (the 30B prefills at 49 tok/s against 533 for the 0.6B).
 2. **Prefill attention** — a tile of query tokens per threadgroup sharing each K/V row, or an online-softmax
    pass that never writes `scores` to device memory (flash decoding does the split for decode only).
-3. **Simdgroup matrix instructions** (`simdgroup_multiply_accumulate` on 8×8 tiles) for prefill matmuls — a
-   different accumulation order, so it would be opt-in like flash decoding (not started).
+3. **Simdgroup matrix instructions for the MoE kernels** — the dense prefill matmuls already use them
+   ([8.10](#810-the-tiled-prefill-matmuls)); `moe_up` / `moe_down` do not.
 4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
 5. **Overlap** — pipeline the CPU's sampling with the next step's GPU work, or sample on the GPU.
@@ -708,6 +708,33 @@ into 1 KB reads and halve the x gathers (4.0 ms per layer against 6.2–6.7 for 
 rows cost too many registers, 16 tokens gain nothing more; the SwiGLU kernel is fastest with one unit
 (1.5 ms against 2.2). End to end: 0.6B prefill 380 → 533 tok/s, 30B 44 → 49 tok/s (its prefill is dominated
 by the MoE kernels, which still handle one token per simdgroup).
+
+### Simdgroup-matrix kernels (chunks of 32+ tokens)
+
+Chunks of at least `jllm.metal.mmaMinTokens` = 32 tokens use `matmul_mma`, `matmul3_mma` and
+`matmul_swiglu_mma` instead (`-Djllm.metal.mmaPrefill=false` brings the scalar tiled kernels back). A threadgroup
+of 4 simdgroups computes a `MMA_BR` = 64 rows × `MMA_BT` = 32 tokens output tile with `simdgroup_float8x8`
+multiply-accumulates, walking the row in quantization blocks (32 weights = one k step):
+
+1. every thread dequantizes 16 weights of one tile row (`value * scale` in f32; Q2_K through `q2k_sub_block`)
+   into threadgroup memory `sa[row][k]` and copies 8 activations into `sb[token][k]`;
+2. after a barrier each simdgroup owns a 32-row × 16-token quarter (4 × 2 accumulators) and runs four k8 steps,
+   loading the weight operand transposed, so `C[token][row] += sb[token][k] · sa[row][k]`;
+3. the tile is stored to threadgroup memory (aliasing `sa`) and written out by an epilogue that carries each
+   shape's guards: accumulate / soft-cap (dense), bias and the three outputs with the f16 V cache (`matmul3`), or
+   `silu(gate) * up` where the tile's first 32 rows are 32 gate units and the next 32 their up rows (SwiGLU / GeGLU).
+
+The operands stay f32: `simdgroup_half8x8` inputs would round the dequantized weights (and activations) to 11
+bits for no change in the memory traffic, and f32 MMA already moves the matmuls off the critical path. Because
+the products are summed in a different order from the lane-walk kernels the results are **not bit-identical**:
+on Qwen3-0.6B a 400-token prompt gives a largest logit difference of 8.6e-6 (max |logit| 10.2, same argmax), the
+greedy text of seven diverse prompts (80 tokens each, 0.6B) and the 30B answer are unchanged, and the architecture
+smoke test passes 60 / 60 with the MMA kernels forced on for its 12-token prompts (`JAVA_OPTS=-Djllm.metal.mmaMinTokens=2`).
+A 64-token tile (16 accumulators per simdgroup) was ten times slower (register spills); 32 tokens it is.
+Qwen3-0.6B prefill goes ~533 → ~1 360 tok/s (413-token prompt, best of several runs on a busy machine; the
+scalar kernels measured 516 in the same session). The 30B went 18.7 → 34.0 tok/s in an A/B run under heavy load
+(49 tok/s before on a quiet machine); its prefill is dominated by the MoE kernels. A 2 012-token prompt on the 0.6B
+went from ~95 to ~300 tok/s (both loaded; attention over the growing prefix is a large share there).
 
 ---
 

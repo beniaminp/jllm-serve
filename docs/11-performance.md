@@ -66,7 +66,7 @@ Apple M1 Pro, Q4_0 weights (Q8_0 embedding / LM head), 413-token prompt, 128 gen
 
 | model | backend | prefill | decode | weight traffic at that decode rate | % of bandwidth ceiling |
 |---|---|---|---|---|---|
-| Qwen3-0.6B | **Metal** (f32 or f16 KV cache) | **~533 tok/s** | **~111 tok/s** | 50 GB/s | 25 % |
+| Qwen3-0.6B | **Metal** (f32 or f16 KV cache) | **~1 360 tok/s** (~533 with `-Djllm.metal.mmaPrefill=false`) | **~111 tok/s** | 50 GB/s | 25 % |
 | Qwen3-0.6B | **CPU, int8 activations** (default) | **~275 tok/s** | **~51 tok/s** | 23 GB/s | 11 % |
 | Qwen3-0.6B | CPU, float activations | ~237 tok/s | ~13 tok/s | 6 GB/s | 3 % |
 | Qwen3-30B-A3B | **Metal** | **~49 tok/s** | **~25 tok/s** | 51 GB/s (≈ 2.05 GB per token) | 26 % |
@@ -221,6 +221,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.flashDecode` | off | flash decoding for decode steps over `jllm.metal.flashMinLen` (512) positions ([08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) |
 | `jllm.metal.commitLayers` | 8 | layers per Metal command buffer (0 = one per pass) |
 | `jllm.metal.prefillMinTokens` | 8 | smallest chunk that uses the tiled prefill matmuls |
+| `jllm.metal.mmaPrefill` | true | simdgroup-matrix prefill matmuls; `false` = the scalar tiled kernels (bit-identical to decode) |
+| `jllm.metal.mmaMinTokens` | 32 | smallest chunk that uses the simdgroup-matrix matmuls ([08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)) |
 | `jllm.metal.attnGroup` | 1 | query heads per attention threadgroup (2, 4, 8 measured no faster) |
 
 JIT warm-up matters: the first ~50 tokens run before C2 has compiled the kernels; `bench` discards a warm-up
@@ -236,6 +238,7 @@ Done:
 |---|---|---|
 | **Kernel fusion on Metal**: `rmsnorm` folded into the following matmul at decode, q/k/v as one dispatch (with bias), `silu_mul` in the gate/up epilogue, f16 cache rows written by the projection and rope kernels, Gemma's final soft-cap in the LM-head epilogue | 338 → 170 dispatches per token; decode 75 → 111 tok/s on the 0.6B model | `kernels.metal`, `MetalKernels`, [08 §8.4](08-metal-backend.md#84-recording-a-forward-pass-metalbackendforward) |
 | **Pipelined command buffers**: commit every 8 layers so encoding overlaps GPU work | part of the 380 → 533 tok/s prefill gain | `MetalBackend.forward` |
+| **Simdgroup-matrix prefill matmuls on Metal** (64 rows × 32 tokens per threadgroup, f32 MMA, not bit-identical) | prefill 533 → ~1 360 tok/s; largest logit difference 8.6e-6 | `matmul_mma` family, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls) |
 | **Tiled prefill matmuls on Metal** (2 rows × 8 tokens per simdgroup, bit-identical) | prefill 380 → 533 tok/s | `matmul_pf` family, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls) |
 | **Int8 activations on CPU** ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | Q4 row kernel 6× faster, decode 13 → 51 tok/s (~3.9×), ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuMatmul` |
 | **f16 KV cache**: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; speed equal or better, outputs unchanged on the test prompts | `cpu/KvCache`, `_h` kernels |
@@ -268,7 +271,7 @@ the model logic out of the kernel layer.
 - Decode is bound by **bytes per token**, not arithmetic: 452 MB (0.6B) or ~2 GB (30B-A3B) per token against
   ~200 GB/s. Quantization and batching are the only levers that move that ceiling.
 - Today's Metal decode reaches ~25 % of the bandwidth roof (~111 tok/s of a ~440 tok/s ceiling); the gap is
-  dispatch overhead and latency-bound small matmuls. Prefill is ~533 tok/s.
+  dispatch overhead and latency-bound small matmuls. Prefill is ~1 360 tok/s.
 - The CPU path was instruction-bound at 128-bit SIMD; int8 activations with integer dot products took the
   row kernel from ~30 conversion-heavy instructions per block to ~31 single-cycle integer ops doing twice
   the lanes, 6× per kernel and ~4× per decoded token (13 → 51 tok/s).
