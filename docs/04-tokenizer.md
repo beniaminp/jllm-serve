@@ -286,8 +286,10 @@ loop is the same O(n log n) heap, so this stays fast, but such chunks are too lo
 - **Post-processor / BOS.** `bosId()`, `eosId()`, `unkId()` and `addBosByDefault()` come from the
   `TemplateProcessing` post-processor and, when present, the sibling `tokenizer_config.json`
   (`add_bos_token`, `bos_token`, `eos_token`; DeepSeek has no template but sets `add_bos_token`). `encode` never
-  prepends BOS; the caller decides. Chat-template output already contains BOS for the families whose template
-  starts with it.
+  prepends BOS; the caller decides, and `promptBos()` (= `bosId()` when `addBosByDefault()`, else -1) is the
+  single answer the engine should use for raw completions instead of guessing from `model_type`
+  (DeepSeek-R1-Distill-Qwen is `qwen2` with `add_bos_token: true`). Chat-template output already contains BOS
+  for the families whose template starts with it.
 
 Unknown normalizer, pre-tokenizer, decoder or post-processor types throw `IllegalArgumentException` instead of
 silently tokenizing differently, as do a non-empty `continuing_subword_prefix` / `end_of_word_suffix`

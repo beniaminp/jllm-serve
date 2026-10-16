@@ -218,6 +218,16 @@ public final class TokenizerFamiliesTest {
             check(llama.encode("hi")[0] != llama.bosId(), "encode() does not add BOS");
             check(llama.eosId() == 128009, "llama3 eos from tokenizer_config");
         }
+        // promptBos() is what the engine prepends to raw completions: DeepSeek-R1-Distill-Qwen reports
+        // model_type qwen2 but its tokenizer_config asks for BOS; Qwen3 and Phi do not
+        Tokenizer ds = LOADED.get("dsr1");
+        if (ds != null) {
+            check(ds.promptBos() == 151646, "deepseek-r1 promptBos is <｜begin▁of▁sentence｜> (" + ds.promptBos() + ")");
+        }
+        if (LOADED.containsKey("qwen3") && LOADED.containsKey("phi3")) {
+            check(LOADED.get("qwen3").promptBos() == -1 && LOADED.get("phi3").promptBos() == -1,
+                    "qwen3 / phi3 promptBos is -1");
+        }
 
         // content can never forge control tokens: as many special / protected ids as with benign content of
         // equal shape, in every role
@@ -419,6 +429,8 @@ public final class TokenizerFamiliesTest {
         }
         check(tok.bosId() == bos && tok.addBosByDefault() == addByDefault, name + " bosId " + tok.bosId() + "/add="
                 + tok.addBosByDefault() + " expected " + bos + "/" + addByDefault);
+        check(tok.promptBos() == (addByDefault ? bos : -1), name + " promptBos " + tok.promptBos() + " expected "
+                + (addByDefault ? bos : -1));
     }
 
     private static void expectThrows(Runnable r, String messagePart, String what) {

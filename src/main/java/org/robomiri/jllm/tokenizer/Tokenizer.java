@@ -542,6 +542,17 @@ public final class Tokenizer {
         return addBos;
     }
 
+    /**
+     * The token to put in front of a plain (non-chat) prompt: {@link #bosId()} when {@link #addBosByDefault()},
+     * else -1. This is the tokenizer's own answer (tokenizer_config.json {@code add_bos_token} / the
+     * post-processor template), so the engine need not guess from the model type: DeepSeek-R1-Distill-Qwen is
+     * {@code model_type: qwen2} but its tokenizer asks for {@code <｜begin▁of▁sentence｜>}. Chat prompts rendered
+     * by {@link ChatTemplate} already contain their BOS and must not get another one.
+     */
+    public int promptBos() {
+        return addBos ? bosId : -1;
+    }
+
     // ------------------------------------------------------------------ internals
 
     private Integer tokenIdOrNull(String token) {
