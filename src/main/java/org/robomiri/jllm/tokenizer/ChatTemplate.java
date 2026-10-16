@@ -12,8 +12,8 @@ import java.util.function.Supplier;
  * Chat templates of the supported model families, each derived from the Jinja {@code chat_template} in the
  * model's tokenizer_config.json (minus tool calling) and checked against the official Jinja render.
  *
- * <p>Get one with {@link #forModelType(String)} / {@link #forModelType(String, Tokenizer)}. The static
- * {@link #renderTokens} / {@link #render} methods are the original Qwen3 ChatML entry points.
+ * <p>Get one with {@link #forModelType(String)} / {@link #forModelType(String, Tokenizer)}; {@code enableThinking}
+ * only matters to Qwen3 (when false, an empty think block is pre-filled so the model answers directly).
  *
  * <p>Control tokens come from the template; message content is encoded with special tokens disabled (plus the
  * format's {@link Format#protectedTokens()}), so text like {@code <|im_end|>} inside a message cannot forge a
@@ -59,25 +59,6 @@ public final class ChatTemplate {
     private static final Format LLAMA3_TODAY = llama3(ChatTemplate::today);
 
     private ChatTemplate() {
-    }
-
-    // ------------------------------------------------------------------ original Qwen3 entry points
-
-    /**
-     * Renders the Qwen3 template directly to token ids.
-     *
-     * @throws IllegalArgumentException for a role outside system/user/assistant/tool
-     */
-    public static int[] renderTokens(Tokenizer tok, List<Message> messages, boolean addGenerationPrompt,
-                                     boolean enableThinking) {
-        return QWEN3.renderTokens(tok, messages, addGenerationPrompt, enableThinking);
-    }
-
-    /**
-     * @param enableThinking when false, an empty think block is pre-filled so the model answers directly
-     */
-    public static String render(List<Message> messages, boolean addGenerationPrompt, boolean enableThinking) {
-        return QWEN3.render(messages, addGenerationPrompt, enableThinking);
     }
 
     // ------------------------------------------------------------------ factory

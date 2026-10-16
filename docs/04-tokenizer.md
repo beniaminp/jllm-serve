@@ -229,8 +229,9 @@ decode to the same text but would be out-of-distribution for the model and hurt 
 
 ## 4.11 Other tokenizer families
 
-The same `Tokenizer` class loads the tokenizers of Llama 3, Mistral, Gemma 2/3, Phi-3/Phi-4, GLM-4 / GLM-Edge,
-DeepSeek-R1-Distill and Mamba (GPT-NeoX). All of them are `"model": {"type": "BPE"}`; none uses the Unigram
+The same `Tokenizer` class loads the tokenizers of Llama 3, Mistral, Gemma 2/3, Phi-3 / Phi-4-mini / phi-4,
+GLM-4 / GLM-Edge, DeepSeek-V2 / DeepSeek-R1-Distill and Mamba (GPT-NeoX). All of them are
+`"model": {"type": "BPE"}`; none uses the Unigram
 model, so no Unigram/Viterbi segmentation is implemented (such a file is rejected with "only BPE tokenizers are
 supported"). What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
 
@@ -239,6 +240,8 @@ supported"). What differs is the pipeline around the merge loop, which is read f
 | Qwen2/3, DeepSeek-R1-Distill | NFC | Split(regex, Isolated) + ByteLevel | `ignore_merges` (Qwen3) | ByteLevel |
 | Llama 3, GLM-4, GLM-Edge | none | Split(regex with `\p{N}{1,3}`, Isolated) + ByteLevel | `ignore_merges` | ByteLevel |
 | Phi-4-mini | none | Split(case-aware regex, **Removed + invert**) + ByteLevel | | ByteLevel |
+| phi-4 (14B) | none | Split(Llama-3 regex, Removed + invert) + ByteLevel; all 96 control tokens `lstrip` + `rstrip` | | ByteLevel |
+| DeepSeek-V2 | empty Sequence | Split on `[\r\n]`, a long Latin/CJK-range regex, digits, punctuation (Isolated) + ByteLevel | | ByteLevel |
 | Mamba (GPT-NeoX) | NFC | ByteLevel with `use_regex` (GPT-2 regex) | 13 byte symbols (0xC0, 0xC1, 0xF5..0xFF, never valid UTF-8) absent from the vocabulary; such bytes are dropped | ByteLevel |
 | Mistral v0.3 | none | **Metaspace** (`prepend_scheme: first`, `split: false`) | `byte_fallback`, `fuse_unk` | Replace ▁→space, ByteFallback, Fuse, **Strip(1)** |
 | Gemma 2/3 | **Replace " " → ▁** | Split(" ", MergedWithPrevious), a no-op once spaces are gone | `byte_fallback`, `fuse_unk` | Replace, ByteFallback, Fuse |
@@ -326,6 +329,8 @@ either.
 | `gemma2`, `gemma3` | `<bos><start_of_turn>user\n…<end_of_turn>\n<start_of_turn>model\n…<end_of_turn>\n` … **`<start_of_turn>model\n`**; system text is prefixed to the first user turn; contents trimmed | `<end_of_turn>`, `<eos>` |
 | `phi3` + SentencePiece vocab | `<\|system\|>\n…<\|end\|>\n<\|user\|>\n…<\|end\|>\n` … **`<\|assistant\|>\n`**; `<\|endoftext\|>` instead when not prompting | `<\|end\|>`, `<\|endoftext\|>`, `<\|assistant\|>` |
 | `phi3` + byte-level vocab (Phi-4-mini) | `<\|system\|>…<\|end\|><\|user\|>…<\|end\|>` … **`<\|assistant\|>`** | `<\|end\|>`, `<\|endoftext\|>` |
+| `phi3` + `<\|im_sep\|>` vocab (phi-4 14B) | `<\|im_start\|>user<\|im_sep\|>…<\|im_end\|>` … **`<\|im_start\|>assistant<\|im_sep\|>`**, no newlines | `<\|im_end\|>`, `<\|endoftext\|>` |
+| `deepseek_v2` | `<｜begin▁of▁sentence｜>{system}\n\nUser: …\n\nAssistant: …<｜end▁of▁sentence｜>` … **`Assistant:`** (plain-text roles) | `<｜end▁of▁sentence｜>` |
 | `glm4` | `[gMASK]<sop><\|system\|>\n…<\|user\|>\n…<\|assistant\|>\n…` … **`<\|assistant\|>`** (no newline) | `<\|endoftext\|>`, `<\|user\|>`, `<\|observation\|>` |
 | `glm` (GLM-Edge) | `<\|user\|>\n…<\|assistant\|>\n…` … **`<\|assistant\|>\n`**, no BOS | `<\|endoftext\|>`, `<\|user\|>`, `<\|observation\|>` |
 | `mamba` | no template: message contents joined by `\n` | `<\|endoftext\|>` |
@@ -339,14 +344,29 @@ produces); `ChatTemplate.llama3("26 Jul 2024")` pins it, which the fixture test 
 
 ### Verification
 
-`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each family, `encode` with the ids of the
-Python `tokenizers` package on 145 strings (English, code, numbers, CJK/emoji/RTL, leading/trailing/multiple
-spaces, newlines, special-token look-alikes, the empty string, random mixes), `decode` and token-by-token
-`StreamDecoder` output with the reference decode, `decode` of random id sequences, and `render` / `renderTokens`
-of 3–4 message conversations (with and without system prompt, odd whitespace, Unicode) with the official Jinja
-`chat_template` rendered by `jinja2` and encoded by `tokenizers`. The expected values live in
+`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each of the 14 families, `encode` with the
+ids of the Python `tokenizers` package on 150 strings (English, code, numbers, CJK/emoji/RTL,
+leading/trailing/multiple spaces, newlines, special and non-special added tokens, indented code, the empty
+string, random mixes) — both with special tokens enabled and in the content mode (`encode_special_tokens`) —
+`decode` and token-by-token `StreamDecoder` output with the reference decode, `decode` of random id sequences,
+and `render` / `renderTokens` of conversations (with and without system prompt, odd whitespace, Unicode,
+`<think>` in content, ending with an assistant turn, tool results) with the official Jinja `chat_template`
+rendered by `jinja2` and encoded by `tokenizers`. The expected values live in
 `src/test/resources/tokenizers/*.json`, produced by `src/test/python/gen_tokenizer_fixtures.py`; the tokenizer
-files themselves are downloaded (no weights) into a directory passed as the first argument:
+files themselves (`tokenizer.json`, `tokenizer_config.json`, no weights) are downloaded into
+`<dir>/<family>/` from these Hugging Face repos (the tokenizer is the same for every size of a family; the
+unsloth entries are ungated mirrors of the Google / Mistral files) and the directory is passed as the first
+argument:
+
+| directory | repo | | directory | repo |
+|---|---|---|---|---|
+| `qwen3` | Qwen/Qwen3-0.6B | | `phi4` | microsoft/Phi-4-mini-instruct |
+| `qwen2` | Qwen/Qwen2.5-0.5B-Instruct | | `phi4_14b` | microsoft/phi-4 |
+| `llama3` | meta-llama/Llama-3.2-1B-Instruct | | `glmedge` | THUDM/glm-edge-1.5b-chat |
+| `mistral` | unsloth/Mistral-7B-Instruct-v0.3 | | `glm4` | THUDM/GLM-4-9B-0414 |
+| `gemma3` | google/gemma-3-1b-it | | `dsr1` | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B |
+| `gemma2` | unsloth/gemma-2-2b-it | | `dsv2` | deepseek-ai/DeepSeek-V2-Lite |
+| `phi3` | microsoft/Phi-3-mini-4k-instruct | | `mamba` | state-spaces/mamba-130m-hf |
 
 ```
 python3 -m venv /tmp/tokv && /tmp/tokv/bin/pip install tokenizers jinja2

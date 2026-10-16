@@ -57,6 +57,15 @@ public final class Tokenizer {
     private static final String DEFAULT_SPLIT =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
+    /*
+     * Piece cache policy. The result of the merge loop is memoized per pre-tokenizer piece (" the", ",", "\n"
+     * recur constantly; a chat prompt is mostly hits). The cache is a ConcurrentHashMap shared by all threads,
+     * fills on first use and is never evicted or cleared: once CACHE_LIMIT entries are present new pieces are
+     * computed but not stored. Only pieces of at most CACHE_MAX_PIECE_BYTES UTF-8 bytes (and chars) are stored,
+     * so a request made of unusual long runs cannot fill the heap: the worst case is about 100 000 entries of a
+     * <=64-byte key plus a <=64-entry int[], i.e. tens of MB, and the hit rate of longer pieces would be poor
+     * anyway. Entries are immutable arrays that callers copy out of (IntList.addAll), never handed out.
+     */
     private static final int CACHE_LIMIT = 100_000;
     /** Chunks longer than this (in UTF-8 bytes) are never cached, bounding the cache's memory as well as its count. */
     private static final int CACHE_MAX_PIECE_BYTES = 64;
@@ -246,7 +255,12 @@ public final class Tokenizer {
             byteTokenIds[b] = id == null ? -1 : id;
         }
 
+        // the model's unk_token (Mistral, Gemma, Phi-3) or, when the model names none, the one of
+        // tokenizer_config.json (Mamba / GPT-NeoX: <|endoftext|>)
         String unkToken = Json.str(model, "unk_token", null);
+        if (unkToken == null && config != null) {
+            unkToken = specialName(config.get("unk_token"));
+        }
         Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
         unkId = unk == null ? -1 : unk;
 

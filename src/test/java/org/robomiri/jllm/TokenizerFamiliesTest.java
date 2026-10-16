@@ -30,7 +30,8 @@ public final class TokenizerFamiliesTest {
     private static final String[][] FAMILIES = {
             {"qwen3", "qwen3"}, {"qwen2", "qwen2"}, {"llama3", "llama"}, {"mistral", "mistral"},
             {"gemma3", "gemma3_text"}, {"gemma2", "gemma2"}, {"phi3", "phi3"}, {"phi4", "phi3"},
-            {"glmedge", "glm"}, {"glm4", "glm4"}, {"dsr1", "qwen2"}, {"mamba", "mamba"}};
+            {"glmedge", "glm"}, {"glm4", "glm4"}, {"dsr1", "qwen2"}, {"mamba", "mamba"}, {"dsv2", "deepseek_v2"},
+            {"phi4_14b", "phi3"}};
 
     private static final Map<String, Tokenizer> LOADED = new java.util.HashMap<>();
     private static final Map<String, String> MODEL_TYPE = new java.util.HashMap<>();
@@ -207,6 +208,8 @@ public final class TokenizerFamiliesTest {
         expectStops("glm4", 151329, 151336, 151338);
         expectStops("dsr1", 151643);
         expectStops("mamba", 0);
+        expectStops("dsv2", 100001);
+        expectStops("phi4_14b", 100265, 100257);
 
         // BOS / EOS information, never added inside encode()
         expectBos("llama3", 128000, true);
@@ -217,6 +220,19 @@ public final class TokenizerFamiliesTest {
         expectBos("phi3", 1, false);
         expectBos("phi4", 199999, false);
         expectBos("mamba", 0, false);
+        expectBos("dsv2", 100000, true);
+        expectBos("phi4_14b", 100257, false);
+        // unk: Mamba's model has none, its tokenizer_config names <|endoftext|>; Mistral's model names <unk>
+        if (LOADED.containsKey("mamba")) {
+            check(LOADED.get("mamba").unkId() == 0, "mamba unkId from tokenizer_config (" + LOADED.get("mamba").unkId() + ")");
+        }
+        if (LOADED.containsKey("mistral")) {
+            check(LOADED.get("mistral").unkId() == 0, "mistral unkId from the model (" + LOADED.get("mistral").unkId() + ")");
+        }
+        if (LOADED.containsKey("phi4_14b")) {
+            check(ChatTemplate.forModelType("phi3", LOADED.get("phi4_14b")).name().equals("phi4-chatml"),
+                    "phi3 model_type + <|im_sep|> tokenizer selects the phi-4 (14B) ChatML format");
+        }
         expectBos("qwen3", -1, false);
         Tokenizer llama = LOADED.get("llama3");
         if (llama != null) {
@@ -334,9 +350,9 @@ public final class TokenizerFamiliesTest {
         expectThrows(() -> ChatTemplate.forModelType("mistral").render(List.of(new ChatTemplate.Message("user", "a"),
                 new ChatTemplate.Message("system", "late")), true, true), "Only user and assistant",
                 "mistral rejects a system message that is not first");
-        check(ChatTemplate.render(sysUser, true, false).equals("<|im_start|>system\nBe brief.<|im_end|>\n"
+        check(ChatTemplate.forModelType("qwen3").render(sysUser, true, false).equals("<|im_start|>system\nBe brief.<|im_end|>\n"
                         + "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
-                "static ChatTemplate.render is still Qwen3 ChatML");
+                "qwen3 with thinking disabled pre-fills an empty think block");
 
         // the Qwen regex is the fallback for a byte-level tokenizer WITHOUT any pre-tokenizer; a chain that merely
         // lacks a regex Split (a literal Split, Digits) must be used as written

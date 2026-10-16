@@ -200,7 +200,7 @@ public final class SmokeTest {
             check(back.equals(s), "roundtrip: " + s + " -> " + back);
         }
         check(t.tokenId("<|im_end|>") == 151645 && t.isSpecial(151645), "special tokens");
-        String p = ChatTemplate.render(List.of(new ChatTemplate.Message("user", "hi")), true, false);
+        String p = ChatTemplate.forModelType("qwen3").render(List.of(new ChatTemplate.Message("user", "hi")), true, false);
         check(p.equals("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"), "template");
     }
 
