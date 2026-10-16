@@ -87,7 +87,7 @@ public final class HuggingFaceHub {
     }
 
     /** {@code localhost} or a loopback IP literal: a local mirror, where the token may travel over plain http. */
-    static boolean isLoopback(String host) {
+    public static boolean isLoopback(String host) {
         if (host == null) {
             return false;
         }
