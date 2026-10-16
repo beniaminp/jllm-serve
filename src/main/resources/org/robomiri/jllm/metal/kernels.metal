@@ -244,7 +244,9 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
 // q, k and v projections of the same input in one dispatch: rows [0, rows0) come from W0 into out0,
 // [rows0, rows0 + rows1) from W1 into out1, the rest from W2 into out2. All three share cols and QT. With
 // hasBias the per-row bias is added in the epilogue (out = v + b, the same float as a separate v += b pass).
-template <int QT, bool NORM>
+// out2 has the KV cache's element type VT: with VT = half the value rows are rounded once, here, as they are
+// written into the f16 cache (the k rows are rounded by norm_rope<half> after the rotation instead).
+template <int QT, bool NORM, typename VT>
 kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
                     device const float *ws0 [[buffer(1)]],
                     device const uchar *wq1 [[buffer(2)]],
@@ -254,7 +256,7 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
                     device const float *x [[buffer(6)]],
                     device float *out0 [[buffer(7)]],
                     device float *out1 [[buffer(8)]],
-                    device float *out2 [[buffer(9)]],
+                    device VT *out2 [[buffer(9)]],
                     device const float *nw [[buffer(10)]],
                     device const float *b0 [[buffer(11)]],
                     device const float *b1 [[buffer(12)]],
@@ -279,12 +281,13 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
     device const float *bias;
     int rows;
     int r;
+    const bool isV = row >= p.rows0 + p.rows1;
     if (row < p.rows0) {
         wq = wq0; ws = ws0; out = out0; bias = b0; rows = p.rows0; r = row;
-    } else if (row < p.rows0 + p.rows1) {
+    } else if (!isV) {
         wq = wq1; ws = ws1; out = out1; bias = b1; rows = p.rows1; r = row - p.rows0;
     } else {
-        wq = wq2; ws = ws2; out = out2; bias = b2; rows = p.rows2; r = row - p.rows0 - p.rows1;
+        wq = wq2; ws = ws2; out = out0; bias = b2; rows = p.rows2; r = row - p.rows0 - p.rows1; // out: see below
     }
     float acc[TOK_TILE];
     for (int t = 0; t < TOK_TILE; t++) acc[t] = 0.0f;
@@ -297,7 +300,11 @@ kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
     for (int t = 0; t < TOK_TILE; t++) {
         if (t < nt) {
             float v = simd_sum(acc[t]);
-            if (lane == 0) out[(ulong)(t0 + t) * rows + r] = p.hasBias ? v + b : v;
+            if (lane == 0) {
+                const float o = p.hasBias ? v + b : v;
+                const ulong idx = (ulong)(t0 + t) * rows + r;
+                if (isV) out2[idx] = VT(o); else out[idx] = o;
+            }
         }
     }
 }
@@ -351,11 +358,16 @@ template [[host_name("matmul_q4")]] kernel matmul_t matmul<4, false>;
 template [[host_name("matmul_q8")]] kernel matmul_t matmul<8, false>;
 template [[host_name("matmul_q4_norm")]] kernel matmul_t matmul<4, true>;
 template [[host_name("matmul_q8_norm")]] kernel matmul_t matmul<8, true>;
-typedef decltype(matmul3<4, false>) matmul3_t;
-template [[host_name("matmul3_q4")]] kernel matmul3_t matmul3<4, false>;
-template [[host_name("matmul3_q8")]] kernel matmul3_t matmul3<8, false>;
-template [[host_name("matmul3_q4_norm")]] kernel matmul3_t matmul3<4, true>;
-template [[host_name("matmul3_q8_norm")]] kernel matmul3_t matmul3<8, true>;
+typedef decltype(matmul3<4, false, float>) matmul3_t;
+typedef decltype(matmul3<4, false, half>) matmul3_h_t;   // *_h: v rows written as half (f16 KV cache)
+template [[host_name("matmul3_q4")]] kernel matmul3_t matmul3<4, false, float>;
+template [[host_name("matmul3_q8")]] kernel matmul3_t matmul3<8, false, float>;
+template [[host_name("matmul3_q4_norm")]] kernel matmul3_t matmul3<4, true, float>;
+template [[host_name("matmul3_q8_norm")]] kernel matmul3_t matmul3<8, true, float>;
+template [[host_name("matmul3_q4_h")]] kernel matmul3_h_t matmul3<4, false, half>;
+template [[host_name("matmul3_q8_h")]] kernel matmul3_h_t matmul3<8, false, half>;
+template [[host_name("matmul3_q4_norm_h")]] kernel matmul3_h_t matmul3<4, true, half>;
+template [[host_name("matmul3_q8_norm_h")]] kernel matmul3_h_t matmul3<8, true, half>;
 typedef decltype(matmul_swiglu<4, false>) matmul_swiglu_t;
 template [[host_name("matmul_swiglu_q4")]] kernel matmul_swiglu_t matmul_swiglu<4, false>;
 template [[host_name("matmul_swiglu_q8")]] kernel matmul_swiglu_t matmul_swiglu<8, false>;
@@ -486,7 +498,7 @@ kernel void matmul_pf(device const uchar *wq [[buffer(0)]],
     }
 }
 
-template <int QT, int NR, int TT>
+template <int QT, int NR, int TT, typename VT>
 kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
                        device const float *ws0 [[buffer(1)]],
                        device const uchar *wq1 [[buffer(2)]],
@@ -496,7 +508,7 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
                        device const float *x [[buffer(6)]],
                        device float *out0 [[buffer(7)]],
                        device float *out1 [[buffer(8)]],
-                       device float *out2 [[buffer(9)]],
+                       device VT *out2 [[buffer(9)]],
                        device const float *nw [[buffer(10)]],
                        device const float *b0 [[buffer(11)]],
                        device const float *b1 [[buffer(12)]],
@@ -516,20 +528,22 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
     device const uchar *wqs[NR];
     device const float *wss[NR];
     device float *outs[NR];
+    bool isV[NR];
     float bias[NR];
     int rows[NR];
     ulong grow[NR];
     for (int r = 0; r < NR; r++) {
         const int row = row0 + min(r, nr - 1);
+        isV[r] = row >= p.rows0 + p.rows1;
         if (row < p.rows0) {
             wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; rows[r] = p.rows0; grow[r] = (ulong)row;
             bias[r] = p.hasBias ? b0[grow[r]] : 0.0f;
-        } else if (row < p.rows0 + p.rows1) {
+        } else if (!isV[r]) {
             wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; rows[r] = p.rows1; grow[r] = (ulong)(row - p.rows0);
             bias[r] = p.hasBias ? b1[grow[r]] : 0.0f;
         } else {
-            wqs[r] = wq2; wss[r] = ws2; outs[r] = out2; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
-            bias[r] = p.hasBias ? b2[grow[r]] : 0.0f;
+            wqs[r] = wq2; wss[r] = ws2; outs[r] = out0; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
+            bias[r] = p.hasBias ? b2[grow[r]] : 0.0f; // written to out2 below
         }
     }
     float acc[NR][TT];
@@ -541,7 +555,11 @@ kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
             for (int t = 0; t < TT; t++) {
                 if (t < nt) {
                     float v = simd_sum(acc[r][t]);
-                    if (lane == 0) outs[r][(ulong)(t0 + t) * rows[r] + grow[r]] = p.hasBias ? v + bias[r] : v;
+                    if (lane == 0) {
+                        const float o = p.hasBias ? v + bias[r] : v;
+                        const ulong idx = (ulong)(t0 + t) * rows[r] + grow[r];
+                        if (isV[r]) out2[idx] = VT(o); else outs[r][idx] = o;
+                    }
                 }
             }
         }
@@ -597,9 +615,12 @@ kernel void matmul_swiglu_pf(device const uchar *wq [[buffer(0)]],
 typedef decltype(matmul_pf<4, PF_ROWS, PF_TOKS>) matmul_pf_t;
 template [[host_name("matmul_pf_q4")]] kernel matmul_pf_t matmul_pf<4, PF_ROWS, PF_TOKS>;
 template [[host_name("matmul_pf_q8")]] kernel matmul_pf_t matmul_pf<8, PF_ROWS, PF_TOKS>;
-typedef decltype(matmul3_pf<4, PF_ROWS, PF_TOKS>) matmul3_pf_t;
-template [[host_name("matmul3_pf_q4")]] kernel matmul3_pf_t matmul3_pf<4, PF_ROWS, PF_TOKS>;
-template [[host_name("matmul3_pf_q8")]] kernel matmul3_pf_t matmul3_pf<8, PF_ROWS, PF_TOKS>;
+typedef decltype(matmul3_pf<4, PF_ROWS, PF_TOKS, float>) matmul3_pf_t;
+typedef decltype(matmul3_pf<4, PF_ROWS, PF_TOKS, half>) matmul3_pf_h_t;
+template [[host_name("matmul3_pf_q4")]] kernel matmul3_pf_t matmul3_pf<4, PF_ROWS, PF_TOKS, float>;
+template [[host_name("matmul3_pf_q8")]] kernel matmul3_pf_t matmul3_pf<8, PF_ROWS, PF_TOKS, float>;
+template [[host_name("matmul3_pf_q4_h")]] kernel matmul3_pf_h_t matmul3_pf<4, PF_ROWS, PF_TOKS, half>;
+template [[host_name("matmul3_pf_q8_h")]] kernel matmul3_pf_h_t matmul3_pf<8, PF_ROWS, PF_TOKS, half>;
 typedef decltype(matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>) matmul_swiglu_pf_t;
 template [[host_name("matmul_swiglu_pf_q4")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>;
 template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<8, PF_UNITS, PF_TOKS>;
@@ -651,13 +672,19 @@ struct RopeParams {
     int useNorm;
 };
 
+// The k rows are read from `k` (f32: the cache rows themselves, or the f32 staging rows of an f16 cache) and
+// written to `kOut` with the cache element type KV at the same row/head offsets: with KV = half this is where
+// the f16 cache rounds k, once, after the norm and the rotation (round-to-nearest-even, Java's
+// Float.floatToFloat16); with KV = float the host binds kOut = k and the update is in place.
+template <typename KV>
 kernel void norm_rope(device float *q [[buffer(0)]],
-                      device float *k [[buffer(1)]],
+                      device const float *k [[buffer(1)]],
                       device const float *qw [[buffer(2)]],
                       device const float *kw [[buffer(3)]],
                       device const float *cosT [[buffer(4)]],
                       device const float *sinT [[buffer(5)]],
-                      constant RopeParams &p [[buffer(6)]],
+                      device KV *kOut [[buffer(6)]],
+                      constant RopeParams &p [[buffer(7)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
                       ushort2 tid2 [[thread_position_in_threadgroup]],
                       ushort sg [[simdgroup_index_in_threadgroup]],
@@ -668,8 +695,9 @@ kernel void norm_rope(device float *q [[buffer(0)]],
     const int half_dim = p.headDim / 2;
     const bool isQ = int(tgp.x) < p.nHeads;
     const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
-    device float *h = isQ ? q + (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
-                          : k + (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    const ulong off = isQ ? (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
+                          : (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    device const float *h = (isQ ? q : k) + off;
     device const float *w = isQ ? qw : kw;
     float a = h[tid];
     float b = h[tid + half_dim];
@@ -682,9 +710,19 @@ kernel void norm_rope(device float *q [[buffer(0)]],
     const int pos = p.pos0 + int(tgp.y);
     const float c = cosT[pos * half_dim + tid];
     const float s = sinT[pos * half_dim + tid];
-    h[tid] = a * c - b * s;
-    h[tid + half_dim] = b * c + a * s;
+    const float ra = a * c - b * s;
+    const float rb = b * c + a * s;
+    if (isQ) {
+        q[off + tid] = ra;
+        q[off + tid + half_dim] = rb;
+    } else {
+        kOut[off + tid] = KV(ra);
+        kOut[off + tid + half_dim] = KV(rb);
+    }
 }
+
+template [[host_name("norm_rope")]] kernel decltype(norm_rope<float>) norm_rope<float>;
+template [[host_name("norm_rope_h")]] kernel decltype(norm_rope<half>) norm_rope<half>;
 
 // ---------------------------------------------------------------------------------------------- attention
 // Causal GQA attention for token t = tokenOffset + tgp.y at position pos0 + t. Grid: (nHeads, tile),
@@ -1212,29 +1250,11 @@ template [[host_name("moe_down_q4")]] kernel moe_down_t moe_down<4>;
 template [[host_name("moe_down_q8")]] kernel moe_down_t moe_down<8>;
 
 // ---------------------------------------------------------------------------------------------- f16 KV cache
-// Optional half-precision cache (backend.kv-dtype=f16). K and V are projected, normalized and rotated in f32
-// staging buffers by the kernels above; kv_store_half then rounds them once (round-to-nearest-even, the same
-// rounding as Java's Float.floatToFloat16) into the half caches, and attention_h is the attention kernel
-// reading half K/V with the same f32 arithmetic as `attention`. The f32 kernels above are not involved.
-
-struct KvStoreParams {
-    int ntok;
-    int pos0;
-    int kvDim;
-};
-
-// kc/vc[pos0 + t, :] = half(k/v[t, :]) for t < ntok. One thread per element; grid: ceil(ntok * kvDim / 256).
-kernel void kv_store_half(device const float *k [[buffer(0)]],
-                          device const float *v [[buffer(1)]],
-                          device half *kc [[buffer(2)]],
-                          device half *vc [[buffer(3)]],
-                          constant KvStoreParams &p [[buffer(4)]],
-                          uint gid [[thread_position_in_grid]]) {
-    if (int(gid) >= p.ntok * p.kvDim) return;
-    const ulong o = (ulong)p.pos0 * p.kvDim + gid;
-    kc[o] = half(k[gid]);
-    vc[o] = half(v[gid]);
-}
+// Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
+// (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
+// row, normalised and rotated there, and rounded once by norm_rope<half> when it writes the cache row
+// (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). attention_h is the attention
+// kernel reading half K/V with the same f32 arithmetic as `attention`.
 
 // Same algorithm and parameters as `attention`, templated on the cache element type.
 template <typename KV>
@@ -1329,18 +1349,23 @@ struct RopeIlParams {
     int rotateHalf; // 1: pair (i, i + rotHalf) inside the rotated prefix (Phi-4-mini); 0: adjacent pairs (GLM)
 };
 
+// k is read from `k` and written to `kOut` (cache element type KV) like norm_rope; the dims beyond the rotated
+// prefix are copied over unchanged so a half cache receives the whole row.
+template <typename KV>
 kernel void norm_rope_il(device float *q [[buffer(0)]],
-                         device float *k [[buffer(1)]],
+                         device const float *k [[buffer(1)]],
                          device const float *cosT [[buffer(2)]],
                          device const float *sinT [[buffer(3)]],
-                         constant RopeIlParams &p [[buffer(4)]],
+                         device KV *kOut [[buffer(4)]],
+                         constant RopeIlParams &p [[buffer(5)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort2 tid2 [[thread_position_in_threadgroup]]) {
     const int tid = tid2.x;
     const bool isQ = int(tgp.x) < p.nHeads;
     const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
-    device float *h = isQ ? q + (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
-                          : k + (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    const ulong off = isQ ? (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
+                          : (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    device const float *h = (isQ ? q : k) + off;
     const int pos = p.pos0 + int(tgp.y);
     const int i0 = p.rotateHalf ? tid : 2 * tid;
     const int i1 = p.rotateHalf ? tid + p.rotHalf : 2 * tid + 1;
@@ -1348,9 +1373,20 @@ kernel void norm_rope_il(device float *q [[buffer(0)]],
     const float b = h[i1];
     const float c = cosT[pos * p.rotHalf + tid];
     const float s = sinT[pos * p.rotHalf + tid];
-    h[i0] = a * c - b * s;
-    h[i1] = b * c + a * s;
+    const float ra = a * c - b * s;
+    const float rb = b * c + a * s;
+    if (isQ) {
+        q[off + i0] = ra;
+        q[off + i1] = rb;
+    } else {
+        kOut[off + i0] = KV(ra);
+        kOut[off + i1] = KV(rb);
+        for (int i = 2 * p.rotHalf + tid; i < p.headDim; i += p.rotHalf) kOut[off + i] = KV(h[i]);
+    }
 }
+
+template [[host_name("norm_rope_il")]] kernel decltype(norm_rope_il<float>) norm_rope_il<float>;
+template [[host_name("norm_rope_il_h")]] kernel decltype(norm_rope_il<half>) norm_rope_il<half>;
 
 // rmsnorm_add: out[row] += rmsnorm(y[row]) * w, for Glm4's post-attention / post-MLP norms applied to the
 // sub-layer output before the residual add. One threadgroup per row of length n.
@@ -1850,10 +1886,13 @@ static inline void mm_tile_q2k(thread device const uchar *const *wq, thread cons
 template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
 template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;
 template [[host_name("matmul_pf_q2k")]] kernel matmul_pf_t matmul_pf<2, PF_ROWS, PF_TOKS>;
-template [[host_name("matmul3_pf_q2k")]] kernel matmul3_pf_t matmul3_pf<2, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul3_pf_q2k")]] kernel matmul3_pf_t matmul3_pf<2, PF_ROWS, PF_TOKS, float>;
+template [[host_name("matmul3_pf_q2k_h")]] kernel matmul3_pf_h_t matmul3_pf<2, PF_ROWS, PF_TOKS, half>;
 template [[host_name("matmul_swiglu_pf_q2k")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<2, PF_UNITS, PF_TOKS>;
-template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false>;
-template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true>;
+template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false, float>;
+template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true, float>;
+template [[host_name("matmul3_q2k_h")]] kernel matmul3_h_t matmul3<2, false, half>;
+template [[host_name("matmul3_q2k_norm_h")]] kernel matmul3_h_t matmul3<2, true, half>;
 template [[host_name("matmul_swiglu_q2k")]] kernel matmul_swiglu_t matmul_swiglu<2, false>;
 template [[host_name("matmul_swiglu_q2k_norm")]] kernel matmul_swiglu_t matmul_swiglu<2, true>;
 template [[host_name("moe_up_q2k")]] kernel moe_up_t moe_up<2>;

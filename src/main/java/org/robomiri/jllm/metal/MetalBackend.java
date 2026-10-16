@@ -104,8 +104,9 @@ public final class MetalBackend implements Backend {
     private int pSwigluPfQ4;
     private int pSwigluPfQ8;
     private int pSwigluPfQ2K;
-    // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
-    // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
+    // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
+    // through an f32 staging row and norm_rope_h rounds it into the cache after the rotation, attention_h
+    // reads half; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
     /**
      * Whether the *_norm matmul variants may be used: they keep the normalised input row (dim floats) in dynamic
@@ -113,9 +114,7 @@ public final class MetalBackend implements Backend {
      * limit (32 KB: dim <= 8176). Otherwise a decode step runs rmsnorm + plain matmul like a prefill chunk.
      */
     private boolean fusedNormFits;
-    private int pKvStoreHalf;
     private Metal.Buffer kStage;
-    private Metal.Buffer vStage;
 
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
@@ -216,17 +215,18 @@ public final class MetalBackend implements Backend {
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pMatmulQ4Norm = metal.pipeline("matmul_q4_norm");
         pMatmulQ8Norm = metal.pipeline("matmul_q8_norm");
-        pMatmul3Q4 = metal.pipeline("matmul3_q4");
-        pMatmul3Q8 = metal.pipeline("matmul3_q8");
-        pMatmul3Q4Norm = metal.pipeline("matmul3_q4_norm");
-        pMatmul3Q8Norm = metal.pipeline("matmul3_q8_norm");
+        String vh = kvHalf ? "_h" : ""; // matmul3 variants writing v as half, rope variants writing k as half
+        pMatmul3Q4 = metal.pipeline("matmul3_q4" + vh);
+        pMatmul3Q8 = metal.pipeline("matmul3_q8" + vh);
+        pMatmul3Q4Norm = metal.pipeline("matmul3_q4_norm" + vh);
+        pMatmul3Q8Norm = metal.pipeline("matmul3_q8_norm" + vh);
         pSwigluQ4 = metal.pipeline("matmul_swiglu_q4");
         pSwigluQ8 = metal.pipeline("matmul_swiglu_q8");
         pSwigluQ4Norm = metal.pipeline("matmul_swiglu_q4_norm");
         pSwigluQ8Norm = metal.pipeline("matmul_swiglu_q8_norm");
         pRmsnorm = metal.pipeline("rmsnorm");
-        pNormRope = metal.pipeline("norm_rope");
-        pNormRopeIl = c.ropeInterleaved() || c.ropePartialHalf() ? metal.pipeline("norm_rope_il") : -1;
+        pNormRope = metal.pipeline("norm_rope" + vh);
+        pNormRopeIl = c.ropeInterleaved() || c.ropePartialHalf() ? metal.pipeline("norm_rope_il" + vh) : -1;
         pRmsnormAdd = c.postNorms() ? metal.pipeline("rmsnorm_add") : -1;
         // Attention specialised on headDim; attnGroup query heads of one KV head per threadgroup. Sharing K/V
         // rows across the group (attnGroup > 1) measured no faster on Qwen3-0.6B (G=2) and slower on
@@ -259,8 +259,8 @@ public final class MetalBackend implements Backend {
         pMoeDownQ8 = metal.pipeline("moe_down_q8");
         pMatmulQ2K = metal.pipeline("matmul_q2k");
         pMatmulQ2KNorm = metal.pipeline("matmul_q2k_norm");
-        pMatmul3Q2K = metal.pipeline("matmul3_q2k");
-        pMatmul3Q2KNorm = metal.pipeline("matmul3_q2k_norm");
+        pMatmul3Q2K = metal.pipeline("matmul3_q2k" + vh);
+        pMatmul3Q2KNorm = metal.pipeline("matmul3_q2k_norm" + vh);
         pSwigluQ2K = metal.pipeline("matmul_swiglu_q2k");
         pSwigluQ2KNorm = metal.pipeline("matmul_swiglu_q2k_norm");
         pMoeUpQ2K = metal.pipeline("moe_up_q2k");
@@ -268,13 +268,12 @@ public final class MetalBackend implements Backend {
         pMatmulPfQ4 = metal.pipeline("matmul_pf_q4");
         pMatmulPfQ8 = metal.pipeline("matmul_pf_q8");
         pMatmulPfQ2K = metal.pipeline("matmul_pf_q2k");
-        pMatmul3PfQ4 = metal.pipeline("matmul3_pf_q4");
-        pMatmul3PfQ8 = metal.pipeline("matmul3_pf_q8");
-        pMatmul3PfQ2K = metal.pipeline("matmul3_pf_q2k");
+        pMatmul3PfQ4 = metal.pipeline("matmul3_pf_q4" + vh);
+        pMatmul3PfQ8 = metal.pipeline("matmul3_pf_q8" + vh);
+        pMatmul3PfQ2K = metal.pipeline("matmul3_pf_q2k" + vh);
         pSwigluPfQ4 = metal.pipeline("matmul_swiglu_pf_q4");
         pSwigluPfQ8 = metal.pipeline("matmul_swiglu_pf_q8");
         pSwigluPfQ2K = metal.pipeline("matmul_swiglu_pf_q2k");
-        pKvStoreHalf = metal.pipeline("kv_store_half");
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
         }
@@ -341,8 +340,7 @@ public final class MetalBackend implements Backend {
             keyCache[l] = metal.newBuffer(kvBytes, false);
             valCache[l] = metal.newBuffer(kvBytes, false);
         }
-        kStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4, false) : null;
-        vStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4, false) : null;
+        kStage = kvHalf ? metal.newBuffer((long) maxBatch * c.kvDim() * 4, false) : null; // f32 k rows before RoPE
         x = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
         xb = metal.newBuffer((long) maxBatch * c.dim() * 4, false);
         q = metal.newBuffer((long) maxBatch * c.qDim() * 4, false);
@@ -431,20 +429,18 @@ public final class MetalBackend implements Backend {
                     rmsnorm(x, L.attnNorm, xb, n, dim);
                     mla.run(l, W, n, pos);
                 } else {
-                    // f32: k/v are written straight into the cache rows; f16: into staging, rounded by kvStore below
+                    // v is written straight into the cache rows at pos (as half for the f16 cache); k too for
+                    // the f32 cache, while the f16 cache stages the f32 k rows and norm_rope rounds them in
+                    long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
                     Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
-                    Metal.Buffer vDst = kvHalf ? vStage : valCache[l];
-                    long kvOff = kvHalf ? 0 : (long) pos * kvDim * 4;
+                    long kOff = kvHalf ? 0 : cacheOff;
                     if (fuseNorm) {
-                        qkv(W, L, x, L.attnNorm, kDst, vDst, kvOff, n);
+                        qkv(W, L, x, L.attnNorm, kDst, kOff, valCache[l], cacheOff, n);
                     } else {
                         rmsnorm(x, L.attnNorm, xb, n, dim);
-                        qkv(W, L, xb, null, kDst, vDst, kvOff, n);
+                        qkv(W, L, xb, null, kDst, kOff, valCache[l], cacheOff, n);
                     }
-                    normRope(L, kDst, kvOff, n, pos, c.usesLocalRope(l));
-                    if (kvHalf) {
-                        kvStore(l, n, pos);
-                    }
+                    normRope(L, kDst, kOff, keyCache[l], cacheOff, n, pos, c.usesLocalRope(l));
                     attention(l, n, pos);
                 }
                 if (L.postAttnNorm != null) {
@@ -592,7 +588,7 @@ public final class MetalBackend implements Backend {
      * q/k/v biases added in the kernel's epilogue when the layer has them.
      */
     private void qkv(ModelWeights.Layer W, LayerBufs L, Metal.Buffer in, Metal.Buffer norm,
-                     Metal.Buffer kDst, Metal.Buffer vDst, long kvOff, int n) {
+                     Metal.Buffer kDst, long kOff, Metal.Buffer vDst, long vOff, int n) {
         if (W.wq.type != W.wk.type || W.wk.type != W.wv.type || W.wq.cols != W.wk.cols || W.wk.cols != W.wv.cols) {
             throw new IllegalStateException("q/k/v projections differ in type or width"); // the loader guarantees they match
         }
@@ -605,8 +601,8 @@ public final class MetalBackend implements Backend {
         bind(5, L.wv, scaleOff(W.wv));
         bind(6, in, 0);
         bind(7, q, 0);
-        bind(8, kDst, kvOff);
-        bind(9, vDst, kvOff);
+        bind(8, kDst, kOff);
+        bind(9, vDst, vOff);
         bind(10, norm != null ? norm : finalNorm, 0);
         bind(11, bias ? L.bq : finalNorm, 0); // dummy bindings without bias
         bind(12, bias ? L.bk : finalNorm, 0);
@@ -687,11 +683,12 @@ public final class MetalBackend implements Backend {
     }
 
     /** GLM interleaved pairs, or rotate-half pairs for partial rotary (Phi-4-mini): the first rotaryDim dims of every q and k head (no qk-norm). */
-    private void normRopeInterleaved(Metal.Buffer kDst, long kvOff, int n, int pos) {
+    private void normRopeInterleaved(Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff, int n, int pos) {
         bind(0, q, 0);
-        bind(1, kDst, kvOff);
+        bind(1, kSrc, kSrcOff);
         bind(2, ropeCos, 0);
         bind(3, ropeSin, 0);
+        bind(4, kOut, kOutOff);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
@@ -699,26 +696,32 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_INT, 5, c.rotaryDim() / 2);
         params.setAtIndex(ValueLayout.JAVA_INT, 6, c.ropeInterleaved() ? 0 : 1);
-        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 4, params, 28, c.heads() + c.kvHeads(), n, 1,
+        metal.dispatch(pNormRopeIl, bufArgs, offArgs, 5, params, 28, c.heads() + c.kvHeads(), n, 1,
                 c.rotaryDim() / 2, 1, 1);
     }
 
-    /** QK-norm + RoPE for the q rows and the k rows just written at position pos, in one dispatch. */
-    private void normRope(LayerBufs L, Metal.Buffer kDst, long kvOff, int n, int pos, boolean localRope) {
+    /**
+     * QK-norm + RoPE for the q rows and the k rows of this chunk, in one dispatch: k is read from
+     * {@code kSrc} (the f32 cache rows at pos, or the f32 staging rows of an f16 cache) and written to the cache
+     * rows {@code kOut} at pos (the same rows for f32, rounded to half for f16).
+     */
+    private void normRope(LayerBufs L, Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff, int n, int pos,
+                          boolean localRope) {
         if (c.ropeInterleaved() || c.ropePartialHalf()) {
             if (L.qNorm != null) {
                 throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
             }
-            normRopeInterleaved(kDst, kvOff, n, pos);
+            normRopeInterleaved(kSrc, kSrcOff, kOut, kOutOff, n, pos);
             return;
         }
         boolean useNorm = L.qNorm != null && L.kNorm != null;
         bind(0, q, 0);
-        bind(1, kDst, kvOff);
+        bind(1, kSrc, kSrcOff);
         bind(2, useNorm ? L.qNorm : finalNorm, 0); // dummy bindings when unused
         bind(3, useNorm ? L.kNorm : finalNorm, 0);
         bind(4, localRope ? ropeCosLocal : ropeCos, 0);
         bind(5, localRope ? ropeSinLocal : ropeSin, 0);
+        bind(6, kOut, kOutOff);
         params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
@@ -726,7 +729,7 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_INT, 6, useNorm ? 1 : 0);
-        metal.dispatch(pNormRope, bufArgs, offArgs, 6, params, 28, c.heads() + c.kvHeads(), n, 1,
+        metal.dispatch(pNormRope, bufArgs, offArgs, 7, params, 28, c.heads() + c.kvHeads(), n, 1,
                 c.headDim() / 2, 1, 1);
     }
 
@@ -790,19 +793,6 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 1, c.headDim());
         params.setAtIndex(ValueLayout.JAVA_INT, 2, nSplit);
         metal.dispatch(pAttnCombine, bufArgs, offArgs, 2, params, 12, c.heads(), 1, 1, 256, 1, 1);
-    }
-
-    /** f16 cache: rounds the n staged k/v rows into rows [pos, pos+n) of layer l's half caches. */
-    private void kvStore(int l, int n, int pos) {
-        int total = n * c.kvDim();
-        bind(0, kStage, 0);
-        bind(1, vStage, 0);
-        bind(2, keyCache[l], 0);
-        bind(3, valCache[l], 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, n);
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, pos);
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
-        metal.dispatch(pKvStoreHalf, bufArgs, offArgs, 4, params, 12, (total + 255) / 256, 1, 1, 256, 1, 1);
     }
 
     /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */
