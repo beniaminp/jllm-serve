@@ -99,19 +99,22 @@ final class MlaMetal {
             }
             bufs[l] = b;
         }
+        // Not zeroed, like the dense caches (see MetalBackend.init): mla_kv_store writes every key and value
+        // element of rows [pos, pos + n) before attention reads rows [0, pos + n), and the projection scratch
+        // below is written for all n tokens of the chunk before it is read.
         int heads = c.heads();
         key = new Metal.Buffer[c.layers()];
         val = new Metal.Buffer[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
-            key[l] = metal.newBuffer((long) ctx * heads * d.qkDim() * 4);
-            val[l] = metal.newBuffer((long) ctx * heads * d.vHeadDim() * 4);
+            key[l] = metal.newBuffer((long) ctx * heads * d.qkDim() * 4, false);
+            val[l] = metal.newBuffer((long) ctx * heads * d.vHeadDim() * 4, false);
         }
-        qa = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4);
-        qaNorm = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4);
-        lat = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4);
-        latNorm = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4);
-        kpe = metal.newBuffer((long) maxBatch * d.qkRopeDim() * 4);
-        kvb = metal.newBuffer((long) maxBatch * heads * (d.qkNopeDim() + d.vHeadDim()) * 4);
+        qa = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4, false);
+        qaNorm = metal.newBuffer((long) maxBatch * Math.max(d.qLoraRank(), 1) * 4, false);
+        lat = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4, false);
+        latNorm = metal.newBuffer((long) maxBatch * d.kvLoraRank() * 4, false);
+        kpe = metal.newBuffer((long) maxBatch * d.qkRopeDim() * 4, false);
+        kvb = metal.newBuffer((long) maxBatch * heads * (d.qkNopeDim() + d.vHeadDim()) * 4, false);
     }
 
     /** Reads {@code xb}, writes the attention output {@code [n, heads*v]} to {@code att} (o_proj is the caller's). */
