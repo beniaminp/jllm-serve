@@ -51,6 +51,7 @@ public final class Engine implements AutoCloseable {
     private final Set<Integer> eosIds;
     private final ReentrantLock lock = new ReentrantLock(true);
     private final long queueTimeoutMs;
+    private final int emptyPromptToken;
 
     private int[] cached = new int[0]; // tokens currently in the KV cache
     private int cachedLen;
@@ -86,6 +87,16 @@ public final class Engine implements AutoCloseable {
                     + " max_tokens or a stop string");
         }
         this.queueTimeoutMs = queueTimeoutMs;
+        // the token an empty prompt is replaced with: the tokenizer's EOS, else config.json's first eos_token_id,
+        // else the smallest known stop id (a Set has no stable order; the choice must not vary between runs)
+        int empty = tokenizer.eosId();
+        if (empty < 0 && !cfg.eosTokenIds().isEmpty()) {
+            empty = cfg.eosTokenIds().getFirst();
+        }
+        if (empty < 0) {
+            empty = this.eosIds.stream().mapToInt(Integer::intValue).min().orElse(-1);
+        }
+        this.emptyPromptToken = empty;
     }
 
     public Tokenizer tokenizer() {
@@ -148,7 +159,10 @@ public final class Engine implements AutoCloseable {
             return withBos;
         }
         if (promptTokens.length == 0) {
-            return new int[]{eosIds.iterator().next()};
+            if (emptyPromptToken < 0) {
+                throw new IllegalArgumentException("empty prompt, and the model has no EOS token to start from");
+            }
+            return new int[]{emptyPromptToken};
         }
         return promptTokens;
     }

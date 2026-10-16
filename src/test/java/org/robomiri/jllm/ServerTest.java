@@ -119,6 +119,11 @@ public final class ServerTest {
         Map<String, Object> j = Json.parseObject(r.body);
         check(r.status == 200 && Json.num(Json.map(j, "usage"), "completion_tokens", -1) == 5,
                 "non-stream chat: 200 with 5 completion tokens");
+        // L18: an empty prompt becomes the tokenizer's EOS token (deterministically)
+        r = f.post("/v1/completions", "{\"prompt\":\"\",\"max_tokens\":2,\"temperature\":0}");
+        int eos = f.tok.eosId() >= 0 ? f.tok.eosId() : f.tok.tokenId("<|im_end|>");
+        check(r.status == 200 && Json.num(Json.map(Json.parseObject(r.body), "usage"), "prompt_tokens", -1) == 1
+                && f.backend.firstToken == eos, "empty prompt: one EOS token (" + f.backend.firstToken + ") is fed");
         r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":3,\"temperature\":0,\"stream\":true}");
         check(r.status == 200 && r.headers.getOrDefault("transfer-encoding", "").equals("chunked")
                 && r.body.endsWith("data: [DONE]\n\n") && r.body.contains("\"finish_reason\":\"length\""),
@@ -350,6 +355,7 @@ public final class ServerTest {
         final AtomicInteger forwards = new AtomicInteger();
         volatile long delayMs;
         volatile int failAfter = -1; // throw from forward() once this many calls happened (-1 = never)
+        volatile int firstToken = -1; // the token at position 0 of the most recent prefill
 
         FakeBackend(int ctx, int token) {
             this.ctx = ctx;
@@ -374,6 +380,9 @@ public final class ServerTest {
         @Override
         public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
             int calls = forwards.incrementAndGet();
+            if (pos == 0) {
+                firstToken = tokens[off];
+            }
             if (failAfter >= 0 && calls > failAfter) {
                 throw new IllegalStateException("fake backend failure");
             }
