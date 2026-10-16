@@ -11,11 +11,12 @@ Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterward
 
 | Piece | Where | Written from scratch |
 |---|---|---|
-| Hugging Face Hub downloader (resumable, SHA-256 verified) | `hub/HuggingFaceHub.java` | yes, on `java.net.http` |
+| Hugging Face Hub downloader (resumable, SHA-256 verified, retries, stall watchdog) | `hub/HuggingFaceHub.java` | yes, on `java.net.http` |
 | safetensors reader (memory-mapped via FFM) | `safetensors/SafeTensors.java` | yes |
 | Byte-level and SentencePiece-style BPE tokenizers + per-family chat templates | `tokenizer/` | yes |
-| Q4_0 / Q8_0 / Q2_K block quantization + mmap'd quantized cache file, shard-by-shard conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
-| Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, custom thread pool, f32/f16 KV cache) | `cpu/` | yes |
+| Typed model description (`Architecture`, `LayerSpec`, `RopeTable`, one parser per family) | `model/Architecture.java`, `model/Families.java`, ... | yes |
+| Q4_0 / Q8_0 / Q2_K block quantization + versioned, mmap'd quantized cache file, shard-by-shard resumable conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
+| Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16 KV cache) | `cpu/` | yes |
 | Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
 | JSON parser/writer | `json/Json.java` | yes |
@@ -26,7 +27,7 @@ Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterward
 ## Requirements
 
 - JDK **26** (uses `java.lang.foreign` and `jdk.incubator.vector`). On this machine: `export JAVA_HOME=/opt/homebrew/opt/openjdk@26`
-- Maven (only used to compile; there are no dependencies to download besides compiler plugins)
+- Maven (only used to compile and to run the tests; there are no dependencies to download besides build plugins)
 - macOS + Xcode command line tools for the Metal backend (optional; the CPU backend works everywhere)
 
 ## Quick start
@@ -40,8 +41,11 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@26   # or any JDK 26+
 ./jllm bench --backend cpu           # throughput numbers
 ```
 
-The first run of a model quantizes it once into `models/<model>/jllm-q4_0.bin`; later starts memory-map that file
-and are ready in milliseconds.
+The first run of a model quantizes it once into `models/<model>/jllm-q4_0.bin` (+ `.json` index); later starts
+memory-map that file and are ready in milliseconds. The index records the converter version and the Hub
+repository, revision and commit the cache was made from: a cache from an older converter or another revision is
+reconverted automatically, and an interrupted conversion resumes where it stopped (`jllm-q4_0.partial.json`).
+Only the shards listed in the model's `model.safetensors.index.json` (or `model.safetensors`) are downloaded.
 
 ### Other models
 
@@ -87,21 +91,34 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"s
 Every setting lives in [`src/main/resources/jllm.properties`](src/main/resources/jllm.properties) with its
 documentation. Precedence: bundled defaults → external file (`--config path`, `$JLLM_CONFIG`, or
 `./jllm.properties` if present) → command line. `./jllm config` prints the effective values and their origin.
+A `./jllm.properties` in the directory you run from is git-ignored, so it is a good place for personal overrides.
 
 ```sh
 cp src/main/resources/jllm.properties jllm.properties   # edit: backend.ctx=2048, server.port=9000, ...
 ./jllm serve                                            # picks up ./jllm.properties automatically
 ./jllm serve --ctx 1024 --server.port 9000              # short aliases or full keys on the command line
+./jllm serve --server.cors-origin=https://app.example.com   # --key=value also works
 ```
+
+Settings are validated strictly, before any weights are loaded: an unknown key, a non-numeric or out-of-range
+number, a malformed boolean (booleans are `true|false|yes|no|on|off|1|0`; a stray `--think flase` is an error, not
+`false`) or an unknown `model.quant` / `backend.kv-dtype` / `backend` value stops the program with a message and
+exit status 2. `prompt`, `raw` and `config` are command line flags only and are rejected in a properties file.
+Notable keys besides the usual ones: `backend.kv-dtype` (`f32` or `f16`), `backend.cpu.int8-activations`
+(default `true`; the CPU quantizes activations to int8 for integer dot products, several times faster decode but
+~1 % different numerics; `false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
+and the `server.*` limits listed under Security below.
 
 Short flags:
 
 ```
+--model REPO          Hugging Face repository (default Qwen/Qwen3-0.6B), --revision REV, --dir PATH (model directory)
 --backend cpu|metal   default: metal on macOS when the native lib builds, else cpu
 --quant q4|q8|q2k     weight format (default q4; q2k = 2.625-bit Q2_K; embeddings/LM head are always q8); cached per model
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
+--backend.kv-dtype f32|f16   KV cache element type (no short alias)
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)
@@ -127,25 +144,42 @@ The server is meant for your own machine. Keep these in mind before changing the
 
 | Model | Backend | Prefill | Decode |
 |---|---|---|---|
-| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~530 tok/s | ~110 tok/s |
-| Qwen3-0.6B Q4_0 | CPU (NEON 128-bit, 10 threads), float activations | ~153 tok/s | ~17 tok/s |
-| Qwen3-0.6B Q4_0 | CPU, int8 activations (`backend.cpu.int8-activations`, the default) | same | ~4× the float row: 13.4 → 53.7 tok/s in the same session ([docs/11](docs/11-performance.md#111-measured)) |
+| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~533 tok/s | ~111 tok/s |
+| Qwen3-0.6B Q4_0, 413-token prompt | CPU (NEON 128-bit, 10 threads), int8 activations (`backend.cpu.int8-activations`, the default) | ~275 tok/s | ~51 tok/s |
 | Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~49 tok/s | ~25 tok/s |
+| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | CPU, int8 activations | ~12 tok/s | ~6 tok/s |
+
+Float activations on the CPU (`--backend.cpu.int8-activations false`) decode about 4× slower; the full history of
+measurements is in [docs/11](docs/11-performance.md#111-measured).
 
 Both backends produce identical greedy output with float activations on the CPU (checked on every merge for
 Qwen3 and the 30B MoE, and across 20 synthetic models of all families × 3 quantization formats by
 `scripts/arch-smoke.sh`, which runs the CPU side with `backend.cpu.int8-activations` off); int8 activations
-change the CPU decode numerics by ~1 % per dot product.
+change the CPU decode numerics by ~1 % per dot product, so greedy output may differ from Metal's after a while.
+The MLA latent KV cache of DeepSeek models is much smaller than a plain one (V2-Lite: 553 KB → 62 KB per token,
+[docs/14](docs/14-model-families.md)).
 
 ## Tests
 
 ```sh
-mvn test                   # SmokeTest (plain main(), no test framework) against models/Qwen_Qwen3-0.6B
-sh scripts/arch-smoke.sh   # every family on synthetic tiny checkpoints, Q4/Q8/Q2_K, CPU == Metal
+mvn test                   # SmokeTest + ServerTest + MetalParamsTest (plain main() classes, no test framework)
+sh scripts/arch-smoke.sh   # 20 synthetic models x Q4/Q8/Q2_K, CPU == Metal; DeepSeek checked against a float64 reference
+```
+
+`mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
+against a fake backend (settings validation, bad requests, keep-alive, slow, stalled and disconnected clients). Two more checks are run by hand:
+
+```sh
+CP=target/classes:target/test-classes
+J="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp $CP org.robomiri.jllm"
+$J.TokenizerFamiliesTest /tmp/jllm-tokenizers   # 3 083 checks, 14 tokenizer families
+$J.ConverterTest --dir <scratch dir>            # converter, resume and cache-invalidation tests
 ```
 
 `TokenizerFamiliesTest` compares the tokenizers and chat templates of all families against fixtures generated
 with the reference `tokenizers`/`jinja2` libraries (`src/test/python/gen_tokenizer_fixtures.py`).
+`ConverterTest` deletes and rewrites cache files, so give it private copies of the models in a scratch directory
+(see the comment at the top of `src/test/java/org/robomiri/jllm/ConverterTest.java`), never `models/`.
 
 Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the CPU KV cache lives on the heap),
 `JAVA_OPTS` (extra JVM flags), `JLLM_NO_BUILD=1` to skip the incremental compile.
@@ -159,9 +193,9 @@ src/main/java/org/robomiri/jllm/
   json/                  JSON parser & writer
   hub/                   Hugging Face downloader
   safetensors/           .safetensors reader (mmap + FFM)
-  tokenizer/             BPE tokenizer, chat template, streaming UTF-8 decoder
-  model/                 config, quantized tensors, cache file + converter, weight loading, RoPE, Backend interface
-  cpu/                   Vector API kernels, thread pool, CPU forward pass
+  tokenizer/             BPE tokenizers, per-family chat templates, streaming UTF-8 decoder
+  model/                 typed Architecture + per-family parsers, quantized tensors, cache file + converter, weights, RoPE, Backend interface
+  cpu/                   Vector API kernels (float and int8 activations), thread pool, KV cache, CPU forward pass
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
   engine/                generation loop, prefix cache, stop strings
@@ -169,4 +203,9 @@ src/main/java/org/robomiri/jllm/
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
 docs/                    how it all works
+scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
