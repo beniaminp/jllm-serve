@@ -1,13 +1,19 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
-import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
-import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MambaMetalBackend;
+import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
+import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.Backend;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Decoder;
+import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.LayerSpec;
+import org.robomiri.jllm.model.MambaArch;
+import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
@@ -40,16 +46,16 @@ public final class ArchSmoke {
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
-            ModelConfig cfg = ModelConfig.load(dir);
-            if (cfg.dim() % QType.BLOCK != 0 || cfg.hiddenDim() % QType.BLOCK != 0 || cfg.qDim() % QType.BLOCK != 0) {
-                System.out.println(dir.getFileName() + ": skipped, dims (" + cfg.dim() + ", " + cfg.hiddenDim() + ", "
-                        + cfg.qDim() + ") are not multiples of the " + QType.BLOCK + "-wide quantization block");
+            Architecture cfg = Architecture.load(dir);
+            if (!quantizable(cfg)) {
+                System.out.println(dir.getFileName() + ": skipped, a width is not a multiple of the " + QType.BLOCK
+                        + "-wide quantization block");
                 continue;
             }
             for (QType q : quants) {
                 failures += run(dir, cfg, q, metal, lib);
             }
-            if (cfg.modelType().equals("phi3")) {
+            if (cfg.core().modelType().equals("phi3")) {
                 failures += checkFusedSplit(dir, cfg);
             }
         }
@@ -60,24 +66,43 @@ public final class ArchSmoke {
         System.out.println("arch smoke passed");
     }
 
+    /** Every quantized width (the residual stream, the MLPs, the query projection / mixer) is a multiple of the block. */
+    private static boolean quantizable(Architecture a) {
+        int b = QType.BLOCK;
+        if (a.core().dim() % b != 0) {
+            return false;
+        }
+        return switch (a) {
+            case MambaArch m -> m.dInner() % b == 0;
+            case Decoder d -> {
+                boolean ok = d.attention().qDim() % b == 0;
+                for (LayerSpec s : d.layers()) {
+                    ok &= !(s.mlp() instanceof Mlp.Dense dense) || dense.hidden() % b == 0;
+                }
+                yield ok;
+            }
+        };
+    }
+
     /**
      * The converter must turn Phi-3's fused {@code qkv_proj} / {@code gate_up_proj} into the q/k/v cache tensors and
      * {@code mlp.gate_up}: every dequantized row (Q8_0) equals the matching row of the fused checkpoint tensor
      * within the quantization step, with the row ranges q, then k, then v / gate, then up.
      */
-    private static int checkFusedSplit(Path dir, ModelConfig cfg) throws Exception {
+    private static int checkFusedSplit(Path dir, Architecture cfg) throws Exception {
         int bad = 0;
+        Attention.Gqa g = (Attention.Gqa) ((Decoder) cfg).attention();
         try (ModelWeights w = ModelWeights.load(dir, cfg, QType.Q8_0, ShardProvider.local(dir));
              SafeTensors st = SafeTensors.open(dir.resolve("model.safetensors"))) {
-            for (int l = 0; l < cfg.layers(); l++) {
+            for (int l = 0; l < cfg.core().layers(); l++) {
                 String p = "model.layers." + l + ".";
                 SafeTensors.Tensor qkv = st.get(p + "self_attn.qkv_proj.weight");
                 SafeTensors.Tensor gu = st.get(p + "mlp.gate_up_proj.weight");
-                ModelWeights.Layer L = w.layers[l];
-                bad += compareRows(qkv, 0, L.wq, p + "q");
-                bad += compareRows(qkv, cfg.qDim(), L.wk, p + "k");
-                bad += compareRows(qkv, cfg.qDim() + cfg.kvDim(), L.wv, p + "v");
-                bad += compareRows(gu, 0, L.wGateUp, p + "gate_up");
+                AttnWeights.Gqa L = w.decoderLayer(l).gqa();
+                bad += compareRows(qkv, 0, L.wq(), p + "q");
+                bad += compareRows(qkv, g.qDim(), L.wk(), p + "k");
+                bad += compareRows(qkv, g.qDim() + g.kvDim(), L.wv(), p + "v");
+                bad += compareRows(gu, 0, w.decoderLayer(l).dense().gateUp(), p + "gate_up");
             }
         }
         System.out.println(dir.getFileName() + " fused qkv / gate_up split: " + (bad == 0 ? "ok" : bad + " BAD ROWS"));
@@ -107,30 +132,31 @@ public final class ArchSmoke {
         return bad;
     }
 
-    private static int run(Path dir, ModelConfig cfg, QType quant, boolean metal, String lib) throws Exception {
+    private static int run(Path dir, Architecture cfg, QType quant, boolean metal, String lib) throws Exception {
         String label = dir.getFileName() + " " + quant;
         int failures = 0;
+        boolean mamba = cfg instanceof MambaArch;
         try (ModelWeights w = ModelWeights.load(dir, cfg, quant, ShardProvider.local(dir))) {
             int[] cpu;
-            float[] cpuLogits = new float[cfg.vocabSize()];
-            try (Backend b = cfg.isMamba() ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
+            float[] cpuLogits = new float[cfg.core().vocabSize()];
+            try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                 cpu = generate(b, cpuLogits);
-                failures += cfg.isMamba() ? stateChecks(b, cfg, "cpu") : 0;
+                failures += mamba ? stateChecks(b, cfg, "cpu") : 0;
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
             if (!metal) {
                 return failures;
             }
-            if (!cfg.isMamba() && cfg.headDim() % 32 != 0) {
-                System.out.println("  metal skipped: headDim " + cfg.headDim() + " is not a multiple of 32");
+            if (cfg instanceof Decoder d && d.attention().headDim() % 32 != 0) {
+                System.out.println("  metal skipped: headDim " + d.attention().headDim() + " is not a multiple of 32");
                 return failures;
             }
             int[] gpu;
-            float[] gpuLogits = new float[cfg.vocabSize()];
-            try (Backend b = cfg.isMamba() ? new MambaMetalBackend(w, 64, 16, lib) : new MetalBackend(w, 64, 16, lib)) {
+            float[] gpuLogits = new float[cfg.core().vocabSize()];
+            try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib) : new MetalBackend(w, 64, 16, lib)) {
                 gpu = generate(b, gpuLogits);
-                failures += cfg.isMamba() ? stateChecks(b, cfg, "metal") : 0;
+                failures += mamba ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
             // the argmax of a random model can be degenerate, so also compare the full final logits
@@ -159,10 +185,10 @@ public final class ArchSmoke {
      * change the result: one chunk, 5 + 7, and token by token give the same logits, and pos == 0 starts afresh
      * (here after the state was left in some other position). Continuing at a wrong position is refused.
      */
-    private static int stateChecks(Backend b, ModelConfig cfg, String name) {
-        float[] one = new float[cfg.vocabSize()];
-        float[] split = new float[cfg.vocabSize()];
-        float[] single = new float[cfg.vocabSize()];
+    private static int stateChecks(Backend b, Architecture cfg, String name) {
+        float[] one = new float[cfg.core().vocabSize()];
+        float[] split = new float[cfg.core().vocabSize()];
+        float[] single = new float[cfg.core().vocabSize()];
         b.forward(PROMPT, 0, PROMPT.length, 0, one);
         b.forward(PROMPT, 0, 5, 0, null);
         b.forward(PROMPT, 5, PROMPT.length - 5, 5, split);

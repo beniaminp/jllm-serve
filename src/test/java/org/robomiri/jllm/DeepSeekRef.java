@@ -6,7 +6,7 @@ import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.ShardProvider;
@@ -35,20 +35,20 @@ public final class DeepSeekRef {
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
-            ModelConfig cfg = ModelConfig.load(dir);
+            Architecture cfg = Architecture.load(dir);
             List<?> ref = Json.list(Json.parseObject(Files.readString(dir.resolve("ref-logits.json"))), "logits");
             float[] expect = new float[ref.size()];
             for (int k = 0; k < expect.length; k++) {
                 expect[k] = ((Number) ref.get(k)).floatValue();
             }
             try (ModelWeights w = ModelWeights.load(dir, cfg, QType.Q8_0, ShardProvider.local(dir))) {
-                float[] cpu = new float[cfg.vocabSize()];
+                float[] cpu = new float[cfg.core().vocabSize()];
                 try (Backend b = new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                     b.forward(PROMPT, 0, PROMPT.length, 0, cpu);
                 }
                 failures += compare(dir.getFileName() + " cpu", expect, cpu);
                 if (metal) {
-                    float[] gpu = new float[cfg.vocabSize()];
+                    float[] gpu = new float[cfg.core().vocabSize()];
                     try (Backend b = new MetalBackend(w, 64, 16, lib)) {
                         b.forward(PROMPT, 0, PROMPT.length, 0, gpu);
                     }

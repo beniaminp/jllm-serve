@@ -2,13 +2,20 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.Int8Kernels;
 import org.robomiri.jllm.json.Json;
-import org.robomiri.jllm.model.DeepSeekConfig;
+import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DeepSeekRouter;
-import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.InterleavedRope;
-import org.robomiri.jllm.model.Rope;
+import org.robomiri.jllm.model.LayerSpec;
+import org.robomiri.jllm.model.MambaArch;
+import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
+import org.robomiri.jllm.model.Rope;
+import org.robomiri.jllm.model.RopeTable;
+import org.robomiri.jllm.model.Router;
+import org.robomiri.jllm.model.Scaling;
 import org.robomiri.jllm.safetensors.SafeTensors;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -616,25 +623,25 @@ public final class SmokeTest {
 
     /** llama3 RoPE scaling against values computed by hand from the transformers formula. */
     static void ropeScaling() {
-        ModelConfig.RopeScaling l3 = new ModelConfig.RopeScaling("llama3", 8, 1, 4, 8192);
+        Scaling l3 = new Scaling.Llama3(8, 1, 4, 8192);
         // headDim 8, theta 1e4: inv_freq = 1, 0.1, 0.01, 0.001 with wavelengths 6.28, 62.8, 628, 6283.
         // Below 8192/4 = 2048 they are kept; 6283 lies in (2048, 8192): smooth = (8192/6283.185 - 1)/3 = 0.101266,
         // inv = (1 - smooth) * 0.001 / 8 + smooth * 0.001 = 2.13608e-4.
-        double[] f = Rope.invFreq(8, 1e4, l3);
+        double[] f = Rope.invFreq(8, 1e4, l3, 0);
         check(f[0] == 1.0 && Math.abs(f[1] - 0.1) < 1e-15 && Math.abs(f[2] - 0.01) < 1e-15, "llama3 keeps high frequencies");
         check(Math.abs(f[3] - 2.1360754402756864e-4) < 1e-12, "llama3 smoothed band: " + f[3]);
         // theta 1e6: inv_freq = 1, 0.0316, 0.001 (smoothed again), 3.1623e-5 (wavelen 198692 > 8192: / factor 8)
-        double[] g = Rope.invFreq(8, 1e6, l3);
+        double[] g = Rope.invFreq(8, 1e6, l3, 0);
         check(Math.abs(g[2] - 2.1360754402756864e-4) < 1e-12 && Math.abs(g[3] - 3.1622776601683795e-5 / 8) < 1e-15,
                 "llama3 low frequencies divided by factor: " + g[3]);
         // headDim 64, theta 5e5 (Llama 3): first and last of 32 frequencies
-        double[] h = Rope.invFreq(64, 5e5, l3);
+        double[] h = Rope.invFreq(64, 5e5, l3, 0);
         check(h[0] == 1.0 && Math.abs(h[31] - 3.7673226901739635e-7) < 1e-18 && Math.abs(h[1] - 0.6636012376960885) < 1e-12,
                 "llama3 headDim 64");
-        check(Arrays.equals(Rope.invFreq(8, 1e4, null), new double[]{1.0, 0.1, 0.01, 0.001}) || Math.abs(
-                Rope.invFreq(8, 1e4, null)[3] - 0.001) < 1e-15, "plain rope unchanged");
+        check(Arrays.equals(Rope.invFreq(8, 1e4, Scaling.NONE, 0), new double[]{1.0, 0.1, 0.01, 0.001}) || Math.abs(
+                Rope.invFreq(8, 1e4, Scaling.NONE, 0)[3] - 0.001) < 1e-15, "plain rope unchanged");
         Rope plain = new Rope(8, 1e4, 4);
-        Rope scaled = new Rope(8, 1e4, 4, l3);
+        Rope scaled = new Rope(new RopeTable(8, 1e4, l3, RopeTable.Pairing.HALF), 4);
         check(plain.cos[8 + 3] != scaled.cos[8 + 3] && plain.cos[8] == scaled.cos[8], "scaled table differs only in low freqs");
     }
 
@@ -659,30 +666,30 @@ public final class SmokeTest {
         check(r.cos.length == 3 * 2 && Math.abs(r.sin[2 * 2 + 1] - (float) Math.sin(0.02)) < 1e-7, "glm rope table width");
         Path tmp = Files.createTempDirectory("jllm-glm");
         try {
-            ModelConfig edge = cfg(tmp, """
+            Architecture edge = cfg(tmp, """
                     {"architectures":["GlmForCausalLM"],"partial_rotary_factor":1.0,"attention_bias":false,
                      "eos_token_id":[59246,59253,59255],"head_dim":128,"hidden_act":"silu","hidden_size":2048,
                      "intermediate_size":6144,"model_type":"glm","num_attention_heads":16,"num_hidden_layers":28,
                      "num_key_value_heads":4,"pad_token_id":59246,"rms_norm_eps":1e-05,"rope_theta":10000.0,
                      "tie_word_embeddings":true,"vocab_size":59264}""");
-            check(edge.ropeInterleaved() && edge.rotaryDim() == 128 && !edge.attentionBias() && !edge.postNorms()
-                    && edge.tiedEmbeddings() && edge.eosTokenIds().equals(List.of(59246, 59253, 59255)),
+            check(interleaved(edge) && rope(edge).rotaryDim() == 128 && !gqa(edge, 0).bias() && !postNorms(edge)
+                    && edge.core().tiedEmbeddings() && edge.core().eosTokenIds().equals(List.of(59246, 59253, 59255)),
                     "GLM-Edge config");
-            ModelConfig chat = cfg(tmp, """
+            Architecture chat = cfg(tmp, """
                     {"architectures":["GlmForCausalLM"],"attention_bias":true,"eos_token_id":[151329,151336,151338],
                      "head_dim":128,"hidden_size":4096,"intermediate_size":13696,"model_type":"glm",
                      "num_attention_heads":32,"num_hidden_layers":40,"num_key_value_heads":2,"rms_norm_eps":1.5625e-07,
                      "rope_theta":10000.0,"tie_word_embeddings":false,"vocab_size":151552}""");
-            check(chat.rotaryDim() == 64 && chat.attentionBias() && !chat.postNorms(), "glm-4-9b-chat-hf: default partial_rotary_factor 0.5");
-            ModelConfig g4 = cfg(tmp, """
+            check(rope(chat).rotaryDim() == 64 && gqa(chat, 0).bias() && !postNorms(chat), "glm-4-9b-chat-hf: default partial_rotary_factor 0.5");
+            Architecture g4 = cfg(tmp, """
                     {"architectures":["Glm4ForCausalLM"],"attention_bias":true,"head_dim":128,"hidden_size":4096,
                      "intermediate_size":13696,"model_type":"glm4","num_attention_heads":32,"num_hidden_layers":40,
                      "num_key_value_heads":2,"partial_rotary_factor":0.5,"rms_norm_eps":1e-05,"rope_theta":10000.0,
                      "vocab_size":151552}""");
-            check(g4.ropeInterleaved() && g4.postNorms() && g4.rotaryDim() == 64 && g4.attentionBias(), "GLM-4-0414 config");
-            check(cfg(tmp, """
+            check(interleaved(g4) && postNorms(g4) && rope(g4).rotaryDim() == 64 && gqa(g4, 0).bias(), "GLM-4-0414 config");
+            check(rope(cfg(tmp, """
                     {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
-                     "num_attention_heads":16,"head_dim":128,"vocab_size":151936}""").rotaryDim() == 128, "non-GLM rotates the full head");
+                     "num_attention_heads":16,"head_dim":128,"vocab_size":151936}""")).rotaryDim() == 128, "non-GLM rotates the full head");
         } finally {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);
@@ -694,7 +701,7 @@ public final class SmokeTest {
         // rotDim 8, theta 1e4: theta^(2i/8) = 1, 10, 100, 1000
         double[] shortF = {1, 2, 4, 8};
         double[] longF = {1, 1.5, 2, 4};
-        ModelConfig.RopeScaling sc = new ModelConfig.RopeScaling("longrope", 32, 1, 4, 4096, shortF, longF, 0);
+        Scaling.LongRope sc = new Scaling.LongRope(32, 4096, shortF, longF, 0);
         double[] s = Rope.invFreq(8, 1e4, sc, 4096); // ctx <= original: short factors
         check(s[0] == 1.0 && Math.abs(s[1] - 1 / 20.0) < 1e-15 && Math.abs(s[2] - 1 / 400.0) < 1e-15
                 && Math.abs(s[3] - 1 / 8000.0) < 1e-18, "longrope short factors: " + Arrays.toString(s));
@@ -704,14 +711,14 @@ public final class SmokeTest {
         // factor = 131072 / 4096 = 32: sqrt(1 + ln 32 / ln 4096) = sqrt(1 + 5/12) = sqrt(17/12) = 1.19023807
         check(Math.abs(Rope.attentionFactor(sc) - Math.sqrt(17.0 / 12.0)) < 1e-12
                 && Math.abs(Rope.attentionFactor(sc) - 1.1902380714238083) < 1e-12, "longrope attention factor");
-        check(Rope.attentionFactor(new ModelConfig.RopeScaling("longrope", 1, 1, 4, 4096, shortF, longF, 0)) == 1.0,
+        check(Rope.attentionFactor(new Scaling.LongRope(1, 4096, shortF, longF, 0)) == 1.0,
                 "attention factor is 1 for factor <= 1");
-        check(Rope.attentionFactor(new ModelConfig.RopeScaling("longrope", 32, 1, 4, 4096, shortF, longF, 1.5)) == 1.5,
+        check(Rope.attentionFactor(new Scaling.LongRope(32, 4096, shortF, longF, 1.5)) == 1.5,
                 "attention_factor override");
-        check(Rope.attentionFactor(null) == 1.0 && Rope.attentionFactor(new ModelConfig.RopeScaling("llama3", 8, 1, 4, 8192)) == 1.0,
+        check(Rope.amplitude(Scaling.NONE) == 1.0 && Rope.amplitude(new Scaling.Llama3(8, 1, 4, 8192)) == 1.0,
                 "other scalings have no attention factor");
         // table: headDim 8 but only the first 4 dims rotate -> 2 pairs per position, scaled by the attention factor
-        Rope r = new Rope(4, 1e4, 3, sc);
+        Rope r = new Rope(new RopeTable(4, 1e4, sc, RopeTable.Pairing.HALF), 3);
         double amp = Math.sqrt(17.0 / 12.0);
         check(r.cos.length == 3 * 2 && r.sin.length == 3 * 2, "partial rope table size");
         check(Math.abs(r.cos[0] - amp) < 1e-6 && r.sin[0] == 0, "position 0: cos = amp, sin = 0");
@@ -727,46 +734,46 @@ public final class SmokeTest {
         Path tmp = Files.createTempDirectory("jllm-phi");
         try {
             // Phi-3-mini-4k-instruct (Hub config): head_dim 96, MHA, window 2047, no scaling, BOS <s>
-            ModelConfig p3 = cfg(tmp, """
+            Architecture p3 = cfg(tmp, """
                     {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":3072,"intermediate_size":8192,
                      "num_hidden_layers":32,"num_attention_heads":32,"num_key_value_heads":32,"vocab_size":32064,
                      "max_position_embeddings":4096,"original_max_position_embeddings":4096,"rms_norm_eps":1e-05,
                      "rope_scaling":null,"rope_theta":10000.0,"sliding_window":2047,"tie_word_embeddings":false,
                      "bos_token_id":1,"eos_token_id":32000,"attention_bias":false,"hidden_act":"silu"}""");
-            check(p3.headDim() == 96 && p3.rotaryDim() == 96 && p3.ropeScaling() == null && p3.windowFor(0) == 2047
-                    && p3.windowFor(31) == 2047 && !p3.qkNorm() && !p3.attentionBias()
-                    && p3.qDim() == 3072 && p3.kvDim() == 3072, "phi-3-mini config");
+            check(gqa(p3, 0).headDim() == 96 && rope(p3).rotaryDim() == 96 && rope(p3).scaling() instanceof Scaling.None
+                    && gqa(p3, 0).window() == 2047 && gqa(p3, 31).window() == 2047 && !gqa(p3, 0).qkNorm() && !gqa(p3, 0).bias()
+                    && gqa(p3, 0).qDim() == 3072 && gqa(p3, 0).kvDim() == 3072, "phi-3-mini config");
             // Phi-4-mini-instruct: GQA 24/8, head_dim 128, partial_rotary_factor 0.75 (96 dims = 48 pairs), tied, BOS = <|endoftext|>
             String f48 = "1.0" + (",1.0").repeat(47);
-            ModelConfig p4 = cfg(tmp, """
+            Architecture p4 = cfg(tmp, """
                     {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":3072,"intermediate_size":8192,
                      "num_hidden_layers":32,"num_attention_heads":24,"num_key_value_heads":8,"vocab_size":200064,
                      "max_position_embeddings":131072,"original_max_position_embeddings":4096,"partial_rotary_factor":0.75,
                      "rope_scaling":{"type":"longrope","short_factor":[%s],"long_factor":[%s]},"rope_theta":10000.0,
                      "sliding_window":262144,"tie_word_embeddings":true,"bos_token_id":199999,"eos_token_id":199999}"""
                     .formatted(f48, f48));
-            check(p4.headDim() == 128 && p4.rotaryDim() == 96 && p4.ropeScaling().type().equals("longrope")
-                    && p4.ropeScaling().shortFactor().length == 48 && p4.ropeScaling().originalMaxPositions() == 4096
-                    && p4.ropeScaling().factor() == 32 && p4.tiedEmbeddings()
-                    && p4.windowFor(5) == 262144 && p4.qDim() == 3072 && p4.kvDim() == 1024, "phi-4-mini config");
-            check(Math.abs(Rope.attentionFactor(p4.ropeScaling()) - 1.1902380714238083) < 1e-12, "phi-4-mini attention factor");
+            Scaling.LongRope p4s = (Scaling.LongRope) rope(p4).scaling();
+            check(gqa(p4, 0).headDim() == 128 && rope(p4).rotaryDim() == 96
+                    && p4s.shortFactor().length == 48 && p4s.originalMaxPositions() == 4096
+                    && p4s.factor() == 32 && p4.core().tiedEmbeddings()
+                    && gqa(p4, 5).window() == 262144 && gqa(p4, 0).qDim() == 3072 && gqa(p4, 0).kvDim() == 1024, "phi-4-mini config");
+            check(Math.abs(Rope.attentionFactor(p4s) - 1.1902380714238083) < 1e-12, "phi-4-mini attention factor");
             // phi-4 (14B): 40/10 heads, head_dim 128, theta 250000, sliding_window null
-            ModelConfig p14 = cfg(tmp, """
+            Architecture p14 = cfg(tmp, """
                     {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":5120,"intermediate_size":17920,
                      "num_hidden_layers":40,"num_attention_heads":40,"num_key_value_heads":10,"vocab_size":100352,
                      "max_position_embeddings":16384,"rope_scaling":null,"rope_theta":250000,"sliding_window":null,
                      "tie_word_embeddings":false,"bos_token_id":100257,"eos_token_id":100265}""");
-            check(p14.headDim() == 128 && p14.windowFor(0) == 0 && p14.ropeTheta() == 250000
-                    && p14.eosTokenIds().equals(List.of(100265)), "phi-4 config");
+            check(gqa(p14, 0).headDim() == 128 && gqa(p14, 0).window() == 0 && rope(p14).theta() == 250000
+                    && p14.core().eosTokenIds().equals(List.of(100265)), "phi-4 config");
             // legacy 'su' name, original_max_position_embeddings only at the top level, factor = 4096 * 32 / 4096
-            ModelConfig su = cfg(tmp, """
+            Architecture su = cfg(tmp, """
                     {"model_type":"phi3","hidden_size":128,"intermediate_size":192,"num_hidden_layers":2,
                      "num_attention_heads":4,"vocab_size":100,"max_position_embeddings":131072,
                      "original_max_position_embeddings":4096,
                      "rope_scaling":{"type":"su","short_factor":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
                                      "long_factor":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]}}""");
-            check(su.ropeScaling().type().equals("longrope") && su.ropeScaling().factor() == 32
-                    && su.ropeScaling().longFactor()[3] == 2.0, "su is longrope");
+            check(rope(su).scaling() instanceof Scaling.LongRope sl && sl.factor() == 32 && sl.longFactor()[3] == 2.0, "su is longrope");
             expectIae(() -> {
                 try {
                     cfg(tmp, """
@@ -786,44 +793,46 @@ public final class SmokeTest {
     static void modelConfigs() throws Exception {
         Path tmp = Files.createTempDirectory("jllm-cfg");
         try {
-            ModelConfig ll = cfg(tmp, """
+            Architecture ll = cfg(tmp, """
                     {"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":2048,"intermediate_size":8192,
                      "num_hidden_layers":16,"num_attention_heads":32,"num_key_value_heads":8,"head_dim":64,"vocab_size":128256,
                      "hidden_act":"silu","rms_norm_eps":1e-5,"rope_theta":500000.0,"tie_word_embeddings":true,
                      "bos_token_id":128000,"eos_token_id":128009,
                      "rope_scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,
                                      "original_max_position_embeddings":8192,"rope_type":"llama3"}}""");
-            check(ll.tiedEmbeddings() && ll.headDim() == 64 && !ll.attentionBias() && !ll.qkNorm() && ll.slidingWindow() == 0
-                    && ll.ropeScaling().factor() == 32 && ll.eosTokenIds().equals(List.of(128009)), "llama 3.2 config");
-            ModelConfig old = cfg(tmp, """
+            check(ll.core().tiedEmbeddings() && gqa(ll, 0).headDim() == 64 && !gqa(ll, 0).bias() && !gqa(ll, 0).qkNorm()
+                    && gqa(ll, 0).window() == 0 && rope(ll).scaling() instanceof Scaling.Llama3 l3 && l3.factor() == 32
+                    && ll.core().eosTokenIds().equals(List.of(128009)), "llama 3.2 config");
+            Architecture old = cfg(tmp, """
                     {"model_type":"llama","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
                      "num_attention_heads":32,"vocab_size":128256,"rope_scaling":{"type":"llama3","factor":8.0,
                      "low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":8192}}""");
-            check(old.headDim() == 128 && old.kvHeads() == 32 && old.ropeScaling().factor() == 8, "legacy rope 'type' key, head_dim default");
-            ModelConfig mi = cfg(tmp, """
+            check(gqa(old, 0).headDim() == 128 && gqa(old, 0).kvHeads() == 32 && rope(old).scaling() instanceof Scaling.Llama3 o3
+                    && o3.factor() == 8, "legacy rope 'type' key, head_dim default");
+            Architecture mi = cfg(tmp, """
                     {"architectures":["MistralForCausalLM"],"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,
                      "num_hidden_layers":32,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":32768,
                      "sliding_window":4096,"bos_token_id":1,"eos_token_id":2}""");
-            check(mi.windowFor(0) == 4096 && mi.windowFor(31) == 4096, "mistral window on every layer");
-            ModelConfig mnull = cfg(tmp, """
+            check(gqa(mi, 0).window() == 4096 && gqa(mi, 31).window() == 4096, "mistral window on every layer");
+            Architecture mnull = cfg(tmp, """
                     {"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
                      "num_attention_heads":32,"vocab_size":32768,"sliding_window":null}""");
-            check(mnull.windowFor(0) == 0, "mistral sliding_window null");
-            ModelConfig q2 = cfg(tmp, """
+            check(gqa(mnull, 0).window() == 0, "mistral sliding_window null");
+            Architecture q2 = cfg(tmp, """
                     {"architectures":["Qwen2ForCausalLM"],"model_type":"qwen2","hidden_size":1536,"intermediate_size":8960,
                      "num_hidden_layers":28,"num_attention_heads":12,"num_key_value_heads":2,"vocab_size":151936,
                      "sliding_window":32768,"use_sliding_window":false,"max_window_layers":21,"tie_word_embeddings":true,
                      "eos_token_id":[151645,151643]}""");
-            check(q2.attentionBias() && !q2.qkNorm() && q2.windowFor(27) == 0 && q2.headDim() == 128
-                    && q2.eosTokenIds().equals(List.of(151645, 151643)), "qwen2.5 config");
-            ModelConfig q2w = cfg(tmp, """
+            check(gqa(q2, 0).bias() && !gqa(q2, 0).qkNorm() && gqa(q2, 27).window() == 0 && gqa(q2, 0).headDim() == 128
+                    && q2.core().eosTokenIds().equals(List.of(151645, 151643)), "qwen2.5 config");
+            Architecture q2w = cfg(tmp, """
                     {"model_type":"qwen2","hidden_size":1536,"intermediate_size":8960,"num_hidden_layers":28,
                      "num_attention_heads":12,"vocab_size":151936,"sliding_window":4096,"use_sliding_window":true,
                      "max_window_layers":21}""");
-            check(q2w.windowFor(20) == 0 && q2w.windowFor(21) == 4096, "qwen2 window from max_window_layers");
-            check(cfg(tmp, """
+            check(gqa(q2w, 20).window() == 0 && gqa(q2w, 21).window() == 4096, "qwen2 window from max_window_layers");
+            check(gqa(cfg(tmp, """
                     {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
-                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":151936}""").qkNorm(), "qwen3 qk-norm");
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":151936}"""), 0).qkNorm(), "qwen3 qk-norm");
             expectIae(() -> {
                 try {
                     cfg(tmp, "{\"model_type\":\"mistral\",\"hidden_size\":32,\"intermediate_size\":37,\"num_hidden_layers\":2,"
@@ -842,19 +851,18 @@ public final class SmokeTest {
     static void mamba() throws Exception {
         Path tmp = Files.createTempDirectory("jllm-mamba-cfg");
         try {
-            ModelConfig m = cfg(tmp, """
+            MambaArch m = (MambaArch) cfg(tmp, """
                     {"architectures":["MambaForCausalLM"],"model_type":"mamba","hidden_size":768,"state_size":16,
                      "conv_kernel":4,"expand":2,"intermediate_size":1536,"time_step_rank":48,"num_hidden_layers":24,
                      "layer_norm_epsilon":1e-5,"vocab_size":50280,"use_bias":false,"use_conv_bias":true,
                      "bos_token_id":0,"eos_token_id":0}""");
-            ModelConfig.MambaParams p = m.mamba();
-            check(m.isMamba() && m.dim() == 768 && m.layers() == 24 && m.vocabSize() == 50280 && m.tiedEmbeddings()
-                    && p.dInner() == 1536 && p.dState() == 16 && p.dConv() == 4 && p.dtRank() == 48
-                    && p.convBias() && m.eosTokenIds().equals(List.of(0)), "mamba-130m config");
-            ModelConfig auto = cfg(tmp, """
+            check(m.core().dim() == 768 && m.core().layers() == 24 && m.core().vocabSize() == 50280 && m.core().tiedEmbeddings()
+                    && m.dInner() == 1536 && m.dState() == 16 && m.dConv() == 4 && m.dtRank() == 48
+                    && m.convBias() && m.core().eosTokenIds().equals(List.of(0)), "mamba-130m config");
+            MambaArch auto = (MambaArch) cfg(tmp, """
                     {"model_type":"mamba","hidden_size":100,"state_size":8,"conv_kernel":3,"expand":2,
                      "time_step_rank":"auto","num_hidden_layers":2,"vocab_size":10}""");
-            check(auto.mamba().dtRank() == 7 && auto.mamba().dInner() == 200, "mamba time_step_rank auto = ceil(d/16), expand");
+            check(auto.dtRank() == 7 && auto.dInner() == 200, "mamba time_step_rank auto = ceil(d/16), expand");
             expectIae(() -> {
                 try {
                     cfg(tmp, "{\"model_type\":\"mamba\",\"hidden_size\":64,\"num_hidden_layers\":1,\"vocab_size\":10,"
@@ -927,8 +935,8 @@ public final class SmokeTest {
     static void kvCacheAttention() throws Exception {
         Path tmp = Files.createTempDirectory("jllm-kv");
         try {
-            ModelConfig cfg = cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":128,\"intermediate_size\":64,"
-                    + "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"vocab_size\":32}");
+            Attention.Gqa cfg = gqa(cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":128,\"intermediate_size\":64,"
+                    + "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"vocab_size\":32}"), 0);
             int ctx = 40;
             int n = 23; // several tiles of the f32 and f16 kernels (8 and 8 tokens per tile at this ctx)
             int hd = cfg.headDim();
@@ -947,7 +955,7 @@ public final class SmokeTest {
             }
             try (org.robomiri.jllm.cpu.ThreadPool pool = new org.robomiri.jllm.cpu.ThreadPool(3)) {
                 for (org.robomiri.jllm.model.KvDtype dtype : org.robomiri.jllm.model.KvDtype.values()) {
-                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, cfg, ctx);
+                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, 1, cfg, ctx);
                     kv.store(0, 0, k, v, n);
                     for (int window : new int[]{0, 6}) {
                         for (float softcap : new float[]{0f, 5f}) {
@@ -1187,7 +1195,7 @@ public final class SmokeTest {
     static void prefixReuse(Path dir) throws Exception {
         Path tmp = Files.createTempDirectory("jllm-engine");
         try {
-            ModelConfig cfg = cfg(tmp, "{\"model_type\":\"mamba\",\"hidden_size\":64,\"num_hidden_layers\":1,"
+            Architecture cfg = cfg(tmp, "{\"model_type\":\"mamba\",\"hidden_size\":64,\"num_hidden_layers\":1,"
                     + "\"vocab_size\":100}");
             Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
             SamplingParams two = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 2, List.of());
@@ -1237,14 +1245,12 @@ public final class SmokeTest {
         check(Math.abs(Rope.yarnMscale(40, 0.707) - 1.2608037774058554) < 1e-12 && Rope.yarnMscale(1, 0.707) == 1.0
                 && Math.abs(Rope.yarnMscale(40, 1.0) - 1.3688879454113936) < 1e-12, "yarn mscale");
         // the table: cos/sin are multiplied by mscale / mscale_all_dim (1.0 when they are equal)
-        DeepSeekConfig.Yarn same = new DeepSeekConfig.Yarn(40, 4096, 32, 1, 0.707, 0.707);
-        Rope r = Rope.deepseek(new DeepSeekConfig(0, 512, 32, 64, 128, 1, 1, 2, 1, 1, false, "greedy", 1.0, false, same, 0.1),
-                1e4, 4);
+        Scaling.Yarn same = new Scaling.Yarn(40, 4096, 32, 1, 0.707, 0.707);
+        Rope r = new Rope(new RopeTable(64, 1e4, same, RopeTable.Pairing.INTERLEAVED), 4);
         check(r.cos[0] == 1f && r.sin[0] == 0f && Math.abs(r.cos[32 + 16] - (float) Math.cos(0.0055)) < 1e-6,
                 "yarn table without mscale correction");
-        DeepSeekConfig.Yarn diff = new DeepSeekConfig.Yarn(40, 4096, 32, 1, 1.0, 0.707);
-        Rope r2 = Rope.deepseek(new DeepSeekConfig(0, 512, 32, 64, 128, 1, 1, 2, 1, 1, false, "greedy", 1.0, false, diff, 0.1),
-                1e4, 4);
+        Scaling.Yarn diff = new Scaling.Yarn(40, 4096, 32, 1, 1.0, 0.707);
+        Rope r2 = new Rope(new RopeTable(64, 1e4, diff, RopeTable.Pairing.INTERLEAVED), 4);
         double m = 1.3688879454113936 / 1.2608037774058554;
         check(Math.abs(r2.cos[0] - m) < 1e-6 && Math.abs(r2.sin[32 + 16] - Math.sin(0.0055) * m) < 1e-6,
                 "yarn table scaled by mscale / mscale_all_dim");
@@ -1282,7 +1288,7 @@ public final class SmokeTest {
         float[] bias = {-0.5f, 0, 0, 0, 0, 0, 0.45f, 0.45f};
         int[] idx2 = new int[2];
         float[] w2 = new float[2];
-        DeepSeekConfig v3 = ds("noaux_tc", 4, 2, true, 2.5, true);
+        Router.DeepSeek v3 = ds("noaux_tc", 4, 2, true, 2.5, true);
         DeepSeekRouter.select(logit(s), bias, v3, 2, true, idx2, w2, new float[8]);
         check(Arrays.equals(idx2, new int[]{4, 6}) && near(w2, 2.5f * 0.8f / 1.1f, 2.5f * 0.3f / 1.1f),
                 "noaux_tc: selection on corrected scores, weights from the uncorrected: " + Arrays.toString(idx2) + Arrays.toString(w2));
@@ -1300,8 +1306,8 @@ public final class SmokeTest {
         check(i1[0] == 2, "group_limited_greedy ranks groups by their maximum: " + i1[0]);
     }
 
-    private static DeepSeekConfig ds(String method, int nGroup, int topkGroup, boolean sigmoid, double scale, boolean scaleAlways) {
-        return new DeepSeekConfig(0, 64, 32, 32, 32, 0, 1, 0, nGroup, topkGroup, sigmoid, method, scale, scaleAlways, null, 1.0);
+    private static Router.DeepSeek ds(String method, int nGroup, int topkGroup, boolean sigmoid, double scale, boolean scaleAlways) {
+        return new Router.DeepSeek(sigmoid, Router.TopK.valueOf(method.toUpperCase()), nGroup, topkGroup, scale, scaleAlways);
     }
 
     /** Logits whose sigmoid is {@code s}. */
@@ -1313,7 +1319,7 @@ public final class SmokeTest {
         return out;
     }
 
-    private static void route(double[] probs, DeepSeekConfig d, float[] bias, int k, boolean norm, int[] idx, float[] w) {
+    private static void route(double[] probs, Router.DeepSeek d, float[] bias, int k, boolean norm, int[] idx, float[] w) {
         float[] logits = new float[probs.length];
         for (int i = 0; i < probs.length; i++) {
             logits[i] = (float) Math.log(probs[i]);
@@ -1334,7 +1340,7 @@ public final class SmokeTest {
     static void deepseekConfigs() throws Exception {
         Path tmp = Files.createTempDirectory("jllm-cfg");
         try {
-            ModelConfig v2 = cfg(tmp, """
+            Architecture v2 = cfg(tmp, """
                     {"architectures":["DeepseekV2ForCausalLM"],"model_type":"deepseek_v2","bos_token_id":100000,
                      "eos_token_id":100001,"first_k_dense_replace":1,"hidden_act":"silu","hidden_size":2048,
                      "intermediate_size":10944,"kv_lora_rank":512,"max_position_embeddings":163840,
@@ -1345,15 +1351,20 @@ public final class SmokeTest {
                      "mscale_all_dim":0.707,"original_max_position_embeddings":4096,"type":"yarn"},"rope_theta":10000,
                      "routed_scaling_factor":1.0,"scoring_func":"softmax","tie_word_embeddings":false,"topk_group":1,
                      "topk_method":"greedy","v_head_dim":128,"vocab_size":102400}""");
-            DeepSeekConfig d = v2.deepseek();
-            check(v2.headDim() == 192 && v2.qDim() == 16 * 192 && v2.kvHeads() == 16 && d.qLoraRank() == 0 && d.vHeadDim() == 128
-                    && d.kvLoraRank() == 512 && d.nShared() == 2 && v2.numExperts() == 64 && v2.expertsPerTok() == 6
-                    && v2.moeDim() == 1408 && !v2.isMoeLayer(0) && v2.isMoeLayer(1) && v2.isMoeLayer(26) && !v2.tiedEmbeddings() && v2.eosTokenIds().equals(List.of(100001)) && v2.maxMlpDim() == 10944
-                    && !d.sigmoid() && d.topkMethod().equals("greedy") && !d.scaleAlways(), "deepseek-v2-lite config");
+            Attention.Mla d = mla(v2);
+            Mlp.Moe e2 = moe(v2);
+            Router.DeepSeek r2 = (Router.DeepSeek) e2.router();
+            check(d.qkDim() == 192 && d.qDim() == 16 * 192 && d.heads() == 16 && d.qLoraRank() == 0 && d.vDim() == 128
+                    && d.kvLoraRank() == 512 && e2.shared().hidden() == 2 * 1408 && e2.experts() == 64 && e2.topK() == 6
+                    && e2.moeDim() == 1408 && !moeLayer(v2, 0) && moeLayer(v2, 1) && moeLayer(v2, 26) && !v2.core().tiedEmbeddings()
+                    && v2.core().eosTokenIds().equals(List.of(100001)) && decoder(v2).maxMlpDim() == 10944
+                    && !r2.sigmoid() && r2.topK() == Router.TopK.GREEDY && !r2.scaleAlways(), "deepseek-v2-lite config");
             // softmax scale = 192^-0.5 * (0.1 * 0.707 * ln 40 + 1)^2
-            check(Math.abs(d.softmaxScale() - 0.07216878364870322 * 1.5896261651208736) < 1e-12 && d.yarn().factor() == 40,
-                    "deepseek-v2-lite attention scale with the yarn mscale: " + d.softmaxScale());
-            ModelConfig v3 = cfg(tmp, """
+            check(Math.abs(d.scale() - 0.07216878364870322 * 1.5896261651208736) < 1e-7
+                    && rope(v2).scaling() instanceof Scaling.Yarn y2 && y2.factor() == 40 && rope(v2).rotaryDim() == 64
+                    && rope(v2).pairing() == RopeTable.Pairing.INTERLEAVED,
+                    "deepseek-v2-lite attention scale with the yarn mscale: " + d.scale());
+            Architecture v3 = cfg(tmp, """
                     {"architectures":["DeepseekV3ForCausalLM"],"model_type":"deepseek_v3","bos_token_id":0,"eos_token_id":1,
                      "first_k_dense_replace":3,"hidden_size":7168,"intermediate_size":18432,"kv_lora_rank":512,
                      "moe_intermediate_size":2048,"moe_layer_freq":1,"n_group":8,"n_routed_experts":256,"n_shared_experts":1,
@@ -1364,11 +1375,12 @@ public final class SmokeTest {
                      "routed_scaling_factor":2.5,"scoring_func":"sigmoid","tie_word_embeddings":false,"topk_group":4,
                      "topk_method":"noaux_tc","v_head_dim":128,"vocab_size":129280,
                      "quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}""");
-            DeepSeekConfig d3 = v3.deepseek();
-            check(d3.qLoraRank() == 1536 && d3.sigmoid() && d3.topkMethod().equals("noaux_tc") && d3.nGroup() == 8
-                    && d3.topkGroup() == 4 && d3.routedScale() == 2.5 && d3.scaleAlways() && v3.normTopK()
-                    && !v3.isMoeLayer(2) && v3.isMoeLayer(3) && v3.maxMlpDim() == 18432
-                    && Math.abs(d3.softmaxScale() - 0.07216878364870322 * 1.3688879454113936 * 1.3688879454113936) < 1e-12,
+            Attention.Mla d3 = mla(v3);
+            Router.DeepSeek r3 = (Router.DeepSeek) moe(v3).router();
+            check(d3.qLoraRank() == 1536 && r3.sigmoid() && r3.topK() == Router.TopK.NOAUX_TC && r3.nGroup() == 8
+                    && r3.topkGroup() == 4 && r3.routedScale() == 2.5 && r3.scaleAlways() && moe(v3).normTopK()
+                    && !moeLayer(v3, 2) && moeLayer(v3, 3) && decoder(v3).maxMlpDim() == 18432
+                    && Math.abs(d3.scale() - 0.07216878364870322 * 1.3688879454113936 * 1.3688879454113936) < 1e-7,
                     "deepseek-v3 config");
             // the V2 chat template of tokenizer_config.json
             ChatTemplate.Format f = ChatTemplate.forModelType("deepseek_v2");
@@ -1411,9 +1423,52 @@ public final class SmokeTest {
         }
     }
 
-    private static ModelConfig cfg(Path dir, String json) throws java.io.IOException {
+    static Architecture cfg(Path dir, String json) throws java.io.IOException {
         Files.writeString(dir.resolve("config.json"), json);
-        return ModelConfig.load(dir);
+        return Architecture.load(dir);
+    }
+
+    // ------------------------------------------------------------------ architecture helpers for the config checks
+
+    static Decoder decoder(Architecture a) {
+        return (Decoder) a;
+    }
+
+    /** The grouped-query attention of layer {@code l}. */
+    static Attention.Gqa gqa(Architecture a, int l) {
+        return (Attention.Gqa) decoder(a).layers().get(l).attn();
+    }
+
+    /** The latent attention (uniform across layers). */
+    static Attention.Mla mla(Architecture a) {
+        return (Attention.Mla) decoder(a).attention();
+    }
+
+    /** The global rotary table. */
+    static RopeTable rope(Architecture a) {
+        return decoder(a).ropeTables().getFirst();
+    }
+
+    static boolean interleaved(Architecture a) {
+        return rope(a).pairing() == RopeTable.Pairing.INTERLEAVED;
+    }
+
+    static boolean postNorms(Architecture a) {
+        return decoder(a).layers().getFirst().norms().post();
+    }
+
+    static boolean moeLayer(Architecture a, int l) {
+        return decoder(a).layers().get(l).mlp() instanceof Mlp.Moe;
+    }
+
+    /** The first MoE layer's spec. */
+    static Mlp.Moe moe(Architecture a) {
+        for (LayerSpec s : decoder(a).layers()) {
+            if (s.mlp() instanceof Mlp.Moe m) {
+                return m;
+            }
+        }
+        throw new IllegalStateException("no MoE layer in " + a);
     }
 
     static void checkEq(int[] a, int[] b, String what) {

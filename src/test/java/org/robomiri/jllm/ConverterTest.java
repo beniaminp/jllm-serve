@@ -2,11 +2,13 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.ModelConverter;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.QuantFile;
+import org.robomiri.jllm.model.Router;
+import org.robomiri.jllm.model.Scaling;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
@@ -84,50 +86,53 @@ public final class ConverterTest {
     static void configs(Path scratch) throws IOException {
         Path d = fresh(scratch.resolve("synthetic-config"));
         try {
-            ModelConfig llama = cfg(d, """
+            Architecture llama = cfg(d, """
                     {"architectures":["LlamaForCausalLM"],"model_type":"llama","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"vocab_size":100,
                      "rope_parameters":{"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":4.0,
                      "original_max_position_embeddings":8192,"rope_theta":500000.0}}""");
-            check(llama.ropeScaling() != null && llama.ropeScaling().type().equals("llama3") && llama.ropeScaling().factor() == 8.0
-                    && llama.ropeTheta() == 500000.0 && llama.normEps() == 1e-6f, "llama: scaling and theta from rope_parameters");
-            ModelConfig qwen3 = cfg(d, """
+            check(SmokeTest.rope(llama).scaling() instanceof Scaling.Llama3 l3 && l3.factor() == 8.0
+                    && SmokeTest.rope(llama).theta() == 500000.0 && llama.core().normEps() == 1e-6f, "llama: scaling and theta from rope_parameters");
+            Architecture qwen3 = cfg(d, """
                     {"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":4,"num_attention_heads":2,"num_key_value_heads":1,"vocab_size":100,
                      "use_sliding_window":true,"sliding_window":16,"max_window_layers":2}""");
-            check(qwen3.windowFor(1) == 0 && qwen3.windowFor(2) == 16 && qwen3.windowFor(3) == 16,
+            check(SmokeTest.gqa(qwen3, 1).window() == 0 && SmokeTest.gqa(qwen3, 2).window() == 16 && SmokeTest.gqa(qwen3, 3).window() == 16,
                     "qwen3: use_sliding_window from max_window_layers");
-            ModelConfig g2 = cfg(d, """
+            Architecture g2 = cfg(d, """
                     {"architectures":["Gemma2ForCausalLM"],"model_type":"gemma2","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":100,
                      "sliding_window":8,"query_pre_attn_scalar":32}""");
-            check(g2.attnSoftcap() == 50f && g2.finalSoftcap() == 30f && g2.ropeTheta() == 1e4, "gemma2: softcap defaults 50/30, theta 1e4");
-            ModelConfig g2off = cfg(d, """
+            check(SmokeTest.gqa(g2, 0).softcap() == 50f && g2.core().finalSoftcap() == 30f && SmokeTest.rope(g2).theta() == 1e4,
+                    "gemma2: softcap defaults 50/30, theta 1e4");
+            Architecture g2off = cfg(d, """
                     {"architectures":["Gemma2ForCausalLM"],"model_type":"gemma2","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":100,
                      "sliding_window":8,"query_pre_attn_scalar":32,"attn_logit_softcapping":null,"final_logit_softcapping":null}""");
-            check(g2off.attnSoftcap() == 0f && g2off.finalSoftcap() == 0f, "gemma2: explicit null soft-capping is off");
-            ModelConfig g3 = cfg(d, """
+            check(SmokeTest.gqa(g2off, 0).softcap() == 0f && g2off.core().finalSoftcap() == 0f, "gemma2: explicit null soft-capping is off");
+            Architecture g3 = cfg(d, """
                     {"architectures":["Gemma3ForCausalLM"],"model_type":"gemma3_text","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":6,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":100,
                      "sliding_window":8,"query_pre_attn_scalar":32}""");
-            check(g3.attnSoftcap() == 0f && g3.finalSoftcap() == 0f && g3.ropeTheta() == 1e6 && g3.gemma().localRopeTheta() == 1e4
-                    && g3.usesLocalRope(0) && !g3.usesLocalRope(5), "gemma3: no softcap, theta 1e6, local 1e4");
+            check(SmokeTest.gqa(g3, 0).softcap() == 0f && g3.core().finalSoftcap() == 0f && SmokeTest.rope(g3).theta() == 1e6
+                    && SmokeTest.decoder(g3).ropeTables().get(1).theta() == 1e4
+                    && SmokeTest.gqa(g3, 0).ropeTable() == 1 && SmokeTest.gqa(g3, 5).ropeTable() == 0, "gemma3: no softcap, theta 1e6, local 1e4");
             check(cfg(d, """
                     {"architectures":["Phi3ForCausalLM"],"model_type":"phi3","hidden_size":64,"intermediate_size":128,
-                     "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"vocab_size":100}""").normEps() == 1e-5f,
+                     "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"vocab_size":100}""").core().normEps() == 1e-5f,
                     "phi3: rms_norm_eps defaults to 1e-5");
             check(cfg(d, """
                     {"architectures":["GlmForCausalLM"],"model_type":"glm","hidden_size":64,"intermediate_size":128,
-                     "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"vocab_size":100}""").normEps() == 1.5625e-7f,
+                     "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":2,"vocab_size":100}""").core().normEps() == 1.5625e-7f,
                     "glm: rms_norm_eps defaults to 1.5625e-7");
-            ModelConfig v3 = cfg(d, """
+            Architecture v3 = cfg(d, """
                     {"architectures":["DeepseekV3ForCausalLM"],"model_type":"deepseek_v3","hidden_size":64,"intermediate_size":128,
                      "num_hidden_layers":2,"num_attention_heads":2,"vocab_size":100,"q_lora_rank":0,"kv_lora_rank":32,
                      "qk_nope_head_dim":16,"qk_rope_head_dim":16,"v_head_dim":16,"n_routed_experts":16,"num_experts_per_tok":2,
                      "moe_intermediate_size":32,"first_k_dense_replace":1}""");
-            check(v3.deepseek().sigmoid() && v3.deepseek().topkMethod().equals("noaux_tc") && v3.deepseek().nGroup() == 8
-                    && v3.deepseek().topkGroup() == 4 && v3.deepseek().routedScale() == 2.5 && v3.normTopK(),
+            Router.DeepSeek r3 = (Router.DeepSeek) SmokeTest.moe(v3).router();
+            check(r3.sigmoid() && r3.topK() == Router.TopK.NOAUX_TC && r3.nGroup() == 8
+                    && r3.topkGroup() == 4 && r3.routedScale() == 2.5 && SmokeTest.moe(v3).normTopK(),
                     "deepseek_v3: sigmoid / noaux_tc / 8 groups keep 4 / 2.5 / norm_topk_prob defaults");
             String shortTypes = rejects(d, """
                     {"architectures":["Gemma3ForCausalLM"],"model_type":"gemma3_text","hidden_size":64,"intermediate_size":128,
@@ -149,9 +154,9 @@ public final class ConverterTest {
         }
     }
 
-    private static ModelConfig cfg(Path dir, String json) throws IOException {
+    private static Architecture cfg(Path dir, String json) throws IOException {
         Files.writeString(dir.resolve("config.json"), json);
-        return ModelConfig.load(dir);
+        return Architecture.load(dir);
     }
 
     private static String rejects(Path dir, String json) throws IOException {
@@ -252,7 +257,7 @@ public final class ConverterTest {
                 }
             }
         });
-        ModelConverter.convert(dir, ModelConfig.load(dir), quant, ShardProvider.local(dir));
+        ModelConverter.convert(dir, Architecture.load(dir), quant, ShardProvider.local(dir));
         System.err.println("conversion finished before the simulated crash");
         System.exit(3);
     }
@@ -280,9 +285,9 @@ public final class ConverterTest {
                 "after the crash: sidecar with " + recorded + " units, .bin present, no index");
         long binAfterCrash = Files.size(QuantFile.binPath(dir, q));
 
-        ModelConfig cfg = ModelConfig.load(dir);
+        Architecture cfg = Architecture.load(dir);
         List<String> plan = new ArrayList<>(List.of("embed"));
-        for (int l = 0; l < cfg.layers(); l++) {
+        for (int l = 0; l < cfg.core().layers(); l++) {
             plan.add("layer." + l);
         }
         plan.add("final");
@@ -292,7 +297,7 @@ public final class ConverterTest {
         }
         CountingProvider resumed = new CountingProvider(dir, false);
         try (ModelWeights w = ModelWeights.load(dir, cfg, q, resumed)) {
-            check(w.layers.length == cfg.layers(), "resumed conversion loads");
+            check(w.layers.length == cfg.core().layers(), "resumed conversion loads");
         }
         check(resumed.ensured > 0, "resumed conversion read the checkpoint");
         String resumedHash = sha256(QuantFile.binPath(dir, q));
@@ -302,7 +307,7 @@ public final class ConverterTest {
 
         QuantFile.delete(dir, q);
         try (ModelWeights w = ModelWeights.load(dir, cfg, q, ShardProvider.local(dir))) {
-            check(w.layers.length == cfg.layers(), "fresh conversion loads");
+            check(w.layers.length == cfg.core().layers(), "fresh conversion loads");
         }
         check(sha256(QuantFile.binPath(dir, q)).equals(resumedHash), "resumed .bin is byte-identical to a fresh conversion");
         check(tensors(QuantFile.jsonPath(dir, q)).equals(resumedIndex), "resumed index equals the fresh one");
@@ -313,10 +318,10 @@ public final class ConverterTest {
 
     static void staleCacheReconversion(Path dir) throws Exception {
         QType q = QType.Q4_0;
-        ModelConfig cfg = ModelConfig.load(dir);
+        Architecture cfg = Architecture.load(dir);
         QuantFile.delete(dir, q);
         try (ModelWeights w = ModelWeights.load(dir, cfg, q, ShardProvider.local(dir))) {
-            check(w.layers.length == cfg.layers(), "tiny MoE converts");
+            check(w.layers.length == cfg.core().layers(), "tiny MoE converts");
         }
         String hash = sha256(QuantFile.binPath(dir, q));
         Path json = QuantFile.jsonPath(dir, q);
@@ -365,7 +370,7 @@ public final class ConverterTest {
 
     static void identityMismatch(Path dir) throws Exception {
         QType q = QType.Q8_0;
-        ModelConfig cfg = ModelConfig.load(dir);
+        Architecture cfg = Architecture.load(dir);
         QuantFile.delete(dir, q);
         CountingProvider a = loadCounting(dir, cfg, q, "hf-internal-testing/tiny-random-Qwen3MoeForCausalLM@main");
         Map<String, Object> header = Json.parseObject(Files.readString(QuantFile.jsonPath(dir, q)));
@@ -386,10 +391,10 @@ public final class ConverterTest {
         check(repo.ensured > 0, "other repo: reconverted");
     }
 
-    private static CountingProvider loadCounting(Path dir, ModelConfig cfg, QType q, String identity) throws IOException {
+    private static CountingProvider loadCounting(Path dir, Architecture cfg, QType q, String identity) throws IOException {
         CountingProvider p = new CountingProvider(dir, false);
         try (ModelWeights w = ModelWeights.load(dir, cfg, q, p, identity)) {
-            check(w.layers.length == cfg.layers(), "load " + q + (identity != null ? " as " + identity : ""));
+            check(w.layers.length == cfg.core().layers(), "load " + q + (identity != null ? " as " + identity : ""));
         }
         return p;
     }
@@ -543,14 +548,15 @@ public final class ConverterTest {
             writeSafetensors(d.resolve("model-00001-of-00002.safetensors"), a, null);
             writeSafetensors(d.resolve("model-00002-of-00002.safetensors"), b, null);
             writeIndex(d, shardOf);
-            ModelConfig cfg = ModelConfig.load(d);
-            check(cfg.attentionBias(), "synthetic qwen2 has q/k/v biases");
+            Architecture cfg = Architecture.load(d);
+            check(SmokeTest.gqa(cfg, 0).bias(), "synthetic qwen2 has q/k/v biases");
             CountingProvider p = new CountingProvider(d, true);
             try (ModelWeights w = ModelWeights.load(d, cfg, QType.Q8_0, p)) {
                 float[] bq1 = values("model.layers.1.self_attn.q_proj.bias", new int[]{32});
                 float[] bv1 = values("model.layers.1.self_attn.v_proj.bias", new int[]{16});
-                check(Arrays.equals(w.layers[1].bq, bq1) && Arrays.equals(w.layers[1].bv, bv1), "layer 1 biases converted from shard B");
-                check(w.layers[0].wo.rows == 32 && w.layers[0].wo.cols == 32, "layer 0 o_proj converted from shard B");
+                check(Arrays.equals(w.decoderLayer(1).gqa().bq(), bq1) && Arrays.equals(w.decoderLayer(1).gqa().bv(), bv1),
+                        "layer 1 biases converted from shard B");
+                check(w.decoderLayer(0).wo().rows == 32 && w.decoderLayer(0).wo().cols == 32, "layer 0 o_proj converted from shard B");
             }
             check(p.released.equals(List.of("model-00002-of-00002.safetensors", "model-00001-of-00002.safetensors")),
                     "low-disk: shard B released once, after its last read in layer 1, then shard A: " + p.released);
@@ -586,7 +592,7 @@ public final class ConverterTest {
     private static String convertFails(Path d, QType q) throws IOException {
         QuantFile.delete(d, q);
         try {
-            ModelConverter.convert(d, ModelConfig.load(d), q, ShardProvider.local(d));
+            ModelConverter.convert(d, Architecture.load(d), q, ShardProvider.local(d));
             return null;
         } catch (IOException e) {
             return e.getMessage();

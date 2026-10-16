@@ -4,7 +4,7 @@ import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.Backend;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
 import org.robomiri.jllm.server.HttpServer;
@@ -422,7 +422,7 @@ public final class ServerTest {
             Files.writeString(tmp.resolve("config.json"), "{\"model_type\":\"" + modelType + "\",\"hidden_size\":64,"
                     + "\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":128,\"vocab_size\":" + tok.vocabSize()
                     + ",\"eos_token_id\":" + tok.tokenId("<|im_end|>") + bos + "}");
-            ModelConfig cfg = ModelConfig.load(tmp);
+            Architecture cfg = Architecture.load(tmp);
             backend = new FakeBackend(ctx, tok.encode(" hello")[0]);
             engine = new Engine(backend, tok, cfg, Set.of(tok.tokenId("<|im_end|>")), QUEUE_TIMEOUT,
                     ChatTemplate.forModelType("qwen3"));
