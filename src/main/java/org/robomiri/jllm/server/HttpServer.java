@@ -491,6 +491,7 @@ public final class HttpServer implements AutoCloseable {
                     if (!res.started()) {
                         res.send(404, "text/plain", "not found");
                     }
+                    res.end();
                 } catch (Exception e) {
                     if (res.started() && e instanceof IOException) {
                         return; // the client went away mid-stream: nothing to report
@@ -500,11 +501,12 @@ public final class HttpServer implements AutoCloseable {
                     if (!res.started()) {
                         res.send(500, "application/json", errorJson("server_error", "internal server error"));
                     } else {
-                        return; // can't recover a half-written response; drop the connection
-                    }
-                } finally {
-                    if (res.started() && !res.ended()) {
-                        res.end();
+                        // A stream that died must not look complete: unless the handler ended it itself (after
+                        // reporting the error in-band), cut it off without the chunked terminator.
+                        if (!res.ended()) {
+                            res.abort();
+                        }
+                        return;
                     }
                 }
                 if (!keepAlive || !probe.nextRequest()) {

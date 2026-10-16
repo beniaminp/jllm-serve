@@ -248,6 +248,14 @@ public final class ApiServer implements AutoCloseable {
             }
             res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
             return;
+        } catch (RuntimeException e) {
+            if (res.started()) {
+                // The status line is long gone: tell the client in-band (OpenAI SDKs raise on an "error" event),
+                // then end the stream without [DONE]. HttpServer logs the exception and drops the connection.
+                sse(res, Json.obj("error", Json.obj("message", "internal server error", "type", "server_error")));
+                res.end();
+            }
+            throw e;
         }
         if (failure[0] != null) {
             throw failure[0];

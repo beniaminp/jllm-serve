@@ -263,10 +263,17 @@ Streaming uses the same `text_completion` objects with a `text` field per event.
 {"error": {"message": "invalid JSON: JSON expected object key at offset 1", "type": "invalid_request_error"}}
 ```
 
-400 for malformed JSON, missing `messages`, or invalid sampling values; 404 unknown route; 405 wrong method.
-An unexpected exception inside a handler produces a plain-text 500 from `HttpServer` (and, if the stream had
-already started, the connection is dropped) — a prompt longer than the context currently ends up here rather
-than as a 400, a known gap.
+400 for malformed JSON, missing `messages`, invalid sampling values or a prompt that does not leave room in the
+context (`"code": "context_length_exceeded"`, measured on the prompt *with* the family BOS token that the engine
+prepends); 404 unknown route; 405 wrong method; 408 when a request takes longer than `server.read-timeout-ms`
+to arrive; 413 body too large; 503 when the engine stays busy for longer than `server.queue-timeout-ms`. An
+unexpected exception inside a handler produces the same JSON shape with status 500.
+
+When the exception happens *after* a stream has started, the status line is long gone. The server then sends
+one more event, `data: {"error": {"message": "internal server error", "type": "server_error"}}`, ends the
+chunked body properly and closes the connection — no `[DONE]`. The OpenAI SDKs raise an `APIError` when a
+stream event carries an `error` key, so clients see a failure rather than a short answer. (A handler that dies
+without reporting in-band is cut off without the chunked terminator, which also reads as an incomplete body.)
 
 ### Thinking mode
 

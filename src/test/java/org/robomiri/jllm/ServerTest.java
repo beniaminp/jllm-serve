@@ -48,6 +48,7 @@ public final class ServerTest {
             disconnectedClient(f, false);
             disconnectedClient(f, true);
             slowRequest(f);
+            midStreamFailure(f);
         }
         try (Fixture f = new Fixture(tok, "llama", 64)) {
             bosContextCheck(f);
@@ -193,6 +194,24 @@ public final class ServerTest {
             check(c == -1 && ms >= READ_TIMEOUT - 50 && ms < 3 * READ_TIMEOUT,
                     "idle keep-alive: closed silently after " + ms + " ms");
         }
+    }
+
+    /** M4: a backend failure after the stream has started ends it with an in-band error event and no [DONE]. */
+    static void midStreamFailure(Fixture f) throws Exception {
+        f.backend.failAfter = f.backend.forwards.get() + 4; // prompt, then a few tokens, then the failure
+        System.err.println("(a stack trace of the injected failure follows: expected)");
+        try {
+            Resp r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":50,\"temperature\":0,\"stream\":true}");
+            String[] events = r.body.split("\n\n");
+            String last = events[events.length - 1];
+            check(r.status == 200 && last.startsWith("data: {\"error\":") && last.contains("\"server_error\"")
+                    && !r.body.contains("[DONE]") && r.body.contains("\"content\":\" hello\""),
+                    "mid-stream failure: tokens, then an error event, then a proper end without [DONE]");
+        } finally {
+            f.backend.failAfter = -1;
+        }
+        check(f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,\"temperature\":0}").status == 200,
+                "mid-stream failure: the server keeps serving afterwards");
     }
 
     /**
