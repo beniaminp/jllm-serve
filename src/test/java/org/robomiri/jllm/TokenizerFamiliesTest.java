@@ -411,6 +411,21 @@ public final class TokenizerFamiliesTest {
         check(t.decode(new int[]{1, 7, 8}).equals("é"), "byte fallback decodes to bytes; first space stripped");
         check(!t.isByteLevel(), "SentencePiece-style tokenizer is not byte-level");
 
+        // Strip normalizer = Rust char::is_whitespace (Unicode White_Space: NBSP, ideographic space, NEL, line
+        // separator...), not Java's Character.isWhitespace (which would also eat U+001C..U+001F)
+        // (reference ids from the Python tokenizers package on the same tiny tokenizer)
+        String stripTok = "{\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"byte_fallback\":true,\"vocab\":{\"<unk>\":0,"
+                + "\"x\":1,\"y\":2,\"<0x1C>\":3,\"<0xC2>\":4,\"<0xA0>\":5,\"_\":6,\"▁\":7,\"<0x1F>\":8},\"merges\":[]},"
+                + "\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"Strip\",\"strip_left\":true,"
+                + "\"strip_right\":true},{\"type\":\"Replace\",\"pattern\":{\"Regex\":\"\\\\s+\"},\"content\":\"_\"}]}}";
+        Tokenizer st = Tokenizer.fromJson(stripTok);
+        checkEq(st.encode(" 　\u0085x    "), new int[]{1}, "Strip removes every White_Space character");
+        checkEq(st.encode("\u001Cx\u001F"), new int[]{3, 1, 8}, "Strip keeps U+001C / U+001F (not White_Space)");
+        checkEq(st.encode("x y"), new int[]{1, 6, 2}, "Replace regex \\s matches NBSP (UNICODE_CHARACTER_CLASS)");
+        checkEq(st.encode("x\u0085y"), new int[]{1, 6, 2}, "Replace regex \\s matches NEL");
+        checkEq(st.encode("x 　y"), new int[]{1, 6, 2}, "Replace regex \\s+ spans ASCII and ideographic space");
+        checkEq(st.encode("x\u001Cy"), new int[]{1, 3, 2}, "Replace regex \\s does not match U+001C");
+
         // a Metaspace decoder drops every ▁ of the first token (reference: decode_chain of Metaspace), not one
         // space of the text; with prepend_scheme "never" nothing is dropped
         String msVocab = "{\"model\":{\"type\":\"BPE\",\"unk_token\":\"<unk>\",\"byte_fallback\":true,\"vocab\":{\"<unk>\":0,"

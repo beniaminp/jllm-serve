@@ -55,16 +55,16 @@ final class Normalizers {
                 String p = Json.str(node, "prepend", "");
                 ops.add(s -> s.isEmpty() ? s : p + s); // HF prepends to non-empty text only
             }
-            case "Strip" -> {
+            case "Strip" -> { // Rust str::trim_start / trim_end: the Unicode White_Space property
                 boolean left = Json.bool(node, "strip_left", true);
                 boolean right = Json.bool(node, "strip_right", true);
                 ops.add(s -> {
                     int a = 0;
                     int b = s.length();
-                    while (left && a < b && Character.isWhitespace(s.charAt(a))) {
+                    while (left && a < b && isWhiteSpace(s.charAt(a))) {
                         a++;
                     }
-                    while (right && b > a && Character.isWhitespace(s.charAt(b - 1))) {
+                    while (right && b > a && isWhiteSpace(s.charAt(b - 1))) {
                         b--;
                     }
                     return s.substring(a, b);
@@ -81,12 +81,27 @@ final class Normalizers {
                     if (regex == null) {
                         throw new IllegalArgumentException("Replace normalizer has no String/Regex pattern");
                     }
-                    Pattern p = Pattern.compile(regex);
+                    // UNICODE_CHARACTER_CLASS like the pre-tokenizer regexes: the Rust regex crate's \s, \w, \d
+                    // are Unicode-aware, Java's are ASCII-only by default
+                    Pattern p = Pattern.compile(regex, Pattern.UNICODE_CHARACTER_CLASS);
                     String repl = Matcher.quoteReplacement(content);
                     ops.add(s -> p.matcher(s).replaceAll(repl));
                 }
             }
             default -> throw new IllegalArgumentException("unsupported normalizer type: " + type);
         }
+    }
+
+    /**
+     * Rust's {@code char::is_whitespace}: exactly the code points with the Unicode {@code White_Space} property.
+     * Differs from {@link Character#isWhitespace} (which adds U+001C..U+001F and lacks the no-break spaces) and
+     * from {@link Character#isSpaceChar} (which lacks the controls).
+     */
+    static boolean isWhiteSpace(int c) {
+        if (c < 0x80) {
+            return (c >= 0x09 && c <= 0x0D) || c == 0x20;
+        }
+        return c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028
+                || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
     }
 }

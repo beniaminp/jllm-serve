@@ -565,10 +565,7 @@ public final class Tokenizer {
 
     /** Rust's {@code char::is_whitespace}, which decides what lstrip / rstrip tokens swallow. */
     private static boolean isWhitespace(char c) {
-        if (c >= 0x1C && c <= 0x1F) {
-            return false;
-        }
-        return Character.isWhitespace(c) || Character.isSpaceChar(c) || c == 0x85;
+        return Normalizers.isWhiteSpace(c);
     }
 
     private void encodeOrdinary(String text, IntList out, boolean first) {

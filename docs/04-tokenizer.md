@@ -278,7 +278,10 @@ loop is the same O(n log n) heap, so this stays fast, but such chunks are too lo
 - **Split behaviors**: `Isolated`, `Removed`, `MergedWithPrevious`, `MergedWithNext`, `Contiguous`, with
   `invert`. Phi-4's `Removed` + `invert: true` keeps the regex matches and drops what lies between them.
 - **ByteLevel** with `add_prefix_space` and `use_regex`; **Digits**, **WhitespaceSplit**, **Whitespace**.
-- **Normalizers** `Sequence`, `NFC/NFD/NFKC/NFKD`, `Prepend`, `Replace` (string or regex), `Strip`, `Lowercase`.
+- **Normalizers** `Sequence`, `NFC/NFD/NFKC/NFKD`, `Prepend`, `Replace` (string or regex; the regex is compiled
+  with `UNICODE_CHARACTER_CLASS` like the pre-tokenizer patterns, so `\s` matches NBSP as in Rust), `Strip`
+  (Rust's `char::is_whitespace`, i.e. exactly the Unicode `White_Space` set — the same predicate decides what
+  `lstrip` / `rstrip` added tokens swallow), `Lowercase`.
 - **Added tokens with `lstrip` / `rstrip`.** Phi-3 and Phi-4 declare `<|user|>`, `<|end|>`, `<|assistant|>`, … with
   `rstrip: true`: the tokenizer swallows the whitespace after such a token, so `<|user|>\nhi` encodes as
   `<|user|>` `hi` and the newline never reaches the model. The reference does this and so do we, also across the
