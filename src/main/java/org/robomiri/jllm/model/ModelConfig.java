@@ -8,7 +8,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Hyper-parameters from a Hugging Face {@code config.json}: Llama ({@code llama}), Mistral ({@code mistral}),
@@ -328,36 +327,32 @@ public record ModelConfig(
         if (partialRotary <= 0 || partialRotary > 1 || (int) (headDim * partialRotary) < 2) {
             throw new IllegalArgumentException("invalid partial_rotary_factor " + partialRotary);
         }
-        double ropeTheta = Json.dbl(c, "rope_theta", Json.dbl(globalRope, "rope_theta", 10000.0));
+        boolean gemma3 = modelType.equals("gemma3_text");
+        // class defaults: Gemma3TextConfig 1e6 (local layers 1e4), everything else 1e4
+        double ropeTheta = Json.dbl(c, "rope_theta", Json.dbl(globalRope, "rope_theta", gemma3 ? 1e6 : 1e4));
         int window = 0;
         int windowFrom = 0;
         long sw = Json.num(c, "sliding_window", 0);
+        boolean qwen3 = modelType.startsWith("qwen3");
         if (sw > 0) {
             if (modelType.equals("mistral") || gemma) {
                 window = (int) Math.min(sw, Integer.MAX_VALUE);
             } else if (phi3) {
                 // all layers; Phi-3.5 / Phi-4-mini set 262144, which is never reached
                 window = (int) Math.min(sw, Integer.MAX_VALUE);
-            } else if (qwen2 && Json.bool(c, "use_sliding_window", false)) {
+            } else if ((qwen2 || qwen3) && Json.bool(c, "use_sliding_window", false)) {
+                // Qwen2Config / Qwen3Config / Qwen3MoeConfig: layers >= max_window_layers use the window
                 window = (int) Math.min(sw, Integer.MAX_VALUE);
                 windowFrom = (int) Json.num(c, "max_window_layers", layers);
             }
         }
-        double localTheta = Json.dbl(c, "rope_local_base_freq", Json.dbl(localRope, "rope_theta", 0));
+        double localTheta = Json.dbl(c, "rope_local_base_freq", Json.dbl(localRope, "rope_theta", gemma3 ? 1e4 : 0));
         ModelConfig.RopeScaling scaling = isDeepseek ? null // DeepSeek: yarn lives in ds
                 : parseRopeScaling(ropeScaling, c, (int) (headDim * partialRotary) & ~1);
-        List<Integer> eos = new java.util.ArrayList<>();
-        Object eosRaw = c.get("eos_token_id");
-        if (eosRaw instanceof Number n) {
-            eos.add(n.intValue());
-        } else if (eosRaw instanceof List<?> l) {
-            for (Object o : l) {
-                eos.add(((Number) o).intValue());
-            }
-        }
-        List<Object> mlpOnly = Json.list(c, "mlp_only_layers");
-        Set<Integer> mlpOnlyLayers = mlpOnly == null ? Set.of()
-                : mlpOnly.stream().map(o -> ((Number) o).intValue()).collect(Collectors.toUnmodifiableSet());
+        List<Integer> eos = intList(c, "eos_token_id");
+        Set<Integer> mlpOnlyLayers = Set.copyOf(intList(c, "mlp_only_layers"));
+        // class defaults: Phi3Config 1e-5, GlmConfig / Glm4Config 1.5625e-7, the other families 1e-6
+        double normEps = Json.dbl(c, "rms_norm_eps", phi3 ? 1e-5 : glm ? 1.5625e-7 : 1e-6);
         int numExperts = (int) Json.num(c, isDeepseek ? "n_routed_experts" : "num_experts", 0);
         int expertsPerTok = (int) Json.num(c, "num_experts_per_tok", 0);
         int moeDim = (int) Json.num(c, "moe_intermediate_size", 0);
@@ -383,13 +378,13 @@ public record ModelConfig(
                 headDim,
                 vocab,
                 (int) Json.num(c, "max_position_embeddings", 4096),
-                (float) Json.dbl(c, "rms_norm_eps", 1e-6),
+                (float) normEps,
                 ropeTheta,
                 Json.bool(c, "tie_word_embeddings", gemma), // Gemma configs omit the key; the class default is true
                 numExperts,
                 expertsPerTok,
                 moeDim,
-                Json.bool(c, "norm_topk_prob", false),
+                Json.bool(c, "norm_topk_prob", modelType.equals("deepseek_v3")), // DeepseekV3Config defaults to true
                 (int) Json.num(c, "decoder_sparse_step", 1),
                 mlpOnlyLayers,
                 partialRotary,
@@ -411,10 +406,19 @@ public record ModelConfig(
         boolean g3 = modelType.equals("gemma3_text");
         boolean[] local = new boolean[layers];
         List<Object> types = Json.list(c, "layer_types");
+        if (types != null && types.size() < layers) {
+            throw new IllegalArgumentException("config.json: layer_types has " + types.size() + " entries for "
+                    + layers + " layers");
+        }
         int pattern = (int) Json.num(c, "sliding_window_pattern", 6);
         for (int l = 0; l < layers; l++) {
-            if (types != null && l < types.size()) {
-                local[l] = "sliding_attention".equals(types.get(l));
+            if (types != null) {
+                Object t = types.get(l);
+                if (!"sliding_attention".equals(t) && !"full_attention".equals(t)) {
+                    throw new IllegalArgumentException("config.json: unsupported layer_types[" + l + "] = " + t
+                            + " (sliding_attention, full_attention)");
+                }
+                local[l] = "sliding_attention".equals(t);
             } else if (g3) {
                 local[l] = pattern > 0 && (l + 1) % pattern != 0;
             } else {
@@ -429,8 +433,40 @@ public record ModelConfig(
         } else if (dtype.equals("float16")) {
             embedScale = Float.float16ToFloat(Float.floatToFloat16(embedScale));
         }
-        return new Gemma((float) Json.dbl(c, "attn_logit_softcapping", 0), (float) Json.dbl(c, "final_logit_softcapping", 0),
+        // Gemma2Config defaults the caps to 50 / 30; Gemma3TextConfig to None (off). An explicit null is off.
+        return new Gemma((float) softcap(c, "attn_logit_softcapping", g3 ? 0 : 50),
+                (float) softcap(c, "final_logit_softcapping", g3 ? 0 : 30),
                 Json.dbl(c, "query_pre_attn_scalar", 256), local, g3 ? localTheta : 0, embedScale);
+    }
+
+    /** A soft-capping value: {@code def} when the key is absent, 0 (off) when it is null, else the number. */
+    private static double softcap(Map<String, Object> c, String key, double def) {
+        return c.containsKey(key) ? Json.dbl(c, key, 0) : def;
+    }
+
+    /**
+     * {@code key} as a list of ints: absent or null gives the empty list, a single int a one-entry list; a list
+     * with anything but integral numbers (or any other value) is rejected with a clear message.
+     */
+    private static List<Integer> intList(Map<String, Object> c, String key) {
+        Object v = c.get(key);
+        if (v == null) {
+            return List.of();
+        }
+        if (v instanceof Number n) {
+            return List.of(n.intValue());
+        }
+        if (v instanceof List<?> l) {
+            List<Integer> out = new java.util.ArrayList<>(l.size());
+            for (Object o : l) {
+                if (!(o instanceof Number n) || n.doubleValue() != n.longValue()) {
+                    throw new IllegalArgumentException("config.json: " + key + " must be an int or a list of ints, got " + v);
+                }
+                out.add(n.intValue());
+            }
+            return List.copyOf(out);
+        }
+        throw new IllegalArgumentException("config.json: " + key + " must be an int or a list of ints, got " + v);
     }
 
     /** Round-to-nearest-even of a float's bits to the upper 16 bits (bfloat16). */
@@ -465,17 +501,9 @@ public record ModelConfig(
             throw new IllegalArgumentException("mamba models with in_proj/out_proj biases (use_bias=true) are not "
                     + "supported; no released checkpoint uses them");
         }
-        List<Integer> eos = new java.util.ArrayList<>();
-        Object eosRaw = c.get("eos_token_id");
-        if (eosRaw instanceof Number n) {
-            eos.add(n.intValue());
-        } else if (eosRaw instanceof List<?> l) {
-            for (Object o : l) {
-                eos.add(((Number) o).intValue());
-            }
-        }
+        List<Integer> eos = intList(c, "eos_token_id");
         MambaParams mp = new MambaParams(dState, dConv, dtRank, dInner, false, Json.bool(c, "use_conv_bias", true));
-        return new ModelConfig(arch, "mamba", false, false, 0, 0, null, -1, List.copyOf(eos), dim, dInner, layers,
+        return new ModelConfig(arch, "mamba", false, false, 0, 0, null, -1, eos, dim, dInner, layers,
                 1, 1, dim, vocab, (int) Json.num(c, "max_position_embeddings", 1 << 20),
                 (float) Json.dbl(c, "layer_norm_epsilon", 1e-5), 0, Json.bool(c, "tie_word_embeddings", true), 0, 0, 0, false, 1, Set.of(), 1.0, null, mp, null);
     }
@@ -508,6 +536,10 @@ public record ModelConfig(
                         Json.num(c, "original_max_position_embeddings", maxPos));
                 double[] shortF = factors(rs, "short_factor", rotaryDim / 2);
                 double[] longF = factors(rs, "long_factor", rotaryDim / 2);
+                // Precedence as in transformers' _compute_longrope_parameters: an explicit rope_scaling.factor
+                // wins; without one the factor is max_position_embeddings / original_max_position_embeddings,
+                // the latter taken from rope_scaling first and the top level second (Phi-3 puts it there). The
+                // factor only feeds the attention_factor default (Rope.attentionFactor), not the frequencies.
                 double f = rs.containsKey("factor") ? factor : (double) maxPos / orig;
                 if (orig <= 1 || f <= 0) {
                     throw new IllegalArgumentException("invalid longrope rope_scaling: " + rs);

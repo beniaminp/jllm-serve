@@ -80,16 +80,18 @@ public record DeepSeekConfig(
             throw new IllegalArgumentException("invalid DeepSeek MLA config: q_lora_rank=" + qLora + " kv_lora_rank="
                     + kvLora + " qk_nope_head_dim=" + nope + " qk_rope_head_dim=" + rope + " v_head_dim=" + vDim);
         }
-        String scoring = Json.str(c, "scoring_func", "softmax");
+        // class defaults: DeepseekV3Config scores with sigmoid and routes noaux_tc over 8 groups keeping 4,
+        // DeepseekV2Config with softmax and plain greedy top-k
+        String scoring = Json.str(c, "scoring_func", v3 ? "sigmoid" : "softmax");
         if (!scoring.equals("softmax") && !scoring.equals("sigmoid")) {
             throw new IllegalArgumentException("unsupported scoring_func '" + scoring + "' (softmax, sigmoid)");
         }
-        String method = Json.str(c, "topk_method", "greedy");
+        String method = Json.str(c, "topk_method", v3 ? "noaux_tc" : "greedy");
         if (!TOPK_METHODS.contains(method)) {
             throw new IllegalArgumentException("unsupported topk_method '" + method + "' (supported: " + TOPK_METHODS + ")");
         }
-        int nGroup = (int) Json.num(c, "n_group", 1);
-        int topkGroup = (int) Json.num(c, "topk_group", 1);
+        int nGroup = (int) Json.num(c, "n_group", v3 ? 8 : 1);
+        int topkGroup = (int) Json.num(c, "topk_group", v3 ? 4 : 1);
         int nRouted = (int) Json.num(c, "n_routed_experts", 0);
         int topK = (int) Json.num(c, "num_experts_per_tok", 0);
         if (!method.equals("greedy")) {
@@ -129,6 +131,6 @@ public record DeepSeekConfig(
         }
         return new DeepSeekConfig(qLora, kvLora, nope, rope, vDim, (int) Json.num(c, "first_k_dense_replace", 0),
                 moeFreq, nShared, nGroup, topkGroup, scoring.equals("sigmoid"), method,
-                Json.dbl(c, "routed_scaling_factor", 1.0), v3, yarn, scale);
+                Json.dbl(c, "routed_scaling_factor", v3 ? 2.5 : 1.0), v3, yarn, scale);
     }
 }
