@@ -573,7 +573,11 @@ public final class HttpServer implements AutoCloseable {
             }
             int c = line.indexOf(':');
             if (c > 0) {
-                headers.put(line.substring(0, c).trim().toLowerCase(Locale.ROOT), line.substring(c + 1).trim());
+                String name = line.substring(0, c).trim().toLowerCase(Locale.ROOT);
+                if ((name.equals("content-length") || name.equals("transfer-encoding")) && headers.containsKey(name)) {
+                    throw new HttpError(400, "duplicate " + name + " header"); // ambiguous framing: refuse it
+                }
+                headers.put(name, line.substring(c + 1).trim());
             }
         }
         if (line == null) {

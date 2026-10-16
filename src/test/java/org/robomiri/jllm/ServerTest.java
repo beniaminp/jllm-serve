@@ -85,6 +85,12 @@ public final class ServerTest {
         // L4: one header line beyond the 64 KB limit
         r = f.exchange(request("GET", "/health", null, "X-Long: " + "y".repeat(70 * 1024)));
         check(r.status == 431, "70 KB header line: 431 (got " + r.status + ")");
+        // L5: ambiguous framing
+        r = f.exchange(request("POST", "/v1/chat/completions", "{}", "Content-Type: application/json", "Content-Length: 2"));
+        check(r.status == 400 && r.body.contains("duplicate"), "two Content-Length headers: 400 (got " + r.status + ")");
+        r = f.exchange(("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                + "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+        check(r.status == 400 && r.body.contains("duplicate"), "two Transfer-Encoding headers: 400 (got " + r.status + ")");
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */
