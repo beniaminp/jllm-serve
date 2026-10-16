@@ -258,17 +258,18 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, 0f); // no soft-cap
         int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
         if (n >= MetalBackend.PREFILL_MIN_TOKENS) {
             int pipe = MetalBackend.byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
-            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, MetalBackend.pfGrid(t.rows), MetalBackend.pfTiles(n), 1,
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, MetalBackend.pfGrid(t.rows), MetalBackend.pfTiles(n), 1,
                     32 * sgPerTg, 1, 1);
             return;
         }
         int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + sgPerTg - 1) / sgPerTg;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, MetalBackend.UNUSED_TG_BYTES, gx, gy, 1, 32 * sgPerTg, 1, 1);
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, MetalBackend.UNUSED_TG_BYTES, gx, gy, 1, 32 * sgPerTg, 1, 1);
     }
 
     private void rmsnorm(Metal.Buffer in, long inOff, Metal.Buffer weight, Metal.Buffer out, int n, int width) {

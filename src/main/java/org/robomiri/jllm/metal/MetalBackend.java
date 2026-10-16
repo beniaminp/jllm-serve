@@ -79,7 +79,6 @@ public final class MetalBackend implements Backend {
     private int pAttnSplit = -1;   // flash decoding, -1 when off
     private int pAttnCombine = -1;
     private Metal.Buffer flashPart;
-    private int pSoftcap;     // Gemma 2 final-logit cap, -1 otherwise
     private int pRouter;
     private int pMoeUpQ4;
     private int pMoeUpQ8;
@@ -251,7 +250,6 @@ public final class MetalBackend implements Backend {
             pAttnSplit = metal.pipeline(kvHalf ? "attention_split_h" : "attention_split");
             pAttnCombine = metal.pipeline("attention_combine");
         }
-        pSoftcap = c.finalSoftcap() > 0 ? metal.pipeline("softcap") : -1;
         pRouter = metal.pipeline("router");
         pMoeUpQ4 = metal.pipeline("moe_up_q4");
         pMoeUpQ8 = metal.pipeline("moe_up_q8");
@@ -480,13 +478,7 @@ public final class MetalBackend implements Backend {
                 // the norm into the LM-head kernel measured ~5% slower at decode: its prologue runs in all
                 // ~38k threadgroups, which costs more than the one dispatch it saves.
                 rmsnormAt(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
-                matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null);
-                if (pSoftcap >= 0) {
-                    bind(0, logitsBuf, 0);
-                    params.setAtIndex(ValueLayout.JAVA_INT, 0, w.lmHead.rows);
-                    params.setAtIndex(ValueLayout.JAVA_FLOAT, 1, c.finalSoftcap());
-                    metal.dispatch(pSoftcap, bufArgs, offArgs, 1, params, 8, (w.lmHead.rows + 255) / 256, 1, 1, 256, 1, 1);
-                }
+                matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap()); // Gemma: capped logits
             }
             metal.commitAndWait();
             committed = true;
@@ -517,7 +509,13 @@ public final class MetalBackend implements Backend {
      * applies rmsnorm with those weights to the input row, exactly as the rmsnorm kernel would.
      */
     void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
-                        int n, boolean acc, Metal.Buffer norm) {
+                int n, boolean acc, Metal.Buffer norm) {
+        matmul(t, wbuf, in, inOff, out, outOff, n, acc, norm, 0f);
+    }
+
+    /** As above; {@code softcap > 0} applies tanh(out / softcap) * softcap in the epilogue (not with acc). */
+    private void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
+                        int n, boolean acc, Metal.Buffer norm, float softcap) {
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
         }
@@ -531,16 +529,17 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, softcap);
         if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int pipe = byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
-            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
             return;
         }
         int pipe = norm != null ? byType(t.type, pMatmulQ4Norm, pMatmulQ8Norm, pMatmulQ2KNorm)
                                 : byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
-        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
+        metal.dispatch(pipe, bufArgs, offArgs, 5, params, 24, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
     }
 
     /** Threadgroups along the row axis for the tiled prefill matmuls (PF_ROWS rows per simdgroup). */

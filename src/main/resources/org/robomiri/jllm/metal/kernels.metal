@@ -71,7 +71,13 @@ struct MatmulParams {
     int ntok;
     int accumulate;
     float eps;      // NORM variants only
+    float softcap;  // > 0: out = tanh(out / softcap) * softcap (Gemma's final-logit cap on the LM head), 0 = off
 };
+
+// Gemma 2 / 3 soft-capping; the argument of tanh is clamped because fast-math tanh overflows for large inputs
+static inline float softcap_f(float v, float cap) {
+    return tanh(clamp(v / cap, -20.0f, 20.0f)) * cap;
+}
 
 struct Matmul3Params {
     int rows0;
@@ -235,7 +241,7 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
             float v = simd_sum(acc[t]);
             if (lane == 0) {
                 ulong o = (ulong)(t0 + t) * p.rows + row;
-                out[o] = p.accumulate ? out[o] + v : v;
+                out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
             }
         }
     }
@@ -490,7 +496,7 @@ kernel void matmul_pf(device const uchar *wq [[buffer(0)]],
                     float v = simd_sum(acc[r][t]);
                     if (lane == 0) {
                         ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
-                        out[o] = p.accumulate ? out[o] + v : v;
+                        out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
                     }
                 }
             }
@@ -1414,20 +1420,8 @@ kernel void rmsnorm_add(device const float *y [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- Gemma 2 / 3
-// Final-logit soft-capping: v[i] = tanh(v[i] / cap) * cap. (The sandwich norms reuse rmsnorm_add above, the
-// GeGLU is the `gelu` flag of matmul_swiglu, the attention soft-cap is AttnParams.softcap.)
-
-struct SoftcapParams {
-    int n;
-    float cap;
-};
-
-kernel void softcap(device float *v [[buffer(0)]],
-                    constant SoftcapParams &p [[buffer(1)]],
-                    uint gid [[thread_position_in_grid]]) {
-    if (int(gid) >= p.n) return;
-    v[gid] = tanh(clamp(v[gid] / p.cap, -20.0f, 20.0f)) * p.cap;
-}
+// The sandwich norms reuse rmsnorm_add above, the GeGLU is the `gelu` flag of matmul_swiglu, the attention
+// soft-cap is AttnParams.softcap and the final-logit soft-cap is MatmulParams.softcap on the LM-head matmul.
 
 // ---------------------------------------------------------------------------------------------- Mamba
 // Mamba (v1) mixer pieces, used by MambaMetalBackend. The projections (in_proj, x_proj, out_proj) reuse the
