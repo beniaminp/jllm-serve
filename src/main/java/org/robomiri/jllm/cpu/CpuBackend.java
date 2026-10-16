@@ -67,14 +67,6 @@ public final class CpuBackend implements Backend {
     final CpuMatmul mm;
     final ThreadLocal<float[]> scratch;
 
-    public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads) {
-        this(w, ctx, maxBatch, threads, KvDtype.F32);
-    }
-
-    public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, KvDtype kvDtype) {
-        this(w, ctx, maxBatch, threads, kvDtype, false);
-    }
-
     /**
      * @param int8Activations quantize activations to int8 per 32-block and use integer dot products for the
      *                        single-token (decode / MoE) matmuls instead of dequantizing weights to float

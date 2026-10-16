@@ -202,23 +202,6 @@ public final class Int8Kernels {
         return widenSum(p);
     }
 
-    /** Exact integer dot product of one Q8_0 block (32 bytes as 2 x 8 shorts) with 32 activation shorts, as 4 int lanes. */
-    private static IntVector blockQ8(ShortVector v0, ShortVector v1, short[] xq, int xb) {
-        ShortVector pa = evenBytes(v0).mul(ShortVector.fromArray(S8, xq, xb))
-                .add(oddBytes(v0).mul(ShortVector.fromArray(S8, xq, xb + 8)));
-        ShortVector pb = evenBytes(v1).mul(ShortVector.fromArray(S8, xq, xb + 16))
-                .add(oddBytes(v1).mul(ShortVector.fromArray(S8, xq, xb + 24)));
-        return widenSum(pa).add(widenSum(pb));
-    }
-
-    private static ShortVector evenBytes(ShortVector v) {
-        return v.lanewise(VectorOperators.LSHL, 8).lanewise(VectorOperators.ASHR, 8);
-    }
-
-    private static ShortVector oddBytes(ShortVector v) {
-        return v.lanewise(VectorOperators.ASHR, 8);
-    }
-
     /** Sums each pair of adjacent short lanes into one int lane (sign-extending both halves by shifts). */
     private static IntVector widenSum(ShortVector p) {
         IntVector pi = p.reinterpretAsInts();
@@ -265,7 +248,10 @@ public final class Int8Kernels {
         return (float) acc;
     }
 
-    /** Exact integer dot product of a whole row (no scales) through the SIMD integer lanes, for tests. */
+    /**
+     * Exact integer dot product of a whole row (no scales) through the SIMD integer lanes, for tests: the same
+     * per-block ({@link #blockQ4}) and per-half-block ({@link #dotRowQ8xQ8}) lane arithmetic as the kernels.
+     */
     public static long intDotRow(QTensor w, int r, short[] xq, int xo) {
         long sum = 0;
         if (!SUPPORTED) {
@@ -276,13 +262,19 @@ public final class Int8Kernels {
         }
         MemorySegment seg = w.data;
         long q = w.rowOffset(r);
-        int nb = w.blocksPerRow();
-        for (int b = 0; b < nb; b++) {
-            IntVector isum = w.type == QType.Q4_0
-                    ? blockQ4(ShortVector.fromMemorySegment(S8, seg, q + (long) b * 16, LE), xq, xo + b * QType.BLOCK)
-                    : blockQ8(ShortVector.fromMemorySegment(S8, seg, q + (long) b * 32, LE),
-                    ShortVector.fromMemorySegment(S8, seg, q + (long) b * 32 + 16, LE), xq, xo + b * QType.BLOCK);
-            sum += isum.reduceLanes(VectorOperators.ADD);
+        if (w.type == QType.Q4_0) {
+            for (int b = 0; b < w.blocksPerRow(); b++) {
+                sum += blockQ4(ShortVector.fromMemorySegment(S8, seg, q + (long) b * 16, LE), xq, xo + b * QType.BLOCK)
+                        .reduceLanes(VectorOperators.ADD);
+            }
+            return sum;
+        }
+        for (int g = 0; g < w.blocksPerRow() * 2; g++) {
+            ShortVector v = ShortVector.fromMemorySegment(S8, seg, q + (long) g * 16, LE);
+            int xb = xo + g * 16;
+            ShortVector p = v.lanewise(VectorOperators.LSHL, 8).lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, xb))
+                    .add(v.lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, xb + 8)));
+            sum += widenSum(p).reduceLanes(VectorOperators.ADD);
         }
         return sum;
     }
