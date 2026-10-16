@@ -143,6 +143,24 @@ template <typename XP>
 static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
                               thread float *acc, ushort lane); // Q2_K section at the end of the file
 
+// The dot of one packed 32-weight block with 32 activations: the one expression behind every matmul kernel
+// (mm_row below and the prefill mm_tile), so the compiler emits the same arithmetic for both families and
+// their results are bit-identical. pk is the block's 16 (Q4_0: low nibbles = weights 0..15, high = 16..31)
+// or 32 (Q8_0) bytes, x4 the 32 activations.
+static inline float q4_block_dot(thread const uchar4 *pk, thread const float4 *x4) {
+    float d = 0.0f;
+    for (int k = 0; k < 4; k++) {
+        d += dot(float4(pk[k] & uchar4(15)) - 8.0f, x4[k]) + dot(float4(pk[k] >> uchar4(4)) - 8.0f, x4[k + 4]);
+    }
+    return d;
+}
+
+static inline float q8_block_dot(thread const char4 *pk, thread const float4 *x4) {
+    float d = 0.0f;
+    for (int k = 0; k < 8; k++) d += dot(float4(pk[k]), x4[k]);
+    return d;
+}
+
 template <int QT, typename XP>
 static inline void mm_row(device const uchar *wq, device const float *ws, ulong grow, int nb,
                           XP x, ulong xstride, int nt, thread float *acc, ushort lane) {
@@ -154,34 +172,30 @@ static inline void mm_row(device const uchar *wq, device const float *ws, ulong 
     if (QT == 4) {
         device const uchar4 *rq = (device const uchar4 *)(wq + grow * nb * 16);
         for (int b = lane; b < nb; b += 32) {
-            float4 lo[4], hi[4];
-            for (int k = 0; k < 4; k++) {
-                uchar4 v = rq[b * 4 + k];
-                lo[k] = float4(v & uchar4(15)) - 8.0f;   // weights 4k .. 4k+3
-                hi[k] = float4(v >> uchar4(4)) - 8.0f;   // weights 16+4k .. 16+4k+3
-            }
+            uchar4 pk[4];
+            for (int k = 0; k < 4; k++) pk[k] = rq[b * 4 + k];
             const float s = rs[b];
             for (int t = 0; t < TOK_TILE; t++) {
                 if (t < nt) {
                     auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
-                    float d = 0.0f;
-                    for (int k = 0; k < 4; k++) d += dot(lo[k], x4[k]) + dot(hi[k], x4[k + 4]);
-                    acc[t] += d * s;
+                    float4 xv[8];
+                    for (int k = 0; k < 8; k++) xv[k] = x4[k];
+                    acc[t] += q4_block_dot(pk, xv) * s;
                 }
             }
         }
     } else {
         device const char4 *rq = (device const char4 *)(wq + grow * nb * 32);
         for (int b = lane; b < nb; b += 32) {
-            float4 w[8];
-            for (int k = 0; k < 8; k++) w[k] = float4(rq[b * 8 + k]);
+            char4 pk[8];
+            for (int k = 0; k < 8; k++) pk[k] = rq[b * 8 + k];
             const float s = rs[b];
             for (int t = 0; t < TOK_TILE; t++) {
                 if (t < nt) {
                     auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
-                    float d = 0.0f;
-                    for (int k = 0; k < 8; k++) d += dot(w[k], x4[k]);
-                    acc[t] += d * s;
+                    float4 xv[8];
+                    for (int k = 0; k < 8; k++) xv[k] = x4[k];
+                    acc[t] += q8_block_dot(pk, xv) * s;
                 }
             }
         }
@@ -340,6 +354,241 @@ template [[host_name("matmul_swiglu_q4")]] kernel matmul_swiglu_t matmul_swiglu<
 template [[host_name("matmul_swiglu_q8")]] kernel matmul_swiglu_t matmul_swiglu<8, false>;
 template [[host_name("matmul_swiglu_q4_norm")]] kernel matmul_swiglu_t matmul_swiglu<4, true>;
 template [[host_name("matmul_swiglu_q8_norm")]] kernel matmul_swiglu_t matmul_swiglu<8, true>;
+
+// ---------------------------------------------------------------------------------------------- prefill matmul
+// The same three products for a chunk of tokens, with one simdgroup computing a tile of NR rows x TT tokens
+// (mm_tile): every x block is loaded once and used for NR rows, every weight block is unpacked once and used
+// for TT tokens, instead of one row per simdgroup re-reading x for each of its TOK_TILE tokens. The single-row
+// kernels gather x from device memory at a 128-byte lane stride, which is what limits them; the tile divides
+// those gathers by NR. Every output element is still accumulated exactly as the single-row kernels do: the
+// same blocks in the same lane order, the same block dot expression, one simd_sum per (row, token), so the
+// results are bit-identical and the host may pick either family per dispatch (MetalBackend uses these when the
+// chunk has at least PREFILL_MIN_TOKENS tokens). Rows of a tile may belong to different matrices (matmul3) or
+// be the gate and up rows of the same unit (matmul_swiglu), hence per-row pointers. nr <= NR rows are valid.
+// Grid: (ceil(rows / (NR * simdgroups)), ceil(ntok / TT)), 128 threads.
+//
+// Tile shapes, measured on an M1 Pro at the Qwen3-0.6B shapes with 64 tokens (ms per layer, single-row kernels
+// 6.2-6.7): 2 x 8 is the best for matmul / matmul3 (4.0: two adjacent rows per simdgroup coalesce into 1 KB
+// reads, four rows cost too many registers, 16 tokens gain nothing more), and one unit (gate + up = 2 rows)
+// x 8 tokens for matmul_swiglu (1.5 vs 2.2; two units are slower, 1.8).
+
+#define PF_ROWS 2      // rows per simdgroup of matmul_pf / matmul3_pf
+#define PF_UNITS 1     // units (gate + up rows) per simdgroup of matmul_swiglu_pf
+#define PF_TOKS 8      // tokens per simdgroup of the prefill kernels
+
+template <int NR, int TT>
+static inline void mm_tile_q2k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
+
+template <int QT, int NR, int TT>
+static inline void mm_tile(thread device const uchar *const *wq, thread device const float *const *ws,
+                           thread const ulong *grow, int nr, int nb, device const float *x, ulong xstride, int nt,
+                           thread float (*acc)[TT], ushort lane) {
+    if (QT == 2) {
+        mm_tile_q2k<NR, TT>(wq, grow, nr, nb, x, xstride, nt, acc, lane);
+        return;
+    }
+    if (QT == 4) {
+        for (int b = lane; b < nb; b += 32) {
+            uchar4 pk[NR][4];
+            float s[NR];
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    device const uchar4 *rq = (device const uchar4 *)(wq[r] + grow[r] * nb * 16) + b * 4;
+                    for (int k = 0; k < 4; k++) pk[r][k] = rq[k];
+                    s[r] = ws[r][grow[r] * nb + b];
+                }
+            }
+            for (int t = 0; t < TT; t++) {
+                if (t < nt) {
+                    auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
+                    float4 xv[8];
+                    for (int k = 0; k < 8; k++) xv[k] = x4[k];
+                    for (int r = 0; r < NR; r++) {
+                        if (r < nr) acc[r][t] += q4_block_dot(pk[r], xv) * s[r];
+                    }
+                }
+            }
+        }
+    } else {
+        for (int b = lane; b < nb; b += 32) {
+            char4 pk[NR][8];
+            float s[NR];
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    device const char4 *rq = (device const char4 *)(wq[r] + grow[r] * nb * 32) + b * 8;
+                    for (int k = 0; k < 8; k++) pk[r][k] = rq[k];
+                    s[r] = ws[r][grow[r] * nb + b];
+                }
+            }
+            for (int t = 0; t < TT; t++) {
+                if (t < nt) {
+                    auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
+                    float4 xv[8];
+                    for (int k = 0; k < 8; k++) xv[k] = x4[k];
+                    for (int r = 0; r < NR; r++) {
+                        if (r < nr) acc[r][t] += q8_block_dot(pk[r], xv) * s[r];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int QT, int NR, int TT>
+kernel void matmul_pf(device const uchar *wq [[buffer(0)]],
+                      device const float *ws [[buffer(1)]],
+                      device const float *x [[buffer(2)]],
+                      device float *out [[buffer(3)]],
+                      device const float *nw [[buffer(4)]],
+                      constant MatmulParams &p [[buffer(5)]],
+                      uint2 tgp [[threadgroup_position_in_grid]],
+                      ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int row0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TT;
+    const int nt = min(TT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (row0 >= p.rows) return;
+    const int nr = min(NR, p.rows - row0);
+    device const uchar *wqs[NR];
+    device const float *wss[NR];
+    ulong grow[NR];
+    for (int r = 0; r < NR; r++) {
+        wqs[r] = wq;
+        wss[r] = ws;
+        grow[r] = (ulong)(row0 + min(r, nr - 1));
+    }
+    float acc[NR][TT];
+    for (int r = 0; r < NR; r++)
+        for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+    mm_tile<QT, NR, TT>(wqs, wss, grow, nr, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+    for (int r = 0; r < NR; r++) {
+        if (r < nr) {
+            for (int t = 0; t < TT; t++) {
+                if (t < nt) {
+                    float v = simd_sum(acc[r][t]);
+                    if (lane == 0) {
+                        ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
+                        out[o] = p.accumulate ? out[o] + v : v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int QT, int NR, int TT>
+kernel void matmul3_pf(device const uchar *wq0 [[buffer(0)]],
+                       device const float *ws0 [[buffer(1)]],
+                       device const uchar *wq1 [[buffer(2)]],
+                       device const float *ws1 [[buffer(3)]],
+                       device const uchar *wq2 [[buffer(4)]],
+                       device const float *ws2 [[buffer(5)]],
+                       device const float *x [[buffer(6)]],
+                       device float *out0 [[buffer(7)]],
+                       device float *out1 [[buffer(8)]],
+                       device float *out2 [[buffer(9)]],
+                       device const float *nw [[buffer(10)]],
+                       constant Matmul3Params &p [[buffer(11)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]],
+                       ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int total = p.rows0 + p.rows1 + p.rows2;
+    const int row0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TT;
+    const int nt = min(TT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (row0 >= total) return;
+    const int nr = min(NR, total - row0);
+    device const uchar *wqs[NR];
+    device const float *wss[NR];
+    device float *outs[NR];
+    int rows[NR];
+    ulong grow[NR];
+    for (int r = 0; r < NR; r++) {
+        const int row = row0 + min(r, nr - 1);
+        if (row < p.rows0) {
+            wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; rows[r] = p.rows0; grow[r] = (ulong)row;
+        } else if (row < p.rows0 + p.rows1) {
+            wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; rows[r] = p.rows1; grow[r] = (ulong)(row - p.rows0);
+        } else {
+            wqs[r] = wq2; wss[r] = ws2; outs[r] = out2; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
+        }
+    }
+    float acc[NR][TT];
+    for (int r = 0; r < NR; r++)
+        for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+    mm_tile<QT, NR, TT>(wqs, wss, grow, nr, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+    for (int r = 0; r < NR; r++) {
+        if (r < nr) {
+            for (int t = 0; t < TT; t++) {
+                if (t < nt) {
+                    float v = simd_sum(acc[r][t]);
+                    if (lane == 0) outs[r][(ulong)(t0 + t) * rows[r] + grow[r]] = v;
+                }
+            }
+        }
+    }
+}
+
+// NR units per simdgroup: rows [unit0, unit0 + nr) are the gate rows, [hidden + unit0, ...) the up rows.
+template <int QT, int NR, int TT>
+kernel void matmul_swiglu_pf(device const uchar *wq [[buffer(0)]],
+                             device const float *ws [[buffer(1)]],
+                             device const float *x [[buffer(2)]],
+                             device float *out [[buffer(3)]],
+                             device const float *nw [[buffer(4)]],
+                             constant SwigluParams &p [[buffer(5)]],
+                             uint2 tgp [[threadgroup_position_in_grid]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int unit0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TT;
+    const int nt = min(TT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (unit0 >= p.hidden) return;
+    const int nu = min(NR, p.hidden - unit0);
+    device const uchar *wqs[2 * NR];
+    device const float *wss[2 * NR];
+    ulong grow[2 * NR];
+    for (int r = 0; r < NR; r++) {
+        const int unit = unit0 + min(r, nu - 1);
+        wqs[r] = wq; wss[r] = ws; grow[r] = (ulong)unit;
+        wqs[NR + r] = wq; wss[NR + r] = ws; grow[NR + r] = (ulong)(p.hidden + unit);
+    }
+    float acc[2 * NR][TT];
+    for (int r = 0; r < 2 * NR; r++)
+        for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+    // nr = 2 * NR: the padded rows (unit clamped to the last valid one) are computed and discarded
+    mm_tile<QT, 2 * NR, TT>(wqs, wss, grow, 2 * NR, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+    for (int r = 0; r < NR; r++) {
+        if (r < nu) {
+            for (int t = 0; t < TT; t++) {
+                if (t < nt) {
+                    float g = simd_sum(acc[r][t]);
+                    float u = simd_sum(acc[NR + r][t]);
+                    if (lane == 0) {
+                        out[(ulong)(t0 + t) * p.hidden + unit0 + r] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(matmul_pf<4, PF_ROWS, PF_TOKS>) matmul_pf_t;
+template [[host_name("matmul_pf_q4")]] kernel matmul_pf_t matmul_pf<4, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul_pf_q8")]] kernel matmul_pf_t matmul_pf<8, PF_ROWS, PF_TOKS>;
+typedef decltype(matmul3_pf<4, PF_ROWS, PF_TOKS>) matmul3_pf_t;
+template [[host_name("matmul3_pf_q4")]] kernel matmul3_pf_t matmul3_pf<4, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul3_pf_q8")]] kernel matmul3_pf_t matmul3_pf<8, PF_ROWS, PF_TOKS>;
+typedef decltype(matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>) matmul_swiglu_pf_t;
+template [[host_name("matmul_swiglu_pf_q4")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>;
+template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<8, PF_UNITS, PF_TOKS>;
 
 // ---------------------------------------------------------------------------------------------- rmsnorm
 // One threadgroup per row of length n.
@@ -1424,8 +1673,40 @@ static inline void mm_row_q2k(device const uchar *wq, ulong grow, int nb, XP x, 
     }
 }
 
+// mm_tile for QT == 2: the sub-blocks of the NR rows are dequantized once per lane unit and used for TT tokens,
+// each row's unit walk and dot being those of mm_row_q2k.
+template <int NR, int TT>
+static inline void mm_tile_q2k(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                               device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
+    const int nsb = (nb + 7) >> 3;
+    const int nsub = nb * 2;
+    for (int u = lane; u < nsub; u += 32) {
+        float4 w[NR][4];
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) q2k_sub_block(wq[r], grow[r], nsb, u, w[r]);
+        }
+        for (int t = 0; t < TT; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * 16);
+                float4 xv[4];
+                for (int k = 0; k < 4; k++) xv[k] = x4[k];
+                for (int r = 0; r < NR; r++) {
+                    if (r < nr) {
+                        float d = 0.0f;
+                        for (int k = 0; k < 4; k++) d += dot(w[r][k], xv[k]);
+                        acc[r][t] += d;
+                    }
+                }
+            }
+        }
+    }
+}
+
 template [[host_name("matmul_q2k")]] kernel matmul_t matmul<2, false>;
 template [[host_name("matmul_q2k_norm")]] kernel matmul_t matmul<2, true>;
+template [[host_name("matmul_pf_q2k")]] kernel matmul_pf_t matmul_pf<2, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul3_pf_q2k")]] kernel matmul3_pf_t matmul3_pf<2, PF_ROWS, PF_TOKS>;
+template [[host_name("matmul_swiglu_pf_q2k")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<2, PF_UNITS, PF_TOKS>;
 template [[host_name("matmul3_q2k")]] kernel matmul3_t matmul3<2, false>;
 template [[host_name("matmul3_q2k_norm")]] kernel matmul3_t matmul3<2, true>;
 template [[host_name("matmul_swiglu_q2k")]] kernel matmul_swiglu_t matmul_swiglu<2, false>;

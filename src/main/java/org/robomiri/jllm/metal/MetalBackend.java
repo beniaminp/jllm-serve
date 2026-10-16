@@ -19,6 +19,15 @@ import java.lang.foreign.ValueLayout;
 public final class MetalBackend implements Backend {
 
     private static final int TOK_TILE = 8; // must match kernels.metal
+    /** Rows (matmul_swiglu_pf: units) and tokens per simdgroup of the *_pf prefill matmuls; must match kernels.metal. */
+    static final int PF_ROWS = 2;
+    static final int PF_UNITS = 1;
+    static final int PF_TOKS = 8;
+    /**
+     * Chunks of at least this many tokens use the tiled prefill matmuls (bit-identical results, see the prefill
+     * section of kernels.metal); smaller ones the single-row kernels. A huge value disables the tiled kernels.
+     */
+    static final int PREFILL_MIN_TOKENS = Integer.getInteger("jllm.metal.prefillMinTokens", 8);
     /**
      * Tokens per attention dispatch; the scores scratch holds one row of ctx floats per (tile token, head)
      * instead of one per (batch token, head). 32 keeps a 64-token prefill chunk at two dispatches per layer.
@@ -73,6 +82,16 @@ public final class MetalBackend implements Backend {
     private int pSwigluQ2KNorm;
     private int pMoeUpQ2K;
     private int pMoeDownQ2K;
+    // tiled prefill variants (see the prefill section of kernels.metal)
+    private int pMatmulPfQ4;
+    private int pMatmulPfQ8;
+    private int pMatmulPfQ2K;
+    private int pMatmul3PfQ4;
+    private int pMatmul3PfQ8;
+    private int pMatmul3PfQ2K;
+    private int pSwigluPfQ4;
+    private int pSwigluPfQ8;
+    private int pSwigluPfQ2K;
     // f16 KV cache (backend.kv-dtype=f16): k/v go through f32 staging buffers, kv_store_half rounds them
     // into the half caches and attention_h reads them; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
@@ -231,6 +250,15 @@ public final class MetalBackend implements Backend {
         pSwigluQ2KNorm = metal.pipeline("matmul_swiglu_q2k_norm");
         pMoeUpQ2K = metal.pipeline("moe_up_q2k");
         pMoeDownQ2K = metal.pipeline("moe_down_q2k");
+        pMatmulPfQ4 = metal.pipeline("matmul_pf_q4");
+        pMatmulPfQ8 = metal.pipeline("matmul_pf_q8");
+        pMatmulPfQ2K = metal.pipeline("matmul_pf_q2k");
+        pMatmul3PfQ4 = metal.pipeline("matmul3_pf_q4");
+        pMatmul3PfQ8 = metal.pipeline("matmul3_pf_q8");
+        pMatmul3PfQ2K = metal.pipeline("matmul3_pf_q2k");
+        pSwigluPfQ4 = metal.pipeline("matmul_swiglu_pf_q4");
+        pSwigluPfQ8 = metal.pipeline("matmul_swiglu_pf_q8");
+        pSwigluPfQ2K = metal.pipeline("matmul_swiglu_pf_q2k");
         pKvStoreHalf = metal.pipeline("kv_store_half");
         if (c.isMoe() && c.numExperts() > 1024) {
             throw new IllegalArgumentException("Metal router kernel supports at most 1024 experts");
@@ -496,11 +524,30 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
+        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+            int pipe = byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, pfGrid(t.rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            return;
+        }
         int pipe = norm != null ? byType(t.type, pMatmulQ4Norm, pMatmulQ8Norm, pMatmulQ2KNorm)
                                 : byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, normTgMem(norm, t.cols), gx, gy, 1, 32 * SG_PER_TG, 1, 1);
+    }
+
+    /** Threadgroups along the row axis for the tiled prefill matmuls (PF_ROWS rows per simdgroup). */
+    static int pfGrid(int rows) {
+        return (rows + SG_PER_TG * PF_ROWS - 1) / (SG_PER_TG * PF_ROWS);
+    }
+
+    /** The same for matmul_swiglu_pf (PF_UNITS gate/up units per simdgroup). */
+    private static int pfUnitGrid(int units) {
+        return (units + SG_PER_TG * PF_UNITS - 1) / (SG_PER_TG * PF_UNITS);
+    }
+
+    static int pfTiles(int n) {
+        return (n + PF_TOKS - 1) / PF_TOKS;
     }
 
     /** Dynamic threadgroup memory for the normalised input row of the *_norm kernels (0 when unused). */
@@ -548,9 +595,14 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 3, W.wq.cols);
         params.setAtIndex(ValueLayout.JAVA_INT, 4, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
+        int rows = W.wq.rows + W.wk.rows + W.wv.rows;
+        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+            int pipe = byType(W.wq.type, pMatmul3PfQ4, pMatmul3PfQ8, pMatmul3PfQ2K);
+            metal.dispatch(pipe, bufArgs, offArgs, 11, params, 24, pfGrid(rows), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            return;
+        }
         int pipe = norm != null ? byType(W.wq.type, pMatmul3Q4Norm, pMatmul3Q8Norm, pMatmul3Q2KNorm)
                                 : byType(W.wq.type, pMatmul3Q4, pMatmul3Q8, pMatmul3Q2K);
-        int rows = W.wq.rows + W.wk.rows + W.wv.rows;
         int gx = (rows + SG_PER_TG - 1) / SG_PER_TG;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 11, params, 24, normTgMem(norm, W.wq.cols), gx, gy, 1,
@@ -575,6 +627,11 @@ public final class MetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 3, c.normEps());
         params.setAtIndex(ValueLayout.JAVA_INT, 4, c.isGemma() ? 1 : 0);
+        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+            int pipe = byType(t.type, pSwigluPfQ4, pSwigluPfQ8, pSwigluPfQ2K);
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, pfUnitGrid(hiddenDim), pfTiles(n), 1, 32 * SG_PER_TG, 1, 1);
+            return;
+        }
         int pipe = norm != null ? byType(t.type, pSwigluQ4Norm, pSwigluQ8Norm, pSwigluQ2KNorm)
                                 : byType(t.type, pSwigluQ4, pSwigluQ8, pSwigluQ2K);
         int gx = (hiddenDim + SG_PER_TG - 1) / SG_PER_TG;

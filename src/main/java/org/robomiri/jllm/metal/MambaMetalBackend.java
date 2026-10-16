@@ -40,6 +40,9 @@ public final class MambaMetalBackend implements Backend {
     private final int pMatmulQ4;
     private final int pMatmulQ8;
     private final int pMatmulQ2K;
+    private final int pMatmulPfQ4;
+    private final int pMatmulPfQ8;
+    private final int pMatmulPfQ2K;
     private final int pRmsnorm;
     private final int pConv;
     private final int pScan;
@@ -93,6 +96,9 @@ public final class MambaMetalBackend implements Backend {
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pMatmulQ2K = metal.pipeline("matmul_q2k");
+        pMatmulPfQ4 = metal.pipeline("matmul_pf_q4");
+        pMatmulPfQ8 = metal.pipeline("matmul_pf_q8");
+        pMatmulPfQ2K = metal.pipeline("matmul_pf_q2k");
         pRmsnorm = metal.pipeline("rmsnorm");
         pConv = metal.pipeline("mamba_conv");
         pScan = metal.pipeline("mamba_scan");
@@ -237,8 +243,14 @@ public final class MambaMetalBackend implements Backend {
         params.setAtIndex(ValueLayout.JAVA_INT, 2, n);
         params.setAtIndex(ValueLayout.JAVA_INT, 3, acc ? 1 : 0);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 4, c.normEps());
-        int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int sgPerTg = 4; // 128 threads = 4 rows per threadgroup
+        if (n >= MetalBackend.PREFILL_MIN_TOKENS) {
+            int pipe = MetalBackend.byType(t.type, pMatmulPfQ4, pMatmulPfQ8, pMatmulPfQ2K);
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, MetalBackend.pfGrid(t.rows), MetalBackend.pfTiles(n), 1,
+                    32 * sgPerTg, 1, 1);
+            return;
+        }
+        int pipe = MetalBackend.byType(t.type, pMatmulQ4, pMatmulQ8, pMatmulQ2K);
         int gx = (t.rows + sgPerTg - 1) / sgPerTg;
         int gy = (n + TOK_TILE - 1) / TOK_TILE;
         metal.dispatch(pipe, bufArgs, offArgs, 5, params, 20, gx, gy, 1, 32 * sgPerTg, 1, 1);
