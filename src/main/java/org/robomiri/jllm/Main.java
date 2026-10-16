@@ -181,8 +181,15 @@ public final class Main {
                 ids.add(n.intValue());
             } else if (eos instanceof List<?> l) {
                 for (Object o : l) {
-                    ids.add(((Number) o).intValue());
+                    if (!(o instanceof Number n)) {
+                        throw new IllegalArgumentException(gen + ": eos_token_id must be an integer or a list of"
+                                + " integers, found " + Json.write(o));
+                    }
+                    ids.add(n.intValue());
                 }
+            } else if (eos != null) {
+                throw new IllegalArgumentException(gen + ": eos_token_id must be an integer or a list of integers,"
+                        + " found " + Json.write(eos));
             }
         }
         // Family stop tokens: ChatML (Qwen), Llama 3 end-of-turn / end-of-text, Mistral / Llama 2 </s>.
@@ -193,9 +200,8 @@ public final class Main {
                 ids.add(id);
             }
         }
-        if (ids.isEmpty()) {
-            ids.add((int) Json.num(Json.parseObject(Files.readString(dir.resolve("config.json"))), "eos_token_id", 0));
-        }
+        // no fallback to token 0: config.json's eos_token_id is already in cfg.eosTokenIds(), and the chat
+        // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
     }
 

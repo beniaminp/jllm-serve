@@ -80,6 +80,11 @@ public final class Engine implements AutoCloseable {
             stops.add(id);
         }
         this.eosIds = Set.copyOf(stops);
+        if (this.eosIds.isEmpty()) {
+            System.err.println("note: no end-of-sequence token id is known for this model (config.json,"
+                    + " generation_config.json, tokenizer and chat template have none): generation ends only at"
+                    + " max_tokens or a stop string");
+        }
         this.queueTimeoutMs = queueTimeoutMs;
     }
 
