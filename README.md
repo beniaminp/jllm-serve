@@ -127,10 +127,10 @@ The server is meant for your own machine. Keep these in mind before changing the
 
 | Model | Backend | Prefill | Decode |
 |---|---|---|---|
-| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~375 tok/s | ~95 tok/s (f16 KV ≈ 100) |
+| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~530 tok/s | ~110 tok/s |
 | Qwen3-0.6B Q4_0 | CPU (NEON 128-bit, 10 threads), float activations | ~153 tok/s | ~17 tok/s |
 | Qwen3-0.6B Q4_0 | CPU, int8 activations (`backend.cpu.int8-activations`, the default) | same | ~4× the float row: 13.4 → 53.7 tok/s in the same session ([docs/11](docs/11-performance.md#111-measured)) |
-| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~44 tok/s | ~23–25 tok/s |
+| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~49 tok/s | ~25 tok/s |
 
 Both backends produce identical greedy output with float activations on the CPU (checked on every merge for
 Qwen3 and the 30B MoE, and across 20 synthetic models of all families × 3 quantization formats by

@@ -139,7 +139,7 @@ Qwen3-30B-A3B-Thinking-2507 at Q4_0 (19.4 GB cache), Apple M1 Pro, idle machine,
 
 | backend | prefill | decode |
 |---|---|---|
-| Metal | 44.7 tok/s | 24.1 tok/s |
+| Metal | 49.2 tok/s | 24.6 tok/s |
 | CPU (10 threads, int8 activations) | ≈ 12 tok/s | ≈ 6 tok/s |
 
 Conversion from the 61 GB bf16 shards took 30 minutes with `--low-disk` (download-bound); the cache then maps in

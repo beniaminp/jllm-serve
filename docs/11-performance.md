@@ -64,7 +64,7 @@ Qwen3-0.6B, 413-token prompt, 128 generated tokens, after JIT warm-up (`./jllm b
 |---|---|---|---|---|
 | Metal Q4_0, first version (one kernel per op) | 344 tok/s | 75 tok/s | 34 GB/s | 17 % |
 | Metal Q8_0, first version | 338 tok/s | 77 tok/s | 54 GB/s | 27 % |
-| **Metal Q4_0, fused kernels** (current) | **378 tok/s** | **107 tok/s** | 48 GB/s | 24 % |
+| **Metal Q4_0, fused + tiled kernels** (current) | **533 tok/s** | **111 tok/s** | 50 GB/s | 25 % |
 | CPU Q4_0 (NEON 128-bit, 10 threads), float activations, first version | 153 tok/s | 17 tok/s | 7.6 GB/s | 4 % |
 | **CPU Q4_0, int8 activations + grouped prefill** (current) | **275 tok/s** | **51 tok/s** | 23 GB/s | 11 % |
 
