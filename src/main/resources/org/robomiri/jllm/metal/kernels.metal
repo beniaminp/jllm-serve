@@ -1431,15 +1431,17 @@ kernel void rmsnorm_add(device const float *y [[buffer(0)]],
 // token. The price: parallelism is d_inner threads (1536 .. 5120), no more during a long prefill.
 
 #define MAMBA_MAX_STATE 64
+#define MAMBA_MAX_CONV 8
 
 struct MambaConvParams {
     int dInner;
-    int dConv;
+    int dConv;      // <= MAMBA_MAX_CONV
     int ntok;
 };
 
 // xc[t, i] = silu(bias[i] + sum_k w[i, k] * window[k]) where window = (conv state of channel i, xz[t, i]);
-// the state (d_conv - 1 previous inputs per channel, oldest first) is advanced past the chunk.
+// the state (d_conv - 1 previous inputs per channel, oldest first) is advanced past the chunk. The window and
+// the channel's weights stay in registers for the whole chunk; the state is read once and written once.
 // xz is [ntok, 2 * dInner] (x half first), xc is [ntok, dInner].
 kernel void mamba_conv(device const float *xz [[buffer(0)]],
                        device const float *w [[buffer(1)]],
@@ -1453,14 +1455,20 @@ kernel void mamba_conv(device const float *xz [[buffer(0)]],
     const int dc = p.dConv;
     device float *st = state + (ulong)i * (dc - 1);
     device const float *wi = w + (ulong)i * dc;
+    float win[MAMBA_MAX_CONV - 1];
+    float wr[MAMBA_MAX_CONV];
+    for (int k = 0; k < dc - 1; k++) win[k] = st[k];
+    for (int k = 0; k < dc; k++) wr[k] = wi[k];
+    const float b = bias[i];
     for (int t = 0; t < p.ntok; t++) {
         const float u = xz[(ulong)t * 2 * p.dInner + i];
-        float sum = bias[i] + wi[dc - 1] * u;
-        for (int k = 0; k < dc - 1; k++) sum += wi[k] * st[k];
-        for (int k = 0; k + 1 < dc - 1; k++) st[k] = st[k + 1];
-        if (dc > 1) st[dc - 2] = u;
+        float sum = b + wr[dc - 1] * u;
+        for (int k = 0; k < dc - 1; k++) sum += wr[k] * win[k];
+        for (int k = 0; k + 1 < dc - 1; k++) win[k] = win[k + 1];
+        if (dc > 1) win[dc - 2] = u;
         xc[(ulong)t * p.dInner + i] = sum / (1.0f + precise::exp(-sum));
     }
+    for (int k = 0; k < dc - 1; k++) st[k] = win[k];
 }
 
 struct MambaScanParams {

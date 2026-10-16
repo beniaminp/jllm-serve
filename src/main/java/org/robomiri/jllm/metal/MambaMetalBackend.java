@@ -92,6 +92,9 @@ public final class MambaMetalBackend implements Backend {
         if (m.dState() > 64) {
             throw new IllegalArgumentException("Metal Mamba scan supports state_size <= 64, got " + m.dState());
         }
+        if (m.dConv() > 8) {
+            throw new IllegalArgumentException("Metal Mamba conv supports conv_kernel <= 8, got " + m.dConv());
+        }
         this.metal = Metal.create(metalLib);
         try { // owns metal from here on: closed again if anything below throws
             init();
