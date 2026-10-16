@@ -130,7 +130,8 @@ public final class MambaCpuBackend implements Backend {
         }
         if (logits != null) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
-            mm.mul(w.lmHead, xb, logits, 0, 1, false);
+            // the caller sizes logits by cfg.vocabSize(); the LM head may have fewer (or, padded, more) rows
+            mm.mul(w.lmHead, Math.min(w.lmHead.rows, logits.length), xb, logits, 0, 1, false);
         }
         statePos = pos + n;
     }
