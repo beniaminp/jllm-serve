@@ -159,21 +159,16 @@ public final class Main {
         }
         int threads = s.getInt("backend.threads");
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
-        if (weights.cfg.isMamba()) { // a recurrent state: no KV cache, and the Mamba kernels take float activations
-            if (kvDtype != KvDtype.F32) {
-                System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
-            }
-            if (!s.getBool("backend.cpu.int8-activations")) {
-                System.err.println("note: backend.cpu.int8-activations=false is ignored for a Mamba model"
-                        + " (its CPU kernels do not use the int8 path)");
-            }
+        if (weights.cfg.isMamba() && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
+            System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
         }
         Backend backend;
         try {
             backend = switch (backendName) {
                 case "cpu" -> weights.cfg.isMamba()
                         ? new MambaCpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors())
+                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
+                                s.getBool("backend.cpu.int8-activations"))
                         : new CpuBackend(weights, ctx, batch,
                                 threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
                                 s.getBool("backend.cpu.int8-activations"));
