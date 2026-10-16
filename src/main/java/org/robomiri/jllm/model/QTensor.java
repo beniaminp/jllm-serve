@@ -44,7 +44,7 @@ public final class QTensor {
         return blocksPerRow(type, cols);
     }
 
-    /** Blocks per row; a Q2_K row that is not a multiple of 256 ends with a partial super-block. */
+    /** Blocks per row; a Q2_K / Q6_K row that is not a multiple of 256 ends with a partial super-block. */
     private static int blocksPerRow(QType type, int cols) {
         return (cols + type.blockSize - 1) / type.blockSize;
     }
@@ -121,6 +121,11 @@ public final class QTensor {
                     int off = b * Q2K.BLOCK;
                     Q2K.quantizeBlock(row, off, Math.min(Q2K.BLOCK, cols - off), q, b * Q2K.BLOCK_BYTES);
                 }
+            } else if (type == QType.Q6_K) {
+                for (int b = 0; b < nb; b++) {
+                    int off = b * Q6K.BLOCK;
+                    Q6K.quantizeBlock(row, off, Math.min(Q6K.BLOCK, cols - off), q, b * Q6K.BLOCK_BYTES);
+                }
             } else if (type == QType.Q4_0) {
                 for (int b = 0; b < nb; b++) {
                     s[b] = quantizeBlockQ4(row, b * QType.BLOCK, q, b * 16);
@@ -187,6 +192,10 @@ public final class QTensor {
     public void dequantizeRow(int r, float[] dst, int off) {
         if (type == QType.Q2_K) {
             Q2K.dequantizeRow(data, rowOffset(r), cols, dst, off);
+            return;
+        }
+        if (type == QType.Q6_K) {
+            Q6K.dequantizeRow(data, rowOffset(r), cols, dst, off);
             return;
         }
         int nb = blocksPerRow();

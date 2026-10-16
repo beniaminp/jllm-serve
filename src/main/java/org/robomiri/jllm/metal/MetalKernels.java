@@ -164,17 +164,18 @@ final class MetalKernels implements AutoCloseable {
         metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
-    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k). */
+    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k / q6k). */
     static String kernel(String base, QType type, String suffix) {
         String qt = switch (type) {
             case Q4_0 -> "q4";
             case Q8_0 -> "q8";
             case Q2_K -> "q2k";
+            case Q6_K -> "q6k";
         };
         return base + "_" + qt + suffix;
     }
 
-    /** Offset of the f32 scale region to bind as buffer(1); Q2_K keeps its scales inside the blocks (unused binding). */
+    /** Offset of the f32 scale region to bind as buffer(1); Q2_K / Q6_K keep their scales inside the blocks (unused binding). */
     private static long scaleOff(QTensor t) {
         return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
     }
