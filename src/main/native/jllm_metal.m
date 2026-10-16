@@ -49,6 +49,13 @@ void *jm_create(const char *source, char *err, int errlen) {
         c.inflight = [NSMutableArray new];
         NSError *e = nil;
         MTLCompileOptions *opts = [MTLCompileOptions new];
+        // The kernels use -INFINITY as the identity of their max reductions; the default (fast) math mode lets
+        // the compiler assume no infinities exist. Relaxed keeps the fast-math optimisations but preserves
+        // infinities and NaNs (macOS 15+; older systems keep the default, where the sentinels have worked so
+        // far because the compiler never exploited the assumption in these reductions).
+        if (@available(macOS 15.0, *)) {
+            opts.mathMode = MTLMathModeRelaxed;
+        }
         c.library = [dev newLibraryWithSource:[NSString stringWithUTF8String:source] options:opts error:&e];
         if (!c.library) {
             set_err(err, errlen, e ? e.localizedDescription : @"shader compilation failed");
