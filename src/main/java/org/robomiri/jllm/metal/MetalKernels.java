@@ -117,7 +117,7 @@ final class MetalKernels implements AutoCloseable {
     /**
      * Whether the *_norm matmul variants may be used for rows of {@code cols} floats: they keep the normalised
      * input row in dynamic threadgroup memory next to their static reduction scratch, which must fit the device's
-     * threadgroup memory limit (32 KB: cols <= 8176). Otherwise a decode step runs rmsnorm + plain matmul.
+     * threadgroup memory limit (32 KB: cols <= 8184). Otherwise a decode step runs rmsnorm + plain matmul.
      */
     boolean fusedNormFits(int cols) {
         return (long) cols * 4 + NORM_STATIC_TG_BYTES <= metal.maxThreadgroupMemory();
