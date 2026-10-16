@@ -52,6 +52,12 @@ public final class GgufMetalCheck {
         return f;
     }
 
+    private static float[] readAt(Metal.Buffer b, long byteOffset, int n) {
+        float[] out = new float[n];
+        MemorySegment.copy(b.contents(), ValueLayout.JAVA_FLOAT, byteOffset, out, 0, n);
+        return out;
+    }
+
     private static float[] read(Metal.Buffer b, int n) {
         float[] out = new float[n];
         MemorySegment.copy(b.contents(), ValueLayout.JAVA_FLOAT, 0, out, 0, n);
@@ -271,9 +277,11 @@ public final class GgufMetalCheck {
                     x[i] = rnd.nextFloat() * 2 - 1;
                 }
                 Metal.Buffer in = k.upload(x);
-                Metal.Buffer[] out = {k.scratch((long) n * ROWS * 4), k.scratch((long) n * ROWS * 4), k.scratch((long) n * ROWS * 4)};
+                // k and v are written at a byte offset into their (cache) buffers, as the backend does
+                Metal.Buffer[] out = {k.scratch((long) n * ROWS * 4), k.scratch((long) n * ROWS * 4 + 128), k.scratch((long) n * ROWS * 4 + 256)};
+                long[] off = {0, 64, 128};
                 k.begin();
-                k.matmul3(t[0], w[0], t[1], w[1], t[2], w[2], in, null, out[0], out[1], 0, out[2], 0, false,
+                k.matmul3(t[0], w[0], t[1], w[1], t[2], w[2], in, null, out[0], out[1], off[1], out[2], off[2], false,
                         withBias ? bb[0] : null, withBias ? bb[1] : null, withBias ? bb[2] : null, n);
                 k.commitAndWait();
                 for (int i = 0; i < 3; i++) {
@@ -291,7 +299,7 @@ public final class GgufMetalCheck {
                             }
                         }
                     }
-                    compare(read(out[i], n * ROWS), y, mag, ROWS, "mixed-type matmul3 n=" + n + " bias=" + withBias + " " + files[i]);
+                    compare(readAt(out[i], off[i], n * ROWS), y, mag, ROWS, "mixed-type matmul3 n=" + n + " bias=" + withBias + " " + files[i]);
                 }
             }
         }

@@ -280,9 +280,9 @@ final class MetalKernels implements AutoCloseable {
             // A GGUF file may quantize the three projections differently (Q4_K_M: v in Q6_K in half the layers),
             // and a kernel instantiation has one block format: one single-matrix dispatch per projection, each
             // with the kernel of its own type, writing where the fused dispatch would.
-            matmul3Part(wq, bwq, in, norm, qOut, 0, null, false, bq, 0, n);
-            matmul3Part(wk, bwk, in, norm, kOut, kOff, null, false, bk, 1, n);
-            matmul3Part(wv, bwv, in, norm, null, 0, vOut, vHalf, bv, 2, n);
+            matmul3Part(wq, bwq, in, norm, qOut, 0, null, 0, false, bq, 0, n);
+            matmul3Part(wk, bwk, in, norm, kOut, kOff, null, 0, false, bk, 1, n);
+            matmul3Part(wv, bwv, in, norm, null, 0, vOut, vOff, vHalf, bv, 2, n);
             return;
         }
         bind(0, bwq, 0);
@@ -314,11 +314,11 @@ final class MetalKernels implements AutoCloseable {
 
     /**
      * One projection of {@link #matmul3} as a dispatch of its own: {@code which} 0 / 1 = q / k (float output at
-     * {@code out}, {@code outOff}), 2 = v (rows past the first two ranges, written to {@code vOut} as half when
+     * {@code out}, {@code outOff}), 2 = v (rows past the first two ranges, written to {@code vOut} at {@code vOff} as half when
      * {@code vHalf}). The unused weight bindings point at the same buffer; their row ranges are empty.
      */
     private void matmul3Part(QTensor w, Metal.Buffer bw, Metal.Buffer in, Metal.Buffer norm, Metal.Buffer out, long outOff,
-                             Metal.Buffer vOut, boolean vHalf, Metal.Buffer bias, int which, int n) {
+                             Metal.Buffer vOut, long vOff, boolean vHalf, Metal.Buffer bias, int which, int n) {
         bind(0, bw, 0);
         bind(1, bw, scaleOff(w));
         bind(2, bw, 0);
@@ -329,7 +329,7 @@ final class MetalKernels implements AutoCloseable {
         if (which == 2) {
             bind(7, in, 0);   // out0 / out1 are not written: their row ranges are empty
             bind(8, in, 0);
-            bind(9, vOut, 0);
+            bind(9, vOut, vOff);
         } else {
             bind(7, out, outOff);
             bind(8, out, outOff);
