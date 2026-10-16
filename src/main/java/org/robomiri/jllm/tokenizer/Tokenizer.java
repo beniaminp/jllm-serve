@@ -305,6 +305,14 @@ public final class Tokenizer {
         return new Tokenizer(Json.parseObject(tokenizerJson), config);
     }
 
+    /**
+     * A tokenizer from an already parsed {@code tokenizer.json} object and optional {@code tokenizer_config.json}
+     * keys ({@code bos_token}, {@code eos_token}, {@code add_bos_token}); see {@link GgufTokenizer}.
+     */
+    public static Tokenizer fromMaps(Map<String, Object> tokenizerJson, Map<String, Object> config) {
+        return new Tokenizer(tokenizerJson, config);
+    }
+
     // ------------------------------------------------------------------ public API
 
     /**
