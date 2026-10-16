@@ -170,8 +170,15 @@ The safetensors file is read exactly once, by `ModelConverter`, which writes a s
 models/Qwen_Qwen3-0.6B/
 ├── model.safetensors      1503 MB   bf16, as downloaded
 ├── jllm-q4_0.bin           452 MB   quantized blobs, one per tensor, each 16 KiB-aligned
-└── jllm-q4_0.json           32 KB   {"tensors": {name: {type, rows, cols, offset, size}}}
+└── jllm-q4_0.json           32 KB   {"version", "layout", "quant", "model", "repo", "revision", "sha",
+                                      "tensors": {name: {type, rows, cols, offset, size}}}
 ```
+
+Besides the tensor table the index records what the cache was made from: the file format `version`, the
+converter `layout` version (bumped whenever the converter changes what it writes — fused tensors, folded norms,
+names), the config description, and the `repo@revision` the model was requested as plus the Hub commit it
+resolved to. `ModelWeights.load` compares all of these (and every tensor shape against `config.json`) and, when
+anything differs, deletes the cache and converts again instead of loading stale weights.
 
 Why a cache file instead of quantizing at every start?
 
@@ -186,16 +193,24 @@ The converter processes the model **one layer at a time** so peak memory is one 
 
 ```
 for each unit (embedding, layer 0 … layer L−1, final norm, lm_head):
-    for each tensor of the unit: open its shard if not open yet (ShardProvider.ensure → may download it)
-    quantize the unit's tensors into a temporary off-heap arena, append them to jllm-q4_0.bin
+    for each rule of the unit (one cache tensor: its source tensors and a transform):
+        open the sources' shards if not open yet (ShardProvider.ensure → may download them)
+        quantize / split / stack / keep-as-f32 into a temporary off-heap arena, append to jllm-q4_0.bin
+    fsync the .bin, rewrite jllm-q4_0.partial.json (units and tensors written so far; tmp + fsync + rename)
     for each shard whose tensors are all consumed: close it, ShardProvider.release(shard)
-write jllm-q4_0.json      ← only now does the cache count as complete
+write jllm-q4_0.json (tmp + fsync + rename)      ← only now does the cache count as complete
 ```
+
+Each unit is a list of *rules*, one per cache tensor, naming the checkpoint tensors it reads; the set of shards
+a unit needs is derived from those rules, so the shard bookkeeping cannot disagree with what the conversion
+actually reads.
 
 With `--low-disk`, `release` deletes the shard. That is how a 61 GB checkpoint is converted on a machine with
 50 GB free: at most two ~4 GB shards exist at any moment next to the growing 19 GB cache. The JSON index is
-written last, so a crash mid-way leaves no half-valid cache (the `.bin` without a `.json` is simply overwritten
-on the next run).
+written last and atomically, so a crash mid-way leaves no half-valid cache. A `.bin` without a `.json` is *not*
+thrown away: the sidecar `jllm-q4_0.partial.json` records the units committed so far, and the next run resumes
+after them (truncating whatever the interrupted unit had appended), provided the sidecar's layout version,
+quant, config description and `repo@revision` match the current conversion — otherwise it starts over.
 
 The cache also normalizes naming differences between checkpoint generations — e.g. the dense MLP is stored as one
 fused `mlp.gate_up` tensor and MoE experts as `mlp.experts.gate_up` / `mlp.experts.down` whichever of the two
@@ -207,5 +222,6 @@ Hugging Face layouts the source used ([12](12-mixture-of-experts.md)).
 |---|---|---|
 | header length sane, offsets inside file, `end − begin == numel × bytes` | `SafeTensors.readFile` | truncated / corrupt downloads |
 | SHA-256 of every LFS file | `HuggingFaceHub` | corrupted transfer |
-| every matrix shape against `config.json` | `ModelWeights.checkShapes` | wrong model / stale cache |
-| cache version | `QuantFile.open` | format changes |
+| every matrix shape against `config.json` | `ModelWeights.checkShapes` | wrong model / stale cache (reconverted automatically) |
+| duplicate tensor names (also across shards), overlapping `data_offsets` | `SafeTensors.readFile` | a header that does not describe one tensor per name |
+| cache version, converter layout version, `repo@revision` | `QuantFile.open`, `ModelWeights.load` | format / converter changes, another revision in the same directory (reconverted automatically) |

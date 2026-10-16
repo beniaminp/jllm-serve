@@ -12,8 +12,11 @@ selected with `--quant q2k`.
 Two bits per weight is meant for large models, where the many thousands of terms in every dot product average
 the error away. On Qwen3-0.6B, applied to every linear layer, it does not merely degrade the model — it breaks
 it (13.7 has the measurements and the per-tensor analysis of why); the point of implementing it is the 30B
-MoE, whose experts dominate the memory footprint ([12](12-mixture-of-experts.md)): 9.8 GB instead of 18.7 GB,
-with the fragile tensors kept at 4 bits.
+MoE, whose experts dominate the memory footprint ([12](12-mixture-of-experts.md)): 9.8 GB instead of 18.7 GB.
+Note that `--quant q2k` applies the format to **every** linear layer — attention, dense MLPs and experts alike;
+only the embedding / LM head stay Q8_0, as for every quant. A mixed recipe that keeps the fragile tensors
+(`down_proj`, the first layers) at 4 bits is analysed in 13.7 as the natural next step, but is not what the
+converter does today.
 
 ---
 
