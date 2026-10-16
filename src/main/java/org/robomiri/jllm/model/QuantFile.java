@@ -56,14 +56,69 @@ public final class QuantFile implements AutoCloseable {
     public record Entry(String type, int rows, int cols, long offset, long size) {
     }
 
+    /**
+     * Where a cache came from: the repository and revision the model was requested as (recorded as given), and
+     * the Hub commit that revision resolved to when it is known. Part of the cache identity: a cache converted
+     * from another repo or revision is not reused.
+     *
+     * @param sha the Hub commit, null when unknown (local files)
+     */
+    public record Identity(String repo, String revision, String sha) {
+
+        /** Parses {@code repo@revision} ({@code revision} is null without an {@code @}); null for null. */
+        public static Identity parse(String name, String sha) {
+            if (name == null) {
+                return null;
+            }
+            int at = name.lastIndexOf('@');
+            return at < 0 ? new Identity(name, null, sha) : new Identity(name.substring(0, at), name.substring(at + 1), sha);
+        }
+
+        /** {@code repo@revision}, the form {@link ModelWeights#load} compares. */
+        public String name() {
+            return revision == null ? repo : repo + "@" + revision;
+        }
+
+        /** True if {@code other} names the same repo and revision (the commit is informational). */
+        public boolean sameAs(Identity other) {
+            return other != null && name().equals(other.name());
+        }
+
+        static Identity read(Map<String, Object> header) {
+            String repo = Json.str(header, "repo", null);
+            return repo == null ? null : new Identity(repo, Json.str(header, "revision", null), Json.str(header, "sha", null));
+        }
+
+        /** Adds the non-null fields to a header map. */
+        static void write(Map<String, Object> header, Identity id) {
+            if (id == null) {
+                return;
+            }
+            header.put("repo", id.repo());
+            if (id.revision() != null) {
+                header.put("revision", id.revision());
+            }
+            if (id.sha() != null) {
+                header.put("sha", id.sha());
+            }
+        }
+    }
+
     private final Arena arena;
     private final MemorySegment mapped;
     private final Map<String, Entry> entries;
+    private final Identity identity;
 
-    private QuantFile(Arena arena, MemorySegment mapped, Map<String, Entry> entries) {
+    private QuantFile(Arena arena, MemorySegment mapped, Map<String, Entry> entries, Identity identity) {
         this.arena = arena;
         this.mapped = mapped;
         this.entries = entries;
+        this.identity = identity;
+    }
+
+    /** The repo / revision / commit recorded at conversion, or null if the cache was converted from local files. */
+    public Identity identity() {
+        return identity;
     }
 
     public static boolean exists(Path dir, QType quant) {
@@ -93,7 +148,8 @@ public final class QuantFile implements AutoCloseable {
      */
     public static QuantFile open(Path dir, QType quant) throws IOException {
         Path json = jsonPath(dir, quant);
-        Map<String, Entry> entries = readIndex(json, Json.map(parseJson(json), "tensors"));
+        Map<String, Object> header = parseJson(json);
+        Map<String, Entry> entries = readIndex(json, Json.map(header, "tensors"));
         Path bin = binPath(dir, quant);
         if (!Files.isRegularFile(bin)) {
             throw new StaleCacheException(bin + " is missing");
@@ -107,7 +163,7 @@ public final class QuantFile implements AutoCloseable {
             for (Map.Entry<String, Entry> e : entries.entrySet()) {
                 checkEntry(e.getKey(), e.getValue(), mapped.byteSize(), bin);
             }
-            return new QuantFile(arena, mapped, entries);
+            return new QuantFile(arena, mapped, entries, Identity.read(header));
         } catch (IOException | RuntimeException e) {
             arena.close();
             throw e;
@@ -252,6 +308,7 @@ public final class QuantFile implements AutoCloseable {
         private final Path bin;
         private final Path partial;
         private final String model;
+        private final Identity identity;
         private final FileChannel ch;
         private final Map<String, Object> index = new LinkedHashMap<>();
         private final List<String> units = new ArrayList<>();
@@ -261,13 +318,14 @@ public final class QuantFile implements AutoCloseable {
 
         /** Starts a fresh cache, discarding any previous partial conversion. */
         public Writer(Path dir, QType quant) throws IOException {
-            this(dir, quant, "", false);
+            this(dir, quant, "", null, false);
         }
 
-        private Writer(Path dir, QType quant, String model, boolean resume) throws IOException {
+        private Writer(Path dir, QType quant, String model, Identity identity, boolean resume) throws IOException {
             this.dir = dir;
             this.quant = quant;
             this.model = model;
+            this.identity = identity;
             this.bin = binPath(dir, quant);
             this.partial = partialPath(dir, quant);
             Files.deleteIfExists(jsonPath(dir, quant));
@@ -281,16 +339,19 @@ public final class QuantFile implements AutoCloseable {
         }
 
         /**
-         * Resumes the conversion recorded in the sidecar when it is consistent with {@code model} and
-         * {@code plannedUnits}, otherwise starts fresh. {@link #completedUnits()} tells which units to skip.
+         * Resumes the conversion recorded in the sidecar when it is consistent with {@code model},
+         * {@code identity} and {@code plannedUnits}, otherwise starts fresh. {@link #completedUnits()} tells
+         * which units to skip.
+         *
+         * @param identity where the checkpoint comes from, recorded in the cache; null for local files
          */
-        public static Writer openOrResume(Path dir, QType quant, String model, List<String> plannedUnits)
+        public static Writer openOrResume(Path dir, QType quant, String model, Identity identity, List<String> plannedUnits)
                 throws IOException {
-            Resumable r = inspect(dir, quant, model, plannedUnits);
+            Resumable r = inspect(dir, quant, model, identity, plannedUnits);
             if (r == null) {
-                return new Writer(dir, quant, model, false);
+                return new Writer(dir, quant, model, identity, false);
             }
-            Writer w = new Writer(dir, quant, model, true);
+            Writer w = new Writer(dir, quant, model, identity, true);
             try {
                 if (w.ch.size() != r.bytes()) {
                     w.ch.truncate(r.bytes());
@@ -313,7 +374,7 @@ public final class QuantFile implements AutoCloseable {
         }
 
         /** Returns what a sidecar lets us reuse, or null (printing why) when the conversion must start over. */
-        private static Resumable inspect(Path dir, QType quant, String model, List<String> plannedUnits) {
+        private static Resumable inspect(Path dir, QType quant, String model, Identity identity, List<String> plannedUnits) {
             Path partial = partialPath(dir, quant);
             Path bin = binPath(dir, quant);
             if (!Files.isRegularFile(partial)) {
@@ -324,9 +385,15 @@ public final class QuantFile implements AutoCloseable {
                 Map<String, Object> side = Json.parseObject(Files.readString(partial));
                 checkVersions(partial, side);
                 List<Object> unitObjs = Json.list(side, "units");
+                Identity recorded = Identity.read(side);
                 if (!quant.name().equals(Json.str(side, "quant", null))
                         || !model.equals(Json.str(side, "model", null)) || unitObjs == null) {
                     reason = "it was written for a different model or format";
+                } else if (!(identity == null ? recorded == null : identity.sameAs(recorded))
+                        || (identity != null && identity.sha() != null && recorded.sha() != null
+                            && !identity.sha().equals(recorded.sha()))) {
+                    reason = "it was written for " + (recorded == null ? "local files" : recorded.name()
+                            + (recorded.sha() != null ? " (" + recorded.sha() + ")" : ""));
                 } else if (!Files.isRegularFile(bin)) {
                     reason = bin.getFileName() + " is missing";
                 } else {
@@ -410,16 +477,27 @@ public final class QuantFile implements AutoCloseable {
             units.add(unitId);
             committed = offset;
             Path tmp = partial.resolveSibling(partial.getFileName() + ".tmp");
-            Files.writeString(tmp, Json.write(Json.obj("version", VERSION, "layout", LAYOUT_VERSION, "quant", quant.name(),
-                    "model", model, "units", units, "tensors", index)));
+            Map<String, Object> side = header();
+            side.put("units", units);
+            side.put("tensors", index);
+            Files.writeString(tmp, Json.write(side));
             Files.move(tmp, partial, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        }
+
+        /** The common head of the index and the sidecar: versions, quant, model description and identity. */
+        private Map<String, Object> header() {
+            Map<String, Object> h = Json.obj("version", VERSION, "layout", LAYOUT_VERSION, "quant", quant.name(),
+                    "model", model);
+            Identity.write(h, identity);
+            return h;
         }
 
         public void finish() throws IOException {
             ch.force(true);
             ch.close();
-            Files.writeString(jsonPath(dir, quant), Json.write(Json.obj("version", VERSION, "layout", LAYOUT_VERSION,
-                    "quant", quant.name(), "model", model, "tensors", index)));
+            Map<String, Object> h = header();
+            h.put("tensors", index);
+            Files.writeString(jsonPath(dir, quant), Json.write(h));
             Files.deleteIfExists(partial);
         }
 

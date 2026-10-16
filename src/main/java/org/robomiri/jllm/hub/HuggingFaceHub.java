@@ -143,6 +143,16 @@ public final class HuggingFaceHub {
     }
 
     private final Map<String, List<RepoFile>> listings = new HashMap<>();
+    private final Map<String, String> commits = new HashMap<>();
+
+    /**
+     * The commit {@code revision} of {@code repo} resolves to (the listing's {@code sha}), or null if the Hub
+     * did not report one.
+     */
+    public String commitSha(String repo, String revision) throws IOException, InterruptedException {
+        listFiles(repo, revision);
+        return commits.get(repo + "@" + revision);
+    }
 
     /** Lists the files of {@code repo} at {@code revision} (cached per repo/revision). */
     public List<RepoFile> listFiles(String repo, String revision) throws IOException, InterruptedException {
@@ -175,6 +185,10 @@ public final class HuggingFaceHub {
             files.add(new RepoFile(name, size, sha));
         }
         listings.put(key, files);
+        String commit = Json.str(info, "sha", null);
+        if (commit != null && !commit.isBlank()) {
+            commits.put(key, commit);
+        }
         return files;
     }
 

@@ -77,9 +77,19 @@ public final class ModelConverter {
      * crash is resumed from the units recorded in {@code jllm-<quant>.partial.json} (see {@link QuantFile.Writer}).
      */
     public static void convert(Path dir, ModelConfig cfg, QType quant, ShardProvider provider) throws IOException {
+        convert(dir, cfg, quant, provider, null);
+    }
+
+    /**
+     * @param identity {@code repo@revision} the checkpoint was requested as, recorded in the cache together with
+     *                 the provider's {@link ShardProvider#commitSha() commit}; null for local files
+     */
+    public static void convert(Path dir, ModelConfig cfg, QType quant, ShardProvider provider, String identity)
+            throws IOException {
         long t0 = System.nanoTime();
         ModelConverter c = new ModelConverter(dir, cfg, quant, provider);
-        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, cfg.toString(), c.unitIds())) {
+        QuantFile.Identity id = QuantFile.Identity.parse(identity, provider.commitSha());
+        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, cfg.toString(), id, c.unitIds())) {
             c.run(w);
             w.finish();
             System.err.printf("\rConverted %s to %s in %.0fs (%.0f MB) -> %s%n", cfg.architecture(), quant,

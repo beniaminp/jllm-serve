@@ -159,18 +159,29 @@ public final class ModelWeights implements AutoCloseable {
 
     static final String STALE_HINT = " (stale cache)";
 
+    /** Local checkpoint: no repo / revision is recorded or checked. See {@link #load(Path, ModelConfig, QType, ShardProvider, String)}. */
+    public static ModelWeights load(Path dir, ModelConfig cfg, QType quant, ShardProvider shards) throws IOException {
+        return load(dir, cfg, quant, shards, null);
+    }
+
     /**
      * Opens the quantized cache in {@code dir}, converting the Hugging Face checkpoint first if there is none.
      *
      * <p>A cache that exists but cannot be used — written by another {@link QuantFile#LAYOUT_VERSION}, an
-     * unparseable or corrupt index, or tensors whose shapes do not match {@code cfg} — is deleted and converted
-     * again. The second attempt must succeed: a shape mismatch after a fresh conversion is a real inconsistency
-     * between the checkpoint and its config and is reported as such.
+     * unparseable or corrupt index, converted from another repo or revision than {@code identity}, or tensors
+     * whose shapes do not match {@code cfg} — is deleted and converted again. The second attempt must succeed:
+     * a shape mismatch after a fresh conversion is a real inconsistency between the checkpoint and its config
+     * and is reported as such.
+     *
+     * @param identity {@code repo@revision} the model was requested as (recorded in the cache and compared with
+     *                 what an existing cache records), or null to skip the check for local files
      */
-    public static ModelWeights load(Path dir, ModelConfig cfg, QType quant, ShardProvider shards) throws IOException {
+    public static ModelWeights load(Path dir, ModelConfig cfg, QType quant, ShardProvider shards, String identity)
+            throws IOException {
+        QuantFile.Identity id = QuantFile.Identity.parse(identity, null);
         boolean converted = false;
         if (!QuantFile.exists(dir, quant)) {
-            ModelConverter.convert(dir, cfg, quant, shards);
+            ModelConverter.convert(dir, cfg, quant, shards, identity);
             converted = true;
         }
         while (true) {
@@ -179,6 +190,10 @@ public final class ModelWeights implements AutoCloseable {
             try {
                 QuantFile file = QuantFile.open(dir, quant);
                 try {
+                    if (id != null && !id.sameAs(file.identity())) {
+                        throw new QuantFile.StaleCacheException("it was converted from "
+                                + (file.identity() == null ? "local files" : file.identity().name()) + ", not " + id.name());
+                    }
                     ModelWeights w = new ModelWeights(cfg, quant, file);
                     System.err.printf("Mapped %s weights (%s, %.0f MB) in %.2fs%n", cfg.architecture(), quant,
                             file.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
@@ -187,7 +202,7 @@ public final class ModelWeights implements AutoCloseable {
                     // a tensor is missing or has the wrong shape: the cache was written for another checkpoint or config
                     file.close();
                     stale = e.getMessage();
-                } catch (RuntimeException e) {
+                } catch (IOException | RuntimeException e) {
                     file.close();
                     throw e;
                 }
@@ -200,7 +215,7 @@ public final class ModelWeights implements AutoCloseable {
             }
             System.err.println("Reconverting " + QuantFile.binPath(dir, quant).getFileName() + ": " + stale);
             QuantFile.delete(dir, quant);
-            ModelConverter.convert(dir, cfg, quant, shards);
+            ModelConverter.convert(dir, cfg, quant, shards, identity);
             converted = true;
         }
     }

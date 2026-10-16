@@ -22,6 +22,11 @@ public interface ShardProvider {
     /** Called when the converter no longer needs {@code fileName} (a low-disk implementation deletes it). */
     void release(String fileName) throws IOException;
 
+    /** The Hub commit the shards come from, recorded in the cache index; null when unknown (local files). */
+    default String commitSha() {
+        return null;
+    }
+
     /**
      * Validates a shard file name taken from an untrusted index: it must be a plain {@code .safetensors} file
      * name (no directory separators, no {@code ..}) that resolves to a direct child of {@code dir}.
