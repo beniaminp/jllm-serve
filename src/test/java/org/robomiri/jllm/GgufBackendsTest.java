@@ -147,7 +147,10 @@ public final class GgufBackendsTest {
         }
         Path dir = Files.createTempDirectory("gguf-backends");
         try {
-            int[] prompt = {1, 5, 17, 33, 2, 40, 9, 77, 120, 3, 200, 14};
+            int[] prompt = new int[44]; // a 40-token chunk (matrix-unit prefill kernels) and a 4-token one
+            for (int i = 0; i < prompt.length; i++) {
+                prompt[i] = 1 + (i * 37 + 11) % (VOCAB - 1);
+            }
             for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe"}) {
                 for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "mixed"}) {
                     Path p = dir.resolve(family + "-" + mode + ".gguf");
@@ -155,11 +158,11 @@ public final class GgufBackendsTest {
                     float[][] cpu;
                     float[][] gpu;
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
-                         CpuBackend b = new CpuBackend(w, 64, 8, 4, KvDtype.F32, false)) {
+                         CpuBackend b = new CpuBackend(w, 64, 40, 4, KvDtype.F32, false)) {
                         cpu = run(b, prompt);
                     }
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
-                         MetalBackend b = new MetalBackend(w, 64, 8, lib, KvDtype.F32)) {
+                         MetalBackend b = new MetalBackend(w, 64, 40, lib, KvDtype.F32)) {
                         gpu = run(b, prompt);
                     }
                     double diff = GgufModelTest.maxDiff(cpu, gpu);
@@ -190,13 +193,13 @@ public final class GgufBackendsTest {
         }
     }
 
-    /** Prefill of the prompt in chunks of up to 8 tokens, then 4 greedy decode steps; logits after each call. */
+    /** Prefill of the prompt in chunks of up to 40 tokens, then 4 greedy decode steps; logits after each call. */
     static float[][] run(org.robomiri.jllm.model.Backend b, int[] prompt) {
         float[][] out = new float[3 + 4][VOCAB];
         int pos = 0;
         int call = 0;
-        for (int off = 0; off < prompt.length; off += 8) {
-            int n = Math.min(8, prompt.length - off);
+        for (int off = 0; off < prompt.length; off += 40) {
+            int n = Math.min(40, prompt.length - off);
             b.forward(prompt, off, n, pos, out[call++]);
             pos += n;
         }

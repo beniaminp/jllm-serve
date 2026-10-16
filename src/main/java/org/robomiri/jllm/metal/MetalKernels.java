@@ -342,7 +342,9 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.MATMUL3).i(which == 0 ? w.rows : 0).i(which == 1 ? w.rows : 0).i(which == 2 ? w.rows : 0)
                 .i(w.cols).i(n).f(eps).i(bias != null);
         String vh = which == 2 && vHalf ? "_h" : "";
-        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+        if (norm == null && useMma(n)) {
+            dispatch(kernel("matmul3_mma", w.type, vh), 14, 0, mmaGrid(w.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", w.type, vh), 14, 0, pfGrid(w.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {
             dispatch(kernel("matmul3", w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),

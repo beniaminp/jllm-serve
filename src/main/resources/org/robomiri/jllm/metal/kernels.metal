@@ -288,6 +288,8 @@ static inline float q8_block_dot(thread const char4 *pk, thread const float4 *x4
 template <int QT, typename XP>
 static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
                                thread float *acc, ushort lane);
+template <int QT>
+static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w);
 template <int QT, int NR, int TT>
 static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
                                 device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
@@ -804,6 +806,11 @@ static inline void mma_core(device const uchar *rwq, device const float *rws, ul
             device const char4 *q = (device const char4 *)(rwq + rgrow * nb * 32 + b * 32 + h * 16);
             const float s = rws[rgrow * nb + b];
             for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = float4(q[k]) * s;
+        } else if (QT >= GG_FIRST) {
+            // GGUF types: the 32-weight unit b of the row, both threads of the row decode it and store their half
+            float4 w[8];
+            gg_unit<QT>(rwq, rgrow, nb, b, w);
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[h * 4 + k];
         } else {
             float4 w[4];
             q2k_sub_block(rwq, rgrow, nsb, 2 * b + h, w);
@@ -928,8 +935,10 @@ kernel void matmul_swiglu_mma(device const uchar *wq [[buffer(0)]],
     const int nb = p.cols / QK;
     const int lr = tid >> 1;
     const int unit = min(unit0 + (lr & 31), p.hidden - 1);
-    const ulong grow = (ulong)(lr < 32 ? unit : p.hidden + unit);
-    mma_core<QT>(wq, ws, grow, nb, x + (ulong)t0 * p.cols, p.cols, p.ntok - t0, sa, sb, sa, tid, sg);
+    // GGUF types: the up rows are the separate view bound as buffer(1), the same unit index in it
+    device const uchar *rwq = (QT >= GG_FIRST && lr >= 32) ? (device const uchar *)ws : wq;
+    const ulong grow = (ulong)((lr < 32 || QT >= GG_FIRST) ? unit : p.hidden + unit);
+    mma_core<QT>(rwq, ws, grow, nb, x + (ulong)t0 * p.cols, p.cols, p.ntok - t0, sa, sb, sa, tid, sg);
     for (int i = tid; i < (MMA_BR / 2) * MMA_BT; i += MM_THREADS) {
         const int t = i / (MMA_BR / 2), j = i % (MMA_BR / 2);
         if (t0 + t < p.ntok && unit0 + j < p.hidden) {
@@ -2033,6 +2042,10 @@ GG_BLOCK_DOT(GG_Q5_K)
     template [[host_name("matmul_swiglu_" SUF)]] kernel matmul_swiglu_t matmul_swiglu<QTV, false>;                \
     template [[host_name("matmul_swiglu_" SUF "_norm")]] kernel matmul_swiglu_t matmul_swiglu<QTV, true>;         \
     template [[host_name("matmul_swiglu_pf_" SUF)]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<QTV, PF_UNITS, PF_TOKS>; \
+    template [[host_name("matmul_mma_" SUF)]] kernel matmul_mma_t matmul_mma<QTV>;                                \
+    template [[host_name("matmul3_mma_" SUF)]] kernel matmul3_mma_t matmul3_mma<QTV, float>;                      \
+    template [[host_name("matmul3_mma_" SUF "_h")]] kernel matmul3_mma_h_t matmul3_mma<QTV, half>;                \
+    template [[host_name("matmul_swiglu_mma_" SUF)]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<QTV>;          \
     template [[host_name("moe_up_" SUF)]] kernel moe_up_t moe_up<QTV>;                                            \
     template [[host_name("moe_down_" SUF)]] kernel moe_down_t moe_down<QTV>;
 GG_INSTANTIATE("q4g", GG_Q4_0)

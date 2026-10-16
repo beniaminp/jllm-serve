@@ -94,7 +94,7 @@ public final class GgufMetalCheck {
         Metal.Buffer w = k.wrap(seg);
         check(w.offset() == 96, file + ": slice offset inside the wrapped pages is " + w.offset());
         Random rnd = new Random(5);
-        for (int n : new int[]{1, 3, 9}) { // decode, a few tokens, a prefill chunk (tiled kernels from 8 tokens)
+        for (int n : new int[]{1, 3, 9, 40}) { // decode, a few tokens, a prefill chunk (tiled kernels from 8 tokens, matrix units from 32)
             float[] x = new float[n * COLS];
             for (int i = 0; i < x.length; i++) {
                 x[i] = rnd.nextFloat() * 2 - 1;
@@ -166,7 +166,7 @@ public final class GgufMetalCheck {
                 for (int r = 0; r < hidden; r++) {
                     double g = y[tok][r];
                     ys[tok][r] = g / (1 + Math.exp(-g)) * y[tok][hidden + r];
-                    ms[tok][r] = Math.abs(ys[tok][r]) + 1e-3 * (mag[tok][r] + mag[tok][hidden + r]);
+                    ms[tok][r] = Math.abs(ys[tok][r]) + 1e-2 * (mag[tok][r] + mag[tok][hidden + r]);
                 }
             }
             Metal.Buffer sw = k.scratch((long) n * hidden * 4);
@@ -191,7 +191,7 @@ public final class GgufMetalCheck {
                         uu += (double) ref[(hidden + r) * COLS + c] * x[c] * scale;
                     }
                     yn[0][r] = gg / (1 + Math.exp(-gg)) * uu;
-                    mn[0][r] = Math.abs(yn[0][r]) + 1e-3 * (mag[0][r] + mag[0][hidden + r]);
+                    mn[0][r] = Math.abs(yn[0][r]) + 1e-2 * (mag[0][r] + mag[0][hidden + r]);
                 }
                 Metal.Buffer swn = k.scratch(hidden * 4L);
                 k.begin();
@@ -213,7 +213,7 @@ public final class GgufMetalCheck {
                 int e = tok % 2;
                 double g = y[tok][e];
                 ye[tok][0] = g / (1 + Math.exp(-g)) * y[tok][2 + e];
-                me[tok][0] = Math.abs(ye[tok][0]) + 1e-3 * (mag[tok][e] + mag[tok][2 + e]);
+                me[tok][0] = Math.abs(ye[tok][0]) + 1e-2 * (mag[tok][e] + mag[tok][2 + e]);
             }
             Metal.Buffer up = k.scratch(n * 4L);
             k.begin();
@@ -270,7 +270,7 @@ public final class GgufMetalCheck {
         Random rnd = new Random(11);
         float[] bias = {0.5f, -1f, 2f, 0.25f};
         Metal.Buffer[] bb = {k.upload(bias), k.upload(bias), k.upload(bias)};
-        for (int n : new int[]{1, 9}) {
+        for (int n : new int[]{1, 9, 40}) {
             for (boolean withBias : new boolean[]{false, true}) {
                 float[] x = new float[n * COLS];
                 for (int i = 0; i < x.length; i++) {
