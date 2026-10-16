@@ -186,21 +186,7 @@ public final class VectorKernels {
             s2 = FloatVector.fromArray(F, w, wo + 2 * n + i).fma(xv, s2);
             s3 = FloatVector.fromArray(F, w, wo + 3 * n + i).fma(xv, s3);
         }
-        float r0 = s0.reduceLanes(VectorOperators.ADD);
-        float r1 = s1.reduceLanes(VectorOperators.ADD);
-        float r2 = s2.reduceLanes(VectorOperators.ADD);
-        float r3 = s3.reduceLanes(VectorOperators.ADD);
-        if (acc) {
-            out[oo] += r0;
-            out[oo + 1] += r1;
-            out[oo + 2] += r2;
-            out[oo + 3] += r3;
-        } else {
-            out[oo] = r0;
-            out[oo + 1] = r1;
-            out[oo + 2] = r2;
-            out[oo + 3] = r3;
-        }
+        store4(out, oo, s0, s1, s2, s3, acc);
     }
 
     /**
@@ -409,6 +395,18 @@ public final class VectorKernels {
 
     static float sumSquares(float[] x, int xo, int n) {
         return dot(x, xo, x, xo, n);
+    }
+
+    /** RMSNorm of one row: {@code out[oo + i] = (in[io + i] * rsqrt(mean(in^2) + eps)) * w[i]}. */
+    static void rmsnormRow(float[] in, int io, float[] out, int oo, float[] w, int n, float eps) {
+        float ss = sumSquares(in, io, n);
+        float scale = (float) (1.0 / Math.sqrt(ss / n + eps));
+        scaleMul(in, io, scale, w, out, oo, n);
+    }
+
+    /** {@code x / (1 + e^-x)}, the scalar SiLU every CPU path uses (so they all round the same way). */
+    static float silu(float x) {
+        return x / (1f + (float) Math.exp(-x));
     }
 
     /** {@code out[oo + i] = (in[io + i] * s) * w[i]}, the RMSNorm scaling step (same rounding as the scalar loop). */

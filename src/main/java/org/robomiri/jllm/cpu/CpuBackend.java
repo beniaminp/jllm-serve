@@ -346,9 +346,7 @@ public final class CpuBackend implements Backend {
     }
 
     void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
-        float ss = VectorKernels.sumSquares(in, io, width);
-        float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
-        VectorKernels.scaleMul(in, io, scale, weight, out, oo, width);
+        VectorKernels.rmsnormRow(in, io, out, oo, weight, width, c.normEps());
     }
 
     /** {@code out[t, r] (+)= dot(W[r, :], in[t, :])} for {@code t < n}: {@link CpuMatmul#mul}. */
@@ -453,7 +451,7 @@ public final class CpuBackend implements Backend {
             int hi = k * m;
             for (int i = 0; i < m; i++) {
                 float g = moeGateUp[gi + i];
-                moeHidden[hi + i] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + i];
+                moeHidden[hi + i] = VectorKernels.silu(g) * moeGateUp[gi + m + i];
             }
         }
         if (mm.useInt8(L.expDown)) {
@@ -530,7 +528,7 @@ public final class CpuBackend implements Backend {
                 int j = i - s * m;
                 int gi = s * gu;
                 float g = moeGateUp[gi + j];
-                moeHidden[s * m + j] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + j];
+                moeHidden[s * m + j] = VectorKernels.silu(g) * moeGateUp[gi + m + j];
             }
         });
 
@@ -710,8 +708,7 @@ public final class CpuBackend implements Backend {
                 int t = i / hdim;
                 int j = i - t * hdim;
                 int gi = t * 2 * hdim;
-                float g = gateUp[gi + j];
-                hidden[t * hdim + j] = g / (1f + (float) Math.exp(-g)) * gateUp[gi + hdim + j];
+                hidden[t * hdim + j] = VectorKernels.silu(gateUp[gi + j]) * gateUp[gi + hdim + j];
             }
         });
     }

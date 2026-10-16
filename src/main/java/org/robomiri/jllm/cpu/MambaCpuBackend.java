@@ -171,7 +171,7 @@ public final class MambaCpuBackend implements Backend {
         if (dc > 1) {
             state[so + dc - 2] = u;
         }
-        return sum / (1f + (float) Math.exp(-sum));
+        return VectorKernels.silu(sum);
     }
 
     /**
@@ -194,7 +194,7 @@ public final class MambaCpuBackend implements Backend {
                     float u = xc[t * di + i];
                     float acc = scanStep(dt, u, L.a, so, s, so, dbc, bo, ds);
                     float z = xz[t * 2 * di + di + i];
-                    y[t * di + i] = (acc + L.d[i] * u) * (z / (1f + (float) Math.exp(-z)));
+                    y[t * di + i] = (acc + L.d[i] * u) * VectorKernels.silu(z);
                 }
             }
         });
@@ -223,11 +223,7 @@ public final class MambaCpuBackend implements Backend {
     // ------------------------------------------------------------------ shared pieces
 
     private void rmsnormRow(float[] in, int io, float[] out, int oo, float[] weight, int width) {
-        float ss = VectorKernels.sumSquares(in, io, width);
-        float scale = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
-        for (int i = 0; i < width; i++) {
-            out[oo + i] = in[io + i] * scale * weight[i];
-        }
+        VectorKernels.rmsnormRow(in, io, out, oo, weight, width, c.normEps());
     }
 
     @Override
