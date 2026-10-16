@@ -315,8 +315,15 @@ public final class Metal implements AutoCloseable {
         return err.getString(0);
     }
 
+    private boolean closed;
+
+    /** Releases every buffer and the context; a second call is a no-op. */
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
         try {
             for (Buffer b : buffers) {
                 bufferRelease.invokeExact(b.handle());
