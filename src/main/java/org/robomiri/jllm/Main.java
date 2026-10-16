@@ -4,6 +4,7 @@ import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.cpu.CpuBackend;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.gguf.GgufModel;
 import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
@@ -20,6 +21,7 @@ import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
 import org.robomiri.jllm.server.HttpServer;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
+import org.robomiri.jllm.tokenizer.GgufTokenizer;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 
 import java.io.BufferedReader;
@@ -66,21 +68,25 @@ public final class Main {
             return;
         }
         String model = s.get("model.repo");
-        Path dir = Path.of(s.get("model.dir")).resolve(model.replace('/', '_'));
         HuggingFaceHub hub = new HuggingFaceHub(s.opt("hub.endpoint"), s.opt("hub.token"), s.getLong("hub.timeout-ms"));
 
-        switch (cmd) {
-            case "config" -> System.out.print(s.describe());
-            case "download" -> hub.download(model, s.get("model.revision"), dir);
-            case "chat" -> chat(load(s, hub, model, dir), s);
-            case "run" -> run(load(s, hub, model, dir), s);
-            case "serve" -> serve(load(s, hub, model, dir), model, s);
-            case "bench" -> bench(load(s, hub, model, dir), s);
-            default -> {
-                System.err.println("unknown command: " + cmd);
-                usage();
-                System.exit(2);
+        try {
+            switch (cmd) {
+                case "config" -> System.out.print(s.describe());
+                case "download" -> download(s, hub, model);
+                case "chat" -> chat(load(s, hub, model), s);
+                case "run" -> run(load(s, hub, model), s);
+                case "serve" -> serve(load(s, hub, model), model, s);
+                case "bench" -> bench(load(s, hub, model), s);
+                default -> {
+                    System.err.println("unknown command: " + cmd);
+                    usage();
+                    System.exit(2);
+                }
             }
+        } catch (HuggingFaceHub.GgufSelectionException e) {
+            System.err.println(e.getMessage()); // a usage problem, not a failure: the message lists the choices
+            System.exit(2);
         }
     }
 
@@ -94,7 +100,8 @@ public final class Main {
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
-                  --model <repo>        --revision <rev>     --dir <path>        --quant q4|q8|q2k   --low-disk
+                  --model <repo|file.gguf>  --revision <rev>  --dir <path>      --quant q4|q8|q2k   --low-disk
+                  --gguf-file <name>    --gguf-quant <label> (a GGUF repo: pick the file; the file is used as it is)
                   --backend cpu|metal   --ctx <n>            --batch <n>         --threads <n>
                   --temp <t> --top-k <k> --top-p <p> --min-p <p> --rep-penalty <r> --seed <s> --max-tokens <n>
                   --think               --system "..."       --host <h>          --port <p>
@@ -109,7 +116,74 @@ public final class Main {
     private record Loaded(ModelWeights weights, Engine engine) {
     }
 
-    private static Loaded load(Settings s, HuggingFaceHub hub, String model, Path dir) throws Exception {
+    /** Where the model comes from: a GGUF file (used as it is), or a Hugging Face safetensors checkpoint in {@code dir}. */
+    private record Source(Path gguf, Path dir) {
+    }
+
+    private static void download(Settings s, HuggingFaceHub hub, String model) throws Exception {
+        Source src = resolve(s, hub, model);
+        if (src.gguf() == null) {
+            hub.download(model, s.get("model.revision"), src.dir());
+        } else {
+            System.err.println(src.gguf());
+        }
+    }
+
+    /**
+     * Decides how {@code model} is loaded, downloading what is missing. A name ending in {@code .gguf} is a local
+     * file. A repository is a GGUF one when {@code model.gguf-file} / {@code model.gguf-quant} is set, or when it
+     * has {@code .gguf} files and no safetensors checkpoint; a model directory that already has a
+     * {@code config.json} is a safetensors one without asking the Hub. Only the chosen GGUF file (and its split
+     * parts) is downloaded.
+     */
+    private static Source resolve(Settings s, HuggingFaceHub hub, String model) throws Exception {
+        if (model.toLowerCase(java.util.Locale.ROOT).endsWith(".gguf")) {
+            Path file = Path.of(model).toAbsolutePath();
+            if (!Files.isRegularFile(file)) {
+                throw new IOException("no such GGUF file: " + file);
+            }
+            return new Source(file, file.getParent());
+        }
+        Path dir = Path.of(s.get("model.dir")).resolve(model.replace('/', '_'));
+        String revision = s.get("model.revision");
+        String file = s.opt("model.gguf-file");
+        String quant = s.opt("model.gguf-quant");
+        boolean forced = file != null || quant != null;
+        boolean safetensors = Files.isRegularFile(dir.resolve("config.json"));
+        if (!forced && safetensors) {
+            return new Source(null, dir);
+        }
+        IOException localProblem = null;
+        List<String> local = HuggingFaceHub.localGgufNames(dir);
+        if (!local.isEmpty()) {
+            try {
+                var sel = HuggingFaceHub.selectGguf(local, file, quant);
+                if (sel.getValue().stream().allMatch(n -> Files.isRegularFile(dir.resolve(n)))) {
+                    return new Source(dir.resolve(sel.getKey()), dir);
+                }
+            } catch (IOException e) {
+                localProblem = e; // none or several fit: the repository's listing may settle it
+            }
+        }
+        try {
+            if (!forced && !HuggingFaceHub.isGgufRepo(hub.listFiles(model, revision))) {
+                return new Source(null, dir);
+            }
+            return new Source(hub.downloadGguf(model, revision, dir, file, quant), dir);
+        } catch (IOException e) {
+            if (localProblem != null && !(e instanceof HuggingFaceHub.HttpStatusException)) {
+                throw new IOException(localProblem.getMessage() + " (the Hub could not be asked: " + e.getMessage() + ")", e);
+            }
+            throw e;
+        }
+    }
+
+    private static Loaded load(Settings s, HuggingFaceHub hub, String model) throws Exception {
+        Source src = resolve(s, hub, model);
+        if (src.gguf() != null) {
+            return loadGguf(s, hub, src);
+        }
+        Path dir = src.dir();
         String revision = s.get("model.revision");
         if (!Files.isRegularFile(dir.resolve("config.json"))) {
             hub.downloadMetadata(model, revision, dir);
@@ -152,6 +226,60 @@ public final class Main {
             }
         };
         ModelWeights weights = ModelWeights.load(dir, arch, quant, shards, model + "@" + revision);
+        return start(s, arch, tok, weights, dir);
+    }
+
+    /** A GGUF file: architecture, tokenizer and weights all come from it, nothing is converted or cached. */
+    private static Loaded loadGguf(Settings s, HuggingFaceHub hub, Source src) throws Exception {
+        long t0 = System.nanoTime();
+        GgufModel gm = GgufModel.open(src.gguf());
+        ModelWeights weights;
+        Architecture arch;
+        Tokenizer tok;
+        try {
+            arch = gm.architecture();
+            System.err.println("GGUF: " + gm.describe());
+            System.err.println("Model: " + arch);
+            String warn = gm.chatTemplateWarning();
+            if (warn != null) {
+                System.err.println("warning: " + warn);
+            }
+            tok = ggufTokenizer(s, hub, gm);
+            weights = gm.weights();
+        } catch (Exception e) {
+            gm.close();
+            throw e;
+        }
+        System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs%n", arch.core().architecture(), weights.quant,
+                weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
+        return start(s, arch, tok, weights, null);
+    }
+
+    /** The tokenizer built from the file; when its pre-tokenizer is unknown, the tokenizer.json of the original repository. */
+    private static Tokenizer ggufTokenizer(Settings s, HuggingFaceHub hub, GgufModel gm) throws Exception {
+        try {
+            return gm.tokenizer();
+        } catch (GgufTokenizer.UnsupportedPreTokenizer e) {
+            String repo = gm.originalRepo();
+            if (repo == null) {
+                throw new IOException(e.getMessage() + "; and the file names no original repository (general.base_model.0.repo_url)"
+                        + " to take tokenizer.json from", e);
+            }
+            System.err.println("note: " + e.getMessage() + "; using the tokenizer.json of " + repo);
+            Path tdir = Path.of(s.get("model.dir")).resolve("tokenizers").resolve(repo.replace('/', '_'));
+            Files.createDirectories(tdir);
+            hub.ensure(repo, "main", tdir, "tokenizer.json");
+            try {
+                hub.ensure(repo, "main", tdir, "tokenizer_config.json");
+            } catch (IOException ignored) {
+                // optional: it only supplies BOS / EOS names
+            }
+            return Tokenizer.load(tdir.resolve("tokenizer.json"));
+        }
+    }
+
+    /** Backend and engine over loaded weights; {@code dir} (null for a GGUF file) may hold a generation_config.json. */
+    private static Loaded start(Settings s, Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
@@ -195,8 +323,8 @@ public final class Main {
 
     private static Set<Integer> eosIds(Path dir, Tokenizer tok, Architecture arch) throws Exception {
         Set<Integer> ids = new HashSet<>(arch.core().eosTokenIds());
-        Path gen = dir.resolve("generation_config.json");
-        if (Files.isRegularFile(gen)) {
+        Path gen = dir == null ? null : dir.resolve("generation_config.json");
+        if (gen != null && Files.isRegularFile(gen)) {
             Object eos = Json.parseObject(Files.readString(gen)).get("eos_token_id");
             if (eos instanceof Number n) {
                 ids.add(n.intValue());

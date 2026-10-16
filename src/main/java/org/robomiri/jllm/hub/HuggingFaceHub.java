@@ -25,7 +25,11 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Collections;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -223,6 +227,162 @@ public final class HuggingFaceHub {
             return List.copyOf(new TreeSet<>(SafeTensors.readWeightMap(index).values()));
         }
         return List.of("model.safetensors");
+    }
+
+    // ------------------------------------------------------------------ GGUF files
+
+    private static final Pattern GGUF_SPLIT = Pattern.compile("^(.*)-(\\d{5})-of-(\\d{5})\\.gguf$");
+
+    /** No GGUF file, or more than one, fits the requested name / quantization: the message lists the choices. */
+    public static final class GgufSelectionException extends IOException {
+        public GgufSelectionException(String message) {
+            super(message);
+        }
+    }
+
+    /** True for a {@code .gguf} file that holds a language model (not the {@code mmproj-*} vision projector). */
+    public static boolean isGgufModelFile(String name) {
+        String base = name.substring(name.lastIndexOf('/') + 1).toLowerCase(java.util.Locale.ROOT);
+        return base.endsWith(".gguf") && !base.startsWith("mmproj");
+    }
+
+    /** True if a repository has GGUF model files and no safetensors checkpoint (so it can only be loaded as GGUF). */
+    public static boolean isGgufRepo(List<RepoFile> listing) {
+        boolean gguf = false;
+        for (RepoFile f : listing) {
+            if (f.name().equals("model.safetensors") || f.name().equals("model.safetensors.index.json")) {
+                return false;
+            }
+            gguf |= isGgufModelFile(f.name());
+        }
+        return gguf;
+    }
+
+    /** The models in {@code names}: a split model counts once, under its first part. Sorted. */
+    private static TreeMap<String, List<String>> ggufModels(List<String> names) {
+        TreeMap<String, List<String>> models = new TreeMap<>();
+        for (String n : names) {
+            if (!isGgufModelFile(n)) {
+                continue;
+            }
+            Matcher m = GGUF_SPLIT.matcher(n);
+            String key = m.matches() ? m.group(1) + "-00001-of-" + m.group(3) + ".gguf" : n;
+            models.computeIfAbsent(key, k -> new ArrayList<>()).add(n);
+        }
+        models.values().forEach(Collections::sort);
+        return models;
+    }
+
+    /** True if the file name carries the quantization label {@code quant} ({@code Q4_K_M}) as a whole word. */
+    static boolean matchesQuant(String name, String quant) {
+        String base = name.substring(name.lastIndexOf('/') + 1);
+        return Pattern.compile("(?<![A-Za-z0-9])" + Pattern.quote(quant) + "(?![A-Za-z0-9_])", Pattern.CASE_INSENSITIVE)
+                .matcher(base).find();
+    }
+
+    /**
+     * Picks the GGUF model to load from {@code names} (the repository's files, or the files in a local directory):
+     * the one named exactly {@code file} (a split model: any of its parts), or the one whose name carries the
+     * label {@code quant}, or the only one there is.
+     *
+     * @return the name of the first part and the names of all parts, in order
+     * @throws IOException with the list of the available files when nothing or more than one model fits
+     */
+    public static Map.Entry<String, List<String>> selectGguf(List<String> names, String file, String quant) throws IOException {
+        TreeMap<String, List<String>> models = ggufModels(names);
+        if (models.isEmpty()) {
+            throw new GgufSelectionException("no .gguf model file found (searched " + names.size() + " files)");
+        }
+        List<Map.Entry<String, List<String>>> hits = new ArrayList<>();
+        String what;
+        if (file != null && !file.isBlank()) {
+            what = "model.gguf-file=" + file;
+            for (Map.Entry<String, List<String>> e : models.entrySet()) {
+                if (e.getValue().contains(file)) {
+                    hits.add(e);
+                }
+            }
+        } else if (quant != null && !quant.isBlank()) {
+            what = "model.gguf-quant=" + quant;
+            for (Map.Entry<String, List<String>> e : models.entrySet()) {
+                if (matchesQuant(e.getKey(), quant)) {
+                    hits.add(e);
+                }
+            }
+        } else {
+            what = "no model.gguf-file / model.gguf-quant";
+            hits.addAll(models.entrySet());
+        }
+        if (hits.size() == 1) {
+            Map.Entry<String, List<String>> e = hits.getFirst();
+            return Map.entry(e.getKey(), e.getValue());
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(hits.isEmpty() ? "no GGUF file matches " : "more than one GGUF file matches ").append(what)
+                .append("; available:");
+        for (Map.Entry<String, List<String>> e : (hits.isEmpty() ? models.entrySet() : hits)) {
+            sb.append("\n  ").append(e.getKey());
+            if (e.getValue().size() > 1) {
+                sb.append(" (").append(e.getValue().size()).append(" parts)");
+            }
+        }
+        sb.append("\nset model.gguf-file to an exact file name (--gguf-file) or model.gguf-quant to a quantization label"
+                + " such as Q4_K_M (--gguf-quant)");
+        throw new GgufSelectionException(sb.toString());
+    }
+
+    /** The GGUF model files under {@code dir} (two levels deep), as names relative to it. */
+    public static List<String> localGgufNames(Path dir) throws IOException {
+        List<String> out = new ArrayList<>();
+        if (!Files.isDirectory(dir)) {
+            return out;
+        }
+        try (var s = Files.walk(dir, 2)) {
+            s.filter(Files::isRegularFile).forEach(p -> out.add(dir.relativize(p).toString().replace('\\', '/')));
+        }
+        out.removeIf(n -> !isGgufModelFile(n) || n.endsWith(".incomplete"));
+        return out;
+    }
+
+    /**
+     * Downloads the GGUF model chosen by {@code file} / {@code quant} (see {@link #selectGguf}) into {@code dir}:
+     * only that file and its split siblings, each resumable and SHA-256 verified like every other download.
+     *
+     * @return the path of the first (or only) file
+     */
+    public Path downloadGguf(String repo, String revision, Path dir, String file, String quant)
+            throws IOException, InterruptedException {
+        Map<String, RepoFile> byName = new HashMap<>();
+        List<String> names = new ArrayList<>();
+        for (RepoFile f : listFiles(repo, revision)) {
+            byName.put(f.name(), f);
+            names.add(f.name());
+        }
+        Map.Entry<String, List<String>> sel;
+        try {
+            sel = selectGguf(names, file, quant);
+        } catch (GgufSelectionException e) {
+            throw new GgufSelectionException(repo + ": " + e.getMessage());
+        }
+        Files.createDirectories(dir);
+        long need = 0;
+        for (String n : sel.getValue()) {
+            Path t = dir.resolve(n);
+            RepoFile f = byName.get(n);
+            if (!(Files.isRegularFile(t) && Files.size(t) == f.size())) {
+                need += Math.max(0, f.size());
+            }
+        }
+        long free = Files.getFileStore(dir).getUsableSpace();
+        if (need > free) {
+            throw new IOException(String.format("need %.1f GB for %s but only %.1f GB are free", need / 1e9, sel.getKey(), free / 1e9));
+        }
+        System.err.printf("Downloading %s@%s: %s (%d file%s, %.1f MB) into %s%n", repo, revision, sel.getKey(),
+                sel.getValue().size(), sel.getValue().size() == 1 ? "" : "s", need / 1e6, dir);
+        for (String n : sel.getValue()) {
+            downloadFile(repo, revision, byName.get(n), dir);
+        }
+        return dir.resolve(sel.getKey());
     }
 
     private final Map<String, List<RepoFile>> listings = new HashMap<>();

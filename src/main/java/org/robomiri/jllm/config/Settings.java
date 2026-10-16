@@ -33,6 +33,8 @@ public final class Settings {
             Map.entry("dir", "model.dir"),
             Map.entry("quant", "model.quant"),
             Map.entry("low-disk", "model.low-disk"),
+            Map.entry("gguf-file", "model.gguf-file"),
+            Map.entry("gguf-quant", "model.gguf-quant"),
             Map.entry("backend", "backend"),
             Map.entry("ctx", "backend.ctx"),
             Map.entry("batch", "backend.batch"),
@@ -205,6 +207,11 @@ public final class Settings {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("model.quant: " + e.getMessage());
         }
+        String ggufFile = get("model.gguf-file");
+        require(ggufFile.isEmpty() || ggufFile.toLowerCase(java.util.Locale.ROOT).endsWith(".gguf"), "model.gguf-file",
+                "must be the exact name of a .gguf file in the repository (or empty)");
+        require(get("model.gguf-quant").matches("[A-Za-z0-9_.-]*"), "model.gguf-quant",
+                "must be a quantization label such as Q4_K_M or Q8_0 (or empty)");
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
