@@ -94,8 +94,8 @@ public final class CpuBackend implements Backend {
             kv = KvCache.create(kvDtype, c, ctx);
             mla = null;
         }
-        kStage = new float[maxBatch * c.kvDim()];
-        vStage = new float[maxBatch * c.kvDim()];
+        kStage = mla == null ? new float[maxBatch * c.kvDim()] : null; // MLA keeps its own cache and staging
+        vStage = mla == null ? new float[maxBatch * c.kvDim()] : null;
         x = new float[maxBatch * c.dim()];
         xb = new float[maxBatch * c.dim()];
         q = new float[maxBatch * c.qDim()];
