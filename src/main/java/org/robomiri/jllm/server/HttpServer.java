@@ -10,9 +10,12 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -30,13 +33,16 @@ public final class HttpServer implements AutoCloseable {
      * Connection limits (the {@code server.*} keys in {@code jllm.properties}).
      *
      * @param readTimeoutMs  socket read timeout while waiting for a request or its body, 0 = none
+     * @param writeTimeoutMs how long a streaming response may wait for a client that stopped reading before the
+     *                       connection is dropped (the generation behind it is cancelled), 0 = forever
      * @param maxConnections simultaneous connections; further ones wait in the kernel accept queue
      * @param maxBodyBytes   largest accepted request body
      * @param corsOrigin     value of {@code Access-Control-Allow-Origin}; null or empty = no CORS headers at all
      */
-    public record Options(int readTimeoutMs, int maxConnections, long maxBodyBytes, String corsOrigin) {
+    public record Options(int readTimeoutMs, int writeTimeoutMs, int maxConnections, long maxBodyBytes,
+                          String corsOrigin) {
         public Options {
-            if (readTimeoutMs < 0 || maxConnections < 1 || maxBodyBytes < 0) {
+            if (readTimeoutMs < 0 || writeTimeoutMs < 0 || maxConnections < 1 || maxBodyBytes < 0) {
                 throw new IllegalArgumentException("invalid server options: " + this);
             }
             if (corsOrigin != null && corsOrigin.isBlank()) {
@@ -45,7 +51,7 @@ public final class HttpServer implements AutoCloseable {
         }
 
         public static Options defaults() {
-            return new Options(30_000, 256, 4L * 1024 * 1024, null);
+            return new Options(30_000, 10_000, 256, 4L * 1024 * 1024, null);
         }
     }
 
@@ -80,9 +86,21 @@ public final class HttpServer implements AutoCloseable {
         }
     }
 
-    /** Response writer; either call {@link #send} once, or {@link #startStream} followed by {@link #write}/{@link #end}. */
+    /**
+     * Response writer; either call {@link #send} once, or {@link #startStream} followed by {@link #write}/{@link #end}.
+     *
+     * <p>A stream is written by a writer thread of its own: {@link #write} only queues the chunk, so the caller
+     * (the engine thread, holding the engine lock) never blocks on a client that has stopped reading. When the
+     * queue stays full for longer than {@link Options#writeTimeoutMs()} the socket is closed, which unblocks the
+     * writer, and {@code write} throws so the caller stops producing.
+     */
     public static final class Response {
+        private static final int QUEUE_CHUNKS = 256;
+        private static final byte[] END = new byte[0];
+
         private final OutputStream out;
+        private final Socket socket;
+        private final int writeTimeoutMs;
         private final boolean keepAlive;
         private final String corsOrigin;
         private final boolean head;    // HEAD request: headers only, never a body
@@ -91,9 +109,16 @@ public final class HttpServer implements AutoCloseable {
         private boolean started;
         private boolean streaming;
         private boolean ended;
+        private BlockingQueue<byte[]> queue;
+        private Thread writer;
+        private volatile IOException writeFailure;
+        private volatile boolean aborted;
 
-        Response(OutputStream out, boolean keepAlive, String corsOrigin, boolean head, boolean chunked) {
+        Response(OutputStream out, Socket socket, int writeTimeoutMs, boolean keepAlive, String corsOrigin,
+                 boolean head, boolean chunked) {
             this.out = out;
+            this.socket = socket;
+            this.writeTimeoutMs = writeTimeoutMs;
             this.keepAlive = keepAlive;
             this.corsOrigin = corsOrigin;
             this.head = head;
@@ -161,31 +186,124 @@ public final class HttpServer implements AutoCloseable {
             }
             h.append("Cache-Control: no-cache\r\n");
             commonHeaders(h);
-            out.write(h.toString().getBytes(StandardCharsets.ISO_8859_1));
-            out.flush();
+            queue = new ArrayBlockingQueue<>(QUEUE_CHUNKS);
+            writer = Thread.ofVirtual().name("http-writer").start(this::drain);
+            enqueue(h.toString().getBytes(StandardCharsets.ISO_8859_1));
         }
 
         public void write(String chunk) throws IOException {
+            if (!streaming) {
+                throw new IllegalStateException("not streaming");
+            }
             byte[] b = chunk.getBytes(StandardCharsets.UTF_8);
             if (b.length == 0 || head) {
                 return;
             }
             if (chunked) {
-                out.write((Integer.toHexString(b.length) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
-                out.write(b);
-                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
-            } else {
-                out.write(b);
+                byte[] size = (Integer.toHexString(b.length) + "\r\n").getBytes(StandardCharsets.ISO_8859_1);
+                byte[] framed = new byte[size.length + b.length + 2];
+                System.arraycopy(size, 0, framed, 0, size.length);
+                System.arraycopy(b, 0, framed, size.length, b.length);
+                framed[framed.length - 2] = '\r';
+                framed[framed.length - 1] = '\n';
+                b = framed;
             }
-            out.flush();
+            enqueue(b);
         }
 
+        /** Finishes the response; for a stream, waits until everything queued has reached the socket. */
         public void end() throws IOException {
-            if (streaming && !ended && chunked && !head) {
-                out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            if (ended) {
+                return;
             }
-            out.flush();
             ended = true;
+            if (!streaming) {
+                out.flush();
+                return;
+            }
+            if (chunked && !head) {
+                enqueue("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            }
+            enqueue(END);
+            boolean finished;
+            try {
+                finished = writeTimeoutMs > 0 ? writer.join(Duration.ofMillis(writeTimeoutMs)) : joinIndefinitely();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                abort();
+                throw new IOException("interrupted while finishing the stream");
+            }
+            if (!finished) {
+                abort();
+                throw new IOException("client stopped reading the stream for " + writeTimeoutMs + " ms");
+            }
+            if (writeFailure != null) {
+                throw new IOException("client connection failed: " + writeFailure.getMessage(), writeFailure);
+            }
+        }
+
+        private boolean joinIndefinitely() throws InterruptedException {
+            writer.join();
+            return true;
+        }
+
+        /** The writer thread: copies queued chunks to the socket, flushing whenever the queue runs empty. */
+        private void drain() {
+            try {
+                while (true) {
+                    byte[] b = queue.take();
+                    if (b == END) {
+                        break;
+                    }
+                    out.write(b);
+                    if (queue.isEmpty()) {
+                        out.flush();
+                    }
+                }
+                out.flush();
+            } catch (IOException e) {
+                writeFailure = e;
+                queue.clear(); // a producer blocked on the full queue wakes up and sees the failure
+            } catch (InterruptedException e) {
+                writeFailure = new IOException("writer interrupted");
+                queue.clear();
+            }
+        }
+
+        private void enqueue(byte[] b) throws IOException {
+            if (writeFailure != null) {
+                throw new IOException("client connection failed: " + writeFailure.getMessage(), writeFailure);
+            }
+            if (aborted) {
+                throw new IOException("stream aborted");
+            }
+            boolean queued;
+            try {
+                if (writeTimeoutMs > 0) {
+                    queued = queue.offer(b, writeTimeoutMs, TimeUnit.MILLISECONDS);
+                } else {
+                    queue.put(b);
+                    queued = true;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                abort();
+                throw new IOException("interrupted while writing the stream");
+            }
+            if (!queued) {
+                abort();
+                throw new IOException("client stopped reading the stream for " + writeTimeoutMs + " ms");
+            }
+        }
+
+        /** Drops the connection: closes the socket so that a writer blocked in {@code write} unblocks. */
+        void abort() {
+            aborted = true;
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // nothing to do
+            }
         }
 
         boolean started() {
@@ -278,7 +396,7 @@ public final class HttpServer implements AutoCloseable {
                 try {
                     req = readRequest(in, out);
                 } catch (HttpError e) {
-                    new Response(out, false, options.corsOrigin(), false, false)
+                    new Response(out, s, options.writeTimeoutMs(), false, options.corsOrigin(), false, false)
                             .send(e.status, "application/json", errorJson("invalid_request_error", e.getMessage()));
                     return;
                 }
@@ -286,7 +404,8 @@ public final class HttpServer implements AutoCloseable {
                     return;
                 }
                 boolean keepAlive = !req.http10 && !"close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
-                Response res = new Response(out, keepAlive, options.corsOrigin(), req.method.equals("HEAD"), !req.http10);
+                Response res = new Response(out, s, options.writeTimeoutMs(), keepAlive, options.corsOrigin(),
+                        req.method.equals("HEAD"), !req.http10);
                 try {
                     handler.handle(req, res);
                     if (!res.started()) {
@@ -473,6 +592,7 @@ public final class HttpServer implements AutoCloseable {
             case 400 -> "Bad Request";
             case 404 -> "Not Found";
             case 405 -> "Method Not Allowed";
+            case 408 -> "Request Timeout";
             case 413 -> "Content Too Large";
             case 415 -> "Unsupported Media Type";
             case 431 -> "Request Header Fields Too Large";

@@ -257,6 +257,7 @@ public final class Main {
         String host = s.get("server.host");
         HttpServer.Options http = new HttpServer.Options(
                 s.getInt("server.read-timeout-ms"),
+                s.getInt("server.write-timeout-ms"),
                 s.getInt("server.max-connections"),
                 s.getLong("server.max-body-bytes"),
                 s.opt("server.cors-origin"));
