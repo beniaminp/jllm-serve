@@ -276,17 +276,22 @@ public final class QuantFile implements AutoCloseable {
         return entries.containsKey(name);
     }
 
+    /** A quantized tensor as a view of the mapped file; {@code name} must not be an F32 entry (see {@link #floats}). */
     public QTensor tensor(String name) {
         Entry e = entry(name);
+        if (e.type().equals("F32")) {
+            throw new IllegalArgumentException(name + " is stored as F32, not as a quantized tensor (read it with floats())");
+        }
         return QTensor.view(QType.valueOf(e.type()), e.rows(), e.cols(), mapped.asSlice(e.offset(), e.size()));
     }
 
+    /** An F32 entry copied into a new array. */
     public float[] floats(String name) {
         Entry e = entry(name);
         if (!e.type().equals("F32")) {
-            throw new IllegalArgumentException(name + " is " + e.type() + ", not F32");
+            throw new IllegalArgumentException(name + " is " + e.type() + ", not F32 (read it with tensor())");
         }
-        float[] out = new float[e.rows() * e.cols()];
+        float[] out = new float[Math.toIntExact(Math.multiplyExact((long) e.rows(), e.cols()))];
         MemorySegment.copy(mapped, ValueLayout.JAVA_FLOAT, e.offset(), out, 0, out.length);
         return out;
     }
