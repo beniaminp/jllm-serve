@@ -10,14 +10,15 @@ it, and about getting text in and out over the network with nothing but `java.ne
 
 ## 10.1 The generation loop
 
-`Engine.generate(prompt, params, sink, cancelled)` is the whole decode algorithm. In pseudo-code, with the
-matching line in `generateLocked` on the right:
+`Engine.generate(prompt, params, sink, cancelled)` is the whole decode algorithm (the prompt is either text,
+which `generate` encodes, or ready-made ids such as `Engine.renderChat(messages, thinking)` returns). In
+pseudo-code, with the matching line in `generateLocked` on the right:
 
 ```
-ids = tokenizer.encode(prompt)                              # text → token ids (04)
-if ids is empty: ids = [EOS]                                # the model must see at least one token
-acquire the lock                                            # one KV cache ⇒ one request at a time
+ids = preparePrompt(ids)                                    # BOS if tokenizer.promptBos() ≥ 0; empty ⇒ [EOS]
+acquire the fair lock, at most server.queue-timeout-ms      # one KV cache ⇒ one request at a time; else 503
 if len(ids) >= ctx: error "prompt too long"
+if cancelled(): return finish = "cancelled"                 # the client left while queued
 
 reuse = length of common prefix(ids, cached), capped at len(ids) − 1      # 10.2
 pos = reuse
@@ -42,6 +43,10 @@ return text, tokens, finish reason, statistics
 
 Points worth noticing:
 
+- **The BOS token** is decided by `Tokenizer.promptBos()` (the tokenizer's own `add_bos_token` rule, see
+  [04 §4.11](04-tokenizer.md#411-other-tokenizer-families)), not guessed from `model_type`. `preparePrompt` is
+  idempotent and public because the API server must measure the prompt *with* its BOS against the context.
+  Chat prompts rendered by the template that already start with the BOS do not get a second one.
 - **Logits only when needed.** During prefill only the last chunk asks for logits; the other chunks exist
   purely to fill the KV cache ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)).
 - **One forward per generated token.** The token sampled at step `i` is fed at position `pos` to obtain the
@@ -49,6 +54,11 @@ Points worth noticing:
 - **`finish_reason`** is `"stop"` (EOS or a stop string), `"length"` (`max_tokens` or the context is full) or
   `"cancelled"`.
 - **Timing.** `t0 → t1` is prefill, `t1 → t2` is decode; `Stats` reports both plus `tokPerSec()`.
+- **Which ids end generation.** `eosIds` is the union of what `Main` collected (`config.json`, `generation_config.json`,
+  well-known stop tokens present in the vocabulary, [04 §4.7](04-tokenizer.md#47-added-and-special-tokens)) and
+  `template.stopIds(tokenizer)`; if the union is empty the engine prints a note and generation ends only at
+  `max_tokens` or a stop string. The vocabulary given to the sampler is `min(core.vocabSize(), tokenizer.vocabSize())`
+  ([09 §9.9](09-sampling.md#99-the-vocabulary-padding-issue)).
 
 ---
 
@@ -84,6 +94,16 @@ a following prompt that does not contain them just diverges at that point.
 
 The cache is a single `int[] cached` + `cachedLen` — no eviction policy, because there is one sequence.
 
+Two cases make the bookkeeping more careful:
+
+- **Failure.** Prefill overwrites the KV cache, so `generateLocked` sets `cachedLen = 0` *before* the first
+  `forward` and only restores it when the request completes. If `forward` (or the sink) throws, the next request
+  starts from nothing instead of trusting a half-overwritten cache.
+- **Recurrent models.** A Mamba backend keeps a fixed-size state, not one K/V entry per position, and a state
+  cannot be rewound to an earlier token. Such backends answer `Backend.supportsPrefixReuse() == false`; the engine
+  then reuses the cache only when the new prompt extends *everything* that was fed before (`reuse == cachedLen`,
+  as in a chat that appends turns) and otherwise restarts at position 0.
+
 ---
 
 ## 10.3 Stop strings
@@ -111,10 +131,15 @@ whatever is still pending is flushed (unless a stop string was hit).
 - **Cancellation.** `cancelled` is a `BooleanSupplier` polled before every token. `HttpServer` watches every
   connection while its request is handled (a virtual thread blocks reading the socket, which returns EOF the
   moment the client closes) and `ApiServer` ORs that flag into `cancelled` for both the streaming and the
-  non-streaming path, so a client that closes its tab stops burning GPU time within one token. A streaming
+  non-streaming path, so a client that closes its tab stops burning GPU time within one token (a request that is cancelled
+  while still queued returns `"cancelled"` as soon as it gets the lock). `server.request-timeout-ms` adds a
+  wall-clock limit per request, measured from the moment generation starts; when it fires the answer ends with
+  `finish_reason: "length"`. A streaming
   client that stops *reading* is cut off after `server.write-timeout-ms` (10.5).
-- **The lock.** The backend owns exactly one KV cache, so `generate` is wrapped in `synchronized (lock)`.
-  Concurrent HTTP requests queue up and are served one at a time; virtual threads make the waiting cheap.
+- **The lock.** The backend owns exactly one KV cache, so generation runs under a **fair** `ReentrantLock`:
+  concurrent HTTP requests are served one at a time in arrival order, and virtual threads make the waiting cheap.
+  The wait is bounded by `server.queue-timeout-ms` (default 60 s, 0 = forever): after that `generate` throws
+  `Engine.OverloadedException`, which the API turns into a 503 `overloaded` instead of letting requests pile up.
   Serving many users at once would require batching several sequences per forward pass ([11](11-performance.md)).
 - **Statistics** (`Engine.Stats`): `promptTokens`, `cachedTokens`, `generatedTokens`, `prefillMs`, `decodeMs`,
   `tokPerSec()`. The CLI prints them after each answer; the API returns them inside `usage`.
@@ -150,12 +175,17 @@ Connection: keep-alive\r\n
 | concept | what it means | where |
 |---|---|---|
 | request line + headers | lines end in `\r\n`; header names are case-insensitive (we lower-case them) | `readLine`, `readRequest` |
-| `Content-Length` body | read exactly that many bytes (≤ 32 MB) | `readRequest` → `in.readNBytes(len)` |
-| chunked request body | rare for clients, supported anyway | `readChunked` |
+| `Content-Length` body | read exactly that many bytes, at most `server.max-body-bytes` (4 MB by default, else 413) | `readRequest` → `readFully` |
+| chunked request body | rare for clients, supported anyway; the running total is limited the same way | `readChunked` |
+| `Expect: 100-continue` | answered with `100 Continue` before the body is read (curl sends it for bodies over 1 KB) | `readRequest` |
+| malformed framing | both `Content-Length` and `Transfer-Encoding`, a duplicate of either, a bad length or chunk size → 400; a header line or block over 64 KB → 431; a body over the limit → 413 | `readRequest` |
+| overall read deadline | `server.read-timeout-ms` bounds each read *and* the whole request (headers plus body) from its first byte; exceeded → 408, so a client trickling one byte at a time cannot hold a connection | `RequestClock` |
 | keep-alive | after a response, loop and read the next request on the same socket unless `Connection: close` | `connection()` loop |
+| HTTP/1.0 and `HEAD` | an HTTP/1.0 request gets no keep-alive and no chunked encoding; `HEAD` gets headers only | `Request.http10`, `Response` |
 | fixed response | status + headers + `Content-Length` + body in one write | `Response.send` |
 | streaming response | see below | `Response.startStream` / `write` / `end` |
-| one thread per connection | `Executors.newVirtualThreadPerTaskExecutor()`: a blocked virtual thread costs ~1 KB, so thousands of idle keep-alive connections are fine | `serve()` |
+| one thread per connection | `Executors.newVirtualThreadPerTaskExecutor()`: a blocked virtual thread costs ~1 KB, so thousands of idle keep-alive connections are fine; a semaphore caps them at `server.max-connections` (256), the rest wait in the kernel accept queue | `serve()` |
+| disconnect probe | while a request is handled, a second virtual thread blocks reading the socket; EOF means the client left, and `Request.clientGone()` lets the handler cancel the generation | `Probe` |
 
 ### Chunked transfer encoding
 
@@ -176,8 +206,12 @@ Hello\r\n
 \r\n
 ```
 
-`Response.write(chunk)` emits one such chunk and flushes, so the client receives it immediately; `end()` sends
-`0\r\n\r\n`.
+`Response.write(chunk)` frames one such chunk and puts it on a **bounded queue** (256 chunks) drained by a writer
+thread of the response's own, which flushes whenever the queue runs empty, so the client still receives each piece
+immediately. The point of the queue: `write` is called by the engine thread while it holds the engine lock, and
+a client that stops reading (its TCP window full) would otherwise block that thread, and with it every other
+request. If the queue stays full for `server.write-timeout-ms` (default 10 s, 0 = forever) the socket is closed and
+`write` throws, which stops the generation. `end()` queues `0\r\n\r\n` and waits for the writer to finish.
 
 ### Server-sent events (SSE)
 
@@ -195,8 +229,9 @@ convention is one JSON object per event and a final `data: [DONE]`. `ApiServer.s
 | `/v1/completions` | POST | raw `prompt` → generate |
 | `/v1/models` | GET | lists the loaded model id |
 | `/health` | GET | `{"status":"ok","model":…}` |
-| `/` | GET | the chat page (`WebUi`) |
-| anything else | — | 404 JSON error; non-POST on a completion route → 405 |
+| `/` (and `/index.html`) | GET | the chat page (`WebUi`) |
+| any path | OPTIONS | CORS preflight: 204, with the `Access-Control-*` headers only when `server.cors-origin` is set |
+| anything else | — | 404 JSON error; non-POST on a completion route → 405; a body that is not `application/json` → 415 |
 
 ### Chat, non-streaming
 
@@ -208,9 +243,13 @@ Request:
  "max_tokens": 60, "temperature": 0.6, "enable_thinking": false}
 ```
 
-`chatPrompt()` renders the messages through `ChatTemplate` (multi-part `content` arrays are flattened to their
-`text` parts; `enable_thinking` may also be given inside `chat_template_kwargs`), `params()` merges the
-request's sampling fields over the server's defaults, and `engine.generate` runs. Response:
+`chatPrompt()` renders the messages to ids with the family template (`Engine.renderChat` →
+`Format.renderTokens`; multi-part `content` arrays are flattened to their `text` parts and any other part type,
+such as `image_url`, is a 400; `enable_thinking` may also be given inside `chat_template_kwargs`, and is ignored,
+with a one-time note, for templates other than Qwen3's). Message content is tokenized like Hugging Face's
+`encode_special_tokens`, so a user who types `<|im_end|>` cannot forge a control token
+([04 §4.11](04-tokenizer.md#411-other-tokenizer-families)). `params()` merges the request's sampling fields over the
+server's defaults ([09 §9.10](09-sampling.md#910-where-each-setting-comes-from)), and `engine.generate` runs. Response:
 
 ```json
 {"id": "chatcmpl-1a14141287f-1", "object": "chat.completion", "created": 1792096151,
@@ -227,8 +266,9 @@ request's sampling fields over the server's defaults, and `engine.generate` runs
 
 ### Chat, streaming (`"stream": true`)
 
-The response is `text/event-stream`, chunked. First an event with the role, then one event per emitted text
-piece, then a closing event with `finish_reason` and `usage`, then `[DONE]`:
+The response is `text/event-stream`, chunked. The headers are sent lazily, with the first token, so until then a
+queue timeout can still be a proper 503. First an event with the role, then one event per emitted text piece, then
+a closing event with `finish_reason` and `usage`, then `[DONE]`:
 
 ```
 data: {"id":"chatcmpl-…","object":"chat.completion.chunk","created":…,"model":"Qwen/Qwen3-0.6B","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
@@ -242,8 +282,13 @@ data: {"id":"chatcmpl-…","object":"chat.completion.chunk",…,"choices":[{"ind
 data: [DONE]
 ```
 
-The engine's text sink writes each event directly, so tokens appear in the client as they are produced. If a
-write fails (client gone) the sink records the error and the `cancelled` supplier stops the engine.
+The engine's text sink queues each event for the connection's writer thread (10.5), so tokens appear in the
+client as they are produced. If a write fails or times out, or the disconnect probe sees the client leave, the
+`cancelled` supplier stops the engine.
+
+`"stream_options": {"include_usage": true}` follows the OpenAI shape instead: `usage` is omitted from the
+`finish_reason` event and sent in an extra final event with `"choices": []` (with `include_usage` false or absent
+under `stream_options`, no usage at all). Without `stream_options` the legacy inline `usage` shown above is kept.
 
 ### Completions
 
@@ -259,19 +304,42 @@ Streaming uses the same `text_completion` objects with a `text` field per event.
 
 ### Errors
 
+Every error, from the HTTP layer or the API, is a JSON body of one shape:
+
 ```json
 {"error": {"message": "invalid JSON: JSON expected object key at offset 1", "type": "invalid_request_error"}}
 ```
 
-400 for malformed JSON, missing `messages`, invalid sampling values or a prompt that does not leave room in the
-context (`"code": "context_length_exceeded"`, measured on the prompt *with* the family BOS token that the engine
-prepends); 404 unknown route; 405 wrong method; 408 when a request takes longer than `server.read-timeout-ms`
-to arrive; 413 body too large; 503 when the engine stays busy for longer than `server.queue-timeout-ms`. An
-unexpected exception inside a handler produces the same JSON shape with status 500.
+(`code` is added where there is one, e.g. `"context_length_exceeded"` or `"overloaded"`.)
 
-When the exception happens *after* a stream has started, the status line is long gone. The server then sends
+| status | when |
+|---|---|
+| 400 | malformed JSON; missing `messages`; invalid sampling values, including non-finite ones ([09 §9.10](09-sampling.md#910-where-each-setting-comes-from)); a prompt that is too long (see below); malformed or ambiguous HTTP framing (duplicate or conflicting `Content-Length` / `Transfer-Encoding`, bad chunk size); a request feature this server does not implement |
+| 404 | unknown route |
+| 405 | wrong method on a completion route |
+| 408 | the request did not arrive within `server.read-timeout-ms` (10.5) |
+| 413 | body larger than `server.max-body-bytes` |
+| 415 | `Content-Type` is not `application/json` |
+| 431 | a request line or header block longer than 64 KB |
+| 500 | an unexpected exception before anything was sent |
+| 503 | `"code": "overloaded"`: the engine stayed busy longer than `server.queue-timeout-ms` |
+
+**Context length.** The check measures the prompt *with* the BOS token that `Engine.preparePrompt` prepends, so
+a request that would fit without it but not with it is rejected up front with 400
+`"code": "context_length_exceeded"` instead of failing inside the engine (the engine's own check is the same
+condition and is only a backstop). Prompts larger than `engine.max-prompt-bytes` (default 16 × `backend.ctx` bytes)
+are refused with the same code *before* tokenizing, so a huge body never reaches the tokenizer. `max_tokens` is
+clamped to the room left in the context.
+
+**Unsupported OpenAI fields.** Rather than silently ignoring what it cannot honour, the server answers 400
+(`"... is not supported"`) for `n` other than 1, non-empty `tools`, `tool_choice` other than `"none"`,
+`response_format` other than text, `logprobs`, non-empty `logit_bias`, `echo`, `suffix`, `best_of` other than 1,
+message content parts that are not `text`, and a completion `prompt` that is not one string (batches and token-id
+arrays).
+
+**After the stream has started** the status line is long gone. If an exception happens then, the server sends
 one more event, `data: {"error": {"message": "internal server error", "type": "server_error"}}`, ends the
-chunked body properly and closes the connection — no `[DONE]`. The OpenAI SDKs raise an `APIError` when a
+chunked body properly and closes the connection, with no `[DONE]`. The OpenAI SDKs raise an `APIError` when a
 stream event carries an `error` key, so clients see a failure rather than a short answer. (A handler that dies
 without reporting in-band is cut off without the chunked terminator, which also reads as an incomplete body.)
 
@@ -296,13 +364,15 @@ for chunk in client.chat.completions.create(model="Qwen/Qwen3-0.6B",
 
 ## 10.7 The JSON parser
 
-`json/Json.java` (≈300 lines) is a **recursive-descent** parser: `value()` looks at the next character and
+`json/Json.java` (≈450 lines) is a **recursive-descent** parser: `value()` looks at the next character and
 calls `object()`, `array()`, `string()`, `number()` or a literal; objects and arrays call `value()` for their
 children. Types map to plain Java: object → `LinkedHashMap<String,Object>` (keeps key order), array →
 `ArrayList<Object>`, integers → `Long`, other numbers → `Double`, plus `String`, `Boolean`, `null`. The writer
 is a pattern-matching `switch` over those types with proper escaping (`"`, `\`, control characters, U+2028/9).
 Typed helpers (`Json.str`, `Json.num`, `Json.map`, …) return defaults instead of throwing, which keeps the API
-handlers short. It parses the 11 MB `tokenizer.json` in well under a second.
+handlers short. Integers beyond `long` fall back to `Double`, nesting deeper than `Json.MAX_DEPTH` (256) is
+rejected, and a parse error is an `IllegalArgumentException` the API reports as a 400 with its offset. It parses
+the 11 MB `tokenizer.json` in well under a second.
 
 ---
 
@@ -332,9 +402,19 @@ layers three sources, later ones winning:
 Flags come in two spellings: short aliases (`Settings.ALIASES`: `--model`, `--revision`, `--dir`, `--quant`,
 `--low-disk`, `--backend`, `--ctx`, `--batch`, `--threads`, `--temp`/`--temperature`, `--top-k`, `--top-p`,
 `--min-p`, `--rep-penalty`, `--seed`, `--max-tokens`, `--think`, `--system`, `--host`, `--port`) or the
-property key itself (`--server.port 9000`, `--bench.rounds=5`). A flag without a value means `true`
-(`--think`). Three flags are per-invocation inputs rather than settings: `--prompt`, `--raw`, `--config`.
-An unknown short flag is rejected (`unknown option --bogus`).
+property key itself (`--server.port 9000`, `--bench.rounds=5`). `--key=value` also works and is the only way
+to pass a value that itself starts with `--`. A boolean flag may stand alone (`--think` means `true`); it only
+consumes the next argument when that is a boolean literal (`true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`), so
+`--raw` never swallows what follows, and a stray positional argument (a typo such as `--think flase`) is an
+error instead of being ignored. Three flags are per-invocation inputs rather than settings: `--prompt`, `--raw`,
+`--config`. An unknown key is rejected (`unknown option --bogus`), also when it appears in the external file.
+
+**Validation happens before the model loads.** `Settings.validate()` parses every typed value once (positive
+`backend.ctx` / `backend.batch`, `server.port` in 0..65535, non-negative timeouts and byte limits, the
+`sampling.*` ranges of [09 §9.10](09-sampling.md#910-where-each-setting-comes-from), the quantization, KV dtype and
+backend names) and `Main` prints the message and exits with status 2, instead of failing minutes later when a
+value is first used. Booleans are strict: `getBool` accepts `true/false`, `yes/no`, `on/off`, `1/0` and throws on
+anything else, rather than treating a typo as `false`.
 
 ```sh
 cp src/main/resources/jllm.properties jllm.properties      # then edit backend.ctx=2048 etc.
@@ -345,8 +425,22 @@ cp src/main/resources/jllm.properties jllm.properties      # then edit backend.c
 #   backend.batch = 64     (default)
 ```
 
-The server uses `sampling.*` as the defaults for request fields that are absent and `chat.thinking` as the
-default for `enable_thinking`; `run`, `chat` and `bench` use them directly.
+The server uses `sampling.*` as the defaults for request fields that are absent (including `seed`) and
+`chat.thinking` as the default for `enable_thinking`; `run`, `chat` and `bench` use them directly.
+
+The `server.*` and `engine.*` keys, all of which this chapter has met:
+
+| key | default | meaning |
+|---|---|---|
+| `server.host` / `server.port` | `127.0.0.1` / `8080` | listen address |
+| `server.read-timeout-ms` | `30000` | per-read timeout and overall deadline for one request (408), 0 = none |
+| `server.write-timeout-ms` | `10000` | how long a streamed answer may wait for a client that stopped reading before it is dropped and its generation cancelled, 0 = forever |
+| `server.max-connections` | `256` | simultaneous connections; more wait in the accept queue |
+| `server.max-body-bytes` | `4194304` | largest request body (413) |
+| `server.queue-timeout-ms` | `60000` | how long a request waits for the engine before the 503, 0 = forever |
+| `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
+| `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
+| `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
 
 ---
 
@@ -361,10 +455,13 @@ default for `enable_thinking`; `run`, `chat` and `bench` use them directly.
 | `bench` | 413-token prompt, `bench.max-tokens` generated, `bench.rounds` rounds after a warm-up, prefix cache evicted between rounds |
 | `config` | prints the effective settings |
 
-`load()` is the assembly line: download metadata if needed → `Architecture` → `Tokenizer` → `ModelWeights.load`
+`load()` is the assembly line: download metadata if needed → `Architecture.load` (a `Decoder` or a `MambaArch`,
+[14 §14.12](14-model-families.md#1412-the-typed-model-architecture)) → `Tokenizer` → `ModelWeights.load`
 (converting to the quantized cache on first use, with a `ShardProvider` that downloads shards on demand and
-deletes them when `model.low-disk` is set) → `CpuBackend` or `MetalBackend` (`backend=auto` picks Metal on
-macOS when the dylib is available) → `Engine` with the EOS ids from `generation_config.json` and the tokenizer.
+deletes them when `model.low-disk` is set) → the backend (`CpuBackend` / `MetalBackend`, or the Mamba variants
+for a `MambaArch`; `backend=auto` picks Metal on macOS when the dylib is available) → `Engine`, given the EOS
+ids from `Main.eosIds` and the queue timeout. A model family without a chat template fails right there, with the
+backend and weights closed again.
 
 ---
 
@@ -375,7 +472,9 @@ macOS when the dylib is available) → `Engine` with the EOS ids from `generatio
 - The prefix cache turns multi-turn chat into incremental prefill by reusing the KV cache for the common prefix
   (always recomputing at least the last token).
 - The HTTP server speaks just enough HTTP/1.1 — request parsing, keep-alive, `Content-Length`, chunked
-  streaming — on virtual threads; SSE events ride inside chunked responses.
+  streaming — on virtual threads; SSE events ride inside chunked responses, written by a per-connection writer
+  thread so that a stalled client costs a timeout, not the engine. Limits (body size, header size, read and
+  write deadlines, queue wait) turn hostile or broken clients into plain JSON errors.
 - The API mirrors OpenAI's chat and completion endpoints closely enough for the official SDKs and the bundled
   web page.
 - Configuration is one properties file with three override layers and a `config` command to inspect them.
