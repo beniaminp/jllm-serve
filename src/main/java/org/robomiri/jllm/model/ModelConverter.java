@@ -61,7 +61,7 @@ public final class ModelConverter {
     }
 
     private final Path dir;
-    private final ModelConfig cfg;
+    private final Architecture arch;
     private final QType quant;
     private final ShardProvider provider;
     private final Map<String, String> shardOf;
@@ -72,9 +72,9 @@ public final class ModelConverter {
     private final Map<String, Integer> remaining = new HashMap<>();
     private final Map<String, SafeTensors> open = new LinkedHashMap<>();
 
-    private ModelConverter(Path dir, ModelConfig cfg, QType quant, ShardProvider provider) throws IOException {
+    private ModelConverter(Path dir, Architecture arch, QType quant, ShardProvider provider) throws IOException {
         this.dir = dir;
-        this.cfg = cfg;
+        this.arch = arch;
         this.quant = quant;
         this.provider = provider;
         this.shardOf = shardMap();
@@ -98,23 +98,23 @@ public final class ModelConverter {
      * Converts the checkpoint in {@code dir} into {@code jllm-<quant>.bin/.json}. A conversion interrupted by a
      * crash is resumed from the units recorded in {@code jllm-<quant>.partial.json} (see {@link QuantFile.Writer}).
      */
-    public static void convert(Path dir, ModelConfig cfg, QType quant, ShardProvider provider) throws IOException {
-        convert(dir, cfg, quant, provider, null);
+    public static void convert(Path dir, Architecture arch, QType quant, ShardProvider provider) throws IOException {
+        convert(dir, arch, quant, provider, null);
     }
 
     /**
      * @param identity {@code repo@revision} the checkpoint was requested as, recorded in the cache together with
      *                 the provider's {@link ShardProvider#commitSha() commit}; null for local files
      */
-    public static void convert(Path dir, ModelConfig cfg, QType quant, ShardProvider provider, String identity)
+    public static void convert(Path dir, Architecture arch, QType quant, ShardProvider provider, String identity)
             throws IOException {
         long t0 = System.nanoTime();
-        ModelConverter c = new ModelConverter(dir, cfg, quant, provider);
+        ModelConverter c = new ModelConverter(dir, arch, quant, provider);
         QuantFile.Identity id = QuantFile.Identity.parse(identity, provider.commitSha());
-        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, cfg.toString(), id, c.unitIds())) {
+        try (QuantFile.Writer w = QuantFile.Writer.openOrResume(dir, quant, arch.toString(), id, c.unitIds())) {
             c.run(w);
             w.finish();
-            System.err.printf("\rConverted %s to %s in %.0fs (%.0f MB) -> %s%n", cfg.architecture(), quant,
+            System.err.printf("\rConverted %s to %s in %.0fs (%.0f MB) -> %s%n", arch.core().architecture(), quant,
                     (System.nanoTime() - t0) / 1e9, w.bytesWritten() / 1e6, QuantFile.binPath(dir, quant));
         } finally {
             c.open.values().forEach(SafeTensors::close);
@@ -263,7 +263,7 @@ public final class ModelConverter {
 
     /** A norm weight under its own name, with the Gemma {@code 1 + w} folded in where the family needs it. */
     private Rule norm(String name) {
-        return cfg.normPlusOne() ? f32PlusOne(name, name) : f32(name, name);
+        return arch.core().normPlusOne() ? f32PlusOne(name, name) : f32(name, name);
     }
 
     private static SafeTensors.Tensor matrix(SafeTensors.Tensor t) throws IOException {
@@ -282,49 +282,67 @@ public final class ModelConverter {
 
     /** The ordered conversion units; each lists its cache tensors as rules. */
     private List<Unit> plan() {
-        if (cfg.isMamba()) {
-            return planMamba();
-        }
+        return switch (arch) {
+            case MambaArch m -> planMamba(m);
+            case Decoder d -> planDecoder(d);
+        };
+    }
+
+    /**
+     * Embedding, one unit per layer, final norm + head. A layer's rules follow its {@link LayerSpec}: the norms
+     * the checkpoint has, the attention variant (grouped-query with optional biases, or MLA) and the MLP variant
+     * (dense, or the stacked experts). How a checkpoint spells a tensor (Phi-3's fused {@code qkv_proj}, GLM's
+     * fused {@code gate_up_proj}, 3-D expert tensors, multimodal prefixes) is detected from the shard map, not
+     * from the spec: it is a layout of the files, not of the model.
+     */
+    private List<Unit> planDecoder(Decoder d) {
+        int dim = d.core().dim();
         List<Unit> units = new ArrayList<>();
         // Embedding first: it is the largest single tensor and lives in the first shard.
         units.add(new Unit("embed", List.of(quantize(EMBED, QType.Q8_0))));
-        for (int l = 0; l < cfg.layers(); l++) {
+        for (int l = 0; l < d.core().layers(); l++) {
+            LayerSpec spec = d.layers().get(l);
             String p = "model.layers." + l + ".";
             List<Rule> rules = new ArrayList<>();
             for (String n : layerNorms(p)) {
                 rules.add(norm(n));
             }
-            if (cfg.attentionBias()) {
-                // q/k/v projection biases (Qwen2, GLM), stored as f32 under their checkpoint names
-                for (String n : new String[]{"q_proj", "k_proj", "v_proj"}) {
-                    rules.add(f32(p + "self_attn." + n + ".bias", p + "self_attn." + n + ".bias"));
+            switch (spec.attn()) {
+                case Attention.Gqa g -> {
+                    if (g.bias()) {
+                        // q/k/v projection biases (Qwen2, GLM), stored as f32 under their checkpoint names
+                        for (String n : new String[]{"q_proj", "k_proj", "v_proj"}) {
+                            rules.add(f32(p + "self_attn." + n + ".bias", p + "self_attn." + n + ".bias"));
+                        }
+                    }
+                    if (fusedQkv(p)) {
+                        // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
+                        String qkv = p + "self_attn.qkv_proj.weight";
+                        int q = g.qDim();
+                        int kv = g.kvDim();
+                        rules.add(splitRows(p + "self_attn.q_proj.weight", qkv, quant, 0, q, q + 2 * kv, dim));
+                        rules.add(splitRows(p + "self_attn.k_proj.weight", qkv, quant, q, kv, q + 2 * kv, dim));
+                        rules.add(splitRows(p + "self_attn.v_proj.weight", qkv, quant, q + kv, kv, q + 2 * kv, dim));
+                        rules.add(quantize(p + "self_attn.o_proj.weight", quant));
+                    } else {
+                        for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                            rules.add(quantize(p + "self_attn." + n + ".weight", quant));
+                        }
+                    }
                 }
+                case Attention.Mla m -> rules.addAll(mlaRules(p, m, dim));
             }
-            if (cfg.deepseek() != null) {
-                rules.addAll(mlaRules(p));
-            } else if (fusedQkv(p)) {
-                // Phi-3: [q rows | k rows | v rows] -> the three cache tensors, so the backends see a plain Llama layer
-                String qkv = p + "self_attn.qkv_proj.weight";
-                int q = cfg.qDim();
-                int kv = cfg.kvDim();
-                rules.add(splitRows(p + "self_attn.q_proj.weight", qkv, quant, 0, q, q + 2 * kv, cfg.dim()));
-                rules.add(splitRows(p + "self_attn.k_proj.weight", qkv, quant, q, kv, q + 2 * kv, cfg.dim()));
-                rules.add(splitRows(p + "self_attn.v_proj.weight", qkv, quant, q + kv, kv, q + 2 * kv, cfg.dim()));
-                rules.add(quantize(p + "self_attn.o_proj.weight", quant));
-            } else {
-                for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                    rules.add(quantize(p + "self_attn." + n + ".weight", quant));
+            switch (spec.mlp()) {
+                case Mlp.Moe m -> rules.addAll(moeRules(p, m, dim));
+                case Mlp.Dense dense -> {
+                    if (fusedGateUp(p)) {
+                        // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
+                        rules.add(quantize(p + "mlp.gate_up", p + "mlp.gate_up_proj.weight", quant, 0, 0));
+                    } else {
+                        rules.add(stack(p + "mlp.gate_up", List.of(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"), quant, 0, 0));
+                    }
+                    rules.add(quantize(p + "mlp.down_proj.weight", quant));
                 }
-            }
-            if (cfg.isMoeLayer(l)) {
-                rules.addAll(moeRules(p));
-            } else if (fusedGateUp(p)) {
-                // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
-                rules.add(quantize(p + "mlp.gate_up", p + "mlp.gate_up_proj.weight", quant, 0, 0));
-                rules.add(quantize(p + "mlp.down_proj.weight", quant));
-            } else {
-                rules.add(stack(p + "mlp.gate_up", List.of(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"), quant, 0, 0));
-                rules.add(quantize(p + "mlp.down_proj.weight", quant));
             }
             units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
@@ -345,8 +363,7 @@ public final class ModelConverter {
      * DeepSeek attention. {@code kv_a_proj_with_mqa [kvLora + rope, dim]} is stored as two tensors,
      * {@code kv_a_latent.weight} (first kvLora rows) and {@code k_pe_proj.weight} (last rope rows).
      */
-    private List<Rule> mlaRules(String p) {
-        DeepSeekConfig d = cfg.deepseek();
+    private List<Rule> mlaRules(String p, Attention.Mla d, int dim) {
         String at = p + "self_attn.";
         List<Rule> rules = new ArrayList<>();
         if (d.qLoraRank() > 0) {
@@ -358,9 +375,9 @@ public final class ModelConverter {
         }
         rules.add(f32(at + "kv_a_layernorm.weight", at + "kv_a_layernorm.weight"));
         String kva = at + "kv_a_proj_with_mqa.weight";
-        int total = d.kvLoraRank() + d.qkRopeDim();
-        rules.add(splitRows(at + "kv_a_latent.weight", kva, quant, 0, d.kvLoraRank(), total, cfg.dim()));
-        rules.add(splitRows(at + "k_pe_proj.weight", kva, quant, d.kvLoraRank(), d.qkRopeDim(), total, cfg.dim()));
+        int total = d.latentDim();
+        rules.add(splitRows(at + "kv_a_latent.weight", kva, quant, 0, d.kvLoraRank(), total, dim));
+        rules.add(splitRows(at + "k_pe_proj.weight", kva, quant, d.kvLoraRank(), d.rope(), total, dim));
         rules.add(quantize(at + "kv_b_proj.weight", quant));
         rules.add(quantize(at + "o_proj.weight", quant));
         return rules;
@@ -373,26 +390,23 @@ public final class ModelConverter {
      * {@code [E, 2m, dim]}, {@code mlp.experts.down_proj [E, dim, m]}, router {@code mlp.router.weight}).
      * Both end up as the same stacked {@code [E*2m, dim]} and {@code [E*dim, m]} matrices.
      */
-    private List<Rule> moeRules(String p) {
-        int e = cfg.numExperts();
-        int m = cfg.moeDim();
+    private List<Rule> moeRules(String p, Mlp.Moe moe, int dim) {
+        int e = moe.experts();
+        int m = moe.moeDim();
         List<Rule> rules = new ArrayList<>();
         rules.add(f32(p + "mlp.router", routerName(p)));
-        DeepSeekConfig d = cfg.deepseek();
-        if (d != null) {
-            if (d.nShared() > 0) {
-                String sp = p + "mlp.shared_experts.";
-                int sh = d.nShared() * cfg.moeDim();
-                rules.add(stack(p + "mlp.shared.gate_up", List.of(sp + "gate_proj.weight", sp + "up_proj.weight"), quant, sh, 0));
-                rules.add(quantize(p + "mlp.shared.down", sp + "down_proj.weight", quant, 0, sh));
-            }
-            if (d.topkMethod().equals("noaux_tc")) {
-                rules.add(f32(p + "mlp.router_bias", p + "mlp.gate.e_score_correction_bias"));
-            }
+        if (moe.shared() != null) {
+            String sp = p + "mlp.shared_experts.";
+            int sh = moe.shared().hidden();
+            rules.add(stack(p + "mlp.shared.gate_up", List.of(sp + "gate_proj.weight", sp + "up_proj.weight"), quant, sh, 0));
+            rules.add(quantize(p + "mlp.shared.down", sp + "down_proj.weight", quant, 0, sh));
+        }
+        if (moe.router() instanceof Router.DeepSeek r && r.hasBias()) {
+            rules.add(f32(p + "mlp.router_bias", p + "mlp.gate.e_score_correction_bias"));
         }
         if (fusedExperts(p)) {
-            rules.add(flatten3d(p + "mlp.experts.gate_up", p + "mlp.experts.gate_up_proj", quant, new long[]{e, 2L * m, cfg.dim()}));
-            rules.add(flatten3d(p + "mlp.experts.down", p + "mlp.experts.down_proj", quant, new long[]{e, cfg.dim(), m}));
+            rules.add(flatten3d(p + "mlp.experts.gate_up", p + "mlp.experts.gate_up_proj", quant, new long[]{e, 2L * m, dim}));
+            rules.add(flatten3d(p + "mlp.experts.down", p + "mlp.experts.down_proj", quant, new long[]{e, dim, m}));
             return rules;
         }
         List<String> gateUp = new ArrayList<>(2 * e);
@@ -440,7 +454,7 @@ public final class ModelConverter {
     }
 
     private boolean hasLmHead() {
-        return !cfg.tiedEmbeddings() && shardOf.containsKey(LM_HEAD);
+        return !arch.core().tiedEmbeddings() && shardOf.containsKey(LM_HEAD);
     }
 
     // ------------------------------------------------------------------ Mamba
@@ -449,11 +463,10 @@ public final class ModelConverter {
     private static final String M_FINAL_NORM = "backbone.norm_f.weight";
 
     /** embedding, one unit per Mamba block, final norm (+ lm_head if the checkpoint has an untied one). */
-    private List<Unit> planMamba() {
-        ModelConfig.MambaParams m = cfg.mamba();
+    private List<Unit> planMamba(MambaArch m) {
         List<Unit> units = new ArrayList<>();
         units.add(new Unit("embed", List.of(quantize(M_EMBED, QType.Q8_0))));
-        for (int l = 0; l < cfg.layers(); l++) {
+        for (int l = 0; l < m.core().layers(); l++) {
             String p = "backbone.layers." + l + ".";
             String q = p + "mixer.";
             List<Rule> rules = new ArrayList<>();

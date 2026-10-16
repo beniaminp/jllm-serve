@@ -1,5 +1,6 @@
 package org.robomiri.jllm.cpu;
 
+import org.robomiri.jllm.model.LayerWeights;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
@@ -47,27 +48,10 @@ final class CpuMatmul {
     /** The widest {@code cols} of any tensor of {@code w}: the row-group scratch must hold four rows of it. */
     static int maxCols(ModelWeights w) {
         int m = Math.max(w.embed.cols, w.lmHead.cols);
-        for (ModelWeights.Layer L : w.layers) {
-            for (QTensor t : new QTensor[]{L.wq, L.wk, L.wv, L.wo, L.wGateUp, L.wDown, L.expGateUp, L.expDown}) {
-                m = Math.max(m, cols(t));
-            }
-            if (L.mla != null) {
-                for (QTensor t : new QTensor[]{L.mla.qProj, L.mla.qA, L.mla.qB, L.mla.kvA, L.mla.kPe, L.mla.kvB,
-                        L.mla.sharedGateUp, L.mla.sharedDown}) {
-                    m = Math.max(m, cols(t));
-                }
-            }
-            if (L.mamba != null) {
-                for (QTensor t : new QTensor[]{L.mamba.inProj, L.mamba.xProj, L.mamba.outProj}) {
-                    m = Math.max(m, cols(t));
-                }
-            }
+        for (LayerWeights L : w.layers) {
+            m = Math.max(m, L.maxCols());
         }
         return m;
-    }
-
-    private static int cols(QTensor t) {
-        return t == null ? 0 : t.cols;
     }
 
     boolean int8() {

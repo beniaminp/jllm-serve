@@ -1,8 +1,9 @@
 package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.MambaLayer;
-import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 
 import java.lang.foreign.MemorySegment;
@@ -24,8 +25,8 @@ import java.lang.foreign.ValueLayout;
 public final class MambaMetalBackend implements Backend {
 
     private final ModelWeights w;
-    private final ModelConfig c;
-    private final ModelConfig.MambaParams m;
+    private final Architecture.Core c;
+    private final MambaArch m;
     private final int ctx;
     private final int maxBatch;
     private final MetalKernels k;
@@ -60,12 +61,9 @@ public final class MambaMetalBackend implements Backend {
     }
 
     public MambaMetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib) {
-        if (!w.cfg.isMamba()) {
-            throw new IllegalArgumentException("not a Mamba model: " + w.cfg);
-        }
         this.w = w;
-        this.c = w.cfg;
-        this.m = c.mamba();
+        this.m = w.mambaArch();
+        this.c = m.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         if (m.dState() > MetalConstants.MAMBA_MAX_STATE) {
@@ -97,18 +95,18 @@ public final class MambaMetalBackend implements Backend {
         convState = new Metal.Buffer[c.layers()];
         ssmState = new Metal.Buffer[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
-            MambaLayer L = w.layers[l].mamba;
+            MambaLayer L = w.mambaLayer(l);
             LayerBufs b = new LayerBufs();
-            b.norm = k.upload(L.norm);
-            b.inProj = k.wrap(L.inProj.data);
-            b.conv = k.upload(L.conv);
-            b.convBias = k.upload(L.convBias);
-            b.xProj = k.wrap(L.xProj.data);
-            b.dtProj = k.upload(L.dtProj);
-            b.dtBias = k.upload(L.dtBias);
-            b.a = k.upload(L.a);
-            b.d = k.upload(L.d);
-            b.outProj = k.wrap(L.outProj.data);
+            b.norm = k.upload(L.norm());
+            b.inProj = k.wrap(L.inProj().data);
+            b.conv = k.upload(L.conv());
+            b.convBias = k.upload(L.convBias());
+            b.xProj = k.wrap(L.xProj().data);
+            b.dtProj = k.upload(L.dtProj());
+            b.dtBias = k.upload(L.dtBias());
+            b.a = k.upload(L.a());
+            b.d = k.upload(L.d());
+            b.outProj = k.wrap(L.outProj().data);
             layers[l] = b;
             convState[l] = k.metal.newBuffer((long) di * (m.dConv() - 1) * 4); // zeroed: the initial state
             ssmState[l] = k.metal.newBuffer((long) di * m.dState() * 4);
@@ -175,13 +173,13 @@ public final class MambaMetalBackend implements Backend {
         try {
             for (int l = 0; l < c.layers(); l++) {
                 LayerBufs L = layers[l];
-                MambaLayer W = w.layers[l].mamba;
+                MambaLayer W = w.mambaLayer(l);
                 k.rmsnorm(x, 0, L.norm, xb, n, dim);
-                k.matmul(W.inProj, L.inProj, xb, 0, xz, 0, n, false, null, 0f);
+                k.matmul(W.inProj(), L.inProj, xb, 0, xz, 0, n, false, null, 0f);
                 k.mambaConv(xz, L.conv, L.convBias, convState[l], xc, m.dInner(), m.dConv(), n);
-                k.matmul(W.xProj, L.xProj, xc, 0, dbc, 0, n, false, null, 0f);
+                k.matmul(W.xProj(), L.xProj, xc, 0, dbc, 0, n, false, null, 0f);
                 k.mambaScan(xc, xz, dbc, L.dtProj, L.dtBias, L.a, L.d, ssmState[l], y, m.dInner(), m.dState(), m.dtRank(), n);
-                k.matmul(W.outProj, L.outProj, y, 0, x, 0, n, true, null, 0f);
+                k.matmul(W.outProj(), L.outProj, y, 0, x, 0, n, true, null, 0f);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit(); // the GPU starts on these layers while the next ones are encoded
                 }

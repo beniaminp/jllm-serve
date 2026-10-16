@@ -9,9 +9,10 @@ import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
+import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.ShardProvider;
@@ -113,8 +114,8 @@ public final class Main {
         if (!Files.isRegularFile(dir.resolve("config.json"))) {
             hub.downloadMetadata(model, revision, dir);
         }
-        ModelConfig cfg = ModelConfig.load(dir);
-        System.err.println("Model: " + cfg);
+        Architecture arch = Architecture.load(dir);
+        System.err.println("Model: " + arch);
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
         QType quant = QType.parse(s.get("model.quant"));
         boolean lowDisk = s.getBool("model.low-disk");
@@ -150,7 +151,7 @@ public final class Main {
                 }
             }
         };
-        ModelWeights weights = ModelWeights.load(dir, cfg, quant, shards, model + "@" + revision);
+        ModelWeights weights = ModelWeights.load(dir, arch, quant, shards, model + "@" + revision);
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
@@ -159,20 +160,21 @@ public final class Main {
         }
         int threads = s.getInt("backend.threads");
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
-        if (weights.cfg.isMamba() && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
+        boolean mamba = arch instanceof MambaArch;
+        if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
         }
         Backend backend;
         try {
             backend = switch (backendName) {
-                case "cpu" -> weights.cfg.isMamba()
+                case "cpu" -> mamba
                         ? new MambaCpuBackend(weights, ctx, batch,
                                 threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
                                 s.getBool("backend.cpu.int8-activations"))
                         : new CpuBackend(weights, ctx, batch,
                                 threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
                                 s.getBool("backend.cpu.int8-activations"));
-                case "metal" -> weights.cfg.isMamba()
+                case "metal" -> mamba
                         ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                         : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
@@ -183,7 +185,7 @@ public final class Main {
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + kvDtype);
         try {
-            return new Loaded(weights, new Engine(backend, tok, cfg, eosIds(dir, tok, cfg), s.getLong("server.queue-timeout-ms")));
+            return new Loaded(weights, new Engine(backend, tok, arch, eosIds(dir, tok, arch), s.getLong("server.queue-timeout-ms")));
         } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
             backend.close();
             weights.close();
@@ -191,8 +193,8 @@ public final class Main {
         }
     }
 
-    private static Set<Integer> eosIds(Path dir, Tokenizer tok, ModelConfig cfg) throws Exception {
-        Set<Integer> ids = new HashSet<>(cfg.eosTokenIds());
+    private static Set<Integer> eosIds(Path dir, Tokenizer tok, Architecture arch) throws Exception {
+        Set<Integer> ids = new HashSet<>(arch.core().eosTokenIds());
         Path gen = dir.resolve("generation_config.json");
         if (Files.isRegularFile(gen)) {
             Object eos = Json.parseObject(Files.readString(gen)).get("eos_token_id");
@@ -219,7 +221,7 @@ public final class Main {
                 ids.add(id);
             }
         }
-        // no fallback to token 0: config.json's eos_token_id is already in cfg.eosTokenIds(), and the chat
+        // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
         // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
     }

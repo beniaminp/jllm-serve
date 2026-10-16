@@ -1,10 +1,20 @@
 package org.robomiri.jllm.metal;
 
+import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.Decoder;
+import org.robomiri.jllm.model.DecoderLayer;
 import org.robomiri.jllm.model.KvDtype;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.LayerSpec;
+import org.robomiri.jllm.model.Mlp;
+import org.robomiri.jllm.model.MlpWeights;
 import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.Rope;
+import org.robomiri.jllm.model.RopeTable;
+import org.robomiri.jllm.model.Router;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -18,7 +28,8 @@ import java.lang.foreign.ValueLayout;
 public final class MetalBackend implements Backend {
 
     private final ModelWeights w;
-    private final ModelConfig c;
+    private final Decoder arch;
+    private final Architecture.Core c;
     private final int ctx;
     private final int maxBatch;
     final MetalKernels k;
@@ -36,12 +47,11 @@ public final class MetalBackend implements Backend {
 
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
-    private LayerBufs[] layers;
+    private LayerPlan[] plans;
     private Metal.Buffer finalNorm;
-    Metal.Buffer ropeCos;
-    Metal.Buffer ropeSin;
-    private Metal.Buffer ropeCosLocal; // Gemma 3 sliding layers; the same buffers as above when there is no local table
-    private Metal.Buffer ropeSinLocal;
+    /** One cos/sin pair per {@link Decoder#ropeTables()} entry. */
+    Metal.Buffer[] ropeCos;
+    Metal.Buffer[] ropeSin;
     private Metal.Buffer[] keyCache;
     private Metal.Buffer[] valCache;
 
@@ -56,28 +66,28 @@ public final class MetalBackend implements Backend {
     Metal.Buffer assign;
     Metal.Buffer routeWeight;
     private Metal.Buffer moeHidden;
-    /** DeepSeek multi-head latent attention, router and shared experts (own caches); null for other families. */
+    /** DeepSeek multi-head latent attention (own caches); null for other families. */
     private MlaMetal mla;
 
-    private static final class LayerBufs {
-        Metal.Buffer attnNorm;
-        Metal.Buffer ffnNorm;
-        Metal.Buffer postAttnNorm;
-        Metal.Buffer postMlpNorm;
-        Metal.Buffer qNorm;
-        Metal.Buffer kNorm;
-        Metal.Buffer bq;
-        Metal.Buffer bk;
-        Metal.Buffer bv;
-        Metal.Buffer wq;
-        Metal.Buffer wk;
-        Metal.Buffer wv;
-        Metal.Buffer wo;
-        Metal.Buffer wGateUp;
-        Metal.Buffer wDown;
-        Metal.Buffer router;
-        Metal.Buffer expGateUp;
-        Metal.Buffer expDown;
+    /**
+     * One decoder layer: its norm buffers, {@code o_proj}, and two strategy objects picked once from the layer's
+     * {@link LayerSpec} (like {@code CpuBackend.LayerPlan}), so {@link #forward} contains no per-layer dispatch on
+     * the family's optional pieces: the attention (grouped-query over the KV cache, or MLA) and the feed-forward
+     * (dense GLU with SiLU or GELU, routed experts, routed plus shared experts). Each step runs exactly the
+     * dispatches the straight-line code recorded before, in the same order.
+     */
+    private record LayerPlan(Metal.Buffer attnNorm, Metal.Buffer postAttnNorm, QTensor wo, Metal.Buffer woBuf,
+                             AttnStep attention, FfnStep ffn) {
+    }
+
+    /** Reads {@code x} (normalizing it with the layer's attention norm), writes the attention output to {@link #att}. */
+    private interface AttnStep {
+        void run(int layer, int n, int pos, boolean fuseNorm);
+    }
+
+    /** Reads {@code x} (normalizing it with the layer's MLP norm), adds the feed-forward output to {@link #x}. */
+    private interface FfnStep {
+        void run(int layer, int n, boolean fuseNorm);
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch) {
@@ -89,15 +99,16 @@ public final class MetalBackend implements Backend {
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
-        this(w, ctx, maxBatch, open(w.cfg, metalLib), kvDtype);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype);
     }
 
-    private static Metal open(ModelConfig c, String metalLib) {
-        if (c.headDim() % 32 != 0 || c.headDim() > 256) {
+    private static Metal open(Decoder d, String metalLib) {
+        int hd = d.attention().headDim();
+        if (hd % 32 != 0 || hd > 256) {
             throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
         }
         // the grouped attention instantiations (G = 2, 4, 8) are only compiled when the override asks for them
-        return Metal.create(metalLib, attnGroupOverride(c) > 1 ? "#define JLLM_ATTN_GROUPS 1\n" : "");
+        return Metal.create(metalLib, attnGroupOverride(d.attention()) > 1 ? "#define JLLM_ATTN_GROUPS 1\n" : "");
     }
 
     /**
@@ -106,10 +117,13 @@ public final class MetalBackend implements Backend {
      * threadgroups run per decode token and each one's serial work grows with the group, so the default is 1;
      * -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads; headDim 64, 128 or 256 only).
      */
-    private static int attnGroupOverride(ModelConfig c) {
-        int group = c.heads() / c.kvHeads();
+    private static int attnGroupOverride(Attention a) {
+        if (!(a instanceof Attention.Gqa g)) {
+            return 1; // MLA attends with its own instantiation
+        }
+        int group = g.heads() / g.kvHeads();
         int override = Integer.getInteger("jllm.metal.attnGroup", 0);
-        int hd = c.headDim();
+        int hd = g.headDim();
         boolean specialised = hd == 64 || hd == 128 || hd == 256;
         return specialised && override > 0 && override <= 8 && Integer.bitCount(override) == 1 && group % override == 0
                 ? override : 1;
@@ -118,11 +132,12 @@ public final class MetalBackend implements Backend {
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
     private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype) {
         this.w = w;
-        this.c = w.cfg;
+        this.arch = w.decoder();
+        this.c = arch.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.kvHalf = kvDtype == KvDtype.F16;
-        this.flashDecode = MetalKernels.FLASH_DECODE && c.deepseek() == null;
+        this.flashDecode = MetalKernels.FLASH_DECODE && arch.attention() instanceof Attention.Gqa;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -137,62 +152,27 @@ public final class MetalBackend implements Backend {
     }
 
     private void init(KvDtype kvDtype) {
+        Attention a = arch.attention();
         // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
-        attnGroup = attnGroupOverride(c);
-        int hd = c.headDim();
+        attnGroup = attnGroupOverride(a);
+        int hd = a.headDim();
         String vh = kvHalf ? "_h" : "";
         attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
-        if (c.isMoe() && c.numExperts() > MetalConstants.MAX_EXPERTS) {
+        if (arch.maxExperts() > MetalConstants.MAX_EXPERTS) {
             throw new IllegalArgumentException("Metal router kernel supports at most " + MetalConstants.MAX_EXPERTS + " experts");
         }
         fusedNormFits = k.fusedNormFits(c.dim());
 
         embedQ = k.wrap(w.embed.data);
         lmHeadQ = w.lmHead == w.embed ? embedQ : k.wrap(w.lmHead.data);
-        layers = new LayerBufs[c.layers()];
-        for (int l = 0; l < c.layers(); l++) {
-            ModelWeights.Layer L = w.layers[l];
-            LayerBufs b = new LayerBufs();
-            b.attnNorm = k.upload(L.attnNorm);
-            b.ffnNorm = k.upload(L.ffnNorm);
-            b.postAttnNorm = L.postAttnNorm != null ? k.upload(L.postAttnNorm) : null;
-            b.postMlpNorm = L.postMlpNorm != null ? k.upload(L.postMlpNorm) : null;
-            b.qNorm = L.qNorm != null ? k.upload(L.qNorm) : null;
-            b.kNorm = L.kNorm != null ? k.upload(L.kNorm) : null;
-            b.bq = L.bq != null ? k.upload(L.bq) : null;
-            b.bk = L.bk != null ? k.upload(L.bk) : null;
-            b.bv = L.bv != null ? k.upload(L.bv) : null;
-            if (L.mla == null) {
-                b.wq = k.wrap(L.wq.data);
-                b.wk = k.wrap(L.wk.data);
-                b.wv = k.wrap(L.wv.data);
-            }
-            b.wo = k.wrap(L.wo.data);
-            if (L.moe) {
-                b.router = k.upload(L.router);
-                b.expGateUp = k.wrap(L.expGateUp.data);
-                b.expDown = k.wrap(L.expDown.data);
-            } else {
-                b.wGateUp = k.wrap(L.wGateUp.data);
-                b.wDown = k.wrap(L.wDown.data);
-            }
-            layers[l] = b;
-        }
         finalNorm = k.upload(w.finalNorm);
-        Rope rope = Rope.of(c, ctx);
-        ropeCos = k.upload(rope.cos);
-        ropeSin = k.upload(rope.sin);
-        boolean localRope = false;
-        for (int l = 0; l < c.layers(); l++) {
-            localRope |= c.usesLocalRope(l);
-        }
-        if (localRope) {
-            Rope local = Rope.local(c, ctx);
-            ropeCosLocal = k.upload(local.cos);
-            ropeSinLocal = k.upload(local.sin);
-        } else {
-            ropeCosLocal = ropeCos;
-            ropeSinLocal = ropeSin;
+        int tables = arch.ropeTables().size();
+        ropeCos = new Metal.Buffer[tables];
+        ropeSin = new Metal.Buffer[tables];
+        for (int t = 0; t < tables; t++) {
+            Rope rope = new Rope(arch.ropeTables().get(t), ctx);
+            ropeCos[t] = k.upload(rope.cos);
+            ropeSin[t] = k.upload(rope.sin);
         }
 
         // None of the buffers below is zeroed: every element is written before it is read. The KV cache rows
@@ -201,34 +181,39 @@ public final class MetalBackend implements Backend {
         // scratch is written for positions [first, len) before the softmax reads the same range. Skipping the
         // memset keeps start-up fast and only commits pages that are actually touched (a long context would
         // otherwise clear gigabytes).
-        long kvBytes = (long) ctx * c.kvDim() * kvDtype.bytes;
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
-        for (int l = 0; l < c.layers() && c.deepseek() == null; l++) { // DeepSeek: MlaMetal owns its latent cache
-            keyCache[l] = k.scratch(kvBytes);
-            valCache[l] = k.scratch(kvBytes);
+        if (a instanceof Attention.Gqa g) { // DeepSeek: MlaMetal owns its latent cache
+            long kvBytes = (long) ctx * g.kvDim() * kvDtype.bytes;
+            for (int l = 0; l < c.layers(); l++) {
+                keyCache[l] = k.scratch(kvBytes);
+                valCache[l] = k.scratch(kvBytes);
+            }
+            kStage = kvHalf ? k.scratch((long) maxBatch * g.kvDim() * 4) : null; // f32 k rows before RoPE
         }
-        kStage = kvHalf ? k.scratch((long) maxBatch * c.kvDim() * 4) : null; // f32 k rows before RoPE
         x = k.scratch((long) maxBatch * c.dim() * 4);
         xb = k.scratch((long) maxBatch * c.dim() * 4);
-        q = k.scratch((long) maxBatch * c.qDim() * 4);
-        att = k.scratch((long) maxBatch * (c.deepseek() == null ? c.qDim()
-                : Math.max(c.qDim(), c.heads() * c.deepseek().vHeadDim())) * 4);
-        hidden = k.scratch((long) maxBatch * c.maxMlpDim() * 4);
-        scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * c.heads() * ctx * 4);
+        q = k.scratch((long) maxBatch * a.qDim() * 4);
+        att = k.scratch((long) maxBatch * Math.max(a.qDim(), a.outDim()) * 4);
+        hidden = k.scratch((long) maxBatch * arch.maxMlpDim() * 4);
+        scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * a.heads() * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
-        flashPart = flashDecode ? k.scratch((long) c.heads() * MetalKernels.FLASH_SPLITS * (c.headDim() + 2) * 4) : null;
-        if (c.isMoe()) {
-            int slots = maxBatch * c.expertsPerTok();
+        flashPart = flashDecode ? k.scratch((long) a.heads() * MetalKernels.FLASH_SPLITS * (hd + 2) * 4) : null;
+        if (arch.anyMoe()) {
+            int slots = maxBatch * arch.maxTopK();
             assign = k.scratch((long) slots * 4);
             routeWeight = k.scratch((long) slots * 4);
-            moeHidden = k.scratch((long) slots * c.moeDim() * 4);
+            moeHidden = k.scratch((long) slots * arch.maxMoeDim() * 4);
         } else {
             assign = null;
             routeWeight = null;
             moeHidden = null;
         }
-        mla = c.deepseek() != null ? new MlaMetal(this, w, ctx, maxBatch, kvDtype) : null;
+        mla = a instanceof Attention.Mla m ? new MlaMetal(this, w, m, ctx, maxBatch, kvDtype) : null;
+        plans = new LayerPlan[c.layers()];
+        for (int l = 0; l < c.layers(); l++) {
+            plans[l] = plan(arch.layers().get(l), w.decoderLayer(l));
+        }
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
@@ -237,6 +222,215 @@ public final class MetalBackend implements Backend {
         if (w.byteSize() > ws) {
             System.err.printf("warning: weights (%.1f GB) exceed Metal's recommended working set (%.1f GB); expect paging%n",
                     w.byteSize() / 1e9, ws / 1e9);
+        }
+    }
+
+    // ------------------------------------------------------------------ layer plans
+
+    private LayerPlan plan(LayerSpec spec, DecoderLayer L) {
+        Metal.Buffer attnNorm = k.upload(L.attnNorm());
+        Metal.Buffer ffnNorm = k.upload(L.ffnNorm());
+        Metal.Buffer postAttnNorm = L.postAttnNorm() != null ? k.upload(L.postAttnNorm()) : null;
+        Metal.Buffer postMlpNorm = L.postMlpNorm() != null ? k.upload(L.postMlpNorm()) : null;
+        AttnStep attention = switch (spec.attn()) {
+            case Attention.Gqa g -> new GqaStep(g, L.gqa(), attnNorm);
+            case Attention.Mla m -> (layer, n, pos, fuseNorm) -> {
+                k.rmsnorm(x, 0, attnNorm, xb, n, c.dim());
+                mla.run(layer, n, pos);
+            };
+        };
+        FfnStep ffn = switch (spec.mlp()) {
+            case Mlp.Dense d -> new DenseStep(d, L.dense(), ffnNorm, postMlpNorm);
+            case Mlp.Moe m -> new MoeStep(m, L.moe(), ffnNorm);
+        };
+        return new LayerPlan(attnNorm, postAttnNorm, L.wo(), k.wrap(L.wo().data), attention, ffn);
+    }
+
+    /**
+     * Grouped-query attention: the fused q/k/v projection (v written straight into the cache rows at pos, as
+     * half for the f16 cache; k too for the f32 cache, while the f16 cache stages the f32 k rows and the rope
+     * kernel rounds them in), QK-norm + RoPE, then the attention kernel.
+     */
+    private final class GqaStep implements AttnStep {
+        private final Attention.Gqa g;
+        private final RopeTable table;
+        private final QTensor wq;
+        private final QTensor wk;
+        private final QTensor wv;
+        private final Metal.Buffer attnNorm;
+        private final Metal.Buffer bwq;
+        private final Metal.Buffer bwk;
+        private final Metal.Buffer bwv;
+        private final Metal.Buffer bq;
+        private final Metal.Buffer bk;
+        private final Metal.Buffer bv;
+        private final Metal.Buffer qNorm;
+        private final Metal.Buffer kNorm;
+        private final Metal.Buffer cos;
+        private final Metal.Buffer sin;
+        /** GLM rotates interleaved pairs of the first rotaryDim dims, Phi rotate-half pairs of them. */
+        private final boolean partial;
+
+        GqaStep(Attention.Gqa g, AttnWeights.Gqa w, Metal.Buffer attnNorm) {
+            this.g = g;
+            this.table = arch.ropeTables().get(g.ropeTable());
+            this.attnNorm = attnNorm;
+            wq = w.wq();
+            wk = w.wk();
+            wv = w.wv();
+            bwq = k.wrap(wq.data);
+            bwk = k.wrap(wk.data);
+            bwv = k.wrap(wv.data);
+            bq = w.bq() != null ? k.upload(w.bq()) : null;
+            bk = w.bk() != null ? k.upload(w.bk()) : null;
+            bv = w.bv() != null ? k.upload(w.bv()) : null;
+            qNorm = w.qNorm() != null ? k.upload(w.qNorm()) : null;
+            kNorm = w.kNorm() != null ? k.upload(w.kNorm()) : null;
+            cos = ropeCos[g.ropeTable()];
+            sin = ropeSin[g.ropeTable()];
+            partial = table.pairing() == RopeTable.Pairing.INTERLEAVED || table.rotaryDim() != g.headDim();
+            if (partial && g.qkNorm()) {
+                throw new IllegalArgumentException("partial rotary embedding combined with q/k norm is not implemented");
+            }
+        }
+
+        @Override
+        public void run(int layer, int n, int pos, boolean fuseNorm) {
+            int dim = c.dim();
+            int kvDim = g.kvDim();
+            long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
+            Metal.Buffer kDst = kvHalf ? kStage : keyCache[layer];
+            long kOff = kvHalf ? 0 : cacheOff;
+            Metal.Buffer in = x;
+            Metal.Buffer norm = attnNorm;
+            if (!fuseNorm) {
+                k.rmsnorm(x, 0, attnNorm, xb, n, dim);
+                in = xb;
+                norm = null;
+            }
+            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, valCache[layer], cacheOff, kvHalf, bq, bk, bv, n);
+            // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
+            // and written to the cache rows at pos (the same rows for f32, rounded to half for f16)
+            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
+            k.rope(table.pairing() == RopeTable.Pairing.INTERLEAVED, kvHalf, q, kDst, kOff, keyCache[layer], cacheOff,
+                    useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
+                    g.headDim(), g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
+            int hd = g.headDim();
+            if (flashDecode && n == 1 && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
+                k.flashAttention(kvHalf, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
+                        hd, pos, ctx, g.scale(), g.qDim(), kvDim, g.window(), g.softcap());
+                return;
+            }
+            k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
+                    pos, ctx, g.scale(), g.qDim(), kvDim, kvDim, g.qDim(), g.window(), g.softcap(), n);
+        }
+    }
+
+    /** Dense gated MLP: the fused norm + gate/up + activation kernel, then the down projection (post-normed for Glm4 / Gemma). */
+    private final class DenseStep implements FfnStep {
+        private final QTensor gateUp;
+        private final QTensor down;
+        private final Metal.Buffer bGateUp;
+        private final Metal.Buffer bDown;
+        private final Metal.Buffer ffnNorm;
+        private final Metal.Buffer postMlpNorm;
+        private final boolean gelu;
+
+        DenseStep(Mlp.Dense d, MlpWeights.Dense w, Metal.Buffer ffnNorm, Metal.Buffer postMlpNorm) {
+            gateUp = w.gateUp();
+            down = w.down();
+            bGateUp = k.wrap(gateUp.data);
+            bDown = k.wrap(down.data);
+            this.ffnNorm = ffnNorm;
+            this.postMlpNorm = postMlpNorm;
+            this.gelu = d.act() == Mlp.Activation.GELU_TANH;
+        }
+
+        @Override
+        public void run(int layer, int n, boolean fuseNorm) {
+            int dim = c.dim();
+            if (fuseNorm) {
+                k.swiglu(gateUp, bGateUp, x, ffnNorm, hidden, gelu, n);
+            } else {
+                k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
+                k.swiglu(gateUp, bGateUp, xb, null, hidden, gelu, n);
+            }
+            if (postMlpNorm != null) {
+                k.matmul(down, bDown, hidden, 0, xb, 0, n, false, null, 0f);
+                k.rmsnormAdd(xb, postMlpNorm, x, n, dim);
+            } else {
+                k.matmul(down, bDown, hidden, 0, x, 0, n, true, null, 0f);
+            }
+        }
+    }
+
+    /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x, then DeepSeek's shared experts. */
+    private final class MoeStep implements FfnStep {
+        private interface Route {
+            void run(int n);
+        }
+
+        private final Mlp.Moe spec;
+        private final QTensor expGateUp;
+        private final QTensor expDown;
+        private final Metal.Buffer bExpGateUp;
+        private final Metal.Buffer bExpDown;
+        private final Metal.Buffer ffnNorm;
+        private final Route route;
+        private final QTensor sharedGateUp;
+        private final QTensor sharedDown;
+        private final Metal.Buffer bSharedGateUp;
+        private final Metal.Buffer bSharedDown;
+
+        MoeStep(Mlp.Moe spec, MlpWeights.Moe w, Metal.Buffer ffnNorm) {
+            this.spec = spec;
+            this.ffnNorm = ffnNorm;
+            expGateUp = w.expGateUp();
+            expDown = w.expDown();
+            bExpGateUp = k.wrap(expGateUp.data);
+            bExpDown = k.wrap(expDown.data);
+            Metal.Buffer router = k.upload(w.router());
+            int e = spec.experts();
+            int dim = c.dim();
+            int topK = spec.topK();
+            route = switch (spec.router()) {
+                case Router.Softmax s -> n -> k.router(xb, router, assign, routeWeight, e, dim, topK, spec.normTopK(), n);
+                case Router.DeepSeek r -> {
+                    Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
+                    int method = switch (r.topK()) {
+                        case GREEDY -> 0;
+                        case GROUP_LIMITED_GREEDY -> 1;
+                        case NOAUX_TC -> 2;
+                    };
+                    yield n -> k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, spec.normTopK(),
+                            r.nGroup(), r.topkGroup(), r.sigmoid(), method, r.scaleAlways(), (float) r.routedScale(), n);
+                }
+            };
+            if (w.shared() != null) {
+                sharedGateUp = w.shared().gateUp();
+                sharedDown = w.shared().down();
+                bSharedGateUp = k.wrap(sharedGateUp.data);
+                bSharedDown = k.wrap(sharedDown.data);
+            } else {
+                sharedGateUp = null;
+                sharedDown = null;
+                bSharedGateUp = null;
+                bSharedDown = null;
+            }
+        }
+
+        @Override
+        public void run(int layer, int n, boolean fuseNorm) {
+            k.rmsnorm(x, 0, ffnNorm, xb, n, c.dim());
+            route.run(n);
+            k.moeUp(expGateUp, bExpGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
+            k.moeDown(expDown, bExpDown, moeHidden, assign, routeWeight, x, c.dim(), spec.topK(), n);
+            if (sharedGateUp != null) {
+                // shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x
+                k.swiglu(sharedGateUp, bSharedGateUp, xb, null, hidden, false, n); // writes silu(gate) * up to hidden
+                k.matmul(sharedDown, bSharedDown, hidden, 0, x, 0, n, true, null, 0f);
+            }
         }
     }
 
@@ -261,7 +455,6 @@ public final class MetalBackend implements Backend {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
         int dim = c.dim();
-        int kvDim = c.kvDim();
         // embeddings are gathered on the CPU (tiny) and written straight into the shared buffer
         float[] row = new float[dim];
         for (int t = 0; t < n; t++) {
@@ -281,57 +474,16 @@ public final class MetalBackend implements Backend {
             // (the *_norm variants read x and normalise on the fly); otherwise it writes xb first.
             boolean fuseNorm = n == 1 && fusedNormFits;
             for (int l = 0; l < c.layers(); l++) {
-                LayerBufs L = layers[l];
-                ModelWeights.Layer W = w.layers[l];
-                if (mla != null) {
-                    k.rmsnorm(x, 0, L.attnNorm, xb, n, dim);
-                    mla.run(l, W, n, pos);
+                LayerPlan L = plans[l];
+                L.attention().run(l, n, pos, fuseNorm);
+                if (L.postAttnNorm() != null) {
+                    // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
+                    k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f);
+                    k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
                 } else {
-                    // v is written straight into the cache rows at pos (as half for the f16 cache); k too for
-                    // the f32 cache, while the f16 cache stages the f32 k rows and the rope kernel rounds them in
-                    long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
-                    Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
-                    long kOff = kvHalf ? 0 : cacheOff;
-                    Metal.Buffer in = x;
-                    Metal.Buffer norm = L.attnNorm;
-                    if (!fuseNorm) {
-                        k.rmsnorm(x, 0, L.attnNorm, xb, n, dim);
-                        in = xb;
-                        norm = null;
-                    }
-                    k.matmul3(W.wq, L.wq, W.wk, L.wk, W.wv, L.wv, in, norm, q, kDst, kOff, valCache[l], cacheOff, kvHalf,
-                            L.bq, L.bk, L.bv, n);
-                    normRope(L, kDst, kOff, keyCache[l], cacheOff, n, pos, c.usesLocalRope(l));
-                    attention(l, n, pos);
+                    k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f);
                 }
-                if (L.postAttnNorm != null) {
-                    // Glm4: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
-                    k.matmul(W.wo, L.wo, att, 0, xb, 0, n, false, null, 0f);
-                    k.rmsnormAdd(xb, L.postAttnNorm, x, n, dim);
-                } else {
-                    k.matmul(W.wo, L.wo, att, 0, x, 0, n, true, null, 0f);
-                }
-
-                if (W.moe) {
-                    k.rmsnorm(x, 0, L.ffnNorm, xb, n, dim);
-                    moe(W, L, l, n);
-                    if (mla != null) {
-                        mla.sharedExperts(W, l, n);
-                    }
-                } else {
-                    if (fuseNorm) {
-                        k.swiglu(W.wGateUp, L.wGateUp, x, L.ffnNorm, hidden, c.isGemma(), n);
-                    } else {
-                        k.rmsnorm(x, 0, L.ffnNorm, xb, n, dim);
-                        k.swiglu(W.wGateUp, L.wGateUp, xb, null, hidden, c.isGemma(), n);
-                    }
-                    if (L.postMlpNorm != null) {
-                        k.matmul(W.wDown, L.wDown, hidden, 0, xb, 0, n, false, null, 0f);
-                        k.rmsnormAdd(xb, L.postMlpNorm, x, n, dim);
-                    } else {
-                        k.matmul(W.wDown, L.wDown, hidden, 0, x, 0, n, true, null, 0f);
-                    }
-                }
+                L.ffn().run(l, n, fuseNorm);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit(); // the GPU starts on these layers while the next ones are encoded
                 }
@@ -354,49 +506,6 @@ public final class MetalBackend implements Backend {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
                     Math.min(w.lmHead.rows, logits.length));
         }
-    }
-
-    /**
-     * QK-norm + RoPE for the q rows and the k rows of this chunk, in one dispatch: k is read from
-     * {@code kSrc} (the f32 cache rows at pos, or the f32 staging rows of an f16 cache) and written to the cache
-     * rows {@code kOut} at pos (the same rows for f32, rounded to half for f16). GLM rotates interleaved pairs
-     * of the first rotaryDim dims, Phi rotate-half pairs of them; both without a qk-norm.
-     */
-    private void normRope(LayerBufs L, Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff, int n, int pos,
-                          boolean localRope) {
-        boolean partial = c.ropeInterleaved() || c.ropePartialHalf();
-        if (partial && L.qNorm != null) {
-            throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
-        }
-        boolean useNorm = !partial && L.qNorm != null && L.kNorm != null;
-        int rotHalf = partial ? c.rotaryDim() / 2 : c.headDim() / 2;
-        k.rope(c.ropeInterleaved(), kvHalf, q, kSrc, kSrcOff, kOut, kOutOff, useNorm ? L.qNorm : null, useNorm ? L.kNorm : null,
-                localRope ? ropeCosLocal : ropeCos, localRope ? ropeSinLocal : ropeSin,
-                c.headDim(), c.qDim(), c.kvDim(), c.heads(), c.kvHeads(), pos, 0, rotHalf, n);
-    }
-
-    /** Dense attention of layer l for the n tokens at pos (the group-specialised kernel, or flash decoding). */
-    private void attention(int l, int n, int pos) {
-        int hd = c.headDim();
-        if (flashDecode && n == 1 && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
-            k.flashAttention(kvHalf, q, keyCache[l], valCache[l], flashPart, scores, att, c.heads(), c.kvHeads(), hd, pos, ctx,
-                    c.attnScale(), c.qDim(), c.kvDim(), c.windowFor(l), c.attnSoftcap());
-            return;
-        }
-        k.attention(attnKernel, attnGroup, q, keyCache[l], valCache[l], att, scores, c.heads(), c.kvHeads(), hd, hd, pos, ctx,
-                c.attnScale(), c.qDim(), c.kvDim(), c.kvDim(), c.qDim(), c.windowFor(l), c.attnSoftcap(), n);
-    }
-
-    /** Router → per-slot gate/up → SwiGLU → weighted down projections accumulated into x. */
-    private void moe(ModelWeights.Layer W, LayerBufs L, int l, int n) {
-        int topK = c.expertsPerTok();
-        if (mla != null) {
-            mla.router(l, L.router, n); // DeepSeek rule; fills assign / routeWeight like `router`
-        } else {
-            k.router(xb, L.router, assign, routeWeight, c.numExperts(), c.dim(), topK, c.normTopK(), n);
-        }
-        k.moeUp(W.expGateUp, L.expGateUp, xb, assign, moeHidden, c.moeDim(), topK, n);
-        k.moeDown(W.expDown, L.expDown, moeHidden, assign, routeWeight, x, c.dim(), topK, n);
     }
 
     @Override

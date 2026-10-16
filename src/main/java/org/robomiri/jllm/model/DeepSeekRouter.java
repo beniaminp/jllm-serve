@@ -31,7 +31,7 @@ public final class DeepSeekRouter {
      * @param weight   receives their routing weights (scaling factor already applied)
      * @param scratch  {@code [nExperts]} floats of working space
      */
-    public static void select(float[] logits, float[] bias, DeepSeekConfig d, int topK, boolean normTopK,
+    public static void select(float[] logits, float[] bias, Router.DeepSeek d, int topK, boolean normTopK,
                               int[] idx, float[] weight, float[] scratch) {
         int e = logits.length;
         if (d.sigmoid()) {
@@ -54,7 +54,7 @@ public final class DeepSeekRouter {
         }
         float[] scores = logits;
         float[] choice = scratch; // what the selection looks at
-        boolean noaux = d.topkMethod().equals("noaux_tc");
+        boolean noaux = d.hasBias();
         for (int i = 0; i < e; i++) {
             choice[i] = noaux ? scores[i] + bias[i] : scores[i];
         }

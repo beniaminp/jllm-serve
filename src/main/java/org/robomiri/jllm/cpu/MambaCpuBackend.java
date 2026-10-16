@@ -1,8 +1,9 @@
 package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.MambaLayer;
-import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 
 import java.util.Arrays;
@@ -25,8 +26,8 @@ import java.util.Arrays;
 public final class MambaCpuBackend implements Backend {
 
     private final ModelWeights w;
-    private final ModelConfig c;
-    private final ModelConfig.MambaParams m;
+    private final Architecture.Core c;
+    private final MambaArch m;
     private final int ctx;
     private final int maxBatch;
     private final ThreadPool pool;
@@ -54,12 +55,9 @@ public final class MambaCpuBackend implements Backend {
      *                        {@link CpuBackend}; the chunked prefill keeps the float path
      */
     public MambaCpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, boolean int8Activations) {
-        if (!w.cfg.isMamba()) {
-            throw new IllegalArgumentException("not a Mamba model: " + w.cfg);
-        }
         this.w = w;
-        this.c = w.cfg;
-        this.m = c.mamba();
+        this.m = w.mambaArch();
+        this.c = m.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.pool = new ThreadPool(threads);
@@ -116,17 +114,17 @@ public final class MambaCpuBackend implements Backend {
             w.embed.dequantizeRow(tokens[off + t], x, t * dim);
         }
         for (int l = 0; l < c.layers(); l++) {
-            MambaLayer L = w.layers[l].mamba;
+            MambaLayer L = w.mambaLayer(l);
             pool.forRange(n, 1, (t0, t1) -> {
                 for (int t = t0; t < t1; t++) {
-                    rmsnormRow(x, t * dim, xb, t * dim, L.norm, dim);
+                    rmsnormRow(x, t * dim, xb, t * dim, L.norm(), dim);
                 }
             });
-            mm.mul(L.inProj, xb, xz, 0, n, false);
+            mm.mul(L.inProj(), xb, xz, 0, n, false);
             conv(L, l, n);
-            mm.mul(L.xProj, xc, dbc, 0, n, false);
+            mm.mul(L.xProj(), xc, dbc, 0, n, false);
             scan(L, l, n);
-            mm.mul(L.outProj, y, x, 0, n, true);
+            mm.mul(L.outProj(), y, x, 0, n, true);
         }
         if (logits != null) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
@@ -149,7 +147,7 @@ public final class MambaCpuBackend implements Backend {
         pool.forRange(di, 32, (i0, i1) -> {
             for (int i = i0; i < i1; i++) {
                 for (int t = 0; t < n; t++) {
-                    xc[t * di + i] = convStep(L.conv, i * dc, L.convBias[i], st, i * (dc - 1), dc, xz[t * 2 * di + i]);
+                    xc[t * di + i] = convStep(L.conv(), i * dc, L.convBias()[i], st, i * (dc - 1), dc, xz[t * 2 * di + i]);
                 }
             }
         });
@@ -189,12 +187,12 @@ public final class MambaCpuBackend implements Backend {
                 int so = i * ds;
                 for (int t = 0; t < n; t++) {
                     int bo = t * stride + rank;
-                    float raw = VectorKernels.dot(L.dtProj, i * rank, dbc, t * stride, rank) + L.dtBias[i];
+                    float raw = VectorKernels.dot(L.dtProj(), i * rank, dbc, t * stride, rank) + L.dtBias()[i];
                     float dt = softplus(raw);
                     float u = xc[t * di + i];
-                    float acc = scanStep(dt, u, L.a, so, s, so, dbc, bo, ds);
+                    float acc = scanStep(dt, u, L.a(), so, s, so, dbc, bo, ds);
                     float z = xz[t * 2 * di + di + i];
-                    y[t * di + i] = (acc + L.d[i] * u) * VectorKernels.silu(z);
+                    y[t * di + i] = (acc + L.d()[i] * u) * VectorKernels.silu(z);
                 }
             }
         });

@@ -1,6 +1,6 @@
 package org.robomiri.jllm.metal;
 
-import org.robomiri.jllm.model.DeepSeekConfig;
+import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 
@@ -430,35 +430,35 @@ final class MetalKernels implements AutoCloseable {
     // ---------------------------------------------------------------- DeepSeek MLA
 
     /** Stores the latent cache rows [c | k_pe] of n tokens from lat / kpe at byte offset off of the cache (half when kvHalf). */
-    void mlaLatStore(boolean kvHalf, Metal.Buffer lat, Metal.Buffer kpe, Metal.Buffer cache, long off, DeepSeekConfig d,
-                     int heads, int n) {
+    void mlaLatStore(boolean kvHalf, Metal.Buffer lat, Metal.Buffer kpe, Metal.Buffer cache, long off, Attention.Mla m,
+                     int n) {
         bind(0, lat, 0);
         bind(1, kpe, 0);
         bind(2, cache, off);
-        mlaParams(d, heads);
+        mlaParams(m);
         dispatch(kvHalf ? "mla_lat_store_h" : "mla_lat_store", 3, 0, n, 1, 1, CHANNEL_THREADS, 1, 1);
     }
 
     /** qa[t, h] = [W_kb_k[h]^T q_nope | q_pe] for the n rows of q (mla_absorb_q); wk is [heads][nope][kvLora] f32. */
-    void mlaAbsorbQ(Metal.Buffer q, Metal.Buffer wk, Metal.Buffer qa, DeepSeekConfig d, int heads, int n) {
+    void mlaAbsorbQ(Metal.Buffer q, Metal.Buffer wk, Metal.Buffer qa, Attention.Mla m, int n) {
         bind(0, q, 0);
         bind(1, wk, 0);
         bind(2, qa, 0);
-        mlaParams(d, heads);
-        dispatch("mla_absorb_q", 3, 0, heads, n, 1, ROW_THREADS, 1, 1);
+        mlaParams(m);
+        dispatch("mla_absorb_q", 3, 0, m.heads(), n, 1, ROW_THREADS, 1, 1);
     }
 
     /** att[t, h] = W_kb_v[h] o[t, h] for the n rows of o (mla_apply_v); wv is [heads][kvLora][vDim] f32. */
-    void mlaApplyV(Metal.Buffer o, Metal.Buffer wv, Metal.Buffer att, DeepSeekConfig d, int heads, int n) {
+    void mlaApplyV(Metal.Buffer o, Metal.Buffer wv, Metal.Buffer att, Attention.Mla m, int n) {
         bind(0, o, 0);
         bind(1, wv, 0);
         bind(2, att, 0);
-        mlaParams(d, heads);
-        dispatch("mla_apply_v", 3, 0, heads, n, 1, ROW_THREADS, 1, 1);
+        mlaParams(m);
+        dispatch("mla_apply_v", 3, 0, m.heads(), n, 1, ROW_THREADS, 1, 1);
     }
 
-    private void mlaParams(DeepSeekConfig d, int heads) {
-        p.reset(KernelParams.MLA).i(d.qkNopeDim()).i(d.qkRopeDim()).i(d.kvLoraRank()).i(d.vHeadDim()).i(heads);
+    private void mlaParams(Attention.Mla m) {
+        p.reset(KernelParams.MLA).i(m.nope()).i(m.rope()).i(m.kvLoraRank()).i(m.vDim()).i(m.heads());
     }
 
     // ---------------------------------------------------------------- Mamba

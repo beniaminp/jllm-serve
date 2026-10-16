@@ -1,10 +1,9 @@
 package org.robomiri.jllm.cpu;
 
-import org.robomiri.jllm.model.DeepSeekConfig;
+import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.InterleavedRope;
 import org.robomiri.jllm.model.KvDtype;
-import org.robomiri.jllm.model.MlaWeights;
-import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.Rope;
 
@@ -16,8 +15,8 @@ import java.util.Arrays;
  *
  * <p>Per token: the query is {@code q_proj(x)} or {@code q_b(norm(q_a(x)))}, per head {@code [q_nope | q_pe]}; the
  * key/value latent is {@code c = norm(kv_a(x))} ({@code kvLora} wide); one rotary key {@code k_pe = kPe(x)} is
- * shared by all heads. The rotary parts of q and k_pe are rotated (pairs {@code (2i, 2i+1)}, see
- * {@link Rope#deepseek}). In the paper's form every head expands {@code c} through {@code kv_b} into
+ * shared by all heads. The rotary parts of q and k_pe are rotated (pairs {@code (2i, 2i+1)}, the interleaved
+ * table of the layer). In the paper's form every head expands {@code c} through {@code kv_b} into
  * {@code k_nope_h = W_kb_k[h] c} and {@code v_h = W_kb_v[h] c}; the engine uses the <b>absorbed</b> form instead,
  * which is the same arithmetic in a different order:
  * <pre>
@@ -37,7 +36,8 @@ import java.util.Arrays;
 final class MlaCpu {
 
     private final CpuBackend b;
-    private final DeepSeekConfig d;
+    private final Attention.Mla m;
+    private final AttnWeights.Mla[] layers;
     private final Rope rope;
     private final int heads;
     private final int qk;
@@ -64,33 +64,33 @@ final class MlaCpu {
     private final int latOff;
     private final int invOff;
 
-    MlaCpu(CpuBackend b, ModelWeights w, Rope rope, int ctx, int maxBatch, KvDtype kvDtype) {
-        ModelConfig c = w.cfg;
+    MlaCpu(CpuBackend b, ModelWeights w, Attention.Mla m, Rope rope, int ctx, int maxBatch, KvDtype kvDtype) {
         this.b = b;
-        this.d = c.deepseek();
+        this.m = m;
         this.rope = rope;
-        heads = c.heads();
-        qk = d.qkDim();
-        int kvl = d.kvLoraRank();
-        aw = kvl + d.qkRopeDim();
+        heads = m.heads();
+        qk = m.qkDim();
+        int kvl = m.kvLoraRank();
+        aw = m.latentDim();
         qaStride = heads * aw;
-        oStride = heads * d.vHeadDim();
+        oStride = heads * m.vDim();
         if ((long) ctx * aw > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("context " + ctx + " is too large for the CPU MLA cache");
         }
-        int layers = c.layers();
-        cache32 = kvDtype == KvDtype.F32 ? new float[layers][ctx * aw] : null;
-        cache16 = kvDtype == KvDtype.F16 ? new short[layers][ctx * aw] : null;
-        wkT = new float[layers][];
-        wv = new float[layers][];
-        for (int l = 0; l < layers; l++) {
-            MlaWeights m = w.layers[l].mla;
-            wkT[l] = m.kvBKeys(d, heads, true);
-            wv[l] = m.kvBValues(d, heads, false);
+        int nLayers = w.arch.core().layers();
+        cache32 = kvDtype == KvDtype.F32 ? new float[nLayers][ctx * aw] : null;
+        cache16 = kvDtype == KvDtype.F16 ? new short[nLayers][ctx * aw] : null;
+        layers = new AttnWeights.Mla[nLayers];
+        wkT = new float[nLayers][];
+        wv = new float[nLayers][];
+        for (int l = 0; l < nLayers; l++) {
+            layers[l] = w.decoderLayer(l).mla();
+            wkT[l] = layers[l].kvBKeys(m, true);
+            wv[l] = layers[l].kvBValues(m, false);
         }
-        qLora = new float[maxBatch * Math.max(d.qLoraRank(), 1)];
+        qLora = new float[maxBatch * Math.max(m.qLoraRank(), 1)];
         lat = new float[maxBatch * kvl];
-        kpe = new float[maxBatch * d.qkRopeDim()];
+        kpe = new float[maxBatch * m.rope()];
         qAbs = new float[maxBatch * qaStride];
         tile = Math.max(1, Math.min(8, 32768 / (heads * ctx)));
         rowOff = tile * heads * ctx;
@@ -101,22 +101,22 @@ final class MlaCpu {
     }
 
     /** Reads {@code b.xb} (normalized hidden states) and writes the attention output {@code [n, heads*v]} to {@code b.att}. */
-    void run(int l, ModelWeights.Layer L, int n, int pos) {
-        MlaWeights m = L.mla;
-        int nope = d.qkNopeDim();
-        int rd = d.qkRopeDim();
-        int kvl = d.kvLoraRank();
-        if (m.qProj != null) {
-            b.matmul(m.qProj, b.xb, b.q, 0, n, false);
-        } else {
-            int ql = d.qLoraRank();
-            b.matmul(m.qA, b.xb, qLora, 0, n, false);
-            b.rmsnorm(qLora, qLora, m.qALayernorm, n, ql);
-            b.matmul(m.qB, qLora, b.q, 0, n, false);
+    void run(int l, int n, int pos) {
+        AttnWeights.Mla mw = layers[l];
+        int nope = m.nope();
+        int rd = m.rope();
+        int kvl = m.kvLoraRank();
+        switch (mw.query()) {
+            case AttnWeights.Mla.Proj p -> b.matmul(p.w(), b.xb, b.q, 0, n, false);
+            case AttnWeights.Mla.Lora q -> {
+                b.matmul(q.a(), b.xb, qLora, 0, n, false);
+                b.rmsnorm(qLora, qLora, q.norm(), n, m.qLoraRank());
+                b.matmul(q.b(), qLora, b.q, 0, n, false);
+            }
         }
-        b.matmul(m.kvA, b.xb, lat, 0, n, false);
-        b.matmul(m.kPe, b.xb, kpe, 0, n, false);
-        b.rmsnorm(lat, lat, m.kvALayernorm, n, kvl);
+        b.matmul(mw.kvA(), b.xb, lat, 0, n, false);
+        b.matmul(mw.kPe(), b.xb, kpe, 0, n, false);
+        b.rmsnorm(lat, lat, mw.kvALayernorm(), n, kvl);
 
         int half = rd / 2;
         int qStride = heads * qk;
@@ -150,8 +150,8 @@ final class MlaCpu {
 
     /** Cache row {@code s} of layer {@code l} = [lat[t] | kpe[t]]. */
     private void store(int l, int s, int t) {
-        int kvl = d.kvLoraRank();
-        int rd = d.qkRopeDim();
+        int kvl = m.kvLoraRank();
+        int rd = m.rope();
         if (cache32 != null) {
             float[] kc = cache32[l];
             System.arraycopy(lat, t * kvl, kc, s * aw, kvl);
@@ -170,9 +170,9 @@ final class MlaCpu {
      * the heads instead so that every thread has work.
      */
     private void attend(int l, int n, int pos) {
-        int kvl = d.kvLoraRank();
-        int vd = d.vHeadDim();
-        float scale = (float) d.softmaxScale();
+        int kvl = m.kvLoraRank();
+        int vd = m.vDim();
+        float scale = m.scale();
         int ctx = cache32 != null ? cache32[l].length / aw : cache16[l].length / aw;
         int tiles = (n + tile - 1) / tile;
         int chunks = Math.min(heads, Math.max(1, (2 * b.pool.threads() + tiles - 1) / tiles)); // head ranges per tile

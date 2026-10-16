@@ -1,7 +1,7 @@
 package org.robomiri.jllm.cpu;
 
+import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
-import org.robomiri.jllm.model.ModelConfig;
 
 import java.util.Arrays;
 
@@ -41,14 +41,15 @@ public abstract class KvCache {
     private final int vOff;
     private final int invOff;
 
-    KvCache(ModelConfig c, int ctx) {
-        this.layers = c.layers();
+    /** @param a the head shape shared by every layer */
+    KvCache(int layers, Attention.Gqa a, int ctx) {
+        this.layers = layers;
         this.ctx = ctx;
-        this.kvDim = c.kvDim();
-        this.kvHeads = c.kvHeads();
-        this.headDim = c.headDim();
-        this.qDim = c.qDim();
-        this.group = c.heads() / c.kvHeads();
+        this.kvDim = a.kvDim();
+        this.kvHeads = a.kvHeads();
+        this.headDim = a.headDim();
+        this.qDim = a.qDim();
+        this.group = a.heads() / a.kvHeads();
         this.tile = Math.max(1, Math.min(8, 32768 / (group * ctx)));
         kOff = tile * group * ctx;
         vOff = kOff + headDim;
@@ -57,14 +58,14 @@ public abstract class KvCache {
         scratch = ThreadLocal.withInitial(() -> new float[len]);
     }
 
-    public static KvCache create(KvDtype dtype, ModelConfig c, int ctx) {
-        long cacheLen = (long) ctx * c.kvDim();
+    public static KvCache create(KvDtype dtype, int layers, Attention.Gqa a, int ctx) {
+        long cacheLen = (long) ctx * a.kvDim();
         if (cacheLen > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("context " + ctx + " is too large for the CPU KV cache");
         }
         return switch (dtype) {
-            case F32 -> new F32(c, ctx);
-            case F16 -> new F16(c, ctx);
+            case F32 -> new F32(layers, a, ctx);
+            case F16 -> new F16(layers, a, ctx);
         };
     }
 
@@ -194,8 +195,8 @@ public abstract class KvCache {
         final float[][] key;
         final float[][] val;
 
-        F32(ModelConfig c, int ctx) {
-            super(c, ctx);
+        F32(int layers, Attention.Gqa a, int ctx) {
+            super(layers, a, ctx);
             key = new float[layers][ctx * kvDim];
             val = new float[layers][ctx * kvDim];
         }
@@ -255,8 +256,8 @@ public abstract class KvCache {
         final short[][] key;
         final short[][] val;
 
-        F16(ModelConfig c, int ctx) {
-            super(c, ctx);
+        F16(int layers, Attention.Gqa a, int ctx) {
+            super(layers, a, ctx);
             key = new short[layers][ctx * kvDim];
             val = new short[layers][ctx * kvDim];
         }

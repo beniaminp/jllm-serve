@@ -1,7 +1,7 @@
 package org.robomiri.jllm.engine;
 
 import org.robomiri.jllm.model.Backend;
-import org.robomiri.jllm.model.ModelConfig;
+import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
@@ -47,7 +47,7 @@ public final class Engine implements AutoCloseable {
 
     private final Backend backend;
     private final Tokenizer tokenizer;
-    private final ModelConfig cfg;
+    private final Architecture.Core model;
     private final Set<Integer> eosIds;
     private final ReentrantLock lock = new ReentrantLock(true);
     private final long queueTimeoutMs;
@@ -57,24 +57,24 @@ public final class Engine implements AutoCloseable {
     private int cachedLen;
     private final ChatTemplate.Format template;
 
-    public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds) {
-        this(backend, tokenizer, cfg, eosIds, 0);
+    public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
+        this(backend, tokenizer, arch, eosIds, 0);
     }
 
     /**
      * @param queueTimeoutMs how long {@link #generate} may wait for the engine while another request runs
      *                       before throwing {@link OverloadedException}; 0 = wait indefinitely
      */
-    public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds, long queueTimeoutMs) {
-        this(backend, tokenizer, cfg, eosIds, queueTimeoutMs, ChatTemplate.forModelType(cfg.modelType(), tokenizer));
+    public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds, long queueTimeoutMs) {
+        this(backend, tokenizer, arch, eosIds, queueTimeoutMs, ChatTemplate.forModelType(arch.core().modelType(), tokenizer));
     }
 
     /** @param template the chat format of the model family (prompt rendering and end-of-turn tokens) */
-    public Engine(Backend backend, Tokenizer tokenizer, ModelConfig cfg, Set<Integer> eosIds, long queueTimeoutMs,
+    public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds, long queueTimeoutMs,
                   ChatTemplate.Format template) {
         this.backend = backend;
         this.tokenizer = tokenizer;
-        this.cfg = cfg;
+        this.model = arch.core();
         this.template = template;
         Set<Integer> stops = new java.util.HashSet<>(eosIds);
         for (int id : template.stopIds(tokenizer)) {
@@ -90,8 +90,8 @@ public final class Engine implements AutoCloseable {
         // the token an empty prompt is replaced with: the tokenizer's EOS, else config.json's first eos_token_id,
         // else the smallest known stop id (a Set has no stable order; the choice must not vary between runs)
         int empty = tokenizer.eosId();
-        if (empty < 0 && !cfg.eosTokenIds().isEmpty()) {
-            empty = cfg.eosTokenIds().getFirst();
+        if (empty < 0 && !model.eosTokenIds().isEmpty()) {
+            empty = model.eosTokenIds().getFirst();
         }
         if (empty < 0) {
             empty = this.eosIds.stream().mapToInt(Integer::intValue).min().orElse(-1);
@@ -188,8 +188,8 @@ public final class Engine implements AutoCloseable {
         if (cancelled.getAsBoolean()) { // the client went away while this request was queued
             return new Result("", new int[0], "cancelled", new Stats(prompt.length, 0, 0, 0, 0));
         }
-        int vocab = Math.min(cfg.vocabSize(), tokenizer.vocabSize());
-        float[] logits = new float[cfg.vocabSize()];
+        int vocab = Math.min(model.vocabSize(), tokenizer.vocabSize());
+        float[] logits = new float[model.vocabSize()];
         Sampler sampler = new Sampler(p, vocab, prompt);
 
         // prefix cache: reuse the longest common prefix, but always recompute at least the last token

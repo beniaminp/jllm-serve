@@ -1,30 +1,32 @@
 package org.robomiri.jllm.model;
 
 /**
- * Rotary position embedding tables in the Hugging Face "rotate half" convention: dimension {@code i} is paired
- * with {@code i + headDim/2} and rotated by {@code pos * invFreq[i]}, where {@code invFreq[i]} is
- * {@code theta^(-2i/headDim)} optionally rescaled for long-context models (see {@link #invFreq}).
+ * The cos/sin table of one {@link RopeTable} over a context length: entry {@code i} of position {@code p} is
+ * {@code p * invFreq[i]}, with {@code invFreq[i] = theta^(-2i/rotaryDim)} optionally rescaled for long-context
+ * models ({@link #invFreq}) and the table multiplied by the scaling's amplitude ({@link #amplitude}).
+ *
+ * <p>The table does not know how a head pairs its dimensions: with {@link RopeTable.Pairing#HALF} the backends
+ * rotate {@code (i, i + rotaryDim/2)} by entry {@code i}, with {@link RopeTable.Pairing#INTERLEAVED}
+ * ({@link InterleavedRope}) the pair {@code (2i, 2i+1)}. Dimensions {@code >= rotaryDim} of a head stay put.
  */
 public final class Rope {
-    // GLM (ModelConfig.ropeInterleaved) uses the same tables, built for the rotated slice only: rotaryDim/2
-    // entries per position and frequencies theta^(-2i/rotaryDim). The pair (2i, 2i+1) of the head is rotated by
-    // entry i instead of the pair (i, i + rotaryDim/2).
 
-    /** {@code [ctx * headDim/2]} cosines. */
+    /** {@code [ctx * rotaryDim/2]} cosines. */
     public final float[] cos;
-    /** {@code [ctx * headDim/2]} sines. */
+    /** {@code [ctx * rotaryDim/2]} sines. */
     public final float[] sin;
 
-    public Rope(int headDim, double theta, int ctx) {
-        this(headDim, theta, ctx, null);
+    /** A plain table: {@code rotaryDim/2} frequencies {@code theta^(-2i/rotaryDim)}, no scaling. */
+    public Rope(int rotaryDim, double theta, int ctx) {
+        this(new RopeTable(rotaryDim, theta, Scaling.NONE, RopeTable.Pairing.HALF), ctx);
     }
 
-    public Rope(int headDim, double theta, int ctx, ModelConfig.RopeScaling scaling) {
-        int half = headDim / 2;
+    public Rope(RopeTable t, int ctx) {
+        int half = t.rotaryDim() / 2;
         cos = new float[ctx * half];
         sin = new float[ctx * half];
-        double[] inv = invFreq(headDim, theta, scaling, ctx);
-        double amp = attentionFactor(scaling);
+        double[] inv = invFreq(t, ctx);
+        double amp = amplitude(t.scaling());
         for (int i = 0; i < half; i++) {
             double freq = inv[i];
             for (int p = 0; p < ctx; p++) {
@@ -35,39 +37,91 @@ public final class Rope {
         }
     }
 
-    public static Rope of(ModelConfig c, int ctx) {
-        if (c.deepseek() != null) {
-            return deepseek(c.deepseek(), c.ropeTheta(), ctx);
-        }
-        return new Rope(c.rotaryDim(), c.ropeTheta(), ctx, c.ropeScaling());
-    }
-
-    private Rope(double[] inv, int ctx, double mscale) {
-        int half = inv.length;
-        cos = new float[ctx * half];
-        sin = new float[ctx * half];
-        for (int i = 0; i < half; i++) {
-            for (int p = 0; p < ctx; p++) {
-                double a = p * inv[i];
-                cos[p * half + i] = (float) (Math.cos(a) * mscale);
-                sin[p * half + i] = (float) (Math.sin(a) * mscale);
-            }
-        }
+    /**
+     * Multiplier of cos and sin (so of {@code q.k} squared): LongRoPE's {@link #attentionFactor}, YaRN's
+     * {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)} (modeling_deepseek.py),
+     * 1 for every other scaling.
+     */
+    public static double amplitude(Scaling s) {
+        return switch (s) {
+            case Scaling.LongRope lr -> attentionFactor(lr);
+            case Scaling.Yarn y -> yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim());
+            case Scaling.None n -> 1.0;
+            case Scaling.Linear l -> 1.0;
+            case Scaling.Llama3 l -> 1.0;
+        };
     }
 
     /**
-     * The table for the {@code qk_rope_head_dim} wide rotary part of DeepSeek MLA, as in modeling_deepseek.py:
-     * YaRN frequencies ({@link #yarnInvFreq}) and cos/sin multiplied by
-     * {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)}. The pairs are the
-     * interleaved dimensions (2i, 2i+1) of the checkpoint layout, rotated by {@code pos * invFreq[i]}.
+     * LongRoPE's multiplier on cos and sin. transformers' {@code _compute_longrope_parameters}:
+     * {@code attention_factor} if given, else 1 for {@code factor <= 1}, else
+     * {@code sqrt(1 + ln(factor) / ln(original_max_position_embeddings))}.
      */
-    public static Rope deepseek(DeepSeekConfig d, double theta, int ctx) {
-        DeepSeekConfig.Yarn y = d.yarn();
-        if (y == null) {
-            return new Rope(invFreq(d.qkRopeDim(), theta, null), ctx, 1.0);
+    public static double attentionFactor(Scaling.LongRope sc) {
+        if (sc.attentionFactor() > 0) {
+            return sc.attentionFactor();
         }
-        double[] inv = yarnInvFreq(d.qkRopeDim(), theta, y.factor(), y.originalMaxPositions(), y.betaFast(), y.betaSlow());
-        return new Rope(inv, ctx, yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim()));
+        return sc.factor() <= 1.0 ? 1.0 : Math.sqrt(1 + Math.log(sc.factor()) / Math.log(sc.originalMaxPositions()));
+    }
+
+    /** The {@code rotaryDim/2} inverse frequencies of {@code t} for a context of {@code ctx} tokens. */
+    public static double[] invFreq(RopeTable t, int ctx) {
+        return invFreq(t.rotaryDim(), t.theta(), t.scaling(), ctx);
+    }
+
+    /**
+     * The {@code rotaryDim/2} inverse frequencies. Plain RoPE: {@code theta^(-2i/rotaryDim)}. {@code linear}:
+     * divided by the factor. {@code llama3} (transformers' {@code _compute_llama3_parameters}): each frequency is
+     * treated by its wavelength {@code 2π/f}: short wavelengths (below {@code original/high_freq_factor}) are
+     * kept, long ones (above {@code original/low_freq_factor}) are divided by {@code factor}, and in between the
+     * two are blended with {@code smooth = (original/wavelen - low) / (high - low)}. {@code longrope}:
+     * {@code 1 / (ext[i] * theta^(2i/rotDim))} with {@code ext} the long factors when {@code ctx} exceeds
+     * {@code original_max_position_embeddings} and the short ones otherwise (transformers picks per sequence
+     * length; here the choice is made once from the context size the backend is created with). {@code yarn}:
+     * {@link #yarnInvFreq}.
+     */
+    public static double[] invFreq(int rotaryDim, double theta, Scaling scaling, int ctx) {
+        int half = rotaryDim / 2;
+        double[] f = new double[half];
+        for (int i = 0; i < half; i++) {
+            f[i] = 1.0 / Math.pow(theta, (2.0 * i) / rotaryDim);
+        }
+        switch (scaling) {
+            case Scaling.None n -> {
+            }
+            case Scaling.Linear l -> {
+                for (int i = 0; i < half; i++) {
+                    f[i] /= l.factor();
+                }
+            }
+            case Scaling.Llama3 sc -> {
+                double lowWavelen = sc.originalMaxPositions() / sc.lowFreqFactor();
+                double highWavelen = sc.originalMaxPositions() / sc.highFreqFactor();
+                for (int i = 0; i < half; i++) {
+                    double wavelen = 2 * Math.PI / f[i];
+                    if (wavelen < highWavelen) {
+                        continue;
+                    }
+                    if (wavelen > lowWavelen) {
+                        f[i] /= sc.factor();
+                    } else {
+                        double smooth = (sc.originalMaxPositions() / wavelen - sc.lowFreqFactor())
+                                / (sc.highFreqFactor() - sc.lowFreqFactor());
+                        f[i] = (1 - smooth) * f[i] / sc.factor() + smooth * f[i];
+                    }
+                }
+            }
+            case Scaling.LongRope sc -> {
+                double[] ext = ctx > sc.originalMaxPositions() ? sc.longFactor() : sc.shortFactor();
+                for (int i = 0; i < half; i++) {
+                    f[i] = 1.0 / (ext[i] * Math.pow(theta, (2.0 * i) / rotaryDim));
+                }
+            }
+            case Scaling.Yarn y -> {
+                return yarnInvFreq(rotaryDim, theta, y.factor(), y.originalMaxPositions(), y.betaFast(), y.betaSlow());
+            }
+        }
+        return f;
     }
 
     /** {@code yarn_get_mscale}: {@code 0.1 * mscale * ln(scale) + 1}, and 1 when {@code scale <= 1}. */
@@ -99,89 +153,6 @@ public final class Rope {
             double inter = 1.0 / (factor * Math.pow(base, (2.0 * i) / dim));
             double ramp = Math.min(Math.max((i - low) / (high - low), 0), 1);
             f[i] = inter * ramp + extra * (1 - ramp);
-        }
-        return f;
-    }
-
-    /**
-     * The table for layers with {@link ModelConfig#usesLocalRope local RoPE} (Gemma 3 sliding layers): base
-     * {@code rope_local_base_freq}, never scaled, over the same {@link ModelConfig#rotaryDim rotated width} as
-     * {@link #of}. Other layers use {@link #of}.
-     */
-    public static Rope local(ModelConfig c, int ctx) {
-        return new Rope(c.rotaryDim(), c.gemma().localRopeTheta(), ctx, null);
-    }
-
-    /**
-     * LongRoPE's multiplier on cos and sin (so on q.k it appears squared). transformers'
-     * {@code _compute_longrope_parameters}: {@code attention_factor} if given, else 1 for {@code factor <= 1}, else
-     * {@code sqrt(1 + ln(factor) / ln(original_max_position_embeddings))}. 1 for every other scaling type.
-     */
-    public static double attentionFactor(ModelConfig.RopeScaling sc) {
-        if (sc == null || !sc.type().equals("longrope")) {
-            return 1.0;
-        }
-        if (sc.attentionFactor() > 0) {
-            return sc.attentionFactor();
-        }
-        return sc.factor() <= 1.0 ? 1.0 : Math.sqrt(1 + Math.log(sc.factor()) / Math.log(sc.originalMaxPositions()));
-    }
-
-    /**
-     * LongRoPE: {@code inv_freq[i] = 1 / (ext[i] * theta^(2i/rotDim))} with {@code ext} the long factors when the
-     * context exceeds {@code original_max_position_embeddings} and the short ones otherwise. transformers picks per
-     * sequence length; here the choice is made once from the context size the backend is created with.
-     */
-    public static double[] invFreq(int rotDim, double theta, ModelConfig.RopeScaling sc, int ctx) {
-        if (sc == null || !sc.type().equals("longrope")) {
-            return invFreq(rotDim, theta, sc);
-        }
-        double[] ext = ctx > sc.originalMaxPositions() ? sc.longFactor() : sc.shortFactor();
-        int half = rotDim / 2;
-        double[] f = new double[half];
-        for (int i = 0; i < half; i++) {
-            f[i] = 1.0 / (ext[i] * Math.pow(theta, (2.0 * i) / rotDim));
-        }
-        return f;
-    }
-
-    /**
-     * The {@code headDim/2} inverse frequencies. Plain RoPE: {@code theta^(-2i/headDim)}. With {@code linear}
-     * scaling they are divided by the factor. With {@code llama3} scaling (transformers'
-     * {@code _compute_llama3_parameters}) each frequency is treated by its wavelength {@code 2π/f}: short
-     * wavelengths (below {@code original/high_freq_factor}) are kept, long ones (above
-     * {@code original/low_freq_factor}) are divided by {@code factor}, and in between the two are blended
-     * with {@code smooth = (original/wavelen - low) / (high - low)}.
-     */
-    public static double[] invFreq(int headDim, double theta, ModelConfig.RopeScaling sc) {
-        int half = headDim / 2;
-        double[] f = new double[half];
-        for (int i = 0; i < half; i++) {
-            f[i] = 1.0 / Math.pow(theta, (2.0 * i) / headDim);
-        }
-        if (sc == null) {
-            return f;
-        }
-        if (sc.type().equals("linear")) {
-            for (int i = 0; i < half; i++) {
-                f[i] /= sc.factor();
-            }
-            return f;
-        }
-        double lowWavelen = sc.originalMaxPositions() / sc.lowFreqFactor();
-        double highWavelen = sc.originalMaxPositions() / sc.highFreqFactor();
-        for (int i = 0; i < half; i++) {
-            double wavelen = 2 * Math.PI / f[i];
-            if (wavelen < highWavelen) {
-                continue;
-            }
-            if (wavelen > lowWavelen) {
-                f[i] /= sc.factor();
-            } else {
-                double smooth = (sc.originalMaxPositions() / wavelen - sc.lowFreqFactor())
-                        / (sc.highFreqFactor() - sc.lowFreqFactor());
-                f[i] = (1 - smooth) * f[i] / sc.factor() + smooth * f[i];
-            }
         }
         return f;
     }
