@@ -166,8 +166,10 @@ those are sorted (`sortDescending`).
 One subtlety: the cumulative probabilities must be measured against the **full-vocabulary** softmax sum, not
 the sum over the survivors — the pruned tail still carries up to `1 − p` of the mass. `nucleusCandidates()`
 therefore returns the denominator computed over all `V` logits, and `sample()` uses it for `cum` on this path.
-(An earlier version normalized over the survivors only, which cut the nucleus one token early; `SmokeTest`
-now checks the kept set against a brute-force reference.)
+This is not a limitation of the `top_k: 0` path: the nucleus is the same set a full-vocabulary sort would give.
+(Normalizing over the survivors only would cut it one token early; `SmokeTest` checks the sampled set against a
+brute-force reference, including the boundary token.) With a non-zero `top_k` the survivors are the `k` best
+tokens and top-p is computed over their softmax, as in Hugging Face, where the discarded logits are −∞.
 
 ---
 
@@ -236,7 +238,7 @@ distributed exactly as in `transformers`.
 `Sampler` uses `java.util.SplittableRandom`: fast, good statistical quality, and seedable. With `seed >= 0`
 (`"seed": 42` in a request, `--seed 42`, or `sampling.seed`) the same prompt and settings produce the same
 output every time *on the same backend* — useful for tests and for reproducing a bad answer. `seed = −1`
-(default) seeds from the clock. Note that CPU and Metal can differ in the last bits of a logit (different
+(the default of `sampling.seed`; a request without `seed` inherits whatever the settings say) seeds from the clock. Note that CPU and Metal can differ in the last bits of a logit (different
 summation order), so a seed guarantees reproducibility per backend, not across them.
 
 ---
@@ -247,7 +249,8 @@ summation order), so a seed guarantees reproducibility per backend, not across t
 regular + 26 added tokens). The remaining 267 rows of the embedding / LM-head matrix are **padding** chosen so
 the matrix dimension is a multiple of 128 for efficient GPU kernels; they were never trained and their logits
 are arbitrary. `Engine` therefore constructs the sampler with
-`vocab = min(cfg.vocabSize(), tokenizer.vocabSize()) = 151 669`, so `argmax`, the heap and the candidate scan
+`vocab = min(core.vocabSize(), tokenizer.vocabSize()) = 151 669` (`core` is the model's `Architecture.Core`, whose
+`vocabSize` is the row count of the embedding and LM head; the logits array keeps the padded length), so `argmax`, the heap and the candidate scan
 never look at those rows — otherwise a padding row would occasionally win and decode to an empty byte string.
 
 ---
@@ -268,8 +271,13 @@ never look at those rows — otherwise a padding row would occasionally win and 
 | `stop` (string or array) | — | — | `stop` |
 
 The bundled defaults mirror Qwen3's own `generation_config.json` (`T = 0.6, top_k = 20, top_p = 0.95`).
-`SamplingParams`' constructor validates ranges (`T ≥ 0`, `0 < top_p ≤ 1`, `0 ≤ min_p ≤ 1`, `r > 0`) and the
-server turns a violation into an HTTP 400.
+`SamplingParams`' constructor validates the parameters: every float must be **finite** (NaN and ±∞ are rejected,
+for instance a `1e999` that overflows to infinity as a float), and `T ≥ 0`, `top_k ≥ 0`, `0 < top_p ≤ 1`,
+`0 ≤ min_p ≤ 1`, `r > 0`. Presence and frequency penalties may be negative. The server turns a violation into an
+HTTP 400 (`invalid_request_error`); `top_k` must additionally be an integer (a fraction or a negative number is a
+400). A request value overrides the setting only if present; `max_tokens` (or `max_completion_tokens`, which wins)
+must be at least 1 and is clamped to the room left in the context. The defaults come from the `sampling.*`
+settings via `Settings.sampling()`; `SamplingParams.defaults()` (2048 tokens) is only the programmatic fallback.
 
 ---
 
