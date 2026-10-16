@@ -19,7 +19,7 @@ status line, headers, a blank line, and the body. Here is what `HuggingFaceHub` 
 GET /Qwen/Qwen3-0.6B/resolve/main/config.json HTTP/1.1
 Host: huggingface.co
 User-Agent: jllm-serve/1.0 (java 26.0.2.1)
-Authorization: Bearer hf_xxxxxxxx            ← only if a token is configured, only to the Hub host
+Authorization: Bearer hf_xxxxxxxx            ← only if a token is configured, only to the Hub host, only over https
 
 HTTP/1.1 200 OK
 Content-Type: application/json
@@ -84,7 +84,7 @@ The fields `listFiles()` reads:
 
 ```json
 {
-  "sha": "c1899de289a04d12100db370d81485cdf75e47ca",        ← the commit; not used
+  "sha": "c1899de289a04d12100db370d81485cdf75e47ca",        ← the commit the revision resolves to; recorded in the quantized cache
   "siblings": [
     {"rfilename": "config.json", "size": 726},                                        ← small file: no "lfs"
     {"rfilename": "model.safetensors", "size": 1503300328,
@@ -98,17 +98,21 @@ The fields `listFiles()` reads:
 
 Each sibling becomes a `RepoFile(name, size, sha256)`; `sha256` is `null` for non-LFS files (they are small
 and simply size-checked). The listing is cached per `repo@revision` so the converter's repeated "give me shard
-N" calls do not hit the API again.
+N" calls do not hit the API again, and the commit `sha` is kept (`commitSha()`): the converter stores it in the
+cache index, so a cache can later be traced to the exact snapshot it was made from ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)).
 
 **2. Content** — `GET {endpoint}/{repo}/resolve/{rev}/{file}` → redirect → bytes.
 
 `{endpoint}` is `https://huggingface.co` unless `hub.endpoint` (settings) or `$HF_ENDPOINT` names a mirror.
+All Hub requests share one timeout, `hub.timeout-ms` (default 60 000): a request that gets no response in time, or a
+download that receives no bytes for that long (2.3), counts as a failed attempt.
 `{rev}` is a branch, tag or commit hash (`model.revision`, default `main`); it is URL-encoded segment by segment
 (`encodePath`) so a revision like `refs/pr/3` works.
 
 ### Which files we take
 
-`isInferenceFile(name)` keeps only what inference needs:
+`isMetadataFile(name)` picks the five small files every model needs, and `weightFileNames(dir)` decides which
+weight files belong to the checkpoint:
 
 | file | why |
 |---|---|
@@ -116,10 +120,14 @@ N" calls do not hit the API again.
 | `generation_config.json` | end-of-sequence ids and default sampling values |
 | `tokenizer.json` | vocabulary + merges ([04](04-tokenizer.md)) |
 | `tokenizer_config.json` | chat template (kept for reference) |
-| `*.safetensors` | the weights ([03](03-safetensors.md)) |
 | `model.safetensors.index.json` | tensor → shard map for sharded checkpoints |
+| the shards named by that index, or else `model.safetensors` | the weights ([03](03-safetensors.md)) |
 
-Skipped: `README.md`, `LICENSE`, `vocab.json`/`merges.txt` (duplicates of `tokenizer.json`), `.gitattributes`.
+Only the shards the index lists are downloaded: repositories that also carry a consolidated checkpoint, a
+duplicate copy or adapters do not cost you the extra gigabytes, and the converter reads exactly the same set. A
+repository with neither an index nor a `model.safetensors` (only `.bin` pickles, GGUF, ...) is rejected with an
+explanation. Skipped: `README.md`, `LICENSE`, `vocab.json`/`merges.txt` (duplicates of `tokenizer.json`),
+`.gitattributes`.
 
 ---
 
@@ -131,13 +139,18 @@ followed the redirect automatically it would re-send *all* headers — including
 A misconfigured mirror or a malicious `Location` would then receive your credential.
 
 `send()` therefore loops over redirects itself (at most `MAX_REDIRECTS = 10`), rebuilding the request each time
-and attaching the token **only when the target host equals the Hub endpoint's host**:
+and attaching the token **only when the target host equals the Hub endpoint's host and the connection is https**:
 
 ```java
-if (token != null && hubHost.equalsIgnoreCase(current.getHost())) {
+if (token != null && tokenUsable && hubHost.equalsIgnoreCase(current.getHost())
+        && ("https".equalsIgnoreCase(current.getScheme()) || isLoopback(current.getHost()))) {
     b.header("Authorization", "Bearer " + token);
 }
 ```
+
+A token must never travel in clear text, so with a plain `http://` endpoint it is withheld (a 401/403 then says
+"token withheld: endpoint … is not https"). The one exception is a loopback mirror (`localhost`, `127.x.x.x`,
+`::1`), where plain http never leaves the machine.
 
 The token comes from, in order: the `hub.token` setting, `$HF_TOKEN`, `$HUGGING_FACE_HUB_TOKEN`, or the file
 `~/.cache/huggingface/token` written by `huggingface-cli login`. Public models such as Qwen3 need none.
@@ -154,8 +167,9 @@ The token comes from, in order: the `hub.token` setting, `$HF_TOKEN`, `$HUGGING_
     sha    = new SHA-256; feed it the existing `have` bytes of part       (hashExisting)
 4.  up to 5 attempts:
         transfer(uri, part, have, …)       ← GET with Range when have > 0, stream to disk, hash as we go
-        on IOException: wait attempt × 1 s, re-read `have` from disk, re-hash, try again
-5.  final size must equal the Hub's size; final hash must equal the Hub's sha256 (else delete part, fail)
+        on a retryable error: wait (Retry-After, else attempt × 1 s), re-read `have` from disk, re-hash, try again
+5.  final size must equal the Hub's size; final hash must equal the Hub's sha256
+    (on a hash mismatch: delete part and start over from byte 0 once; a second mismatch fails)
 6.  atomic rename part → target
 ```
 
@@ -188,10 +202,24 @@ starts over; had it answered `416` with `have == size`, the file was already com
 
 ### Retries
 
-Network errors (`IOException`: reset connection, timeout, DNS blip) trigger up to 5 attempts with a linear
+What is retried is decided by `retryable()`; the same rules apply to the file listing and to downloads:
+
+| failure | retried? |
+|---|---|
+| network errors (`IOException`: reset connection, DNS blip), no response within `hub.timeout-ms` | yes |
+| a download that stalls: no byte for `hub.timeout-ms` | yes (see below) |
+| HTTP 5xx | yes |
+| HTTP 429 Too Many Requests | yes, waiting for the server's `Retry-After` (capped at 300 s) |
+| other HTTP 4xx (401, 403, 404, ...) | **no**, fails at once with the status and a hint about the token |
+
+There are up to 5 attempts; between them the wait is the server's `Retry-After` if it sent one, else a linear
 back-off of 1, 2, 3, 4 seconds. Each retry resumes from whatever reached the disk, so a flaky connection
-costs time, not progress. An HTTP error status (404, 403) is also raised as an `IOException` and therefore
-retried the same way — harmless but slow; see the troubleshooting table.
+costs time, not progress.
+
+**Stall watchdog.** A TCP connection can go silent without ever failing, and a blocked `read` would then hang
+forever. While a body is streaming, a small virtual thread (`StallWatchdog`) watches the time since the last
+received byte; after `hub.timeout-ms` without progress it closes the stream, the blocked read fails with
+"no data received for 60 s", and the retry loop resumes the download.
 
 ### The progress line
 
@@ -206,11 +234,11 @@ The same `downloadFile` serves three entry points, used in different situations:
 
 | method | what it fetches | used by |
 |---|---|---|
-| `download(repo, rev, dir)` | every inference file, in listing order | `./jllm download` |
-| `downloadMetadata(repo, rev, dir)` | only the non-`.safetensors` inference files | `Main.load` when `config.json` is missing |
+| `download(repo, rev, dir)` | the metadata files, then exactly the shards `weightFileNames` derives from the index | `./jllm download` |
+| `downloadMetadata(repo, rev, dir)` | only the five small metadata files (no weights) | `Main.load` when `config.json` is missing |
 | `ensure(repo, rev, dir, name)` | exactly one named file, if not already present | `ShardProvider.ensure` → `ModelConverter`, one shard at a time |
 
-`download` first checks free space: it sums the sizes of the files that are *not* already complete and compares
+`download` first checks free space: it sums the sizes of the shards that are *not* already complete and compares
 with `Files.getFileStore(dir).getUsableSpace()`. If the model does not fit it fails immediately with a message
 pointing at `--low-disk`, rather than filling the disk and dying at shard 13.
 
@@ -219,7 +247,11 @@ The on-demand path is what makes large models practical. `Main.load` builds a `S
 ```java
 ensure(name)  → dir/name if present, else hub.ensure(model, revision, dir, name)
 release(name) → if model.low-disk: delete dir/name
+commitSha()   → hub.commitSha(model, revision), recorded in the cache index (null when offline)
 ```
+
+The shard names come from the downloaded index, i.e. from the network, so `ShardProvider.checkName` accepts only
+plain `.safetensors` file names that live directly in the model directory before anything is fetched or deleted.
 
 and hands it to `ModelWeights.load` → `ModelConverter`, which asks for shards only when it needs a tensor in them
 and releases each shard once every tensor in it has been consumed ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)).
@@ -240,20 +272,23 @@ layers straddling two shards. Machine: 50 GB free. Command:
 | start | — | 50 GB |
 | `downloadMetadata` | `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `model.safetensors.index.json` (1.7 MB: the tensor → shard map) | 50 GB |
 | converter needs `model.embed_tokens.weight` → `ensure(shard 1)` | + `model-00001-of-00016.safetensors.incomplete` growing… then renamed `…safetensors` (3.8 GB) | 46 GB |
-| embedding + layers 0–2 quantized | + `jllm-q4_0.bin` growing (0.35 GB embedding, then ~0.4 GB per layer) | 45 GB |
+| embedding + layers 0–2 quantized | + `jllm-q4_0.bin` growing (0.35 GB embedding, then ~0.4 GB per layer) and `jllm-q4_0.partial.json` (the units finished so far) | 45 GB |
 | layer 3 straddles shards 1 and 2 → `ensure(shard 2)` | shard 1 + shard 2 + bin | 41 GB |
 | last tensor of shard 1 consumed → `release(shard 1)` → **deleted** | shard 2 + bin | 45 GB |
 | … repeats: at any moment 1–2 shards (≤ 7.6 GB) + the growing `.bin` | | |
 | layer 47 done, final norm, `lm_head.weight` from shard 16 | shard 16 + `jllm-q4_0.bin` (19.7 GB) | 26 GB |
-| `release(shard 16)`, `jllm-q4_0.json` written (**now** the cache is valid) | `jllm-q4_0.bin` + `jllm-q4_0.json` + the five small files | 30 GB |
+| `release(shard 16)`, `jllm-q4_0.json` written and `.partial.json` removed (**now** the cache is valid) | `jllm-q4_0.bin` + `jllm-q4_0.json` + the five small files | 30 GB |
 | every later start | the same; shards are never needed again | |
 
 Peak usage is about 2 shards + the finished cache ≈ 27 GB. Without `--low-disk` the shards are kept
 (standard behaviour, lets you reconvert with `--quant q8` without downloading again), which needs 61 + 20 GB.
 
-If the process is interrupted mid-way, the next run finds a `.bin` without a `.json`, discards it and starts
-the conversion over; shards still on disk are reused, deleted ones are downloaded again. (Resuming the
-conversion itself is a possible improvement, see [11](11-performance.md).)
+If the process is interrupted mid-way, the next run finds a `.bin` without a `.json` but with the
+`.partial.json` sidecar, and **resumes after the last finished unit** (embedding, layer, ...) instead of starting
+over; only the shards the remaining units need are fetched, so shards that were already released are not
+downloaded again ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)). If the sidecar
+does not match the current conversion (another quant, revision or converter version), the conversion starts
+from the beginning.
 
 ---
 
@@ -279,11 +314,13 @@ Sub-directories inside the repo (`onnx/model.onnx`) are allowed and created with
 | symptom | meaning | fix |
 |---|---|---|
 | `Hub API … returned HTTP 401/403 (gated/private repo? set HF_TOKEN)` | the model requires accepting a license and authenticating | accept the license on the model page, then `export HF_TOKEN=hf_…` or `huggingface-cli login`, or set `hub.token` |
-| `Hub API … returned HTTP 404` | repo name or `model.revision` is wrong | check the spelling (`Qwen/Qwen3-0.6B`, case-sensitive) and the revision |
+| `Hub API … returned HTTP 404` | repo name or `model.revision` is wrong | check the spelling (`Qwen/Qwen3-0.6B`, case-sensitive) and the revision; a 4xx is not retried |
+| `… (token withheld: endpoint … is not https)` | `hub.endpoint` / `$HF_ENDPOINT` is a plain `http://` mirror, so the token is not sent | use https, or a loopback mirror |
 | `need 61.1 GB … but only 50.2 GB are free` | `./jllm download` refuses to start a download that cannot fit | run `run`/`serve` with `--low-disk` instead, or free space |
-| `…: sha256 mismatch` | the bytes on disk differ from what the Hub published (corruption in transit or on disk); the `.incomplete` file was deleted | just re-run; if it repeats, check the disk and any proxy |
+| `…: sha256 mismatch, downloading again from the start` | the partial file on disk was corrupt (or the file changed on the Hub while resuming); it was deleted and the download restarts once | wait; if it fails a second time, check the disk and any proxy |
 | `…: size mismatch` | the server closed the connection early 5 times in a row | re-run (it resumes); check the network |
-| repeated `retrying (n/5)` with HTTP 404 in the message | one file of the listing does not resolve at this revision | report the repo; the retries are harmless |
+| `no data received for 60 s` / `retrying (n/5)` | a stalled connection was cut by the watchdog and is being resumed | nothing, or raise `hub.timeout-ms` on a very slow link |
+| `… has no model.safetensors` | the repository only ships pytorch `.bin` or GGUF files | only safetensors checkpoints are supported |
 | `refusing to write outside model dir` | a file name in the listing contains `..` | do not use that repo |
 | very slow (< 5 MB/s) | single connection, far from the CDN | set `HF_ENDPOINT` to a nearby mirror; parallel shard downloads are a possible improvement |
 
@@ -293,11 +330,11 @@ Sub-directories inside the repo (`onnx/model.onnx`) are allowed and created with
 
 ```
 listing  = GET /api/models/{repo}/revision/{rev}?blobs=true          # names, sizes, sha256
-for each file we need (or the one shard the converter asked for):
+for each file we need (the metadata, the shards the index lists, or the one shard the converter asked for):
     if dir/name exists with the right size: skip
     have = bytes already in dir/name.incomplete; sha = hash(those bytes)
-    retry up to 5×:
-        GET /{repo}/resolve/{rev}/{name}  [Range: bytes=have-]       # follow redirects by hand; token only to the Hub
+    retry up to 5× (network errors, stalls, 429, 5xx; not other 4xx):
+        GET /{repo}/resolve/{rev}/{name}  [Range: bytes=have-]       # follow redirects by hand; token only to the Hub, over https
         append the stream to dir/name.incomplete, hashing as we go
     check size == listing.size and sha == listing.sha256
     rename dir/name.incomplete → dir/name                             # atomic: a final name means "complete and verified"
