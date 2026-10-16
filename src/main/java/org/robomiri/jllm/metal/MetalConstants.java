@@ -28,7 +28,9 @@ public final class MetalConstants {
     public static final int ATT_THREADS = 256;
     /** Tokens per attention dispatch: the scores scratch holds one row of ctx floats per (tile token, head). */
     public static final int ATT_TILE = 32;
-    /** mla_kv_store / mamba_conv / mamba_scan threadgroup. */
+    /** Widest absorbed MLA query / latent cache row in units of 32 lanes ({@code kv_lora_rank + rope <= 576}). */
+    public static final int MLA_MAX_PER = 18;
+    /** mla_lat_store / mamba_conv / mamba_scan threadgroup. */
     public static final int CHANNEL_THREADS = 64;
     /** Experts the router kernels can hold in threadgroup memory. */
     public static final int MAX_EXPERTS = 1024;
@@ -58,6 +60,7 @@ public final class MetalConstants {
         m.put("ROW_THREADS", (double) ROW_THREADS);
         m.put("ATT_THREADS", (double) ATT_THREADS);
         m.put("ATT_TILE", (double) ATT_TILE);
+        m.put("MLA_MAX_PER", (double) MLA_MAX_PER);
         m.put("CHANNEL_THREADS", (double) CHANNEL_THREADS);
         m.put("MAX_EXPERTS", (double) MAX_EXPERTS);
         m.put("MAX_GROUPS", (double) MAX_GROUPS);

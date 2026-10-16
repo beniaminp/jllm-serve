@@ -2,6 +2,7 @@ package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.DeepSeekConfig;
 import org.robomiri.jllm.model.InterleavedRope;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.MlaWeights;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
@@ -13,16 +14,25 @@ import java.util.Arrays;
  * DeepSeek Multi-head Latent Attention on the CPU, called by {@link CpuBackend} in place of the q/k/v projections
  * and the attention of a standard layer (the {@code o_proj} stays with the caller).
  *
- * <p>Per token: the query is {@code q_proj(x)} or {@code q_b(norm(q_a(x)))}; the key/value latent is
- * {@code norm(kv_a(x))} expanded by {@code kv_b} into per-head {@code k_nope} and {@code v}; one rotary key
- * {@code k_pe = kPe(x)} is shared by all heads. The rotary parts of q and k_pe are rotated (pairs
- * {@code (2i, 2i+1)}, see {@link Rope#deepseek}); key = {@code [k_nope, k_pe]}, query = {@code [q_nope, q_pe]}.
+ * <p>Per token: the query is {@code q_proj(x)} or {@code q_b(norm(q_a(x)))}, per head {@code [q_nope | q_pe]}; the
+ * key/value latent is {@code c = norm(kv_a(x))} ({@code kvLora} wide); one rotary key {@code k_pe = kPe(x)} is
+ * shared by all heads. The rotary parts of q and k_pe are rotated (pairs {@code (2i, 2i+1)}, see
+ * {@link Rope#deepseek}). In the paper's form every head expands {@code c} through {@code kv_b} into
+ * {@code k_nope_h = W_kb_k[h] c} and {@code v_h = W_kb_v[h] c}; the engine uses the <b>absorbed</b> form instead,
+ * which is the same arithmetic in a different order:
+ * <pre>
+ *   score_h(s) = q_nope_h . (W_kb_k[h] c_s) + q_pe_h . k_pe_s = (W_kb_k[h]^T q_nope_h) . c_s + q_pe_h . k_pe_s
+ *   out_h      = sum_s w_s (W_kb_v[h] c_s) = W_kb_v[h] (sum_s w_s c_s)
+ * </pre>
+ * So the query of head h becomes {@code q_abs_h = [W_kb_k[h]^T q_nope_h | rope(q_pe_h)]} ({@code kvLora + rope}
+ * wide), the key of every position is the one row {@code [c_s | rope(k_pe_s)]} shared by all heads, the value is
+ * its first {@code kvLora} entries, and one small per-head matmul with {@code W_kb_v[h]} follows the softmax.
  *
- * <p>The cache holds the expanded per-head keys ({@code heads * (nope+rope)} floats) and values
- * ({@code heads * v}) in f32 - simple, but much larger than the compressed latent MLA is designed for
- * (DeepSeek-V2-Lite: 5120 floats = 20 KB per token and layer, 553 KB per token over 27 layers). The norms run
- * parallel over tokens, the rotation and cache scatter parallel over (token, head), the attention per
- * (token, head) with the heaviest tokens handed out first.
+ * <p>The cache therefore holds one row of {@code kvLora + rope} numbers per token and layer (f32, or f16 with
+ * {@code backend.kv-dtype=f16}: stored as half, expanded to f32 per row before the SIMD kernels read it): 576
+ * floats = 2.3 KB for DeepSeek-V2-Lite instead of the 20 KB of the expanded per-head keys and values. Attention
+ * is tiled like {@link KvCache}: each task owns a tile of tokens and a range of heads and reads every cached row
+ * once for all of them (the row is shared by the heads, so this is multi-query attention with one kv head).
  */
 final class MlaCpu {
 
@@ -31,33 +41,63 @@ final class MlaCpu {
     private final Rope rope;
     private final int heads;
     private final int qk;
-    private final int kStride;
-    private final int vStride;
+    /** Absorbed query / cached row width: kvLora + rope. */
+    private final int aw;
+    private final int qaStride;
+    private final int oStride;
 
-    private final float[][] key;
-    private final float[][] val;
-    private final float[] qa;
+    /** The latent cache, one of the two: rows of {@code aw} per token. */
+    private final float[][] cache32;
+    private final short[][] cache16;
+    /** Per layer {@code W_kb_k[h]^T} as [heads][kvLora][nope] and {@code W_kb_v[h]} as [heads][v][kvLora], f32. */
+    private final float[][] wkT;
+    private final float[][] wv;
+    private final float[] qLora;
     private final float[] lat;
     private final float[] kpe;
-    private final float[] kvb;
+    private final float[] qAbs;
+    /** Tokens per attention tile, as in {@link KvCache}: tile * heads * ctx score floats stay within 32 K. */
+    private final int tile;
+    /** Per thread: [tile * heads * ctx scores][aw expanded row][tile * heads * kvLora latent sums][tile * heads 1/sum]. */
+    private final ThreadLocal<float[]> scratch;
+    private final int rowOff;
+    private final int latOff;
+    private final int invOff;
 
-    MlaCpu(CpuBackend b, ModelConfig c, Rope rope, int ctx, int maxBatch) {
+    MlaCpu(CpuBackend b, ModelWeights w, Rope rope, int ctx, int maxBatch, KvDtype kvDtype) {
+        ModelConfig c = w.cfg;
         this.b = b;
         this.d = c.deepseek();
         this.rope = rope;
         heads = c.heads();
         qk = d.qkDim();
-        kStride = heads * qk;
-        vStride = heads * d.vHeadDim();
-        if ((long) ctx * kStride > Integer.MAX_VALUE - 16) {
+        int kvl = d.kvLoraRank();
+        aw = kvl + d.qkRopeDim();
+        qaStride = heads * aw;
+        oStride = heads * d.vHeadDim();
+        if ((long) ctx * aw > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("context " + ctx + " is too large for the CPU MLA cache");
         }
-        key = new float[c.layers()][ctx * kStride];
-        val = new float[c.layers()][ctx * vStride];
-        qa = new float[maxBatch * Math.max(d.qLoraRank(), 1)];
-        lat = new float[maxBatch * d.kvLoraRank()];
+        int layers = c.layers();
+        cache32 = kvDtype == KvDtype.F32 ? new float[layers][ctx * aw] : null;
+        cache16 = kvDtype == KvDtype.F16 ? new short[layers][ctx * aw] : null;
+        wkT = new float[layers][];
+        wv = new float[layers][];
+        for (int l = 0; l < layers; l++) {
+            MlaWeights m = w.layers[l].mla;
+            wkT[l] = m.kvBKeys(d, heads, true);
+            wv[l] = m.kvBValues(d, heads, false);
+        }
+        qLora = new float[maxBatch * Math.max(d.qLoraRank(), 1)];
+        lat = new float[maxBatch * kvl];
         kpe = new float[maxBatch * d.qkRopeDim()];
-        kvb = new float[maxBatch * heads * (d.qkNopeDim() + d.vHeadDim())];
+        qAbs = new float[maxBatch * qaStride];
+        tile = Math.max(1, Math.min(8, 32768 / (heads * ctx)));
+        rowOff = tile * heads * ctx;
+        latOff = rowOff + aw;
+        invOff = latOff + tile * heads * kvl;
+        int len = invOff + tile * heads;
+        scratch = ThreadLocal.withInitial(() -> new float[len]);
     }
 
     /** Reads {@code b.xb} (normalized hidden states) and writes the attention output {@code [n, heads*v]} to {@code b.att}. */
@@ -65,71 +105,141 @@ final class MlaCpu {
         MlaWeights m = L.mla;
         int nope = d.qkNopeDim();
         int rd = d.qkRopeDim();
-        int vd = d.vHeadDim();
         int kvl = d.kvLoraRank();
         if (m.qProj != null) {
             b.matmul(m.qProj, b.xb, b.q, 0, n, false);
         } else {
             int ql = d.qLoraRank();
-            b.matmul(m.qA, b.xb, qa, 0, n, false);
-            b.rmsnorm(qa, qa, m.qALayernorm, n, ql);
-            b.matmul(m.qB, qa, b.q, 0, n, false);
+            b.matmul(m.qA, b.xb, qLora, 0, n, false);
+            b.rmsnorm(qLora, qLora, m.qALayernorm, n, ql);
+            b.matmul(m.qB, qLora, b.q, 0, n, false);
         }
         b.matmul(m.kvA, b.xb, lat, 0, n, false);
         b.matmul(m.kPe, b.xb, kpe, 0, n, false);
         b.rmsnorm(lat, lat, m.kvALayernorm, n, kvl);
-        b.matmul(m.kvB, lat, kvb, 0, n, false);
 
         int half = rd / 2;
-        int kvbStride = heads * (nope + vd);
-        float[] kc = key[l];
-        float[] vc = val[l];
+        int qStride = heads * qk;
         float[] cos = rope.cos;
         float[] sin = rope.sin;
         float[] q = b.q;
-        // per (token, head): rotate q_pe in place; assemble the cached key [k_nope, k_pe] (the shared k_pe is
-        // copied unrotated and rotated in its slot, so no head waits for another) and copy v
-        b.pool.forRange(n * heads, 4, (i0, i1) -> {
+        float[] wk = wkT[l];
+        // per (token, head): rotate q_pe in place and absorb W_kb_k into q_nope; the head-0 task of each token also
+        // rotates the shared k_pe and stores the cache row [c | k_pe] (no other task touches that token's row)
+        b.pool.forRange(n * heads, 1, (i0, i1) -> {
             for (int i = i0; i < i1; i++) {
                 int t = i / heads;
                 int h = i - t * heads;
                 int ro = (pos + t) * half;
-                InterleavedRope.rotate(q, t * kStride + h * qk + nope, rd, cos, sin, ro);
-                int src = t * kvbStride + h * (nope + vd);
-                int kd = (pos + t) * kStride + h * qk;
-                System.arraycopy(kvb, src, kc, kd, nope);
-                System.arraycopy(kpe, t * rd, kc, kd + nope, rd);
-                InterleavedRope.rotate(kc, kd + nope, rd, cos, sin, ro);
-                System.arraycopy(kvb, src + nope, vc, (pos + t) * vStride + h * vd, vd);
+                int qo = t * qStride + h * qk;
+                InterleavedRope.rotate(q, qo + nope, rd, cos, sin, ro);
+                int ao = t * qaStride + h * aw;
+                int wo = h * kvl * nope;
+                for (int j = 0; j < kvl; j++) {
+                    qAbs[ao + j] = VectorKernels.dot(q, qo, wk, wo + j * nope, nope);
+                }
+                System.arraycopy(q, qo + nope, qAbs, ao + kvl, rd);
+                if (h == 0) {
+                    InterleavedRope.rotate(kpe, t * rd, rd, cos, sin, ro);
+                    store(l, pos + t, t);
+                }
             }
         });
         attend(l, n, pos);
     }
 
+    /** Cache row {@code s} of layer {@code l} = [lat[t] | kpe[t]]. */
+    private void store(int l, int s, int t) {
+        int kvl = d.kvLoraRank();
+        int rd = d.qkRopeDim();
+        if (cache32 != null) {
+            float[] kc = cache32[l];
+            System.arraycopy(lat, t * kvl, kc, s * aw, kvl);
+            System.arraycopy(kpe, t * rd, kc, s * aw + kvl, rd);
+        } else {
+            short[] kc = cache16[l];
+            KvCache.F16.toHalf(lat, t * kvl, kc, s * aw, kvl);
+            KvCache.F16.toHalf(kpe, t * rd, kc, s * aw + kvl, rd);
+        }
+    }
+
+    /**
+     * One task per (token tile, head range): scores of every (token, head) of the task against each cached row
+     * (read in place for f32, expanded once per task for f16), softmax, the weighted latent sum, then
+     * {@code W_kb_v[h]} on it. Later tiles see more keys and are handed out first; a short chunk (decode) splits
+     * the heads instead so that every thread has work.
+     */
     private void attend(int l, int n, int pos) {
-        float[] kc = key[l];
-        float[] vc = val[l];
-        float[] q = b.q;
-        float[] att = b.att;
+        int kvl = d.kvLoraRank();
         int vd = d.vHeadDim();
         float scale = (float) d.softmaxScale();
-        // one (token, head) per task, last tokens (most keys) first: a fine grain keeps the tail short
-        b.pool.forRangeFine(n * heads, 1, (i0, i1) -> {
-            float[] sc = b.scratch.get();
+        int ctx = cache32 != null ? cache32[l].length / aw : cache16[l].length / aw;
+        int tiles = (n + tile - 1) / tile;
+        int chunks = Math.min(heads, Math.max(1, (2 * b.pool.threads() + tiles - 1) / tiles)); // head ranges per tile
+        int hpc = (heads + chunks - 1) / chunks;                                              // heads per range
+        chunks = (heads + hpc - 1) / hpc;
+        float[] rows32 = cache32 != null ? cache32[l] : null;
+        short[] rows16 = cache16 != null ? cache16[l] : null;
+        float[] wvl = wv[l];
+        float[] att = b.att;
+        int hc = chunks;
+        b.pool.forRangeFine(tiles * hc, 1, (i0, i1) -> {
+            float[] sc = scratch.get();
+            float[] rows = rows32 != null ? rows32 : sc;
             for (int i = i0; i < i1; i++) {
-                int t = n - 1 - i / heads;
-                int h = i % heads;
-                int qo = t * kStride + h * qk;
-                int ko = h * qk;
-                int ao = t * vStride + h * vd;
-                int len = pos + t + 1;
-                for (int s = 0; s < len; s++) {
-                    sc[s] = VectorKernels.dot(q, qo, kc, s * kStride + ko, qk) * scale;
+                int h0 = (i % hc) * hpc;
+                int h1 = Math.min(heads, h0 + hpc);
+                int t0 = (tiles - 1 - i / hc) * tile;
+                int t1 = Math.min(n, t0 + tile);
+                int sMax = pos + t1;
+                for (int s = 0; s < sMax; s++) {
+                    int so;
+                    if (rows32 != null) {
+                        so = s * aw;
+                    } else {
+                        KvCache.F16.toFloat(rows16, s * aw, sc, rowOff, aw);
+                        so = rowOff;
+                    }
+                    for (int t = Math.max(t0, s - pos); t < t1; t++) { // tokens that see position s
+                        int row = (t - t0) * hpc;
+                        for (int h = h0; h < h1; h++) {
+                            sc[(row + h - h0) * ctx + s] = VectorKernels.dot(qAbs, t * qaStride + h * aw, rows, so, aw) * scale;
+                        }
+                    }
                 }
-                float inv = 1f / KvCache.softmax(sc, 0, len, 0f);
-                Arrays.fill(att, ao, ao + vd, 0f);
-                for (int s = 0; s < len; s++) {
-                    VectorKernels.axpy(sc[s] * inv, vc, s * vStride + h * vd, att, ao, vd);
+                for (int t = t0; t < t1; t++) {
+                    int len = pos + t + 1;
+                    for (int h = h0; h < h1; h++) {
+                        int row = (t - t0) * hpc + h - h0;
+                        sc[invOff + row] = 1f / KvCache.softmax(sc, row * ctx, len, 0f);
+                        Arrays.fill(sc, latOff + row * kvl, latOff + (row + 1) * kvl, 0f);
+                    }
+                }
+                for (int s = 0; s < sMax; s++) {
+                    int so;
+                    if (rows32 != null) {
+                        so = s * aw;
+                    } else {
+                        KvCache.F16.toFloat(rows16, s * aw, sc, rowOff, kvl);
+                        so = rowOff;
+                    }
+                    for (int t = Math.max(t0, s - pos); t < t1; t++) {
+                        int row = (t - t0) * hpc;
+                        for (int h = h0; h < h1; h++) {
+                            int r = row + h - h0;
+                            VectorKernels.axpy(sc[r * ctx + s] * sc[invOff + r], rows, so, sc, latOff + r * kvl, kvl);
+                        }
+                    }
+                }
+                for (int t = t0; t < t1; t++) {
+                    for (int h = h0; h < h1; h++) {
+                        int lo = latOff + ((t - t0) * hpc + h - h0) * kvl;
+                        int ao = t * oStride + h * vd;
+                        int wo = h * vd * kvl;
+                        for (int j = 0; j < vd; j++) {
+                            att[ao + j] = VectorKernels.dot(wvl, wo + j * kvl, sc, lo, kvl);
+                        }
+                    }
                 }
             }
         });

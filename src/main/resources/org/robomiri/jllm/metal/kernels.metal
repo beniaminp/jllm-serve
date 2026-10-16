@@ -3,7 +3,7 @@
 // Parameter structs contain only 32-bit ints/floats so the Java side writes them field by field (KernelParams
 // lists the layouts, MetalParamsTest checks them against the structs below). Sections:
 //   0. constants   1. common (reductions, block formats)   2. matmul   3. norm + rope   4. attention
-//   5. mixture of experts   6. state space (Mamba)   7. elementwise (DeepSeek MLA cache store)
+//   5. mixture of experts   6. state space (Mamba)   7. DeepSeek MLA (latent cache store, query absorption)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -28,7 +28,8 @@ using namespace metal;
 #define ATT_SIMDGROUPS 8
 #define ATT_TILE 32             // tokens per attention dispatch (scores scratch rows per head)
 #define MAX_PER 8               // widest head in units of 32 lanes (headDim <= 256)
-#define CHANNEL_THREADS 64      // mla_kv_store / mamba_conv / mamba_scan threadgroup
+#define MLA_MAX_PER 18          // widest absorbed MLA query / cache row in units of 32 lanes (kv_lora_rank + rope <= 576)
+#define CHANNEL_THREADS 64      // mla_lat_store / mamba_conv / mamba_scan threadgroup
 #define MAX_EXPERTS 1024        // router logits held in threadgroup memory
 #define MAX_GROUPS 64           // DeepSeek expert groups
 #define FLASH_MAX_SPLITS 64     // partials attention_combine can merge
@@ -892,7 +893,9 @@ template [[host_name("rope_il_h")]] kernel decltype(rope<half, true>) rope<half,
 //   G           query heads of one KV head per threadgroup (grid (nHeads / G, tile)); G > 1 shares each K/V row
 //               across the group and is opt-in (-Djllm.metal.attnGroup, JLLM_ATTN_GROUPS)
 //   PERK, PERV  key / value head width in units of 32 (compile-time), or 0 for the widths in the params:
-//               used for head dims other than 64 / 128 / 256 and for DeepSeek MLA (qkDim = nope + rope, vDim)
+//               used for head dims other than 64 / 128 / 256 and for DeepSeek MLA (qkDim = kv_lora_rank + rope,
+//               vDim = kv_lora_rank; the value is the leading part of the key row, see section 7)
+//   MAXP        bound of the runtime widths in units of 32 (MAX_PER; MLA_MAX_PER for the attention_mla pair)
 // Tokens are dispatched in tiles so the scores scratch only needs tile * nHeads * ctx floats (indexed by the
 // tile-local token tgp.y), and the scores live in device memory so the context is not limited by threadgroup
 // memory. Each lane owns dims lane, lane + 32, ... of q, k and v. Per head every value is produced the same
@@ -916,7 +919,7 @@ struct AttnParams {
     float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
 };
 
-template <typename KV, int G, int PERK, int PERV>
+template <typename KV, int G, int PERK, int PERV, int MAXP = MAX_PER>
 kernel void attention_t(device const float *q [[buffer(0)]],
                         device const KV *kc [[buffer(1)]],
                         device const KV *vc [[buffer(2)]],
@@ -929,10 +932,10 @@ kernel void attention_t(device const float *q [[buffer(0)]],
                         ushort sg [[simdgroup_index_in_threadgroup]],
                         ushort lane [[thread_index_in_simdgroup]],
                         ushort nsg [[simdgroups_per_threadgroup]]) {
-    constexpr int MK = PERK > 0 ? PERK : MAX_PER;    // loop bounds
-    constexpr int MV = PERV > 0 ? PERV : MAX_PER;
+    constexpr int MK = PERK > 0 ? PERK : MAXP;       // loop bounds
+    constexpr int MV = PERV > 0 ? PERV : MAXP;
     threadgroup float red[G * ATT_SIMDGROUPS];  // per-head cross-simdgroup reduction slots
-    threadgroup float part[ATT_SIMDGROUPS][ATT_THREADS];
+    threadgroup float part[ATT_SIMDGROUPS][MAXP * 32]; // = ATT_THREADS for MAX_PER
     const ushort tid = tid2.x;
     const ushort tpg = tpg2.x;
     const int perK = PERK > 0 ? PERK : p.qkDim / 32;
@@ -1031,11 +1034,14 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     }
 }
 
-// attention / attention_h: runtime widths (head dims other than 64 / 128 / 256, DeepSeek MLA);
+// attention / attention_h: runtime widths (head dims other than 64 / 128 / 256);
+// attention_mla / attention_mla_h: runtime widths up to MLA_MAX_PER * 32 (DeepSeek's absorbed queries);
 // attention_g{G}_d{headDim}[_h]: compile-time widths, G query heads per threadgroup.
 #define ATTN_INST(KV, G, PER, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_t<KV, G, PER, PER>) attention_t<KV, G, PER, PER>;
 ATTN_INST(float, 1, 0, "attention")           ATTN_INST(half, 1, 0, "attention_h")
+template [[host_name("attention_mla")]] kernel decltype(attention_t<float, 1, 0, 0, MLA_MAX_PER>) attention_t<float, 1, 0, 0, MLA_MAX_PER>;
+template [[host_name("attention_mla_h")]] kernel decltype(attention_t<half, 1, 0, 0, MLA_MAX_PER>) attention_t<half, 1, 0, 0, MLA_MAX_PER>;
 ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(half, 1, 2, "attention_g1_d64_h")
 ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(half, 1, 4, "attention_g1_d128_h")
 ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(half, 1, 8, "attention_g1_d256_h")
@@ -1573,29 +1579,53 @@ kernel void mamba_scan(device const float *xc [[buffer(0)]],
     for (int n = 0; n < N; n++) st[n] = s[n];
 }
 
-// ---------------------------------------------------------------------------------------------- 7. elementwise: DeepSeek MLA cache store
-// Multi-head latent attention (DeepSeek-V2/V3). Projections, norms and the output projection use the generic
-// matmul / rmsnorm kernels; only what is specific to MLA is below. Keys and queries are qk = nope + rope wide, values
-// are vDim wide (not equal), so the cache has separate row strides for K and V.
+// ---------------------------------------------------------------------------------------------- 7. DeepSeek MLA
+// Multi-head latent attention (DeepSeek-V2/V3) in the absorbed form (see MlaCpu for the derivation): the cache
+// holds one row [c | k_pe] per token (c = normalised kv_a latent, kvLora wide; k_pe = the rotated shared rotary
+// key, rope wide), the two halves of kv_b_proj never expand it. Per head the query becomes
+//   q_abs = [W_kb_k[h]^T q_nope | rope(q_pe)]           (kvLora + rope wide, mla_absorb_q)
+// so the generic attention kernel (attention_mla[_h]: qkDim = kvLora + rope, vDim = kvLora, one kv head shared by
+// all query heads, the value = the leading kvLora of the key row) produces o = sum_s w_s c_s per head, and
+//   out = W_kb_v[h] o                                    (vDim wide, mla_apply_v)
+// finishes it. Projections, norms and o_proj use the generic matmul / rmsnorm kernels. W_kb_k / W_kb_v are the
+// per-head key / value rows of kv_b_proj, dequantised to f32 at load; both are read with the lane index on the
+// contiguous axis: wk is [heads][nope][kvLora], wv is [heads][kvLora][vDim].
 
-// mla_kv_store: assembles key = [k_nope | k_pe] and value for every head of every token from the kv_b output
-// ([ntok, heads * (nope + vDim)], per head nope key values then vDim values) and the rotated k_pe ([ntok, rope]).
-// kc / vc are bound at the row of the first token. Grid: (heads, ntok), 64 threads.
-
-struct MlaStoreParams {
+struct MlaParams {
     int nope;
     int rope;
+    int kvLora;
     int vDim;
-    int kvbStride;
-    int kStride;
-    int vStride;
+    int heads;
 };
 
-kernel void mla_kv_store(device const float *kvb [[buffer(0)]],
-                         device const float *kpe [[buffer(1)]],
-                         device float *kc [[buffer(2)]],
-                         device float *vc [[buffer(3)]],
-                         constant MlaStoreParams &p [[buffer(4)]],
+// mla_lat_store: cache row [c | k_pe] of every token of the chunk; `cache` is bound at the row of the first
+// token (f32, or half for backend.kv-dtype=f16). Grid: (ntok), CHANNEL_THREADS.
+template <typename KV>
+kernel void mla_lat_store_t(device const float *lat [[buffer(0)]],
+                            device const float *kpe [[buffer(1)]],
+                            device KV *cache [[buffer(2)]],
+                            constant MlaParams &p [[buffer(3)]],
+                            uint2 tgp [[threadgroup_position_in_grid]],
+                            ushort2 tid2 [[thread_position_in_threadgroup]],
+                            ushort2 tpg2 [[threads_per_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int t = int(tgp.x);
+    device KV *row = cache + (ulong)t * (p.kvLora + p.rope);
+    for (int i = tid; i < p.kvLora; i += tpg) row[i] = KV(lat[(ulong)t * p.kvLora + i]);
+    for (int i = tid; i < p.rope; i += tpg) row[p.kvLora + i] = KV(kpe[(ulong)t * p.rope + i]);
+}
+template [[host_name("mla_lat_store")]] kernel decltype(mla_lat_store_t<float>) mla_lat_store_t<float>;
+template [[host_name("mla_lat_store_h")]] kernel decltype(mla_lat_store_t<half>) mla_lat_store_t<half>;
+
+// mla_absorb_q: qa[t, h] = [W_kb_k[h]^T q_nope[t, h] | q_pe[t, h]] from q ([ntok, heads * (nope + rope)], q_pe
+// already rotated in place) and wk ([heads][nope][kvLora]). One thread per output j, the nope-long sum reads
+// wk[h][i][j] coalesced across the threadgroup. Grid: (heads, ntok), ROW_THREADS.
+kernel void mla_absorb_q(device const float *q [[buffer(0)]],
+                         device const float *wk [[buffer(1)]],
+                         device float *qa [[buffer(2)]],
+                         constant MlaParams &p [[buffer(3)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort2 tid2 [[thread_position_in_threadgroup]],
                          ushort2 tpg2 [[threads_per_threadgroup]]) {
@@ -1603,11 +1633,39 @@ kernel void mla_kv_store(device const float *kvb [[buffer(0)]],
     const ushort tpg = tpg2.x;
     const int h = int(tgp.x);
     const int t = int(tgp.y);
-    device const float *src = kvb + (ulong)t * p.kvbStride + (ulong)h * (p.nope + p.vDim);
-    device float *kd = kc + (ulong)t * p.kStride + (ulong)h * (p.nope + p.rope);
-    device float *vd = vc + (ulong)t * p.vStride + (ulong)h * p.vDim;
-    for (int i = tid; i < p.nope; i += tpg) kd[i] = src[i];
-    for (int i = tid; i < p.rope; i += tpg) kd[p.nope + i] = kpe[(ulong)t * p.rope + i];
-    for (int i = tid; i < p.vDim; i += tpg) vd[i] = src[p.nope + i];
+    const int qk = p.nope + p.rope;
+    const int aw = p.kvLora + p.rope;
+    device const float *qh = q + ((ulong)t * p.heads + h) * qk;
+    device const float *w = wk + (ulong)h * p.nope * p.kvLora;
+    device float *out = qa + ((ulong)t * p.heads + h) * aw;
+    for (int j = tid; j < p.kvLora; j += tpg) {
+        float acc = 0.0f;
+        for (int i = 0; i < p.nope; i++) acc += qh[i] * w[(ulong)i * p.kvLora + j];
+        out[j] = acc;
+    }
+    for (int i = tid; i < p.rope; i += tpg) out[p.kvLora + i] = qh[p.nope + i];
+}
+
+// mla_apply_v: att[t, h] = W_kb_v[h] o[t, h] from the attention output o ([ntok, heads * kvLora]) and wv
+// ([heads][kvLora][vDim]); one thread per output i, wv[h][j][i] coalesced. Grid: (heads, ntok), ROW_THREADS.
+kernel void mla_apply_v(device const float *o [[buffer(0)]],
+                        device const float *wv [[buffer(1)]],
+                        device float *att [[buffer(2)]],
+                        constant MlaParams &p [[buffer(3)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort2 tid2 [[thread_position_in_threadgroup]],
+                        ushort2 tpg2 [[threads_per_threadgroup]]) {
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int h = int(tgp.x);
+    const int t = int(tgp.y);
+    device const float *oh = o + ((ulong)t * p.heads + h) * p.kvLora;
+    device const float *w = wv + (ulong)h * p.kvLora * p.vDim;
+    device float *out = att + ((ulong)t * p.heads + h) * p.vDim;
+    for (int i = tid; i < p.vDim; i += tpg) {
+        float acc = 0.0f;
+        for (int j = 0; j < p.kvLora; j++) acc += w[(ulong)j * p.vDim + i] * oh[j];
+        out[i] = acc;
+    }
 }
 

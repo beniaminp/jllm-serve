@@ -87,11 +87,8 @@ public final class CpuBackend implements Backend {
                     + c.maxPositions() + "); RoPE positions beyond the training length are extrapolated");
         }
         if (c.deepseek() != null) {
-            if (kvDtype != KvDtype.F32) {
-                throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
-            }
             kv = null;
-            mla = new MlaCpu(this, c, rope, ctx, maxBatch);
+            mla = new MlaCpu(this, w, rope, ctx, maxBatch, kvDtype);
         } else {
             kv = KvCache.create(kvDtype, c, ctx);
             mla = null;

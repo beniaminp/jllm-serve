@@ -137,9 +137,6 @@ public final class MetalBackend implements Backend {
     }
 
     private void init(KvDtype kvDtype) {
-        if (c.deepseek() != null && kvDtype != KvDtype.F32) {
-            throw new IllegalArgumentException("backend.kv-dtype=" + kvDtype + " is not supported for DeepSeek MLA models (use f32)");
-        }
         // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
         attnGroup = attnGroupOverride(c);
         int hd = c.headDim();
@@ -207,7 +204,7 @@ public final class MetalBackend implements Backend {
         long kvBytes = (long) ctx * c.kvDim() * kvDtype.bytes;
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
-        for (int l = 0; l < c.layers() && c.deepseek() == null; l++) { // DeepSeek: MlaMetal owns its caches
+        for (int l = 0; l < c.layers() && c.deepseek() == null; l++) { // DeepSeek: MlaMetal owns its latent cache
             keyCache[l] = k.scratch(kvBytes);
             valCache[l] = k.scratch(kvBytes);
         }
@@ -231,7 +228,7 @@ public final class MetalBackend implements Backend {
             routeWeight = null;
             moeHidden = null;
         }
-        mla = c.deepseek() != null ? new MlaMetal(this, w, ctx, maxBatch) : null;
+        mla = c.deepseek() != null ? new MlaMetal(this, w, ctx, maxBatch, kvDtype) : null;
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
