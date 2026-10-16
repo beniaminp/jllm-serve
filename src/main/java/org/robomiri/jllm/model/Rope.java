@@ -105,10 +105,11 @@ public final class Rope {
 
     /**
      * The table for layers with {@link ModelConfig#usesLocalRope local RoPE} (Gemma 3 sliding layers): base
-     * {@code rope_local_base_freq}, never scaled. Other layers use {@link #of}.
+     * {@code rope_local_base_freq}, never scaled, over the same {@link ModelConfig#rotaryDim rotated width} as
+     * {@link #of}. Other layers use {@link #of}.
      */
     public static Rope local(ModelConfig c, int ctx) {
-        return new Rope(c.headDim(), c.gemma().localRopeTheta(), ctx, null);
+        return new Rope(c.rotaryDim(), c.gemma().localRopeTheta(), ctx, null);
     }
 
     /**
