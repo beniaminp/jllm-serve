@@ -45,6 +45,8 @@ public final class ServerTest {
             basics(f);
             keepAlive(f);
             stalledStreamClient(f);
+            disconnectedClient(f, false);
+            disconnectedClient(f, true);
         }
         System.out.println("all server tests passed");
     }
@@ -117,6 +119,40 @@ public final class ServerTest {
         }
         check(closedByServer, "stalled stream client: server closed the connection");
         stalled.close();
+    }
+
+    /**
+     * M1: a client that closes its connection mid-generation is noticed by the connection probe, for a
+     * non-streaming request (nothing is written until the end) as well as a streaming one (before any write
+     * fails), and the engine stops generating within a few tokens.
+     */
+    static void disconnectedClient(Fixture f, boolean stream) throws Exception {
+        String what = (stream ? "stream" : "non-stream") + " client disconnect";
+        f.backend.delayMs = 2; // ~2 ms per token: 100k tokens would take minutes
+        try {
+            Socket s = f.connect();
+            String body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":100000,"
+                    + "\"temperature\":0,\"stream\":" + stream + "}";
+            s.getOutputStream().write(request("POST", "/v1/chat/completions", body, "Content-Type: application/json"));
+            s.getOutputStream().flush();
+            if (stream) {
+                readHeaders(s.getInputStream());
+            } else {
+                Thread.sleep(150); // let the generation start
+            }
+            int atClose = f.backend.forwards.get();
+            s.close();
+            long t0 = System.nanoTime();
+            Resp r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"next\"}],\"max_tokens\":1,\"temperature\":0}");
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            check(r.status == 200 && ms < 1500, what + ": the next request is served in " + ms + " ms");
+            int settled = f.backend.forwards.get();
+            Thread.sleep(200);
+            check(f.backend.forwards.get() == settled, what + ": generation stopped");
+            check(settled - atClose < 50, what + ": stopped within a few tokens (" + (settled - atClose) + " forwards after the close)");
+        } finally {
+            f.backend.delayMs = 0;
+        }
     }
 
     // ------------------------------------------------------------------ fixture: engine on a fake backend

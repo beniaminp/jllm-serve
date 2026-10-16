@@ -199,7 +199,7 @@ public final class ApiServer implements AutoCloseable {
         if (!stream) {
             Engine.Result r;
             try {
-                r = engine.generate(prompt, params, null, deadline);
+                r = engine.generate(prompt, params, null, () -> req.clientGone() || deadline.getAsBoolean());
             } catch (Engine.OverloadedException e) {
                 res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
                 return;
@@ -232,7 +232,7 @@ public final class ApiServer implements AutoCloseable {
                 } catch (IOException e) {
                     failure[0] = e; // client disconnected: stop generating
                 }
-            }, () -> failure[0] != null || deadline.getAsBoolean());
+            }, () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
         } catch (Engine.OverloadedException e) {
             if (res.started()) {
                 throw e;
@@ -242,6 +242,9 @@ public final class ApiServer implements AutoCloseable {
         }
         if (failure[0] != null) {
             throw failure[0];
+        }
+        if (req.clientGone()) {
+            throw new IOException("client disconnected");
         }
         startStream(res, chat, id, object, created);
         String finish = deadline.finishReason(r);

@@ -9,6 +9,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -72,6 +73,7 @@ public final class HttpServer implements AutoCloseable {
         public final byte[] body;
         /** True for an HTTP/1.0 (or version-less) request: no keep-alive, no chunked responses. */
         public final boolean http10;
+        Probe probe;
 
         Request(String method, String path, Map<String, String> headers, byte[] body, boolean http10) {
             this.method = method;
@@ -83,6 +85,82 @@ public final class HttpServer implements AutoCloseable {
 
         public String bodyText() {
             return new String(body, StandardCharsets.UTF_8);
+        }
+
+        /**
+         * Whether the client has closed the connection since the request was read (also true when it merely
+         * shut down its sending side). Polled by long-running handlers so that they stop working for nobody.
+         */
+        public boolean clientGone() {
+            return probe != null && probe.gone;
+        }
+    }
+
+    /**
+     * Watches the connection while its request is handled: a virtual thread blocks reading the socket, which
+     * returns -1 (or throws) as soon as the client closes, so a generation can be cancelled even when nothing is
+     * being written to the client (non-streaming requests), and before the first failed write for streams. A
+     * byte it reads instead is the start of the next (pipelined) request and is pushed back with mark/reset
+     * once the response is complete; after that a read timeout is the keep-alive idle timeout.
+     */
+    private static final class Probe implements Runnable {
+        private static final int PENDING = -2;
+        private static final int TIMEOUT = -3;
+
+        private final InputStream in;
+        private final Thread thread;
+        volatile boolean gone;
+        private volatile boolean responseDone;
+        private volatile int result = PENDING;
+
+        Probe(InputStream in) {
+            this.in = in;
+            this.thread = Thread.ofVirtual().name("http-probe").start(this);
+        }
+
+        @Override
+        public void run() {
+            try {
+                in.mark(1);
+                while (true) {
+                    try {
+                        int c = in.read();
+                        result = c;
+                        if (c < 0) {
+                            gone = true;
+                        }
+                        return;
+                    } catch (SocketTimeoutException e) {
+                        if (responseDone) { // nothing arrived after the response: an idle connection
+                            result = TIMEOUT;
+                            return;
+                        }
+                        // the response is still being produced: keep watching
+                    }
+                }
+            } catch (IOException e) {
+                gone = true;
+                result = -1;
+            }
+        }
+
+        /**
+         * Called once the response is complete; waits for the next request's first byte. Returns true when it
+         * arrived (and is back in the stream), false when the client is gone or the idle timeout expired.
+         */
+        boolean nextRequest() throws IOException {
+            responseDone = true;
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (result < 0) {
+                return false;
+            }
+            in.reset();
+            return true;
         }
     }
 
@@ -404,6 +482,8 @@ public final class HttpServer implements AutoCloseable {
                     return;
                 }
                 boolean keepAlive = !req.http10 && !"close".equalsIgnoreCase(req.headers.getOrDefault("connection", ""));
+                Probe probe = new Probe(in); // the body has been consumed: from here on the socket is idle inbound
+                req.probe = probe;
                 Response res = new Response(out, s, options.writeTimeoutMs(), keepAlive, options.corsOrigin(),
                         req.method.equals("HEAD"), !req.http10);
                 try {
@@ -427,7 +507,7 @@ public final class HttpServer implements AutoCloseable {
                         res.end();
                     }
                 }
-                if (!keepAlive) {
+                if (!keepAlive || !probe.nextRequest()) {
                     return;
                 }
             }

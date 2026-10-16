@@ -108,9 +108,11 @@ whatever is still pending is flushed (unless a stop string was hit).
 
 ## 10.4 Cancellation, the lock, statistics
 
-- **Cancellation.** `cancelled` is a `BooleanSupplier` polled before every token. The streaming handler flips
-  it when a write to the socket fails, so a client that closes its tab stops burning GPU time within one token.
-  (Non-streaming requests have no such signal and run to completion — a known limitation.)
+- **Cancellation.** `cancelled` is a `BooleanSupplier` polled before every token. `HttpServer` watches every
+  connection while its request is handled (a virtual thread blocks reading the socket, which returns EOF the
+  moment the client closes) and `ApiServer` ORs that flag into `cancelled` for both the streaming and the
+  non-streaming path, so a client that closes its tab stops burning GPU time within one token. A streaming
+  client that stops *reading* is cut off after `server.write-timeout-ms` (10.5).
 - **The lock.** The backend owns exactly one KV cache, so `generate` is wrapped in `synchronized (lock)`.
   Concurrent HTTP requests queue up and are served one at a time; virtual threads make the waiting cheap.
   Serving many users at once would require batching several sequences per forward pass ([11](11-performance.md)).
