@@ -37,35 +37,35 @@ public final class MambaMetalBackend implements Backend {
     private final Metal metal;
     private final Arena arena = Arena.ofShared();
 
-    private final int pMatmulQ4;
-    private final int pMatmulQ8;
-    private final int pMatmulQ2K;
-    private final int pMatmulPfQ4;
-    private final int pMatmulPfQ8;
-    private final int pMatmulPfQ2K;
-    private final int pRmsnorm;
-    private final int pConv;
-    private final int pScan;
+    private int pMatmulQ4;
+    private int pMatmulQ8;
+    private int pMatmulQ2K;
+    private int pMatmulPfQ4;
+    private int pMatmulPfQ8;
+    private int pMatmulPfQ2K;
+    private int pRmsnorm;
+    private int pConv;
+    private int pScan;
 
-    private final Metal.Buffer embedQ;
-    private final Metal.Buffer lmHeadQ;
-    private final LayerBufs[] layers;
-    private final Metal.Buffer finalNorm;
-    private final Metal.Buffer[] convState;
-    private final Metal.Buffer[] ssmState;
+    private Metal.Buffer embedQ;
+    private Metal.Buffer lmHeadQ;
+    private LayerBufs[] layers;
+    private Metal.Buffer finalNorm;
+    private Metal.Buffer[] convState;
+    private Metal.Buffer[] ssmState;
     private int statePos = 0;
 
-    private final Metal.Buffer x;
-    private final Metal.Buffer xb;
-    private final Metal.Buffer xz;
-    private final Metal.Buffer xc;
-    private final Metal.Buffer dbc;
-    private final Metal.Buffer y;
-    private final Metal.Buffer logitsBuf;
+    private Metal.Buffer x;
+    private Metal.Buffer xb;
+    private Metal.Buffer xz;
+    private Metal.Buffer xc;
+    private Metal.Buffer dbc;
+    private Metal.Buffer y;
+    private Metal.Buffer logitsBuf;
 
-    private final MemorySegment bufArgs;
-    private final MemorySegment offArgs;
-    private final MemorySegment params;
+    private MemorySegment bufArgs;
+    private MemorySegment offArgs;
+    private MemorySegment params;
 
     private static final class LayerBufs {
         Metal.Buffer norm;
@@ -93,6 +93,20 @@ public final class MambaMetalBackend implements Backend {
             throw new IllegalArgumentException("Metal Mamba scan supports state_size <= 64, got " + m.dState());
         }
         this.metal = Metal.create(metalLib);
+        try { // owns metal from here on: closed again if anything below throws
+            init();
+        } catch (RuntimeException | Error e) {
+            try {
+                metal.close();
+            } catch (RuntimeException | Error suppressed) {
+                e.addSuppressed(suppressed);
+            }
+            arena.close();
+            throw e;
+        }
+    }
+
+    private void init() {
         pMatmulQ4 = metal.pipeline("matmul_q4");
         pMatmulQ8 = metal.pipeline("matmul_q8");
         pMatmulQ2K = metal.pipeline("matmul_q2k");
