@@ -5,6 +5,7 @@ import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
+import org.robomiri.jllm.model.Ggml;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 
@@ -134,10 +135,58 @@ public final class Int8Kernels {
      * block scales are {@code xs[xo/32 ..]}. {@code xo} must be a multiple of 32.
      */
     public static float dotRow(QTensor w, int r, short[] xq, float[] xs, int xo) {
+        if (w.second != null) {
+            return dotRow(w.partOf(r), w.partRow(r), xq, xs, xo);
+        }
         if (!SUPPORTED) {
             return dotRowScalar(w, r, xq, xs, xo);
         }
-        return w.type == QType.Q4_0 ? dotRowQ4xQ8(w, r, xq, xs, xo) : dotRowQ8xQ8(w, r, xq, xs, xo);
+        return switch (w.type) {
+            case Q4_0 -> dotRowQ4xQ8(w, r, xq, xs, xo);
+            case Q4_0G -> dotRowQ4GxQ8(w, r, xq, xs, xo);
+            case Q8_0G -> dotRowQ8GxQ8(w, r, xq, xs, xo);
+            default -> dotRowQ8xQ8(w, r, xq, xs, xo);
+        };
+    }
+
+    /**
+     * {@link #dotRowQ4xQ8} for ggml's Q4_0 layout: 18-byte blocks, f16 scale first, then the same 16 nibble bytes
+     * (so {@link #blockQ4} applies unchanged, loaded from byte 2 of the block).
+     */
+    public static float dotRowQ4GxQ8(QTensor w, int r, short[] xq, float[] xs, int xo) {
+        MemorySegment seg = w.data;
+        long q = w.rowOffset(r);
+        int nb = w.blocksPerRow();
+        int sb = xo / QType.BLOCK;
+        FloatVector acc = FloatVector.zero(F4);
+        FloatVector magic = FloatVector.broadcast(F4, MAGIC);
+        for (int b = 0; b < nb; b++, q += Ggml.Q4_0_BYTES) {
+            IntVector isum = blockQ4(ShortVector.fromMemorySegment(S8, seg, q + 2, LE), xq, xo + b * QType.BLOCK);
+            float scale = Ggml.f16(seg, q) * xs[sb + b];
+            acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
+        }
+        return acc.reduceLanes(VectorOperators.ADD);
+    }
+
+    /** {@link #dotRowQ8xQ8} for ggml's Q8_0 layout: 34-byte blocks, f16 scale then 32 int8, 16-byte halves at byte 2 and 18. */
+    public static float dotRowQ8GxQ8(QTensor w, int r, short[] xq, float[] xs, int xo) {
+        MemorySegment seg = w.data;
+        long q = w.rowOffset(r);
+        int ng = w.blocksPerRow() * 2;
+        int sb = xo / QType.BLOCK;
+        FloatVector acc = FloatVector.zero(F4);
+        FloatVector magic = FloatVector.broadcast(F4, MAGIC);
+        for (int g = 0; g < ng; g++) {
+            long blk = q + (long) (g >> 1) * Ggml.Q8_0_BYTES;
+            ShortVector v = ShortVector.fromMemorySegment(S8, seg, blk + 2 + (g & 1) * 16, LE);
+            int xb = xo + g * 16;
+            ShortVector p = v.lanewise(VectorOperators.LSHL, 8).lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, xb))
+                    .add(v.lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, xb + 8)));
+            IntVector isum = widenSum(p);
+            float scale = Ggml.f16(seg, blk) * xs[sb + (g >> 1)];
+            acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
+        }
+        return acc.reduceLanes(VectorOperators.ADD);
     }
 
     /**
@@ -220,15 +269,15 @@ public final class Int8Kernels {
         MemorySegment seg = w.data;
         int qb = xo + b * QType.BLOCK;
         int sum = 0;
-        if (w.type == QType.Q4_0) {
-            long base = w.rowOffset(r) + (long) b * 16;
+        if (w.type == QType.Q4_0 || w.type == QType.Q4_0G) {
+            long base = w.type == QType.Q4_0G ? w.rowOffset(r) + (long) b * Ggml.Q4_0_BYTES + 2 : w.rowOffset(r) + (long) b * 16;
             for (int j = 0; j < 16; j++) {
                 int v = seg.get(ValueLayout.JAVA_BYTE, base + j) & 0xFF;
                 sum += ((v & 0xF) - 8) * xq[qb + permutedIndex(j)];
                 sum += ((v >>> 4) - 8) * xq[qb + permutedIndex(j + 16)];
             }
         } else {
-            long base = w.rowOffset(r) + (long) b * 32;
+            long base = w.type == QType.Q8_0G ? w.rowOffset(r) + (long) b * Ggml.Q8_0_BYTES + 2 : w.rowOffset(r) + (long) b * 32;
             for (int j = 0; j < QType.BLOCK; j++) {
                 sum += seg.get(ValueLayout.JAVA_BYTE, base + j) * xq[qb + permutedIndex(j)];
             }
@@ -242,8 +291,9 @@ public final class Int8Kernels {
         int nb = w.blocksPerRow();
         long s = w.scaleOffset(r);
         for (int b = 0; b < nb; b++) {
-            float scale = w.data.get(ValueLayout.JAVA_FLOAT, s + (long) b * 4) * xs[xo / QType.BLOCK + b];
-            acc += (double) scale * blockDotScalar(w, r, b, xq, xo);
+            float ws = w.type.gguf ? Ggml.f16(w.data, w.rowOffset(r) + (long) b * w.type.blockBytes)
+                    : w.data.get(ValueLayout.JAVA_FLOAT, s + (long) b * 4);
+            acc += (double) (ws * xs[xo / QType.BLOCK + b]) * blockDotScalar(w, r, b, xq, xo);
         }
         return (float) acc;
     }

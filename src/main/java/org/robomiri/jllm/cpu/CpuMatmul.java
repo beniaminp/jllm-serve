@@ -58,9 +58,13 @@ final class CpuMatmul {
         return int8;
     }
 
-    /** The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0); anything else stays float. */
+    /**
+     * The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0 and their ggml layouts
+     * Q4_0G, Q8_0G); every other type (Q2_K, Q4_K, Q5_K, ...) stays on the float kernels.
+     */
     boolean useInt8(QTensor wt) {
-        return int8 && (wt.type == QType.Q4_0 || wt.type == QType.Q8_0) && wt.cols % QType.BLOCK == 0;
+        return int8 && (wt.type == QType.Q4_0 || wt.type == QType.Q8_0 || wt.type == QType.Q4_0G || wt.type == QType.Q8_0G)
+                && wt.cols % QType.BLOCK == 0;
     }
 
     /** Quantizes {@code in[off .. off + n)} into the int8 scratch (grown if needed) and returns it; scales are in {@link #xs()}. */

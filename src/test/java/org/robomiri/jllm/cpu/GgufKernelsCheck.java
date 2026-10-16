@@ -140,6 +140,30 @@ public final class GgufKernelsCheck {
             float got = VectorKernels.dotRow(t, r, x, 4);
             worstDot = Math.max(worstDot, Math.abs(got - want) / (mag + 1e-6));
         }
+        if (qt == QType.Q4_0G || qt == QType.Q8_0G) {
+            // int8 activations: the SIMD integer kernel against its scalar reference and against the float product
+            short[] xq = new short[COLS];
+            float[] xs = new float[COLS / 32];
+            float[] xa = java.util.Arrays.copyOfRange(x, 4, 4 + COLS);
+            Int8Kernels.quantize(xa, 0, COLS, xq, xs);
+            double worstInt = 0;
+            double worstVsFloat = 0;
+            for (int r = 0; r < ROWS; r++) {
+                float got = Int8Kernels.dotRow(t, r, xq, xs, 0);
+                float want = Int8Kernels.dotRowScalar(t, r, xq, xs, 0);
+                double mag = 0;
+                double fl = 0;
+                for (int i = 0; i < COLS; i++) {
+                    mag += Math.abs((double) ref[r * COLS + i] * xa[i]);
+                    fl += (double) ref[r * COLS + i] * xa[i];
+                }
+                worstInt = Math.max(worstInt, Math.abs(got - want) / (mag + 1e-9));
+                worstVsFloat = Math.max(worstVsFloat, Math.abs(got - fl) / (mag + 1e-9));
+            }
+            check(worstInt < 1e-5, type + " int8-activation SIMD dot vs scalar reference: " + worstInt);
+            check(worstVsFloat < 0.02, type + " int8-activation dot vs float dot (activation rounding): " + worstVsFloat);
+            System.out.printf("%-5s int8 activations: SIMD vs scalar %.2e, vs float dot %.2e%n", type, worstInt, worstVsFloat);
+        }
         check(worstScalar < 1e-5, type + " scalar dequantizer vs gguf.quants: max rel err " + worstScalar);
         check(worstSimd < 1e-5, type + " SIMD dequantizer vs gguf.quants: max rel err " + worstSimd);
         check(worstDot < 1e-5, type + " SIMD dot vs reference: max err relative to sum|w x| " + worstDot);
