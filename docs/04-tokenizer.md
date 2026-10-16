@@ -1,6 +1,7 @@
 # 4. The tokenizer: byte-level BPE from scratch
 
-Code: `tokenizer/Tokenizer.java`, `tokenizer/ChatTemplate.java`, `tokenizer/StreamDecoder.java`
+Code: `tokenizer/Tokenizer.java`, `tokenizer/ChatTemplate.java`, `tokenizer/StreamDecoder.java`, `tokenizer/AddedTokenTrie.java`,
+`tokenizer/LongLongMap.java`, `tokenizer/Normalizers.java`, `tokenizer/PreTokenizers.java`
 
 ## 4.1 Why tokens at all?
 
@@ -162,7 +163,9 @@ Before any of the above, the text is scanned for added tokens with a **leftmost-
 (`AddedTokenTrie`: a trie over the token strings, indexed by first character, so a character that starts no
 added token costs one array read; at a candidate position the deepest terminal node wins, so `<|im_start|>` beats
 any shorter token with the same prefix). Matches map straight to their id; the text between them goes through
-stages 1–3:
+stages 1–3. An earlier version joined every added token into one regex alternation, which costs time proportional
+to the number of tokens at every position (Gemma 3 has 6 415 of them): encoding a 2 MB text took 50 s for Gemma 3
+and is now 0.24 s, with Mistral about 10 times and Llama 3 about 17 times faster.
 
 ```
 "<|im_start|>user\nhi<|im_end|>\n"
@@ -171,7 +174,9 @@ stages 1–3:
 ```
 
 `<|im_end|>` (151645) and `<|endoftext|>` (151643) are the **end-of-sequence** ids: when the model produces one,
-generation stops. `Main.eosIds` collects them from `generation_config.json` and the tokenizer.
+generation stops. `Main.eosIds` collects them from `config.json`'s `eos_token_id`, `generation_config.json` and a list of
+family stop tokens the vocabulary has (`<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`, `<|end_of_text|>`, `</s>`); the
+engine adds the chat template's own end-of-turn ids on top ([10](10-engine-and-server.md)).
 
 ## 4.8 Decoding, and the streaming problem
 
@@ -205,8 +210,10 @@ Name three planets.<|im_end|>
 ```
 
 The prompt ends right after `assistant\n`; the model writes the reply and finishes with `<|im_end|>`.
-`ChatTemplate.render(messages, addGenerationPrompt, enableThinking)` produces this string (the official version
-is a Jinja template inside `tokenizer_config.json`; ours is the same logic in Java, minus tool-calling).
+`ChatTemplate.forModelType("qwen3").render(messages, addGenerationPrompt, enableThinking)` produces this string
+(the official version is a Jinja template inside `tokenizer_config.json`; ours is the same logic in Java, minus
+tool-calling). There are no static `render` / `renderTokens` helpers any more: every family is a
+`ChatTemplate.Format` obtained from `forModelType` (section 4.11).
 
 **Thinking mode.** Qwen3 can reason before answering, wrapped in `<think> … </think>`. When thinking is
 *disabled* the template appends an empty block, `<think>\n\n</think>\n\n`, so the model sees that the thinking
@@ -221,9 +228,12 @@ consecutive ones sharing a single user turn.
 
 ## 4.10 Verifying correctness
 
-`SmokeTest` compares our ids with those produced by the reference `tokenizers` library for several strings,
+`SmokeTest` compares our ids with those produced by the reference `tokenizers` library for several Qwen strings,
 checks `decode(encode(s)) == s` on Unicode, emoji, code and whitespace-heavy samples, checks the special-token
-ids, the rendered template, and the stream decoder's handling of a split emoji. Matching ids matter: the model
+ids and the rendered Qwen3 template, that malformed `tokenizer.json` files fail with an
+`IllegalArgumentException` naming the problem, that the heap merge loop equals a verbatim copy of the old
+rescan-every-pair implementation, and the piece-cache limits. The cross-family comparison against the reference
+is `TokenizerFamiliesTest` (4.11). Matching ids matter: the model
 was trained on the reference tokenization, and a slightly different split (e.g. `" wor" "ld"`) would still
 decode to the same text but would be out-of-distribution for the model and hurt quality.
 
@@ -344,7 +354,7 @@ produces); `ChatTemplate.llama3("26 Jul 2024")` pins it, which the fixture test 
 
 ### Verification
 
-`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each of the 14 families, `encode` with the
+`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each of the 14 families (3 083 checks when all fixtures are present), `encode` with the
 ids of the Python `tokenizers` package on 150 strings (English, code, numbers, CJK/emoji/RTL,
 leading/trailing/multiple spaces, newlines, special and non-special added tokens, indented code, the empty
 string, random mixes) — both with special tokens enabled and in the content mode (`encode_special_tokens`) —
