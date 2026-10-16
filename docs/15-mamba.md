@@ -1,8 +1,9 @@
 # 15. Mamba — a model without attention
 
-Code: `model/MambaArch`, `model/MambaLayer`, `model/ModelConverter.planMamba`, `cpu/MambaCpuBackend`,
-`metal/MambaMetalBackend`, `kernels.metal` (`mamba_conv`, `mamba_scan`), `Backend.supportsPrefixReuse`,
-`engine/Engine.generateLocked`
+Code: `model/MambaArch` (an `Architecture`, see [14.12](14-model-families.md#1412-the-typed-model-architecture)) and its
+parser `model/Families.mamba`, `model/MambaLayer`, `model/ModelConverter.planMamba`, `cpu/MambaCpuBackend` (on the
+shared `cpu/CpuMatmul`), `metal/MambaMetalBackend`, `kernels.metal` section 6 (`mamba_conv`, `mamba_scan`),
+`Backend.supportsPrefixReuse`, `engine/Engine.generateLocked`
 
 Chapter 5 describes a transformer: every new token **looks back at all earlier tokens** through attention, which is
 why the engine keeps a KV cache that grows with the conversation. **Mamba** (Gu & Dao, 2023, `MambaForCausalLM`;
@@ -125,7 +126,9 @@ new state = (−1, 2, 3)      # the oldest value dropped out, 3 came in
 
 At the start of a sequence the conv state is zero, which is what padding the sequence with zeros on the left means in
 the transformers implementation (`padding = d_conv − 1`). `convStep` in `MambaCpuBackend` is this function; the
-Metal kernel `mamba_conv` is the same loop with one thread per channel.
+Metal kernel `mamba_conv` is the same loop with one thread per channel, which loads the channel's `d_conv − 1` state
+values and its `d_conv` weights into registers once, slides the window over all tokens of the chunk and writes the
+state back once at the end.
 
 ## 15.4 Shapes for mamba-130m (verified on the Hub)
 
@@ -134,6 +137,14 @@ Metal kernel `mamba_conv` is the same loop with one thread per channel.
 `vocab_size 50280`, `use_bias false`, `use_conv_bias true`, `eos_token_id 0`, `bos_token_id 0`, no
 `tie_word_embeddings` key. `mamba-2.8b-hf`: 2560 / 64 layers / `intermediate_size 5120` / `time_step_rank 160`, the
 rest identical. (The checkpoint's vocabulary is 50280, already padded, so the config and the embedding agree.)
+
+`Families.mamba` turns this into `MambaArch(core, dState, dConv, dtRank, dInner, convBias)`; the `Core` holds the width,
+layer count, vocabulary, norm epsilon and the one-line `description` that is recorded in the quantized cache. The
+defaults are those of transformers' `MambaConfig`: `state_size` 16, `conv_kernel` 4, `expand` 2 (so `intermediate_size`
+= 2·`hidden_size` when absent), `time_step_rank` `"auto"` = `ceil(hidden_size/16)`, `layer_norm_epsilon` 1e-5,
+`use_conv_bias` true, and `tie_word_embeddings` **true** when the key is missing (the released checkpoints have no
+`lm_head`). `use_bias: true`, `hidden_act` other than `silu`, `state_size` outside 1…64 and `conv_kernel` outside 1…8
+are rejected while parsing, for both backends.
 
 Tensors (read from the safetensors header: 242 tensors for 130m; 2.8b is sharded in 3 files, 642 tensors):
 
@@ -172,7 +183,8 @@ Qwen3-0.6B (28 layers × 2 × 1024 floats per token): 229 kB *per token*, i.e. 1
 `ctx` setting no longer sizes any buffer; it is only the limit the engine enforces on prompt + generated tokens
 (Mamba itself has no hard context limit, though quality drops far past the training length).
 
-`Backend.forward(tokens, off, n, pos, logits)` keeps its contract, but positions are implicit: `pos == 0` **resets**
+`Backend.forward(tokens, off, n, pos, logits)` keeps its contract (the logits of the last token; only
+`min(head rows, logits.length)` values are written, because the LM head may have padded rows), but positions are implicit: `pos == 0` **resets**
 both states to zero, any other `pos` must equal the number of tokens fed since (otherwise
 `IllegalStateException`). Splitting a prompt into chunks — 12 tokens at once, 5 + 7, or one by one — gives the same
 logits (`ArchSmoke` checks this on both backends).
@@ -184,8 +196,9 @@ prefix of consecutive prompts and recomputes only the rest. A transformer can do
 depends only on tokens `0 … k`, so rows beyond the shared prefix can simply be overwritten. A Mamba state is a *single
 summary of all the tokens so far*: it cannot be rewound to "the state after token 6" once it has absorbed token 9.
 
-So `Backend` has a capability, `supportsPrefixReuse()` (default `true`, Mamba returns `false`), and the engine
-treats it as follows:
+So `Backend` has a capability, `supportsPrefixReuse()` (default `true`; `MambaCpuBackend` and `MambaMetalBackend`
+return `false`), and `Engine.generateLocked` treats it as follows (a backend that cannot rewind keeps the common
+prefix only when it covers *all* cached tokens, otherwise `reuse` is set to 0):
 
 | Situation | KV-cache backend | Mamba backend |
 |---|---|---|
@@ -201,18 +214,21 @@ implemented. Covered by `SmokeTest.prefixReuse` with a recording backend.
 ## 15.7 The implementations
 
 **CPU (`MambaCpuBackend`)**. For a chunk of `n` tokens, per layer: RMSNorm of the `n` rows; `in_proj` as a quantized
-matmul over the chunk (same scheme as `CpuBackend.matmul`: streamed rows for decode, four dequantized rows reused for
-all tokens for prefill); `conv` — parallel over channels with `ThreadPool.forRange`, each worker loops over the `n`
+matmul over the chunk. The matmuls are the shared `CpuMatmul` of the transformer backend, so they behave identically:
+streamed rows for decode, four dequantized rows reused for all tokens for prefill, and, for a single token with
+`backend.cpu.int8-activations` on, the integer Q4_0/Q8_0 dot products against an int8-quantized activation
+([07](07-cpu-backend.md); the chunked prefill stays in float, `jllm.cpu.deterministic` feeds tokens one by one); `conv` — parallel over channels with `ThreadPool.forRange`, each worker loops over the `n`
 tokens of its channels, so the state of a channel is touched by one thread only; `x_proj` matmul; `scan` — again
 parallel over channels, sequential over tokens inside; `out_proj` matmul accumulating into the residual. The `dt_proj`
 dot product (length `dt_rank`) uses `VectorKernels.dot`. The scan's `exp` is scalar (`d_state` values per channel and
 token); `d_state` = 16 is too short to be worth vectorizing across, and the Vector API has no exp that is fast on every platform.
 
-**Metal (`MambaMetalBackend`, kernels at the end of `kernels.metal`)**. The whole chunk is one command buffer.
+**Metal (`MambaMetalBackend`, kernels in section 6 of `kernels.metal`)**. The whole chunk is one command buffer.
 Per layer: `rmsnorm`, `matmul_q4/q8` (`in_proj`), `mamba_conv`, `matmul` (`x_proj`), `mamba_scan`, `matmul` (`out_proj`,
 accumulating) — six dispatches. The projections reuse the existing batched matmul kernels unchanged. `mamba_conv`
-and `mamba_scan` use **one GPU thread per channel** that loops over the chunk's tokens itself; the SSM state of the
-channel (≤ 64 floats) is held in registers for the whole chunk and written back once. The `dt_proj` product is done
+and `mamba_scan` use **one GPU thread per channel** (64-thread threadgroups) that loops over the chunk's tokens
+itself; the conv window and weights (≤ 8 taps, `MAMBA_MAX_CONV`) and the SSM state of the channel (≤ 64 floats,
+`MAMBA_MAX_STATE`) are held in registers for the whole chunk, read once and written back once. The `dt_proj` product is done
 inside the scan kernel so no `[n, d_inner]` intermediate is needed.
 
 *Trade-off.* The alternative is one dispatch per token and layer, which would give each launch more independence but
@@ -228,7 +244,8 @@ Both backends compute `exp` / `softplus` the same way (Metal uses `precise::exp/
 ## 15.8 Measured numbers
 
 All on an M1 Pro **while the machine was heavily loaded by other jobs** (load average > 100), so treat them as
-rough. The checkpoint is a random-weight file with the exact mamba-130m shapes
+rough; they were taken before the CPU backend moved to the shared `CpuMatmul` (int8 activations) and have not been
+re-measured. The checkpoint is a random-weight file with the exact mamba-130m shapes
 (`scripts/make-tiny-model.py <dir> mamba130m`; Q4_0 cache 110 MB), because downloading the real weights was not part
 of this work; speed does not depend on the values. `jllm bench`, 401-token prompt, 64 generated tokens:
 
@@ -260,12 +277,20 @@ head). Deep random networks amplify float32 rounding (at the 130m shape, 8 layer
 - `backend.kv-dtype` is ignored (there is no KV cache).
 
 The plain-text chat format (no template; messages joined with newlines, `<|endoftext|>` stops) lives in
-`ChatTemplate` for `mamba`; the model is a base model and simply continues the text. There is no BOS token
-(`Core.bosTokenId` is −1 for Mamba even though the config has `bos_token_id: 0`).
+`ChatTemplate` for `mamba`; the model is a base model and simply continues the text. `Core.bosTokenId` is −1 for
+Mamba even though the config has `bos_token_id: 0`: the engine takes the BOS to prepend from the tokenizer
+(`Tokenizer.promptBos()`, i.e. `add_bos_token` of `tokenizer_config.json`), and the Mamba (GPT-NeoX) tokenizer does
+not ask for one, so prompts are fed as they are.
 
 ## 15.10 Testing
 
 ```
-sh scripts/arch-smoke.sh            # tiny Mamba (d_model 64 and 128): CPU == Metal ids and logits, chunking invariance
+sh scripts/arch-smoke.sh            # tiny Mamba models (d_model 64 and 128): CPU == Metal ids and logits, chunking invariance
 mvn -q test                         # SmokeTest.mamba: config, hand-computed scan step and causal conv; SmokeTest.prefixReuse
 ```
+
+`arch-smoke.sh` generates 20 synthetic models (the whole supported zoo, two of them Mamba: `mamba`, d_model 64 / state 16
+/ conv 4 / tied head, and `mamba3`, d_model 128 / state 8 / conv 3 / untied head), converts each to q4, q8 and q2k and
+requires CPU and Metal to agree: 60 of 60 combinations pass. For Mamba it also feeds the prompt in different chunkings
+and requires the same logits, checks that continuing at a wrong position is refused and that `supportsPrefixReuse()` is false. `scripts/make-tiny-model.py <dir> mamba130m` writes a (non-tiny) random checkpoint with
+the exact mamba-130m shapes for benchmarking.
