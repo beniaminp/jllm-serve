@@ -663,7 +663,7 @@ public final class SmokeTest {
                      "num_key_value_heads":4,"pad_token_id":59246,"rms_norm_eps":1e-05,"rope_theta":10000.0,
                      "tie_word_embeddings":true,"vocab_size":59264}""");
             check(edge.ropeInterleaved() && edge.rotaryDim() == 128 && !edge.attentionBias() && !edge.postNorms()
-                    && edge.tiedEmbeddings() && edge.promptBosId() == -1 && edge.eosTokenIds().equals(List.of(59246, 59253, 59255)),
+                    && edge.tiedEmbeddings() && edge.eosTokenIds().equals(List.of(59246, 59253, 59255)),
                     "GLM-Edge config");
             ModelConfig chat = cfg(tmp, """
                     {"architectures":["GlmForCausalLM"],"attention_bias":true,"eos_token_id":[151329,151336,151338],
@@ -730,7 +730,7 @@ public final class SmokeTest {
                      "max_position_embeddings":4096,"original_max_position_embeddings":4096,"rms_norm_eps":1e-05,
                      "rope_scaling":null,"rope_theta":10000.0,"sliding_window":2047,"tie_word_embeddings":false,
                      "bos_token_id":1,"eos_token_id":32000,"attention_bias":false,"hidden_act":"silu"}""");
-            check(p3.headDim() == 96 && p3.rotaryDim() == 96 && p3.promptBosId() == -1 && p3.ropeScaling() == null && p3.windowFor(0) == 2047
+            check(p3.headDim() == 96 && p3.rotaryDim() == 96 && p3.ropeScaling() == null && p3.windowFor(0) == 2047
                     && p3.windowFor(31) == 2047 && !p3.qkNorm() && !p3.attentionBias()
                     && p3.qDim() == 3072 && p3.kvDim() == 3072, "phi-3-mini config");
             // Phi-4-mini-instruct: GQA 24/8, head_dim 128, partial_rotary_factor 0.75 (96 dims = 48 pairs), tied, BOS = <|endoftext|>
@@ -744,7 +744,7 @@ public final class SmokeTest {
                     .formatted(f48, f48));
             check(p4.headDim() == 128 && p4.rotaryDim() == 96 && p4.ropeScaling().type().equals("longrope")
                     && p4.ropeScaling().shortFactor().length == 48 && p4.ropeScaling().originalMaxPositions() == 4096
-                    && p4.ropeScaling().factor() == 32 && p4.tiedEmbeddings() && p4.promptBosId() == -1
+                    && p4.ropeScaling().factor() == 32 && p4.tiedEmbeddings()
                     && p4.windowFor(5) == 262144 && p4.qDim() == 3072 && p4.kvDim() == 1024, "phi-4-mini config");
             check(Math.abs(Rope.attentionFactor(p4.ropeScaling()) - 1.1902380714238083) < 1e-12, "phi-4-mini attention factor");
             // phi-4 (14B): 40/10 heads, head_dim 128, theta 250000, sliding_window null
@@ -753,7 +753,7 @@ public final class SmokeTest {
                      "num_hidden_layers":40,"num_attention_heads":40,"num_key_value_heads":10,"vocab_size":100352,
                      "max_position_embeddings":16384,"rope_scaling":null,"rope_theta":250000,"sliding_window":null,
                      "tie_word_embeddings":false,"bos_token_id":100257,"eos_token_id":100265}""");
-            check(p14.headDim() == 128 && p14.windowFor(0) == 0 && p14.promptBosId() == -1 && p14.ropeTheta() == 250000
+            check(p14.headDim() == 128 && p14.windowFor(0) == 0 && p14.ropeTheta() == 250000
                     && p14.eosTokenIds().equals(List.of(100265)), "phi-4 config");
             // legacy 'su' name, original_max_position_embeddings only at the top level, factor = 4096 * 32 / 4096
             ModelConfig su = cfg(tmp, """
@@ -791,8 +791,7 @@ public final class SmokeTest {
                      "rope_scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,
                                      "original_max_position_embeddings":8192,"rope_type":"llama3"}}""");
             check(ll.tiedEmbeddings() && ll.headDim() == 64 && !ll.attentionBias() && !ll.qkNorm() && ll.slidingWindow() == 0
-                    && ll.ropeScaling().factor() == 32 && ll.eosTokenIds().equals(List.of(128009))
-                    && ll.promptBosId() == 128000, "llama 3.2 config");
+                    && ll.ropeScaling().factor() == 32 && ll.eosTokenIds().equals(List.of(128009)), "llama 3.2 config");
             ModelConfig old = cfg(tmp, """
                     {"model_type":"llama","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
                      "num_attention_heads":32,"vocab_size":128256,"rope_scaling":{"type":"llama3","factor":8.0,
@@ -802,7 +801,7 @@ public final class SmokeTest {
                     {"architectures":["MistralForCausalLM"],"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,
                      "num_hidden_layers":32,"num_attention_heads":32,"num_key_value_heads":8,"vocab_size":32768,
                      "sliding_window":4096,"bos_token_id":1,"eos_token_id":2}""");
-            check(mi.windowFor(0) == 4096 && mi.windowFor(31) == 4096 && mi.promptBosId() == 1, "mistral window on every layer");
+            check(mi.windowFor(0) == 4096 && mi.windowFor(31) == 4096, "mistral window on every layer");
             ModelConfig mnull = cfg(tmp, """
                     {"model_type":"mistral","hidden_size":4096,"intermediate_size":14336,"num_hidden_layers":32,
                      "num_attention_heads":32,"vocab_size":32768,"sliding_window":null}""");
@@ -813,7 +812,7 @@ public final class SmokeTest {
                      "sliding_window":32768,"use_sliding_window":false,"max_window_layers":21,"tie_word_embeddings":true,
                      "eos_token_id":[151645,151643]}""");
             check(q2.attentionBias() && !q2.qkNorm() && q2.windowFor(27) == 0 && q2.headDim() == 128
-                    && q2.eosTokenIds().equals(List.of(151645, 151643)) && q2.promptBosId() == -1, "qwen2.5 config");
+                    && q2.eosTokenIds().equals(List.of(151645, 151643)), "qwen2.5 config");
             ModelConfig q2w = cfg(tmp, """
                     {"model_type":"qwen2","hidden_size":1536,"intermediate_size":8960,"num_hidden_layers":28,
                      "num_attention_heads":12,"vocab_size":151936,"sliding_window":4096,"use_sliding_window":true,
@@ -848,7 +847,7 @@ public final class SmokeTest {
             ModelConfig.MambaParams p = m.mamba();
             check(m.isMamba() && m.dim() == 768 && m.layers() == 24 && m.vocabSize() == 50280 && m.tiedEmbeddings()
                     && p.dInner() == 1536 && p.dState() == 16 && p.dConv() == 4 && p.dtRank() == 48
-                    && p.convBias() && m.eosTokenIds().equals(List.of(0)) && m.promptBosId() == -1, "mamba-130m config");
+                    && p.convBias() && m.eosTokenIds().equals(List.of(0)), "mamba-130m config");
             ModelConfig auto = cfg(tmp, """
                     {"model_type":"mamba","hidden_size":100,"state_size":8,"conv_kernel":3,"expand":2,
                      "time_step_rank":"auto","num_hidden_layers":2,"vocab_size":10}""");
@@ -1121,8 +1120,7 @@ public final class SmokeTest {
             DeepSeekConfig d = v2.deepseek();
             check(v2.headDim() == 192 && v2.qDim() == 16 * 192 && v2.kvHeads() == 16 && d.qLoraRank() == 0 && d.vHeadDim() == 128
                     && d.kvLoraRank() == 512 && d.nShared() == 2 && v2.numExperts() == 64 && v2.expertsPerTok() == 6
-                    && v2.moeDim() == 1408 && !v2.isMoeLayer(0) && v2.isMoeLayer(1) && v2.isMoeLayer(26) && !v2.tiedEmbeddings()
-                    && v2.promptBosId() == 100000 && v2.eosTokenIds().equals(List.of(100001)) && v2.maxMlpDim() == 10944
+                    && v2.moeDim() == 1408 && !v2.isMoeLayer(0) && v2.isMoeLayer(1) && v2.isMoeLayer(26) && !v2.tiedEmbeddings() && v2.eosTokenIds().equals(List.of(100001)) && v2.maxMlpDim() == 10944
                     && !d.sigmoid() && d.topkMethod().equals("greedy") && !d.scaleAlways(), "deepseek-v2-lite config");
             // softmax scale = 192^-0.5 * (0.1 * 0.707 * ln 40 + 1)^2
             check(Math.abs(d.softmaxScale() - 0.07216878364870322 * 1.5896261651208736) < 1e-12 && d.yarn().factor() == 40,
@@ -1141,7 +1139,7 @@ public final class SmokeTest {
             DeepSeekConfig d3 = v3.deepseek();
             check(d3.qLoraRank() == 1536 && d3.sigmoid() && d3.topkMethod().equals("noaux_tc") && d3.nGroup() == 8
                     && d3.topkGroup() == 4 && d3.routedScale() == 2.5 && d3.scaleAlways() && v3.normTopK()
-                    && !v3.isMoeLayer(2) && v3.isMoeLayer(3) && v3.maxMlpDim() == 18432 && v3.promptBosId() == 0
+                    && !v3.isMoeLayer(2) && v3.isMoeLayer(3) && v3.maxMlpDim() == 18432
                     && Math.abs(d3.softmaxScale() - 0.07216878364870322 * 1.3688879454113936 * 1.3688879454113936) < 1e-12,
                     "deepseek-v3 config");
             // the V2 chat template of tokenizer_config.json

@@ -158,14 +158,6 @@ public record ModelConfig(
         return slidingWindow > 0 && l >= windowFromLayer ? slidingWindow : 0;
     }
 
-    /**
-     * The token id to put in front of every prompt, or -1 when the family does not use one: Llama and Mistral
-     * were trained with {@code <s>} / {@code <|begin_of_text|>} at the start of each sequence, Qwen was not.
-     */
-    public int promptBosId() {
-        return modelType.equals("llama") || modelType.equals("mistral") || gemma != null || deepseek != null ? bosTokenId : -1;
-    }
-
     public int qDim() {
         return heads * headDim;
     }

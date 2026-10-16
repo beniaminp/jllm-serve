@@ -69,7 +69,7 @@ final class GemmaChecks {
                     "gemma2 caps and scale 1/16");
             check(g2.windowFor(0) == 4096 && g2.windowFor(1) == 0 && g2.windowFor(24) == 4096 && g2.windowFor(25) == 0,
                     "gemma2 even layers are local");
-            check(!g2.usesLocalRope(0) && g2.embedScale() == 48f && g2.promptBosId() == 2,
+            check(!g2.usesLocalRope(0) && g2.embedScale() == 48f,
                     "gemma2 embed scale sqrt(2304) = 48, bos 2, one rope table");
             check(g2.eosTokenIds().equals(List.of(1, 107)) && g2.headDim() == 256 && g2.vocabSize() == 256000,
                     "gemma2 ids and shapes");
@@ -92,7 +92,7 @@ final class GemmaChecks {
             }
             check(pat, "gemma3 5 local : 1 global (layers 5, 11, 17, 23 global)");
             // sqrt(1152) = 33.941 rounds to 34.0 in bfloat16 (8 significant bits), as transformers' normalizer does
-            check(g3.embedScale() == 34.0f && g3.promptBosId() == 2, "gemma3 embed scale bf16(sqrt(1152)) = 34");
+            check(g3.embedScale() == 34.0f, "gemma3 embed scale bf16(sqrt(1152)) = 34");
 
             // unsloth/gemma-3-4b-it: multimodal wrapper, decoder settings in text_config
             ModelConfig g4 = cfg(tmp, """

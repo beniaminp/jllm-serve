@@ -151,7 +151,7 @@ public final class Engine implements AutoCloseable {
      * limit must measure the prepared prompt rather than the raw ids. Idempotent.
      */
     public int[] preparePrompt(int[] promptTokens) {
-        int bos = cfg.promptBosId();
+        int bos = tokenizer.promptBos(); // the tokenizer's add_bos_token rule, not a per-family guess
         if (bos >= 0 && (promptTokens.length == 0 || promptTokens[0] != bos)) {
             int[] withBos = new int[promptTokens.length + 1];
             withBos[0] = bos;
@@ -237,7 +237,7 @@ public final class Engine implements AutoCloseable {
             }
             sampler.accept(tok);
             out.add(tok);
-            String piece = dec.push(tokenizer.tokenBytes(tok));
+            String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
             if (!piece.isEmpty()) {
                 pending += piece;
                 int hit = findStop(pending, p.stop());
