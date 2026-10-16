@@ -104,20 +104,25 @@ MLX would otherwise do for us.
 
 ---
 
-## 8.1 Four layers, one responsibility each
+## 8.1 Five layers, one responsibility each
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│ MetalBackend.java   knows the MODEL: which buffer is Wq of layer 3, grid sizes,      │  Java
-│                     the order of operations in a forward pass, parameter structs     │
+│ MetalBackend.java   know the MODEL: which buffer is Wq of layer 3, the order of      │  Java
+│ MlaMetal.java       operations in a forward pass (dense / DeepSeek MLA / Mamba);     │
+│ MambaMetalBackend   own the weights, caches and activations                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ MetalKernels.java   knows the KERNELS: one writer per kernel (buffers, parameter     │  Java
+│                     struct via Params/KernelParams, grid), the shared constants      │
+│                     (MetalConstants) and tunables; owns the Metal context            │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │ Metal.java          knows NOTHING about models: compile shader source, make/wrap     │  Java (FFM)
-│                     buffers, begin / dispatch / commitAndWait; owns the handles      │
+│                     buffers, memoized pipelines, begin / dispatch / commit / wait    │
 ├───────────────────────────── C function calls (jm_*) ───────────────────────────────┤
 │ jllm_metal.m        Objective-C: talks to the Metal framework; 16 C functions        │  native
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │ kernels.metal       Metal Shading Language (C++ dialect): the code the GPU runs;     │  GPU
-│                     compiled at start-up from source                                 │
+│                     compiled at start-up from source, in seven sections             │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -256,74 +261,76 @@ picks Metal.
 
 ### Dispatch list per dense layer (Qwen3-0.6B: dim 1024, qDim 2048, kvDim 1024, ffn 3072, 16/8 heads)
 
-Grid sizes are *threadgroups*; `×` = threads per threadgroup. `n` = tokens in this call.
+Grid sizes are *threadgroups*; `n` = tokens in this call. A decode step (`n = 1`) folds every rmsnorm into
+the projection that follows it (the `*_norm` kernel variants normalise the input row on the fly, see
+[8.5](#85-the-kernels-one-by-one)); a prefill chunk writes `xb` first and uses the tiled `*_pf` matmuls
+([8.10](#810-the-tiled-prefill-matmuls)).
 
-| # | kernel | writes | grid, decode `n=1` | grid, prefill `n=64` | threads |
+| # | decode `n = 1` | prefill `n = 64` | writes | grid (decode / prefill) | threads |
 |---|---|---|---|---|---|
-| 1 | `rmsnorm` | `xb` | 1 | 64 | 256 |
-| 2 | `matmul_q4` (Wq 2048×1024) | `q` | (512, 1) | (512, 8) | 128 |
-| 3 | `matmul_q4` (Wk 1024×1024) | `keyCache[l]` at offset `pos·kvDim·4` | (256, 1) | (256, 8) | 128 |
-| 4 | `matmul_q4` (Wv) | `valCache[l]` at offset `pos·kvDim·4` | (256, 1) | (256, 8) | 128 |
-| 5 | `norm_rope` (16 heads, q_norm) | `q` in place | (16, 1) | (16, 64) | 64 |
-| 6 | `norm_rope` (8 heads, k_norm) | cache rows in place | (8, 1) | (8, 64) | 64 |
-| 7 | `attention` | `att` | (16, 1) | (16, 64) | 256 |
-| 8 | `matmul_q4` (Wo 1024×2048, accumulate) | `x +=` | (256, 1) | (256, 8) | 128 |
-| 9 | `rmsnorm` | `xb` | 1 | 64 | 256 |
-| 10 | `matmul_q4` (Wgate∥Wup 6144×1024) | `gateUp` | (1536, 1) | (1536, 8) | 128 |
-| 11 | `silu_mul` | `hidden` | 12 | 768 | 256 |
-| 12 | `matmul_q4` (Wdown 1024×3072, accumulate) | `x +=` | (256, 1) | (256, 8) | 128 |
+| 1 | — | `rmsnorm` | `xb` | — / 64 | 256 |
+| 2 | `matmul3_q4_norm` | `matmul3_pf_q4` | `q`; k and v rows **straight into the caches** at `pos` (bias in the epilogue) | (1024, 1) / (512, 8) | 128 |
+| 3 | `rope` (16 q heads + 8 k heads, qk-norm) | `rope` | `q` in place, the k cache rows | (24, 1) / (24, 64) | 64 |
+| 4 | `attention_g1_d128` | `attention_g1_d128` (2 tiles of 32 tokens) | `att` | (16, 1) / (16, 32) × 2 | 256 |
+| 5 | `matmul_q4` (Wo, accumulate) | `matmul_pf_q4` | `x +=` | (256, 1) / (128, 8) | 128 |
+| 6 | — | `rmsnorm` | `xb` | — / 64 | 256 |
+| 7 | `matmul_swiglu_q4_norm` (Wgate∥Wup) | `matmul_swiglu_pf_q4` | `hidden = silu(g)·u` | (768, 1) / (768, 8) | 128 |
+| 8 | `matmul_q4` (Wdown, accumulate) | `matmul_pf_q4` | `x +=` | (256, 1) / (128, 8) | 128 |
 
-28 layers × 12 = 336, plus the final `rmsnorm` (1 group) and the LM head `matmul_q8` (151 936 rows → grid
-(37 984, 1)): **338 dispatches per decode step**.
-
-Notice steps 3, 4 and 6: the K and V projections write *directly into the KV cache* at the byte offset of
-position `pos` (`bind(3, keyCache[l], pos·kvDim·4)`), and `norm_rope` for K runs in place on those cache rows.
-There is no separate "store into cache" step. (With `backend.kv-dtype=f16` steps 3, 4 and 6 target two f32
-staging buffers instead and a thirteenth dispatch, `kv_store_half`, rounds the rows into the `half` caches —
-[8.9](#89-the-f16-kv-cache).)
+28 layers × 6 = 168, plus the final `rmsnorm` and the LM head `matmul_q8` (151 936 rows, grid (37 984, 1),
+Gemma's logit soft-cap in its epilogue): **170 dispatches per decode step**, in 4 command buffers
+(`-Djllm.metal.commitLayers=8`). With `backend.kv-dtype=f16` the kernel names gain `_h` and k goes through
+a staging row — [8.9](#89-the-f16-kv-cache). With `-Djllm.metal.flashDecode=true` step 4 of a decode step
+over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11](#811-flash-decoding-opt-in).
 
 ### Dispatch list per MoE layer (Qwen3-30B-A3B: dim 2048, qDim 4096, kvDim 512, 128 experts, top-8, moeDim 768)
 
 | # | kernel | grid, decode `n=1` | grid, prefill `n=64` | threads |
 |---|---|---|---|---|
-| 1–9 | as above with the 30B shapes: Wq (1024, ·), Wk/Wv (128, ·), rope (32,·)/(4,·), attention (32,·), Wo (512, ·) | | | |
-| 10 | `router` | 1 | 64 | 128 (= experts) |
-| 11 | `moe_up_q4` (1536 rows per expert) | (384, 8) | (384, 512) | 128 |
-| 12 | `silu_mul` over `n·8·768` | 24 | 1536 | 256 |
-| 13 | `moe_down_q4` (2048 rows per expert) | (512, 1) | (512, 64) | 128 |
+| 1–5 | as above with the 30B shapes | | | |
+| 6 | `rmsnorm` | 1 | 64 | 256 |
+| 7 | `router` (DeepSeek: `router_ds`) | 1 | 64 | 256 |
+| 8 | `moe_up_q4` (1536 rows per expert, SwiGLU in the epilogue) | (192, 8) | (192, 512) | 128 |
+| 9 | `moe_down_q4` (2048 rows per expert) | (512, 1) | (512, 64) | 128 |
 
-48 layers × 13 + 2 = **626 dispatches per decode step**.
+48 layers × 8 + 2 = **386 dispatches per decode step**.
 
-### Parameter structs: why only 4-byte members
+### Parameter structs: `Params`, `KernelParams` and `MetalParamsTest`
 
-Each kernel takes a small `struct` by `constant` reference. Java has no struct type, so `MetalBackend` writes
-the fields one after another into the 64-byte `params` segment and tells the shim how many bytes to copy:
+Each kernel takes a small `struct` by `constant` reference. Java has no struct type, so every writer in
+`MetalKernels` fills the fields in declaration order through the typed builder and passes the returned size
+as `plen`:
 
 ```java
-params.setAtIndex(ValueLayout.JAVA_INT,   0, t.rows);      // byte 0
-params.setAtIndex(ValueLayout.JAVA_INT,   1, t.cols);      // byte 4
-params.setAtIndex(ValueLayout.JAVA_INT,   2, n);           // byte 8
-params.setAtIndex(ValueLayout.JAVA_INT,   3, acc ? 1 : 0); // byte 12
-metal.dispatch(pipe, bufArgs, offArgs, 4, params, 16, ...); // plen = 16
+p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);   // MatmulParams
+dispatch(kernel("matmul", t.type, ""), 5, tgmem, gx, gy, 1, MM_THREADS, 1, 1);   // plen = p.done() = 24
 ```
 
-This only works if the C++ struct has the same layout — which is guaranteed when every member is a 4-byte `int`
-or `float` (no padding is ever inserted). `setAtIndex(JAVA_FLOAT, 1, eps)` writes a float at byte 4, matching
-`struct NormParams { int n; float eps; }`. The structs and their sizes:
+This only works if the C++ struct has the same layout, which is guaranteed when every member is a 4-byte `int`
+or `float` (no padding is ever inserted). Three checks keep the two sides together: `KernelParams` lists each
+struct's name and field kinds (`MATMUL("MatmulParams", "iiiiff")`), `Params.done()` fails the dispatch if a
+writer wrote a different number or kind of fields, and `MetalParamsTest` parses the `struct` blocks of
+`kernels.metal` and asserts that every layout has the same field count, kinds and byte size as its struct, that
+no struct is without a writer, and that the constants `MetalConstants` mirrors equal the shader's `#define`s
+(`java -cp target/classes:target/test-classes org.robomiri.jllm.MetalParamsTest`, no GPU needed).
 
 | struct | fields | bytes |
 |---|---|---|
-| `MatmulParams` | rows, cols, ntok, accumulate | 16 |
+| `MatmulParams` | rows, cols, ntok, accumulate, eps, softcap | 24 |
+| `Matmul3Params` | rows0, rows1, rows2, cols, ntok, eps, hasBias | 28 |
+| `SwigluParams` | hidden, cols, ntok, eps, gelu | 20 |
 | `NormParams` | n, eps | 8 |
-| `RopeParams` | headDim, rowStride, pos0, eps, useNorm | 20 |
-| `AttnParams` | nHeads, nKvHeads, headDim, pos0, ctx, scale, qStride, kvStride | 32 |
-| `SiluParams` | n, total | 8 |
-| `RouterParams` | nExperts, dim, topK, normalize | 16 |
+| `RopeParams` | headDim, qStride, kvStride, nHeads, pos0, eps, useNorm, rotOff, rotHalf | 36 |
+| `AttnParams` | nHeads, nKvHeads, qkDim, vDim, pos0, ctx, scale, qStride, kStride, vStride, oStride, window, tokenOffset, softcap | 56 |
+| `AttnSplitParams`, `AttnCombineParams` | flash decoding ([8.11](#811-flash-decoding-opt-in)) | 48, 12 |
+| `RouterParams` / `RouterDsParams` | nExperts, dim, topK, normalize (+ DeepSeek's groups, method, scale) | 16 / 40 |
 | `MoeParams` | rowsPerExpert, cols, topK | 12 |
+| `MlaStoreParams`, `MambaConvParams`, `MambaScanParams` | MLA cache store, Mamba conv and scan | 24, 12, 16 |
 
 Buffers are bound at indices `0 … nbuf−1` and the params at index `nbuf`, matching the `[[buffer(i)]]`
-attributes in the kernel signature. Getting one index wrong is the classic bug: the kernel reads the wrong
-buffer and silently produces garbage, which is why the CPU backend exists as a reference.
+attributes in the kernel signature; a buffer a kernel declares but the dispatch does not use (norm weights,
+biases) is bound to a small dummy buffer. Getting one index wrong is the classic bug: the kernel reads the
+wrong buffer and silently produces garbage, which is why the CPU backend exists as a reference.
 
 ### Buffers allocated at start-up
 
@@ -333,11 +340,15 @@ buffer and silently produces garbage, which is why the CPU backend exists as a r
 | `keyCache` + `valCache`, per layer `ctx·kvDim·4` (`·2` with `backend.kv-dtype=f16`) | 28 × 2 × 16 MB = 939 MB (470 MB f16) | 48 × 2 × 4 MB = 403 MB (201 MB f16) |
 | `x`, `xb` (`batch·dim·4`) | 256 KB each | 512 KB |
 | `q`, `att` (`batch·qDim·4`) | 512 KB each | 1 MB |
-| `gateUp`, `hidden` | 1.5 MB, 768 KB | — (dense MLP unused) |
-| `scores` (`batch·heads·ctx·4`) | 16.8 MB | 16.8 MB |
+| `hidden` (`batch·ffn·4`) | 768 KB | — (dense MLP unused) |
+| `scores` (`32·heads·ctx·4`: one row per tile token and head) | 8.4 MB | 8.4 MB |
 | `logitsBuf` | 608 KB | 608 KB |
-| MoE: `assign`, `routeWeight`, `moeGateUp`, `moeHidden` | — | 2 KB, 2 KB, 3.1 MB, 1.6 MB |
+| MoE: `assign`, `routeWeight`, `moeHidden` | — | 2 KB, 2 KB, 1.6 MB |
+| `kStage` (f16 cache only, `batch·kvDim·4`), `flashPart` (flash decoding only) | 256 KB, 266 KB | 128 KB, 266 KB |
 | norm gains, RoPE tables (uploaded copies) | ~2 MB | ~3 MB |
+
+None of the scratch buffers is zeroed at allocation (`jm_buffer_new` with `zero = 0`): every element is written
+before it is read, so the memset would only cost start-up time and commit untouched pages.
 
 `recommendedMaxWorkingSetSize` is compared with the weight size at start-up; exceeding it does not fail but
 means the GPU will page weights in and out.
@@ -351,7 +362,7 @@ compute, write*. We go through them in the order they appear in `kernels.metal`.
 
 ### `tg_sum`, `tg_max` — threadgroup reductions
 
-Shown in 8.0. Used by `rmsnorm` (sum of squares), `norm_rope` (per-head sum of squares), `attention` (max and
+Shown in 8.0. Used by `rmsnorm` (sum of squares), `rope` (per-head sum of squares), `attention_t` (max and
 sum of the softmax). `buf` has 32 entries because a threadgroup has at most 1024 / 32 = 32 simdgroups.
 
 ### `block_dot<QT>` — the inner loop of every matmul
@@ -405,13 +416,31 @@ scale = rsqrt(ss / n + eps)                     rsqrt = 1/sqrt, one instruction
 thread tid writes out[i] = x[i] * scale * w[i] for its elements
 ```
 
-For `n = 1024` each thread handles 4 elements. `MetalBackend.rmsnormAt` binds the input at a byte offset so
-the final norm can read only the last token's row (`(n−1)·dim·4`) and write row 0 of `xb`.
+For `n = 1024` each thread handles 4 elements. `MetalKernels.rmsnorm` binds the input at a byte offset so
+the final norm can read only the last token's row (`(n−1)·dim·4`) and write row 0 of `xb`. At decode the
+norm before a projection is not a dispatch at all: the `matmul_*_norm` variants recompute the row's scale in
+every threadgroup with `norm_scale_128`, which reproduces the 256-thread reduction of `rmsnorm` lane for lane
+on 128 threads, so the fused result is bit-identical to `rmsnorm` + `matmul` (used only while `dim·4` bytes of
+normalised row fit the 32 KB of threadgroup memory, `jm_device_max_tg_mem`).
 
-### `norm_rope` — one thread per rotary pair
+### `matmul3` and `matmul_swiglu` — the fused projections
 
-Grid `(heads, ntok)`; `headDim / 2 = 64` threads per threadgroup, so **thread `i` owns the pair `(i, i+64)`**
-of one head of one token — exactly the "rotate-half" pairing from [05 §5.5](05-transformer-math.md#55-step-3--qk-norm-and-rotary-position-embedding-rope):
+`matmul3` runs the q, k and v projections in one dispatch: the row range `[0, rows0)` comes from Wq into `q`,
+`[rows0, rows0+rows1)` from Wk into the key cache rows at `pos`, the rest from Wv into the value cache rows,
+each row exactly as `matmul` would compute it, with the optional q/k/v bias added in the epilogue
+(`out = v + b`, the same float as a separate pass). The v output is templated on the cache element type, so
+the f16 cache receives `half(v + b)` directly ([8.9](#89-the-f16-kv-cache)). `matmul_swiglu` gives one
+simdgroup the gate row `r` and the up row `hidden + r` of the stacked gate∥up matrix and writes
+`silu(g)·u` (or Gemma's `gelu_tanh(g)·u`), so the FFN needs no gate/up scratch and no activation pass.
+
+### `rope<KV, ADJACENT>` — one thread per rotary pair
+
+One kernel for every rotary variant: grid `(nHeads + k heads, ntok)`; `rotHalf` threads per threadgroup,
+thread `i` owning one pair of the rotated slice that starts at `rotOff` of each head. `ADJACENT = false`
+pairs `(i, i + rotHalf)` — the "rotate-half" pairing from
+[05 §5.5](05-transformer-math.md#55-step-3--qk-norm-and-rotary-position-embedding-rope) used by Llama, Qwen,
+Gemma and Phi's partial rotation; `ADJACENT = true` pairs `(2i, 2i+1)` for GLM and DeepSeek. For the 0.6B
+model (`rotHalf = 64`, `rotOff = 0`):
 
 ```
 a = h[i];  b = h[i + 64]
@@ -422,10 +451,20 @@ h[i]      = a·cos[pos][i] − b·sin[pos][i]
 h[i + 64] = b·cos[pos][i] + a·sin[pos][i]
 ```
 
-The `cos`/`sin` tables are the `Rope` arrays uploaded once (`[ctx × 64]` each). `rowStride` lets the same
-kernel walk `q` (stride `qDim`) or the KV cache (stride `kvDim`, starting at position `pos`).
+Threadgroups `x < nHeads` rotate q heads in place; the others read a k head from `k` (the f32 cache rows at
+`pos`, or the f32 staging row of an f16 cache) and write it to `kOut` with the cache element type `KV`
+(dims outside the rotated slice copied along), which is where the f16 cache rounds k, once, after the
+rotation. The `cos`/`sin` tables are the `Rope` arrays uploaded once (`[ctx × rotHalf]` each); DeepSeek rotates
+its q heads and the shared `k_pe` row through the q path (`rotOff = nope`, no k heads).
 
-### `attention` — one threadgroup (256 threads = 8 simdgroups) per (head, token)
+### `attention_t<KV, G, PERK, PERV>` — one threadgroup (256 threads = 8 simdgroups) per (head, token)
+
+One template behind every attention variant: `KV` is the cache element type (`float`, or `half` converted on
+load), `G` the query heads sharing a threadgroup (1 unless `-Djllm.metal.attnGroup` asks for 2/4/8, which are
+then compiled on demand), `PERK` / `PERV` the key and value head widths in units of 32 lanes — compile-time for
+head dims 64 / 128 / 256 (`attention_g1_d128`), or 0 for the widths in the params (`attention`: other head
+dims, and DeepSeek MLA with 192-wide keys and 128-wide values). Per head the arithmetic is the same whatever the
+arguments.
 
 Three phases, following the formula `softmax(q·K / √hd) · V`:
 
@@ -452,26 +491,21 @@ GQA: `kvh = h / (nHeads / nKvHeads)` selects the shared KV head.
 The two `threadgroup_barrier(mem_flags::mem_device)` calls make the scratch writes of phase 1 visible to
 phase 2, and phase 2's to phase 3.
 
-### `silu_mul` — one thread per element
-
-`gid` indexes the flattened `[ntok, n]` output; `t = gid / n`, `i = gid % n`; reads `gate` at `[t, i]` and
-`up` at `[t, n + i]` of the `[ntok, 2n]` input; writes `g / (1 + exp(−g)) · u`. Used for the dense FFN
-(`n = 3072`) and for MoE slots (`n = 768`, `ntok = n·8`).
-
-### `router` — one threadgroup per token, `nExperts` threads
+### `router` / `router_ds` — one threadgroup (256 threads = 8 simdgroups) per token
 
 ```
-thread e:   logits[e] = Wrouter[e] · x[t]          (scalar loop over dim; the router is 1 MB, not worth more)
-barrier
-thread 0:   mx = max; logits[e] = exp(logits[e] − mx); sum
-            8 times: pick the largest remaining, assign[t·8+k] = e, rw[t·8+k] = p_e; set it to −∞
+simdgroup sg:  logits[e] for e = sg, sg+8, ...:  the 32 lanes read the router row in float4 steps
+               (512 contiguous bytes per iteration) and finish with simd_sum
+tg_max, exp, tg_sum:   the softmax max and sum as threadgroup reductions
+thread 0:   8 times: pick the largest remaining, assign[t·8+k] = e, rw[t·8+k] = p_e; set it to −∞
             if normalize: rw /= Σ selected p_e
 ```
 
 Thread 0 doing 8 passes over 128 entries is ~1 000 operations — trivial next to a 1 MB read, and it keeps the
 selection exactly identical to `CpuBackend.route` (softmax first, then top-k, then renormalize, like
-transformers). `logits` lives in threadgroup memory (`[1024]`, hence the 1024-expert limit checked in the
-constructor against `jm_pipeline_max_threads`).
+transformers). `router_ds` computes the logits the same way and applies DeepSeek's rule on thread 0 (sigmoid or
+softmax scores, group-limited selection, bias for `noaux_tc`, scaling; see `DeepSeekRouter.java`). The logits
+live in threadgroup memory (`MAX_EXPERTS = 1024`, checked in the constructors).
 
 ### `moe_up<QT>` — one simdgroup per (slot, expert row)
 
@@ -515,8 +549,12 @@ template [[host_name("moe_up_q4")]] kernel moe_up_t moe_up<4>;
 template [[host_name("moe_up_q8")]] kernel moe_up_t moe_up<8>;
 ```
 
-`host_name` is the string `jm_pipeline` looks up. (`matmul_q4`/`matmul_q8` predate `block_dot` and are
-written out twice; folding them into the template is a pending clean-up.)
+`host_name` is the string `jm_pipeline` looks up, and `Metal.pipeline(name)` looks it up lazily: a pipeline
+is created the first time a dispatch names it and memoized, so only the variants a model runs are built. Every
+quantized kernel is a template on `QT` (4 = Q4_0, 8 = Q8_0, 2 = Q2_K), the matmul family additionally on the
+fused-norm flag (and `matmul3` on the v output type), the attention and rope kernels on the cache element type.
+The grouped attention instantiations (`attention_g{2,4,8}_*`) sit behind `#ifdef JLLM_ATTN_GROUPS`, which
+`MetalBackend` defines (through `Metal.create`'s preamble) only when `-Djllm.metal.attnGroup` asks for them.
 
 ---
 
@@ -524,7 +562,7 @@ written out twice; folding them into the template is a pending clean-up.)
 
 - **Position attributes must agree in dimensionality.** A kernel cannot mix `uint2 tgp
   [[threadgroup_position_in_grid]]` with a scalar `ushort tid [[thread_position_in_threadgroup]]` — the
-  compiler rejects it. Hence `ushort2 tid2` and `tid2.x` in `norm_rope` and `attention`. `simdgroup_index…`
+  compiler rejects it. Hence `ushort2 tid2` and `tid2.x` in `rope` and `attention_t`. `simdgroup_index…`
   and `thread_index_in_simdgroup` are not position attributes and may stay scalar.
 - **Struct layout**: only `int`/`float` members, in the order Java writes them; `plen` must match the struct size.
 - **`newBufferWithBytesNoCopy` needs page alignment**; otherwise it returns nil, the shim prints why to stderr
@@ -549,36 +587,39 @@ written out twice; folding them into the template is a pending clean-up.)
 
 ## 8.7 Measured numbers and where the time goes
 
-Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt: **~344 tok/s prefill, ~75 tok/s decode** (~110 tok/s on short
-contexts); Q8_0 decodes at essentially the same speed (~77 tok/s). Greedy output is byte-identical to the CPU.
+Apple M1 Pro, Qwen3-0.6B Q4_0, 413-token prompt (`bench --ctx 1024`): **~540 tok/s prefill, ~105 tok/s
+decode** (the same at `--ctx 4096`); Qwen3-30B-A3B Q4_0: **~49 tok/s prefill, ~24 tok/s decode**. Greedy
+output is byte-identical to the CPU backend. Before the tiled prefill matmuls and the pipelined command buffers
+the 0.6B model prefilled at ~380 tok/s and the 30B at ~44 tok/s; decode was within noise of today's numbers.
 
-The Q4 ≈ Q8 result is the tell: if decode were limited by weight bandwidth, Q8 (1.8× the bytes) would be
-clearly slower. So the ~13 ms per token go elsewhere:
+Where a decode step of the 0.6B model (~9.5 ms) goes:
 
 | cost | evidence |
 |---|---|
-| **338 dispatches per token** | each costs a few µs of GPU front-end time plus the serial dependency between consecutive kernels; alone this is a sizeable fraction of 13 ms |
-| **under-filled grids** | `Wk`, `Wv`, `Wo`, `Wdown` have 1024 rows → 256 threadgroups of 128 threads = 32 768 threads on a GPU that wants hundreds of thousands in flight; the M1 Pro's 16 cores are mostly idle during these kernels |
+| **170 dispatches per token** | each costs a few µs of GPU front-end time plus the serial dependency between consecutive kernels; the fusions ([8.4](#84-recording-a-forward-pass-metalbackendforward)) brought the count down from 338 |
+| **under-filled grids** | `Wo`, `Wdown` have 1024 rows → 256 threadgroups of 128 threads = 32 768 threads on a GPU that wants hundreds of thousands in flight; the M1 Pro's 16 cores are mostly idle during these kernels |
 | **the LM head** | `151 936 × 1024` Q8 = 165 MB, a third of all bytes read per token, in one 37 984-threadgroup dispatch |
-| **attention reads the whole prefix** | per layer, per head: `len × 128 × 4 B` of keys and the same of values; at 4 096 tokens that is 4 MB per head per layer |
+| **attention reads the whole prefix** | per layer, per head: `len × 128 × 4 B` of keys and the same of values; at 4 096 tokens that is 4 MB per head per layer — the `half` cache halves it, flash decoding ([8.11](#811-flash-decoding-opt-in)) spreads it over more threadgroups |
 | **a CPU round trip per token** | `commitAndWait` + logits copy + sampling + embedding write: the GPU idles while the CPU samples |
 
-### The optimizations, by expected payoff
+A prefill chunk of 64 tokens is bound by the matmuls' reads of the activations (the single-row kernels gather x
+at a 128-byte lane stride per row), which is what the tiled kernels of [8.10](#810-the-tiled-prefill-matmuls)
+attack; at several thousand tokens of context the attention kernel (one threadgroup per head and token,
+reading the whole prefix) dominates instead.
 
-1. **Kernel fusion** — fold `rmsnorm` into the following matmul's prologue, compute q/k/v in one dispatch,
-   apply SiLU in the gate/up matmul's epilogue, and apply RoPE inside the q/k projection. Roughly halves the
-   dispatch count.
-2. **Expert-grouped MoE prefill** — today `moe_up` handles one token per simdgroup, so a 64-token chunk reads
-   every chosen expert's weights once *per token*. Sorting slots by expert and running a `TOK_TILE`-style loop
-   over the tokens that share an expert gives the reuse the dense matmul already has.
-3. **Flash-style attention** — compute scores, the running max/sum and the value accumulation in one pass with
-   online softmax, never writing `scores` to device memory. (The `half` KV cache that halves the K/V traffic
-   exists already: `backend.kv-dtype=f16`, [8.9](#89-the-f16-kv-cache).)
-4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wk`-sized matmuls fill the GPU,
+### What remains, by expected payoff
+
+1. **Expert-grouped MoE prefill** — `moe_up` handles one token per simdgroup, so a 64-token chunk reads every
+   chosen expert's weights once *per token*. Sorting slots by expert and running a `TOK_TILE`-style loop over
+   the tokens that share an expert gives the reuse the dense matmul already has (the 30B prefills at 49 tok/s
+   against 540 for the 0.6B).
+2. **Prefill attention** — a tile of query tokens per threadgroup sharing each K/V row, or an online-softmax
+   pass that never writes `scores` to device memory (flash decoding does the split for decode only).
+3. **Simdgroup matrix instructions** (`simdgroup_multiply_accumulate` on 8×8 tiles) for prefill matmuls — a
+   different accumulation order, so it would be opt-in like flash decoding.
+4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
-5. **Simdgroup matrix instructions** (`simdgroup_multiply_accumulate` on 8×8 tiles) for prefill matmuls, which
-   are compute-bound and currently use scalar `dot()` on `float4`.
-6. **Overlap** — pipeline the CPU's sampling with the next step's GPU work, or sample on the GPU.
+5. **Overlap** — pipeline the CPU's sampling with the next step's GPU work, or sample on the GPU.
 
 ---
 
@@ -591,37 +632,73 @@ clearly slower. So the ~13 ms per token go elsewhere:
 - Unified memory lets the memory-mapped quantized cache be used by the GPU in place (`jm_buffer_wrap`).
 - A ~250-line Objective-C shim exposes 16 C functions; `Metal.java` binds them with the FFM API (`Linker`,
   `FunctionDescriptor`, `MethodHandle.invokeExact`, `MemorySegment`), no JNI, no generated code.
-- `MetalBackend.forward` records the whole forward pass (338 dispatches for 0.6B, 626 for 30B-A3B) into one
-  serial command buffer and waits once.
-- Decode on the M1 Pro is currently limited by dispatch count and small grids rather than by bandwidth, which
-  is exactly what the listed optimizations attack.
+- `MetalBackend.forward` records the whole forward pass (170 dispatches for 0.6B, 386 for 30B-A3B) through
+  the writers of `MetalKernels`, submitting every 8 layers so the GPU runs them while the rest is encoded, and
+  waits once at the end.
+- Every parameter struct has one Java writer, checked against the shader source by `MetalParamsTest`.
+- Decode on the M1 Pro is limited by dispatch count and small grids rather than by bandwidth; prefill by the
+  matmuls' activation reads (tiled kernels) and, at long contexts, by attention.
 
 ---
 
 ## 8.9 The f16 KV cache
 
 `backend.kv-dtype=f16` allocates `keyCache`/`valCache` as `half` buffers (`ctx·kvDim·2` bytes per layer, 470 MB
-instead of 939 MB for the 0.6B model at `ctx = 4096`) and changes three things in the dense layer; everything
-else, including every f32 kernel, is untouched. The kernels live in the "f16 KV cache" section at the end of
-`kernels.metal`.
+instead of 939 MB for the 0.6B model at `ctx = 4096`) and selects the `_h` instantiations of three kernels;
+the dispatch count does not change and everything else is untouched.
 
 | step | f32 (default) | f16 |
 |---|---|---|
-| 3, 4 `matmul` Wk, Wv | into `keyCache[l]`/`valCache[l]` at offset `pos·kvDim·4` | into f32 staging buffers `kStage`/`vStage` (`batch·kvDim·4` bytes) at offset 0 |
-| 6 `norm_rope` (k) | in place on the cache rows | in place on `kStage` |
-| new `kv_store_half` | — | one thread per element: `kc[pos·kvDim + i] = half(kStage[i])`, same for V; grid `ceil(n·kvDim / 256)` |
-| 7 attention | `attention` | `attention_h` — the same kernel templated on the cache element type (`attention_kv<half>`) |
+| 2 `matmul3` | k and v rows into the caches at `pos·kvDim·4` | `matmul3_*_h`: v rows written as `half(v + bias)` into the cache at `pos·kvDim·2`; k rows into the f32 staging buffer `kStage` (`batch·kvDim·4` bytes) |
+| 3 `rope` | k in place on the cache rows | `rope_h`: reads `kStage`, writes the rotated head as `half` into the cache rows |
+| 4 attention | `attention_g1_d128` | `attention_g1_d128_h` — the same template with `KV = half` |
 
-So a decode step records 13 dispatches per dense layer instead of 12 (366 instead of 338 for the 0.6B model);
-`kv_store_half` moves 8 KB per layer and costs a few microseconds. The matmul and `norm_rope` kernels did not
-need `half` variants because the staging buffers are f32: K is rounded exactly once, after RoPE, with Metal's
-default round-to-nearest-even `half()` conversion — the same rounding as Java's `Float.floatToFloat16` on the
-CPU path, which is why the two backends' f16 outputs are identical.
+Each cache element is rounded exactly once — v after the projection, k after the norm and the rotation — with
+Metal's default round-to-nearest-even `half()` conversion, the same rounding as Java's `Float.floatToFloat16`
+on the CPU path, which is why the two backends' f16 outputs are identical.
 
-`attention_kv<KV>` differs from `attention` only in the pointer types of `kc`/`vc` and in the loads, which widen
-each `half` to `float` before the multiply (`qr[i] * float(kv[lane + i * 32])`). Scores, softmax and the
-value accumulation stay f32, so the f16 variant changes what is *read*, not what is computed: per cached
-position and lane it loads 4 × 2 bytes of K and 4 × 2 bytes of V instead of 4 × 4 each. On the M1 Pro this is
-worth a few percent of decode at a few hundred tokens of context (the attention kernel is not the dominant
-cost there — [8.7](#87-measured-numbers-and-where-the-time-goes)); the point of the option is the memory and
-the scaling at long contexts. Measurements are in [11 §11.3](11-performance.md#113-memory-footprint).
+The `half` attention instantiations differ from the `float` ones only in the pointer types of `kc`/`vc` and in
+the loads, which widen each `half` to `float` before the multiply (`float(kv[lane + i * 32])`). Scores, softmax
+and the value accumulation stay f32, so the f16 variant changes what is *read*, not what is computed: per
+cached position and lane it loads 4 × 2 bytes of K and 4 × 2 bytes of V instead of 4 × 4 each. On the M1 Pro
+this is worth a few percent of decode at a few hundred tokens of context (the attention kernel is not the
+dominant cost there — [8.7](#87-measured-numbers-and-where-the-time-goes)); at 3 000 tokens the prefill is a
+third faster and decode ~10 % faster. Measurements are in [11 §11.3](11-performance.md#113-memory-footprint).
+
+---
+
+## 8.10 The tiled prefill matmuls
+
+The single-row matmuls give a simdgroup one output row and let each lane walk the row's quantization blocks
+(`lane, lane + 32, ...`), re-reading the token's activations for every row: for a 64-token chunk the x
+matrix is gathered once per row at a 128-byte lane stride, and that, not the weight reads, is what limits
+prefill. `matmul_pf`, `matmul3_pf` and `matmul_swiglu_pf` give a simdgroup a tile of `PF_ROWS = 2` rows (one
+gate+up unit for the SwiGLU kernel) × `PF_TOKS = 8` tokens: every x block is loaded once for the tile's rows
+and every weight block unpacked once for its tokens. The lane walk over blocks, the block dot (the shared
+`q4_block_dot` / `q8_block_dot` expression, so the compiler emits the same arithmetic for both families) and the
+one `simd_sum` per output are the same as in the single-row kernels, so every output element is accumulated in
+the same order and the results are **bit-identical** — checked element-wise for Q4_0, Q8_0 and Q2_K and on a
+64-token chunk's logits for both cache types. Chunks of at least 8 tokens use them
+(`-Djllm.metal.prefillMinTokens`).
+
+Tile shape, measured per layer at the 0.6B shapes with 64 tokens: two adjacent rows per simdgroup coalesce
+into 1 KB reads and halve the x gathers (4.0 ms per layer against 6.2–6.7 for the single-row kernels), four
+rows cost too many registers, 16 tokens gain nothing more; the SwiGLU kernel is fastest with one unit
+(1.5 ms against 2.2). End to end: 0.6B prefill 380 → 540 tok/s, 30B 44 → 49 tok/s (its prefill is dominated
+by the MoE kernels, which still handle one token per simdgroup).
+
+---
+
+## 8.11 Flash decoding (opt-in)
+
+`-Djllm.metal.flashDecode=true` changes a decode step over at least 512 cached positions
+(`-Djllm.metal.flashMinLen`): instead of one threadgroup per head walking the whole context,
+`attention_split` runs the three phases of `attention_t` on a sub-range of `flashChunk = 128` keys per
+threadgroup (grid `(heads, nSplit)`, `nSplit ≤ 32`), with the softmax relative to the sub-range's own maximum,
+and writes the unnormalised partial `(o[headDim], max, sum)`; `attention_combine` rescales every partial to the
+global maximum and divides by the combined sum. The combine adds the sub-ranges' sums and value accumulations
+in a different order from the single-pass kernel, so the results are not bit-identical and the option is off
+by default: on Qwen3-0.6B with a 3 176-token prompt at `--ctx 4096` (M1 Pro) decode goes 50–55 → 60–62 tok/s
+with the f32 cache (+3–5 % with f16), the greedy output is identical and the largest logit difference is
+4.4e-6 (relative 3.7e-7) with the same argmax on every step. Dense attention only; DeepSeek MLA keeps the
+single-pass kernel.
