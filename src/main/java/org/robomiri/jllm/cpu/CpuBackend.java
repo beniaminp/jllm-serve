@@ -8,14 +8,14 @@ import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelConfig;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
-import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.Rope;
 
 import java.util.Arrays;
 
 /**
- * Decoder forward pass on the CPU (Llama, Mistral, Qwen2, Qwen3): quantized matmuls with the Vector API,
- * multithreaded over output rows (decode) or row groups (prefill), f32 or f16 KV cache on the Java heap ({@link KvCache}).
+ * Decoder forward pass on the CPU (Llama, Mistral, Qwen2, Qwen3, GLM, Phi-3, Gemma, DeepSeek): quantized matmuls
+ * with the Vector API ({@link CpuMatmul}: multithreaded over output rows for decode, row groups for prefill), f32
+ * or f16 KV cache on the Java heap ({@link KvCache}).
  */
 public final class CpuBackend implements Backend {
 
@@ -63,13 +63,9 @@ public final class CpuBackend implements Backend {
     private final int[] usedExperts;
     private final int[] slotOrder;
 
+    /** The quantized matmul (float and int8 paths) and the thread-local float scratch, shared with {@link MlaCpu}. */
+    final CpuMatmul mm;
     final ThreadLocal<float[]> scratch;
-
-    // int8 activation path (Int8Kernels): the matmul input quantized to Q8_0, one row at a time; the buffers
-    // are written by the caller thread only (before the row loop is published) and grown on demand
-    private final boolean int8;
-    private short[] xq;
-    private float[] xs;
 
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads) {
         this(w, ctx, maxBatch, threads, KvDtype.F32);
@@ -90,7 +86,6 @@ public final class CpuBackend implements Backend {
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.pool = new ThreadPool(threads);
-        this.int8 = int8Activations;
         this.rope = Rope.of(c, ctx);
         this.ropeLocal = anyLocalRope(c) ? Rope.local(c, ctx) : rope;
         if (ctx > c.maxPositions()) {
@@ -143,7 +138,8 @@ public final class CpuBackend implements Backend {
         }
         int scratchLen = Math.max(Math.max(ctx, c.numExperts()),
                 4 * Math.max(Math.max(c.maxMlpDim(), c.moeDim()), Math.max(c.dim(), c.qDim())));
-        scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
+        mm = new CpuMatmul(pool, int8Activations, DETERMINISTIC, scratchLen);
+        scratch = mm.scratch;
     }
 
     private static boolean anyLocalRope(ModelConfig c) {
@@ -157,7 +153,7 @@ public final class CpuBackend implements Backend {
 
     @Override
     public String name() {
-        return "cpu (" + VectorKernels.describe() + (int8 ? ", " + Int8Kernels.describe() : "")
+        return "cpu (" + VectorKernels.describe() + (mm.int8() ? ", " + Int8Kernels.describe() : "")
                 + (DETERMINISTIC ? ", deterministic" : "") + ", " + pool.threads() + " threads)";
     }
 
@@ -244,7 +240,7 @@ public final class CpuBackend implements Backend {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
             // the caller sizes logits by cfg.vocabSize(); the LM head may have fewer (or, padded, more) rows
             int rows = Math.min(w.lmHead.rows, logits.length);
-            matmul(w.lmHead, rows, xb, logits, 0, 1, false);
+            mm.mul(w.lmHead, rows, xb, logits, 0, 1, false);
             float cap = c.finalSoftcap();
             if (cap > 0) {
                 pool.forRange(rows, 4096, (i0, i1) -> {
@@ -285,94 +281,9 @@ public final class CpuBackend implements Backend {
         VectorKernels.scaleMul(in, io, scale, weight, out, oo, width);
     }
 
-    /**
-     * out[t, r] (+)= dot(W[r, :], in[t, :]) for t in [0, n). Decode streams quantized rows straight into FMAs;
-     * prefill dequantizes four rows at a time and reuses them for every token in the batch.
-     */
+    /** {@code out[t, r] (+)= dot(W[r, :], in[t, :])} for {@code t < n}: {@link CpuMatmul#mul}. */
     void matmul(QTensor wt, float[] in, float[] out, int outOff, int n, boolean acc) {
-        matmul(wt, wt.rows, in, out, outOff, n, acc);
-    }
-
-    /** The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0); anything else stays float. */
-    private boolean useInt8(QTensor wt) {
-        return int8 && (wt.type == QType.Q4_0 || wt.type == QType.Q8_0) && wt.cols % QType.BLOCK == 0;
-    }
-
-    /** Quantizes {@code in[off .. off + n)} into the int8 scratch (grown if needed) and returns it; scales are in {@link #xs}. */
-    private short[] quantizeInt8(float[] in, int off, int n) {
-        if (xq == null || xq.length < n) {
-            xq = new short[n];
-            xs = new float[n / QType.BLOCK];
-        }
-        Int8Kernels.quantize(in, off, n, xq, xs);
-        return xq;
-    }
-
-    /** {@link #matmul} over the first {@code rows} rows of {@code wt}; for {@code n > 1} the output row stride stays {@code wt.rows}. */
-    private void matmul(QTensor wt, int rows, float[] in, float[] out, int outOff, int n, boolean acc) {
-        int cols = wt.cols;
-        int stride = wt.rows;
-        if (n == 1) {
-            matmulOne(wt, rows, in, 0, out, outOff, acc);
-            return;
-        }
-        if (DETERMINISTIC) {
-            for (int t = 0; t < n; t++) {
-                matmulOne(wt, rows, in, t * cols, out, outOff + t * stride, acc);
-            }
-            return;
-        }
-        int groups = (rows + 3) / 4;
-        pool.forRange(groups, 1, (g0, g1) -> {
-            float[] tmp = scratch.get();
-            for (int g = g0; g < g1; g++) {
-                int r = g * 4;
-                if (r + 4 <= rows) {
-                    for (int k = 0; k < 4; k++) {
-                        VectorKernels.dequantRow(wt, r + k, tmp, k * cols);
-                    }
-                    int t = 0;
-                    for (; t + 4 <= n; t += 4) {
-                        int xo = t * cols;
-                        int oo = outOff + t * stride + r;
-                        VectorKernels.dot4x4(tmp, 0, cols, in, xo, xo + cols, xo + 2 * cols, xo + 3 * cols,
-                                out, oo, oo + stride, oo + 2 * stride, oo + 3 * stride, acc);
-                    }
-                    for (; t < n; t++) {
-                        VectorKernels.dot4(tmp, 0, cols, in, t * cols, out, outOff + t * stride + r, acc);
-                    }
-                } else {
-                    for (int rr = r; rr < rows; rr++) {
-                        for (int t = 0; t < n; t++) {
-                            float v = VectorKernels.dotRow(wt, rr, in, t * cols);
-                            int o = outOff + t * stride + rr;
-                            out[o] = acc ? out[o] + v : v;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /** The single-token kernel: {@code out[outOff + r] (+)= dot(W[r, :], in[inOff, :])}, parallel over rows. */
-    private void matmulOne(QTensor wt, int rows, float[] in, int inOff, float[] out, int outOff, boolean acc) {
-        if (useInt8(wt)) {
-            short[] xq = quantizeInt8(in, inOff, wt.cols);
-            float[] xs = this.xs;
-            pool.forRange(rows, 16, (r0, r1) -> {
-                for (int r = r0; r < r1; r++) {
-                    float v = Int8Kernels.dotRow(wt, r, xq, xs, 0);
-                    out[outOff + r] = acc ? out[outOff + r] + v : v;
-                }
-            });
-            return;
-        }
-        pool.forRange(rows, 16, (r0, r1) -> {
-            for (int r = r0; r < r1; r++) {
-                float v = VectorKernels.dotRow(wt, r, in, inOff);
-                out[outOff + r] = acc ? out[outOff + r] + v : v;
-            }
-        });
+        mm.mul(wt, wt.rows, in, out, outOff, n, acc);
     }
 
     /** buf[off + t*bias.length + i] += bias[i] for n rows (Qwen2 q/k/v bias). */
@@ -497,9 +408,9 @@ public final class CpuBackend implements Backend {
             route(L.router, xo, e, topK, routerLogits, 0);
         }
         // all selected experts' gate/up rows in one parallel loop
-        if (useInt8(L.expGateUp)) {
-            short[] xq = quantizeInt8(xb, xo, dim);
-            float[] xs = this.xs;
+        if (mm.useInt8(L.expGateUp)) {
+            short[] xq = mm.quantizeInt8(xb, xo, dim);
+            float[] xs = mm.xs();
             pool.forRange(topK * gu, 32, (i0, i1) -> {
                 for (int i = i0; i < i1; i++) {
                     int k = i / gu;
@@ -524,9 +435,9 @@ public final class CpuBackend implements Backend {
                 moeHidden[hi + i] = g / (1f + (float) Math.exp(-g)) * moeGateUp[gi + m + i];
             }
         }
-        if (useInt8(L.expDown)) {
-            short[] xq = quantizeInt8(moeHidden, 0, topK * m);   // slot k starts at block offset k * m
-            float[] xs = this.xs;
+        if (mm.useInt8(L.expDown)) {
+            short[] xq = mm.quantizeInt8(moeHidden, 0, topK * m);   // slot k starts at block offset k * m
+            float[] xs = mm.xs();
             pool.forRange(dim, 8, (r0, r1) -> {
                 for (int r = r0; r < r1; r++) {
                     float sum = 0;

@@ -437,10 +437,12 @@ slow-to-compile full-block form) vs 1.3–3.7 ms float.
 
 ### Where it is used
 
-- **Decode** (`n == 1`): every Q4_0 / Q8_0 linear layer and the LM head (`CpuBackend.useInt8`: Q2_K rows and
+- **Decode** (`n == 1`): every Q4_0 / Q8_0 linear layer and the LM head (`CpuMatmul.useInt8`: Q2_K rows and
   any width that is not a multiple of 32 keep the float `dotRow`). Quantize `in` once, then the parallel row
   loop calls `Int8Kernels.dotRow` instead of `VectorKernels.dotRow`. The MLA, shared-expert and Mamba code
-  paths reach the kernel only through this same `matmul`, so the format check covers them.
+  paths reach the kernel only through this same `CpuMatmul.mul` (one class shared by `CpuBackend`, `MlaCpu` and
+  `MambaCpuBackend`), so the format check covers them. `MambaCpuBackend` takes the switch as a constructor
+  argument like `CpuBackend`; its four-argument constructor is the exact float path the CPU-vs-Metal checks use.
 - **MoE** (per token, any `n`): `xb` is quantized once per token for the gate/up rows, and the 8 expert
   hidden vectors once for the down rows (`k * m` is a multiple of 32, so a slot offset is a block offset).
 - **Prefill** stays on the float path: measured per (row, token), the int8 kernel is slightly *slower* than
