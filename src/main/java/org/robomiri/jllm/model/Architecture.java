@@ -21,6 +21,13 @@ import java.util.Map;
  */
 public sealed interface Architecture permits Decoder, MambaArch {
 
+    /**
+     * Config key written by the GGUF loader and never found in a Hugging Face config: the file's q/k rows were
+     * permuted by llama.cpp's converter for its interleaved RoPE (llama architecture), so the rotary table pairs
+     * {@code 2i} with {@code 2i + 1} instead of {@code i} with {@code i + rotaryDim/2} (docs/16-gguf.md).
+     */
+    String GGUF_INTERLEAVED_ROPE = "jllm_gguf_interleaved_rope";
+
     Core core();
 
     /**

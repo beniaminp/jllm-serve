@@ -31,13 +31,79 @@ public final class QTensor {
     public final int cols;
     public final MemorySegment data;
     public final long scalesOffset;
+    /**
+     * Non-null for a {@linkplain #split split} tensor: the second of its two views ({@link #data} is the first's).
+     * Everything that reads {@code data} / {@link #rowOffset} of a tensor must route through {@link #partOf} and
+     * {@link #partRow} first (the kernels' entry points do) or check {@link #isSplit}.
+     */
+    public final QTensor second;
+    private final QTensor head;
+    /** Split layout: 0 = the rows of {@link #second} follow those of the first view, m > 0 = per expert, m gate then m up rows. */
+    public final int interleave;
 
     private QTensor(QType type, int rows, int cols, MemorySegment data) {
+        this(type, rows, cols, data, null, null, 0);
+    }
+
+    private QTensor(QType type, int rows, int cols, MemorySegment data, QTensor head, QTensor second, int interleave) {
+        this.head = head;
         this.type = type;
         this.rows = rows;
         this.cols = cols;
         this.data = data;
         this.scalesOffset = scalesOffset(type, rows, cols);
+        this.second = second;
+        this.interleave = interleave;
+    }
+
+    /**
+     * A logical matrix whose rows live in two separate views of a GGUF file: a dense MLP's gate and up projections
+     * (rows {@code [0, first.rows)} from {@code first}, the following {@code second.rows} from {@code second};
+     * {@code interleave} 0), or the gate and up experts of a MoE layer ({@code first} and {@code second} are
+     * {@code [experts * m, cols]}; logical row {@code e * 2m + k} is row {@code e * m + k} of {@code first} for
+     * {@code k < m}, else row {@code e * m + k - m} of {@code second}; {@code interleave} = m). It stands in for the
+     * stacked tensor the converter writes without copying either half; the GPU kernels bind the two views
+     * separately, the CPU kernels route each row with {@link #partOf}.
+     */
+    public static QTensor split(QTensor first, QTensor second, int interleave) {
+        if (first.type != second.type || first.cols != second.cols || first.second != null || second.second != null
+                || !first.type.gguf || first.rows != second.rows) {
+            throw new IllegalArgumentException("cannot stack " + first.rows + "x" + first.cols + " " + first.type + " with "
+                    + second.rows + "x" + second.cols + " " + second.type);
+        }
+        if (interleave < 0 || (interleave > 0 && first.rows % interleave != 0)) {
+            throw new IllegalArgumentException("invalid expert width " + interleave + " for " + first.rows + " rows");
+        }
+        return new QTensor(first.type, first.rows + second.rows, first.cols, first.data, first, second, interleave);
+    }
+
+    public boolean isSplit() {
+        return second != null;
+    }
+
+    /** The view that holds logical row {@code r}: {@code this}, or for a split tensor the first view or {@link #second}. */
+    public QTensor partOf(int r) {
+        if (second == null) {
+            return this;
+        }
+        return upHalf(r) ? second : head;
+    }
+
+    /** Row of {@link #partOf}{@code (r)} that is logical row {@code r}. */
+    public int partRow(int r) {
+        if (second == null) {
+            return r;
+        }
+        if (interleave == 0) {
+            return upHalf(r) ? r - rows / 2 : r;
+        }
+        int e = r / (2 * interleave);
+        int k = r % (2 * interleave);
+        return e * interleave + (k >= interleave ? k - interleave : k);
+    }
+
+    private boolean upHalf(int r) {
+        return interleave == 0 ? r >= rows / 2 : r % (2 * interleave) >= interleave;
     }
 
     public int blocksPerRow() {
@@ -210,6 +276,10 @@ public final class QTensor {
 
     /** Dequantizes row {@code r} into {@code dst[off .. off + cols)}. */
     public void dequantizeRow(int r, float[] dst, int off) {
+        if (second != null) {
+            partOf(r).dequantizeRow(partRow(r), dst, off);
+            return;
+        }
         if (type == QType.Q2_K) {
             Q2K.dequantizeRow(data, rowOffset(r), cols, dst, off);
             return;
@@ -248,7 +318,7 @@ public final class QTensor {
     }
 
     public long byteSize() {
-        return data.byteSize();
+        return second == null ? data.byteSize() : data.byteSize() + second.data.byteSize();
     }
 
     static long align(long v, long a) {

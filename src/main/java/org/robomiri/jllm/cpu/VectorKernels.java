@@ -33,6 +33,9 @@ public final class VectorKernels {
 
     /** Dot product of row {@code r} of {@code w} with {@code x[xo .. xo + cols)}. */
     static float dotRow(QTensor w, int r, float[] x, int xo) {
+        if (w.second != null) {
+            return dotRow(w.partOf(r), w.partRow(r), x, xo);
+        }
         if (w.type == QType.Q2_K) {
             return Q2KKernels.dot(w, r, x, xo);
         }
@@ -110,6 +113,10 @@ public final class VectorKernels {
 
     /** Dequantizes row {@code r} into {@code dst[off .. off + cols)} using SIMD conversions. */
     static void dequantRow(QTensor w, int r, float[] dst, int off) {
+        if (w.second != null) {
+            dequantRow(w.partOf(r), w.partRow(r), dst, off);
+            return;
+        }
         if (w.type == QType.Q2_K) {
             Q2KKernels.dequant(w, r, dst, off);
             return;

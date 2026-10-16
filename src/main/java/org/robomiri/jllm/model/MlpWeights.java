@@ -9,7 +9,7 @@ public sealed interface MlpWeights permits MlpWeights.Dense, MlpWeights.Moe {
     boolean matches(Mlp spec, int dim);
 
     /** The tensors the spec asks for, under {@code p} ({@code model.layers.N.}). */
-    static MlpWeights load(QuantFile f, String p, Mlp spec) {
+    static MlpWeights load(TensorSource f, String p, Mlp spec) {
         return switch (spec) {
             case Mlp.Dense d -> new Dense(f.tensor(p + "mlp.gate_up"), f.tensor(p + "mlp.down_proj.weight"));
             case Mlp.Moe m -> Moe.load(f, p, m);
@@ -48,7 +48,7 @@ public sealed interface MlpWeights permits MlpWeights.Dense, MlpWeights.Moe {
      */
     record Moe(float[] router, float[] routerBias, QTensor expGateUp, QTensor expDown, Dense shared) implements MlpWeights {
 
-        static Moe load(QuantFile f, String p, Mlp.Moe m) {
+        static Moe load(TensorSource f, String p, Mlp.Moe m) {
             boolean bias = m.router() instanceof Router.DeepSeek r && r.hasBias();
             Dense shared = m.shared() == null ? null
                     : new Dense(f.tensor(p + "mlp.shared.gate_up"), f.tensor(p + "mlp.shared.down"));

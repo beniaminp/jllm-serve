@@ -13,7 +13,7 @@ package org.robomiri.jllm.model;
 public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNorm, float[] postMlpNorm,
                            AttnWeights attn, QTensor wo, MlpWeights mlp) implements LayerWeights {
 
-    static DecoderLayer load(QuantFile f, String p, LayerSpec s) {
+    static DecoderLayer load(TensorSource f, String p, LayerSpec s) {
         LayerSpec.Norms n = s.norms();
         return new DecoderLayer(
                 f.floats(p + "input_layernorm.weight"),

@@ -97,13 +97,20 @@ final class Families {
 
     /** Llama 3.x: the reference decoder, every default of {@link Draft} is Llama's (rotate-half RoPE, llama3 scaling read generically). */
     private static Decoder llama(Draft d) {
-        return d.build();
+        return ggufRope(d).build();
     }
 
     /** Mistral: {@code sliding_window} applies to every layer. */
     private static Decoder mistral(Draft d) {
         d.window = Draft.Window.ALL;
-        return d.build();
+        return ggufRope(d).build();
+    }
+
+    private static Draft ggufRope(Draft d) {
+        if (Json.bool(d.c, Architecture.GGUF_INTERLEAVED_ROPE, false)) {
+            d.pairing = Pairing.INTERLEAVED;
+        }
+        return d;
     }
 
     /** Qwen2 / 2.5: q/k/v biases (the config omits the key); the window on layers >= {@code max_window_layers} only with {@code use_sliding_window}. */

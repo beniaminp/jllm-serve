@@ -9,7 +9,7 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
     boolean matches(Attention spec, int dim);
 
     /** The tensors the spec asks for, under {@code a} ({@code model.layers.N.self_attn.}). */
-    static AttnWeights load(QuantFile f, String a, Attention spec) {
+    static AttnWeights load(TensorSource f, String a, Attention spec) {
         return switch (spec) {
             case Attention.Gqa g -> Gqa.load(f, a, g);
             case Attention.Mla m -> Mla.load(f, a, m);
@@ -24,7 +24,7 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
     record Gqa(QTensor wq, QTensor wk, QTensor wv, float[] bq, float[] bk, float[] bv, float[] qNorm, float[] kNorm)
             implements AttnWeights {
 
-        static Gqa load(QuantFile f, String a, Attention.Gqa g) {
+        static Gqa load(TensorSource f, String a, Attention.Gqa g) {
             return new Gqa(f.tensor(a + "q_proj.weight"), f.tensor(a + "k_proj.weight"), f.tensor(a + "v_proj.weight"),
                     g.bias() ? f.floats(a + "q_proj.bias") : null,
                     g.bias() ? f.floats(a + "k_proj.bias") : null,
@@ -89,7 +89,7 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
             }
         }
 
-        static Mla load(QuantFile f, String a, Attention.Mla m) {
+        static Mla load(TensorSource f, String a, Attention.Mla m) {
             Query q = m.qLoraRank() > 0
                     ? new Lora(f.tensor(a + "q_a_proj.weight"), f.floats(a + "q_a_layernorm.weight"), f.tensor(a + "q_b_proj.weight"))
                     : new Proj(f.tensor(a + "q_proj.weight"));

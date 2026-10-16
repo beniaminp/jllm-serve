@@ -19,12 +19,16 @@ public final class ModelWeights implements AutoCloseable {
     public final QTensor lmHead;
     public final LayerWeights[] layers;
     public final float[] finalNorm;
-    private final QuantFile file;
+    private final TensorSource file;
+    private final AutoCloseable owner;
+    private final long bytes;
 
-    private ModelWeights(Architecture arch, QType quant, QuantFile file) {
+    private ModelWeights(Architecture arch, QType quant, TensorSource file, AutoCloseable owner, long bytes) {
         this.arch = arch;
         this.quant = quant;
         this.file = file;
+        this.owner = owner;
+        this.bytes = bytes;
         Architecture.Core c = arch.core();
         boolean mamba = arch instanceof MambaArch;
         embed = file.tensor(mamba ? "backbone.embeddings.weight" : "model.embed_tokens.weight");
@@ -89,7 +93,20 @@ public final class ModelWeights implements AutoCloseable {
         return (MambaLayer) layers[l];
     }
 
-    static final String STALE_HINT = " (stale cache)";
+    /** Appended to a shape-mismatch message of a converted cache (the remedy there is to reconvert). */
+    public static final String STALE_HINT = " (stale cache)";
+
+    /**
+     * Weights read from any {@link TensorSource} (a GGUF file): the same loading and shape checks as for a converted
+     * cache. {@code owner} is closed with the weights and releases the memory behind the tensors.
+     *
+     * @param quant a label for the dominant weight format (informational)
+     * @param bytes the size of the file(s) behind the weights
+     * @throws IllegalArgumentException if a tensor is missing or does not match {@code arch}
+     */
+    public static ModelWeights of(Architecture arch, QType quant, TensorSource source, AutoCloseable owner, long bytes) {
+        return new ModelWeights(arch, quant, source, owner, bytes);
+    }
 
     /** Local checkpoint: no repo / revision is recorded or checked. See {@link #load(Path, Architecture, QType, ShardProvider, String)}. */
     public static ModelWeights load(Path dir, Architecture arch, QType quant, ShardProvider shards) throws IOException {
@@ -126,7 +143,7 @@ public final class ModelWeights implements AutoCloseable {
                         throw new QuantFile.StaleCacheException("it was converted from "
                                 + (file.identity() == null ? "local files" : file.identity().name()) + ", not " + id.name());
                     }
-                    ModelWeights w = new ModelWeights(arch, quant, file);
+                    ModelWeights w = new ModelWeights(arch, quant, file, file::close, file.byteSize());
                     System.err.printf("Mapped %s weights (%s, %.0f MB) in %.2fs%n", arch.core().architecture(), quant,
                             file.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
                     return w;
@@ -153,11 +170,17 @@ public final class ModelWeights implements AutoCloseable {
     }
 
     public long byteSize() {
-        return file.byteSize();
+        return bytes;
     }
 
     @Override
     public void close() {
-        file.close();
+        try {
+            owner.close();
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

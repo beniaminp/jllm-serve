@@ -19,7 +19,7 @@ package org.robomiri.jllm.model;
 public record MambaLayer(float[] norm, QTensor inProj, float[] conv, float[] convBias, QTensor xProj, float[] dtProj,
                          float[] dtBias, float[] a, float[] d, QTensor outProj) implements LayerWeights {
 
-    static MambaLayer load(QuantFile f, String p, MambaArch m) {
+    static MambaLayer load(TensorSource f, String p, MambaArch m) {
         String q = p + "mixer.";
         MambaLayer L = new MambaLayer(f.floats(p + "norm.weight"), f.tensor(q + "in_proj.weight"),
                 f.floats(q + "conv1d.weight"), f.has(q + "conv1d.bias") ? f.floats(q + "conv1d.bias") : new float[m.dInner()],

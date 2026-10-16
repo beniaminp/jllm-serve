@@ -31,7 +31,7 @@ import java.util.Map;
  * {@link #LAYOUT_VERSION}, a blob that does not fit the file — is reported as a {@link StaleCacheException},
  * which {@link ModelWeights#load} answers by deleting the files and converting again.
  */
-public final class QuantFile implements AutoCloseable {
+public final class QuantFile implements TensorSource, AutoCloseable {
 
     /** Format of the two files themselves (blob layout, index schema). */
     public static final int VERSION = 1;
@@ -272,11 +272,13 @@ public final class QuantFile implements AutoCloseable {
         }
     }
 
+    @Override
     public boolean has(String name) {
         return entries.containsKey(name);
     }
 
     /** A quantized tensor as a view of the mapped file; {@code name} must not be an F32 entry (see {@link #floats}). */
+    @Override
     public QTensor tensor(String name) {
         Entry e = entry(name);
         if (e.type().equals("F32")) {
@@ -286,6 +288,7 @@ public final class QuantFile implements AutoCloseable {
     }
 
     /** An F32 entry copied into a new array. */
+    @Override
     public float[] floats(String name) {
         Entry e = entry(name);
         if (!e.type().equals("F32")) {
