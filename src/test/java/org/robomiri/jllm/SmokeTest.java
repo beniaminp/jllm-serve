@@ -55,6 +55,7 @@ public final class SmokeTest {
         phi3Configs();
         GemmaChecks.run();
         mamba();
+        kvCacheAttention();
         prefixReuse(dir);
         deepseekConfigs();
         System.out.println("all smoke tests passed");
@@ -913,6 +914,117 @@ public final class SmokeTest {
         }
         check(Math.abs(outs[3] - 0.7310586f) < 1e-6 && outs[0] == 0f && outs[1] == 0f && outs[2] == 0f,
                 "conv tap 0 sees the input d_conv-1 tokens back");
+    }
+
+    /**
+     * The KV cache's tiled prefill attention against its per-token decode path (same kernels, so the same bits are
+     * expected once both are compiled; the check tolerates the last bit because the interpreter's lane reduction
+     * order differs from C2's) and against a double-precision reference, for f32 and f16 caches, with and without a
+     * sliding window and soft-capping.
+     */
+    static void kvCacheAttention() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-kv");
+        try {
+            ModelConfig cfg = cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":128,\"intermediate_size\":64,"
+                    + "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"vocab_size\":32}");
+            int ctx = 40;
+            int n = 23; // several tiles of the f32 and f16 kernels (8 and 8 tokens per tile at this ctx)
+            int hd = cfg.headDim();
+            int qDim = cfg.qDim();
+            int kvDim = cfg.kvDim();
+            Random rnd = new Random(7);
+            float[] k = new float[n * kvDim];
+            float[] v = new float[n * kvDim];
+            float[] q = new float[n * qDim];
+            for (int i = 0; i < k.length; i++) {
+                k[i] = rnd.nextFloat() * 2 - 1;
+                v[i] = rnd.nextFloat() * 2 - 1;
+            }
+            for (int i = 0; i < q.length; i++) {
+                q[i] = (rnd.nextFloat() * 2 - 1) * 3;
+            }
+            try (org.robomiri.jllm.cpu.ThreadPool pool = new org.robomiri.jllm.cpu.ThreadPool(3)) {
+                for (org.robomiri.jllm.model.KvDtype dtype : org.robomiri.jllm.model.KvDtype.values()) {
+                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, cfg, ctx);
+                    kv.store(0, 0, k, v, n);
+                    for (int window : new int[]{0, 6}) {
+                        for (float softcap : new float[]{0f, 5f}) {
+                            float scale = 0.2f;
+                            float[] prefill = new float[n * qDim];
+                            float[] decode = new float[n * qDim];
+                            float[] one = new float[qDim];
+                            float[] qt = new float[qDim];
+                            for (int rep = 0; rep < 3; rep++) { // warm the kernels so both paths run compiled code
+                                kv.attention(pool, 0, n, 0, q, prefill, window, scale, softcap);
+                                for (int t = 0; t < n; t++) {
+                                    System.arraycopy(q, t * qDim, qt, 0, qDim);
+                                    kv.attention(pool, 0, 1, t, qt, one, window, scale, softcap);
+                                    System.arraycopy(one, 0, decode, t * qDim, qDim);
+                                }
+                            }
+                            // double-precision reference on the stored (possibly f16-rounded) rows
+                            float[] ks = new float[n * kvDim];
+                            float[] vs = new float[n * kvDim];
+                            for (int i = 0; i < ks.length; i++) {
+                                ks[i] = dtype == org.robomiri.jllm.model.KvDtype.F16
+                                        ? Float.float16ToFloat(Float.floatToFloat16(k[i])) : k[i];
+                                vs[i] = dtype == org.robomiri.jllm.model.KvDtype.F16
+                                        ? Float.float16ToFloat(Float.floatToFloat16(v[i])) : v[i];
+                            }
+                            double maxRef = 0;
+                            double maxPd = 0;
+                            int exact = 0;
+                            int group = cfg.heads() / cfg.kvHeads();
+                            for (int t = 0; t < n; t++) {
+                                int len = t + 1;
+                                int first = window > 0 ? Math.max(0, len - window) : 0;
+                                for (int h = 0; h < cfg.heads(); h++) {
+                                    int ko = (h / group) * hd;
+                                    double[] sc = new double[len];
+                                    double max = Double.NEGATIVE_INFINITY;
+                                    for (int s = first; s < len; s++) {
+                                        double d = 0;
+                                        for (int i = 0; i < hd; i++) {
+                                            d += (double) q[t * qDim + h * hd + i] * ks[s * kvDim + ko + i];
+                                        }
+                                        d *= scale;
+                                        if (softcap > 0) {
+                                            d = Math.tanh(d / softcap) * softcap;
+                                        }
+                                        sc[s] = d;
+                                        max = Math.max(max, d);
+                                    }
+                                    double sum = 0;
+                                    for (int s = first; s < len; s++) {
+                                        sc[s] = Math.exp(sc[s] - max);
+                                        sum += sc[s];
+                                    }
+                                    for (int i = 0; i < hd; i++) {
+                                        double o = 0;
+                                        for (int s = first; s < len; s++) {
+                                            o += sc[s] / sum * vs[s * kvDim + ko + i];
+                                        }
+                                        int idx = t * qDim + h * hd + i;
+                                        maxRef = Math.max(maxRef, Math.abs(o - prefill[idx]));
+                                        maxPd = Math.max(maxPd, Math.abs(prefill[idx] - decode[idx]));
+                                        if (prefill[idx] == decode[idx]) {
+                                            exact++;
+                                        }
+                                    }
+                                }
+                            }
+                            String what = dtype + " window=" + window + " softcap=" + softcap;
+                            check(maxRef < 2e-6, "kv attention " + what + " vs double reference: max diff " + maxRef);
+                            check(maxPd < 1e-7, "kv attention " + what + " tiled prefill vs decode: max diff " + maxPd
+                                    + ", " + exact + "/" + (n * qDim) + " bit-identical");
+                        }
+                    }
+                }
+            }
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
     }
 
     /** A backend that records the (pos, n) of every forward() and always predicts token 0. */

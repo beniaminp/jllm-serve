@@ -329,55 +329,9 @@ public final class CpuBackend implements Backend {
         }
     }
 
-    /** Causal grouped-query attention for tokens at positions [pos, pos+n). */
+    /** Causal grouped-query attention for tokens at positions [pos, pos+n): {@link KvCache#attention}. */
     private void attention(int layer, int n, int pos) {
-        if (kv instanceof KvCache.F16 half) {
-            half.attention(pool, layer, n, pos, q, att, c.windowFor(layer), c.attnScale(), c.attnSoftcap());
-            return;
-        }
-        float[] kc = ((KvCache.F32) kv).key[layer];
-        float[] vc = ((KvCache.F32) kv).val[layer];
-        int hd = c.headDim();
-        int nh = c.heads();
-        int kvDim = c.kvDim();
-        int qDim = c.qDim();
-        int group = nh / c.kvHeads();
-        float scale = c.attnScale();
-        float softcap = c.attnSoftcap();
-        int window = c.windowFor(layer); // 0 = full causal attention
-        // one (token, head) pair per task: the work per pair grows with t, so contiguous chunks of pairs would
-        // leave the heaviest work to the last few tasks; a fine grain keeps the tail short
-        pool.forRangeFine(n * nh, 1, (i0, i1) -> {
-            float[] sc = scratch.get();
-            for (int i = i0; i < i1; i++) {
-                int t = i / nh;
-                int h = i % nh;
-                int ko = (h / group) * hd;
-                int qo = t * qDim + h * hd;
-                int len = pos + t + 1;
-                int first = window > 0 ? Math.max(0, len - window) : 0;
-                float max = Float.NEGATIVE_INFINITY;
-                for (int s = first; s < len; s++) {
-                    float d = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;
-                    if (softcap > 0) {
-                        d = (float) Math.tanh(d / softcap) * softcap;
-                    }
-                    sc[s] = d;
-                    max = Math.max(max, d);
-                }
-                float sum = 0;
-                for (int s = first; s < len; s++) {
-                    float e = (float) Math.exp(sc[s] - max);
-                    sc[s] = e;
-                    sum += e;
-                }
-                float inv = 1f / sum;
-                Arrays.fill(att, qo, qo + hd, 0f);
-                for (int s = first; s < len; s++) {
-                    VectorKernels.axpy(sc[s] * inv, vc, s * kvDim + ko, att, qo, hd);
-                }
-            }
-        });
+        kv.attention(pool, layer, n, pos, q, att, c.windowFor(layer), c.attnScale(), c.attnSoftcap());
     }
 
     /**

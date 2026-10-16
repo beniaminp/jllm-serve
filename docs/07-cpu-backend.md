@@ -223,23 +223,51 @@ decode reaches ~17 on the same hardware. Rows left over when `rows % 4 != 0` fal
 
 ---
 
-## 7.5 Attention (`CpuBackend.attention`)
+## 7.5 Attention (`KvCache.attention`)
 
-Work is split over `(token, head)` pairs — `n × 16` of them — so even decode (`n = 1`) keeps all cores busy.
-For each pair, with `len = pos + t + 1` cached positions and the thread-local scratch `sc`:
+The attention loop lives with the cache (`KvCache.F32` / `KvCache.F16`, [7.13](#713-the-f16-kv-cache-kvcache));
+`CpuBackend` only passes the layer's window, scale and soft-cap. For one query head with `len = pos + t + 1`
+cached positions and the thread-local scratch `sc`, the math is:
 
 ```java
-for s < len:  sc[s] = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;  max = max(max, sc[s])
+for s < len:  sc[s] = VectorKernels.dot(q, qo, K[s], hd) * scale;  max = max(max, sc[s])     // (softcap: tanh(s/cap)*cap)
 for s < len:  sc[s] = exp(sc[s] - max);  sum += sc[s]
 Arrays.fill(att, qo, qo + hd, 0)
-for s < len:  VectorKernels.axpy(sc[s] / sum, vc, s * kvDim + ko, att, qo, hd)     // att += w_s · v_s
+for s < len:  VectorKernels.axpy(sc[s] * (1 / sum), V[s], att, qo, hd)                      // att += w_s · v_s
 ```
 
 `dot` is a two-accumulator SIMD dot product (two independent FMA chains hide the FMA latency); `axpy` is
 `y += a·x` over 128 floats (32 FMA instructions). `Math.exp` is scalar and ~20 ns each — at `len = 4096` and
-16 heads that is 1.3 ms per layer per token, a visible share of the step; a vectorized exp is a known next step.
-The scratch array holds `ctx` scores, so no allocation happens per call. `ko = (h / group) * hd` selects the
-shared KV head (GQA).
+16 heads that is 1.3 ms per layer per token, a visible share of the step ([7.15](#715-fast-math-jllmcpufastmath)
+has the vectorized alternative). `ko = (h / group) * hd` selects the shared KV head (GQA).
+
+**Decode (`n == 1`, f32)** runs exactly that loop with one task per query head (16 tasks), the finest split a
+single token allows.
+
+**Prefill (`n > 1`) is tiled.** A K row of the cache is `kvDim × 4 B`; one layer's K at `ctx = 4096` is 16 MB,
+so with one task per `(token, head)` every K and V row was streamed from L3/DRAM `n × heads` times per layer.
+`attentionTiled` instead makes one task per `(kv head, tile of up to 8 consecutive tokens)` — the tile serves
+`tile × group` query heads — and runs three passes over the keys:
+
+```
+for s in [sMin, sMax):                                   sMin/sMax: the union of the tile's causal (and window) ranges
+    K[s] (f32: in place; f16: expanded once into scratch)
+    for each token t of the tile with first_t <= s < len_t, for h < group:
+        sc[row(t,h) * ctx + s] = dot(q[t][g*group+h], K[s]) * scale        // the same dot, same bits
+for each (t, h): max, exp, sum over sc[row * ctx + first_t .. len_t) in ascending s; inv = 1/sum; att[t][h] = 0
+for s in [sMin, sMax):
+    V[s] (in place / expanded once)
+    for each (t, h) that sees s:  axpy(sc[row * ctx + s] * inv, V[s], att[t][h])                  // ascending s
+```
+
+Each K and V row is now read (f32) or converted (f16) once per `tile × group` dot products instead of once
+each. Per output element the arithmetic is unchanged — the same `dot` over `headDim`, the max and the sum over
+the keys in ascending order, the same ascending `axpy` chain — so the tiled kernel is bit-identical to the
+per-head loop (`SmokeTest.kvCacheAttention` checks tiled prefill against per-token decode and against a
+double-precision reference, for f32 and f16, with and without window and soft-cap). The tile size is 8 tokens
+when `group × ctx` score rows fit in 32 K floats per thread (`ctx ≤ 2048` at `group = 2`), halving down to one
+token at long contexts, so the per-thread scratch stays near 128 KB. Tasks are handed out heaviest tile first
+(`forRangeFine`, chunk 1): later tokens see more keys, and the fine grain keeps the tail short.
 
 ---
 
@@ -493,14 +521,14 @@ In order of expected payoff on this CPU:
 ## 7.13 The f16 KV cache (`KvCache`)
 
 `backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation. The storage lives in `cpu/KvCache.java`
-with two implementations; `CpuBackend` only knows `kv.store(...)` and, for f32, the raw arrays:
+with two implementations; `CpuBackend` only knows `kv.store(...)` and `kv.attention(...)`:
 
 | | `KvCache.F32` (default) | `KvCache.F16` |
 |---|---|---|
 | storage per layer | `float[ctx × kvDim]` for K and for V | `short[ctx × kvDim]` for K and for V |
 | 0.6B at `ctx = 4096` | 940 MB | **470 MB** |
 | `store` | `System.arraycopy` of the staged rows | `Float.floatToFloat16` per value (round-to-nearest-even) |
-| attention | `CpuBackend.attention` on the arrays, unchanged | `KvCache.F16.attention` |
+| attention | `KvCache.F32.attention`: rows read in place | `KvCache.F16.attention`: rows expanded into scratch |
 
 **Why staging buffers.** The k/v projections used to write straight into the cache and `normRope` ran in place
 on the cached row. With an f16 cache that would round k *before* RoPE and again after it. Instead both backends
@@ -511,22 +539,12 @@ way, which is why the two backends' f16 outputs are identical. The f32 path pays
 
 **The f16 attention loop.** `Float.float16ToFloat` is a JIT intrinsic (`fcvt` on NEON, F16C on x86) and C2
 auto-vectorizes the plain conversion loop, but the Vector API has no half-float lane type, so the SIMD `dot`
-and `axpy` cannot read `short[]` directly. The loop therefore expands each cached row slice into thread-local
-scratch and reuses the f32 kernels — and to convert as little as possible it is organized per **(token,
-kv-head)** rather than per (token, head):
-
-```
-for each (t, g) pair:                                  g = kv head, serving query heads g·group … g·group+group−1
-    for s < len:   expand K[s][g] → sc[kRow]  (128 shorts → floats, once)
-                   for h < group:  sc[h·ctx + s] = dot(q[t][g·group+h], sc[kRow]) · scale      (SIMD, as before)
-    per head:      softmax over sc[h·ctx .. h·ctx+len), 1/sum kept in sc[inv + h];  att[t][head] = 0
-    for s < len:   expand V[s][g] → sc[vRow]  (once)
-                   for h < group:  axpy(sc[h·ctx+s] · sc[inv+h], sc[vRow], att[t][g·group+h])
-```
-
-With `group = 2` (16 query heads over 8 KV heads) each cached value is converted once for two heads. The
-per-thread scratch is `group × ctx + 2 × headDim + group` floats (33 KB at `ctx = 4096`), allocated once. The
-work items per layer drop from `n × 16` to `n × 8`, which on 10 cores costs nothing measurable for decode.
+and `axpy` cannot read `short[]` directly. The f16 cache therefore runs the tiled kernel of
+[7.5](#75-attention-kvcacheattention) for every `n`, with `expand` converting each K / V row slice
+(`headDim` shorts → floats) into thread-local scratch once per tile: for decode that is once per kv head
+(`group = 2` query heads share it), for prefill once per `tile × group` query heads. The per-thread scratch is
+`tile × group × ctx + 2 × headDim + tile × group` floats, allocated once. Decode has `kvHeads` tasks per layer
+instead of the f32 path's `heads`, which on 10 cores costs nothing measurable.
 
 **Precision.** f16 keeps 11 significant bits (about 3 decimal digits) and a range of ±65 504; K and V values
 after QK-norm and RoPE are O(1), so nothing overflows and the rounding error is ~5 × 10⁻⁴ relative per value,
