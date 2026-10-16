@@ -678,7 +678,7 @@ public final class HttpServer implements AutoCloseable {
             }
             sb.append((char) c);
             if (sb.length() > MAX_HEADER) {
-                throw new IOException("line too long");
+                throw new HttpError(431, "request line or header longer than " + MAX_HEADER + " bytes");
             }
         }
         return sb.isEmpty() ? null : sb.toString();

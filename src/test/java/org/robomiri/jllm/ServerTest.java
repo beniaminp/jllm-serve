@@ -82,6 +82,9 @@ public final class ServerTest {
                 + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7fffffffffffffff\r\n";
         r = f.exchange(chunked.getBytes(StandardCharsets.ISO_8859_1));
         check(r.status == 413, "chunk size 0x7fffffffffffffff after 5 bytes: 413 (got " + r.status + ")");
+        // L4: one header line beyond the 64 KB limit
+        r = f.exchange(request("GET", "/health", null, "X-Long: " + "y".repeat(70 * 1024)));
+        check(r.status == 431, "70 KB header line: 431 (got " + r.status + ")");
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */
