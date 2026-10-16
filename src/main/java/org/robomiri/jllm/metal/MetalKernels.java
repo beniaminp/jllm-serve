@@ -164,12 +164,16 @@ final class MetalKernels implements AutoCloseable {
         metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
-    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k). */
+    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k, and q4g / q8g / q4k / q5k for GGUF tensors). */
     static String kernel(String base, QType type, String suffix) {
         String qt = switch (type) {
             case Q4_0 -> "q4";
             case Q8_0 -> "q8";
             case Q2_K -> "q2k";
+            case Q4_0G -> "q4g";
+            case Q8_0G -> "q8g";
+            case Q4_K -> "q4k";
+            case Q5_K -> "q5k";
         };
         return base + "_" + qt + suffix;
     }

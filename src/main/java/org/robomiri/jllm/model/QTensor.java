@@ -77,6 +77,28 @@ public final class QTensor {
     }
 
     /**
+     * Wraps the bytes of a ggml tensor in place: {@code rows} rows of {@code cols / blockSize} contiguous blocks of
+     * {@code type} (a {@link QType#gguf} type or {@link QType#Q2_K}, whose block layout is llama.cpp's), exactly
+     * {@code rows * cols / blockSize * blockBytes} bytes, with no padding. The segment need not be page aligned.
+     */
+    public static QTensor mapped(QType type, int rows, int cols, MemorySegment data) {
+        if (type.scaleBytes != 0 || cols % type.blockSize != 0) {
+            throw new IllegalArgumentException(type + " cannot view a " + rows + "x" + cols + " ggml tensor");
+        }
+        long expect = (long) rows * (cols / type.blockSize) * type.blockBytes;
+        if (data.byteSize() != expect) {
+            throw new IllegalArgumentException("segment of " + data.byteSize() + " bytes does not match " + rows + "x"
+                    + cols + " " + type + " (" + expect + ")");
+        }
+        return new QTensor(type, rows, cols, data);
+    }
+
+    /** True if this tensor is a view of a GGUF file's bytes (not the engine's page-padded layout). */
+    public boolean isMapped() {
+        return type.gguf;
+    }
+
+    /**
      * Per-thread scratch for {@link #quantize}: each row is quantized into on-heap arrays and copied out with
      * two bulk copies, instead of one bounds-checked segment access per quantized byte. The arrays are grown on
      * demand and kept, so quantizing a model's thousands of tensors allocates them once per worker thread.
@@ -104,6 +126,9 @@ public final class QTensor {
     }
 
     public static QTensor quantize(Arena arena, QType type, int rows, int cols, RowSource src) {
+        if (type.gguf) {
+            throw new IllegalArgumentException(type + " is a view of GGUF data; the engine does not quantize to it");
+        }
         if (cols % QType.BLOCK != 0) {
             throw new IllegalArgumentException("cols " + cols + " is not a multiple of " + QType.BLOCK);
         }
@@ -187,6 +212,17 @@ public final class QTensor {
     public void dequantizeRow(int r, float[] dst, int off) {
         if (type == QType.Q2_K) {
             Q2K.dequantizeRow(data, rowOffset(r), cols, dst, off);
+            return;
+        }
+        if (type.gguf) {
+            long row = rowOffset(r);
+            switch (type) {
+                case Q4_0G -> Ggml.dequantQ4_0(data, row, cols, dst, off);
+                case Q8_0G -> Ggml.dequantQ8_0(data, row, cols, dst, off);
+                case Q4_K -> Ggml.dequantQ4_K(data, row, cols, dst, off);
+                case Q5_K -> Ggml.dequantQ5_K(data, row, cols, dst, off);
+                default -> throw new IllegalStateException(type.name());
+            }
             return;
         }
         int nb = blocksPerRow();
