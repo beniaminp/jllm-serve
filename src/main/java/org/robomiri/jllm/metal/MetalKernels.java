@@ -118,8 +118,9 @@ final class MetalKernels implements AutoCloseable {
         return metal.newBuffer(bytes, false);
     }
 
+    /** Zero-copy buffer over a weight tensor's bytes (page aligned, or a slice of a mapped GGUF file). */
     Metal.Buffer wrap(MemorySegment seg) {
-        return metal.wrap(seg);
+        return metal.wrapRange(seg);
     }
 
     /**
@@ -151,7 +152,7 @@ final class MetalKernels implements AutoCloseable {
 
     private void bind(int i, Metal.Buffer b, long offset) {
         bufArgs.setAtIndex(ValueLayout.ADDRESS, i, b.handle());
-        offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset);
+        offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset + b.offset());
     }
 
     private void bindOrDummy(int i, Metal.Buffer b) {
@@ -259,11 +260,20 @@ final class MetalKernels implements AutoCloseable {
     void matmul3(QTensor wq, Metal.Buffer bwq, QTensor wk, Metal.Buffer bwk, QTensor wv, Metal.Buffer bwv,
                  Metal.Buffer in, Metal.Buffer norm, Metal.Buffer qOut, Metal.Buffer kOut, long kOff,
                  Metal.Buffer vOut, long vOff, boolean vHalf, Metal.Buffer bq, Metal.Buffer bk, Metal.Buffer bv, int n) {
-        if (wq.type != wk.type || wk.type != wv.type || wq.cols != wk.cols || wk.cols != wv.cols) {
-            throw new IllegalStateException("q/k/v projections differ in type or width"); // the loader guarantees they match
+        if (wq.cols != wk.cols || wk.cols != wv.cols) {
+            throw new IllegalStateException("q/k/v projections differ in width"); // the loader guarantees they match
         }
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
+        }
+        if (wq.type != wk.type || wk.type != wv.type) {
+            // A GGUF file may quantize the three projections differently (Q4_K_M: v in Q6_K in half the layers),
+            // and a kernel instantiation has one block format: one single-matrix dispatch per projection, each
+            // with the kernel of its own type, writing where the fused dispatch would.
+            matmul3Part(wq, bwq, in, norm, qOut, 0, null, false, bq, 0, n);
+            matmul3Part(wk, bwk, in, norm, kOut, kOff, null, false, bk, 1, n);
+            matmul3Part(wv, bwv, in, norm, null, 0, vOut, vHalf, bv, 2, n);
+            return;
         }
         bind(0, bwq, 0);
         bind(1, bwq, scaleOff(wq));
@@ -289,6 +299,44 @@ final class MetalKernels implements AutoCloseable {
         } else {
             dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
                     rowGrid(rows), tokTiles(n), 1, MM_THREADS, 1, 1);
+        }
+    }
+
+    /**
+     * One projection of {@link #matmul3} as a dispatch of its own: {@code which} 0 / 1 = q / k (float output at
+     * {@code out}, {@code outOff}), 2 = v (rows past the first two ranges, written to {@code vOut} as half when
+     * {@code vHalf}). The unused weight bindings point at the same buffer; their row ranges are empty.
+     */
+    private void matmul3Part(QTensor w, Metal.Buffer bw, Metal.Buffer in, Metal.Buffer norm, Metal.Buffer out, long outOff,
+                             Metal.Buffer vOut, boolean vHalf, Metal.Buffer bias, int which, int n) {
+        bind(0, bw, 0);
+        bind(1, bw, scaleOff(w));
+        bind(2, bw, 0);
+        bind(3, bw, scaleOff(w));
+        bind(4, bw, 0);
+        bind(5, bw, scaleOff(w));
+        bind(6, in, 0);
+        if (which == 2) {
+            bind(7, in, 0);   // out0 / out1 are not written: their row ranges are empty
+            bind(8, in, 0);
+            bind(9, vOut, 0);
+        } else {
+            bind(7, out, outOff);
+            bind(8, out, outOff);
+            bind(9, out, outOff);
+        }
+        bindOrDummy(10, norm);
+        bindOrDummy(11, which == 0 ? bias : null);
+        bindOrDummy(12, which == 1 ? bias : null);
+        bindOrDummy(13, which == 2 ? bias : null);
+        p.reset(KernelParams.MATMUL3).i(which == 0 ? w.rows : 0).i(which == 1 ? w.rows : 0).i(which == 2 ? w.rows : 0)
+                .i(w.cols).i(n).f(eps).i(bias != null);
+        String vh = which == 2 && vHalf ? "_h" : "";
+        if (norm == null && n >= PREFILL_MIN_TOKENS) {
+            dispatch(kernel("matmul3_pf", w.type, vh), 14, 0, pfGrid(w.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else {
+            dispatch(kernel("matmul3", w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
+                    rowGrid(w.rows), tokTiles(n), 1, MM_THREADS, 1, 1);
         }
     }
 

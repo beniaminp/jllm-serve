@@ -283,11 +283,24 @@ static inline float q8_block_dot(thread const char4 *pk, thread const float4 *x4
     return d;
 }
 
+// GGUF block types (QT >= GG_FIRST, the GGUF section at the end of the file)
+#define GG_FIRST 20
+template <int QT, typename XP>
+static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                               thread float *acc, ushort lane);
+template <int QT, int NR, int TT>
+static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                                device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
+
 template <int QT, typename XP>
 static inline void mm_row(device const uchar *wq, device const float *ws, ulong grow, int nb,
                           XP x, ulong xstride, int nt, thread float *acc, ushort lane) {
     if (QT == 2) {
         mm_row_q2k(wq, grow, nb, x, xstride, nt, acc, lane);
+        return;
+    }
+    if (QT >= GG_FIRST) {
+        mm_row_gguf<QT>(wq, grow, nb, x, xstride, nt, acc, lane);
         return;
     }
     device const float *rs = ws + grow * nb;
@@ -518,6 +531,10 @@ static inline void mm_tile(thread device const uchar *const *wq, thread device c
                            thread float (*acc)[TT], ushort lane) {
     if (QT == 2) {
         mm_tile_q2k<NR, TT>(wq, grow, nr, nb, x, xstride, nt, acc, lane);
+        return;
+    }
+    if (QT >= GG_FIRST) {
+        mm_tile_gguf<QT, NR, TT>(wq, grow, nr, nb, x, xstride, nt, acc, lane);
         return;
     }
     if (QT == 4) {
@@ -1866,3 +1883,150 @@ kernel void mla_apply_v(device const float *o [[buffer(0)]],
     }
 }
 
+
+// ============================================================================================== GGUF block types
+// llama.cpp's own block layouts, read in place from a memory-mapped GGUF file (docs/16-gguf.md). The scales live
+// inside the blocks, so buffer(1) (ws) is unused, exactly as for Q2_K. Blocks are only 2-byte aligned for the
+// legacy formats (18 and 34 bytes), so their quants are read as ushorts; the K-quants' 144 / 176-byte blocks are
+// 4-byte aligned. One lane unit is a 32-weight block (Q4_0 / Q8_0) or sub-block (Q4_K / Q5_K: eight per
+// 256-weight super-block), so all four types walk a row with the same unit loop (cols / 32 units) and share
+// gg_unit, which dequantizes a unit to 8 float4 (scale and min applied). The single-row kernels (mm_row_gguf),
+// the prefill tiles (mm_tile_gguf) and the MoE block_dot all use it, so every kernel computes the same products.
+//   QT  20 Q4_0 (18 B: half d, 16 nibble bytes)     21 Q8_0 (34 B: half d, 32 int8)
+//       22 Q4_K (144 B: half d, dmin, 12 scale bytes, 128 nibble bytes)
+//       23 Q5_K (176 B: half d, dmin, 12 scale bytes, 32 high-bit bytes, 128 nibble bytes)
+
+#define GG_Q4_0 20
+#define GG_Q8_0 21
+#define GG_Q4_K 22
+#define GG_Q5_K 23
+
+// 32 weights of unit u of global row `grow` (nb units per row) into w[0..8) as dequantized floats.
+template <int QT>
+static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w) {
+    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+        constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
+        device const uchar *blk = wq + (grow * nb + u) * BYTES;
+        const float d = float(*(device const half *)blk);
+        device const ushort *p = (device const ushort *)(blk + 2);
+        if (QT == GG_Q4_0) {
+            for (int k = 0; k < 4; k++) {
+                const uchar4 v = as_type<uchar4>(uint(p[2 * k]) | (uint(p[2 * k + 1]) << 16));
+                w[k] = (float4(v & uchar4(15)) - 8.0f) * d;
+                w[k + 4] = (float4(v >> uchar4(4)) - 8.0f) * d;
+            }
+        } else {
+            for (int k = 0; k < 8; k++) {
+                w[k] = float4(as_type<char4>(uint(p[2 * k]) | (uint(p[2 * k + 1]) << 16))) * d;
+            }
+        }
+    } else {
+        constexpr bool Q5 = QT == GG_Q5_K;
+        constexpr int BYTES = Q5 ? 176 : 144;
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * BYTES;
+        const int j = u & 7;
+        const float2 dd = float2(as_type<half2>(*(device const uint *)blk));   // d, dmin (4-byte aligned)
+        device const uchar *sc = blk + 4;
+        uint s;
+        uint m;
+        if (j < 4) {
+            s = sc[j] & 63;
+            m = sc[j + 4] & 63;
+        } else {
+            s = (sc[j + 4] & 15) | ((uint(sc[j - 4]) >> 6) << 4);
+            m = (sc[j + 4] >> 4) | ((uint(sc[j]) >> 6) << 4);
+        }
+        const float dl = dd.x * float(s);
+        const float ml = dd.y * float(m);
+        const uchar sh = uchar((j & 1) << 2);
+        device const uchar4 *q = (device const uchar4 *)(blk + (Q5 ? 48 : 16) + (j >> 1) * 32);
+        device const uchar4 *h = (device const uchar4 *)(blk + 16);
+        for (int k = 0; k < 8; k++) {
+            uchar4 v = (q[k] >> uchar4(sh)) & uchar4(15);
+            if (Q5) v |= ((h[k] >> uchar4(j)) & uchar4(1)) << uchar4(4);
+            w[k] = float4(v) * dl - ml;
+        }
+    }
+}
+
+// mm_row for QT >= GG_FIRST (called from the generic mm_row): lane l walks units l, l + 32, ...
+template <int QT, typename XP>
+static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x, ulong xstride, int nt,
+                               thread float *acc, ushort lane) {
+    for (int u = lane; u < nb; u += 32) {
+        float4 w[8];
+        gg_unit<QT>(wq, grow, nb, u, w);
+        for (int t = 0; t < TOK_TILE; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * QK);
+                float d = 0.0f;
+                for (int k = 0; k < 8; k++) d += dot(w[k], x4[k]);
+                acc[t] += d;
+            }
+        }
+    }
+}
+
+// mm_tile for QT >= GG_FIRST: the units of the NR rows are dequantized once and used for TT tokens, each
+// row's unit walk and dot being those of mm_row_gguf.
+template <int QT, int NR, int TT>
+static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
+                                device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane) {
+    for (int u = lane; u < nb; u += 32) {
+        float4 w[NR][8];
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) gg_unit<QT>(wq[r], grow[r], nb, u, w[r]);
+        }
+        for (int t = 0; t < TT; t++) {
+            if (t < nt) {
+                auto x4 = as_f4(x + (ulong)t * xstride + u * QK);
+                float4 xv[8];
+                for (int k = 0; k < 8; k++) xv[k] = x4[k];
+                for (int r = 0; r < NR; r++) {
+                    if (r < nr) {
+                        float d = 0.0f;
+                        for (int k = 0; k < 8; k++) d += dot(w[r][k], xv[k]);
+                        acc[r][t] += d;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// block_dot for the MoE kernels: 32-weight unit b of a row.
+#define GG_BLOCK_DOT(QTV)                                                                                         \
+    template <>                                                                                                   \
+    inline float block_dot<QTV>(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,       \
+                                device const float4 *x4) {                                                        \
+        float4 w[8];                                                                                              \
+        gg_unit<QTV>(wq, grow, nb, b, w);                                                                         \
+        float d = 0.0f;                                                                                           \
+        for (int k = 0; k < 8; k++) d += dot(w[k], x4[k]);                                                        \
+        return d;                                                                                                 \
+    }
+GG_BLOCK_DOT(GG_Q4_0)
+GG_BLOCK_DOT(GG_Q8_0)
+GG_BLOCK_DOT(GG_Q4_K)
+GG_BLOCK_DOT(GG_Q5_K)
+
+#define GG_INSTANTIATE(SUF, QTV)                                                                                  \
+    template [[host_name("matmul_" SUF)]] kernel matmul_t matmul<QTV, false>;                                     \
+    template [[host_name("matmul_" SUF "_norm")]] kernel matmul_t matmul<QTV, true>;                              \
+    template [[host_name("matmul_pf_" SUF)]] kernel matmul_pf_t matmul_pf<QTV, PF_ROWS, PF_TOKS>;                 \
+    template [[host_name("matmul3_" SUF)]] kernel matmul3_t matmul3<QTV, false, float>;                           \
+    template [[host_name("matmul3_" SUF "_norm")]] kernel matmul3_t matmul3<QTV, true, float>;                    \
+    template [[host_name("matmul3_" SUF "_h")]] kernel matmul3_h_t matmul3<QTV, false, half>;                     \
+    template [[host_name("matmul3_" SUF "_norm_h")]] kernel matmul3_h_t matmul3<QTV, true, half>;                 \
+    template [[host_name("matmul3_pf_" SUF)]] kernel matmul3_pf_t matmul3_pf<QTV, PF_ROWS, PF_TOKS, float>;       \
+    template [[host_name("matmul3_pf_" SUF "_h")]] kernel matmul3_pf_h_t matmul3_pf<QTV, PF_ROWS, PF_TOKS, half>; \
+    template [[host_name("matmul_swiglu_" SUF)]] kernel matmul_swiglu_t matmul_swiglu<QTV, false>;                \
+    template [[host_name("matmul_swiglu_" SUF "_norm")]] kernel matmul_swiglu_t matmul_swiglu<QTV, true>;         \
+    template [[host_name("matmul_swiglu_pf_" SUF)]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<QTV, PF_UNITS, PF_TOKS>; \
+    template [[host_name("moe_up_" SUF)]] kernel moe_up_t moe_up<QTV>;                                            \
+    template [[host_name("moe_down_" SUF)]] kernel moe_down_t moe_down<QTV>;
+GG_INSTANTIATE("q4g", GG_Q4_0)
+GG_INSTANTIATE("q8g", GG_Q8_0)
+GG_INSTANTIATE("q4k", GG_Q4_K)
+GG_INSTANTIATE("q5k", GG_Q5_K)

@@ -27,9 +27,19 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  */
 public final class Metal implements AutoCloseable {
 
-    /** A Metal buffer handle plus a CPU view of its (shared) contents. */
-    public record Buffer(MemorySegment handle, MemorySegment contents, long size) {
+    /**
+     * A Metal buffer handle plus a CPU view of its (shared) contents. {@code offset} is where the data of interest
+     * starts inside the buffer: 0, except for a weight tensor that is a slice of a larger memory-mapped file
+     * ({@link #wrapRange}); {@link MetalKernels} adds it to every binding offset.
+     */
+    public record Buffer(MemorySegment handle, MemorySegment contents, long size, long offset) {
+        public Buffer(MemorySegment handle, MemorySegment contents, long size) {
+            this(handle, contents, size, 0);
+        }
     }
+
+    /** Metal wraps whole pages; Apple Silicon's are 16 KiB. */
+    private static final long PAGE = 16384;
 
     private static final int ERR_LEN = 4096;
     private static final Linker LINKER = Linker.nativeLinker();
@@ -259,6 +269,23 @@ public final class Metal implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         }
+    }
+
+    /**
+     * Zero-copy view of a slice of larger native memory (a tensor inside a memory-mapped GGUF file) that is not page
+     * aligned: wraps the pages the slice touches and returns a buffer whose {@link Buffer#offset} is the slice's
+     * position in the first of them. The extra bytes before and after the slice belong to the same mapping, so
+     * they are valid memory; the buffer is never written. Page-aligned segments are wrapped as they are.
+     */
+    public Buffer wrapRange(MemorySegment seg) {
+        long addr = seg.address();
+        long base = addr & -PAGE;
+        long end = (addr + seg.byteSize() + PAGE - 1) & -PAGE;
+        if (base == addr && end == addr + seg.byteSize()) {
+            return wrap(seg);
+        }
+        Buffer b = wrap(MemorySegment.ofAddress(base).reinterpret(end - base));
+        return new Buffer(b.handle(), b.contents(), b.size(), addr - base);
     }
 
     private Buffer track(MemorySegment h, long size) throws Throwable {
