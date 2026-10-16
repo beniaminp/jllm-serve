@@ -110,23 +110,35 @@ public final class ModelWeights implements AutoCloseable {
      */
     public static ModelWeights load(Path dir, Architecture arch, QType quant, ShardProvider shards, String identity)
             throws IOException {
+        return load(dir, arch, quant, QuantFile.DEFAULT_HEAD, shards, identity);
+    }
+
+    /**
+     * As above with the embedding / LM head stored as {@code head} (Q8_0 by default, or Q6_K). The head format is
+     * part of the cache name, so a cache converted with another head is neither read nor overwritten.
+     */
+    public static ModelWeights load(Path dir, Architecture arch, QType quant, QType head, ShardProvider shards,
+                                    String identity) throws IOException {
         QuantFile.Identity id = QuantFile.Identity.parse(identity, null);
         boolean converted = false;
-        if (!QuantFile.exists(dir, quant)) {
-            ModelConverter.convert(dir, arch, quant, shards, identity);
+        if (!QuantFile.exists(dir, quant, head)) {
+            ModelConverter.convert(dir, arch, quant, head, shards, identity);
             converted = true;
         }
         while (true) {
             long t0 = System.nanoTime();
             String stale = null;
             try {
-                QuantFile file = QuantFile.open(dir, quant);
+                QuantFile file = QuantFile.open(dir, quant, head);
                 try {
                     if (id != null && !id.sameAs(file.identity())) {
                         throw new QuantFile.StaleCacheException("it was converted from "
                                 + (file.identity() == null ? "local files" : file.identity().name()) + ", not " + id.name());
                     }
                     ModelWeights w = new ModelWeights(arch, quant, file);
+                    if (w.embed.type != head) {
+                        throw new QuantFile.StaleCacheException("its embedding is " + w.embed.type + ", not " + head);
+                    }
                     System.err.printf("Mapped %s weights (%s, %.0f MB) in %.2fs%n", arch.core().architecture(), quant,
                             file.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9);
                     return w;
@@ -142,12 +154,12 @@ public final class ModelWeights implements AutoCloseable {
                 stale = e.getMessage();
             }
             if (converted) {
-                throw new IOException("the freshly converted cache " + QuantFile.binPath(dir, quant)
+                throw new IOException("the freshly converted cache " + QuantFile.binPath(dir, quant, head)
                         + " does not match the config: " + stale);
             }
-            System.err.println("Reconverting " + QuantFile.binPath(dir, quant).getFileName() + ": " + stale);
-            QuantFile.delete(dir, quant);
-            ModelConverter.convert(dir, arch, quant, shards, identity);
+            System.err.println("Reconverting " + QuantFile.binPath(dir, quant, head).getFileName() + ": " + stale);
+            QuantFile.delete(dir, quant, head);
+            ModelConverter.convert(dir, arch, quant, head, shards, identity);
             converted = true;
         }
     }

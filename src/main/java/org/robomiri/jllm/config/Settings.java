@@ -32,6 +32,7 @@ public final class Settings {
             Map.entry("revision", "model.revision"),
             Map.entry("dir", "model.dir"),
             Map.entry("quant", "model.quant"),
+            Map.entry("head-quant", "model.head-quant"),
             Map.entry("low-disk", "model.low-disk"),
             Map.entry("backend", "backend"),
             Map.entry("ctx", "backend.ctx"),
@@ -204,6 +205,11 @@ public final class Settings {
             QType.parse(get("model.quant"));
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("model.quant: " + e.getMessage());
+        }
+        try {
+            QType.parseHead(get("model.head-quant"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("model.head-quant: " + e.getMessage());
         }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
         String backend = get("backend");

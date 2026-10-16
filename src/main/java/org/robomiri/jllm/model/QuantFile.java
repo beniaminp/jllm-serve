@@ -22,7 +22,8 @@ import java.util.Map;
 /**
  * jllm's own on-disk format for quantized weights, so a model is quantized once and memory-mapped afterwards.
  *
- * <p>Two files: {@code jllm-<quant>.bin} holds page-aligned blobs in exactly the {@link QTensor} memory layout
+ * <p>Two files: {@code jllm-<quant>.bin} (for a non-default embedding / LM head format {@code jllm-<quant>-h6k.bin},
+ * see {@link #stem}) holds page-aligned blobs in exactly the {@link QTensor} memory layout
  * (so a mapped slice can be used directly, even zero-copy by Metal), and {@code jllm-<quant>.json} describes
  * them: {@code {"version", "layout", "quant", "model", "tensors": {name: {type, rows, cols, offset, size}}}}.
  * The JSON is written last and acts as the "conversion complete" marker.
@@ -122,21 +123,50 @@ public final class QuantFile implements AutoCloseable {
         return identity;
     }
 
+    /** The format the embedding / LM head is stored in unless asked otherwise; caches of it carry no head tag. */
+    public static final QType DEFAULT_HEAD = QType.Q8_0;
+
+    /**
+     * File-name stem of a cache: {@code jllm-<quant>} for the default (Q8_0) head, {@code jllm-<quant>-h6k} for a
+     * Q6_K head. The head format is part of the cache identity, so a cache converted with one head is never
+     * reused for another.
+     */
+    static String stem(QType quant, QType head) {
+        String tag = head == DEFAULT_HEAD ? "" : head == QType.Q6_K ? "-h6k" : "-h" + head.name().toLowerCase();
+        return "jllm-" + quant.name().toLowerCase() + tag;
+    }
+
     public static boolean exists(Path dir, QType quant) {
-        return Files.isRegularFile(jsonPath(dir, quant)) && Files.isRegularFile(binPath(dir, quant));
+        return exists(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static boolean exists(Path dir, QType quant, QType head) {
+        return Files.isRegularFile(jsonPath(dir, quant, head)) && Files.isRegularFile(binPath(dir, quant, head));
     }
 
     public static Path binPath(Path dir, QType quant) {
-        return dir.resolve("jllm-" + quant.name().toLowerCase() + ".bin");
+        return binPath(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static Path binPath(Path dir, QType quant, QType head) {
+        return dir.resolve(stem(quant, head) + ".bin");
     }
 
     public static Path jsonPath(Path dir, QType quant) {
-        return dir.resolve("jllm-" + quant.name().toLowerCase() + ".json");
+        return jsonPath(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static Path jsonPath(Path dir, QType quant, QType head) {
+        return dir.resolve(stem(quant, head) + ".json");
     }
 
     /** Removes the cache files of {@code quant} in {@code dir} (index, blobs, any resume sidecar and temp files). */
     public static void delete(Path dir, QType quant) throws IOException {
-        for (Path p : new Path[]{jsonPath(dir, quant), binPath(dir, quant), partialPath(dir, quant)}) {
+        delete(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static void delete(Path dir, QType quant, QType head) throws IOException {
+        for (Path p : new Path[]{jsonPath(dir, quant, head), binPath(dir, quant, head), partialPath(dir, quant, head)}) {
             Files.deleteIfExists(p);
             Files.deleteIfExists(tmpPath(p));
         }
@@ -170,10 +200,14 @@ public final class QuantFile implements AutoCloseable {
      *                             converter layout, or describes blobs the {@code .bin} does not hold
      */
     public static QuantFile open(Path dir, QType quant) throws IOException {
-        Path json = jsonPath(dir, quant);
+        return open(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static QuantFile open(Path dir, QType quant, QType head) throws IOException {
+        Path json = jsonPath(dir, quant, head);
         Map<String, Object> header = parseJson(json);
         Map<String, Entry> entries = readIndex(json, Json.map(header, "tensors"));
-        Path bin = binPath(dir, quant);
+        Path bin = binPath(dir, quant, head);
         if (!Files.isRegularFile(bin)) {
             throw new StaleCacheException(bin + " is missing");
         }
@@ -316,7 +350,11 @@ public final class QuantFile implements AutoCloseable {
 
     /** Sidecar that records the units already written while a conversion is in progress. */
     public static Path partialPath(Path dir, QType quant) {
-        return dir.resolve("jllm-" + quant.name().toLowerCase() + ".partial.json");
+        return partialPath(dir, quant, DEFAULT_HEAD);
+    }
+
+    public static Path partialPath(Path dir, QType quant, QType head) {
+        return dir.resolve(stem(quant, head) + ".partial.json");
     }
 
     /**
@@ -333,6 +371,7 @@ public final class QuantFile implements AutoCloseable {
     public static final class Writer implements AutoCloseable {
         private final Path dir;
         private final QType quant;
+        private final QType head;
         private final Path bin;
         private final Path partial;
         private final String model;
@@ -346,17 +385,19 @@ public final class QuantFile implements AutoCloseable {
 
         /** Starts a fresh cache, discarding any previous partial conversion. */
         public Writer(Path dir, QType quant) throws IOException {
-            this(dir, quant, "", null, false);
+            this(dir, quant, DEFAULT_HEAD, "", null, false);
         }
 
-        private Writer(Path dir, QType quant, String model, Identity identity, boolean resume) throws IOException {
+        private Writer(Path dir, QType quant, QType head, String model, Identity identity, boolean resume)
+                throws IOException {
             this.dir = dir;
             this.quant = quant;
+            this.head = head;
             this.model = model;
             this.identity = identity;
-            this.bin = binPath(dir, quant);
-            this.partial = partialPath(dir, quant);
-            Files.deleteIfExists(jsonPath(dir, quant));
+            this.bin = binPath(dir, quant, head);
+            this.partial = partialPath(dir, quant, head);
+            Files.deleteIfExists(jsonPath(dir, quant, head));
             if (!resume) {
                 Files.deleteIfExists(partial);
                 this.ch = FileChannel.open(bin, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
@@ -375,11 +416,17 @@ public final class QuantFile implements AutoCloseable {
          */
         public static Writer openOrResume(Path dir, QType quant, String model, Identity identity, List<String> plannedUnits)
                 throws IOException {
-            Resumable r = inspect(dir, quant, model, identity, plannedUnits);
+            return openOrResume(dir, quant, DEFAULT_HEAD, model, identity, plannedUnits);
+        }
+
+        /** As above for the cache with embedding / LM head format {@code head}. */
+        public static Writer openOrResume(Path dir, QType quant, QType head, String model, Identity identity,
+                                          List<String> plannedUnits) throws IOException {
+            Resumable r = inspect(dir, quant, head, model, identity, plannedUnits);
             if (r == null) {
-                return new Writer(dir, quant, model, identity, false);
+                return new Writer(dir, quant, head, model, identity, false);
             }
-            Writer w = new Writer(dir, quant, model, identity, true);
+            Writer w = new Writer(dir, quant, head, model, identity, true);
             try {
                 if (w.ch.size() != r.bytes()) {
                     w.ch.truncate(r.bytes());
@@ -402,9 +449,10 @@ public final class QuantFile implements AutoCloseable {
         }
 
         /** Returns what a sidecar lets us reuse, or null (printing why) when the conversion must start over. */
-        private static Resumable inspect(Path dir, QType quant, String model, Identity identity, List<String> plannedUnits) {
-            Path partial = partialPath(dir, quant);
-            Path bin = binPath(dir, quant);
+        private static Resumable inspect(Path dir, QType quant, QType head, String model, Identity identity,
+                                         List<String> plannedUnits) {
+            Path partial = partialPath(dir, quant, head);
+            Path bin = binPath(dir, quant, head);
             if (!Files.isRegularFile(partial)) {
                 return null;
             }
@@ -415,6 +463,7 @@ public final class QuantFile implements AutoCloseable {
                 List<Object> unitObjs = Json.list(side, "units");
                 Identity recorded = Identity.read(side);
                 if (!quant.name().equals(Json.str(side, "quant", null))
+                        || !head.name().equals(Json.str(side, "head", DEFAULT_HEAD.name()))
                         || !model.equals(Json.str(side, "model", null)) || unitObjs == null) {
                     reason = "it was written for a different model or format";
                 } else if (!(identity == null ? recorded == null : identity.sameAs(recorded))
@@ -514,6 +563,9 @@ public final class QuantFile implements AutoCloseable {
         private Map<String, Object> header() {
             Map<String, Object> h = Json.obj("version", VERSION, "layout", LAYOUT_VERSION, "quant", quant.name(),
                     "model", model);
+            if (head != DEFAULT_HEAD) {
+                h.put("head", head.name()); // absent = Q8_0, so caches of the default head are unchanged
+            }
             Identity.write(h, identity);
             return h;
         }
@@ -524,7 +576,7 @@ public final class QuantFile implements AutoCloseable {
             ch.close();
             Map<String, Object> h = header();
             h.put("tensors", index);
-            writeAtomic(jsonPath(dir, quant), Json.write(h));
+            writeAtomic(jsonPath(dir, quant, head), Json.write(h));
             Files.deleteIfExists(partial);
         }
 
