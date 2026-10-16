@@ -19,6 +19,13 @@ import java.util.Arrays;
  */
 public final class CpuBackend implements Backend {
 
+    /**
+     * {@code -Djllm.cpu.deterministic=true}: every multi-token matmul (and MoE layer) is run token by token through
+     * the single-token kernels, so a token's hidden state no longer depends on whether it was prefilled or decoded
+     * (docs/07 §7.14). Slower prefill; meant for comparisons, not for serving.
+     */
+    static final boolean DETERMINISTIC = Boolean.getBoolean("jllm.cpu.deterministic");
+
     private final ModelWeights w;
     private final ModelConfig c;
     private final int ctx;
@@ -150,7 +157,8 @@ public final class CpuBackend implements Backend {
 
     @Override
     public String name() {
-        return "cpu (" + VectorKernels.describe() + (int8 ? ", " + Int8Kernels.describe() : "") + ", " + pool.threads() + " threads)";
+        return "cpu (" + VectorKernels.describe() + (int8 ? ", " + Int8Kernels.describe() : "")
+                + (DETERMINISTIC ? ", deterministic" : "") + ", " + pool.threads() + " threads)";
     }
 
     @Override
@@ -303,27 +311,17 @@ public final class CpuBackend implements Backend {
     /** {@link #matmul} over the first {@code rows} rows of {@code wt}; for {@code n > 1} the output row stride stays {@code wt.rows}. */
     private void matmul(QTensor wt, int rows, float[] in, float[] out, int outOff, int n, boolean acc) {
         int cols = wt.cols;
+        int stride = wt.rows;
         if (n == 1) {
-            if (useInt8(wt)) {
-                short[] xq = quantizeInt8(in, 0, cols);
-                float[] xs = this.xs;
-                pool.forRange(rows, 16, (r0, r1) -> {
-                    for (int r = r0; r < r1; r++) {
-                        float v = Int8Kernels.dotRow(wt, r, xq, xs, 0);
-                        out[outOff + r] = acc ? out[outOff + r] + v : v;
-                    }
-                });
-                return;
-            }
-            pool.forRange(rows, 16, (r0, r1) -> {
-                for (int r = r0; r < r1; r++) {
-                    float v = VectorKernels.dotRow(wt, r, in, 0);
-                    out[outOff + r] = acc ? out[outOff + r] + v : v;
-                }
-            });
+            matmulOne(wt, rows, in, 0, out, outOff, acc);
             return;
         }
-        int stride = wt.rows;
+        if (DETERMINISTIC) {
+            for (int t = 0; t < n; t++) {
+                matmulOne(wt, rows, in, t * cols, out, outOff + t * stride, acc);
+            }
+            return;
+        }
         int groups = (rows + 3) / 4;
         pool.forRange(groups, 1, (g0, g1) -> {
             float[] tmp = scratch.get();
@@ -352,6 +350,27 @@ public final class CpuBackend implements Backend {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    /** The single-token kernel: {@code out[outOff + r] (+)= dot(W[r, :], in[inOff, :])}, parallel over rows. */
+    private void matmulOne(QTensor wt, int rows, float[] in, int inOff, float[] out, int outOff, boolean acc) {
+        if (useInt8(wt)) {
+            short[] xq = quantizeInt8(in, inOff, wt.cols);
+            float[] xs = this.xs;
+            pool.forRange(rows, 16, (r0, r1) -> {
+                for (int r = r0; r < r1; r++) {
+                    float v = Int8Kernels.dotRow(wt, r, xq, xs, 0);
+                    out[outOff + r] = acc ? out[outOff + r] + v : v;
+                }
+            });
+            return;
+        }
+        pool.forRange(rows, 16, (r0, r1) -> {
+            for (int r = r0; r < r1; r++) {
+                float v = VectorKernels.dotRow(wt, r, in, inOff);
+                out[outOff + r] = acc ? out[outOff + r] + v : v;
             }
         });
     }
@@ -455,23 +474,31 @@ public final class CpuBackend implements Backend {
      * expert's SwiGLU MLP on the token and add the results to x weighted by the (renormalized) router probabilities.
      */
     private void moe(ModelWeights.Layer L, int n) {
-        if (n > 1) {
+        if (n > 1 && !DETERMINISTIC) {
             moeBatched(L, n);
             return;
         }
+        for (int t = 0; t < n; t++) {
+            moeToken(L, t);
+        }
+    }
+
+    /** The single-token MoE layer for token {@code t}: {@code x[t] += Σ_k w_k · expert_k(xb[t])}. */
+    private void moeToken(ModelWeights.Layer L, int t) {
         int dim = c.dim();
         int e = c.numExperts();
         int topK = c.expertsPerTok();
         int m = c.moeDim();
         int gu = 2 * m;
+        int xo = t * dim;
         if (L.mla != null) {
-            routeDeepseek(L, 0, e, topK);
+            routeDeepseek(L, xo, e, topK);
         } else {
-            route(L.router, 0, e, topK, routerLogits, 0);
+            route(L.router, xo, e, topK, routerLogits, 0);
         }
         // all selected experts' gate/up rows in one parallel loop
         if (useInt8(L.expGateUp)) {
-            short[] xq = quantizeInt8(xb, 0, dim);
+            short[] xq = quantizeInt8(xb, xo, dim);
             float[] xs = this.xs;
             pool.forRange(topK * gu, 32, (i0, i1) -> {
                 for (int i = i0; i < i1; i++) {
@@ -485,7 +512,7 @@ public final class CpuBackend implements Backend {
                 for (int i = i0; i < i1; i++) {
                     int k = i / gu;
                     int r = i - k * gu;
-                    moeGateUp[i] = VectorKernels.dotRow(L.expGateUp, assign[k] * gu + r, xb, 0);
+                    moeGateUp[i] = VectorKernels.dotRow(L.expGateUp, assign[k] * gu + r, xb, xo);
                 }
             });
         }
@@ -506,7 +533,7 @@ public final class CpuBackend implements Backend {
                     for (int k = 0; k < topK; k++) {
                         sum += routeWeight[k] * Int8Kernels.dotRow(L.expDown, assign[k] * dim + r, xq, xs, k * m);
                     }
-                    x[r] += sum;
+                    x[xo + r] += sum;
                 }
             });
         } else {
@@ -516,7 +543,7 @@ public final class CpuBackend implements Backend {
                     for (int k = 0; k < topK; k++) {
                         sum += routeWeight[k] * VectorKernels.dotRow(L.expDown, assign[k] * dim + r, moeHidden, k * m);
                     }
-                    x[r] += sum;
+                    x[xo + r] += sum;
                 }
             });
         }

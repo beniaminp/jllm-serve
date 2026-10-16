@@ -533,3 +533,50 @@ and a 623-token reading-comprehension prompt were identical to f32 on both backe
 
 **Measured** (M1 Pro, 10 threads, Qwen3-0.6B Q4_0, ctx 4096, machine shared with other jobs so absolute
 numbers are below [7.9](#79-measured-numbers-and-the-bottleneck)): see [11 §11.3](11-performance.md#113-memory-footprint).
+
+---
+
+## 7.14 Prefill and decode are not bit-identical; results depend on history
+
+The two matmul paths of [7.4](#74-decode-vs-prefill-matmul-cpubackendmatmul) compute the same dot products in
+different orders:
+
+| | `n == 1` (decode) | `n > 1` (prefill) |
+|---|---|---|
+| weights | streamed as quantized blocks, `(lo·x + hi·x) · scale` accumulated per block | four rows dequantized to float once, then `dot4` / `dot4x4` FMAs over `cols` |
+| int8 activations (default on) | integer products, `Σ_b (s_b · d_b) · Σ w q` | never (float path) |
+| MoE | per token: `dotRow` per expert row | experts grouped over tokens, `dot4x4` |
+
+Float addition is not associative, so the keys, values and logits of a token differ in the last bits depending
+on whether its `forward` call carried one token or many (typically a relative 1e-6 to 1e-5 per element, more
+with int8 activations). Attention, RMSNorm, RoPE and SiLU are the same code for both paths. The Metal backend has
+the same property for its own reasons (different threadgroup shapes).
+
+**Why this makes outputs depend on history.** The engine reuses the KV cache for the longest common prefix of
+consecutive requests ([10](10-engine-and-server.md)). Cached positions were written either by a prefill (`n > 1`) or by
+decode steps (`n == 1`) of an earlier request, so a new request that extends them attends to slightly different
+K/V than it would if its prompt were prefilled from position 0 in one go. The same prompt can therefore yield
+different logits in a second chat turn than in a fresh process, and greedy decoding can diverge after the first
+near-tie. Exact reproducibility holds only for the same *sequence of `forward` calls* (`Backend.forward` states
+this contract); the `run` command, `bench` (which evicts the prefix before each round) and `ArchSmoke` always
+start from position 0, which is why their outputs are reproducible.
+
+**`-Djllm.cpu.deterministic=true`** (system property, read once by `CpuBackend`; the name reports
+`deterministic`) routes every `n > 1` matmul and MoE layer through the single-token kernels, one token at a
+time, with the same int8 setting as decode. Then a token's K/V, hidden state and logits are bit-identical
+however the prompt is chunked and whatever was in the cache before, which makes two runs comparable
+element by element (for example `--batch 1` against `--batch 64`, or a chat turn against a fresh run). Prefill
+loses the four-row reuse of [7.4](#74-decode-vs-prefill-matmul-cpubackendmatmul), so it is a comparison
+tool, not a serving mode. It does not make CPU equal to Metal: that comparison needs int8 activations off
+([7.10](#710-int8-activations-integer-dot-products-int8kernels)), and even then the two backends differ in the
+last bits of the prefill path.
+
+**One more source of last-bit noise: the JIT tier.** `reduceLanes(ADD)` on a `FloatVector` does not specify the
+order in which lanes are combined; the Java fallback the interpreter and C1 run adds them sequentially, the C2
+code on NEON adds them pairwise. The first few hundred calls of every kernel in a process therefore sum in a
+different order than the rest, and two runs of the same command can differ in the 7th significant digit of a
+logit depending on exactly when C2 took over (observed on Qwen3-0.6B: three identical commands, two distinct
+results). Within one tier the results are exact: with `-Xint` (tiny models only; the Vector API fallback is
+about 1 000× slower) the same prompt gives bit-identical logits run after run, and under
+`jllm.cpu.deterministic` also for `--batch 1` versus `--batch 16`. For greedy text this noise only matters at a
+near-tie; the `run` gates in [11](11-performance.md) have been stable across hundreds of runs.
