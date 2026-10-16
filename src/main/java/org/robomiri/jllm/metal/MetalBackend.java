@@ -65,7 +65,7 @@ public final class MetalBackend implements Backend {
     private final boolean flashDecode; // M6 flash decoding enabled for this model (dense attention only)
     private Metal.Buffer flashPart;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
-    // through an f32 staging row and norm_rope_h rounds it into the cache after the rotation, attention_h
+    // through an f32 staging row and rope_h rounds it into the cache after the rotation, attention_h
     // reads half; see the "f16 KV cache" section of kernels.metal
     private final boolean kvHalf;
     private final String vh;       // "_h" kernel-name suffix for the half-cache variants, "" otherwise
@@ -350,7 +350,7 @@ public final class MetalBackend implements Backend {
                     mla.run(l, W, n, pos);
                 } else {
                     // v is written straight into the cache rows at pos (as half for the f16 cache); k too for
-                    // the f32 cache, while the f16 cache stages the f32 k rows and norm_rope rounds them in
+                    // the f32 cache, while the f16 cache stages the f32 k rows and the rope kernel rounds them in
                     long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
                     Metal.Buffer kDst = kvHalf ? kStage : keyCache[l];
                     long kOff = kvHalf ? 0 : cacheOff;
@@ -601,55 +601,51 @@ public final class MetalBackend implements Backend {
         metal.dispatch(metal.pipeline("rmsnorm_add"), bufArgs, offArgs, 3, params, 8, n, 1, 1, 256, 1, 1);
     }
 
-    /** GLM interleaved pairs, or rotate-half pairs for partial rotary (Phi-4-mini): the first rotaryDim dims of every q and k head (no qk-norm). */
-    private void normRopeInterleaved(Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff, int n, int pos) {
-        bind(0, q, 0);
-        bind(1, kSrc, kSrcOff);
-        bind(2, ropeCos, 0);
-        bind(3, ropeSin, 0);
-        bind(4, kOut, kOutOff);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.heads());
-        params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
-        params.setAtIndex(ValueLayout.JAVA_INT, 5, c.rotaryDim() / 2);
-        params.setAtIndex(ValueLayout.JAVA_INT, 6, c.ropeInterleaved() ? 0 : 1);
-        metal.dispatch(metal.pipeline("norm_rope_il" + vh), bufArgs, offArgs, 5, params, 28, c.heads() + c.kvHeads(), n, 1,
-                c.rotaryDim() / 2, 1, 1);
-    }
-
     /**
      * QK-norm + RoPE for the q rows and the k rows of this chunk, in one dispatch: k is read from
      * {@code kSrc} (the f32 cache rows at pos, or the f32 staging rows of an f16 cache) and written to the cache
-     * rows {@code kOut} at pos (the same rows for f32, rounded to half for f16).
+     * rows {@code kOut} at pos (the same rows for f32, rounded to half for f16). GLM rotates interleaved pairs
+     * of the first rotaryDim dims, Phi rotate-half pairs of them; both without a qk-norm.
      */
     private void normRope(LayerBufs L, Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff, int n, int pos,
                           boolean localRope) {
-        if (c.ropeInterleaved() || c.ropePartialHalf()) {
-            if (L.qNorm != null) {
-                throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
-            }
-            normRopeInterleaved(kSrc, kSrcOff, kOut, kOutOff, n, pos);
-            return;
+        boolean partial = c.ropeInterleaved() || c.ropePartialHalf();
+        if (partial && L.qNorm != null) {
+            throw new IllegalStateException("partial rotary embedding combined with q/k norm is not implemented");
         }
-        boolean useNorm = L.qNorm != null && L.kNorm != null;
-        bind(0, q, 0);
+        boolean useNorm = !partial && L.qNorm != null && L.kNorm != null;
+        int rotHalf = partial ? c.rotaryDim() / 2 : c.headDim() / 2;
+        rope(c.ropeInterleaved(), q, kSrc, kSrcOff, kOut, kOutOff, useNorm ? L.qNorm : null, useNorm ? L.kNorm : null,
+                localRope ? ropeCosLocal : ropeCos, localRope ? ropeSinLocal : ropeSin,
+                c.headDim(), c.qDim(), c.kvDim(), c.heads(), c.kvHeads(), pos, 0, rotHalf, n);
+    }
+
+    /**
+     * The one writer of RopeParams: {@code rope} (rotate-half pairs) or {@code rope_il} (adjacent pairs) over
+     * nHeads q heads in place and nKHeads k heads from kSrc into kOut (the half variant when the cache is f16),
+     * rotating the {@code 2 * rotHalf} dims from {@code rotOff} of every head; qw/kw non-null = qk-norm first.
+     */
+    void rope(boolean adjacent, Metal.Buffer qb, Metal.Buffer kSrc, long kSrcOff, Metal.Buffer kOut, long kOutOff,
+              Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin, int headDim, int qStride, int kvStride,
+              int nHeads, int nKHeads, int pos, int rotOff, int rotHalf, int n) {
+        bind(0, qb, 0);
         bind(1, kSrc, kSrcOff);
-        bind(2, useNorm ? L.qNorm : finalNorm, 0); // dummy bindings when unused
-        bind(3, useNorm ? L.kNorm : finalNorm, 0);
-        bind(4, localRope ? ropeCosLocal : ropeCos, 0);
-        bind(5, localRope ? ropeSinLocal : ropeSin, 0);
+        bind(2, qw != null ? qw : finalNorm, 0); // dummy bindings when unused
+        bind(3, kw != null ? kw : finalNorm, 0);
+        bind(4, cos, 0);
+        bind(5, sin, 0);
         bind(6, kOut, kOutOff);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.headDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.qDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.kvDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 3, c.heads());
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, headDim);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, qStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, kvStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, nHeads);
         params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
         params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.normEps());
-        params.setAtIndex(ValueLayout.JAVA_INT, 6, useNorm ? 1 : 0);
-        metal.dispatch(metal.pipeline("norm_rope" + vh), bufArgs, offArgs, 7, params, 28, c.heads() + c.kvHeads(), n, 1,
-                c.headDim() / 2, 1, 1);
+        params.setAtIndex(ValueLayout.JAVA_INT, 6, qw != null ? 1 : 0);
+        params.setAtIndex(ValueLayout.JAVA_INT, 7, rotOff);
+        params.setAtIndex(ValueLayout.JAVA_INT, 8, rotHalf);
+        String kernel = (adjacent ? "rope_il" : "rope") + (nKHeads > 0 ? vh : "");
+        metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, 7, params, 36, nHeads + nKHeads, n, 1, rotHalf, 1, 1);
     }
 
     /** Dense attention of layer l for the n tokens at pos (the group-specialised kernel, or flash decoding). */

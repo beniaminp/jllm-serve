@@ -10,8 +10,9 @@ import java.lang.foreign.ValueLayout;
 /**
  * DeepSeek multi-head latent attention, expert router and shared experts on the GPU, driven by
  * {@link MetalBackend} (see {@code MlaCpu} for the math). Projections, norms and attention (the runtime-width
- * {@code attention} instantiation: keys nope + rope wide, values vDim wide) reuse the generic kernels; the
- * kernels added for DeepSeek are {@code mla_rope}, {@code mla_kv_store} and {@code router_ds}.
+ * {@code attention} instantiation: keys nope + rope wide, values vDim wide) and the rotary embedding (the
+ * interleaved {@code rope_il} on the slice after the nope part) reuse the generic kernels; the kernels added
+ * for DeepSeek are {@code mla_kv_store} and {@code router_ds}.
  *
  * <p>The cache keeps the expanded per-head keys ({@code heads*(nope+rope)} floats per token) and values
  * ({@code heads*v}) in f32, like the CPU backend: 553 KB per token for DeepSeek-V2-Lite.
@@ -142,16 +143,9 @@ final class MlaMetal {
                 heads * qk, heads * qk, heads * vd, heads * vd, 0, 0f, n);
     }
 
+    /** Interleaved rotation of the rd-wide slice at `nope` of every head of the rows of v, in place (q path). */
     private void rope(Metal.Buffer v, int heads, int qk, int nope, int rd, int rowStride, int n, int pos) {
-        mb.bind(0, v, 0);
-        mb.bind(1, mb.ropeCos, 0);
-        mb.bind(2, mb.ropeSin, 0);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 0, qk);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 1, nope);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 2, rd);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, rowStride);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
-        metal.dispatch(metal.pipeline("mla_rope"), mb.bufArgs, mb.offArgs, 3, mb.params, 20, heads, n, 1, rd / 2, 1, 1);
+        mb.rope(true, v, v, 0, v, 0, null, null, mb.ropeCos, mb.ropeSin, qk, rowStride, rowStride, heads, 0, pos, nope, rd / 2, n);
     }
 
     /** Routes the n tokens of {@code xb}: fills the backend's assign / routeWeight buffers (scaling included). */

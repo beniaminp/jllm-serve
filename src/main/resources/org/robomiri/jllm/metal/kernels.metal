@@ -251,7 +251,7 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
 // [rows0, rows0 + rows1) from W1 into out1, the rest from W2 into out2. All three share cols and QT. With
 // hasBias the per-row bias is added in the epilogue (out = v + b, the same float as a separate v += b pass).
 // out2 has the KV cache's element type VT: with VT = half the value rows are rounded once, here, as they are
-// written into the f16 cache (the k rows are rounded by norm_rope<half> after the rotation instead).
+// written into the f16 cache (the k rows are rounded by rope<half, ..> after the rotation instead).
 template <int QT, bool NORM, typename VT>
 kernel void matmul3(device const uchar *wq0 [[buffer(0)]],
                     device const float *ws0 [[buffer(1)]],
@@ -663,72 +663,85 @@ kernel void rmsnorm(device const float *x [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------------------------- qk-norm + rope
-// In place on the q rows ([ntok, qStride], nHeads heads) and the freshly written k rows of the KV cache
-// ([ntok, kvStride], nKvHeads heads) in one dispatch. Grid: (nHeads + nKvHeads, ntok); threadgroup x < nHeads
-// handles q head x, otherwise k head x - nHeads. Threads per threadgroup = headDim / 2, thread i owns the
-// rotary pair (i, i + headDim/2).
+// rope<KV, ADJACENT>: rotary embedding (optionally preceded by the per-head qk-norm) for the q rows
+// ([ntok, qStride], nHeads heads) and the k rows of the same tokens in one dispatch. Grid: (nHeads + k heads,
+// ntok); threadgroup x < nHeads handles q head x in place, otherwise k head x - nHeads: read from `k` (the
+// f32 cache rows at pos, or the f32 staging rows of an f16 cache) and written to the cache rows `kOut` with
+// the cache element type KV, which for half is where the f16 cache rounds k, once, after the norm and the
+// rotation (round-to-nearest-even, Java's Float.floatToFloat16); for float the host binds kOut = k.
+// Threads per threadgroup = rotHalf = rotated dims / 2 = table entries per position; thread i owns one pair:
+//   ADJACENT = false  (i, i + rotHalf) inside the rotated slice   (rotate-half: Llama, Qwen, Gemma, Phi partial)
+//   ADJACENT = true   (2i, 2i + 1)                                 (interleaved: GLM, DeepSeek MLA)
+// The rotated slice starts at rotOff within the head (0 except DeepSeek's q, where it follows the nope part);
+// dims outside the slice are copied to kOut unchanged so a half cache receives the whole row. The qk-norm
+// (useNorm) covers the whole head and so needs a full rotation (rotHalf = headDim / 2); the host rejects
+// partial rotation with a norm. DeepSeek rotates q and its shared k_pe row with the q path (no k heads).
 
 struct RopeParams {
-    int headDim;
+    int headDim;     // head stride within a row (MLA q: nope + rope)
     int qStride;
     int kvStride;
-    int nHeads;
+    int nHeads;      // q heads; threadgroups beyond them are k heads
     int pos0;
     float eps;
     int useNorm;
+    int rotOff;      // first rotated dim within the head
+    int rotHalf;     // rotated dims / 2
 };
 
-// The k rows are read from `k` (f32: the cache rows themselves, or the f32 staging rows of an f16 cache) and
-// written to `kOut` with the cache element type KV at the same row/head offsets: with KV = half this is where
-// the f16 cache rounds k, once, after the norm and the rotation (round-to-nearest-even, Java's
-// Float.floatToFloat16); with KV = float the host binds kOut = k and the update is in place.
-template <typename KV>
-kernel void norm_rope(device float *q [[buffer(0)]],
-                      device const float *k [[buffer(1)]],
-                      device const float *qw [[buffer(2)]],
-                      device const float *kw [[buffer(3)]],
-                      device const float *cosT [[buffer(4)]],
-                      device const float *sinT [[buffer(5)]],
-                      device KV *kOut [[buffer(6)]],
-                      constant RopeParams &p [[buffer(7)]],
-                      uint2 tgp [[threadgroup_position_in_grid]],
-                      ushort2 tid2 [[thread_position_in_threadgroup]],
-                      ushort sg [[simdgroup_index_in_threadgroup]],
-                      ushort lane [[thread_index_in_simdgroup]],
-                      ushort nsg [[simdgroups_per_threadgroup]]) {
+template <typename KV, bool ADJACENT>
+kernel void rope(device float *q [[buffer(0)]],
+                 device const float *k [[buffer(1)]],
+                 device const float *qw [[buffer(2)]],
+                 device const float *kw [[buffer(3)]],
+                 device const float *cosT [[buffer(4)]],
+                 device const float *sinT [[buffer(5)]],
+                 device KV *kOut [[buffer(6)]],
+                 constant RopeParams &p [[buffer(7)]],
+                 uint2 tgp [[threadgroup_position_in_grid]],
+                 ushort2 tid2 [[thread_position_in_threadgroup]],
+                 ushort sg [[simdgroup_index_in_threadgroup]],
+                 ushort lane [[thread_index_in_simdgroup]],
+                 ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[32];
     const ushort tid = tid2.x;
-    const int half_dim = p.headDim / 2;
     const bool isQ = int(tgp.x) < p.nHeads;
     const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
     const ulong off = isQ ? (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
                           : (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
     device const float *h = (isQ ? q : k) + off;
     device const float *w = isQ ? qw : kw;
-    float a = h[tid];
-    float b = h[tid + half_dim];
+    const int i0 = p.rotOff + (ADJACENT ? 2 * tid : tid);
+    const int i1 = p.rotOff + (ADJACENT ? 2 * tid + 1 : tid + p.rotHalf);
+    float a = h[i0];
+    float b = h[i1];
     if (p.useNorm) {
         float ss = tg_sum(a * a + b * b, buf, sg, lane, nsg);
         float scale = rsqrt(ss / p.headDim + p.eps);
-        a *= scale * w[tid];
-        b *= scale * w[tid + half_dim];
+        a *= scale * w[i0];
+        b *= scale * w[i1];
     }
     const int pos = p.pos0 + int(tgp.y);
-    const float c = cosT[pos * half_dim + tid];
-    const float s = sinT[pos * half_dim + tid];
+    const float c = cosT[pos * p.rotHalf + tid];
+    const float s = sinT[pos * p.rotHalf + tid];
     const float ra = a * c - b * s;
     const float rb = b * c + a * s;
     if (isQ) {
-        q[off + tid] = ra;
-        q[off + tid + half_dim] = rb;
+        q[off + i0] = ra;
+        q[off + i1] = rb;
     } else {
-        kOut[off + tid] = KV(ra);
-        kOut[off + tid + half_dim] = KV(rb);
+        kOut[off + i0] = KV(ra);
+        kOut[off + i1] = KV(rb);
+        for (int i = tid; i < p.headDim; i += p.rotHalf) {
+            if (i < p.rotOff || i >= p.rotOff + 2 * p.rotHalf) kOut[off + i] = KV(h[i]);
+        }
     }
 }
 
-template [[host_name("norm_rope")]] kernel decltype(norm_rope<float>) norm_rope<float>;
-template [[host_name("norm_rope_h")]] kernel decltype(norm_rope<half>) norm_rope<half>;
+template [[host_name("rope")]] kernel decltype(rope<float, false>) rope<float, false>;
+template [[host_name("rope_h")]] kernel decltype(rope<half, false>) rope<half, false>;
+template [[host_name("rope_il")]] kernel decltype(rope<float, true>) rope<float, true>;
+template [[host_name("rope_il_h")]] kernel decltype(rope<half, true>) rope<half, true>;
 
 // ---------------------------------------------------------------------------------------------- attention
 // Causal attention for the tokens t = tokenOffset + tgp.y of a tile at positions pos0 + t, 256 threads =
@@ -1195,63 +1208,12 @@ template [[host_name("moe_down_q8")]] kernel moe_down_t moe_down<8>;
 // ---------------------------------------------------------------------------------------------- f16 KV cache
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
-// row, normalised and rotated there, and rounded once by norm_rope<half> when it writes the cache row
+// row, normalised and rotated there, and rounded once by rope<half, ..> when it writes the cache row
 // (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). The *_h attention instantiations
 // read half K/V with the same f32 arithmetic (attention_t<half, ...> above).
 
 // ---------------------------------------------------------------------------------------------- GLM
-// norm_rope_il: GLM (and rotate-half partial rotary, rotateHalf = 1) rotary embedding for the q rows and the k rows in one dispatch (like norm_rope, no qk-norm).
-// Only the first 2*rotHalf dims of each head rotate, and the pairs are adjacent: (2i, 2i+1) is rotated by table
-// entry i (rotate-half models pair i with i + headDim/2 instead). Grid: (nHeads + nKvHeads, ntok), rotHalf threads.
-
-struct RopeIlParams {
-    int headDim;
-    int qStride;
-    int kvStride;
-    int nHeads;
-    int pos0;
-    int rotHalf; // rotated dims / 2 = entries per position in the cos/sin tables
-    int rotateHalf; // 1: pair (i, i + rotHalf) inside the rotated prefix (Phi-4-mini); 0: adjacent pairs (GLM)
-};
-
-// k is read from `k` and written to `kOut` (cache element type KV) like norm_rope; the dims beyond the rotated
-// prefix are copied over unchanged so a half cache receives the whole row.
-template <typename KV>
-kernel void norm_rope_il(device float *q [[buffer(0)]],
-                         device const float *k [[buffer(1)]],
-                         device const float *cosT [[buffer(2)]],
-                         device const float *sinT [[buffer(3)]],
-                         device KV *kOut [[buffer(4)]],
-                         constant RopeIlParams &p [[buffer(5)]],
-                         uint2 tgp [[threadgroup_position_in_grid]],
-                         ushort2 tid2 [[thread_position_in_threadgroup]]) {
-    const int tid = tid2.x;
-    const bool isQ = int(tgp.x) < p.nHeads;
-    const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
-    const ulong off = isQ ? (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
-                          : (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
-    device const float *h = (isQ ? q : k) + off;
-    const int pos = p.pos0 + int(tgp.y);
-    const int i0 = p.rotateHalf ? tid : 2 * tid;
-    const int i1 = p.rotateHalf ? tid + p.rotHalf : 2 * tid + 1;
-    const float a = h[i0];
-    const float b = h[i1];
-    const float c = cosT[pos * p.rotHalf + tid];
-    const float s = sinT[pos * p.rotHalf + tid];
-    const float ra = a * c - b * s;
-    const float rb = b * c + a * s;
-    if (isQ) {
-        q[off + i0] = ra;
-        q[off + i1] = rb;
-    } else {
-        kOut[off + i0] = KV(ra);
-        kOut[off + i1] = KV(rb);
-        for (int i = 2 * p.rotHalf + tid; i < p.headDim; i += p.rotHalf) kOut[off + i] = KV(h[i]);
-    }
-}
-
-template [[host_name("norm_rope_il")]] kernel decltype(norm_rope_il<float>) norm_rope_il<float>;
-template [[host_name("norm_rope_il_h")]] kernel decltype(norm_rope_il<half>) norm_rope_il<half>;
+// The GLM / Phi partial, interleaved rotary embedding is the rope_il / rope kernel above.
 
 // rmsnorm_add: out[row] += rmsnorm(y[row]) * w, for Glm4's post-attention / post-MLP norms applied to the
 // sub-layer output before the residual add. One threadgroup per row of length n.
@@ -1385,36 +1347,6 @@ kernel void mamba_scan(device const float *xc [[buffer(0)]],
 // Multi-head latent attention (DeepSeek-V2/V3). Projections, norms and the output projection use the generic
 // matmul / rmsnorm kernels; only what is specific to MLA is below. Keys and queries are qk = nope + rope wide, values
 // are vDim wide (not equal), so the cache has separate row strides for K and V.
-
-// mla_rope: rotates the interleaved pairs (2i, 2i+1) of the `rope` wide slice that starts `nope` into every head of
-// each row (q: heads = nHeads, nope = qk - rope; the shared k_pe: heads = 1, nope = 0). In place.
-// Grid: (heads, ntok); threads per threadgroup = rope / 2.
-
-struct MlaRopeParams {
-    int qk;         // head stride within a row
-    int nope;
-    int rope;
-    int rowStride;
-    int pos0;
-};
-
-kernel void mla_rope(device float *v [[buffer(0)]],
-                     device const float *cosT [[buffer(1)]],
-                     device const float *sinT [[buffer(2)]],
-                     constant MlaRopeParams &p [[buffer(3)]],
-                     uint2 tgp [[threadgroup_position_in_grid]],
-                     ushort2 tid2 [[thread_position_in_threadgroup]]) {
-    const ushort tid = tid2.x;
-    const int half_dim = p.rope / 2;
-    device float *h = v + (ulong)tgp.y * p.rowStride + (ulong)tgp.x * p.qk + p.nope;
-    const int pos = p.pos0 + int(tgp.y);
-    const float a = h[2 * tid];
-    const float b = h[2 * tid + 1];
-    const float c = cosT[pos * half_dim + tid];
-    const float s = sinT[pos * half_dim + tid];
-    h[2 * tid] = a * c - b * s;
-    h[2 * tid + 1] = b * c + a * s;
-}
 
 // mla_kv_store: assembles key = [k_nope | k_pe] and value for every head of every token from the kv_b output
 // ([ntok, heads * (nope + vDim)], per head nope key values then vDim values) and the rotated k_pe ([ntok, rope]).
