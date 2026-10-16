@@ -70,13 +70,25 @@ public final class Settings {
         }
         s.props.stringPropertyNames().forEach(k -> s.sources.put(k, "default"));
 
-        Map<String, String> cli = parseArgs(args);
+        // keys whose flag may stand alone (--think) and whose value is only consumed when it is a boolean literal
+        java.util.Set<String> booleanKeys = new java.util.HashSet<>(java.util.Set.of("raw"));
+        for (String k : s.props.stringPropertyNames()) {
+            String v = s.props.getProperty(k);
+            if (v.equals("true") || v.equals("false")) {
+                booleanKeys.add(k);
+            }
+        }
+        Map<String, String> cli = parseArgs(args, booleanKeys);
         Path external = findExternal(cli.get("config"));
         if (external != null) {
             try (Reader r = Files.newBufferedReader(external, StandardCharsets.UTF_8)) {
                 Properties p = new Properties();
                 p.load(r);
                 for (String k : p.stringPropertyNames()) {
+                    if (CLI_ONLY.contains(k)) {
+                        throw new IllegalArgumentException(k + " is a command line flag (--" + k + "), not a setting: "
+                                + "remove it from " + external);
+                    }
                     s.put(k, p.getProperty(k), external.toString());
                 }
             }
@@ -101,12 +113,22 @@ public final class Settings {
         return Files.isRegularFile(local) ? local : null;
     }
 
-    private static Map<String, String> parseArgs(String[] args) {
+    /**
+     * {@code --key value}, {@code --key=value} (the only way to pass a value that itself starts with {@code --})
+     * or, for a boolean key, a bare {@code --flag}: it consumes the next argument only when that is a boolean
+     * literal, so {@code --raw} never swallows what follows it. Nothing takes positional arguments after the
+     * command word, so a stray one (a typo such as {@code --think flase}) is an error rather than ignored.
+     */
+    private static Map<String, String> parseArgs(String[] args, java.util.Set<String> booleanKeys) {
         Map<String, String> m = new LinkedHashMap<>();
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
             if (!a.startsWith("--")) {
-                continue;
+                if (i == 0) {
+                    continue; // the command word
+                }
+                throw new IllegalArgumentException("unexpected argument '" + a + "' (options are --key value or"
+                        + " --key=value; boolean flags take true/false or stand alone)");
             }
             String key = a.substring(2);
             String value;
@@ -114,14 +136,27 @@ public final class Settings {
             if (eq >= 0) {
                 value = key.substring(eq + 1);
                 key = key.substring(0, eq);
-            } else if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
-                value = args[++i];
             } else {
-                value = "true";
+                key = ALIASES.getOrDefault(key, key);
+                String next = i + 1 < args.length ? args[i + 1] : null;
+                if (next == null || next.startsWith("--")) {
+                    value = "true";
+                } else if (booleanKeys.contains(key) && !isBooleanLiteral(next)) {
+                    value = "true"; // a bare flag; the next argument is reported as unexpected on the next round
+                } else {
+                    value = args[++i];
+                }
             }
             m.put(ALIASES.getOrDefault(key, key), value);
         }
         return m;
+    }
+
+    private static boolean isBooleanLiteral(String v) {
+        return switch (v.toLowerCase(java.util.Locale.ROOT)) {
+            case "true", "false", "yes", "no", "on", "off", "1", "0" -> true;
+            default -> false;
+        };
     }
 
     private void put(String key, String value, String source) {
@@ -227,9 +262,13 @@ public final class Settings {
         }
     }
 
+    /** Accepts true/false, yes/no, on/off and 1/0 (case-insensitive); anything else is an error, not false. */
     public boolean getBool(String key) {
-        String v = get(key).toLowerCase();
-        return v.equals("true") || v.equals("yes") || v.equals("on") || v.equals("1");
+        return switch (get(key).toLowerCase(java.util.Locale.ROOT)) {
+            case "true", "yes", "on", "1" -> true;
+            case "false", "no", "off", "0" -> false;
+            default -> throw new IllegalArgumentException(key + " must be true or false, got '" + get(key) + "'");
+        };
     }
 
     public SamplingParams sampling() {

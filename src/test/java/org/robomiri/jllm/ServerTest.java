@@ -78,6 +78,38 @@ public final class ServerTest {
                         "settings: " + bad[0] + " " + bad[1] + " rejected up front: " + e.getMessage());
             }
         }
+        // L10: --key=value for values that start with --, boolean flags, strict booleans, CLI-only keys in a file
+        Settings s = Settings.load(new String[]{"run", "--system=--weird", "--raw", "--prompt", "hi", "--think", "no"}).validate();
+        check(s.get("chat.system").equals("--weird") && s.getBool("raw") && s.get("prompt").equals("hi") && !s.getBool("chat.thinking"),
+                "settings: --key=--value, bare --raw before another flag, --think no");
+        s = Settings.load(new String[]{"run", "--raw", "0", "--low-disk", "FALSE", "--think"}).validate();
+        check(!s.getBool("raw") && !s.getBool("model.low-disk") && s.getBool("chat.thinking"),
+                "settings: boolean flags consume a following boolean literal (0, FALSE) or stand alone");
+        for (String[] args : new String[][]{{"serve", "--chat.thinking", "flase"}, {"serve", "--chat.thinking=flase"},
+                {"run", "--raw", "tell me a story"}}) {
+            try {
+                Settings.load(args).validate();
+                check(false, "settings: " + String.join(" ", args) + " rejected");
+            } catch (IllegalArgumentException e) {
+                check(e.getMessage().contains(args[args.length - 1].replace("--chat.thinking=", "")),
+                        "settings: " + String.join(" ", args) + " rejected: " + e.getMessage());
+            }
+        }
+        Path file = Files.createTempFile("jllm-test", ".properties");
+        try {
+            Files.writeString(file, "prompt=hello\n");
+            try {
+                Settings.load(new String[]{"run", "--config", file.toString()});
+                check(false, "settings: prompt= in the properties file rejected");
+            } catch (IllegalArgumentException e) {
+                check(e.getMessage().contains("prompt"), "settings: prompt= in the properties file rejected: " + e.getMessage());
+            }
+            Files.writeString(file, "backend.ctx=512\n");
+            check(Settings.load(new String[]{"run", "--config", file.toString()}).validate().getInt("backend.ctx") == 512,
+                    "settings: the external file is still applied");
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 
     static void basics(Fixture f) throws Exception {
