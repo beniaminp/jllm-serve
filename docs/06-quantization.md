@@ -1,6 +1,11 @@
 # 6. Quantization: Q4_0 and Q8_0 — with all the math
 
-Code: `model/QType.java`, `model/QTensor.java`, `model/QuantFile.java`, `model/ModelConverter.java`
+Code: `model/QType.java`, `model/QTensor.java`, `model/QuantFile.java`, `model/ModelConverter.java`,
+`model/ModelWeights.java`; kernels in `cpu/VectorKernels.java`, `cpu/Int8Kernels.java`, `cpu/CpuMatmul.java`
+
+This chapter derives the two 32-weight-block formats, Q4_0 and Q8_0, and the memory layout, cache file and
+kernels that every format shares. The third format, Q2_K (`--quant q2k`, 256-weight super-blocks with
+two-level scales), has its own chapter: [13](13-q2k-quantization.md).
 
 The model's weights are 596 million numbers (Qwen3-0.6B) or 30 billion (Qwen3-30B-A3B). How many bytes each
 number takes decides how much memory the model needs **and how fast it runs**. This chapter explains why,
@@ -51,9 +56,9 @@ Qwen3-0.6B, bf16 (2 bytes/weight):   1 190 MB / 200 GB/s  =  6.0 ms  →  ≤ 16
 Qwen3-0.6B, Q4_0 (0.625 B/weight):     450 MB / 200 GB/s  =  2.3 ms  →  ≤ 440 tok/s
 ```
 
-Halving the bytes doubles the ceiling. (The measured numbers are below the ceilings for reasons covered in
-[11](11-performance.md), but the ratio holds.) The second reason is capacity: the 30B MoE model is 61 GB in bf16
-and does not fit in 32 GB of RAM at all; at ~0.65 bytes/weight it is 20 GB and does.
+Halving the bytes doubles the ceiling. (The measured Q4_0 decode rates are well below the ceilings, ~111 tok/s on
+Metal and ~51 tok/s on the CPU, for reasons covered in [11](11-performance.md), but the ratio holds.) The second reason is capacity: the 30B MoE model is 61 GB in bf16
+and does not fit in 32 GB of RAM at all; at ~0.65 bytes/weight it is 19.4 GB and does.
 
 ---
 
@@ -67,7 +72,7 @@ Why 32 and not the whole row? Because weights are not uniformly sized: a row of 
 among values around 0.02. A single row-wide scale would be set by the 0.3 and squash the 0.02s into one or two
 levels. With 32-weight blocks, that outlier only hurts its 31 neighbours. The cost is 4 bytes of scale per
 block — 1 bit per weight on top of the 4 or 8 data bits. (These are exactly llama.cpp's `Q4_0` and `Q8_0`
-formats, so the numbers are comparable with the rest of the ecosystem.) In code: `QType.BLOCK = 32`.
+formats, so the numbers are comparable with the rest of the ecosystem.) In code: `QType.BLOCK = 32` (Q2_K is the exception: its unit is a 256-weight super-block, `QType.blockSize`, see [13](13-q2k-quantization.md)).
 
 ---
 
@@ -193,12 +198,15 @@ and with one `SHIFT >> 4` gets weights 16…31 as 16 lanes — two full vectors 
 
 ## 6.4 The memory layout of a `QTensor`
 
-A quantized `[rows, cols]` matrix is one contiguous off-heap `MemorySegment`:
+A quantized `[rows, cols]` matrix is one contiguous off-heap `MemorySegment`. The diagram and arithmetic below are
+the Q4_0 / Q8_0 case; each `QType` carries its own `blockSize` (weights per block: 32, or 256 for Q2_K),
+`blockBytes` (16 / 32 / 84) and `scaleBytes` (4 for the separate f32 scale of Q4_0 / Q8_0, **0** for Q2_K, whose
+scales live inside its blocks), and the formulas are written with those fields:
 
 ```
 offset 0 ───────────────────────────────────────────────────────────────────────┐
 │ quantized blocks, row-major:                                                 │
-│   row 0: block 0 | block 1 | … | block nb−1       nb = cols / 32              │
+│   row 0: block 0 | block 1 | … | block nb−1       nb = cols / 32 (Q2_K: ⌈cols / 256⌉) │
 │   row 1: …                                        blockBytes = 16 (Q4) / 32 (Q8) │
 │   …                                                                           │
 │ size = rows × nb × blockBytes                                                 │
@@ -212,11 +220,15 @@ offset 0 ───────────────────────�
 The helper arithmetic (`QTensor.rowOffset`, `scaleOffset`, `scalesOffset`, `byteSize`):
 
 ```
+nb             = ⌈cols / blockSize⌉                  QTensor.blocksPerRow()
 rowOffset(r)   = r × nb × blockBytes                 first block of row r
 scaleOffset(r) = scalesOffset + r × nb × 4           first scale of row r
 scalesOffset   = align(rows × nb × blockBytes, 64)
-byteSize       = align(scalesOffset + rows × nb × 4, 16384)
+byteSize       = align(scalesOffset + rows × nb × scaleBytes, 16384)
 ```
+
+For Q2_K `scaleBytes = 0`, so the scale region is empty and `byteSize` is just the blocks rounded up to a page
+([13 §13.6](13-q2k-quantization.md#136-a-q2_k-qtensor)).
 
 **Worked example, `k_proj.weight` of Qwen3-0.6B, `[1024, 1024]` in Q4_0:**
 
@@ -243,7 +255,8 @@ total         = 175 030 272 B ≈ 175 MB = 1.125 B/weight ✓
 
 Scales are kept in their own region rather than interleaved with the data (as llama.cpp does) for two reasons:
 both regions stay naturally aligned for vector loads, and the GPU can bind them as two separate buffer
-arguments (`wq`, `ws` in `kernels.metal`) at two offsets of the same allocation.
+arguments (`wq`, `ws` in `kernels.metal`) at two offsets of the same allocation (`MetalKernels.scaleOff`; for
+Q2_K it binds offset 0 because there is nothing to point at).
 
 The 16 KiB page alignment (`QTensor.PAGE`) is what allows Metal to wrap the memory with
 `newBufferWithBytesNoCopy` instead of copying it ([08](08-metal-backend.md)); it costs at most 16 KiB of padding
@@ -256,17 +269,19 @@ per tensor.
 | tensor | format | why |
 |---|---|---|
 | embedding / LM head | **Q8_0 always** | the LM head's error goes straight into the logits; small models are measurably worse with a Q4 head. Also only read once per token (one row for the embedding; all rows for the head). |
-| attention `q/k/v/o`, FFN `gate/up/down`, MoE experts | `--quant` (Q4_0 default, Q8_0 optional) | the bulk of the bytes; errors average out over many dot products |
-| norms, QK-norm gains, MoE router | f32 | tiny (1 KB – 1 MB each); the router decides which experts run, so its precision matters |
-| activations, KV cache | f32 | computed on the fly, never stored on disk; quantizing them is a separate (future) optimization |
+| attention `q/k/v/o` (or the MLA projections), FFN `gate/up/down`, MoE experts incl. DeepSeek's shared experts | `--quant` (`model.quant`): Q4_0 default, `q8`, or `q2k` | the bulk of the bytes; errors average out over many dot products. The converter applies the one chosen format to **every** one of these tensors; there is no mixed recipe (e.g. `down_proj` at 4 bits, the rest at 2) |
+| norms (incl. QK-norm and post-norm gains), q/k/v biases, MoE router (and DeepSeek's router bias) | f32 | tiny (1 KB – 1 MB each); the router decides which experts run, so its precision matters |
+| activations | f32; on the CPU decode path quantized on the fly to Q8_0 (6.8) | computed per token, never stored on disk |
+| KV cache | f32, or f16 with `backend.kv-dtype=f16` | in RAM only; for DeepSeek's MLA it holds just the latent row ([05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)) |
 
 Sizes that result (`ModelWeights.byteSize()`):
 
 | model | parameters | bf16 | jllm Q4_0 cache | jllm Q8_0 cache |
 |---|---|---|---|---|
 | Qwen3-0.6B (tied embedding) | 596 M | 1 190 MB | **452 MB** (175 Q8 embed + 275 Q4 layers + padding) | ~670 MB |
-| Qwen3-30B-A3B (separate `lm_head`) | 30.5 B | 61 000 MB | **≈ 19.7 GB** (2 × 350 MB Q8 embed/head + 18.1 GB Q4 experts + 0.9 GB Q4 attention) | would not fit in 32 GB |
+| Qwen3-30B-A3B (separate `lm_head`) | 30.5 B | 61 000 MB | **≈ 19.4 GB** (2 × 350 MB Q8 embed/head + 18.1 GB Q4 experts + 0.6 GB Q4 attention) | would not fit in 32 GB |
 
+With `--quant q2k` the same 0.6B cache is 321 MB and the 30B's about 10.5 GB ([13 §13.6](13-q2k-quantization.md#136-a-q2_k-qtensor)).
 ---
 
 ## 6.6 Stacked matrices and row arithmetic
@@ -288,22 +303,38 @@ Selecting expert `e` costs nothing: the kernel computes `row = e × rowsPerExper
 
 ## 6.7 Quantizing: when and how
 
-`QTensor.quantize(arena, type, rows, cols, rowSource)` allocates the segment, then runs
-`IntStream.range(0, rows).parallel()` — each row is quantized independently (one thread-local `float[cols]`
-buffer per worker), reading its source values through the memory-mapped safetensors
-([03 §3.4](03-safetensors.md#34-memory-mapping-with-the-ffm-api)). All cores participate; Qwen3-0.6B converts
-in ~2 s, the 30B MoE in a few minutes dominated by reading 61 GB from disk.
+`QTensor.quantize(arena, type, rows, cols, rowSource)` allocates the segment (`cols` must be a multiple of 32),
+then runs `IntStream.range(0, rows).parallel()` — each row is quantized independently, reading its source values
+through the memory-mapped safetensors ([03 §3.4](03-safetensors.md#34-memory-mapping-with-the-ffm-api)). A worker
+**stages** the row in thread-local on-heap arrays — the `float[cols]` source row, a `byte[]` for the quantized
+blocks and a `float[]` for the scales, grown once and reused for every row the thread handles — and copies the
+result into the segment with two bulk `MemorySegment.copy` calls, instead of one bounds-checked segment access
+per quantized byte. All cores participate; Qwen3-0.6B converts in ~2 s, the 30B MoE in a few minutes dominated by
+reading 61 GB from disk.
 
-This happens **once**: `ModelConverter` writes every tensor's segment verbatim into `jllm-q4_0.bin` and the
-offsets into `jllm-q4_0.json` ([03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)).
-Afterwards `ModelWeights` memory-maps the `.bin` and wraps each tensor with
+This happens **once**: `ModelConverter` walks the checkpoint one unit at a time (embedding, each layer, final
+norm and head), writes every tensor's segment verbatim into `jllm-<quant>.bin` and the offsets into
+`jllm-<quant>.json` (`<quant>` is the lower-cased `QType` name: `jllm-q4_0.bin`, `jllm-q8_0.bin`,
+`jllm-q2_k.bin`; [03 §3.5](03-safetensors.md#35-from-safetensors-to-jllms-quantized-cache)). The JSON is written
+last and is the "conversion complete" marker; a crash in the middle leaves a `jllm-<quant>.partial.json` sidecar
+from which the next run resumes. The index records the file-format `version`, the converter's `LAYOUT_VERSION`
+(which tensors exist under which names, which are fused or split; currently 2), the model description and the
+**identity** of the checkpoint — `repo`, `revision` and the Hub commit `sha`.
+
+The cache is therefore self-invalidating. `ModelWeights.load` converts when there is no cache, and when an
+existing one cannot be used — another `LAYOUT_VERSION`, an unparseable or truncated index, a blob that does not
+fit the file, tensor shapes that do not match the architecture, or an identity that differs from the
+`repo@revision` now requested — `QuantFile` raises `StaleCacheException`, the files are deleted (`Reconverting
+jllm-q4_0.bin: …` on stderr) and the conversion runs again. A freshly converted cache that still does not match
+is reported as an error instead of looping. Afterwards `ModelWeights` memory-maps the `.bin` and wraps each
+tensor with
 
 ```java
 QTensor.view(type, rows, cols, mapped.asSlice(offset, size))
 ```
 
 — no quantization, no copy, no RAM until a row is touched. `view` checks that `size == byteSize(type, rows,
-cols)` so a stale or truncated cache fails loudly.
+cols)`, so a stale or truncated cache fails loudly (and, as above, triggers a reconversion).
 
 ---
 
@@ -312,11 +343,23 @@ cols)` so a stale or truncated cache fails loudly.
 Reading values back is `x̂ = (q − 8) · d` per weight (`QTensor.dequantizeRow`), but the hot kernels never expand
 a whole matrix to floats: that would multiply memory traffic by 6. Instead:
 
-- **decode** (`VectorKernels.dotQ4`): load 16 bytes, unpack to two 16-lane vectors *in registers*, multiply with
-  the activation, accumulate; apply the scale once per block. Weight bytes are read exactly once.
-- **prefill** (`VectorKernels.dequantRow` + `dot4`): expand 4 rows into a thread-local float buffer, then reuse
-  them for all 64 tokens of the batch, so the unpacking cost is amortized.
-- **Metal** (`block_dot<QT>` in `kernels.metal`): same as decode, one `uchar4` at a time.
+All CPU matmuls go through `CpuMatmul.mul`, which picks the kernel by the number of tokens `n` and the weight format:
+
+- **decode, float** (`VectorKernels.dotRow` → `dotQ4`): load 16 bytes, unpack to two 16-byte vectors *in
+  registers*, convert to float lanes, multiply with the activation, accumulate; apply the scale once per block.
+  Weight bytes are read exactly once. (`dotQ8` for Q8_0, `Q2KKernels.dot` for Q2_K.)
+- **decode, int8 activations** (default, `backend.cpu.int8-activations=true`; `CpuMatmul.useInt8` → `Int8Kernels.dotRow`,
+  Q4_0 and Q8_0 weights only): the activation vector is quantized **once per matmul** to Q8_0 — blocks of 32,
+  `d = max|x| / 127`, one scale per block — and each weight row is multiplied with it in integer lanes: the exact
+  integer sum `Σ w_i·q_i` of a block is scaled by `weightScale × activationScale` and accumulated in float. No
+  byte→float conversion is left in the inner loop; the price is a ~0.9 % RMS relative error on each dot product,
+  and the gain is about 4× decode speed on the CPU (13 → 54 tok/s in the A/B run of
+  [11 §11.1](11-performance.md#111-measured); the current build decodes ~51 tok/s). Q2_K rows keep the float path.
+- **prefill** (`n > 1`: `VectorKernels.dequantRow` + `dot4x4` / `dot4`): expand 4 rows into a thread-local float
+  buffer, then reuse them for every token of the chunk (up to `backend.batch`, 64), four tokens at a time, so the
+  unpacking cost is amortized. Prefill always uses float activations.
+- **Metal** (`block_dot<QT>` / `mm_row<QT>` in `kernels.metal`): same as float decode, one `uchar4` at a time;
+  activations stay f32 on the GPU.
 
 Details in [07](07-cpu-backend.md) and [08](08-metal-backend.md).
 
@@ -331,15 +374,21 @@ an individual weight. That is why a 15 % per-weight perturbation yields outputs 
 
 The standard way to measure the damage is **perplexity**: run a text through the model and compute how
 surprised it is by the actual next tokens (lower is better). For Q4_0 on small models the increase is typically
-a few percent; for Q8_0 it is below measurement noise. In practice:
+a few percent (7.16 → 7.37 on the 97-token paragraph of [13 §13.7](13-q2k-quantization.md#137-measurements)); for Q8_0 it
+is below measurement noise. In practice:
 
-- greedy outputs of this project's Q4_0 Qwen3-0.6B agree between CPU and Metal exactly and give the same kind of
-  answers as the full-precision model; individual token choices can differ from bf16 on close calls;
+- greedy outputs of this project's Q4_0 Qwen3-0.6B give the same kind of answers as the full-precision model;
+  individual token choices can differ from bf16 on close calls. Metal and the CPU with
+  `backend.cpu.int8-activations=false` produce identical greedy text; the default int8 CPU path perturbs the
+  last bits of the logits, so its text can diverge after a near-tie ([11 §11.1](11-performance.md#111-measured));
 - `--quant q8` is the near-lossless reference when you want to check whether an odd answer is a Q4 artifact;
 - the embedding/LM head stay Q8_0 because the logits see those errors with no averaging across layers.
 
-Activations (`x`, `q`, `k`, `v`) stay f32: they are recomputed per token and never stored, so there is no
-memory to save — and the attention scores are sensitive to their precision.
+Activations (`x`, `q`, `k`, `v`) stay f32 everywhere except the int8 decode matmuls of 6.8, where the activation
+is rounded to Q8_0 for the duration of one matmul only (error ≈ 0.4 % per element, ~0.9 % per dot product); the
+residual stream, norms, softmax and the attention scores are always f32. They are recomputed per token and never
+stored, so there is no memory to save. The one activation-like thing that *is* stored, the KV cache, is f32 by
+default and optionally f16 (`backend.kv-dtype`, [05 §5.9](05-transformer-math.md#59-prefill-decode-and-the-kv-cache)).
 
 ---
 
@@ -347,10 +396,10 @@ memory to save — and the attention scores are sensitive to their precision.
 
 | format | idea | not in this project because |
 |---|---|---|
-| **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | implemented: `--quant q2k`, see [13](13-q2k-quantization.md) |
+| **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | *done*: `--quant q2k`, see [13](13-q2k-quantization.md) (applied to every linear layer; pure Q2_K breaks a 0.6B model) |
 | **Q4_K / Q5_K / Q6_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | more complex kernels; Q4_0 is the simplest format that works ([13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them) |
 | **GPTQ / AWQ** | choose the quantized values by minimizing the *output* error on calibration data, not per-weight rounding | needs calibration runs and a solver at conversion time |
-| **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, twice the lanes per SIMD register and no byte→float conversions | *done* on the CPU decode path, `backend.cpu.int8-activations` ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) |
+| **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, twice the lanes per SIMD register and no byte→float conversions | *done* on the CPU decode path for Q4_0 / Q8_0 weights, `backend.cpu.int8-activations` ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) |
 | **fp8 / NF4** | 8-bit floats; 4-bit non-uniform "normal float" levels | GPU-oriented; no hardware fp8 on Apple M1 |
 
 ---
@@ -362,6 +411,8 @@ memory to save — and the attention scores are sensitive to their precision.
 - Nibbles are packed as (j, j+16) pairs so SIMD code gets two vectors from one 16-byte load.
 - A `QTensor` is `[blocks][64-aligned scales][page padding]`; offsets are pure arithmetic, so a row, a block, or
   an expert is addressed without any lookup.
-- Quantization happens once into `jllm-q4_0.bin`; afterwards the file is memory-mapped and used in place by
-  both the CPU (Vector API) and the GPU (zero-copy Metal buffers).
+- Quantization happens once into `jllm-<quant>.bin` (+ `.json` with the layout version and the checkpoint's
+  repo / revision / sha, so a stale cache is reconverted automatically); afterwards the file is memory-mapped
+  and used in place by both the CPU (Vector API, optionally with int8 activations) and the GPU (zero-copy Metal
+  buffers).
 - Decode speed ∝ 1 / bytes, which is the whole reason to do this.
