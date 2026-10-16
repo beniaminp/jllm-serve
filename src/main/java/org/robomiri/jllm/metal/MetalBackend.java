@@ -25,6 +25,12 @@ public final class MetalBackend implements Backend {
      */
     private static final int ATT_TILE = 32;
     private static final int MAX_BUFS = 16; // matmul3 binds 11 buffers
+    /**
+     * Layers per command buffer: the dispatches of every COMMIT_LAYERS layers are submitted (without waiting)
+     * while the following layers are still being encoded, so GPU execution overlaps the CPU-side encoding
+     * instead of starting only after the whole pass is recorded. 0 = one command buffer per forward pass.
+     */
+    static final int COMMIT_LAYERS = Integer.getInteger("jllm.metal.commitLayers", 8);
 
     private final ModelWeights w;
     private final ModelConfig c;
@@ -429,6 +435,9 @@ public final class MetalBackend implements Backend {
                     } else {
                         matmul(W.wDown, L.wDown, hidden, 0, x, 0, n, true, null);
                     }
+                }
+                if (COMMIT_LAYERS > 0 && (l + 1) % COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
+                    metal.commit(); // the GPU starts on these layers while the next ones are encoded
                 }
             }
             if (logits != null) {

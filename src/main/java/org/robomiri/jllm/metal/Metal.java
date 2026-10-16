@@ -46,6 +46,7 @@ public final class Metal implements AutoCloseable {
     private final MethodHandle begin;
     private final MethodHandle dispatch;
     private final MethodHandle abort;
+    private final MethodHandle commit;
     private final MethodHandle commitWait;
 
     private final Arena arena = Arena.ofShared();
@@ -70,7 +71,8 @@ public final class Metal implements AutoCloseable {
         dispatch = handle(l, "jm_dispatch", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT,
                 ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
         abort = handle(l, "jm_abort", FunctionDescriptor.ofVoid(ADDRESS));
-        commitWait = handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        commit = handle(l, "jm_commit", FunctionDescriptor.ofVoid(ADDRESS));
+        commitWait =handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
         try {
             ctx = (MemorySegment) create.invokeExact(arena.allocateFrom(shaderSource), err, ERR_LEN);
         } catch (Throwable t) {
@@ -280,6 +282,19 @@ public final class Metal implements AutoCloseable {
     public void abort() {
         try {
             abort.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /**
+     * Submits the dispatches recorded so far without waiting and keeps recording into a fresh command buffer, so
+     * the GPU starts on them while the rest of the pass is being encoded. Execution order is preserved (one
+     * in-order queue); {@link #commitAndWait()} waits for everything and reports a failure of any part.
+     */
+    public void commit() {
+        try {
+            commit.invokeExact(ctx);
         } catch (Throwable t) {
             throw rethrow(t);
         }

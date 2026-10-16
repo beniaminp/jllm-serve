@@ -198,6 +198,9 @@ public final class MambaMetalBackend implements Backend {
                 matmul(W.xProj, L.xProj, xc, dbc, n, false);
                 scan(L, l, n);
                 matmul(W.outProj, L.outProj, y, x, n, true);
+                if (MetalBackend.COMMIT_LAYERS > 0 && (l + 1) % MetalBackend.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
+                    metal.commit(); // the GPU starts on these layers while the next ones are encoded
+                }
             }
             if (logits != null) {
                 rmsnorm(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);

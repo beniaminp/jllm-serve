@@ -20,6 +20,8 @@
 @property(nonatomic, strong) NSMutableArray<id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic, strong) id<MTLCommandBuffer> cmd;
 @property(nonatomic, strong) id<MTLComputeCommandEncoder> enc;
+// command buffers of the current forward pass that jm_commit already submitted (jm_commit_wait checks them)
+@property(nonatomic, strong) NSMutableArray<id<MTLCommandBuffer>> *inflight;
 @end
 
 @implementation JMContext
@@ -44,6 +46,7 @@ void *jm_create(const char *source, char *err, int errlen) {
         c.device = dev;
         c.queue = [dev newCommandQueue];
         c.pipelines = [NSMutableArray new];
+        c.inflight = [NSMutableArray new];
         NSError *e = nil;
         MTLCompileOptions *opts = [MTLCompileOptions new];
         c.library = [dev newLibraryWithSource:[NSString stringWithUTF8String:source] options:opts error:&e];
@@ -162,13 +165,17 @@ void jm_buffer_release(void *buf) {
     }
 }
 
+static void open_cmd(JMContext *c) {
+    c.cmd = [c.queue commandBufferWithUnretainedReferences];
+    c.enc = [c.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+}
+
 // Starts recording a new command buffer with a serial compute encoder: each dispatch sees the results of the
 // previous one, so the Java side does not need explicit barriers.
 void jm_begin(void *ctx) {
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
-        c.cmd = [c.queue commandBufferWithUnretainedReferences];
-        c.enc = [c.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        open_cmd(c);
     }
 }
 
@@ -194,8 +201,23 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
     }
 }
 
+// Submits what has been recorded so far without waiting and opens a fresh command buffer for the dispatches
+// that follow, so the GPU runs the first part of a forward pass while the CPU is still encoding the rest.
+// Command buffers of one queue execute in submission order, so the serial-dependency guarantee of jm_begin
+// carries across the split. jm_commit_wait later waits for the last buffer and reports a failure of any.
+void jm_commit(void *ctx) {
+    @autoreleasepool {
+        JMContext *c = (__bridge JMContext *) ctx;
+        [c.enc endEncoding];
+        [c.cmd commit];
+        [c.inflight addObject:c.cmd];
+        open_cmd(c);
+    }
+}
+
 // Discards the command buffer being recorded without running it. Metal aborts the process if a compute
 // encoder is released before endEncoding, so the Java side calls this when recording fails part-way.
+// Parts already submitted with jm_commit are waited for (they may still read buffers the CPU writes next).
 // A no-op when nothing is being recorded.
 void jm_abort(void *ctx) {
     @autoreleasepool {
@@ -205,21 +227,31 @@ void jm_abort(void *ctx) {
         }
         c.enc = nil;
         c.cmd = nil;
+        if (c.inflight.count > 0) {
+            [c.inflight.lastObject waitUntilCompleted];
+            [c.inflight removeAllObjects];
+        }
     }
 }
 
-// Submits the recorded work and blocks until the GPU is done. Returns 0 on success.
+// Submits the recorded work and blocks until the GPU is done with it and with everything jm_commit
+// submitted before. Returns 0 on success.
 int jm_commit_wait(void *ctx, char *err, int errlen) {
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
         [c.enc endEncoding];
         [c.cmd commit];
-        [c.cmd waitUntilCompleted];
+        [c.cmd waitUntilCompleted]; // in-order queue: the earlier buffers are complete too
+        [c.inflight addObject:c.cmd];
         int rc = 0;
-        if (c.cmd.status == MTLCommandBufferStatusError) {
-            set_err(err, errlen, c.cmd.error ? c.cmd.error.localizedDescription : @"command buffer failed");
-            rc = -1;
+        for (id<MTLCommandBuffer> cmd in c.inflight) {
+            if (cmd.status == MTLCommandBufferStatusError) {
+                set_err(err, errlen, cmd.error ? cmd.error.localizedDescription : @"command buffer failed");
+                rc = -1;
+                break;
+            }
         }
+        [c.inflight removeAllObjects];
         c.enc = nil;
         c.cmd = nil;
         return rc;
