@@ -39,7 +39,8 @@ import java.util.concurrent.TimeoutException;
  *
  * <p>Every request has a response timeout and every download body has a stall watchdog (no bytes for the
  * timeout counts as a connection failure), so a hung connection is retried instead of blocking forever.
- * Client errors (4xx) are not retried; server errors (5xx) and I/O failures are retried with back-off.
+ * Client errors (4xx) are not retried; server errors (5xx), 429 Too Many Requests (honouring
+ * {@code Retry-After}) and I/O failures are retried with back-off, for listings and downloads alike.
  */
 public final class HuggingFaceHub {
 
@@ -51,6 +52,8 @@ public final class HuggingFaceHub {
     private final HttpClient http;
     private final String endpoint;
     private final String token;
+    /** False when a token is configured but the endpoint is plain http to a non-loopback host, so it is never sent. */
+    private final boolean tokenUsable;
     private volatile long timeoutMillis;
 
     public HuggingFaceHub() {
@@ -78,7 +81,33 @@ public final class HuggingFaceHub {
         String ep = endpoint != null ? endpoint : System.getenv("HF_ENDPOINT");
         this.endpoint = ep == null || ep.isBlank() ? "https://huggingface.co" : ep.replaceAll("/+$", "");
         this.token = token != null && !token.isBlank() ? token.trim() : findToken();
+        URI epUri = URI.create(this.endpoint);
+        this.tokenUsable = "https".equalsIgnoreCase(epUri.getScheme()) || isLoopback(epUri.getHost());
         setTimeoutMillis(timeoutMillis);
+    }
+
+    /** {@code localhost} or a loopback IP literal: a local mirror, where the token may travel over plain http. */
+    static boolean isLoopback(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.toLowerCase();
+        if (h.startsWith("[") && h.endsWith("]")) {
+            h = h.substring(1, h.length() - 1);
+        }
+        return h.equals("localhost") || h.startsWith("127.") || h.equals("::1") || h.equals("0:0:0:0:0:0:0:1");
+    }
+
+    /** The hint appended to a 401 / 403: what to do about the token. */
+    private String authHint(int status) {
+        if (status != 401 && status != 403) {
+            return "";
+        }
+        if (token == null) {
+            return " (gated/private repo? set HF_TOKEN)";
+        }
+        return tokenUsable ? " (is HF_TOKEN valid and allowed to read this repo?)"
+                : " (token withheld: endpoint " + endpoint + " is not https)";
     }
 
     /** Sets the response timeout of each request and the maximum time without progress on a download body. */
@@ -116,22 +145,61 @@ public final class HuggingFaceHub {
     public record RepoFile(String name, long size, String sha256) {
     }
 
-    /** An HTTP response with an unexpected status; 4xx statuses are not retried. */
+    /** An HTTP response with an unexpected status; 4xx statuses other than 429 are not retried. */
     public static final class HttpStatusException extends IOException {
         private final int status;
+        private final long retryAfterMillis;
 
         HttpStatusException(int status, String message) {
+            this(status, message, 0);
+        }
+
+        HttpStatusException(int status, String message, long retryAfterMillis) {
             super(message);
             this.status = status;
+            this.retryAfterMillis = retryAfterMillis;
         }
 
         public int status() {
             return status;
         }
 
-        boolean isClientError() {
-            return status >= 400 && status < 500;
+        /** The server's {@code Retry-After} in milliseconds (429 / 503), 0 when it gave none. */
+        public long retryAfterMillis() {
+            return retryAfterMillis;
         }
+
+        /** True for a failure that will not go away by retrying: a 4xx other than 429 Too Many Requests. */
+        boolean isPermanent() {
+            return status >= 400 && status < 500 && status != 429;
+        }
+    }
+
+    /** Builds the exception for an unexpected status, carrying the response's {@code Retry-After} if any. */
+    private static HttpStatusException statusException(HttpResponse<?> resp, String message) {
+        long retryAfter = 0;
+        String header = resp.headers().firstValue("retry-after").orElse(null);
+        if (header != null) {
+            try {
+                retryAfter = Math.min(Long.parseLong(header.trim()), 300) * 1000L; // seconds; an HTTP date is ignored
+            } catch (NumberFormatException ignored) {
+                // HTTP-date form: fall back to the usual back-off
+            }
+        }
+        return new HttpStatusException(resp.statusCode(), message, retryAfter);
+    }
+
+    /** True if {@code e} is worth another attempt: I/O trouble, a 5xx or a 429. */
+    private static boolean retryable(IOException e) {
+        return !(e instanceof HttpStatusException h) || !h.isPermanent();
+    }
+
+    /** Milliseconds to wait before attempt {@code attempt + 1}: the server's Retry-After, else linear back-off. */
+    private static long backoffMillis(IOException e, int attempt) {
+        if (e instanceof HttpStatusException h && h.retryAfterMillis() > 0) {
+            return h.retryAfterMillis();
+        }
+        return 1000L * attempt;
     }
 
     /** True for the small files every model needs: configs, tokenizer and the shard index. */
@@ -177,13 +245,29 @@ public final class HuggingFaceHub {
             return cached;
         }
         URI uri = URI.create(endpoint + "/api/models/" + repo + "/revision/" + encodeSegment(revision) + "?blobs=true");
-        HttpResponse<String> resp = send(uri, HttpResponse.BodyHandlers.ofString(), null, false);
-        if (resp.statusCode() != 200) {
-            throw new HttpStatusException(resp.statusCode(), "Hub API " + uri + " returned HTTP " + resp.statusCode()
-                    + (resp.statusCode() == 401 || resp.statusCode() == 403 ? " (gated/private repo? set HF_TOKEN)" : "")
-                    + ": " + truncate(resp.body()));
+        HttpResponse<String> resp;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                resp = send(uri, HttpResponse.BodyHandlers.ofString(), null, false);
+                if (resp.statusCode() != 200) {
+                    throw statusException(resp, "Hub API " + uri + " returned HTTP " + resp.statusCode()
+                            + authHint(resp.statusCode()) + ": " + truncate(resp.body()));
+                }
+                break;
+            } catch (IOException e) {
+                if (attempt >= MAX_ATTEMPTS || !retryable(e)) {
+                    throw e;
+                }
+                System.err.printf("  listing %s: %s, retrying (%d/%d)%n", repo, e.getMessage(), attempt, MAX_ATTEMPTS);
+                Thread.sleep(backoffMillis(e, attempt));
+            }
         }
-        Map<String, Object> info = Json.parseObject(resp.body());
+        Map<String, Object> info;
+        try {
+            info = Json.parseObject(resp.body());
+        } catch (RuntimeException e) {
+            throw new IOException("Hub API " + uri + " returned invalid JSON: " + e.getMessage(), e);
+        }
         List<RepoFile> files = new ArrayList<>();
         List<Object> siblings = Json.list(info, "siblings");
         if (siblings == null) {
@@ -296,11 +380,11 @@ public final class HuggingFaceHub {
                     have = transfer(uri, part, have, f, sha);
                     break;
                 } catch (IOException e) {
-                    if (attempt >= MAX_ATTEMPTS || e instanceof HttpStatusException h && h.isClientError()) {
+                    if (attempt >= MAX_ATTEMPTS || !retryable(e)) {
                         throw e;
                     }
                     System.err.printf("%n  %s: %s, retrying (%d/%d)%n", f.name(), e.getMessage(), attempt, MAX_ATTEMPTS);
-                    Thread.sleep(1000L * attempt);
+                    Thread.sleep(backoffMillis(e, attempt));
                     // resume from what is on disk; re-hash it since the stream state is unknown
                     have = Files.isRegularFile(part) ? Files.size(part) : 0;
                     sha = sha256();
@@ -334,9 +418,11 @@ public final class HuggingFaceHub {
         String range = have > 0 ? "bytes=" + have + "-" : null;
         HttpResponse<InputStream> resp = send(uri, HttpResponse.BodyHandlers.ofInputStream(), range, true);
         int status = resp.statusCode();
-        if (status == 416 && have > 0 && have == f.size()) {
+        if (status == 416 && have > 0 && (f.size() < 0 || have == f.size())) {
+            // Range Not Satisfiable at the end of the file: the download is complete. With an unknown size
+            // (no LFS entry) the 416 itself is the only evidence; the sha256 check does not apply there.
             resp.body().close();
-            return have; // already complete
+            return have;
         }
         boolean append;
         if (status == 206) {
@@ -352,7 +438,7 @@ public final class HuggingFaceHub {
             try (InputStream in = resp.body()) {
                 body = new String(in.readNBytes(512), StandardCharsets.UTF_8);
             }
-            throw new HttpStatusException(status, "GET " + uri + " returned HTTP " + status + ": " + truncate(body));
+            throw statusException(resp, "GET " + uri + " returned HTTP " + status + authHint(status) + ": " + truncate(body));
         }
         long size = f.size() >= 0 ? f.size() : have + resp.headers().firstValueAsLong("content-length").orElse(-1);
         Progress progress = new Progress(f.name(), size, have);
@@ -438,7 +524,7 @@ public final class HuggingFaceHub {
 
     /**
      * Sends a GET, following redirects manually; the auth header is only sent to the Hub endpoint itself, and
-     * only over https so the token never travels in clear text.
+     * only over https (or to a loopback mirror) so the token never travels in clear text.
      *
      * <p>Timeouts: {@link HttpRequest.Builder#timeout} runs until the whole body has been consumed, which would
      * abort any download longer than the timeout, so it is only set on {@code !streaming} (small API) requests.
@@ -456,8 +542,8 @@ public final class HuggingFaceHub {
             if (!streaming) {
                 b.timeout(Duration.ofMillis(timeout));
             }
-            if (token != null && hubHost != null && hubHost.equalsIgnoreCase(current.getHost())
-                    && "https".equalsIgnoreCase(current.getScheme())) {
+            if (token != null && tokenUsable && hubHost != null && hubHost.equalsIgnoreCase(current.getHost())
+                    && ("https".equalsIgnoreCase(current.getScheme()) || isLoopback(current.getHost()))) {
                 b.header("Authorization", "Bearer " + token);
             }
             if (range != null) {
