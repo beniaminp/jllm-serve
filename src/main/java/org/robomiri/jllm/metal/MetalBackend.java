@@ -62,6 +62,8 @@ public final class MetalBackend implements Backend {
     Metal.Buffer hidden;
     Metal.Buffer scores;
     private Metal.Buffer logitsBuf;
+    private Metal.Buffer logitsAllBuf; // n rows of logits for forwardAll, grown on demand
+    private int logitsAllRows;
     // MoE (null for dense models)
     Metal.Buffer assign;
     Metal.Buffer routeWeight;
@@ -451,6 +453,16 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+        run(tokens, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
+        run(tokens, off, n, pos, logitsOut, stride);
+    }
+
+    /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
+    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
@@ -488,7 +500,15 @@ public final class MetalBackend implements Backend {
                     k.commit(); // the GPU starts on these layers while the next ones are encoded
                 }
             }
-            if (logits != null) {
+            if (logits != null && stride > 0) {
+                // every row (speculative verification): rmsnorm and LM head over the n tokens
+                if (logitsAllBuf == null || logitsAllRows < n) {
+                    logitsAllRows = Math.min(maxBatch, Math.max(n, 16)); // buffers live until the backend closes: size once
+                    logitsAllBuf = k.scratch((long) logitsAllRows * w.lmHead.rows * 4);
+                }
+                k.rmsnorm(x, 0, finalNorm, xb, n, dim);
+                k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsAllBuf, 0, n, false, null, c.finalSoftcap());
+            } else if (logits != null) {
                 // normalise only the last token (read x at row n-1, write xb row 0), then the LM head. Folding
                 // the norm into the LM-head kernel measured ~5% slower at decode: its prologue runs in all
                 // ~38k threadgroups, which costs more than the one dispatch it saves.
@@ -502,7 +522,13 @@ public final class MetalBackend implements Backend {
                 k.abort(); // an un-ended encoder would make Metal abort the process on release
             }
         }
-        if (logits != null) {
+        if (logits != null && stride > 0) {
+            int rows = Math.min(w.lmHead.rows, stride);
+            for (int i = 0; i < n; i++) {
+                MemorySegment.copy(logitsAllBuf.contents(), ValueLayout.JAVA_FLOAT, (long) i * w.lmHead.rows * 4,
+                        logits, i * stride, rows);
+            }
+        } else if (logits != null) {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
                     Math.min(w.lmHead.rows, logits.length));
         }
