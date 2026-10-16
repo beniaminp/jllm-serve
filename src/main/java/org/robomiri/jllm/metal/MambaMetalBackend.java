@@ -234,7 +234,8 @@ public final class MambaMetalBackend implements Backend {
             }
         }
         if (logits != null) {
-            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0, w.lmHead.rows);
+            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
+                    Math.min(w.lmHead.rows, logits.length));
         }
         statePos = pos + n;
     }
