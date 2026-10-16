@@ -9,8 +9,9 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * DeepSeek multi-head latent attention, expert router and shared experts on the GPU, driven by
- * {@link MetalBackend} (see {@code MlaCpu} for the math). Projections and norms reuse the generic kernels; the
- * kernels added for DeepSeek are {@code mla_rope}, {@code mla_kv_store}, {@code attention_mla} and {@code router_ds}.
+ * {@link MetalBackend} (see {@code MlaCpu} for the math). Projections, norms and attention (the runtime-width
+ * {@code attention} instantiation: keys nope + rope wide, values vDim wide) reuse the generic kernels; the
+ * kernels added for DeepSeek are {@code mla_rope}, {@code mla_kv_store} and {@code router_ds}.
  *
  * <p>The cache keeps the expanded per-head keys ({@code heads*(nope+rope)} floats per token) and values
  * ({@code heads*v}) in f32, like the CPU backend: 553 KB per token for DeepSeek-V2-Lite.
@@ -31,14 +32,10 @@ final class MlaMetal {
         Metal.Buffer routerBias;
     }
 
-    /** Must equal MetalBackend.ATT_TILE: the scores scratch holds that many tokens. */
-    private static final int ATT_TILE = 32;
-
     private final MetalBackend mb;
     private final Metal metal;
     private final ModelConfig c;
     private final DeepSeekConfig d;
-    private final int ctx;
     private final Bufs[] bufs;
     private final Metal.Buffer[] key;
     private final Metal.Buffer[] val;
@@ -54,7 +51,6 @@ final class MlaMetal {
         this.metal = mb.metal;
         this.c = w.cfg;
         this.d = c.deepseek();
-        this.ctx = ctx;
         if (d.qkDim() % 32 != 0 || d.qkDim() > 256 || d.vHeadDim() % 32 != 0 || d.vHeadDim() > 256
                 || d.qkRopeDim() / 2 > 256) {
             throw new IllegalArgumentException("Metal MLA needs qk (" + d.qkDim() + ") and v (" + d.vHeadDim()
@@ -141,26 +137,9 @@ final class MlaMetal {
         mb.params.setAtIndex(ValueLayout.JAVA_INT, 5, heads * vd);
         metal.dispatch(metal.pipeline("mla_kv_store"), mb.bufArgs, mb.offArgs, 4, mb.params, 24, heads, n, 1, 64, 1, 1);
 
-        mb.bind(0, mb.q, 0);
-        mb.bind(1, key[l], 0);
-        mb.bind(2, val[l], 0);
-        mb.bind(3, mb.att, 0);
-        mb.bind(4, mb.scores, 0);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 0, heads);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 1, qk);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 2, vd);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 3, pos);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 4, ctx);
-        mb.params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, (float) d.softmaxScale());
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 6, heads * qk);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 7, heads * qk);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 8, heads * vd);
-        mb.params.setAtIndex(ValueLayout.JAVA_INT, 9, heads * vd);
-        for (int t0 = 0; t0 < n; t0 += ATT_TILE) { // same token tiling as MetalBackend.attention
-            mb.params.setAtIndex(ValueLayout.JAVA_INT, 10, t0);
-            metal.dispatch(metal.pipeline("attention_mla"), mb.bufArgs, mb.offArgs, 5, mb.params, 44, heads, Math.min(ATT_TILE, n - t0), 1,
-                    256, 1, 1);
-        }
+        // the runtime-width attention kernel: keys heads * qk wide, values heads * vd, no GQA, window or cap
+        mb.attention("attention", 1, mb.q, key[l], val[l], mb.att, heads, heads, qk, vd, pos, (float) d.softmaxScale(),
+                heads * qk, heads * qk, heads * vd, heads * vd, 0, 0f, n);
     }
 
     private void rope(Metal.Buffer v, int heads, int qk, int nope, int rd, int rowStride, int n, int pos) {

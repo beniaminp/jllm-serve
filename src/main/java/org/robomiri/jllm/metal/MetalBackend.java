@@ -652,31 +652,47 @@ public final class MetalBackend implements Backend {
                 c.headDim() / 2, 1, 1);
     }
 
-    /** One dispatch per tile of ATT_TILE tokens; the scores scratch is indexed by the tile-local token. */
+    /** Dense attention of layer l for the n tokens at pos (the group-specialised kernel, or flash decoding). */
     private void attention(int l, int n, int pos) {
         if (flashDecode && n == 1 && pos + 1 >= FLASH_MIN_LEN) {
             flashAttention(l, pos);
             return;
         }
-        bind(0, q, 0);
-        bind(1, keyCache[l], 0);
-        bind(2, valCache[l], 0);
-        bind(3, att, 0);
+        int hd = c.headDim();
+        attention(attnKernel, attnGroup, q, keyCache[l], valCache[l], att, c.heads(), c.kvHeads(), hd, hd, pos,
+                c.attnScale(), c.qDim(), c.kvDim(), c.kvDim(), c.qDim(), c.windowFor(l), c.attnSoftcap(), n);
+    }
+
+    /**
+     * The one writer of AttnParams: {@code attention_t} for n tokens, one dispatch per tile of ATT_TILE tokens
+     * (the scores scratch is indexed by the tile-local token). {@code groups} query heads share a threadgroup;
+     * kc/vc are the full caches, out receives rows of oStride floats.
+     */
+    void attention(String kernel, int groups, Metal.Buffer qb, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
+                   int nHeads, int nKvHeads, int qkDim, int vDim, int pos, float scale, int qStride, int kStride,
+                   int vStride, int oStride, int window, float softcap, int n) {
+        bind(0, qb, 0);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, 0);
         bind(4, scores, 0);
-        params.setAtIndex(ValueLayout.JAVA_INT, 0, c.heads());
-        params.setAtIndex(ValueLayout.JAVA_INT, 1, c.kvHeads());
-        params.setAtIndex(ValueLayout.JAVA_INT, 2, c.headDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 3, pos);
-        params.setAtIndex(ValueLayout.JAVA_INT, 4, ctx);
-        params.setAtIndex(ValueLayout.JAVA_FLOAT, 5, c.attnScale());
-        params.setAtIndex(ValueLayout.JAVA_INT, 6, c.qDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 7, c.kvDim());
-        params.setAtIndex(ValueLayout.JAVA_INT, 8, c.windowFor(l));
-        params.setAtIndex(ValueLayout.JAVA_FLOAT, 10, c.attnSoftcap());
+        params.setAtIndex(ValueLayout.JAVA_INT, 0, nHeads);
+        params.setAtIndex(ValueLayout.JAVA_INT, 1, nKvHeads);
+        params.setAtIndex(ValueLayout.JAVA_INT, 2, qkDim);
+        params.setAtIndex(ValueLayout.JAVA_INT, 3, vDim);
+        params.setAtIndex(ValueLayout.JAVA_INT, 4, pos);
+        params.setAtIndex(ValueLayout.JAVA_INT, 5, ctx);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 6, scale);
+        params.setAtIndex(ValueLayout.JAVA_INT, 7, qStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 8, kStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 9, vStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 10, oStride);
+        params.setAtIndex(ValueLayout.JAVA_INT, 11, window);
+        params.setAtIndex(ValueLayout.JAVA_FLOAT, 13, softcap);
+        int pipe = metal.pipeline(kernel);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
-            params.setAtIndex(ValueLayout.JAVA_INT, 9, t0);
-            metal.dispatch(metal.pipeline(attnKernel), bufArgs, offArgs, 5, params, 44, c.heads() / attnGroup,
-                    Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
+            params.setAtIndex(ValueLayout.JAVA_INT, 12, t0);
+            metal.dispatch(pipe, bufArgs, offArgs, 5, params, 56, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, 256, 1, 1);
         }
     }
 

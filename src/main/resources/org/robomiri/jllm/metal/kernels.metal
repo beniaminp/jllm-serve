@@ -731,107 +731,38 @@ template [[host_name("norm_rope")]] kernel decltype(norm_rope<float>) norm_rope<
 template [[host_name("norm_rope_h")]] kernel decltype(norm_rope<half>) norm_rope<half>;
 
 // ---------------------------------------------------------------------------------------------- attention
-// Causal GQA attention for token t = tokenOffset + tgp.y at position pos0 + t. Grid: (nHeads, tile),
-// 256 threads = 8 simdgroups. Tokens are dispatched in tiles so the scores scratch only needs
-// tile * nHeads * ctx floats: it is indexed by the tile-local token tgp.y, not by t.
-// Scores go to a device scratch row (so context length is not limited by threadgroup memory).
-// Each lane owns headDim/32 (<= 8) dimensions of q, k and v.
+// Causal attention for the tokens t = tokenOffset + tgp.y of a tile at positions pos0 + t, 256 threads =
+// 8 simdgroups per threadgroup. attention_t<KV, G, PERK, PERV> is the one kernel behind every variant:
+//   KV          cache element type (float, or half for backend.kv-dtype=f16; converted on load, all arithmetic f32)
+//   G           query heads of one KV head per threadgroup (grid (nHeads / G, tile)); G > 1 shares each K/V row
+//               across the group and is opt-in (-Djllm.metal.attnGroup, JLLM_ATTN_GROUPS)
+//   PERK, PERV  key / value head width in units of 32 (compile-time), or 0 for the widths in the params:
+//               used for head dims other than 64 / 128 / 256 and for DeepSeek MLA (qkDim = nope + rope, vDim)
+// Tokens are dispatched in tiles so the scores scratch only needs tile * nHeads * ctx floats (indexed by the
+// tile-local token tgp.y), and the scores live in device memory so the context is not limited by threadgroup
+// memory. Each lane owns dims lane, lane + 32, ... of q, k and v. Per head every value is produced the same
+// way whatever the template arguments: scores by simdgroup-strided positions with one simd_sum each, max and
+// sum by the two-level reductions, the value accumulation simdgroup-strided then reduced through `part`.
 
 struct AttnParams {
     int nHeads;
     int nKvHeads;
-    int headDim;
+    int qkDim;       // query / key head width (headDim; MLA: nope + rope)
+    int vDim;        // value head width (headDim; MLA: vHeadDim)
     int pos0;
     int ctx;
     float scale;
-    int qStride;
-    int kvStride;
+    int qStride;     // q row stride (nHeads * qkDim)
+    int kStride;     // key cache row stride (nKvHeads * qkDim)
+    int vStride;     // value cache row stride (nKvHeads * vDim)
+    int oStride;     // output row stride (nHeads * vDim)
     int window;      // sliding-window length in tokens, 0 = full causal attention
     int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
     float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
 };
 
-kernel void attention(device const float *q [[buffer(0)]],
-                      device const float *kc [[buffer(1)]],
-                      device const float *vc [[buffer(2)]],
-                      device float *out [[buffer(3)]],
-                      device float *scores [[buffer(4)]],
-                      constant AttnParams &p [[buffer(5)]],
-                      uint2 tgp [[threadgroup_position_in_grid]],
-                      ushort2 tid2 [[thread_position_in_threadgroup]],
-                      ushort2 tpg2 [[threads_per_threadgroup]],
-                      ushort sg [[simdgroup_index_in_threadgroup]],
-                      ushort lane [[thread_index_in_simdgroup]],
-                      ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float buf[32];
-    threadgroup float part[8][256];
-    const ushort tid = tid2.x;
-    const ushort tpg = tpg2.x;
-
-    const int h = int(tgp.x);
-    const int t = p.tokenOffset + int(tgp.y);
-    const int kvh = h / (p.nHeads / p.nKvHeads);
-    const int len = p.pos0 + t + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
-    const int per = p.headDim / 32;
-    device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
-    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
-    device const float *kb = kc + kvh * p.headDim;
-    device const float *vb = vc + kvh * p.headDim;
-
-    float qr[8];
-    for (int i = 0; i < 8; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
-
-    // 1. scores
-    float mx = -INFINITY;
-    for (int s = first + sg; s < len; s += nsg) {
-        device const float *kv = kb + (ulong)s * p.kvStride;
-        float d = 0.0f;
-        for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * kv[lane + i * 32];
-        d = simd_sum(d) * p.scale;
-        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
-        if (lane == 0) sc[s] = d;
-        mx = max(mx, d);
-    }
-    mx = tg_max(mx, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // 2. softmax numerators
-    float sum = 0.0f;
-    for (int s = first + tid; s < len; s += tpg) {
-        float e = exp(sc[s] - mx);
-        sc[s] = e;
-        sum += e;
-    }
-    sum = tg_sum(sum, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // 3. weighted sum of values, split over simdgroups then reduced
-    float o[8];
-    for (int i = 0; i < 8; i++) o[i] = 0.0f;
-    for (int s = first + sg; s < len; s += nsg) {
-        const float pr = sc[s];
-        device const float *vv = vb + (ulong)s * p.kvStride;
-        for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * vv[lane + i * 32];
-    }
-    for (int i = 0; i < 8; i++) if (i < per) part[sg][lane + i * 32] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = 1.0f / sum;
-    for (int d = tid; d < p.headDim; d += tpg) {
-        float acc = 0.0f;
-        for (int g = 0; g < nsg; g++) acc += part[g][d];
-        out[(ulong)t * p.qStride + h * p.headDim + d] = acc * inv;
-    }
-}
-
-// attention_g<G, PER>: the same computation for G query heads of one KV head per threadgroup (G divides the
-// GQA group nHeads / nKvHeads), so each K and V row is loaded once and used for G heads. Grid:
-// (nHeads / G, tile), 256 threads. Per head every value is produced exactly as in `attention`: the same
-// dot products, the same per-thread softmax partial sums (s = tid, tid + 256, ...), the same two-level
-// simd reductions and the same simdgroup-strided value accumulation. PER = headDim / 32.
-
-template <typename KV, int G, int PER>
-kernel void attention_g(device const float *q [[buffer(0)]],
+template <typename KV, int G, int PERK, int PERV>
+kernel void attention_t(device const float *q [[buffer(0)]],
                         device const KV *kc [[buffer(1)]],
                         device const KV *vc [[buffer(2)]],
                         device float *out [[buffer(3)]],
@@ -843,11 +774,16 @@ kernel void attention_g(device const float *q [[buffer(0)]],
                         ushort sg [[simdgroup_index_in_threadgroup]],
                         ushort lane [[thread_index_in_simdgroup]],
                         ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float red[G * 8];      // per-head cross-simdgroup reduction slots (nsg <= 8)
+    constexpr int MK = PERK > 0 ? PERK : 8;    // loop bounds (8 = 256 / 32, the widest head)
+    constexpr int MV = PERV > 0 ? PERV : 8;
+    threadgroup float red[G * 8];              // per-head cross-simdgroup reduction slots (nsg <= 8)
     threadgroup float part[8][256];
     const ushort tid = tid2.x;
     const ushort tpg = tpg2.x;
-    const int headDim = PER * 32;
+    const int perK = PERK > 0 ? PERK : p.qkDim / 32;
+    const int perV = PERV > 0 ? PERV : p.vDim / 32;
+    const int qkDim = PERK > 0 ? PERK * 32 : p.qkDim;
+    const int vDim = PERV > 0 ? PERV * 32 : p.vDim;
 
     const int h0 = int(tgp.x) * G;
     const int tl = int(tgp.y);
@@ -855,29 +791,29 @@ kernel void attention_g(device const float *q [[buffer(0)]],
     const int kvh = h0 / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
     const int first = p.window > 0 ? max(0, len - p.window) : 0;
-    device const KV *kb = kc + kvh * headDim;
-    device const KV *vb = vc + kvh * headDim;
+    device const KV *kb = kc + kvh * qkDim;
+    device const KV *vb = vc + kvh * vDim;
     device float *sc[G];
     for (int g = 0; g < G; g++) sc[g] = scores + ((ulong)tl * p.nHeads + h0 + g) * p.ctx;
 
-    float qr[G][PER];
+    float qr[G][MK];
     for (int g = 0; g < G; g++) {
-        device const float *qv = q + (ulong)t * p.qStride + (h0 + g) * headDim;
-        for (int i = 0; i < PER; i++) qr[g][i] = qv[lane + i * 32];
+        device const float *qv = q + (ulong)t * p.qStride + (h0 + g) * qkDim;
+        for (int i = 0; i < MK; i++) qr[g][i] = i < perK ? qv[lane + i * 32] : 0.0f;
     }
 
     // 1. scores: each K row is read once per threadgroup and dotted with the G query heads
     float mx[G];
     for (int g = 0; g < G; g++) mx[g] = -INFINITY;
     for (int s = first + sg; s < len; s += nsg) {
-        device const KV *kv = kb + (ulong)s * p.kvStride;
-        float kr[PER];
-        for (int i = 0; i < PER; i++) kr[i] = float(kv[lane + i * 32]);
+        device const KV *kv = kb + (ulong)s * p.kStride;
+        float kr[MK];
+        for (int i = 0; i < MK; i++) kr[i] = i < perK ? float(kv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
             float d = 0.0f;
-            for (int i = 0; i < PER; i++) d += qr[g][i] * kr[i];
+            for (int i = 0; i < MK; i++) if (i < perK) d += qr[g][i] * kr[i];
             d = simd_sum(d) * p.scale;
-            if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
+            if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
             if (lane == 0) sc[g][s] = d;
             mx[g] = max(mx[g], d);
         }
@@ -914,42 +850,40 @@ kernel void attention_g(device const float *q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
-    // 3. weighted sum of values: each V row is read once per threadgroup
-    float o[G][PER];
+    // 3. weighted sum of values: each V row is read once per threadgroup, split over simdgroups then reduced
+    float o[G][MV];
     for (int g = 0; g < G; g++)
-        for (int i = 0; i < PER; i++) o[g][i] = 0.0f;
+        for (int i = 0; i < MV; i++) o[g][i] = 0.0f;
     for (int s = first + sg; s < len; s += nsg) {
-        device const KV *vv = vb + (ulong)s * p.kvStride;
-        float vr[PER];
-        for (int i = 0; i < PER; i++) vr[i] = float(vv[lane + i * 32]);
+        device const KV *vv = vb + (ulong)s * p.vStride;
+        float vr[MV];
+        for (int i = 0; i < MV; i++) vr[i] = i < perV ? float(vv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
             const float pr = sc[g][s];
-            for (int i = 0; i < PER; i++) o[g][i] += pr * vr[i];
+            for (int i = 0; i < MV; i++) if (i < perV) o[g][i] += pr * vr[i];
         }
     }
     for (int g = 0; g < G; g++) {
-        for (int i = 0; i < PER; i++) part[sg][lane + i * 32] = o[g][i];
+        for (int i = 0; i < MV; i++) if (i < perV) part[sg][lane + i * 32] = o[g][i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float inv = 1.0f / sum[g];
-        for (int d = tid; d < headDim; d += tpg) {
+        for (int d = tid; d < vDim; d += tpg) {
             float acc = 0.0f;
             for (int k = 0; k < nsg; k++) acc += part[k][d];
-            out[(ulong)t * p.qStride + (h0 + g) * headDim + d] = acc * inv;
+            out[(ulong)t * p.oStride + (h0 + g) * vDim + d] = acc * inv;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
-// attention_g{G}_d{headDim} reads the f32 cache, attention_g{G}_d{headDim}_h the f16 cache (same arithmetic
-// as attention_h: half values are converted on load, everything else is f32).
+// attention / attention_h: runtime widths (head dims other than 64 / 128 / 256, DeepSeek MLA);
+// attention_g{G}_d{headDim}[_h]: compile-time widths, G query heads per threadgroup.
 #define ATTN_INST(KV, G, PER, NAME) \
-    template [[host_name(NAME)]] kernel decltype(attention_g<KV, G, PER>) attention_g<KV, G, PER>;
-ATTN_INST(float, 1, 2, "attention_g1_d64")
-ATTN_INST(float, 1, 4, "attention_g1_d128")
-ATTN_INST(float, 1, 8, "attention_g1_d256")
-ATTN_INST(half, 1, 2, "attention_g1_d64_h")
-ATTN_INST(half, 1, 4, "attention_g1_d128_h")
-ATTN_INST(half, 1, 8, "attention_g1_d256_h")
+    template [[host_name(NAME)]] kernel decltype(attention_t<KV, G, PER, PER>) attention_t<KV, G, PER, PER>;
+ATTN_INST(float, 1, 0, "attention")           ATTN_INST(half, 1, 0, "attention_h")
+ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(half, 1, 2, "attention_g1_d64_h")
+ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(half, 1, 4, "attention_g1_d128_h")
+ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(half, 1, 8, "attention_g1_d256_h")
 // The grouped variants are only instantiated when the host defines JLLM_ATTN_GROUPS (-Djllm.metal.attnGroup).
 #ifdef JLLM_ATTN_GROUPS
 ATTN_INST(float, 2, 2, "attention_g2_d64")    ATTN_INST(float, 4, 2, "attention_g4_d64")    ATTN_INST(float, 8, 2, "attention_g8_d64")
@@ -1262,86 +1196,8 @@ template [[host_name("moe_down_q8")]] kernel moe_down_t moe_down<8>;
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
 // row, normalised and rotated there, and rounded once by norm_rope<half> when it writes the cache row
-// (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). attention_h is the attention
-// kernel reading half K/V with the same f32 arithmetic as `attention`.
-
-// Same algorithm and parameters as `attention`, templated on the cache element type.
-template <typename KV>
-kernel void attention_kv(device const float *q [[buffer(0)]],
-                         device const KV *kc [[buffer(1)]],
-                         device const KV *vc [[buffer(2)]],
-                         device float *out [[buffer(3)]],
-                         device float *scores [[buffer(4)]],
-                         constant AttnParams &p [[buffer(5)]],
-                         uint2 tgp [[threadgroup_position_in_grid]],
-                         ushort2 tid2 [[thread_position_in_threadgroup]],
-                         ushort2 tpg2 [[threads_per_threadgroup]],
-                         ushort sg [[simdgroup_index_in_threadgroup]],
-                         ushort lane [[thread_index_in_simdgroup]],
-                         ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float buf[32];
-    threadgroup float part[8][256];
-    const ushort tid = tid2.x;
-    const ushort tpg = tpg2.x;
-
-    const int h = int(tgp.x);
-    const int t = p.tokenOffset + int(tgp.y);
-    const int kvh = h / (p.nHeads / p.nKvHeads);
-    const int len = p.pos0 + t + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
-    const int per = p.headDim / 32;
-    device const float *qv = q + (ulong)t * p.qStride + h * p.headDim;
-    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
-    device const KV *kb = kc + kvh * p.headDim;
-    device const KV *vb = vc + kvh * p.headDim;
-
-    float qr[8];
-    for (int i = 0; i < 8; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
-
-    // 1. scores
-    float mx = -INFINITY;
-    for (int s = first + sg; s < len; s += nsg) {
-        device const KV *kv = kb + (ulong)s * p.kvStride;
-        float d = 0.0f;
-        for (int i = 0; i < 8; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
-        d = simd_sum(d) * p.scale;
-        if (p.softcap > 0.0f) d = tanh(clamp(d / p.softcap, -20.0f, 20.0f)) * p.softcap;
-        if (lane == 0) sc[s] = d;
-        mx = max(mx, d);
-    }
-    mx = tg_max(mx, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // 2. softmax numerators
-    float sum = 0.0f;
-    for (int s = first + tid; s < len; s += tpg) {
-        float e = exp(sc[s] - mx);
-        sc[s] = e;
-        sum += e;
-    }
-    sum = tg_sum(sum, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // 3. weighted sum of values, split over simdgroups then reduced
-    float o[8];
-    for (int i = 0; i < 8; i++) o[i] = 0.0f;
-    for (int s = first + sg; s < len; s += nsg) {
-        const float pr = sc[s];
-        device const KV *vv = vb + (ulong)s * p.kvStride;
-        for (int i = 0; i < 8; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
-    }
-    for (int i = 0; i < 8; i++) if (i < per) part[sg][lane + i * 32] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = 1.0f / sum;
-    for (int d = tid; d < p.headDim; d += tpg) {
-        float acc = 0.0f;
-        for (int g = 0; g < nsg; g++) acc += part[g][d];
-        out[(ulong)t * p.qStride + h * p.headDim + d] = acc * inv;
-    }
-}
-
-typedef decltype(attention_kv<half>) attention_kv_t;
-template [[host_name("attention_h")]] kernel attention_kv_t attention_kv<half>;
+// (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). The *_h attention instantiations
+// read half K/V with the same f32 arithmetic (attention_t<half, ...> above).
 
 // ---------------------------------------------------------------------------------------------- GLM
 // norm_rope_il: GLM (and rotate-half partial rotary, rotateHalf = 1) rotary embedding for the q rows and the k rows in one dispatch (like norm_rope, no qk-norm).
@@ -1591,92 +1447,6 @@ kernel void mla_kv_store(device const float *kvb [[buffer(0)]],
     for (int i = tid; i < p.nope; i += tpg) kd[i] = src[i];
     for (int i = tid; i < p.rope; i += tpg) kd[p.nope + i] = kpe[(ulong)t * p.rope + i];
     for (int i = tid; i < p.vDim; i += tpg) vd[i] = src[p.nope + i];
-}
-
-// attention_mla: same algorithm as `attention` (one head x token per threadgroup, 256 threads) with a q/k width
-// `qkDim` and a different value width `vDim` (both multiples of 32, <= 256) and no grouped heads or window. Token tiles as
-// in `attention`: t = tokenOffset + tgp.y, scores indexed by the tile-local token.
-
-struct MlaAttnParams {
-    int nHeads;
-    int qkDim;
-    int vDim;
-    int pos0;
-    int ctx;
-    float scale;
-    int qStride;
-    int kStride;
-    int vStride;
-    int oStride;
-    int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
-};
-
-kernel void attention_mla(device const float *q [[buffer(0)]],
-                          device const float *kc [[buffer(1)]],
-                          device const float *vc [[buffer(2)]],
-                          device float *out [[buffer(3)]],
-                          device float *scores [[buffer(4)]],
-                          constant MlaAttnParams &p [[buffer(5)]],
-                          uint2 tgp [[threadgroup_position_in_grid]],
-                          ushort2 tid2 [[thread_position_in_threadgroup]],
-                          ushort2 tpg2 [[threads_per_threadgroup]],
-                          ushort sg [[simdgroup_index_in_threadgroup]],
-                          ushort lane [[thread_index_in_simdgroup]],
-                          ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float buf[32];
-    threadgroup float part[8][256];
-    const ushort tid = tid2.x;
-    const ushort tpg = tpg2.x;
-
-    const int h = int(tgp.x);
-    const int t = p.tokenOffset + int(tgp.y);
-    const int len = p.pos0 + t + 1;
-    const int perK = p.qkDim / 32;
-    const int perV = p.vDim / 32;
-    device const float *qv = q + (ulong)t * p.qStride + h * p.qkDim;
-    device float *sc = scores + ((ulong)tgp.y * p.nHeads + h) * p.ctx;
-    device const float *kb = kc + h * p.qkDim;
-    device const float *vb = vc + h * p.vDim;
-
-    float qr[8];
-    for (int i = 0; i < 8; i++) qr[i] = i < perK ? qv[lane + i * 32] : 0.0f;
-
-    float mx = -INFINITY;
-    for (int s = sg; s < len; s += nsg) {
-        device const float *kv = kb + (ulong)s * p.kStride;
-        float d = 0.0f;
-        for (int i = 0; i < 8; i++) if (i < perK) d += qr[i] * kv[lane + i * 32];
-        d = simd_sum(d) * p.scale;
-        if (lane == 0) sc[s] = d;
-        mx = max(mx, d);
-    }
-    mx = tg_max(mx, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    float sum = 0.0f;
-    for (int s = tid; s < len; s += tpg) {
-        float e = exp(sc[s] - mx);
-        sc[s] = e;
-        sum += e;
-    }
-    sum = tg_sum(sum, buf, sg, lane, nsg);
-    threadgroup_barrier(mem_flags::mem_device);
-
-    float o[8];
-    for (int i = 0; i < 8; i++) o[i] = 0.0f;
-    for (int s = sg; s < len; s += nsg) {
-        const float pr = sc[s];
-        device const float *vv = vb + (ulong)s * p.vStride;
-        for (int i = 0; i < 8; i++) if (i < perV) o[i] += pr * vv[lane + i * 32];
-    }
-    for (int i = 0; i < 8; i++) if (i < perV) part[sg][lane + i * 32] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = 1.0f / sum;
-    for (int d = tid; d < p.vDim; d += tpg) {
-        float acc = 0.0f;
-        for (int g = 0; g < nsg; g++) acc += part[g][d];
-        out[(ulong)t * p.oStride + h * p.vDim + d] = acc * inv;
-    }
 }
 
 // ---------------------------------------------------------------------------------------------- DeepSeek router
