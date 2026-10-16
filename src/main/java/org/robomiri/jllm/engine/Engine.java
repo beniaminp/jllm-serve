@@ -197,7 +197,7 @@ public final class Engine implements AutoCloseable {
         long t1 = System.nanoTime();
 
         List<Integer> out = new ArrayList<>();
-        StreamDecoder dec = new StreamDecoder();
+        StreamDecoder dec = new StreamDecoder(tokenizer); // strips the leading space SentencePiece decoders drop, like decode()
         StringBuilder text = new StringBuilder();
         String pending = ""; // text held back because it could be the start of a stop string
         int maxStop = p.stop().stream().mapToInt(String::length).max().orElse(0);
