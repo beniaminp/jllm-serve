@@ -321,6 +321,17 @@ public final class Settings {
                 List.of());
     }
 
+    /** Every setting key, sorted (the bundled defaults plus any command line flag such as {@code prompt}). */
+    public java.util.SortedSet<String> keys() {
+        return new java.util.TreeSet<>(props.stringPropertyNames());
+    }
+
+    /** Where the value of {@code key} came from: {@code default}, the external file's path or {@code command line}. */
+    public String source(String key) {
+        get(key); // unknown keys are an error, as everywhere else
+        return sources.get(key);
+    }
+
     /** Human readable dump of every setting and where it came from. */
     public String describe() {
         StringBuilder sb = new StringBuilder();

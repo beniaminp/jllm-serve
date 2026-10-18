@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      jllm-web: a Spring Boot web console on top of the jllm-serve engine (chat, model management, settings,
+      logs) that also exposes the OpenAI-compatible API. It is a separate project on purpose: the engine in the
+      parent directory keeps its zero-dependency build, and this module consumes it as an ordinary jar.
+
+      Build: (cd .. && mvn -q install -DskipTests), then mvn package     or simply ./run.sh
+      Run:   ./run.sh   (Spring Boot options as arguments, e.g. server.port=9000)
+    -->
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.1</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>org.robomiri</groupId>
+    <artifactId>jllm-web</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <java.version>26</java.version>
+        <maven.compiler.release>26</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <jllm.version>1.0-SNAPSHOT</jllm.version>
+        <!-- the engine needs the incubating Vector API and native access (Metal, mmap) at run time -->
+        <jllm.jvm.args>--add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED</jllm.jvm.args>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.robomiri</groupId>
+            <artifactId>jllm-serve</artifactId>
+            <version>${jllm.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>jllm-web</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>26</release>
+                    <compilerArgs>
+                        <arg>--add-modules</arg>
+                        <arg>jdk.incubator.vector</arg>
+                        <arg>-parameters</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>${jllm.jvm.args}</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <jvmArguments>${jllm.jvm.args}</jvmArguments>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

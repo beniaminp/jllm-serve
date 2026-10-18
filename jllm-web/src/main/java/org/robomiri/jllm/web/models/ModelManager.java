@@ -1,0 +1,582 @@
+package org.robomiri.jllm.web.models;
+
+import org.robomiri.jllm.ModelLoader;
+import org.robomiri.jllm.config.Settings;
+import org.robomiri.jllm.hub.HuggingFaceHub;
+import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.web.WebProperties;
+import org.robomiri.jllm.web.settings.SettingsService;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
+
+/**
+ * Downloads models from the Hugging Face Hub, loads them into memory with per-model settings and unloads them.
+ * Downloads run two at a time; loads one at a time (each can take most of the machine's memory and cores).
+ */
+@Service
+public class ModelManager implements DisposableBean {
+
+    /**
+     * @param source   a Hugging Face link, {@code owner/name}, {@code owner/name:QUANT} or a local {@code .gguf} path
+     * @param id       the name clients use in the {@code model} field; empty = derived from the source
+     * @param settings engine settings for this model only, e.g. {@code backend.ctx}, {@code backend}, {@code model.quant}
+     */
+    public record LoadRequest(String source, String id, String revision, String ggufFile, String ggufQuant,
+                              Map<String, String> settings) {
+    }
+
+    public record DownloadRequest(String source, String revision, String ggufFile, String ggufQuant,
+                                  Map<String, String> settings) {
+    }
+
+    /**
+     * A model on disk.
+     *
+     * @param source    what to put into a {@link LoadRequest} to load it
+     * @param ggufFile  the GGUF file within the repository directory, or null for a safetensors checkpoint
+     * @param caches    the quantized caches converted from a safetensors checkpoint
+     * @param loadedAs  ids of the loaded models that use it
+     */
+    public record LocalModel(String name, String format, String source, String revision, String ggufFile,
+                             String path, long bytes, List<String> caches, List<String> loadedAs) {
+    }
+
+    /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
+    public record RepoInfo(String repo, String revision, String file, String quant, String defaultId, boolean gguf,
+                           List<HuggingFaceHub.RepoFile> files, List<HuggingFaceHub.RepoFile> ggufFiles) {
+    }
+
+    /** Where a request points, after the link and the explicit fields are combined. */
+    private record Target(String model, String revision, String file, String quant, boolean local, String id) {
+    }
+
+    private static final String MARKER = ".jllm-web.json";
+
+    private final SettingsService settings;
+    private final WebProperties props;
+    private final Map<String, LoadedModel> loaded = new LinkedHashMap<>();
+    private final Map<String, Job> jobs = new LinkedHashMap<>();
+    private final ExecutorService downloads = Executors.newFixedThreadPool(2, Thread.ofPlatform().name("jllm-download-", 1).daemon().factory());
+    private final ExecutorService loads = Executors.newSingleThreadExecutor(Thread.ofPlatform().name("jllm-load").daemon().factory());
+    private final AtomicLong jobCounter = new AtomicLong();
+
+    public ModelManager(SettingsService settings, WebProperties props) {
+        this.settings = settings;
+        this.props = props;
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void autoload() {
+        for (String spec : props.autoload()) {
+            if (!spec.isBlank()) {
+                load(new LoadRequest(spec.trim(), null, null, null, null, Map.of()));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ loaded models
+
+    public synchronized List<LoadedModel> loaded() {
+        return new ArrayList<>(loaded.values());
+    }
+
+    /**
+     * The model a request names: by id; when the id is unknown or missing and exactly one model is loaded, that one
+     * (clients send whatever model name they were configured with).
+     *
+     * @throws NoSuchElementException when nothing fits
+     */
+    public synchronized LoadedModel resolve(String id) {
+        if (id != null) {
+            LoadedModel m = loaded.get(id);
+            if (m != null) {
+                return m;
+            }
+        }
+        if (loaded.size() == 1) {
+            return loaded.values().iterator().next();
+        }
+        if (loaded.isEmpty()) {
+            throw new NoSuchElementException("no model is loaded: load one in the web console (Models tab) or with POST /api/models/load");
+        }
+        throw new NoSuchElementException("model '" + id + "' is not loaded; loaded: " + String.join(", ", loaded.keySet()));
+    }
+
+    /** Unloads a model: running requests on it are cancelled first. */
+    public void unload(String id) throws InterruptedException {
+        LoadedModel m;
+        synchronized (this) {
+            m = loaded.get(id);
+            if (m == null) {
+                throw new NoSuchElementException("model '" + id + "' is not loaded");
+            }
+        }
+        if (!m.close(60_000)) {
+            throw new IllegalStateException("model " + id + " is still busy after 60 s; try again");
+        }
+        synchronized (this) {
+            loaded.remove(id);
+        }
+        System.err.println("Unloaded " + id);
+    }
+
+    // ------------------------------------------------------------------ jobs
+
+    public synchronized List<Job.View> jobs() {
+        List<Job.View> out = new ArrayList<>();
+        for (Job j : jobs.values()) {
+            out.add(j.view());
+        }
+        return out.reversed();
+    }
+
+    public synchronized void cancel(String jobId) {
+        Job j = jobs.get(jobId);
+        if (j == null) {
+            throw new NoSuchElementException("no job " + jobId);
+        }
+        if (!j.finished() && j.future != null) {
+            j.future.cancel(true);
+            if (j.state == Job.State.QUEUED) {
+                j.finish(Job.State.CANCELLED, null);
+            } else {
+                j.phase = "cancelling";
+            }
+        }
+    }
+
+    public synchronized void clearFinishedJobs() {
+        jobs.values().removeIf(Job::finished);
+    }
+
+    /** Starts downloading a model without loading it. */
+    public Job.View download(DownloadRequest r) {
+        Target t = target(r.source(), r.revision(), r.ggufFile(), r.ggufQuant(), null);
+        if (t.local()) {
+            throw new IllegalArgumentException("a local file needs no download: load it");
+        }
+        Map<String, String> extra = settingsFor(t, r.settings());
+        Settings s = settings.with(extra); // validates before the job is queued
+        Job job = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
+        submit(downloads, job, () -> {
+            HuggingFaceHub hub = ModelLoader.hub(s);
+            planProgress(job, s, hub, t);
+            job.phase = "downloading";
+            ModelLoader.download(s, hub, t.model());
+            writeMarker(s, t);
+        });
+        return job.view();
+    }
+
+    /** Starts loading a model (downloading what is missing first). */
+    public Job.View load(LoadRequest r) {
+        Target t = target(r.source(), r.revision(), r.ggufFile(), r.ggufQuant(), r.id());
+        Map<String, String> extra = settingsFor(t, r.settings());
+        Settings s = settings.with(extra);
+        synchronized (this) {
+            if (loaded.containsKey(t.id())) {
+                throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
+            }
+            for (Job j : jobs.values()) {
+                if (j.kind == Job.Kind.LOAD && !j.finished() && j.model.equals(t.id())) {
+                    throw new IllegalStateException("'" + t.id() + "' is already being loaded (job " + j.id + ")");
+                }
+            }
+        }
+        Job job = newJob(Job.Kind.LOAD, t.id(), r.source());
+        submit(loads, job, () -> {
+            HuggingFaceHub hub = ModelLoader.hub(s);
+            long t0 = System.nanoTime();
+            if (!t.local() && !s.getBool("model.low-disk")) { // low-disk downloads shard by shard while converting
+                planProgress(job, s, hub, t);
+                job.phase = "downloading";
+                ModelLoader.download(s, hub, t.model());
+                writeMarker(s, t);
+            }
+            checkInterrupted();
+            job.phase = "loading";
+            System.err.println("Loading " + t.id() + " (" + t.model() + ")");
+            ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model());
+            if (Thread.currentThread().isInterrupted()) {
+                l.close();
+                throw new CancellationException();
+            }
+            if (!t.local()) {
+                writeMarker(s, t);
+            }
+            Map<String, String> snapshot = new LinkedHashMap<>();
+            for (String k : s.keys()) {
+                if (SettingsService.scope(k) == SettingsService.Scope.LOAD && !s.get(k).isEmpty()) {
+                    snapshot.put(k, s.get(k));
+                }
+            }
+            LoadedModel m = new LoadedModel(t.id(), t.model(), l, snapshot, (System.nanoTime() - t0) / 1e9);
+            synchronized (this) {
+                loaded.put(t.id(), m);
+            }
+            System.err.println("Loaded " + t.id() + ": " + l.engine().backend().name() + ", ctx="
+                    + l.engine().backend().contextLength());
+        });
+        return job.view();
+    }
+
+    private synchronized Job newJob(Job.Kind kind, String model, String source) {
+        Job job = new Job("job-" + jobCounter.incrementAndGet(), kind, model, source);
+        jobs.put(job.id(), job);
+        while (jobs.size() > 100) { // forget the oldest finished ones
+            String oldest = jobs.values().stream().filter(Job::finished).map(Job::id).findFirst().orElse(null);
+            if (oldest == null) {
+                break;
+            }
+            jobs.remove(oldest);
+        }
+        return job;
+    }
+
+    private interface Work {
+        void run() throws Exception;
+    }
+
+    private void submit(ExecutorService pool, Job job, Work work) {
+        job.future = pool.submit(() -> {
+            if (job.finished()) { // cancelled while queued
+                return;
+            }
+            job.state = Job.State.RUNNING;
+            job.phase = "starting";
+            try {
+                work.run();
+                job.finish(Job.State.DONE, null);
+            } catch (CancellationException | InterruptedException e) {
+                job.finish(Job.State.CANCELLED, null);
+            } catch (Throwable e) {
+                if (Thread.currentThread().isInterrupted()) {
+                    job.finish(Job.State.CANCELLED, null);
+                } else {
+                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                    job.finish(Job.State.FAILED, msg);
+                    System.err.println(job.kind.name().toLowerCase(Locale.ROOT) + " of " + job.model + " failed: " + msg);
+                    if (!(e instanceof IOException) && !(e instanceof IllegalArgumentException)) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        });
+    }
+
+    private static void checkInterrupted() {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new CancellationException();
+        }
+    }
+
+    private Target target(String source, String revision, String file, String quant, String id) {
+        HfLink link = HfLink.parse(source);
+        String rev = blank(revision) ? link.revision() : revision.trim();
+        String f = blank(file) ? link.file() : file.trim();
+        String q = blank(quant) ? link.quant() : quant.trim();
+        if (f != null) {
+            q = null; // an exact file wins over a label
+        }
+        HfLink effective = new HfLink(link.repo(), rev, f, q, link.local());
+        String name = blank(id) ? effective.defaultId() : id.trim();
+        return new Target(link.repo(), rev, f, q, link.local(), name);
+    }
+
+    private static Map<String, String> settingsFor(Target t, Map<String, String> requested) {
+        Map<String, String> extra = new LinkedHashMap<>();
+        if (requested != null) {
+            requested.forEach((k, v) -> {
+                if (k.equals("model.repo") || k.equals("model.revision") || k.equals("model.gguf-file")
+                        || k.equals("model.gguf-quant")) {
+                    throw new IllegalArgumentException(k + " is given by the source, revision and GGUF fields");
+                }
+                if (v != null && !v.isBlank()) {
+                    extra.put(k, v.trim());
+                }
+            });
+        }
+        extra.put("model.repo", t.model());
+        extra.put("model.revision", t.revision() == null ? "main" : t.revision());
+        extra.put("model.gguf-file", t.file() == null ? "" : t.file());
+        extra.put("model.gguf-quant", t.quant() == null ? "" : t.quant());
+        return extra;
+    }
+
+    private static boolean blank(String s) {
+        return s == null || s.isBlank();
+    }
+
+    private static Path repoDir(Settings s, String repo) {
+        return Path.of(s.get("model.dir")).resolve(repo.replace('/', '_'));
+    }
+
+    /** Works out which files the job will fetch, the same way {@link ModelLoader#resolve} decides, for the progress bar. */
+    private static void planProgress(Job job, Settings s, HuggingFaceHub hub, Target t) {
+        try {
+            Path dir = repoDir(s, t.model());
+            boolean forced = t.file() != null || t.quant() != null;
+            if (!forced && Files.isRegularFile(dir.resolve("config.json"))) {
+                // a checkpoint that is (partly) here: its shards are what the index lists
+                Map<String, Long> sizes = new LinkedHashMap<>();
+                Map<String, Long> byName = new LinkedHashMap<>();
+                for (HuggingFaceHub.RepoFile f : hub.listFiles(t.model(), s.get("model.revision"))) {
+                    byName.put(f.name(), f.size());
+                }
+                for (String n : HuggingFaceHub.weightFileNames(dir)) {
+                    sizes.put(n, byName.getOrDefault(n, -1L));
+                }
+                job.expect(dir, sizes);
+                return;
+            }
+            List<HuggingFaceHub.RepoFile> listing = hub.listFiles(t.model(), s.get("model.revision"));
+            Map<String, Long> sizes = new LinkedHashMap<>();
+            if (forced || HuggingFaceHub.isGgufRepo(listing)) {
+                List<String> names = listing.stream().map(HuggingFaceHub.RepoFile::name).toList();
+                var sel = HuggingFaceHub.selectGguf(names, t.file(), t.quant());
+                for (HuggingFaceHub.RepoFile f : listing) {
+                    if (sel.getValue().contains(f.name())) {
+                        sizes.put(f.name(), f.size());
+                    }
+                }
+            } else {
+                for (HuggingFaceHub.RepoFile f : listing) {
+                    if (HuggingFaceHub.isMetadataFile(f.name()) || f.name().endsWith(".safetensors")) {
+                        sizes.put(f.name(), f.size());
+                    }
+                }
+            }
+            job.expect(dir, sizes);
+        } catch (Exception e) {
+            // no progress bar; the download itself reports the problem
+        }
+    }
+
+    /** Remembers which repository and revision a model directory holds (its name loses the owner/name split). */
+    private static void writeMarker(Settings s, Target t) {
+        try {
+            Path dir = repoDir(s, t.model());
+            if (Files.isDirectory(dir)) {
+                Files.writeString(dir.resolve(MARKER), Json.write(Json.obj("repo", t.model(), "revision",
+                        t.revision() == null ? "main" : t.revision())));
+            }
+        } catch (IOException e) {
+            System.err.println("note: cannot write " + MARKER + ": " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------------ hub and disk
+
+    public RepoInfo inspect(String source, String revision) throws IOException, InterruptedException {
+        Target t = target(source, revision, null, null, null);
+        if (t.local()) {
+            throw new IllegalArgumentException("a local file: nothing to look up on the Hub");
+        }
+        HfLink link = HfLink.parse(source);
+        Settings s = settings.current();
+        String rev = t.revision() == null ? "main" : t.revision();
+        List<HuggingFaceHub.RepoFile> files = ModelLoader.hub(s).listFiles(t.model(), rev);
+        boolean gguf = link.file() != null || link.quant() != null || HuggingFaceHub.isGgufRepo(files);
+        List<HuggingFaceHub.RepoFile> ggufFiles = files.stream()
+                .filter(f -> HuggingFaceHub.isGgufModelFile(f.name()))
+                .filter(f -> !f.name().matches(".*-0000[2-9]-of-.*|.*-000[1-9][0-9]-of-.*")) // split parts after the first
+                .toList();
+        return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles);
+    }
+
+    /** The models in {@code model.dir}: safetensors checkpoints and GGUF files. */
+    public List<LocalModel> localModels() throws IOException {
+        Settings s = settings.current();
+        Path root = Path.of(s.get("model.dir")).toAbsolutePath();
+        List<LocalModel> out = new ArrayList<>();
+        if (!Files.isDirectory(root)) {
+            return out;
+        }
+        Map<String, List<String>> users = new LinkedHashMap<>();
+        for (LoadedModel m : loaded()) {
+            users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+        }
+        List<Path> entries;
+        try (Stream<Path> st = Files.list(root)) {
+            entries = st.sorted().toList();
+        }
+        for (Path p : entries) {
+            String name = p.getFileName().toString();
+            if (Files.isRegularFile(p) && isFirstGguf(name)) {
+                String abs = p.toString();
+                out.add(new LocalModel(name, "gguf", abs, null, null, abs, Files.size(p), List.of(),
+                        users.getOrDefault(abs, List.of())));
+                continue;
+            }
+            if (!Files.isDirectory(p) || name.equals("tokenizers") || name.startsWith(".")) {
+                continue;
+            }
+            String[] repoRev = repoOf(p);
+            String repo = repoRev[0];
+            List<String> loadedAs = users.getOrDefault(repo, List.of());
+            if (Files.isRegularFile(p.resolve("config.json"))) {
+                List<String> caches = new ArrayList<>();
+                try (Stream<Path> st = Files.list(p)) {
+                    st.map(x -> x.getFileName().toString()).filter(n -> n.startsWith("jllm-") && n.endsWith(".bin"))
+                            .sorted().forEach(caches::add);
+                }
+                out.add(new LocalModel(repo, "safetensors", repo, repoRev[1], null, p.toString(), dirSize(p), caches, loadedAs));
+            }
+            for (String g : HuggingFaceHub.localGgufNames(p)) {
+                if (!isFirstGguf(Path.of(g).getFileName().toString())) {
+                    continue;
+                }
+                long bytes = 0;
+                for (Path part : ggufParts(p.resolve(g))) {
+                    bytes += Files.size(part);
+                }
+                out.add(new LocalModel(repo + " / " + g, "gguf", repo, repoRev[1], g, p.resolve(g).toString(), bytes,
+                        List.of(), loadedAs));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Deletes a model from disk: a whole checkpoint directory (with its quantized caches), or one GGUF file (with its
+     * split parts).
+     */
+    public void deleteLocal(String path) throws IOException {
+        Path root = Path.of(settings.current().get("model.dir")).toAbsolutePath().normalize();
+        Path p = Path.of(path).toAbsolutePath().normalize();
+        if (!p.startsWith(root) || p.equals(root)) {
+            throw new IllegalArgumentException("only models inside " + root + " can be deleted");
+        }
+        for (LocalModel m : localModels()) {
+            if (Path.of(m.path()).toAbsolutePath().normalize().equals(p) && !m.loadedAs().isEmpty()) {
+                throw new IllegalStateException(m.name() + " is loaded as " + String.join(", ", m.loadedAs()) + ": unload it first");
+            }
+        }
+        if (Files.isDirectory(p)) {
+            try (Stream<Path> st = Files.walk(p)) {
+                for (Path x : st.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.delete(x);
+                }
+            }
+        } else if (Files.isRegularFile(p) && p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".gguf")) {
+            for (Path part : ggufParts(p)) {
+                Files.deleteIfExists(part);
+            }
+        } else {
+            throw new NoSuchElementException("no model at " + p);
+        }
+        System.err.println("Deleted " + p);
+    }
+
+    private static boolean isFirstGguf(String name) {
+        return HuggingFaceHub.isGgufModelFile(name) && !name.endsWith(".incomplete")
+                && !name.matches("(?i).*-(\\d{5})-of-\\d{5}\\.gguf") || name.matches("(?i).*-00001-of-\\d{5}\\.gguf");
+    }
+
+    /** A GGUF file and, for {@code x-00001-of-0000N.gguf}, its other parts. */
+    private static List<Path> ggufParts(Path first) {
+        String n = first.getFileName().toString();
+        var m = java.util.regex.Pattern.compile("(?i)(.*)-00001-of-(\\d{5})\\.gguf").matcher(n);
+        if (!m.matches()) {
+            return List.of(first);
+        }
+        int count = Integer.parseInt(m.group(2));
+        List<Path> parts = new ArrayList<>();
+        for (int i = 1; i <= count; i++) {
+            Path part = first.resolveSibling(String.format("%s-%05d-of-%s.gguf", m.group(1), i, m.group(2)));
+            if (Files.isRegularFile(part)) {
+                parts.add(part);
+            }
+        }
+        return parts;
+    }
+
+    /**
+     * The repository and revision a model directory came from: the web console's marker, else the identity the
+     * quantized cache recorded, else a guess from the directory name (the first '_' was the '/').
+     */
+    private static String[] repoOf(Path dir) {
+        for (Path f : new Path[]{dir.resolve(MARKER)}) {
+            String[] r = readRepo(f);
+            if (r != null) {
+                return r;
+            }
+        }
+        try (Stream<Path> st = Files.list(dir)) {
+            for (Path f : st.filter(x -> {
+                String n = x.getFileName().toString();
+                return n.startsWith("jllm-") && n.endsWith(".json") && !n.contains("partial");
+            }).sorted().toList()) {
+                String[] r = readRepo(f);
+                if (r != null) {
+                    return r;
+                }
+            }
+        } catch (IOException ignored) {
+            // fall through to the guess
+        }
+        String name = dir.getFileName().toString();
+        int u = name.indexOf('_');
+        return new String[]{u > 0 ? name.substring(0, u) + "/" + name.substring(u + 1) : name, null};
+    }
+
+    private static String[] readRepo(Path f) {
+        if (!Files.isRegularFile(f)) {
+            return null;
+        }
+        try {
+            Map<String, Object> o = Json.parseObject(Files.readString(f));
+            String repo = Json.str(o, "repo", null);
+            if (repo == null || !repo.contains("/")) {
+                return null;
+            }
+            return new String[]{repo, Json.str(o, "revision", null)};
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static long dirSize(Path dir) throws IOException {
+        try (Stream<Path> st = Files.walk(dir)) {
+            return st.filter(Files::isRegularFile).mapToLong(p -> {
+                try {
+                    return Files.size(p);
+                } catch (IOException e) {
+                    return 0;
+                }
+            }).sum();
+        }
+    }
+
+    @Override
+    public void destroy() {
+        downloads.shutdownNow();
+        loads.shutdownNow();
+        for (LoadedModel m : loaded()) {
+            try {
+                m.close(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+}

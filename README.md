@@ -2,6 +2,8 @@
 
 An LLM inference engine and OpenAI-compatible server written in Java from scratch with **zero external
 dependencies** — only the JDK (Vector API, FFM/Panama) plus a ~200-line Objective-C shim for Metal.
+An optional browser console with model management ([`jllm-web/`](#web-console-jllm-web)) is a separate Spring Boot
+module; the engine itself does not depend on it.
 
 Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`, `qwen3_moe`), **Qwen2 / 2.5**
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
@@ -105,6 +107,43 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
 `GET /health`, `GET /` (chat UI). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`.
+
+## Web console (`jllm-web/`)
+
+A separate Spring Boot module on top of the engine: a browser console to chat, manage models and change settings,
+plus the same OpenAI-compatible API. It lives in its own Maven project so the engine keeps its zero-dependency
+build; it consumes the engine as an ordinary jar (`org.robomiri:jllm-serve`, installed into the local Maven
+repository by its launcher).
+
+```sh
+./jllm-web/run.sh                                   # builds both, console at http://127.0.0.1:8090/
+./jllm-web/run.sh --server.port=9000 --jllm.web.api-key=secret
+./jllm-web/run.sh --jllm.web.autoload=unsloth/Qwen3-0.6B-GGUF:Q4_K_M   # load models at startup
+```
+
+- **Chat**: streaming chat with any loaded model, several conversations (kept in the browser), system prompt,
+  Qwen3 thinking toggle (the `<think>` part is shown collapsible), per-chat sampling parameters, tokens/s per reply.
+- **Models**: paste a Hugging Face link — the model page, `.../tree/<revision>`, `.../blob/main/<file>.gguf`,
+  `owner/name`, `owner/name:Q4_K_M` — or a local `.gguf` path; *Inspect* lists the repository's files (and the
+  GGUF files to pick from), then *Download only* or *Load* with per-model options: id, backend, context length,
+  KV cache type, weight quantization, batch, threads, speculative decoding / draft model, low-disk conversion.
+  Downloads and loads run as background jobs with progress and cancel. Several models can be loaded at once;
+  the `model` field of an API request picks one (with a single model loaded any name works). Loaded models show
+  their settings, requests and speed and can be unloaded (running requests are cancelled first). Models on disk
+  can be loaded again or deleted.
+- **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
+  from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
+  `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and
+  weight settings to the next load.
+- **Logs**: the engine's output (download progress, conversion, errors) live.
+- **API**: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions` (same fields and streaming
+  behaviour as `jllm serve`), and the management API the console uses: `/api/models/load|download|loaded|local`,
+  `/api/hub/inspect`, `/api/jobs`, `/api/settings`, `/api/logs`, `/api/status`.
+
+The console binds to `127.0.0.1` by default: the management API can load models and delete files. Set
+`jllm.web.api-key` before exposing it; `/v1/**` and `/api/**` then need `Authorization: Bearer <key>`.
+Application settings are in `jllm-web/src/main/resources/application.properties`; `cd jllm-web && mvn test` runs
+its tests (no model needed).
 
 ## Configuration
 
@@ -211,6 +250,7 @@ Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the CPU KV ca
 ```
 src/main/java/org/robomiri/jllm/
   Main.java              CLI: download | run | chat | serve | bench | config
+  ModelLoader.java       resolve / download / load a model as the settings describe (used by the CLI and jllm-web)
   config/                layered settings (jllm.properties → external file → flags)
   json/                  JSON parser & writer
   hub/                   Hugging Face downloader
@@ -226,6 +266,14 @@ src/main/native/jllm_metal.m                       Objective-C shim exposing a C
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
 docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
+jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
+  src/main/java/org/robomiri/jllm/web/
+    models/              Hugging Face links, download / load jobs, loaded models, models on disk
+    openai/              /v1 endpoints
+    settings/            jllm.properties view and persisted overrides
+    api/                 /api management endpoints, API key filter
+    logs/                captured engine output
+  src/main/resources/static/   the console (plain HTML/CSS/JS, no build step)
 ```
 
 ## License

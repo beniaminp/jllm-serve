@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jllm console</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <div class="brand">jllm<span>console</span></div>
+  <nav>
+    <button data-tab="chat" class="active">Chat</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="logs">Logs</button>
+    <button data-tab="api">API</button>
+  </nav>
+  <div id="status" class="status"></div>
+</header>
+
+<main>
+  <!-- ============================================================== chat -->
+  <section id="tab-chat" class="tab active">
+    <aside class="convs">
+      <button id="new-chat" class="primary wide">+ New chat</button>
+      <ul id="conv-list"></ul>
+    </aside>
+    <div class="chat">
+      <div class="chat-bar">
+        <label>Model <select id="chat-model"></select></label>
+        <label class="check"><input type="checkbox" id="chat-think"> thinking</label>
+        <button id="toggle-params" class="ghost">Parameters</button>
+      </div>
+      <div id="params" class="params hidden">
+        <label>System prompt <textarea id="p-system" rows="2" placeholder="(none)"></textarea></label>
+        <div class="grid">
+          <label>temperature <input id="p-temperature" type="number" step="0.05" min="0"></label>
+          <label>top_p <input id="p-top_p" type="number" step="0.01" min="0" max="1"></label>
+          <label>top_k <input id="p-top_k" type="number" step="1" min="0"></label>
+          <label>min_p <input id="p-min_p" type="number" step="0.01" min="0" max="1"></label>
+          <label>max_tokens <input id="p-max_tokens" type="number" step="1" min="1"></label>
+          <label>repetition_penalty <input id="p-repetition_penalty" type="number" step="0.05" min="0"></label>
+          <label>seed <input id="p-seed" type="number" step="1"></label>
+        </div>
+        <p class="hint">Empty fields use the server defaults (Settings tab, <code>sampling.*</code>).</p>
+      </div>
+      <div id="messages" class="messages"></div>
+      <form id="composer" class="composer">
+        <textarea id="input" rows="3" placeholder="Message… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <div class="composer-actions">
+          <button type="submit" id="send" class="primary">Send</button>
+          <button type="button" id="stop" class="danger hidden">Stop</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- ============================================================== models -->
+  <section id="tab-models" class="tab">
+    <div class="card">
+      <h2>Add a model from Hugging Face</h2>
+      <form id="inspect-form" class="row">
+        <input id="hf-link" placeholder="https://huggingface.co/Qwen/Qwen3-0.6B  ·  unsloth/Qwen3-0.6B-GGUF:Q4_K_M  ·  /path/model.gguf" required>
+        <button class="primary">Inspect</button>
+      </form>
+      <div id="inspect-result"></div>
+    </div>
+
+    <div class="card">
+      <h2>Loaded <span class="muted small">(served on <code>/v1</code>)</span></h2>
+      <div id="loaded-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>Jobs <button id="clear-jobs" class="ghost small">clear finished</button></h2>
+      <div id="job-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>On disk <span id="model-dir" class="muted small"></span></h2>
+      <div id="local-list"></div>
+    </div>
+  </section>
+
+  <!-- ============================================================== settings -->
+  <section id="tab-settings" class="tab">
+    <div class="card">
+      <h2>Engine settings</h2>
+      <p class="hint">The keys of <code>jllm.properties</code>. Changes are stored in <code id="settings-file"></code>.
+        <span class="badge live">live</span> applies to the next request,
+        <span class="badge load">load</span> to the next model load (loaded models keep theirs),
+        <span class="badge cli">cli</span> is only used by the command line tools.</p>
+      <div class="row">
+        <input id="settings-filter" placeholder="filter…">
+        <button id="settings-save" class="primary">Save changes</button>
+      </div>
+      <div id="settings-msg"></div>
+      <div id="settings-list"></div>
+    </div>
+  </section>
+
+  <!-- ============================================================== logs -->
+  <section id="tab-logs" class="tab">
+    <div class="card fill">
+      <h2>Log <label class="check small"><input type="checkbox" id="log-follow" checked> follow</label></h2>
+      <pre id="log" class="log"></pre>
+      <pre id="log-pending" class="log pending"></pre>
+    </div>
+  </section>
+
+  <!-- ============================================================== api -->
+  <section id="tab-api" class="tab">
+    <div class="card">
+      <h2>OpenAI-compatible API</h2>
+      <p>Base URL: <code id="base-url"></code> · the <code>model</code> field picks one of the loaded models (with a single model loaded, any name works).</p>
+      <p id="api-key-note"></p>
+      <h3>curl</h3>
+      <pre id="ex-curl" class="code"></pre>
+      <h3>Python (openai)</h3>
+      <pre id="ex-python" class="code"></pre>
+      <h3>Endpoints</h3>
+      <table class="table">
+        <tr><td><code>GET /v1/models</code></td><td>loaded models</td></tr>
+        <tr><td><code>POST /v1/chat/completions</code></td><td>chat, <code>stream</code>, <code>stream_options.include_usage</code>, <code>enable_thinking</code></td></tr>
+        <tr><td><code>POST /v1/completions</code></td><td>raw text completion</td></tr>
+        <tr><td><code>GET/PUT /api/settings</code></td><td>engine settings</td></tr>
+        <tr><td><code>POST /api/models/load</code>, <code>DELETE /api/models/loaded?id=</code></td><td>load / unload</td></tr>
+        <tr><td><code>POST /api/models/download</code>, <code>GET /api/jobs</code></td><td>downloads and their progress</td></tr>
+        <tr><td><code>GET /api/models/local</code>, <code>GET /api/hub/inspect?source=</code></td><td>models on disk, a repository's files</td></tr>
+        <tr><td><code>GET /api/status</code>, <code>GET /api/logs?after=</code></td><td>status, log</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h2>API key</h2>
+      <p class="hint">Only needed when the server runs with <code>jllm.web.api-key</code>. Kept in this browser.</p>
+      <div class="row"><input id="api-key" type="password" placeholder="key"><button id="api-key-save" class="primary">Save</button></div>
+    </div>
+  </section>
+</main>
+
+<template id="load-form-tpl">
+  <form class="load-form">
+    <div class="grid">
+      <label>Model id <input name="id" placeholder="(default)"></label>
+      <label>Revision <input name="revision" placeholder="main"></label>
+      <label class="gguf-only">GGUF file <select name="ggufFile"></select></label>
+      <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
+      <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
+      <label>KV cache <select name="backend.kv-dtype"><option value="">(default)</option><option>f32</option><option>f16</option></select></label>
+      <label class="st-only">Weights <select name="model.quant"><option value="">(default)</option><option value="q4">q4 (Q4_0)</option><option value="q8">q8 (Q8_0)</option><option value="q6k">q6k (Q6_K)</option><option value="q2k">q2k (Q2_K)</option></select></label>
+      <label>Batch <input name="backend.batch" type="number" min="1" placeholder="(default)"></label>
+      <label>Threads <input name="backend.threads" type="number" min="0" placeholder="(default)"></label>
+      <label>Speculative <select name="engine.speculative"><option value="">(default)</option><option>off</option><option>ngram</option><option>draft</option></select></label>
+      <label>Draft model <input name="engine.draft-model" placeholder="owner/name"></label>
+      <label class="check st-only"><input type="checkbox" name="model.low-disk"> low disk</label>
+    </div>
+    <div class="row">
+      <button type="submit" name="action" value="load" class="primary">Load</button>
+      <button type="submit" name="action" value="download" class="ghost dl-only">Download only</button>
+    </div>
+  </form>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

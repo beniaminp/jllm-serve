@@ -1,41 +1,19 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.config.Settings;
-import org.robomiri.jllm.cpu.CpuBackend;
-import org.robomiri.jllm.cpu.MambaCpuBackend;
-import org.robomiri.jllm.engine.DraftModel;
 import org.robomiri.jllm.engine.Engine;
-import org.robomiri.jllm.engine.Speculator;
-import org.robomiri.jllm.gguf.GgufModel;
 import org.robomiri.jllm.hub.HuggingFaceHub;
-import org.robomiri.jllm.json.Json;
-import org.robomiri.jllm.metal.Metal;
-import org.robomiri.jllm.metal.MambaMetalBackend;
-import org.robomiri.jllm.metal.MetalBackend;
-import org.robomiri.jllm.model.Architecture;
-import org.robomiri.jllm.model.Backend;
-import org.robomiri.jllm.model.KvDtype;
-import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.ModelWeights;
-import org.robomiri.jllm.model.QType;
-import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
 import org.robomiri.jllm.server.HttpServer;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
-import org.robomiri.jllm.tokenizer.GgufTokenizer;
-import org.robomiri.jllm.tokenizer.Tokenizer;
 
 import java.io.BufferedReader;
-import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * Command line entry point. All options live in {@code jllm.properties} (bundled defaults), may be overridden
@@ -70,16 +48,16 @@ public final class Main {
             return;
         }
         String model = s.get("model.repo");
-        HuggingFaceHub hub = new HuggingFaceHub(s.opt("hub.endpoint"), s.opt("hub.token"), s.getLong("hub.timeout-ms"));
+        HuggingFaceHub hub = ModelLoader.hub(s);
 
         try {
             switch (cmd) {
                 case "config" -> System.out.print(s.describe());
-                case "download" -> download(s, hub, model);
-                case "chat" -> chat(load(s, hub, model), s);
-                case "run" -> run(load(s, hub, model), s);
-                case "serve" -> serve(load(s, hub, model), model, s);
-                case "bench" -> bench(load(s, hub, model), s);
+                case "download" -> ModelLoader.download(s, hub, model);
+                case "chat" -> chat(ModelLoader.load(s, hub, model), s);
+                case "run" -> run(ModelLoader.load(s, hub, model), s);
+                case "serve" -> serve(ModelLoader.load(s, hub, model), model, s);
+                case "bench" -> bench(ModelLoader.load(s, hub, model), s);
                 default -> {
                     System.err.println("unknown command: " + cmd);
                     usage();
@@ -111,312 +89,8 @@ public final class Main {
                   any property key directly, e.g. --server.port 9000 or --bench.rounds=5""");
     }
 
-    /**
-     * The loaded model. Close in this order: engine (the backend releases its buffers) and then weights (the
-     * memory-mapped quantized cache): {@code try (ModelWeights w = l.weights(); Engine e = l.engine())}.
-     */
-    private record Loaded(ModelWeights weights, Engine engine) {
-    }
 
-    /** Where the model comes from: a GGUF file (used as it is), or a Hugging Face safetensors checkpoint in {@code dir}. */
-    private record Source(Path gguf, Path dir) {
-    }
-
-    private static void download(Settings s, HuggingFaceHub hub, String model) throws Exception {
-        Source src = resolve(s, hub, model, s.opt("model.gguf-file"), s.opt("model.gguf-quant"));
-        if (src.gguf() == null) {
-            hub.download(model, s.get("model.revision"), src.dir());
-        } else {
-            System.err.println(src.gguf());
-        }
-    }
-
-    /**
-     * Decides how {@code model} is loaded, downloading what is missing. A name ending in {@code .gguf} is a local
-     * file. A repository is a GGUF one when {@code model.gguf-file} / {@code model.gguf-quant} is set, or when it
-     * has {@code .gguf} files and no safetensors checkpoint; a model directory that already has a
-     * {@code config.json} is a safetensors one without asking the Hub. Only the chosen GGUF file (and its split
-     * parts) is downloaded.
-     */
-    private static Source resolve(Settings s, HuggingFaceHub hub, String model, String file, String quant) throws Exception {
-        if (model.toLowerCase(java.util.Locale.ROOT).endsWith(".gguf")) {
-            Path local = Path.of(model).toAbsolutePath();
-            if (!Files.isRegularFile(local)) {
-                throw new HuggingFaceHub.GgufSelectionException("no such GGUF file: " + local);
-            }
-            return new Source(local, local.getParent());
-        }
-        Path dir = Path.of(s.get("model.dir")).resolve(model.replace('/', '_'));
-        String revision = s.get("model.revision");
-        boolean forced = file != null || quant != null;
-        boolean safetensors = Files.isRegularFile(dir.resolve("config.json"));
-        if (!forced && safetensors) {
-            return new Source(null, dir);
-        }
-        IOException localProblem = null;
-        List<String> local = HuggingFaceHub.localGgufNames(dir);
-        if (!local.isEmpty()) {
-            try {
-                var sel = HuggingFaceHub.selectGguf(local, file, quant);
-                if (sel.getValue().stream().allMatch(n -> Files.isRegularFile(dir.resolve(n)))) {
-                    return new Source(dir.resolve(sel.getKey()), dir);
-                }
-            } catch (IOException e) {
-                localProblem = e; // none or several fit: the repository's listing may settle it
-            }
-        }
-        try {
-            if (!forced && !HuggingFaceHub.isGgufRepo(hub.listFiles(model, revision))) {
-                return new Source(null, dir);
-            }
-            return new Source(hub.downloadGguf(model, revision, dir, file, quant), dir);
-        } catch (IOException e) {
-            if (localProblem != null && !(e instanceof HuggingFaceHub.HttpStatusException)) {
-                throw new IOException(localProblem.getMessage() + " (the Hub could not be asked: " + e.getMessage() + ")", e);
-            }
-            throw e;
-        }
-    }
-
-    /** A model ready to run: architecture, tokenizer and weights, from a safetensors checkpoint or a GGUF file. */
-    private record Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) {
-    }
-
-    private static Loaded load(Settings s, HuggingFaceHub hub, String model) throws Exception {
-        Prepared p = prepare(s, hub, model, s.opt("model.gguf-file"), s.opt("model.gguf-quant"));
-        Architecture arch = p.arch();
-        Tokenizer tok = p.tok();
-        ModelWeights weights = p.weights();
-        int ctx = s.getInt("backend.ctx");
-        int batch = s.getInt("backend.batch");
-        Backend backend = createBackend(s, arch, weights);
-        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
-        try {
-            Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
-            Speculator.Config spec = s.speculation();
-            if (spec.mode() != Speculator.Mode.OFF) {
-                DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch) : null;
-                if (engine.enableSpeculation(spec, draft)) {
-                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase() + ", up to " + spec.k()
-                            + " tokens per pass" + (draft != null ? ", draft " + s.get("engine.draft-model") : ""));
-                }
-            }
-            return new Loaded(weights, engine);
-        } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
-            backend.close();
-            weights.close();
-            throw e;
-        }
-    }
-
-    /**
-     * Resolves {@code model} (a Hugging Face repository, a local {@code .gguf} file, or a GGUF repository narrowed by
-     * {@code file} / {@code quant}), downloads what is missing and loads its architecture, tokenizer and weights.
-     * Used for the target model and for a draft model alike.
-     */
-    private static Prepared prepare(Settings s, HuggingFaceHub hub, String model, String file, String quant) throws Exception {
-        Source src = resolve(s, hub, model, file, quant);
-        if (src.gguf() != null) {
-            return prepareGguf(s, hub, src);
-        }
-        Path dir = src.dir();
-        String revision = s.get("model.revision");
-        if (!Files.isRegularFile(dir.resolve("config.json"))) {
-            hub.downloadMetadata(model, revision, dir);
-        }
-        Architecture arch = Architecture.load(dir);
-        System.err.println("Model: " + arch);
-        Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
-        QType q = QType.parse(s.get("model.quant"));
-        QType head = QType.parseHead(s.get("model.head-quant"));
-        ShardProvider shards = shardProvider(hub, model, revision, dir, s.getBool("model.low-disk"));
-        ModelWeights weights = ModelWeights.load(dir, arch, q, head, shards, model + "@" + revision);
-        return new Prepared(arch, tok, weights, dir);
-    }
-
-    /** A GGUF file: architecture, tokenizer and weights all come from it, nothing is converted or cached. */
-    private static Prepared prepareGguf(Settings s, HuggingFaceHub hub, Source src) throws Exception {
-        long t0 = System.nanoTime();
-        long tokNanos;
-        GgufModel gm = GgufModel.open(src.gguf());
-        ModelWeights weights;
-        Architecture arch;
-        Tokenizer tok;
-        try {
-            arch = gm.architecture();
-            System.err.println("GGUF: " + gm.describe());
-            System.err.println("Model: " + arch);
-            String warn = gm.chatTemplateWarning();
-            if (warn != null) {
-                System.err.println("warning: " + warn);
-            }
-            tok = ggufTokenizer(s, hub, gm);
-            tokNanos = System.nanoTime() - t0;
-            weights = gm.weights();
-        } catch (Exception e) {
-            gm.close();
-            throw e;
-        }
-        System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs (tokenizer %.2fs)%n", arch.core().architecture(),
-                weights.quant, weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9, tokNanos / 1e9);
-        return new Prepared(arch, tok, weights, null);
-    }
-
-    /** The tokenizer built from the file; when its pre-tokenizer is unknown, the tokenizer.json of the original repository. */
-    private static Tokenizer ggufTokenizer(Settings s, HuggingFaceHub hub, GgufModel gm) throws Exception {
-        try {
-            return gm.tokenizer();
-        } catch (GgufTokenizer.UnsupportedPreTokenizer e) {
-            String repo = gm.originalRepo();
-            if (repo == null) {
-                throw new IOException(e.getMessage() + "; and the file names no original repository (general.base_model.0.repo_url)"
-                        + " to take tokenizer.json from", e);
-            }
-            System.err.println("note: " + e.getMessage() + "; using the tokenizer.json of " + repo);
-            Path tdir = Path.of(s.get("model.dir")).resolve("tokenizers").resolve(repo.replace('/', '_'));
-            Files.createDirectories(tdir);
-            hub.ensure(repo, "main", tdir, "tokenizer.json");
-            try {
-                hub.ensure(repo, "main", tdir, "tokenizer_config.json");
-            } catch (IOException ignored) {
-                // optional: it only supplies BOS / EOS names
-            }
-            return Tokenizer.load(tdir.resolve("tokenizer.json"));
-        }
-    }
-
-    private static ShardProvider shardProvider(HuggingFaceHub hub, String model, String revision, Path dir, boolean lowDisk) {
-        return new ShardProvider() {
-            @Override
-            public Path ensure(String name) throws IOException {
-                Path p = dir.resolve(name);
-                if (Files.isRegularFile(p)) {
-                    return p;
-                }
-                try {
-                    return hub.ensure(model, revision, dir, name);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("interrupted");
-                }
-            }
-
-            @Override
-            public String commitSha() {
-                try {
-                    return hub.commitSha(model, revision);
-                } catch (IOException | InterruptedException e) {
-                    return null; // offline: the cache simply records no commit
-                }
-            }
-
-            @Override
-            public void release(String name) throws IOException {
-                if (lowDisk) {
-                    Files.deleteIfExists(dir.resolve(name));
-                    System.err.println("\ndeleted " + name + " (model.low-disk)");
-                }
-            }
-        };
-    }
-
-    private static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
-        int ctx = s.getInt("backend.ctx");
-        int batch = s.getInt("backend.batch");
-        String backendName = s.get("backend");
-        if (backendName.equals("auto")) {
-            backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
-        }
-        int threads = s.getInt("backend.threads");
-        KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
-        boolean mamba = arch instanceof MambaArch;
-        if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
-            System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
-        }
-        Backend backend;
-        try {
-            backend = switch (backendName) {
-                case "cpu" -> mamba
-                        ? new MambaCpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                                s.getBool("backend.cpu.int8-activations"))
-                        : new CpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                                s.getBool("backend.cpu.int8-activations"));
-                case "metal" -> mamba
-                        ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
-                        : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
-                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
-            };
-        } catch (Exception e) {
-            weights.close();
-            throw e;
-        }
-        return backend;
-    }
-
-    /**
-     * Loads the draft model of {@code engine.draft-model} (a safetensors repository, a GGUF repository with a single
-     * file, or a local {@code .gguf}) on the same backend type; it must share the target's tokenizer.
-     */
-    private static DraftModel loadDraft(Settings s, HuggingFaceHub hub, Tokenizer targetTok, Architecture targetArch) throws Exception {
-        String repo = s.get("engine.draft-model");
-        Prepared p = prepare(s, hub, repo, null, null);
-        Architecture arch = p.arch();
-        ModelWeights weights = p.weights();
-        try {
-            if (arch instanceof MambaArch || targetArch instanceof MambaArch) {
-                throw new IllegalArgumentException("engine.draft-model: speculation needs attention (KV cache) models");
-            }
-            System.err.println("Draft model: " + arch);
-            Tokenizer tok = p.tok();
-            String probe = "Hello, world! The quick brown fox \u00e9\u4e2d 123\n\tdef f(x): return x";
-            if (tok.vocabSize() != targetTok.vocabSize() || !java.util.Arrays.equals(tok.encode(probe), targetTok.encode(probe))) {
-                throw new IllegalArgumentException("engine.draft-model " + repo + " does not share the target's tokenizer");
-            }
-        } catch (RuntimeException e) {
-            weights.close();
-            throw e;
-        }
-        Backend backend = createBackend(s, arch, weights); // closes the weights if it fails
-        System.err.println("Draft backend: " + backend.name());
-        return new DraftModel(backend, arch.core().vocabSize(), weights::close);
-    }
-
-    private static Set<Integer> eosIds(Path dir, Tokenizer tok, Architecture arch) throws Exception {
-        Set<Integer> ids = new HashSet<>(arch.core().eosTokenIds());
-        Path gen = dir == null ? null : dir.resolve("generation_config.json");
-        if (gen != null && Files.isRegularFile(gen)) {
-            Object eos = Json.parseObject(Files.readString(gen)).get("eos_token_id");
-            if (eos instanceof Number n) {
-                ids.add(n.intValue());
-            } else if (eos instanceof List<?> l) {
-                for (Object o : l) {
-                    if (!(o instanceof Number n)) {
-                        throw new IllegalArgumentException(gen + ": eos_token_id must be an integer or a list of"
-                                + " integers, found " + Json.write(o));
-                    }
-                    ids.add(n.intValue());
-                }
-            } else if (eos != null) {
-                throw new IllegalArgumentException(gen + ": eos_token_id must be an integer or a list of integers,"
-                        + " found " + Json.write(eos));
-            }
-        }
-        // Family stop tokens: ChatML (Qwen), Llama 3 end-of-turn / end-of-text, Mistral / Llama 2 </s>.
-        // the family template's end-of-turn ids are added by Engine; these cover base models without a template
-        for (String name : new String[]{"<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>"}) {
-            int id = tok.tokenId(name);
-            if (id >= 0) {
-                ids.add(id);
-            }
-        }
-        // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
-        // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
-        return ids;
-    }
-
-    private static void run(Loaded l, Settings s) {
+    private static void run(ModelLoader.Loaded l, Settings s) {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             String text = s.has("prompt") ? s.get("prompt") : "Hello";
             int[] prompt = s.has("raw") && s.getBool("raw")
@@ -431,7 +105,7 @@ public final class Main {
         }
     }
 
-    private static void chat(Loaded l, Settings s) throws Exception {
+    private static void chat(ModelLoader.Loaded l, Settings s) throws Exception {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
             List<ChatTemplate.Message> history = new ArrayList<>();
@@ -469,7 +143,7 @@ public final class Main {
         }
     }
 
-    private static void serve(Loaded l, String model, Settings s) throws Exception {
+    private static void serve(ModelLoader.Loaded l, String model, Settings s) throws Exception {
         int port = s.getInt("server.port");
         String host = s.get("server.host");
         HttpServer.Options http = new HttpServer.Options(
@@ -487,7 +161,7 @@ public final class Main {
         }
     }
 
-    private static void bench(Loaded l, Settings s) {
+    private static void bench(ModelLoader.Loaded l, Settings s) {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < 40; i++) {
