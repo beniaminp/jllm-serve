@@ -243,55 +243,66 @@ is skipped and the tokens go one by one through the decode path ([7.14](#714-pre
 
 The attention loop lives with the cache (`KvCache.F32` / `KvCache.F16`, [7.13](#713-the-f16-kv-cache-kvcache));
 `CpuBackend` only passes the layer's window, scale and soft-cap. For one query head with `len = pos + t + 1`
-cached positions and the thread-local scratch `sc`, the math is:
-
-```java
-for s < len:  sc[s] = VectorKernels.dot(q, qo, K[s], hd) * scale;  max = max(max, sc[s])     // (softcap: tanh(s/cap)*cap)
-for s < len:  sc[s] = exp(sc[s] - max);  sum += sc[s]
-Arrays.fill(att, qo, qo + hd, 0)
-for s < len:  VectorKernels.axpy(sc[s] * (1 / sum), V[s], att, qo, hd)                      // att += w_s · v_s
-```
-
-`dot` is a two-accumulator SIMD dot product (two independent FMA chains hide the FMA latency); `axpy` is
-`y += a·x` over 128 floats (32 FMA instructions). `Math.exp` is scalar and ~6 ns each — at `len = 4096` and
-16 heads that is 0.4 ms per layer per token, a visible share of the step ([7.15](#715-fast-math-jllmcpufastmath)
-has the vectorized alternative). `ko = (h / group) * hd` selects the shared KV head (GQA).
-
-**Decode (`n == 1`, f32)** runs exactly that loop with one task per query head (16 tasks), the finest split a
-single token allows.
-
-**Prefill (`n > 1`) is tiled.** A K row of the cache is `kvDim × 4 B`; one layer's K at `ctx = 4096` is 16 MB,
-so with one task per `(token, head)` every K and V row was streamed from L3/DRAM `n × heads` times per layer.
-`attentionTiled` instead makes one task per `(kv head, tile of consecutive tokens)` — the tile serves
-`tile × group` query heads — and walks the keys in blocks of 128 (`KEY_BLOCK`):
+cached positions the math is:
 
 ```
-for each block [b0, b1) of the keys any row of the tile sees:
-    K[b0..b1) (f32: in place; f16: expanded once into scratch)
-    for s in the block, for the rows (t, h) that see s, four at a time:
-        sc[row * span + s] = dot(q[row], K[s]) * scale          // dot4: four dots sharing each K load, same bits as dot
-for each row: max, exp, sum over its keys in ascending s; inv = 1/sum; att[row] = 0
-for each block [b0, b1):
-    V[b0..b1) (in place / expanded once)
-    for the rows four at a time, for each headDim vector c:
-        acc_r = att[row_r][c]; for s ascending: acc_r = V[s][c] · (sc[row_r * span + s] · inv_r) + acc_r; att[row_r][c] = acc_r
+for s < len:  sc[s] = (q · K[s]) * scale                 (softcap: tanh(s/cap)*cap)
+p = softmax(sc[0..len))                                   max, exp(s - max), sum; p = e / sum
+att = Σ_s p[s] · V[s]                                     ascending s
 ```
 
-Each K and V row is read (f32) or converted (f16) once per tile instead of once per dot product, and the output
-accumulates in registers — four independent FMA chains, one per row — instead of a load / FMA / store through
-memory per key. Per output element the arithmetic is unchanged — the same `dot` over `headDim`, the max and the
-sum over the keys in ascending order, the same ascending FMA chain as `axpy` — so the tiled kernel is
-bit-identical to the per-head loop (`SmokeTest.kvCacheAttention` checks tiled prefill against per-token decode and
-against a double-precision reference, for f32 and f16, with and without window and soft-cap). A `headDim` that is
-not a multiple of the vector length falls back to the same loop one key at a time.
+`ko = (h / group) * hd` selects the shared KV head (GQA).
 
-The tile is up to 16 tokens, as long as its score rows over the `span = pos + n` keys fit 8 MB per thread, with
-at least two tasks per pool thread. Before, the tile was sized from `ctx` and shrank to one token per tile at
-`ctx = 32768`, so a long context's every K / V row was converted and read once per token. Measured with
-Qwen3-0.6B (28 layers, 8 kv heads, f16 cache, `ctx = 32768`, 4 cores): a 6 033-token prompt — the size of a coding
-agent's instructions and tool definitions — prefilled in 313 s before and 115 s with the span-sized tiles and the
-blocked loops (16- and 64-token tiles measured the same). Tasks are handed out
-heaviest tile first (`forRangeFine`, chunk 1): later tokens see more keys, and the fine grain keeps the tail short.
+**Layout.** A dot product per key, `q · K[s]`, ends in a horizontal reduction of a vector (`reduceLanes`: a
+shuffle tree), and at `headDim = 128` with 16 float lanes that reduction costs as much as the eight FMAs before
+it. The cache therefore stores K **transposed in chunks of 32 keys**: chunk `c` of kv head `g` is `[hd][32]`, so
+one vector load holds element `i` of 16 (AVX-512) or 8 (AVX2) consecutive keys, and
+
+```
+score[s .. s+FL) = Σ_i  broadcast(q[i]) · Kchunk[i][s .. s+FL)        hd FMAs, no reduction
+```
+
+V stays row-major (`[ctx, kvDim]`): `att += p[s] · V[s]` is already a broadcast FMA per output vector.
+
+**Tiles.** One task per `(kv head, tile of up to 64 consecutive tokens)`; the tile serves `tile × group` query
+rows. Keys are walked in blocks of 128 (`KEY_BLOCK`):
+
+```
+for each block of K chunks any row of the tile sees:
+    K chunks (f32: in place; f16: converted once into scratch)
+    for each chunk, the rows that see one of its keys, four at a time (score4; then score2 / score1):
+        8 accumulators = 4 rows × 2 key vectors; per head element 2 key loads + 4 broadcasts feed 8 FMAs
+for each row: softmax over its keys in ascending s, then p = e · (1/sum) in place; att[row] = 0
+for each block of V rows (in place / converted once):
+    rows four at a time (accumulate4), two output vectors per row in registers:
+        for s ascending: acc[r][c] = V[s][c] · p[r][s] + acc[r][c]
+```
+
+Whichever variant computes it, every score is the same sequential chain of FMAs over the head elements followed
+by `* scale`, and every output element adds its keys in ascending order, so prefill (big tiles) and decode (a
+one-token tile) are bit-identical. `SmokeTest.kvCacheAttention` checks prefill against decode and against a
+double-precision reference, for f32 and f16, with and without window and soft-cap, at a head size that is whole
+vectors and one that is not (that one falls back to `attentionTiledSimple`, one key at a time over expanded rows).
+Scores of keys outside a row's window or past its position (the rest of a chunk) are computed and ignored.
+
+**Decode with few kv heads.** A one-token tile gives `kvHeads` tasks. When that is fewer than the pool's threads
+(4 kv heads on 10 cores, common in 7B coding models), `attentionDecode` runs three phases instead: scores by
+(kv head, range of key chunks), softmax by query head, outputs by (kv head, slice of the head's elements). Same
+operations per element, so still bit-identical. With 2 kv heads on 4 threads, 10 000 keys: 2.1 → 1.05 ms per
+layer. With 8 kv heads on 4 threads the tiled path stays faster (a head's work stays on one core).
+
+**Measured** with Qwen3-0.6B (28 layers, 16/8 heads, f16 cache, `ctx = 32768`, 4-core Xeon AVX-512):
+
+| | before (per-key dots) | transposed K, 64-token tiles, fast exp |
+|---|---|---|
+| one layer, 64 tokens at position 6 000 | 44 ms | 21 ms |
+| one layer, decode at position 10 000 | 3.2 ms (f32 2.8) | 2.35 ms (f32 1.6) |
+| 6 033-token prompt (a coding agent's first request) | 115 s (313 s with ctx-sized tiles) | 60 s |
+| decode after that prompt | ~2–3 tok/s | 7.6 tok/s |
+
+About 40 % of the remaining "before" time was scalar `Math.exp` in the softmax, hence fast math by default
+([7.15](#715-fast-math-jllmcpufastmath)). Tasks are handed out heaviest tile first (`forRangeFine`, chunk 1): later
+tokens see more keys, and the fine grain keeps the tail short.
 
 **MLA (DeepSeek).** `MlaCpu` replaces the q/k/v projections and this attention for latent-attention models. Its
 cache holds one row per token and layer of `kvLora + rope` numbers (576 floats for DeepSeek-V2-Lite instead of the
@@ -607,10 +618,10 @@ with two implementations; `CpuBackend` only knows `kv.store(...)` and `kv.attent
 
 | | `KvCache.F32` (default) | `KvCache.F16` |
 |---|---|---|
-| storage per layer | `float[ctx × kvDim]` for K and for V | `short[ctx × kvDim]` for K and for V |
+| storage per layer | `float[]`: K in transposed 32-key chunks, V rows | `int[]`: the same shapes, two halves per `int` |
 | 0.6B at `ctx = 4096` | 940 MB | **470 MB** |
-| `store` | `System.arraycopy` of the staged rows | `Float.floatToFloat16` per value (round-to-nearest-even) |
-| attention | `KvCache.F32.attention`: rows read in place | `KvCache.F16.attention`: rows expanded into scratch |
+| `store` | K scattered into its chunk, V `System.arraycopy` | `Float.floatToFloat16` per value (round-to-nearest-even) |
+| attention | chunks and rows read in place | blocks converted into scratch with vector code |
 
 **Why staging buffers.** The k/v projections used to write straight into the cache and `normRope` ran in place
 on the cached row. With an f16 cache that would round k *before* RoPE and again after it. Instead both backends
@@ -619,14 +630,16 @@ and store once — so a value is rounded exactly once, and the Metal backend rou
 way, which is why the two backends' f16 outputs are identical. The f32 path pays one extra `arraycopy` of
 `n × kvDim` floats per layer, which does not show in the measurements.
 
-**The f16 attention loop.** `Float.float16ToFloat` is a JIT intrinsic (`fcvt` on NEON, F16C on x86) and C2
-auto-vectorizes the plain conversion loop, but the Vector API has no half-float lane type, so the SIMD `dot`
-and `axpy` cannot read `short[]` directly. The f16 cache therefore runs the tiled kernel of
-[7.5](#75-attention-kvcacheattention) for every `n`, with `expand` converting each K / V row slice
-(`headDim` shorts → floats) into thread-local scratch once per tile: for decode that is once per kv head
-(`group = 2` query heads share it), for prefill once per `tile × group` query heads. The per-thread scratch grows
-to the largest tile's scores plus one block of 128 rows. Decode has `kvHeads` tasks per layer
-instead of the f32 path's `heads`, which on 10 cores costs nothing measurable.
+**The f16 attention loop.** The Vector API has no half-float lane type, and widening `short` lanes to `int`
+lanes is the shape-changing conversion that C2 handles badly ([7.10](#710-int8-activations-integer-dot-products-int8kernels)).
+So the f16 cache packs two halves into each `int`: K pairs head elements `2p` and `2p+1` of a key, V pairs keys
+`2j` and `2j+1` of an element. One `IntVector` load then yields two float vectors through same-shape operations
+only (`KvCache.F16.lowHalf` / `highHalf`): shift the half's exponent and mantissa to f32 bits 13–27, add the
+exponent rebias `112 << 23` as an integer, OR the sign back in, and for subnormal halves (exponent 0) take
+`asFloat(bits + (113 << 23)) − 2⁻¹⁴` instead, an exact float subtraction that never touches a denormal operand.
+That is bit-exact with `Float.float16ToFloat` for all 63 488 finite halves (`GgufKernelsCheck` checks every one;
+infinities and NaNs, which a KV cache never holds, come out as large finite values). The tiled kernel converts
+each block of K chunks and V rows once per tile into thread-local scratch, then runs the f32 kernels on it.
 
 **Precision.** f16 keeps 11 significant bits (about 3 decimal digits) and a range of ±65 504; K and V values
 after QK-norm and RoPE are O(1), so nothing overflows and the rounding error is ~5 × 10⁻⁴ relative per value,
@@ -687,11 +700,12 @@ near-tie; the `run` gates in [11](11-performance.md) have been stable across hun
 
 ## 7.15 Fast math (`jllm.cpu.fastmath`)
 
-`-Djllm.cpu.fastmath=true` (system property, default off; the backend name reports `fastmath`) replaces the
-scalar `Math.exp` of the attention softmax and the `Math.tanh` of the attention and final-logit soft-caps with
-polynomial kernels on float lanes (`VectorKernels.expFast` / `tanhFast`, used through `softmaxExp` and
-`softcapFast`). Everything else, including SiLU, keeps `Math.exp`. The results are *not* bit-identical to the
-default path - that is why it is a switch - but they are close:
+Fast math is **on by default** (the backend name reports `fastmath`); `-Djllm.cpu.fastmath=false` turns it off.
+It replaces the scalar `Math.exp` of the attention softmax and the `Math.tanh` of the attention and final-logit
+soft-caps with polynomial kernels on float lanes (`VectorKernels.expFast` / `tanhFast`, used through `softmaxExp`
+and `softcapFast`). Everything else, including SiLU, keeps `Math.exp`. The results are *not* bit-identical to the
+scalar functions, so bit-exact comparisons with the Metal backend (`scripts/arch-smoke.sh`) pass
+`-Djllm.cpu.fastmath=false`, but they are close:
 
 - `expFast`: `x = n·ln 2 + r` with `|r| ≤ ln 2 / 2`, a degree-6 Taylor polynomial in `r` (Horner with FMAs) and
   `2^n` assembled from the exponent bits; `n` comes from the `1.5 · 2^23` rounding trick of
@@ -703,7 +717,9 @@ default path - that is why it is a switch - but they are close:
 - The lane kernels and their scalar tails use the same arithmetic, so a row's result does not depend on where
   the vector loop stops.
 
-In isolation one exp costs 0.8 ns instead of 6.3 ns (8×). In a decode step the softmax is `heads × len` exps
+It became the default when the attention kernels stopped being reduction-bound: on a 6 000-key prefill chunk the
+scalar exps were ~40 % of the attention time (44 → 26 ms per layer with the switch alone). In isolation one exp
+costs 0.8 ns instead of 6.3 ns (8×). In a decode step the softmax is `heads × len` exps
 per layer against `heads × len × headDim × 2` FMAs for the scores and values, so the gain is bounded: measured
 on the M1 Pro (10 threads, Qwen3-0.6B Q4_0, int8 on, machine shared with other jobs), decode after a
 3 023-token prompt went from 21.6 / 20.8 tok/s to 22.7 / 22.7 tok/s (two interleaved runs each, +5–9 %), the

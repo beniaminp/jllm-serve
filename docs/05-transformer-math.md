@@ -862,8 +862,8 @@ recurrent state ([15](15-mamba.md)).
 int8 decode path rounds the activation), so a token's logits depend slightly on whether it was prefilled or
 decoded. `-Djllm.cpu.deterministic=true` runs every call token by token through the single-token kernels for
 comparisons ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)),
-and `-Djllm.cpu.fastmath=true` swaps `Math.exp`/`tanh` in the softmax for faster polynomials at a small accuracy
-cost ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)).
+and by default the CPU backend uses faster polynomials instead of `Math.exp`/`tanh` in the softmax, at a small accuracy
+cost (`-Djllm.cpu.fastmath=false` restores them) ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)).
 
 **The prefix cache on top** ([10](10-engine-and-server.md)): the engine remembers which token ids currently
 occupy the cache. When the next request shares a prefix (a chat history), only the new tokens are prefilled.

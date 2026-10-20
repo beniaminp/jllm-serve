@@ -935,9 +935,14 @@ public final class SmokeTest {
      * sliding window and soft-capping.
      */
     static void kvCacheAttention() throws Exception {
+        kvCacheAttention(128); // head dim 32: the vector kernels
+        kvCacheAttention(96);  // head dim 24: the one-key-at-a-time fallback where a head is not whole vectors
+    }
+
+    static void kvCacheAttention(int hidden) throws Exception {
         Path tmp = Files.createTempDirectory("jllm-kv");
         try {
-            Attention.Gqa cfg = gqa(cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":128,\"intermediate_size\":64,"
+            Attention.Gqa cfg = gqa(cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":" + hidden + ",\"intermediate_size\":64,"
                     + "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"vocab_size\":32}"), 0);
             int ctx = 40;
             int n = 23; // several tiles of the f32 and f16 kernels (at least two tasks per pool thread), plus remainders
@@ -1025,7 +1030,7 @@ public final class SmokeTest {
                                     }
                                 }
                             }
-                            String what = dtype + " window=" + window + " softcap=" + softcap;
+                            String what = dtype + " hd=" + hd + " window=" + window + " softcap=" + softcap;
                             check(maxRef < 2e-6, "kv attention " + what + " vs double reference: max diff " + maxRef);
                             // same kernels, so bit-identical once both run C2 code; while one of them still runs
                             // the interpreter's sequential lane reduction a last-bit (1e-7) difference is expected

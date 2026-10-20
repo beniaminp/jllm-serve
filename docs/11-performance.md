@@ -158,7 +158,7 @@ of the decode step is attention, the element-wise passes and pool synchronizatio
 Rows are dequantized once per 4-row group and reused across the 64 tokens by `dot4x4` / `dot4`, which is why
 prefill is ~5× faster per token than int8 decode and ~18× faster than float decode. Attention is tiled over
 (kv head, token tile) so every K / V row is read once per tile ([07 §7.5](07-cpu-backend.md#75-attention-kvcacheattention)),
-and the scalar `exp` / `silu` loops are still visible here (`-Djllm.cpu.fastmath` vectorizes the softmax's).
+and the scalar `exp` / `silu` loops are still visible here (fast math, now the default, vectorizes the softmax's).
 
 ---
 
@@ -212,11 +212,11 @@ Set by the `jllm` launcher:
 | `-XX:+UseParallelGC` | almost nothing is allocated during generation; ParallelGC has the lowest overhead |
 | `-Xmx4g` (`JLLM_XMX`) | room for the CPU KV cache at `--ctx 4096`; raise it for larger contexts on CPU, or halve the cache with `backend.kv-dtype=f16` |
 
-Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="-Djllm.cpu.fastmath=true" ./jllm bench`):
+Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="-Djllm.cpu.fastmath=false" ./jllm bench`):
 
 | property | default | effect |
 |---|---|---|
-| `jllm.cpu.fastmath` | off | vectorized `exp` / `tanh` in the attention softmax and soft-caps, not bit-identical ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) |
+| `jllm.cpu.fastmath` | on | vectorized `exp` / `tanh` in the attention softmax and soft-caps, not bit-identical ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) |
 | `jllm.cpu.deterministic` | off | prefill through the single-token kernels, for exact comparisons; slower ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)) |
 | `jllm.metal.flashDecode` | off | flash decoding for decode steps over `jllm.metal.flashMinLen` (512) positions ([08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) |
 | `jllm.metal.commitLayers` | 8 | layers per Metal command buffer (0 = one per pass) |
@@ -245,7 +245,7 @@ Done:
 | **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)) | each expert row dequantized once per chunk and reused for its tokens | `CpuBackend.moeBatched` |
 | **Tiled CPU attention** over (kv head, token tile) | each K / V row read once per tile; bit-identical | `KvCache.attentionTiled` |
 | **Flash decoding** on Metal, opt-in ([08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) | +3–5 % decode at ~3 000 tokens of context, not bit-identical, so off by default | `attention_split`, `attention_combine` |
-| **Vectorized `exp` / `tanh`** on CPU, opt-in (`jllm.cpu.fastmath`) | +5–9 % decode at ~3 000 tokens | `VectorKernels.expFast` |
+| **Vectorized `exp` / `tanh`** on CPU, default (`jllm.cpu.fastmath=false` to disable) | +5–9 % decode at ~3 000 tokens, −40 % long-prompt attention | `VectorKernels.expFast` |
 | **MLA latent cache** (DeepSeek): absorbed `W_kb`, one 576-wide row per token | 2.2 GB → 255 MB at `--ctx 4096` ([14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | `MlaCpu`, `MlaMetal` |
 
 Remaining, by expected payoff:

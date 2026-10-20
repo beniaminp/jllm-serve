@@ -3,25 +3,32 @@ package org.robomiri.jllm.cpu;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
 
+import jdk.incubator.vector.FloatVector;
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 import java.util.Arrays;
 
 /**
- * The CPU backend's KV cache: per layer one K and one V matrix of {@code [ctx, kvDim]}, row-major, on the Java
- * heap, and the causal grouped-query attention over it. {@link F32} holds plain floats that the attention loop
- * reads in place. {@link F16} holds IEEE half floats in {@code short[]} (converted with
- * {@link Float#floatToFloat16} / {@link Float#float16ToFloat}, both JIT intrinsics) and expands each cached row
- * into thread-local scratch before the f32 SIMD kernels read it. The math is f32 in both cases; f16 only changes
- * what is stored between forward calls.
+ * The CPU backend's KV cache, on the Java heap, and the causal grouped-query attention over it. Per layer and kv
+ * head, K is stored <em>transposed</em> in chunks of {@link #CHUNK} keys ({@code [hd][CHUNK]} per chunk): a vector
+ * load then holds one head element of {@code FL} keys, and a score vector for {@code FL} keys is {@code headDim} FMAs
+ * with broadcast query elements, with no horizontal reduction per key. V is stored as rows ({@code [ctx, kvDim]}),
+ * the shape the output accumulation wants. {@link F32} holds floats that the kernels read in place. {@link F16}
+ * holds IEEE halves packed two to an {@code int}, which vector code converts with shifts and masks into thread-local
+ * scratch, a block of keys at a time. The math is f32 in both cases; f16 only changes what is stored between
+ * forward calls.
  *
- * <p><b>Tiling.</b> For {@code n > 1} the work is split into tiles of one kv head and up to {@link #MAX_TILE}
- * consecutive tokens (fewer when their score rows over the {@code pos + n} keys would exceed {@link #SCORE_BUDGET}), which serve {@code tile × group} query heads. Each cached K row is read (f32) or expanded
- * (f16) once per tile and dotted with all of the tile's query heads; the scores of every query head are kept for
- * all its keys, the softmax runs per head, and each V row is read / expanded once per tile and added to every
- * head's output. Per output element nothing changes against the per-(token, head) loop: the same {@code dot}
- * over {@code headDim}, max and sum over the keys in ascending order, and the same ascending {@code axpy}
- * accumulation, so the results are bit-identical; only the memory traffic drops by {@code tile × group}.
- * Decode ({@code n == 1}) on f32 keeps one task per query head (more tasks than kv heads); f16 decode is the
- * one-token tile, which converts each row once per kv head instead of once per query head.
+ * <p><b>Tiling.</b> The work is split into tiles of one kv head and up to {@link #MAX_TILE} consecutive tokens
+ * (fewer when their score rows over the {@code pos + n} keys would exceed {@link #SCORE_BUDGET}), which serve
+ * {@code tile × group} query heads. Each block of K chunks is read (or expanded) once per tile and scored against
+ * four query rows at a time; the softmax runs per row and normalizes the probabilities in place; each block of V
+ * rows is read once per tile and added to four rows' outputs at a time, two vectors per row in registers. Every
+ * score is the same chain of FMAs over the head elements, and every output element adds the keys in ascending
+ * order, whichever kernel variant computes it, so prefill (tiles of many tokens) and decode (a one-token tile, or
+ * {@link #attentionDecode} when there are fewer kv heads than threads) give bit-identical results. A head size that
+ * is not whole vectors uses {@code attentionTiledSimple}, one key at a time over expanded rows.
  */
 public abstract class KvCache {
 
@@ -34,10 +41,11 @@ public abstract class KvCache {
     /** Query heads per kv head. */
     final int group;
     /**
-     * Most tokens per prefill tile: each K / V row is read (and, f16, expanded) once per tile. Measured on a 6 K-token
-     * prefill, 16 and 64 run equally fast; 16 needs a quarter of the scratch and leaves more tasks to balance.
+     * Most tokens per prefill tile: each K / V row is read (and, f16, expanded) once per tile. With the f16 expansion
+     * vectorized and the score kernel no longer reduction-bound, 64 beat 32 and 16 on a 6 K-token prefill (94 s, 98 s,
+     * 101 s before the kernel changes).
      */
-    static final int MAX_TILE = 16;
+    static final int MAX_TILE = 64;
     /** Score floats per thread a prefill tile may use ({@code tile × group × (pos + n)}): 8 MB. */
     static final int SCORE_BUDGET = 1 << 21;
     /** Per thread, grown on demand: [tile × group × span scores][headDim K row][headDim V row][tile × group 1/sum]. */
@@ -133,11 +141,33 @@ public abstract class KvCache {
     public abstract void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
                                    float scale, float softcap);
 
-    /** The f32 K (or V) rows of {@code layer} when they can be read in place, null when they must be expanded. */
-    abstract float[] rowsInPlace(int layer, boolean values);
+    /** The f32 transposed K chunks of {@code layer} (see {@link #keyChunk}) when they can be read in place, else null. */
+    abstract float[] keysInPlace(int layer);
+
+    /** The f32 V rows ({@code [ctx, kvDim]}) of {@code layer} when they can be read in place, else null. */
+    abstract float[] valuesInPlace(int layer);
+
+    /** Expands the K chunks {@code [c0, c1)} of kv head {@code g} to f32, {@code [hd][CHUNK]} each, into {@code dst[d ..]}. */
+    abstract void expandKeys(int layer, int g, int c0, int c1, float[] dst, int d);
+
+    /**
+     * Expands elements {@code [i0, i1)} (whole vectors) of the V rows {@code [s0, s1)} ({@code s0} even) of kv head
+     * {@code g} to f32, {@code i1 - i0} per row, into {@code dst[d ..]}.
+     */
+    abstract void expandValues(int layer, int g, int s0, int s1, int i0, int i1, float[] dst, int d);
 
     /** Expands the {@code headDim} values of kv head slice {@code ko} of row {@code s} into {@code dst[d ..]}. */
     abstract void expand(int layer, boolean values, int s, int ko, float[] dst, int d);
+
+    /** Chunks per kv head: the context rounded up to whole chunks. */
+    final int chunks() {
+        return (ctx + CHUNK - 1) / CHUNK;
+    }
+
+    /** Offset of chunk {@code c} of kv head {@code g} in an f32 transposed K array: {@code [kvHeads][chunks][hd][CHUNK]}. */
+    final int keyChunk(int g, int c) {
+        return (g * chunks() + c) * headDim * CHUNK;
+    }
 
     private static final boolean FASTMATH = VectorKernels.FASTMATH;
 
@@ -158,38 +188,46 @@ public abstract class KvCache {
         return VectorKernels.softmaxExp(sc, o, n, max);
     }
 
-    /** Keys per block of the blocked kernel: their K or V rows (f32) take 64 KB at headDim 128. */
+    /** Keys per block of the blocked kernel (a multiple of {@link #CHUNK}): their K or V rows (f32) take 64 KB at headDim 128. */
     static final int KEY_BLOCK = 128;
+
+    /** Keys per chunk of the transposed K layout: one chunk holds {@code [headDim][CHUNK]} values. */
+    static final int CHUNK = 32;
+
+    /** Whether the vector kernels apply: whole vectors per head and per chunk. */
+    final boolean vectorized() {
+        int fl = VectorKernels.FL;
+        return headDim % fl == 0 && CHUNK % (2 * fl) == 0;
+    }
 
     /**
      * The tiled kernel described in the class comment, for every (kv head, token tile) pair of the chunk. The keys
-     * are walked in blocks of {@link #KEY_BLOCK}: an f16 cache expands a block's K (then V) rows once into scratch,
-     * the scores are computed four query heads at a time sharing each key load, and the outputs accumulate in
-     * registers, four rows at a time, instead of going through memory once per key. Every output element still sees
-     * the same operations in the same (ascending key) order as {@link VectorKernels#dot} / {@link VectorKernels#axpy}
-     * one key at a time, so the results are unchanged.
+     * are walked in blocks of {@link #KEY_BLOCK}. Scores come from the transposed K chunks: one vector holds the
+     * scores of {@code FL} keys and is built by {@code headDim} FMAs with broadcast query elements, four query rows
+     * at a time sharing each key load, with no horizontal reduction. Outputs accumulate in registers, four rows at a
+     * time, over V rows in ascending key order. An f16 cache first expands a block's K chunks (then V rows) to f32
+     * scratch with vector code. Decode is the one-token tile, so prefill and decode compute every score and output
+     * with the same operations in the same order.
      */
     final void attentionTiled(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
                               float scale, float softcap) {
-        int hd = headDim;
-        int fl = VectorKernels.FL;
-        if (hd % fl != 0) {
+        if (!vectorized()) {
             attentionTiledSimple(pool, layer, n, pos, q, att, window, scale, softcap);
             return;
         }
+        int hd = headDim;
         // tiles are sized by the keys this chunk sees, not by the context: at a 32 K context a fixed budget left
         // one token per tile, so every K / V row was expanded and read once per token instead of once per tile
-        int span = pos + n;
+        int span = roundUp(pos + n, CHUNK); // score row stride: whole chunks
         // ... but at least two tasks per thread, so that wide machines with few kv heads stay busy
         int minTiles = (2 * pool.threads() + kvHeads - 1) / kvHeads;
         int tile = Math.max(1, Math.min(Math.min(MAX_TILE, (n + minTiles - 1) / minTiles),
                 Math.min(n, SCORE_BUDGET / (group * span))));
         int tiles = (n + tile - 1) / tile;
-        int blkOff = tile * group * span;              // one block of K or V rows, hd floats each
-        int invOff = blkOff + KEY_BLOCK * hd;
-        int scratchLen = invOff + tile * group;
-        float[] kIn = rowsInPlace(layer, false);
-        float[] vIn = rowsInPlace(layer, true);
+        int blkOff = tile * group * span;              // one block of K chunks or V rows, f32
+        int scratchLen = blkOff + KEY_BLOCK * hd;
+        float[] kIn = keysInPlace(layer);
+        float[] vIn = valuesInPlace(layer);
         boolean capped = softcap > 0 && !FASTMATH;
         // later tiles see more keys: hand them out first so the tail of the job is made of the light ones
         pool.forRangeFine(kvHeads * tiles, 1, (i0, i1) -> {
@@ -212,41 +250,52 @@ public abstract class KvCache {
                         hi[r] = len;
                     }
                 }
-                int sMin = lo[0];
+                int sMin = lo[0] / CHUNK * CHUNK;
                 int sMax = hi[rows - 1];
 
-                // scores: sc[r * span + s] for the visible keys of every row
+                // scores: sc[r * span + s] for the chunks holding visible keys of every row (others are ignored)
                 for (int b0 = sMin; b0 < sMax; b0 += KEY_BLOCK) {
                     int b1 = Math.min(sMax, b0 + KEY_BLOCK);
-                    float[] kArr = kIn != null ? kIn : sc;
-                    if (kIn == null) {
-                        for (int s = b0; s < b1; s++) {
-                            expand(layer, false, s, ko, sc, blkOff + (s - b0) * hd);
-                        }
+                    float[] kArr;
+                    int kBase;
+                    if (kIn != null) {
+                        kArr = kIn;
+                        kBase = keyChunk(g, b0 / CHUNK);
+                    } else {
+                        expandKeys(layer, g, b0 / CHUNK, (b1 + CHUNK - 1) / CHUNK, sc, blkOff);
+                        kArr = sc;
+                        kBase = blkOff;
                     }
-                    for (int s = b0; s < b1; s++) {
-                        int koff = kIn != null ? s * kvDim + ko : blkOff + (s - b0) * hd;
+                    for (int c0 = b0; c0 < b1; c0 += CHUNK) {
+                        int cb = kBase + (c0 - b0) * hd;
+                        int c1 = c0 + CHUNK;
                         int r = 0;
                         while (r < rows) {
-                            if (s < lo[r] || s >= hi[r]) {
+                            if (lo[r] >= c1 || hi[r] <= c0) {
                                 r++;
-                                continue;
-                            }
-                            if (r + 3 < rows && s >= lo[r + 3] && s < hi[r + 3] && s >= lo[r + 1] && s < hi[r + 1]
-                                    && s >= lo[r + 2] && s < hi[r + 2]) {
-                                dot4(q, rq[r], rq[r + 1], rq[r + 2], rq[r + 3], kArr, koff, hd, sc, r * span + s, span,
-                                        scale, softcap, capped);
+                            } else if (r + 3 < rows && lo[r + 3] < c1 && hi[r + 3] > c0 && lo[r + 1] < c1 && hi[r + 1] > c0
+                                    && lo[r + 2] < c1 && hi[r + 2] > c0) {
+                                score4(kArr, cb, q, rq[r], rq[r + 1], rq[r + 2], rq[r + 3], hd, sc, r * span + c0, span, scale);
                                 r += 4;
+                            } else if (r + 1 < rows && lo[r + 1] < c1 && hi[r + 1] > c0) {
+                                score2(kArr, cb, q, rq[r], rq[r + 1], hd, sc, r * span + c0, span, scale);
+                                r += 2;
                             } else {
-                                float d = VectorKernels.dot(q, rq[r], kArr, koff, hd) * scale;
-                                sc[r * span + s] = capped ? (float) Math.tanh(d / softcap) * softcap : d;
+                                score1(kArr, cb, q, rq[r], hd, sc, r * span + c0, scale);
                                 r++;
                             }
                         }
                     }
                 }
                 for (int r = 0; r < rows; r++) {
-                    sc[invOff + r] = 1f / softmax(sc, r * span + lo[r], hi[r] - lo[r], softcap);
+                    int o = r * span;
+                    if (capped) {
+                        for (int s = lo[r]; s < hi[r]; s++) {
+                            sc[o + s] = (float) Math.tanh(sc[o + s] / softcap) * softcap;
+                        }
+                    }
+                    float inv = 1f / softmax(sc, o + lo[r], hi[r] - lo[r], softcap);
+                    VectorKernels.scale(sc, o + lo[r], hi[r] - lo[r], inv); // probabilities, used by every output vector
                     Arrays.fill(att, rq[r], rq[r] + hd, 0f);
                 }
 
@@ -260,108 +309,299 @@ public abstract class KvCache {
                         vBase = b0 * kvDim + ko;
                         vStride = kvDim;
                     } else {
-                        for (int s = b0; s < b1; s++) {
-                            expand(layer, true, s, ko, sc, blkOff + (s - b0) * hd);
-                        }
+                        expandValues(layer, g, b0, b1, 0, hd, sc, blkOff);
                         vBase = blkOff;
                         vStride = hd;
                     }
                     int r = 0;
                     for (; r + 3 < rows; r += 4) {
-                        accumulate4(sc, span, invOff, r, lo, hi, b0, b1, vArr, vBase, vStride, att, rq, hd);
+                        accumulate4(sc, span, r, lo, hi, b0, b1, vArr, vBase, vStride, att, rq, hd);
                     }
                     for (; r < rows; r++) {
-                        accumulate1(sc, span, invOff, r, Math.max(lo[r], b0), Math.min(hi[r], b1), b0, vArr, vBase,
-                                vStride, att, rq[r], hd);
+                        accumulate1(sc, span, r, Math.max(lo[r], b0), Math.min(hi[r], b1), b0, vArr, vBase, vStride,
+                                att, rq[r], hd);
                     }
                 }
             }
         });
     }
 
+    /** Decode scores of every query head over the context, shared by the tasks of one {@link #attentionDecode}. */
+    private float[] decodeScores = new float[0];
+
     /**
-     * Four rows' scores against one key, exactly as four {@link VectorKernels#dot} calls (two accumulators over
-     * alternating vectors, then the scalar tail) but loading each key vector once.
+     * Decode ({@code n == 1}) in three parallel phases, so that a model with few kv heads still keeps every thread
+     * busy: the scores by (kv head, range of key chunks), the softmax by query head, the outputs by (kv head, slice of
+     * the head's elements). Each score and each output element sees the same operations in the same order as in
+     * {@link #attentionTiled}, so decode and prefill still agree bit for bit.
      */
-    private static void dot4(float[] q, int q0, int q1, int q2, int q3, float[] k, int ko, int hd, float[] sc, int so,
-                             int stride, float scale, float softcap, boolean capped) {
+    final void attentionDecode(ThreadPool pool, int layer, int pos, float[] q, float[] att, int window, float scale,
+                               float softcap) {
+        int hd = headDim;
+        int fl = VectorKernels.FL;
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int span = roundUp(len, CHUNK);
+        int heads = kvHeads * group;
+        if (decodeScores.length < heads * span) {
+            decodeScores = new float[Math.max(heads * span, Math.min(heads * roundUp(ctx, CHUNK), 2 * heads * span))];
+        }
+        float[] sc = decodeScores;
+        float[] kIn = keysInPlace(layer);
+        float[] vIn = valuesInPlace(layer);
+        int c0 = first / CHUNK;
+        int c1 = span / CHUNK;
+        int want = 2 * pool.threads();
+        int keyParts = Math.max(1, Math.min((want + kvHeads - 1) / kvHeads, (c1 - c0) / 4)); // >= 4 chunks per task
+        pool.forRangeFine(kvHeads * keyParts, 1, (i0, i1) -> {
+            float[] buf = scratch(KEY_BLOCK * hd);
+            for (int i = i0; i < i1; i++) {
+                int g = i / keyParts;
+                int part = i % keyParts;
+                int pa = c0 + (int) ((long) (c1 - c0) * part / keyParts);
+                int pb = c0 + (int) ((long) (c1 - c0) * (part + 1) / keyParts);
+                for (int b0 = pa; b0 < pb; b0 += KEY_BLOCK / CHUNK) {
+                    int b1 = Math.min(pb, b0 + KEY_BLOCK / CHUNK);
+                    float[] kArr = kIn != null ? kIn : buf;
+                    int kBase = 0;
+                    if (kIn != null) {
+                        kBase = keyChunk(g, b0);
+                    } else {
+                        expandKeys(layer, g, b0, b1, buf, 0);
+                    }
+                    for (int c = b0; c < b1; c++) {
+                        int cb = kBase + (c - b0) * hd * CHUNK;
+                        int r = 0;
+                        int row = g * group;
+                        for (; r + 3 < group; r += 4) {
+                            score4(kArr, cb, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd, (row + r + 3) * hd,
+                                    hd, sc, (row + r) * span + c * CHUNK, span, scale);
+                        }
+                        for (; r + 1 < group; r += 2) {
+                            score2(kArr, cb, q, (row + r) * hd, (row + r + 1) * hd, hd, sc, (row + r) * span + c * CHUNK,
+                                    span, scale);
+                        }
+                        for (; r < group; r++) {
+                            score1(kArr, cb, q, (row + r) * hd, hd, sc, (row + r) * span + c * CHUNK, scale);
+                        }
+                    }
+                }
+            }
+        });
+        boolean capped = softcap > 0 && !FASTMATH;
+        pool.forRangeFine(heads, 1, (h0, h1) -> {
+            for (int h = h0; h < h1; h++) {
+                int o = h * span;
+                if (capped) {
+                    for (int s = first; s < len; s++) {
+                        sc[o + s] = (float) Math.tanh(sc[o + s] / softcap) * softcap;
+                    }
+                }
+                float inv = 1f / softmax(sc, o + first, len - first, softcap);
+                VectorKernels.scale(sc, o + first, len - first, inv);
+                Arrays.fill(att, h * hd, (h + 1) * hd, 0f);
+            }
+        });
+        // output slices of whole vectors, at least two per task so accumulate1 can keep several chains
+        int slice = hd % (4 * fl) == 0 ? 4 * fl : hd % (2 * fl) == 0 ? 2 * fl : fl;
+        int slices = hd / slice;
+        int sMin = first / CHUNK * CHUNK;
+        pool.forRangeFine(kvHeads * slices, 1, (i0, i1) -> {
+            float[] buf = scratch(KEY_BLOCK * slice);
+            for (int i = i0; i < i1; i++) {
+                int g = i / slices;
+                int e0 = (i % slices) * slice;
+                for (int b0 = sMin; b0 < len; b0 += KEY_BLOCK) {
+                    int b1 = Math.min(len, b0 + KEY_BLOCK);
+                    float[] vArr;
+                    int vBase;
+                    int vStride;
+                    if (vIn != null) {
+                        vArr = vIn;
+                        vBase = b0 * kvDim + g * hd + e0;
+                        vStride = kvDim;
+                    } else {
+                        expandValues(layer, g, b0, b1, e0, e0 + slice, buf, 0);
+                        vArr = buf;
+                        vBase = 0;
+                        vStride = slice;
+                    }
+                    for (int r = 0; r < group; r++) {
+                        int h = g * group + r;
+                        accumulate1(sc, span, h, Math.max(first, b0), b1, b0, vArr, vBase, vStride, att, h * hd + e0,
+                                slice);
+                    }
+                }
+            }
+        });
+    }
+
+    static int roundUp(int x, int m) {
+        return (x + m - 1) / m * m;
+    }
+
+    /**
+     * Scores of four query rows against the {@link #CHUNK} keys of the transposed chunk at {@code k[kb ..]}
+     * ({@code [hd][CHUNK]}): two vectors of keys at a time, one FMA per head element with the broadcast query element
+     * (eight accumulators: each key and query load feeds several FMAs). Written scaled to {@code sc[so ..]},
+     * {@code sc[so + stride ..]}, ...
+     */
+    private static void score4(float[] k, int kb, float[] q, int q0, int q1, int q2, int q3, int hd, float[] sc, int so,
+                               int stride, float scale) {
         var sp = VectorKernels.F;
         int fl = VectorKernels.FL;
-        jdk.incubator.vector.FloatVector a0 = jdk.incubator.vector.FloatVector.zero(sp), a1 = a0, b0 = a0, b1 = a0,
-                c0 = a0, c1 = a0, d0 = a0, d1 = a0;
-        int i = 0;
-        int ub = hd - 2 * fl;
-        for (; i <= ub; i += 2 * fl) {
-            var k0 = jdk.incubator.vector.FloatVector.fromArray(sp, k, ko + i);
-            var k1 = jdk.incubator.vector.FloatVector.fromArray(sp, k, ko + i + fl);
-            a0 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q0 + i).fma(k0, a0);
-            a1 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q0 + i + fl).fma(k1, a1);
-            b0 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q1 + i).fma(k0, b0);
-            b1 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q1 + i + fl).fma(k1, b1);
-            c0 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q2 + i).fma(k0, c0);
-            c1 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q2 + i + fl).fma(k1, c1);
-            d0 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q3 + i).fma(k0, d0);
-            d1 = jdk.incubator.vector.FloatVector.fromArray(sp, q, q3 + i + fl).fma(k1, d1);
+        for (int v = 0; v < CHUNK; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(sp);
+            FloatVector a1 = a0;
+            FloatVector a2 = a0;
+            FloatVector a3 = a0;
+            FloatVector b0 = a0;
+            FloatVector b1 = a0;
+            FloatVector b2 = a0;
+            FloatVector b3 = a0;
+            for (int i = 0; i < hd; i++) {
+                FloatVector ka = FloatVector.fromArray(sp, k, kb + i * CHUNK + v);
+                FloatVector kz = FloatVector.fromArray(sp, k, kb + i * CHUNK + v + fl);
+                FloatVector x0 = FloatVector.broadcast(sp, q[q0 + i]);
+                FloatVector x1 = FloatVector.broadcast(sp, q[q1 + i]);
+                FloatVector x2 = FloatVector.broadcast(sp, q[q2 + i]);
+                FloatVector x3 = FloatVector.broadcast(sp, q[q3 + i]);
+                a0 = ka.fma(x0, a0);
+                b0 = kz.fma(x0, b0);
+                a1 = ka.fma(x1, a1);
+                b1 = kz.fma(x1, b1);
+                a2 = ka.fma(x2, a2);
+                b2 = kz.fma(x2, b2);
+                a3 = ka.fma(x3, a3);
+                b3 = kz.fma(x3, b3);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+            a1.mul(scale).intoArray(sc, so + stride + v);
+            b1.mul(scale).intoArray(sc, so + stride + v + fl);
+            a2.mul(scale).intoArray(sc, so + 2 * stride + v);
+            b2.mul(scale).intoArray(sc, so + 2 * stride + v + fl);
+            a3.mul(scale).intoArray(sc, so + 3 * stride + v);
+            b3.mul(scale).intoArray(sc, so + 3 * stride + v + fl);
         }
-        float sa = a0.add(a1).reduceLanes(jdk.incubator.vector.VectorOperators.ADD);
-        float sb = b0.add(b1).reduceLanes(jdk.incubator.vector.VectorOperators.ADD);
-        float scc = c0.add(c1).reduceLanes(jdk.incubator.vector.VectorOperators.ADD);
-        float sd = d0.add(d1).reduceLanes(jdk.incubator.vector.VectorOperators.ADD);
-        for (; i < hd; i++) {
-            sa += q[q0 + i] * k[ko + i];
-            sb += q[q1 + i] * k[ko + i];
-            scc += q[q2 + i] * k[ko + i];
-            sd += q[q3 + i] * k[ko + i];
-        }
-        sc[so] = cap(sa * scale, softcap, capped);
-        sc[so + stride] = cap(sb * scale, softcap, capped);
-        sc[so + 2 * stride] = cap(scc * scale, softcap, capped);
-        sc[so + 3 * stride] = cap(sd * scale, softcap, capped);
     }
 
-    private static float cap(float d, float softcap, boolean capped) {
-        return capped ? (float) Math.tanh(d / softcap) * softcap : d;
+    /** {@link #score4} for two rows, with the same operations per score. */
+    private static void score2(float[] k, int kb, float[] q, int q0, int q1, int hd, float[] sc, int so, int stride,
+                               float scale) {
+        var sp = VectorKernels.F;
+        int fl = VectorKernels.FL;
+        for (int v = 0; v < CHUNK; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(sp);
+            FloatVector a1 = a0;
+            FloatVector b0 = a0;
+            FloatVector b1 = a0;
+            for (int i = 0; i < hd; i++) {
+                FloatVector ka = FloatVector.fromArray(sp, k, kb + i * CHUNK + v);
+                FloatVector kz = FloatVector.fromArray(sp, k, kb + i * CHUNK + v + fl);
+                FloatVector x0 = FloatVector.broadcast(sp, q[q0 + i]);
+                FloatVector x1 = FloatVector.broadcast(sp, q[q1 + i]);
+                a0 = ka.fma(x0, a0);
+                b0 = kz.fma(x0, b0);
+                a1 = ka.fma(x1, a1);
+                b1 = kz.fma(x1, b1);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+            a1.mul(scale).intoArray(sc, so + stride + v);
+            b1.mul(scale).intoArray(sc, so + stride + v + fl);
+        }
+    }
+
+    /** {@link #score4} for one row, with the same operations per score. */
+    private static void score1(float[] k, int kb, float[] q, int q0, int hd, float[] sc, int so, float scale) {
+        var sp = VectorKernels.F;
+        int fl = VectorKernels.FL;
+        for (int v = 0; v < CHUNK; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(sp);
+            FloatVector b0 = a0;
+            for (int i = 0; i < hd; i++) {
+                FloatVector x0 = FloatVector.broadcast(sp, q[q0 + i]);
+                a0 = FloatVector.fromArray(sp, k, kb + i * CHUNK + v).fma(x0, a0);
+                b0 = FloatVector.fromArray(sp, k, kb + i * CHUNK + v + fl).fma(x0, b0);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+        }
     }
 
     /**
-     * Rows {@code r .. r+3}: their keys of block {@code [b0, b1)} added to their outputs. The keys all four see run
-     * with four independent accumulators per vector of the head; the others row by row, in ascending order.
+     * Rows {@code r .. r+3}: their keys of block {@code [b0, b1)} added to their outputs ({@code sc} holds the
+     * normalized probabilities). The keys all four see run with two output vectors per row in registers (eight
+     * accumulators); the others row by row. Each output element sees the same FMAs in ascending key order either way.
      */
-    private void accumulate4(float[] sc, int span, int invOff, int r, int[] lo, int[] hi, int b0, int b1, float[] v,
+    private void accumulate4(float[] sc, int span, int r, int[] lo, int[] hi, int b0, int b1, float[] v,
                              int vBase, int vStride, float[] att, int[] rq, int hd) {
         int a = Math.max(b0, Math.max(Math.max(lo[r], lo[r + 1]), Math.max(lo[r + 2], lo[r + 3])));
         int b = Math.min(b1, Math.min(Math.min(hi[r], hi[r + 1]), Math.min(hi[r + 2], hi[r + 3])));
         if (a >= b) { // nothing in common in this block (rare: near the diagonal or a window edge)
             for (int k = 0; k < 4; k++) {
-                accumulate1(sc, span, invOff, r + k, Math.max(lo[r + k], b0), Math.min(hi[r + k], b1), b0, v, vBase,
+                accumulate1(sc, span, r + k, Math.max(lo[r + k], b0), Math.min(hi[r + k], b1), b0, v, vBase,
                         vStride, att, rq[r + k], hd);
             }
             return;
         }
         for (int k = 0; k < 4; k++) { // keys before the common range
-            accumulate1(sc, span, invOff, r + k, Math.max(lo[r + k], b0), a, b0, v, vBase, vStride, att, rq[r + k], hd);
+            accumulate1(sc, span, r + k, Math.max(lo[r + k], b0), a, b0, v, vBase, vStride, att, rq[r + k], hd);
         }
         var sp = VectorKernels.F;
         int fl = VectorKernels.FL;
-        float i0 = sc[invOff + r];
-        float i1 = sc[invOff + r + 1];
-        float i2 = sc[invOff + r + 2];
-        float i3 = sc[invOff + r + 3];
         int p0 = r * span;
         int p1 = p0 + span;
         int p2 = p1 + span;
         int p3 = p2 + span;
-        for (int c = 0; c < hd; c += fl) {
-            var x0 = jdk.incubator.vector.FloatVector.fromArray(sp, att, rq[r] + c);
-            var x1 = jdk.incubator.vector.FloatVector.fromArray(sp, att, rq[r + 1] + c);
-            var x2 = jdk.incubator.vector.FloatVector.fromArray(sp, att, rq[r + 2] + c);
-            var x3 = jdk.incubator.vector.FloatVector.fromArray(sp, att, rq[r + 3] + c);
+        int c = 0;
+        for (; c + 2 * fl <= hd; c += 2 * fl) {
+            var x0 = FloatVector.fromArray(sp, att, rq[r] + c);
+            var y0 = FloatVector.fromArray(sp, att, rq[r] + c + fl);
+            var x1 = FloatVector.fromArray(sp, att, rq[r + 1] + c);
+            var y1 = FloatVector.fromArray(sp, att, rq[r + 1] + c + fl);
+            var x2 = FloatVector.fromArray(sp, att, rq[r + 2] + c);
+            var y2 = FloatVector.fromArray(sp, att, rq[r + 2] + c + fl);
+            var x3 = FloatVector.fromArray(sp, att, rq[r + 3] + c);
+            var y3 = FloatVector.fromArray(sp, att, rq[r + 3] + c + fl);
             for (int s = a; s < b; s++) {
-                var vv = jdk.incubator.vector.FloatVector.fromArray(sp, v, vBase + (s - b0) * vStride + c);
-                x0 = vv.fma(jdk.incubator.vector.FloatVector.broadcast(sp, sc[p0 + s] * i0), x0);
-                x1 = vv.fma(jdk.incubator.vector.FloatVector.broadcast(sp, sc[p1 + s] * i1), x1);
-                x2 = vv.fma(jdk.incubator.vector.FloatVector.broadcast(sp, sc[p2 + s] * i2), x2);
-                x3 = vv.fma(jdk.incubator.vector.FloatVector.broadcast(sp, sc[p3 + s] * i3), x3);
+                int vo = vBase + (s - b0) * vStride + c;
+                var va = FloatVector.fromArray(sp, v, vo);
+                var vz = FloatVector.fromArray(sp, v, vo + fl);
+                var w0 = FloatVector.broadcast(sp, sc[p0 + s]);
+                var w1 = FloatVector.broadcast(sp, sc[p1 + s]);
+                var w2 = FloatVector.broadcast(sp, sc[p2 + s]);
+                var w3 = FloatVector.broadcast(sp, sc[p3 + s]);
+                x0 = va.fma(w0, x0);
+                y0 = vz.fma(w0, y0);
+                x1 = va.fma(w1, x1);
+                y1 = vz.fma(w1, y1);
+                x2 = va.fma(w2, x2);
+                y2 = vz.fma(w2, y2);
+                x3 = va.fma(w3, x3);
+                y3 = vz.fma(w3, y3);
+            }
+            x0.intoArray(att, rq[r] + c);
+            y0.intoArray(att, rq[r] + c + fl);
+            x1.intoArray(att, rq[r + 1] + c);
+            y1.intoArray(att, rq[r + 1] + c + fl);
+            x2.intoArray(att, rq[r + 2] + c);
+            y2.intoArray(att, rq[r + 2] + c + fl);
+            x3.intoArray(att, rq[r + 3] + c);
+            y3.intoArray(att, rq[r + 3] + c + fl);
+        }
+        for (; c < hd; c += fl) { // an odd number of vectors per head
+            var x0 = FloatVector.fromArray(sp, att, rq[r] + c);
+            var x1 = FloatVector.fromArray(sp, att, rq[r + 1] + c);
+            var x2 = FloatVector.fromArray(sp, att, rq[r + 2] + c);
+            var x3 = FloatVector.fromArray(sp, att, rq[r + 3] + c);
+            for (int s = a; s < b; s++) {
+                var vv = FloatVector.fromArray(sp, v, vBase + (s - b0) * vStride + c);
+                x0 = vv.fma(FloatVector.broadcast(sp, sc[p0 + s]), x0);
+                x1 = vv.fma(FloatVector.broadcast(sp, sc[p1 + s]), x1);
+                x2 = vv.fma(FloatVector.broadcast(sp, sc[p2 + s]), x2);
+                x3 = vv.fma(FloatVector.broadcast(sp, sc[p3 + s]), x3);
             }
             x0.intoArray(att, rq[r] + c);
             x1.intoArray(att, rq[r + 1] + c);
@@ -369,31 +609,52 @@ public abstract class KvCache {
             x3.intoArray(att, rq[r + 3] + c);
         }
         for (int k = 0; k < 4; k++) { // keys after it
-            accumulate1(sc, span, invOff, r + k, b, Math.min(hi[r + k], b1), b0, v, vBase, vStride, att, rq[r + k], hd);
+            accumulate1(sc, span, r + k, b, Math.min(hi[r + k], b1), b0, v, vBase, vStride, att, rq[r + k], hd);
         }
     }
 
-    /** Row {@code r}: keys {@code [from, to)} (inside the block starting at {@code b0}) added to its output. */
-    private static void accumulate1(float[] sc, int span, int invOff, int r, int from, int to, int b0, float[] v,
+    /**
+     * Row {@code r}: keys {@code [from, to)} (inside the block starting at {@code b0}) added to its output, up to four
+     * output vectors at a time (independent chains; each element still adds the keys in ascending order).
+     */
+    private static void accumulate1(float[] sc, int span, int r, int from, int to, int b0, float[] v,
                                     int vBase, int vStride, float[] att, int qo, int hd) {
         if (from >= to) {
             return;
         }
         var sp = VectorKernels.F;
         int fl = VectorKernels.FL;
-        float inv = sc[invOff + r];
         int p = r * span;
-        for (int c = 0; c < hd; c += fl) {
-            var x = jdk.incubator.vector.FloatVector.fromArray(sp, att, qo + c);
+        int c = 0;
+        for (; c + 4 * fl <= hd; c += 4 * fl) {
+            var x0 = FloatVector.fromArray(sp, att, qo + c);
+            var x1 = FloatVector.fromArray(sp, att, qo + c + fl);
+            var x2 = FloatVector.fromArray(sp, att, qo + c + 2 * fl);
+            var x3 = FloatVector.fromArray(sp, att, qo + c + 3 * fl);
             for (int s = from; s < to; s++) {
-                x = jdk.incubator.vector.FloatVector.fromArray(sp, v, vBase + (s - b0) * vStride + c)
-                        .fma(jdk.incubator.vector.FloatVector.broadcast(sp, sc[p + s] * inv), x);
+                int vo = vBase + (s - b0) * vStride + c;
+                var w = FloatVector.broadcast(sp, sc[p + s]);
+                x0 = FloatVector.fromArray(sp, v, vo).fma(w, x0);
+                x1 = FloatVector.fromArray(sp, v, vo + fl).fma(w, x1);
+                x2 = FloatVector.fromArray(sp, v, vo + 2 * fl).fma(w, x2);
+                x3 = FloatVector.fromArray(sp, v, vo + 3 * fl).fma(w, x3);
+            }
+            x0.intoArray(att, qo + c);
+            x1.intoArray(att, qo + c + fl);
+            x2.intoArray(att, qo + c + 2 * fl);
+            x3.intoArray(att, qo + c + 3 * fl);
+        }
+        for (; c < hd; c += fl) {
+            var x = FloatVector.fromArray(sp, att, qo + c);
+            for (int s = from; s < to; s++) {
+                x = FloatVector.fromArray(sp, v, vBase + (s - b0) * vStride + c)
+                        .fma(FloatVector.broadcast(sp, sc[p + s]), x);
             }
             x.intoArray(att, qo + c);
         }
     }
 
-    /** The tile loop one key at a time: used when {@code headDim} is not a multiple of the vector length. */
+    /** The tile loop one key at a time over expanded rows: used when {@code headDim} is not a multiple of the vector length. */
     private void attentionTiledSimple(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
                               float scale, float softcap) {
         int hd = headDim;
@@ -406,13 +667,9 @@ public abstract class KvCache {
         int vOff = kOff + hd;
         int invOff = vOff + hd;
         int scratchLen = invOff + tile * group;
-        float[] kIn = rowsInPlace(layer, false);
-        float[] vIn = rowsInPlace(layer, true);
         // later tiles see more keys: hand them out first so the tail of the job is made of the light ones
         pool.forRangeFine(kvHeads * tiles, 1, (i0, i1) -> {
             float[] sc = scratch(scratchLen);
-            float[] kArr = kIn != null ? kIn : sc;
-            float[] vArr = vIn != null ? vIn : sc;
             for (int i = i0; i < i1; i++) {
                 int g = i % kvHeads;
                 int t0 = (tiles - 1 - i / kvHeads) * tile;
@@ -422,13 +679,7 @@ public abstract class KvCache {
                 int sMax = pos + t1;
                 // scores: row (t - t0) * group + h holds the keys of query head g * group + h of token t
                 for (int s = sMin; s < sMax; s++) {
-                    int koff;
-                    if (kIn != null) {
-                        koff = s * kvDim + ko;
-                    } else {
-                        expand(layer, false, s, ko, sc, kOff);
-                        koff = kOff;
-                    }
+                    expand(layer, false, s, ko, sc, kOff);
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
                         int first = window > 0 ? Math.max(0, len - window) : 0;
@@ -438,7 +689,7 @@ public abstract class KvCache {
                         int qo = t * qDim + g * group * hd;
                         int row = (t - t0) * group;
                         for (int h = 0; h < group; h++) {
-                            float d = VectorKernels.dot(q, qo + h * hd, kArr, koff, hd) * scale;
+                            float d = VectorKernels.dot(q, qo + h * hd, sc, kOff, hd) * scale;
                             sc[(row + h) * span + s] = softcap > 0 && !FASTMATH ? (float) Math.tanh(d / softcap) * softcap : d;
                         }
                     }
@@ -455,13 +706,7 @@ public abstract class KvCache {
                     }
                 }
                 for (int s = sMin; s < sMax; s++) {
-                    int voff;
-                    if (vIn != null) {
-                        voff = s * kvDim + ko;
-                    } else {
-                        expand(layer, true, s, ko, sc, vOff);
-                        voff = vOff;
-                    }
+                    expand(layer, true, s, ko, sc, vOff);
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
                         int first = window > 0 ? Math.max(0, len - window) : 0;
@@ -471,7 +716,7 @@ public abstract class KvCache {
                         int qo = t * qDim + g * group * hd;
                         int row = (t - t0) * group;
                         for (int h = 0; h < group; h++) {
-                            VectorKernels.axpy(sc[(row + h) * span + s] * sc[invOff + row + h], vArr, voff, att, qo + h * hd, hd);
+                            VectorKernels.axpy(sc[(row + h) * span + s] * sc[invOff + row + h], sc, vOff, att, qo + h * hd, hd);
                         }
                     }
                 }
@@ -481,97 +726,236 @@ public abstract class KvCache {
 
     // ------------------------------------------------------------------ f32
 
+    /**
+     * f32: K in transposed chunks, read in place by the score kernel; V rows {@code [ctx, kvDim]} read in place by the
+     * output kernel.
+     */
     static final class F32 extends KvCache {
         final float[][] key;
         final float[][] val;
 
         F32(int layers, Attention.Gqa a, int ctx) {
             super(layers, a, ctx);
-            key = new float[layers][ctx * kvDim];
+            key = new float[layers][kvHeads * chunks() * headDim * CHUNK];
             val = new float[layers][ctx * kvDim];
         }
 
         @Override
         public void store(int layer, int pos, float[] k, float[] v, int n) {
-            System.arraycopy(k, 0, key[layer], pos * kvDim, n * kvDim);
+            float[] kc = key[layer];
+            for (int t = 0; t < n; t++) {
+                int s = pos + t;
+                for (int g = 0; g < kvHeads; g++) {
+                    int base = keyChunk(g, s / CHUNK) + s % CHUNK;
+                    int src = t * kvDim + g * headDim;
+                    for (int i = 0; i < headDim; i++) {
+                        kc[base + i * CHUNK] = k[src + i];
+                    }
+                }
+            }
             System.arraycopy(v, 0, val[layer], pos * kvDim, n * kvDim);
         }
 
         @Override
-        float[] rowsInPlace(int layer, boolean values) {
-            return values ? val[layer] : key[layer];
+        float[] keysInPlace(int layer) {
+            return key[layer];
+        }
+
+        @Override
+        float[] valuesInPlace(int layer) {
+            return val[layer];
+        }
+
+        @Override
+        void expandKeys(int layer, int g, int c0, int c1, float[] dst, int d) {
+            System.arraycopy(key[layer], keyChunk(g, c0), dst, d, (c1 - c0) * headDim * CHUNK);
+        }
+
+        @Override
+        void expandValues(int layer, int g, int s0, int s1, int i0, int i1, float[] dst, int d) {
+            int w = i1 - i0;
+            for (int s = s0; s < s1; s++) {
+                System.arraycopy(val[layer], s * kvDim + g * headDim + i0, dst, d + (s - s0) * w, w);
+            }
         }
 
         @Override
         void expand(int layer, boolean values, int s, int ko, float[] dst, int d) {
-            throw new UnsupportedOperationException();
+            if (values) {
+                System.arraycopy(val[layer], s * kvDim + ko, dst, d, headDim);
+                return;
+            }
+            int base = keyChunk(ko / headDim, s / CHUNK) + s % CHUNK;
+            for (int i = 0; i < headDim; i++) {
+                dst[d + i] = key[layer][base + i * CHUNK];
+            }
         }
 
         @Override
         public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                        float softcap) {
-            if (n > 1) {
+            // with as many kv heads as threads the tiled kernel is already balanced and keeps a head's work on one core
+            if (n == 1 && vectorized() && kvHeads < pool.threads()) {
+                attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
+            } else {
                 attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
-                return;
             }
-            // decode: one task per query head, the finest split there is for a single token
-            float[] kc = key[layer];
-            float[] vc = val[layer];
-            int hd = headDim;
-            int nh = kvHeads * group;
-            int len = pos + 1;
-            int first = window > 0 ? Math.max(0, len - window) : 0;
-            pool.forRangeFine(nh, 1, (h0, h1) -> {
-                float[] sc = scratch.get();
-                for (int h = h0; h < h1; h++) {
-                    int ko = (h / group) * hd;
-                    int qo = h * hd;
-                    for (int s = first; s < len; s++) {
-                        float d = VectorKernels.dot(q, qo, kc, s * kvDim + ko, hd) * scale;
-                        sc[s] = softcap > 0 && !FASTMATH ? (float) Math.tanh(d / softcap) * softcap : d;
-                    }
-                    float inv = 1f / softmax(sc, first, len - first, softcap);
-                    Arrays.fill(att, qo, qo + hd, 0f);
-                    for (int s = first; s < len; s++) {
-                        VectorKernels.axpy(sc[s] * inv, vc, s * kvDim + ko, att, qo, hd);
-                    }
-                }
-            });
         }
     }
 
     // ------------------------------------------------------------------ f16
 
+    /**
+     * f16: IEEE halves packed two to an {@code int}, so that a vector of int lanes converts {@code 2 × FL} of them with
+     * shifts and masks ({@link #lowHalf}, {@link #highHalf}; the Vector API has no half-float conversion). K chunks
+     * hold head elements {@code 2p} (low) and {@code 2p+1} (high) of each key, {@code [kvHeads][chunks][hd/2][CHUNK]};
+     * V holds keys {@code 2j} (low) and {@code 2j+1} (high) of each element, {@code [ctx/2][kvDim]}.
+     */
     static final class F16 extends KvCache {
-        final short[][] key;
-        final short[][] val;
+        private static final VectorSpecies<Integer> I = IntVector.SPECIES_PREFERRED;
+        final int[][] key;
+        final int[][] val;
+        /** Element pairs per head (an odd {@code headDim} leaves the last high half zero). */
+        private final int pairs;
 
         F16(int layers, Attention.Gqa a, int ctx) {
             super(layers, a, ctx);
-            key = new short[layers][ctx * kvDim];
-            val = new short[layers][ctx * kvDim];
+            pairs = (headDim + 1) / 2;
+            key = new int[layers][kvHeads * chunks() * pairs * CHUNK];
+            val = new int[layers][(ctx + 1) / 2 * kvDim];
+        }
+
+        private int keyPairChunk(int g, int c) {
+            return (g * chunks() + c) * pairs * CHUNK;
         }
 
         @Override
         public void store(int layer, int pos, float[] k, float[] v, int n) {
-            toHalf(k, 0, key[layer], pos * kvDim, n * kvDim);
-            toHalf(v, 0, val[layer], pos * kvDim, n * kvDim);
+            int[] kc = key[layer];
+            int[] vc = val[layer];
+            for (int t = 0; t < n; t++) {
+                int s = pos + t;
+                for (int g = 0; g < kvHeads; g++) {
+                    int base = keyPairChunk(g, s / CHUNK) + s % CHUNK;
+                    int src = t * kvDim + g * headDim;
+                    for (int i = 0; i < headDim; i++) {
+                        put(kc, base + (i >> 1) * CHUNK, (i & 1) != 0, Float.floatToFloat16(k[src + i]));
+                    }
+                }
+                int vb = (s >> 1) * kvDim;
+                for (int i = 0; i < kvDim; i++) {
+                    put(vc, vb + i, (s & 1) != 0, Float.floatToFloat16(v[t * kvDim + i]));
+                }
+            }
+        }
+
+        private static void put(int[] a, int i, boolean high, short h) {
+            a[i] = high ? (a[i] & 0xFFFF) | (h << 16) : (a[i] & 0xFFFF0000) | (h & 0xFFFF);
+        }
+
+        private static short get(int[] a, int i, boolean high) {
+            return (short) (high ? a[i] >>> 16 : a[i]);
         }
 
         @Override
-        float[] rowsInPlace(int layer, boolean values) {
+        float[] keysInPlace(int layer) {
             return null;
         }
 
         @Override
+        float[] valuesInPlace(int layer) {
+            return null;
+        }
+
+        @Override
+        void expandKeys(int layer, int g, int c0, int c1, float[] dst, int d) {
+            int[] kc = key[layer];
+            int fl = VectorKernels.FL;
+            int hd = headDim;
+            for (int c = c0; c < c1; c++) {
+                int src = keyPairChunk(g, c);
+                int o = d + (c - c0) * hd * CHUNK;
+                for (int p = 0; p < pairs; p++) {
+                    for (int v = 0; v < CHUNK; v += fl) {
+                        IntVector x = IntVector.fromArray(I, kc, src + p * CHUNK + v);
+                        lowHalf(x).intoArray(dst, o + 2 * p * CHUNK + v);
+                        if (2 * p + 1 < hd) {
+                            highHalf(x).intoArray(dst, o + (2 * p + 1) * CHUNK + v);
+                        }
+                    }
+                }
+            }
+        }
+
+        @Override
+        void expandValues(int layer, int g, int s0, int s1, int i0, int i1, float[] dst, int d) {
+            int[] vc = val[layer];
+            int fl = VectorKernels.FL;
+            int w = i1 - i0;
+            for (int s = s0; s < s1; s += 2) {
+                int src = (s >> 1) * kvDim + g * headDim;
+                int o = d + (s - s0) * w - i0;
+                for (int i = i0; i < i1; i += fl) {
+                    IntVector x = IntVector.fromArray(I, vc, src + i);
+                    lowHalf(x).intoArray(dst, o + i);
+                    highHalf(x).intoArray(dst, o + w + i); // key s + 1: inside the scratch block even past s1
+                }
+            }
+        }
+
+        @Override
         void expand(int layer, boolean values, int s, int ko, float[] dst, int d) {
-            toFloat(values ? val[layer] : key[layer], s * kvDim + ko, dst, d, headDim);
+            if (values) {
+                int base = (s >> 1) * kvDim + ko;
+                for (int i = 0; i < headDim; i++) {
+                    dst[d + i] = Float.float16ToFloat(get(val[layer], base + i, (s & 1) != 0));
+                }
+                return;
+            }
+            int base = keyPairChunk(ko / headDim, s / CHUNK) + s % CHUNK;
+            for (int i = 0; i < headDim; i++) {
+                dst[d + i] = Float.float16ToFloat(get(key[layer], base + (i >> 1) * CHUNK, (i & 1) != 0));
+            }
         }
 
         @Override
         public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                        float softcap) {
-            attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
+            // with as many kv heads as threads the tiled kernel is already balanced and keeps a head's work on one core
+            if (n == 1 && vectorized() && kvHeads < pool.threads()) {
+                attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
+            } else {
+                attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
+            }
+        }
+
+        private static final int EXP_MASK = 0x0F800000;    // a half's exponent after the shift to f32 position
+        private static final int SIGN = 0x80000000;
+        private static final int REBIAS = 112 << 23;       // f32 bias 127 - f16 bias 15
+        private static final float SUB_MAGIC = 0x1p-14f;   // 2^-14: subnormals are renormalized by a float subtraction
+
+        /**
+         * The halves in the low 16 bits of each lane, as floats: exact for zeros, subnormals and normals (the
+         * exponent is rebiased by an integer add; subnormals become {@code (2^-14 + m·2^-24) − 2^-14}, an exact float
+         * subtraction with no denormal operand). Infinities and NaNs, which a KV cache does not hold, come out as
+         * large finite values.
+         */
+        static FloatVector lowHalf(IntVector x) {
+            return half(x.lanewise(VectorOperators.LSHL, 13), x.lanewise(VectorOperators.LSHL, 16));
+        }
+
+        /** {@link #lowHalf} for the halves in the high 16 bits of each lane. */
+        static FloatVector highHalf(IntVector x) {
+            return half(x.lanewise(VectorOperators.LSHR, 3), x);
+        }
+
+        /** {@code shifted}: the half's exponent and mantissa at f32 bits 13..27; {@code signed}: its sign at bit 31. */
+        private static FloatVector half(IntVector shifted, IntVector signed) {
+            IntVector em = shifted.and(0x0FFFE000);
+            IntVector normal = em.add(REBIAS);
+            FloatVector sub = em.add(REBIAS + (1 << 23)).reinterpretAsFloats().sub(SUB_MAGIC);
+            IntVector bits = normal.blend(sub.reinterpretAsInts(), em.and(EXP_MASK).eq(0));
+            return bits.or(signed.and(SIGN)).reinterpretAsFloats();
         }
 
         static void toHalf(float[] src, int so, short[] dst, int d, int n) {

@@ -74,6 +74,7 @@ public final class GgufKernelsCheck {
             scalarOnly(a, "Q3_K", Ggml::dequantQ3_K);
             scalarOnly(a, "Q6_K", Ggml::dequantQ6_K); // the scalar definition used by the converting fallbacks
         }
+        halfConversion();
         System.out.println("ggml kernels: " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
             System.exit(1);
@@ -173,6 +174,43 @@ public final class GgufKernelsCheck {
         check(worstDot < 1e-5, type + " SIMD dot vs reference: max err relative to sum|w x| " + worstDot);
         System.out.printf("%-5s scalar == reference for %d/%d weights, max rel err scalar %.2e simd %.2e, dot %.2e (%s)%n", type,
                 exact, ROWS * COLS, worstScalar, worstSimd, worstDot, VectorKernels.describe());
+    }
+
+    /**
+     * The f16 KV cache's vector half-to-float conversion ({@link KvCache.F16#lowHalf} / {@code highHalf}) against
+     * {@link Float#float16ToFloat} for every finite half (zeros, subnormals, normals, both signs), in both lane halves.
+     */
+    private static void halfConversion() {
+        var sp = jdk.incubator.vector.IntVector.SPECIES_PREFERRED;
+        int[] lanes = new int[sp.length()];
+        float[] lo = new float[sp.length()];
+        float[] hi = new float[sp.length()];
+        int wrong = 0;
+        int tested = 0;
+        for (int h = 0; h < 65536; h += sp.length()) {
+            for (int l = 0; l < lanes.length; l++) {
+                int a = h + l;
+                int b = (h + l) ^ 0x8000; // the other lane half holds a different value with the opposite sign
+                lanes[l] = (a & 0xFFFF) | (b << 16);
+            }
+            jdk.incubator.vector.IntVector x = jdk.incubator.vector.IntVector.fromArray(sp, lanes, 0);
+            KvCache.F16.lowHalf(x).intoArray(lo, 0);
+            KvCache.F16.highHalf(x).intoArray(hi, 0);
+            for (int l = 0; l < lanes.length; l++) {
+                short a = (short) (h + l);
+                short b = (short) ((h + l) ^ 0x8000);
+                if ((a & 0x7C00) == 0x7C00) {
+                    continue; // infinities and NaNs are not supported
+                }
+                tested++;
+                if (Float.floatToRawIntBits(lo[l]) != Float.floatToRawIntBits(Float.float16ToFloat(a))
+                        || Float.floatToRawIntBits(hi[l]) != Float.floatToRawIntBits(Float.float16ToFloat(b))) {
+                    wrong++;
+                }
+            }
+        }
+        check(wrong == 0, "vector half-to-float conversion: " + wrong + " of " + tested + " halves differ");
+        System.out.printf("f16   vector half-to-float == Float.float16ToFloat for %d/%d finite halves%n", tested - wrong, tested);
     }
 
     /**

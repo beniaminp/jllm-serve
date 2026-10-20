@@ -273,14 +273,15 @@ public final class VectorKernels {
         }
     }
 
-    // ------------------------------------------------------------------ fast math (opt-in, not bit-exact)
+    // ------------------------------------------------------------------ fast math (default, not bit-exact)
 
     /**
-     * {@code -Djllm.cpu.fastmath=true}: the attention softmax and the soft-capping use the polynomial
-     * {@link #expFast} / {@link #tanhFast} on float lanes instead of scalar {@link Math#exp} / {@link Math#tanh}.
-     * Relative error about 2e-7 (exp) and 1e-6 (tanh), so not bit-identical to the default path; off by default.
+     * The attention softmax and the soft-capping use the polynomial {@link #expFast} / {@link #tanhFast} on float
+     * lanes instead of scalar {@link Math#exp} / {@link Math#tanh}: relative error about 2e-7 (exp) and 1e-6 (tanh).
+     * On by default since the exps are ~40 % of a long prompt's attention; {@code -Djllm.cpu.fastmath=false} restores
+     * the scalar functions (bit-exact comparisons with the Metal backend need that).
      */
-    public static final boolean FASTMATH = Boolean.getBoolean("jllm.cpu.fastmath");
+    public static final boolean FASTMATH = !"false".equals(System.getProperty("jllm.cpu.fastmath"));
 
     private static final float LOG2E = 1.4426950408889634f;
     private static final float LN2_HI = 0.693145751953125f;    // ln 2 split so that n * LN2_HI is exact for |n| < 2^10
@@ -428,6 +429,19 @@ public final class VectorKernels {
     /** {@code x / (1 + e^-x)}, the scalar SiLU every CPU path uses (so they all round the same way). */
     static float silu(float x) {
         return x / (1f + (float) Math.exp(-x));
+    }
+
+    /** {@code x[i] *= s} for {@code i in [o, o + n)} (one multiply per element, lanes or tail alike). */
+    static void scale(float[] x, int o, int n, float s) {
+        FloatVector sv = FloatVector.broadcast(F, s);
+        int i = o;
+        int ub = o + F.loopBound(n);
+        for (; i < ub; i += FL) {
+            FloatVector.fromArray(F, x, i).mul(sv).intoArray(x, i);
+        }
+        for (; i < o + n; i++) {
+            x[i] *= s;
+        }
     }
 
     /** {@code out[oo + i] = (in[io + i] * s) * w[i]}, the RMSNorm scaling step (same rounding as the scalar loop). */
