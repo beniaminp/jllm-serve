@@ -12,8 +12,8 @@ import org.robomiri.jllm.model.QType;
  *
  * <ul>
  *   <li>{@code n == 1}: every row is one {@link VectorKernels#dotRow} streaming the quantized blocks, or, with int8
- *       activations on and a Q4_0 / Q8_0 weight ({@link #useInt8}), one {@link Int8Kernels#dotRow} against the
- *       activation quantized once per call ({@link #quantizeInt8}).</li>
+ *       activations on and a Q4_0 / Q8_0 / K-quant weight ({@link #useInt8}), one {@link Int8Kernels#dotRow} /
+ *       {@link KQuantKernels#dotRow} against the activation quantized once per call ({@link #quantizeInt8}).</li>
  *   <li>{@code n > 1}: four rows are dequantized into thread-local scratch once and reused for every token
  *       ({@link VectorKernels#dot4x4} / {@link VectorKernels#dot4}); rows left over when {@code rows % 4 != 0}
  *       fall back to {@code dotRow}. With {@link CpuBackend#DETERMINISTIC} the tokens go one by one through the
@@ -32,6 +32,8 @@ final class CpuMatmul {
     private final boolean deterministic;
     private short[] xq;
     private float[] xs;
+    private int[] xsum;
+    private float[] permuted;
 
     /**
      * @param int8       quantize single-token activations to int8 and use the integer kernels for Q4_0 / Q8_0 weights
@@ -60,11 +62,16 @@ final class CpuMatmul {
 
     /**
      * The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0 and their ggml layouts
-     * Q4_0G, Q8_0G); every other type (Q2_K, Q4_K, Q5_K, ...) stays on the float kernels.
+     * Q4_0G, Q8_0G) and the K-quants of {@link KQuantKernels} (Q4_K, Q5_K, Q6_K); Q2_K stays on the float kernels.
      */
     boolean useInt8(QTensor wt) {
-        return int8 && (wt.type == QType.Q4_0 || wt.type == QType.Q8_0 || wt.type == QType.Q4_0G || wt.type == QType.Q8_0G)
-                && wt.cols % QType.BLOCK == 0;
+        return int8 && ((wt.type == QType.Q4_0 || wt.type == QType.Q8_0 || wt.type == QType.Q4_0G || wt.type == QType.Q8_0G)
+                && wt.cols % QType.BLOCK == 0 || KQuantKernels.supports(wt));
+    }
+
+    /** Row {@code r} of {@code wt} (a {@link #useInt8} type) times the last {@link #quantizeInt8} activation from {@code xo}. */
+    float int8Dot(QTensor wt, int r, short[] xq, float[] xs, int xo) {
+        return KQuantKernels.supports(wt) ? KQuantKernels.dotRow(wt, r, xq, xs, xsum, xo) : Int8Kernels.dotRow(wt, r, xq, xs, xo);
     }
 
     /** Quantizes {@code in[off .. off + n)} into the int8 scratch (grown if needed) and returns it; scales are in {@link #xs()}. */
@@ -72,8 +79,10 @@ final class CpuMatmul {
         if (xq == null || xq.length < n) {
             xq = new short[n];
             xs = new float[n / QType.BLOCK];
+            xsum = new int[n / QType.BLOCK];
         }
         Int8Kernels.quantize(in, off, n, xq, xs);
+        KQuantKernels.blockSums(xq, n, xsum); // the K-quants' min terms; n adds, next to nothing
         return xq;
     }
 
@@ -99,6 +108,10 @@ final class CpuMatmul {
             for (int t = 0; t < n; t++) {
                 mulOne(wt, rows, in, t * cols, out, outOff + t * stride, acc);
             }
+            return;
+        }
+        if (KQuantKernels.supports(wt)) {
+            mulPermuted(wt, rows, in, out, outOff, n, acc);
             return;
         }
         int groups = (rows + 3) / 4;
@@ -133,6 +146,51 @@ final class CpuMatmul {
         });
     }
 
+    /**
+     * {@link #mul} for the K-quants: rows dequantized in {@link KQuantKernels}' permuted order (no widening casts) and
+     * the activations permuted the same way, once, by the calling thread before the row loop is published.
+     */
+    private void mulPermuted(QTensor wt, int rows, float[] in, float[] out, int outOff, int n, boolean acc) {
+        int cols = wt.cols;
+        int stride = wt.rows;
+        if (permuted == null || permuted.length < n * cols) {
+            permuted = new float[n * cols];
+        }
+        float[] xp = permuted;
+        KQuantKernels.permute(in, n, cols, xp);
+        int groups = (rows + 3) / 4;
+        pool.forRange(groups, 1, (g0, g1) -> {
+            float[] tmp = scratch.get();
+            for (int g = g0; g < g1; g++) {
+                int r = g * 4;
+                if (r + 4 <= rows) {
+                    for (int k = 0; k < 4; k++) {
+                        KQuantKernels.dequantPermuted(wt, r + k, tmp, k * cols);
+                    }
+                    int t = 0;
+                    for (; t + 4 <= n; t += 4) {
+                        int xo = t * cols;
+                        int oo = outOff + t * stride + r;
+                        VectorKernels.dot4x4(tmp, 0, cols, xp, xo, xo + cols, xo + 2 * cols, xo + 3 * cols,
+                                out, oo, oo + stride, oo + 2 * stride, oo + 3 * stride, acc);
+                    }
+                    for (; t < n; t++) {
+                        VectorKernels.dot4(tmp, 0, cols, xp, t * cols, out, outOff + t * stride + r, acc);
+                    }
+                } else {
+                    for (int rr = r; rr < rows; rr++) {
+                        KQuantKernels.dequantPermuted(wt, rr, tmp, 0);
+                        for (int t = 0; t < n; t++) {
+                            float v = VectorKernels.dot(tmp, 0, xp, t * cols, cols);
+                            int o = outOff + t * stride + rr;
+                            out[o] = acc ? out[o] + v : v;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /** The single-token kernel: {@code out[outOff + r] (+)= dot(W[r, :], in[inOff, :])} for {@code r < rows}, parallel over rows. */
     void mulOne(QTensor wt, int rows, float[] in, int inOff, float[] out, int outOff, boolean acc) {
         if (useInt8(wt)) {
@@ -140,7 +198,7 @@ final class CpuMatmul {
             float[] xs = this.xs;
             pool.forRange(rows, 16, (r0, r1) -> {
                 for (int r = r0; r < r1; r++) {
-                    float v = Int8Kernels.dotRow(wt, r, xq, xs, 0);
+                    float v = int8Dot(wt, r, xq, xs, 0);
                     out[outOff + r] = acc ? out[outOff + r] + v : v;
                 }
             });

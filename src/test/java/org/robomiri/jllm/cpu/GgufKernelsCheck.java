@@ -165,10 +165,63 @@ public final class GgufKernelsCheck {
             check(worstVsFloat < 0.02, type + " int8-activation dot vs float dot (activation rounding): " + worstVsFloat);
             System.out.printf("%-5s int8 activations: SIMD vs scalar %.2e, vs float dot %.2e%n", type, worstInt, worstVsFloat);
         }
+        if (qt == QType.Q4_K || qt == QType.Q5_K || qt == QType.Q6_K) {
+            kquants(type, t, ref, java.util.Arrays.copyOfRange(x, 4, 4 + COLS));
+        }
         check(worstScalar < 1e-5, type + " scalar dequantizer vs gguf.quants: max rel err " + worstScalar);
         check(worstSimd < 1e-5, type + " SIMD dequantizer vs gguf.quants: max rel err " + worstSimd);
         check(worstDot < 1e-5, type + " SIMD dot vs reference: max err relative to sum|w x| " + worstDot);
         System.out.printf("%-5s scalar == reference for %d/%d weights, max rel err scalar %.2e simd %.2e, dot %.2e (%s)%n", type,
                 exact, ROWS * COLS, worstScalar, worstSimd, worstDot, VectorKernels.describe());
+    }
+
+    /**
+     * {@link KQuantKernels}: the int8-activation dot against the exact product of the reference weights with the
+     * dequantized int8 activation, and against the float dot (only activation rounding differs); the permuted
+     * dequantization element by element; a dot of permuted row and permuted activation against the plain one.
+     */
+    private static void kquants(String type, QTensor t, float[] ref, float[] xa) {
+        short[] xq = new short[COLS];
+        float[] xs = new float[COLS / 32];
+        int[] sums = new int[COLS / 32];
+        Int8Kernels.quantize(xa, 0, COLS, xq, xs);
+        KQuantKernels.blockSums(xq, COLS, sums);
+        double worstExact = 0;
+        double worstFloat = 0;
+        double worstDeq = 0;
+        double worstPermDot = 0;
+        float[] row = new float[COLS];
+        float[] xp = new float[COLS];
+        KQuantKernels.permute(xa, 1, COLS, xp);
+        for (int r = 0; r < ROWS; r++) {
+            double exact = 0;
+            double fl = 0;
+            double mag = 0;
+            for (int i = 0; i < COLS; i++) {
+                double w = ref[r * COLS + i];
+                double xi = (double) xs[i / 32] * xq[(i / 32) * 32 + Int8Kernels.permutedIndex(i % 32)];
+                exact += w * xi;
+                fl += w * xa[i];
+                mag += Math.abs(w * xa[i]);
+            }
+            float got = KQuantKernels.dotRow(t, r, xq, xs, sums, 0);
+            worstExact = Math.max(worstExact, Math.abs(got - exact) / (mag + 1e-9));
+            worstFloat = Math.max(worstFloat, Math.abs(got - fl) / (mag + 1e-9));
+            KQuantKernels.dequantPermuted(t, r, row, 0);
+            double pd = 0;
+            for (int i = 0; i < COLS; i++) {
+                float e = ref[r * COLS + i];
+                float g = row[(i / 32) * 32 + KQuantKernels.permutedIndex(i % 32)];
+                worstDeq = Math.max(worstDeq, Math.abs(g - e) / (Math.abs(e) + 1e-3));
+                pd += (double) row[i] * xp[i];
+            }
+            worstPermDot = Math.max(worstPermDot, Math.abs(pd - fl) / (mag + 1e-9));
+        }
+        check(worstExact < 1e-5, type + " int8 K-quant dot vs exact product with the quantized activation: " + worstExact);
+        check(worstFloat < 0.02, type + " int8 K-quant dot vs float dot (activation rounding): " + worstFloat);
+        check(worstDeq < 1e-5, type + " permuted dequantization vs gguf.quants: " + worstDeq);
+        check(worstPermDot < 1e-6, type + " permuted row . permuted activation vs plain dot: " + worstPermDot);
+        System.out.printf("%-5s int8 K-quant dot: vs exact %.2e, vs float %.2e; permuted dequant %.2e, permuted dot %.2e%n",
+                type, worstExact, worstFloat, worstDeq, worstPermDot);
     }
 }

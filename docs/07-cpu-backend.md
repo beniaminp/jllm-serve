@@ -536,6 +536,31 @@ slow-to-compile full-block form) vs 1.3–3.7 ms float.
 
 Measured numbers are in [11.1](11-performance.md#111-measured).
 
+### GGUF K-quants (`KQuantKernels`)
+
+GGUF files are mostly Q4_K / Q5_K / Q6_K (256-weight super-blocks with 6- or 8-bit sub-block scales). These
+used to go through the float `VectorKernels` path, which unpacks bytes with `castShape` widening casts. On a
+512-bit machine that kernel triggered the C2 pathology from point 2 above: compilation took minutes, and
+decode ran at C1 speed (~0.1 tok/s) until it finished. `KQuantKernels` brings the int8-activation scheme to
+the K-quants, built from the same few operations (loads, shifts, masks, short multiplies, the magic-constant
+int→float):
+
+- **Decode** (`dotRow`). A 16-byte load of nibbles, seen as 8 short lanes, gives four 8-lane weight vectors
+  whose activations are contiguous in the permuted Q8 layout. The mins of Q4_K / Q5_K are folded out as
+  `dmin · m_j · xs_j · Σ xq` using per-block activation sums (`blockSums`, computed once per matmul). Q5_K's
+  fifth bit and Q6_K's two high bits are OR-ed into both bytes of each short lane at once (`& 0x0F0F`,
+  `& 0x0303`). Each row is one method: a scalar prologue per super-block computes the 8 (Q6_K: 16) combined
+  scales `d · sc_j · xs_j` into a small scratch array, and the vector loop only broadcasts a float. Two earlier
+  versions were 2–3× slower: one computed the scales inside the vector loop, the other used one method call
+  per super-block (each with its own reduction).
+- **Prefill** (`mulPermuted`). Every weight row is dequantized into the same permuted block order, the
+  activations are permuted once (`permute`), and the float `dot4x4` / `dot4` kernels run unchanged; a dot
+  product doesn't depend on the order of its terms.
+
+One thread, 2 048 × 1 024, Xeon AVX-512: Q4_0 0.17–0.3 ns per weight, Q4_K 0.29, Q6_K 0.49. Qwen3-0.6B
+Q4_K_M decode on 4 threads went from 6.9 to 11 tok/s (prefill ~110 tok/s). `GgufKernelsCheck` compares all
+three formats against the `gguf.quants` reference.
+
 **CPU vs Metal agreement.** The Metal backend computes with float activations, so the bit-for-bit
 CPU == Metal checks (`scripts/arch-smoke.sh`, `ArchSmoke`, `DeepSeekRef`) construct the CPU backend with
 int8 activations off; with the default `true`, CPU and Metal greedy outputs can diverge after the first

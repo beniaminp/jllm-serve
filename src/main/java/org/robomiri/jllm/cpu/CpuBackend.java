@@ -505,7 +505,7 @@ public final class CpuBackend implements Backend {
                     for (int i = i0; i < i1; i++) {
                         int k = i / gu;
                         int r = i - k * gu;
-                        moeGateUp[i] = Int8Kernels.dotRow(expGateUp, assign[k] * gu + r, xq, xs, 0);
+                        moeGateUp[i] = mm.int8Dot(expGateUp, assign[k] * gu + r, xq, xs, 0);
                     }
                 });
             } else {
@@ -532,7 +532,7 @@ public final class CpuBackend implements Backend {
                     for (int r = r0; r < r1; r++) {
                         float sum = 0;
                         for (int k = 0; k < topK; k++) {
-                            sum += routeWeight[k] * Int8Kernels.dotRow(expDown, assign[k] * dim + r, xq, xs, k * m);
+                            sum += routeWeight[k] * mm.int8Dot(expDown, assign[k] * dim + r, xq, xs, k * m);
                         }
                         x[xo + r] += sum;
                     }
