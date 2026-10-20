@@ -69,6 +69,9 @@ public final class MetalBackend implements Backend {
     Metal.Buffer assign;
     Metal.Buffer routeWeight;
     private Metal.Buffer moeHidden;
+    private Metal.Buffer moeOrder;  // grouped MoE: slots sorted by expert
+    private Metal.Buffer moeTiles;  // grouped MoE: tiles of one expert's slots
+    private Metal.Buffer moeOut;    // grouped MoE: each slot's weighted output row
     /** DeepSeek multi-head latent attention (own caches); null for other families. */
     private MlaMetal mla;
 
@@ -213,6 +216,9 @@ public final class MetalBackend implements Backend {
             assign = k.scratch((long) slots * 4);
             routeWeight = k.scratch((long) slots * 4);
             moeHidden = k.scratch((long) slots * arch.maxMoeDim() * 4);
+            moeOrder = k.scratch((long) slots * 4);
+            moeTiles = k.scratch((long) (1 + 3 * MetalKernels.moeMaxTiles(slots, arch.maxExperts())) * 4);
+            moeOut = k.scratch((long) slots * c.dim() * 4);
         } else {
             assign = null;
             routeWeight = null;
@@ -438,8 +444,13 @@ public final class MetalBackend implements Backend {
         public void run(int layer, int n, boolean fuseNorm) {
             k.rmsnorm(x, 0, ffnNorm, xb, n, c.dim());
             route.run(n);
-            k.moeUp(expGateUp, bExpGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
-            k.moeDown(expDown, bExpDown, moeHidden, assign, routeWeight, x, c.dim(), spec.topK(), n);
+            if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+                k.moeGrouped(expGateUp, bExpGateUp, expDown, bExpDown, xb, assign, routeWeight, moeOrder, moeTiles,
+                        moeHidden, moeOut, x, spec.experts(), spec.moeDim(), c.dim(), spec.topK(), n);
+            } else {
+                k.moeUp(expGateUp, bExpGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
+                k.moeDown(expDown, bExpDown, moeHidden, assign, routeWeight, x, c.dim(), spec.topK(), n);
+            }
             if (sharedGateUp != null) {
                 // shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x
                 k.swiglu(sharedGateUp, bSharedGateUp, xb, null, hidden, false, n); // writes silu(gate) * up to hidden

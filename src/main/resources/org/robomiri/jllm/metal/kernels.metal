@@ -303,6 +303,7 @@ static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x,
                                thread float *acc, ushort lane);
 template <int QT>
 static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w);
+static inline void q6k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w);
 template <int QT, int NR, int TT>
 static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
                                 device const float *x, ulong xstride, int nt, thread float (*acc)[TT], ushort lane);
@@ -798,18 +799,20 @@ template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_s
 #define MMA_SA_FLOATS (MMA_BR * 32)
 #define MMA_SB_FLOATS (MMA_BT * 32)
 
+// mma_core_rows: the core with each thread's activation row given (xrow = the row of tile token tid >> 2), so a
+// caller can gather the tile's tokens (the MoE kernels take the slots of one expert).
 template <int QT>
-static inline void mma_core(device const uchar *rwq, device const float *rws, ulong rgrow, int nb,
-                            device const float *x, int cols, int ntRem,
-                            threadgroup float *sa, threadgroup float *sb, threadgroup float *sc,
-                            ushort tid, ushort sg) {
+static inline void mma_core_rows(device const uchar *rwq, device const float *rws, ulong rgrow, int nb,
+                                 device const float *xrow,
+                                 threadgroup float *sa, threadgroup float *sb, threadgroup float *sc,
+                                 ushort tid, ushort sg) {
     simdgroup_float8x8 acc[8];
     for (int i = 0; i < 8; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     const int lr = tid >> 1;
     const int h = tid & 1;
     const int lt = tid >> 2;
     const int lp = tid & 3;
-    device const float4 *xr = (device const float4 *)(x + (ulong)min(lt, ntRem - 1) * cols) + lp * 2;
+    device const float4 *xr = (device const float4 *)xrow + lp * 2;
     const int nsb = (nb + 7) >> 3;
     const ushort sr = sg & 1;
     const ushort st = sg >> 1;
@@ -832,6 +835,10 @@ static inline void mma_core(device const uchar *rwq, device const float *rws, ul
             float4 w[8];
             gg_unit<QT>(rwq, rgrow, nb, b, w);
             for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[h * 4 + k];
+        } else if (QT == 6) {
+            float4 w[4];
+            q6k_sub_block(rwq, rgrow, nsb, 2 * b + h, w);
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[k];
         } else {
             float4 w[4];
             q2k_sub_block(rwq, rgrow, nsb, 2 * b + h, w);
@@ -855,6 +862,15 @@ static inline void mma_core(device const uchar *rwq, device const float *rws, ul
         for (int j = 0; j < 4; j++)
             simdgroup_store(acc[i * 4 + j], sc + (st * 16 + i * 8) * MMA_BR + sr * 32 + j * 8, MMA_BR);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+
+template <int QT>
+static inline void mma_core(device const uchar *rwq, device const float *rws, ulong rgrow, int nb,
+                            device const float *x, int cols, int ntRem,
+                            threadgroup float *sa, threadgroup float *sb, threadgroup float *sc,
+                            ushort tid, ushort sg) {
+    mma_core_rows<QT>(rwq, rws, rgrow, nb, x + (ulong)min(int(tid >> 2), ntRem - 1) * cols, sa, sb, sc, tid, sg);
 }
 
 template <int QT>
@@ -1615,6 +1631,159 @@ template [[host_name("moe_down_q8")]] kernel moe_down_t moe_down<8>;
 template [[host_name("moe_up_q2k")]] kernel moe_up_t moe_up<2>;
 template [[host_name("moe_down_q2k")]] kernel moe_down_t moe_down<2>;
 
+// ---- expert-grouped prefill (chunks of many tokens): moe_sort, moe_up_mma, moe_down_mma, moe_combine
+// moe_up / moe_down give every slot (token, k) its own simdgroups, so a chunk reads an expert's weights once per slot
+// that picked it. Here the slots are first grouped by expert (moe_sort: a stable counting sort, deterministic, no
+// atomics) into tiles of up to MMA_BT slots of one expert, and each tile runs the simdgroup-matrix core of the dense
+// prefill matmuls with its slots' activation rows gathered: the expert's weights are read once per tile. moe_down_mma
+// writes each slot's weighted output row apart (no two tiles write the same element) and moe_combine adds a token's
+// topK rows in k order, as moe_down does.
+
+struct MoeSortParams {
+    int slots;       // ntok * topK
+    int experts;
+    int maxTiles;    // capacity of the tiles list
+};
+
+// One threadgroup. order[] = the slots grouped by expert (ascending slot within an expert); tiles[0] = number of
+// tiles, then (expert, first index into order, count) per tile.
+kernel void moe_sort(device const int *assign [[buffer(0)]],
+                     device int *order [[buffer(1)]],
+                     device int *tiles [[buffer(2)]],
+                     constant MoeSortParams &p [[buffer(3)]],
+                     ushort tid [[thread_index_in_threadgroup]],
+                     ushort tpg [[threads_per_threadgroup]]) {
+    threadgroup int cnt[MAX_EXPERTS];
+    threadgroup int off[MAX_EXPERTS];
+    for (int e = tid; e < p.experts; e += tpg) {
+        int c = 0;
+        for (int s = 0; s < p.slots; s++) c += assign[s] == e ? 1 : 0;
+        cnt[e] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int o = 0;
+        int nt = 0;
+        for (int e = 0; e < p.experts; e++) {
+            off[e] = o;
+            for (int i = 0; i < cnt[e]; i += MMA_BT) {
+                if (nt < p.maxTiles) {
+                    tiles[1 + 3 * nt] = e;
+                    tiles[2 + 3 * nt] = o + i;
+                    tiles[3 + 3 * nt] = min(MMA_BT, cnt[e] - i);
+                    nt++;
+                }
+            }
+            o += cnt[e];
+        }
+        tiles[0] = nt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = tid; e < p.experts; e += tpg) {
+        int k = off[e];
+        for (int s = 0; s < p.slots; s++) {
+            if (assign[s] == e) order[k++] = s;
+        }
+    }
+}
+
+// h[s, unit] = silu(Wgate_e[unit] . x[t]) * (Wup_e[unit] . x[t]) for the slots s of tile tgp.y; 32 units per
+// threadgroup (rows 0..31 of the 64-row tile are the gate rows, 32..63 the up rows, as in matmul_swiglu_mma).
+template <int QT>
+kernel void moe_up_mma(device const uchar *wq [[buffer(0)]],
+                       device const float *ws [[buffer(1)]],
+                       device const float *x [[buffer(2)]],
+                       device const int *order [[buffer(3)]],
+                       device const int *tiles [[buffer(4)]],
+                       device float *out [[buffer(5)]],
+                       constant MoeParams &p [[buffer(6)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort tid [[thread_index_in_threadgroup]],
+                       ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMA_SA_FLOATS];
+    threadgroup float sb[MMA_SB_FLOATS];
+    const int ti = int(tgp.y);
+    if (ti >= tiles[0]) return; // the grid is sized for the most tiles a chunk can have
+    const int e = tiles[1 + 3 * ti];
+    const int start = tiles[2 + 3 * ti];
+    const int cnt = tiles[3 + 3 * ti];
+    const int m = p.rowsPerExpert / 2;
+    const int unit0 = int(tgp.x) * (MMA_BR / 2);
+    const int nb = p.cols / QK;
+    const int lr = tid >> 1;
+    const int unit = min(unit0 + (lr & 31), m - 1);
+    // GGUF types: gate and up experts are two [experts * m, cols] views (wq, and buffer(1) = ws)
+    device const uchar *rwq = (QT >= GG_FIRST && lr >= 32) ? (device const uchar *)ws : wq;
+    const ulong grow = QT >= GG_FIRST ? (ulong)e * m + unit : (ulong)e * p.rowsPerExpert + (lr < 32 ? unit : m + unit);
+    const int slot = order[start + min(int(tid >> 2), cnt - 1)];
+    mma_core_rows<QT>(rwq, ws, grow, nb, x + (ulong)(slot / p.topK) * p.cols, sa, sb, sa, tid, sg);
+    for (int i = tid; i < (MMA_BR / 2) * MMA_BT; i += MM_THREADS) {
+        const int t = i / (MMA_BR / 2), j = i % (MMA_BR / 2);
+        if (t < cnt && unit0 + j < m) {
+            const float g = sa[t * MMA_BR + j];
+            const float u = sa[t * MMA_BR + 32 + j];
+            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+        }
+    }
+}
+
+// ys[s, row] = rw[s] * (W_e[row] . h[s]) for the slots s of tile tgp.y; 64 rows per threadgroup.
+template <int QT>
+kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
+                         device const float *ws [[buffer(1)]],
+                         device const float *h [[buffer(2)]],
+                         device const int *order [[buffer(3)]],
+                         device const int *tiles [[buffer(4)]],
+                         device const float *rw [[buffer(5)]],
+                         device float *ys [[buffer(6)]],
+                         constant MoeParams &p [[buffer(7)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MMA_SA_FLOATS];
+    threadgroup float sb[MMA_SB_FLOATS];
+    const int ti = int(tgp.y);
+    if (ti >= tiles[0]) return;
+    const int e = tiles[1 + 3 * ti];
+    const int start = tiles[2 + 3 * ti];
+    const int cnt = tiles[3 + 3 * ti];
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int nb = p.cols / QK;
+    const int row = min(row0 + int(tid >> 1), p.rowsPerExpert - 1);
+    const int slot = order[start + min(int(tid >> 2), cnt - 1)];
+    mma_core_rows<QT>(wq, ws, (ulong)e * p.rowsPerExpert + row, nb, h + (ulong)slot * p.cols, sa, sb, sa, tid, sg);
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, j = i % MMA_BR;
+        if (t < cnt && row0 + j < p.rowsPerExpert) {
+            const int s = order[start + t];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * sa[t * MMA_BR + j];
+        }
+    }
+}
+
+// x[t, row] += sum_k ys[t * topK + k, row], k ascending. Grid: (ceil(dim / ROW_THREADS), ntok).
+kernel void moe_combine(device const float *ys [[buffer(0)]],
+                        device float *x [[buffer(1)]],
+                        constant MoeParams &p [[buffer(2)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_index_in_threadgroup]]) {
+    const int row = int(tgp.x) * ROW_THREADS + tid;
+    if (row >= p.rowsPerExpert) return;
+    const int t = int(tgp.y);
+    float total = 0.0f;
+    for (int k = 0; k < p.topK; k++) total += ys[((ulong)t * p.topK + k) * p.rowsPerExpert + row];
+    x[(ulong)t * p.rowsPerExpert + row] += total;
+}
+
+typedef decltype(moe_up_mma<4>) moe_up_mma_t;
+typedef decltype(moe_down_mma<4>) moe_down_mma_t;
+template [[host_name("moe_up_mma_q4")]] kernel moe_up_mma_t moe_up_mma<4>;
+template [[host_name("moe_up_mma_q8")]] kernel moe_up_mma_t moe_up_mma<8>;
+template [[host_name("moe_up_mma_q2k")]] kernel moe_up_mma_t moe_up_mma<2>;
+template [[host_name("moe_down_mma_q4")]] kernel moe_down_mma_t moe_down_mma<4>;
+template [[host_name("moe_down_mma_q8")]] kernel moe_down_mma_t moe_down_mma<8>;
+template [[host_name("moe_down_mma_q2k")]] kernel moe_down_mma_t moe_down_mma<2>;
+
 // router_ds: one threadgroup (256 threads = 8 simdgroups) per token. The logits are computed as in `router`
 // (simdgroup sg handles experts sg, sg + 8, ...; the 32 lanes read the router row in coalesced float4 steps and
 // finish with simd_sum), the softmax max and sum are threadgroup reductions, and thread 0 then applies the
@@ -2074,6 +2243,12 @@ static inline void mm_tile_q6k(thread device const uchar *const *wq, thread cons
     }
 }
 
+template [[host_name("matmul_mma_q6k")]] kernel matmul_mma_t matmul_mma<6>;
+template [[host_name("moe_up_mma_q6k")]] kernel moe_up_mma_t moe_up_mma<6>;
+template [[host_name("moe_down_mma_q6k")]] kernel moe_down_mma_t moe_down_mma<6>;
+template [[host_name("matmul3_mma_q6k")]] kernel matmul3_mma_t matmul3_mma<6, float>;
+template [[host_name("matmul3_mma_q6k_h")]] kernel matmul3_mma_h_t matmul3_mma<6, half>;
+template [[host_name("matmul_swiglu_mma_q6k")]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<6>;
 template [[host_name("matmul_q6k")]] kernel matmul_t matmul<6, false>;
 template [[host_name("matmul_q6k_norm")]] kernel matmul_t matmul<6, true>;
 template [[host_name("matmul_pf_q6k")]] kernel matmul_pf_t matmul_pf<6, PF_ROWS, PF_TOKS>;
@@ -2234,7 +2409,9 @@ GG_BLOCK_DOT(GG_Q5_K)
     template [[host_name("matmul3_mma_" SUF "_h")]] kernel matmul3_mma_h_t matmul3_mma<QTV, half>;                \
     template [[host_name("matmul_swiglu_mma_" SUF)]] kernel matmul_swiglu_mma_t matmul_swiglu_mma<QTV>;          \
     template [[host_name("moe_up_" SUF)]] kernel moe_up_t moe_up<QTV>;                                            \
-    template [[host_name("moe_down_" SUF)]] kernel moe_down_t moe_down<QTV>;
+    template [[host_name("moe_down_" SUF)]] kernel moe_down_t moe_down<QTV>;                                      \
+    template [[host_name("moe_up_mma_" SUF)]] kernel moe_up_mma_t moe_up_mma<QTV>;                                \
+    template [[host_name("moe_down_mma_" SUF)]] kernel moe_down_mma_t moe_down_mma<QTV>;
 GG_INSTANTIATE("q4g", GG_Q4_0)
 GG_INSTANTIATE("q8g", GG_Q8_0)
 GG_INSTANTIATE("q4k", GG_Q4_K)

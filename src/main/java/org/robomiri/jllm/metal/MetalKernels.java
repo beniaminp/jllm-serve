@@ -206,13 +206,12 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /**
-     * True if a chunk of n tokens of weights of type {@code type} runs on the simdgroup-matrix prefill kernels. Only
-     * the formats with an MMA instantiation qualify ({@code matmul_mma_q4/q8/q2k}); the others (Q6_K, ...) use the
-     * tiled scalar kernels.
+     * True if a chunk of n tokens of weights of type {@code type} runs on the simdgroup-matrix prefill kernels: every
+     * format has an MMA instantiation ({@code matmul_mma_q4/q8/q2k/q6k} and the GGUF ones).
      */
     private static boolean useMma(int n, QType type) {
         return MMA_PREFILL && n >= MMA_MIN_TOKENS
-                && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type.gguf);
+                && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
     }
 
     /** Threadgroups along the row axis for the MMA prefill matmuls (MMA_BR rows per threadgroup). */
@@ -549,6 +548,64 @@ final class MetalKernels implements AutoCloseable {
         bind(4, out, 0);
         p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK); // rows per expert: gate | up
         dispatch(kernel("moe_up", gateUp.type, ""), 5, 0, rowGrid(moeDim), n * topK, 1, MM_THREADS, 1, 1);
+    }
+
+    /**
+     * Expert-grouped MoE for chunks of at least this many tokens (moe_sort + moe_up_mma + moe_down_mma + moe_combine);
+     * {@code -Djllm.metal.moeMma=false} keeps the per-slot kernels.
+     */
+    static final boolean MOE_MMA = !"false".equals(System.getProperty("jllm.metal.moeMma"));
+    static final int MOE_MMA_MIN = Integer.getInteger("jllm.metal.moeMmaMin", 16);
+
+    /** Tiles of up to MMA_BT slots of one expert that a chunk can need: whole tiles plus one partial per expert. */
+    static int moeMaxTiles(int slots, int experts) {
+        return slots / MetalConstants.MMA_BT + Math.min(experts, slots) + 1;
+    }
+
+    /**
+     * The grouped MoE block of n tokens: slots sorted by expert into tiles, gate/up and down projections per tile on the
+     * simdgroup-matrix core, then x[t] += the weighted rows of the token's topK slots.
+     */
+    void moeGrouped(QTensor gateUp, Metal.Buffer bGateUp, QTensor down, Metal.Buffer bDown, Metal.Buffer xb,
+                    Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer order, Metal.Buffer tiles, Metal.Buffer hidden,
+                    Metal.Buffer ys, Metal.Buffer x, int experts, int moeDim, int dim, int topK, int n) {
+        int slots = n * topK;
+        int maxTiles = moeMaxTiles(slots, experts);
+        bind(0, assign, 0);
+        bind(1, order, 0);
+        bind(2, tiles, 0);
+        p.reset(KernelParams.MOE_SORT).i(slots).i(experts).i(maxTiles);
+        dispatch("moe_sort", 3, 0, 1, 1, 1, ROW_THREADS, 1, 1);
+
+        bind(0, bGateUp, 0);
+        if (gateUp.isSplit()) {
+            bind(1, upBuffer(gateUp), 0);
+        } else {
+            bind(1, bGateUp, scaleOff(gateUp));
+        }
+        bind(2, xb, 0);
+        bind(3, order, 0);
+        bind(4, tiles, 0);
+        bind(5, hidden, 0);
+        p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK);
+        dispatch(kernel("moe_up_mma", gateUp.type, ""), 6, 0, mmaGrid(moeDim, MetalConstants.MMA_BR / 2), maxTiles, 1,
+                MM_THREADS, 1, 1);
+
+        bind(0, bDown, 0);
+        bind(1, bDown, scaleOff(down));
+        bind(2, hidden, 0);
+        bind(3, order, 0);
+        bind(4, tiles, 0);
+        bind(5, rw, 0);
+        bind(6, ys, 0);
+        p.reset(KernelParams.MOE).i(dim).i(down.cols).i(topK);
+        dispatch(kernel("moe_down_mma", down.type, ""), 7, 0, mmaGrid(dim, MetalConstants.MMA_BR), maxTiles, 1,
+                MM_THREADS, 1, 1);
+
+        bind(0, ys, 0);
+        bind(1, x, 0);
+        p.reset(KernelParams.MOE).i(dim).i(moeDim).i(topK);
+        dispatch("moe_combine", 2, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */

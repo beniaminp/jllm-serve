@@ -20,6 +20,7 @@ public enum KernelParams {
     ROUTER("RouterParams", "iiii"),
     ROUTER_DS("RouterDsParams", "iiiiiiiiif"),
     MOE("MoeParams", "iii"),
+    MOE_SORT("MoeSortParams", "iii"),
     MLA("MlaParams", "iiiii"),
     MAMBA_CONV("MambaConvParams", "iii"),
     MAMBA_SCAN("MambaScanParams", "iiii");
