@@ -1239,12 +1239,21 @@ public final class SmokeTest {
                     int[] more = e.tokenizer().encode(" And of Italy?");
                     int[] p2 = Arrays.copyOf(cont, cont.length + more.length);
                     System.arraycopy(more, 0, p2, cont.length, more.length);
+                    org.robomiri.jllm.engine.Engine.Result c;
+                    try (org.robomiri.jllm.engine.Engine third = org.robomiri.jllm.ModelLoader.extraEngine(st, l)) {
+                        int adopted = third.adoptPrefix(e, p2); // a slot taking over another slot's prefix
+                        check(adopted == cont.length && Arrays.equals(third.cachedTokens(), cont),
+                                dtype + " prefix copied from another engine: " + adopted + " positions");
+                        c = third.generate(p2, greedy, null, () -> false);
+                    }
                     org.robomiri.jllm.engine.Engine.Result a = e.generate(p2, greedy, null, () -> false);
                     org.robomiri.jllm.engine.Engine.Result b = fresh.generate(p2, greedy, null, () -> false);
                     check(b.stats().cachedTokens() == saved && a.stats().cachedTokens() == saved
                                     && Arrays.equals(a.tokens(), b.tokens()),
                             dtype + " restored engine continues like the original: " + Arrays.toString(b.tokens()) + " vs "
                                     + Arrays.toString(a.tokens()) + ", reused " + b.stats().cachedTokens());
+                    check(c.stats().cachedTokens() == saved && Arrays.equals(a.tokens(), c.tokens()),
+                            dtype + " engine with a copied prefix continues like the original: " + Arrays.toString(c.tokens()));
                 }
             }
         } finally {

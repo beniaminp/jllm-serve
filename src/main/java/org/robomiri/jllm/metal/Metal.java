@@ -134,8 +134,15 @@ public final class Metal implements AutoCloseable {
     }
 
     public static boolean available(String explicitLib) {
-        return System.getProperty("os.name", "").toLowerCase().contains("mac") && locateLibrary(explicitLib) != null;
+        return (System.getProperty("os.name", "").toLowerCase().contains("mac") || EMULATOR)
+                && locateLibrary(explicitLib) != null;
     }
+
+    /**
+     * {@code -Djllm.metal.emulator=true}: the library is the CPU emulator ({@code scripts/build-metal-emu.sh}), which
+     * runs the same kernels on any OS, very slowly; used to test the Metal backend without an Apple GPU.
+     */
+    static final boolean EMULATOR = Boolean.getBoolean("jllm.metal.emulator");
 
     private static Path findLibrary(String explicitLib) {
         Path p = locateLibrary(explicitLib);

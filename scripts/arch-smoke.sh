@@ -37,6 +37,8 @@
 #   hf-internal-testing_tiny-random-Glm4ForCausalLM       generated: glm4, four norms per layer, partial interleaved rope
 #
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
+#        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
+#                                            (scripts/build-metal-emu.sh, needs clang++), so no Apple GPU is needed
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -x /opt/homebrew/opt/openjdk@26/bin/java ] && export JAVA_HOME=/opt/homebrew/opt/openjdk@26
@@ -45,7 +47,13 @@ M="${ARCH_MODELS:-/tmp/jllm-arch-models}"
 P=hf-internal-testing_tiny-random
 
 mvn -q compile test-compile
-./scripts/build-native.sh >/dev/null
+if [ -n "${METAL_EMU:-}" ]; then
+  METAL_LIB="$(./scripts/build-metal-emu.sh 2>/dev/null | tail -1)"
+  JAVA_OPTS="${JAVA_OPTS:-} -Djllm.metal.emulator=true"
+else
+  ./scripts/build-native.sh >/dev/null
+  METAL_LIB=target/native/libjllm_metal.dylib
+fi
 
 LLAMA="$M/${P}-LlamaForCausalLM"
 if [ ! -f "$LLAMA/model.safetensors" ]; then
@@ -86,11 +94,11 @@ for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM;
   REF_Q8=1 python3 scripts/deepseek-ref.py "$M/${P}-$n" >/dev/null
 done
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
-  -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef target/native/libjllm_metal.dylib \
+  -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef "$METAL_LIB" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
-  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke target/native/libjllm_metal.dylib \
+  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \

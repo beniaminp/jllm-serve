@@ -776,7 +776,7 @@ public final class CpuBackend implements Backend {
 
     @Override
     public String stateFormat() {
-        return kv == null ? null : "cpu-kv " + kv.format();
+        return kv == null ? null : "kv " + kv.format(); // the same rows as MetalBackend writes
     }
 
     @Override
@@ -785,6 +785,14 @@ public final class CpuBackend implements Backend {
             Backend.super.saveState(n, out);
         }
         kv.write(n, out);
+    }
+
+    @Override
+    public void copyStateFrom(Backend other, int n) {
+        if (kv == null || !(other instanceof CpuBackend o) || o.kv == null) {
+            Backend.super.copyStateFrom(other, n);
+        }
+        kv.copyFrom(((CpuBackend) other).kv, n);
     }
 
     @Override

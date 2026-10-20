@@ -49,6 +49,7 @@ public final class LoadedModel {
         private final Engine engine;
         private final int index;
         private final AtomicInteger users = new AtomicInteger();
+        private volatile long lastUsed;
 
         Slot(Engine engine, int index) {
             this.engine = engine;
@@ -65,6 +66,7 @@ public final class LoadedModel {
 
         @Override
         public void close() {
+            lastUsed = System.nanoTime();
             users.decrementAndGet();
         }
     }
@@ -127,7 +129,23 @@ public final class LoadedModel {
      * saved to disk ({@link KvStore}) that covers more of the prompt is then loaded into the slot.
      */
     public Slot pick(int[] prompt) {
-        Slot s = choose(prompt);
+        Choice c = choose(prompt);
+        Slot s = c.slot();
+        if (c.donor() != null) {
+            try {
+                long t0 = System.nanoTime();
+                int got = s.engine.adoptPrefix(c.donor().engine, prompt);
+                if (got > 0) {
+                    System.err.printf("slots: copied a %d-token prefix of %s from slot %d into slot %d in %.0f ms (slot %d"
+                                    + " keeps its conversation)%n", s.engine.cachedLength(), id, c.donor().index, s.index,
+                            (System.nanoTime() - t0) / 1e6, c.donor().index);
+                }
+            } catch (RuntimeException e) {
+                System.err.println("slots: prefix copy failed: " + e);
+            } finally {
+                c.donor().users.decrementAndGet();
+            }
+        }
         if (store != null) {
             try {
                 store.restore(this, s, prompt);
@@ -138,25 +156,88 @@ public final class LoadedModel {
         return s;
     }
 
-    private synchronized Slot choose(int[] prompt) {
-        Slot bestIdle = null;
-        Slot bestAny = null;
-        int idleLen = -1;
-        int anyLen = -1;
+    /** Copying a prefix from another slot must save at least this many tokens of prefill. */
+    static final int MIN_COPY = 256;
+
+    /** The slot a request runs on, and the idle slot to copy its prompt's prefix from first (or null). */
+    private record Choice(Slot slot, Slot donor) {
+    }
+
+    /**
+     * Slot policy, a fork-style prefix cache over the slots:
+     * <ol>
+     *   <li>an idle slot whose whole cache the prompt continues (the next turn of its conversation) runs it in place;</li>
+     *   <li>otherwise the prompt runs on the idle slot that matters least (empty, else least recently used), after
+     *       copying the longest matching prefix from another idle slot into it when that saves at least
+     *       {@link #MIN_COPY} tokens of prefill: the donor keeps its own conversation instead of being overwritten
+     *       from the point where the prompts diverge (an agent's sessions share ~10k tokens of instructions);</li>
+     *   <li>when every slot is busy, the one with the longest prefix is waited for.</li>
+     * </ol>
+     */
+    private synchronized Choice choose(int[] prompt) {
+        Slot cont = null;
+        int contLen = 0;
+        Slot donor = null;
+        int donorLen = 0;
+        Slot victim = null;
         for (Slot s : slots) {
-            int len = s.engine.cachedPrefix(prompt);
-            if (s.users.get() == 0 && len > idleLen) {
-                bestIdle = s;
-                idleLen = len;
+            if (s.users.get() > 0) {
+                continue;
             }
-            if (len > anyLen || (len == anyLen && bestAny != null && s.users.get() < bestAny.users.get())) {
-                bestAny = s;
-                anyLen = len;
+            int len = s.engine.cachedPrefix(prompt);
+            int all = s.engine.cachedLength();
+            if (len > 0 && len >= Math.min(all, prompt.length - 1) && len > contLen) {
+                cont = s;
+                contLen = len;
+            }
+            if (len > donorLen) {
+                donor = s;
+                donorLen = len;
+            }
+            if (victim == null || worthLess(s, victim)) {
+                victim = s;
             }
         }
-        Slot s = bestIdle != null && (anyLen - idleLen < 1024) ? bestIdle : bestAny;
-        s.users.incrementAndGet();
-        return s;
+        if (cont != null && contLen >= donorLen) {
+            cont.users.incrementAndGet();
+            return new Choice(cont, null);
+        }
+        if (victim == null) { // all busy: wait for the one holding the longest prefix
+            Slot best = slots.getFirst();
+            int bestLen = -1;
+            for (Slot s : slots) {
+                int len = s.engine.cachedPrefix(prompt);
+                if (len > bestLen || (len == bestLen && s.users.get() < best.users.get())) {
+                    best = s;
+                    bestLen = len;
+                }
+            }
+            best.users.incrementAndGet();
+            return new Choice(best, null);
+        }
+        if (donor == null || donor == victim) {
+            victim.users.incrementAndGet();
+            return new Choice(victim, null);
+        }
+        int victimLen = victim.engine.cachedPrefix(prompt);
+        int donorTail = donor.engine.cachedLength() - donorLen; // what the donor would lose if the prompt ran there
+        if (donorLen - victimLen < MIN_COPY || donorTail < MIN_COPY) {
+            donor.users.incrementAndGet(); // little to gain by copying, or little to lose: run on the donor itself
+            return new Choice(donor, null);
+        }
+        victim.users.incrementAndGet();
+        donor.users.incrementAndGet(); // kept idle until the copy is done
+        return new Choice(victim, donor);
+    }
+
+    /** Empty slots first, then the least recently used. */
+    private static boolean worthLess(Slot a, Slot b) {
+        int la = a.engine.cachedLength();
+        int lb = b.engine.cachedLength();
+        if ((la == 0) != (lb == 0)) {
+            return la == 0;
+        }
+        return a.lastUsed < b.lastUsed;
     }
 
     public int slotCount() {

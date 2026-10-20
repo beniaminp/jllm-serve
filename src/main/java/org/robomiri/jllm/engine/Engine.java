@@ -383,6 +383,48 @@ public final class Engine implements AutoCloseable {
         return new Result(text.toString(), tokens, finish, stats);
     }
 
+    /**
+     * Takes over the part of {@code src}'s cache that {@code prompt} starts with, when that is longer than what this
+     * engine holds for it: the keys and values are copied from {@code src}'s backend (same model, same cache layout)
+     * instead of being prefilled. Both engines are locked meanwhile (in a fixed order, so two engines adopting from
+     * each other cannot deadlock); a busy {@code src} is waited for.
+     *
+     * @return the number of positions now shared with {@code src} that were not cached here before, 0 if none
+     */
+    public int adoptPrefix(Engine src, int[] prompt) {
+        String format = backend.stateFormat();
+        if (src == this || format == null || !format.equals(src.backend.stateFormat())) {
+            return 0;
+        }
+        Engine first = System.identityHashCode(this) <= System.identityHashCode(src) ? this : src;
+        Engine second = first == this ? src : this;
+        first.acquire();
+        try {
+            second.acquire();
+            try {
+                int have = cachedPrefix(prompt);
+                int n = src.cachedPrefix(prompt);
+                if (n <= have) {
+                    return 0;
+                }
+                cachedLen = 0;
+                backend.copyStateFrom(src.backend, n);
+                cached = java.util.Arrays.copyOf(src.cached, n);
+                cachedLen = n;
+                return n - have;
+            } finally {
+                second.lock.unlock();
+            }
+        } finally {
+            first.lock.unlock();
+        }
+    }
+
+    /** How many positions the cache holds now (0 while a request is running). */
+    public int cachedLength() {
+        return cachedLen;
+    }
+
     /** The tokens whose keys and values are in the cache now (a copy). */
     public int[] cachedTokens() {
         int n = cachedLen;

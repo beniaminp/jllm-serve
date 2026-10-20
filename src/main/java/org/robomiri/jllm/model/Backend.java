@@ -74,6 +74,15 @@ public interface Backend extends AutoCloseable {
         throw new UnsupportedOperationException(name() + " cannot load a saved cache");
     }
 
+    /**
+     * Replaces the state of positions {@code [0, n)} with that of {@code other}, a backend of the same model with the
+     * same {@link #stateFormat}: copying a finished prefix costs a memory copy instead of a prefill. Both backends
+     * must be idle (the engines hold their locks).
+     */
+    default void copyStateFrom(Backend other, int n) {
+        throw new UnsupportedOperationException(name() + " cannot copy a cache");
+    }
+
     @Override
     void close();
 }

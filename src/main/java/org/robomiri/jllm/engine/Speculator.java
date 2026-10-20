@@ -12,8 +12,12 @@ import java.util.Set;
  * multi-token target pass ({@link Backend#forwardAll}) and keeps the longest prefix the target agrees with,
  * so several tokens are produced per pass over the weights.
  *
- * <p>Drafts come from prompt lookup (the longest recent n-gram of the suffix found earlier in prompt + output; no
- * second model) or from a small {@link DraftModel} that shares the tokenizer. Both propose a deterministic
+ * <p>Drafts come from prompt lookup (the longest suffix n-gram of the text found earlier in prompt + output; no
+ * second model) or from a small {@link DraftModel} that shares the tokenizer. Prompt lookup is tuned for coding
+ * agents, whose output keeps copying what is already in the context (lines of a file the agent read, the shape of
+ * earlier tool calls): every n-gram of the history is kept in a hash index ({@link NgramIndex}), so an occurrence
+ * any distance back is found in constant time, the longest match wins, and the number of drafted tokens adapts to
+ * the acceptance rate (doubling while whole drafts are accepted, falling back to what was accepted otherwise). Both propose a deterministic
  * sequence, so the proposal distribution is one-hot and the acceptance rule of speculative sampling reduces to
  * {@link Sampler#verify}: greedy decoding accepts a draft token iff it is the target's argmax (the output is
  * the non-speculative output), sampled decoding accepts it with probability p(token) and otherwise draws from p
@@ -39,14 +43,14 @@ public final class Speculator implements AutoCloseable {
     }
 
     /**
-     * @param k        most tokens proposed per pass
+     * @param k        most tokens proposed per pass (prompt lookup starts lower and adapts up to it)
      * @param ngramMax longest suffix n-gram looked up (prompt lookup)
      * @param ngramMin shortest suffix n-gram that may propose
-     * @param window   how many of the most recent tokens are searched (prompt lookup)
+     * @param window   how many of the most recent tokens may be copied from (prompt lookup), 0 = all of them
      */
     public record Config(Mode mode, int k, int ngramMax, int ngramMin, int window) {
         public Config {
-            if (k < 1 || ngramMax < 1 || ngramMin < 1 || ngramMin > ngramMax || window < 1) {
+            if (k < 1 || ngramMax < 1 || ngramMin < 1 || ngramMin > ngramMax || window < 0 || ngramMax > NgramIndex.MAX_N) {
                 throw new IllegalArgumentException("invalid speculation settings: " + mode + " k=" + k + " ngram "
                         + ngramMin + ".." + ngramMax + " window=" + window);
             }
@@ -77,6 +81,8 @@ public final class Speculator implements AutoCloseable {
     private int cooldown; // plain steps still to take before drafting again
     private long draftedTotal;
     private long acceptedTotal;
+    private int kNow;     // adaptive draft length (prompt lookup)
+    private final NgramIndex index;
 
     /**
      * @param stride    logits row width of the target (its model vocabulary size)
@@ -103,6 +109,7 @@ public final class Speculator implements AutoCloseable {
         this.feed = new int[maxDrafts + 1];
         this.drafts = new int[maxDrafts];
         this.ready = new int[maxDrafts + 1];
+        this.index = cfg.mode() == Mode.NGRAM ? new NgramIndex(cfg.ngramMin(), cfg.ngramMax()) : null;
     }
 
     /** Whether the backend can be used for speculation at all (a recurrent state cannot be rolled back). */
@@ -112,11 +119,21 @@ public final class Speculator implements AutoCloseable {
 
     /** Starts a request: the history is the (prepared) prompt. */
     public void begin(int[] prompt) {
-        len = 0;
+        // an agent's next request repeats the previous one and adds to it: keep the index of the common prefix
+        int keep = 0;
+        int n = Math.min(len, prompt.length);
+        while (keep < n && hist[keep] == prompt[keep]) {
+            keep++;
+        }
+        if (index != null) {
+            index.truncate(hist, keep);
+        }
+        len = keep;
         misses = 0;
         cooldown = 0;
-        for (int t : prompt) {
-            onToken(t);
+        kNow = Math.min(4, maxDrafts);
+        for (int i = keep; i < prompt.length; i++) {
+            onToken(prompt[i]);
         }
     }
 
@@ -126,6 +143,9 @@ public final class Speculator implements AutoCloseable {
             hist = Arrays.copyOf(hist, len * 2);
         }
         hist[len++] = tok;
+        if (index != null && len >= 2) {
+            index.add(hist, len - 2); // the n-grams ending one token back: never the suffix being looked up
+        }
     }
 
     /**
@@ -139,7 +159,7 @@ public final class Speculator implements AutoCloseable {
      *         {@link #ready}, {@link #preAccepted} and {@link #newPos} describe the outcome
      */
     public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler) {
-        int want = Math.min(Math.min(maxDrafts, room - 1), ctxLimit - pos - 1);
+        int want = Math.min(Math.min(kNow, room - 1), ctxLimit - pos - 1);
         if (want < 1) {
             return false;
         }
@@ -170,6 +190,8 @@ public final class Speculator implements AutoCloseable {
             }
             break;
         }
+        // whole draft accepted: try longer ones next time; else as many as this text supported
+        kNow = acc == m ? Math.min(maxDrafts, Math.max(kNow, 2 * m)) : Math.max(1, Math.min(kNow, acc + 1));
         if (acc > 0) {
             misses = 0;
         } else { // a pass that gained nothing costs more than a plain step: back off exponentially (1, 3, 7, 15 steps)
@@ -214,32 +236,16 @@ public final class Speculator implements AutoCloseable {
      * {@code ngramMin}) suffix of the history; proposes the tokens that followed it, into {@link #drafts}.
      */
     private int lookup(int want) {
-        int last = hist[len - 1];
-        int bestLen = 0;
-        int bestEnd = -1;
-        int lo = Math.max(cfg.ngramMin() - 1, len - 1 - cfg.window());
-        for (int e = len - 2; e >= lo; e--) {
-            if (hist[e] != last) {
-                continue;
-            }
-            int m = 1;
-            while (m < cfg.ngramMax() && e - m >= 0 && hist[e - m] == hist[len - 1 - m]) {
-                m++;
-            }
-            if (m > bestLen) {
-                bestLen = m;
-                bestEnd = e;
-                if (m == cfg.ngramMax()) {
-                    break;
-                }
+        int min = cfg.window() > 0 ? len - 1 - cfg.window() : -1;
+        for (int n = Math.min(cfg.ngramMax(), len - 1); n >= cfg.ngramMin(); n--) {
+            int e = index.find(hist, len - 1, n);
+            if (e >= 0 && e > min) {
+                int m = Math.min(want, len - 1 - e);
+                System.arraycopy(hist, e + 1, drafts, 0, m);
+                return m;
             }
         }
-        if (bestLen < cfg.ngramMin()) {
-            return 0;
-        }
-        int m = Math.min(want, len - 1 - bestEnd);
-        System.arraycopy(hist, bestEnd + 1, drafts, 0, m);
-        return m;
+        return 0;
     }
 
     @Override

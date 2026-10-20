@@ -180,6 +180,19 @@ public abstract class KvCache {
         return (this instanceof F16 ? "f16" : "f32") + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
     }
 
+    /** Positions {@code [0, n)} of every layer copied from {@code o}, a cache of the same {@link #format}. */
+    public final void copyFrom(KvCache o, int n) {
+        if (!format().equals(o.format()) || o.ctx < n || ctx < n) {
+            throw new IllegalArgumentException("cannot copy a " + o.format() + " cache into a " + format() + " one");
+        }
+        int chunksUsed = (n + CHUNK - 1) / CHUNK;
+        for (int layer = 0; layer < layers; layer++) {
+            copyLayer(o, layer, n, chunksUsed);
+        }
+    }
+
+    abstract void copyLayer(KvCache o, int layer, int n, int chunksUsed);
+
     /** Rows per buffer of {@link #write} / {@link #read}. */
     private static final int IO_ROWS = 256;
 
@@ -838,6 +851,15 @@ public abstract class KvCache {
         }
 
         @Override
+        void copyLayer(KvCache o, int layer, int n, int chunksUsed) {
+            F32 src = (F32) o;
+            for (int g = 0; g < kvHeads; g++) {
+                System.arraycopy(src.key[layer], src.keyChunk(g, 0), key[layer], keyChunk(g, 0), chunksUsed * headDim * CHUNK);
+            }
+            System.arraycopy(src.val[layer], 0, val[layer], 0, n * kvDim);
+        }
+
+        @Override
         float[] keysInPlace(int layer) {
             return key[layer];
         }
@@ -936,6 +958,15 @@ public abstract class KvCache {
 
         private static short get(int[] a, int i, boolean high) {
             return (short) (high ? a[i] >>> 16 : a[i]);
+        }
+
+        @Override
+        void copyLayer(KvCache o, int layer, int n, int chunksUsed) {
+            F16 src = (F16) o;
+            for (int g = 0; g < kvHeads; g++) {
+                System.arraycopy(src.key[layer], src.keyPairChunk(g, 0), key[layer], keyPairChunk(g, 0), chunksUsed * pairs * CHUNK);
+            }
+            System.arraycopy(src.val[layer], 0, val[layer], 0, (n + 1) / 2 * kvDim);
         }
 
         @Override

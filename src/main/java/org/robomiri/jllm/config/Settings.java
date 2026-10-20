@@ -297,9 +297,9 @@ public final class Settings {
         int min = getInt("engine.ngram-min");
         int window = getInt("engine.ngram-window");
         require(k >= 1 && k <= 32, "engine.draft-tokens", "must be 1..32");
-        require(max >= 1, "engine.ngram-max", "must be at least 1");
+        require(max >= 1 && max <= 16, "engine.ngram-max", "must be 1..16");
         require(min >= 1 && min <= max, "engine.ngram-min", "must be 1..engine.ngram-max");
-        require(window >= 1, "engine.ngram-window", "must be at least 1");
+        require(window >= 0, "engine.ngram-window", "must be 0 (the whole text) or more");
         if (mode == Speculator.Mode.DRAFT) {
             require(!get("engine.draft-model").isBlank(), "engine.draft-model",
                     "is required when engine.speculative=draft");

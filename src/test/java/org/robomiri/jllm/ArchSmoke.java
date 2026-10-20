@@ -161,6 +161,11 @@ public final class ArchSmoke {
                 failures += mamba ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
+            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
+                for (KvDtype dt : KvDtype.values()) {
+                    failures += kvStateChecks(w, lib, cfg, dt);
+                }
+            }
             // the argmax of a random model can be degenerate, so also compare the full final logits
             float scale = 0;
             float diff = 0;
@@ -215,6 +220,53 @@ public final class ArchSmoke {
         System.out.printf("  %s state: one chunk vs 5+7 %.1e, vs token by token %.1e, wrong pos refused=%b -> %s%n", name, d1,
                 d2, refused, ok ? "ok" : "FAILED");
         return ok ? 0 : 1;
+    }
+
+    /**
+     * Saved caches and prefix copies on the Metal backend: a cache saved by one backend and loaded into another, or
+     * copied from it, continues with exactly the logits of the original; a cache saved by the CPU backend has the
+     * same layout and loads into the Metal backend (the continuation then agrees within the usual CPU / Metal
+     * tolerance).
+     */
+    private static int kvStateChecks(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
+        int vocab = cfg.core().vocabSize();
+        int n = PROMPT.length;
+        int[] next = {PROMPT[3]};
+        float[] want = new float[vocab];
+        float[] got = new float[vocab];
+        int bad = 0;
+        try (MetalBackend a = new MetalBackend(w, 64, 16, lib, dt); MetalBackend b = new MetalBackend(w, 64, 16, lib, dt);
+             MetalBackend c = new MetalBackend(w, 64, 16, lib, dt); CpuBackend cpu = new CpuBackend(w, 64, 16, 4, dt, false)) {
+            a.forward(PROMPT, 0, n, 0, null);
+            var bytes = new java.io.ByteArrayOutputStream();
+            a.saveState(n, java.nio.channels.Channels.newChannel(bytes));
+            b.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(bytes.toByteArray())));
+            c.copyStateFrom(a, n);
+            a.forward(next, 0, 1, n, want);
+            b.forward(next, 0, 1, n, got);
+            boolean loaded = Arrays.equals(want, got);
+            c.forward(next, 0, 1, n, got);
+            boolean copied = Arrays.equals(want, got);
+            // the CPU backend's file in the Metal backend
+            cpu.forward(PROMPT, 0, n, 0, null);
+            var cpuBytes = new java.io.ByteArrayOutputStream();
+            cpu.saveState(n, java.nio.channels.Channels.newChannel(cpuBytes));
+            boolean sameFormat = cpu.stateFormat().equals(a.stateFormat()) && cpuBytes.size() == bytes.size();
+            b.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+            b.forward(next, 0, 1, n, got);
+            float scale = 0;
+            float diff = 0;
+            for (int i = 0; i < vocab; i++) {
+                scale = Math.max(scale, Math.abs(want[i]));
+                diff = Math.max(diff, Math.abs(want[i] - got[i]));
+            }
+            boolean crossOk = diff <= 1e-3f * scale + 1e-4f;
+            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e)%n", dt,
+                    loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
+                    sameFormat && crossOk ? "ok" : "MISMATCH", diff);
+            bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
+        }
+        return bad;
     }
 
     private static int[] generate(Backend b, float[] logits) {
