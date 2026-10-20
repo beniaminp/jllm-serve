@@ -77,8 +77,10 @@ Only the shards listed in the model's `model.safetensors.index.json` (or `model.
 A repository with several `.gguf` files needs `--gguf-quant` (a label such as `Q4_K_M`) or `--gguf-file` (exact name);
 without either the error lists the files. Only the chosen file (and the `-0000i-of-0000N` parts of a split model) is
 downloaded, with the usual resume and SHA-256 check. Nothing is converted or cached: the weights are read from the
-mapped file. Tensors in a format the kernels cannot read directly (Q6_K for now, F16/BF16) are requantized to Q8_0 in
-memory at load. See [docs/16](docs/16-gguf.md) for the file format, the llama q/k permutation, the zero-copy mapping
+mapped file. Q4_0, Q8_0, Q2_K and the K-quants Q4_K / Q5_K / Q6_K (the usual `Q4_K_M` mix) are computed in place; on
+the CPU the K-quants use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11 tok/s on 4 AVX-512
+cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Other formats (Q3_K, Q4_1, Q5_0/1,
+F16/BF16) are requantized to Q8_0 in memory at load. See [docs/16](docs/16-gguf.md) for the file format, the llama q/k permutation, the zero-copy mapping
 and the verification.
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
@@ -160,7 +162,7 @@ a 0.6B model picks the right tool for simple requests but not for long chains. M
 processes with your user's rights, and the tools of an MCP server can do whatever that server allows (write files,
 call APIs), so only add servers you trust and enable their tools in chats where you want them.
 
-### Coding agents (opencode)
+### Coding agents (opencode, Continue, aider, Cline)
 
 The console serves [opencode](https://opencode.ai) (and other agents that speak the OpenAI API) directly:
 
@@ -172,6 +174,21 @@ The console serves [opencode](https://opencode.ai) (and other agents that speak 
    overall request timeout — plus the warnings that apply (context too small, a single slot, a model family that
    follows the tool-call format less reliably).
 3. Run `opencode`. Every request is one line in the console's Logs (slot, prompt and cached tokens, speed, finish).
+
+**Continue, aider and Cline** get ready-made settings too, on the *Connect* page or from a terminal with
+`./jllm-web/agent-config.sh continue|aider|cline` (`opencode.sh` is `agent-config.sh opencode`):
+
+| agent | what is generated | where |
+|---|---|---|
+| [Continue](https://docs.continue.dev) | `config.yaml`: an `openai` provider per loaded model with `apiBase`, context length and max tokens, `tool_use` for agent mode, a one-hour request timeout, Qwen3 thinking off through `extraBodyProperties` | `~/.continue/config.yaml` (an existing file is kept; the new one goes next to it as `config.jllm.yaml`) |
+| [aider](https://aider.chat) | `.aider.conf.yml` (`model: openai/<id>`, `openai-api-base`, timeout), `.aider.model.metadata.json` (context and output limits, zero cost) and `.aider.model.settings.yml` (`edit_format: whole` for models under 4 GB, `diff` above, repo map, thinking off) | the repository root |
+| [Cline](https://cline.bot) | the values for its *OpenAI Compatible* provider: base URL, API key, model ID, context window, max output tokens (Cline keeps its settings in the editor, not in a file) | printed / shown on the page |
+
+Each comes with the warnings that apply: a context too small for that agent's prompt (Continue's agent mode ~5k
+tokens, aider ~4k with its repository map, Cline ~12k), a single slot, a family that follows tool and edit formats
+less reliably, and for Cline that Qwen3 thinking can only be switched off server-side (`chat.thinking=false`).
+Checked with aider 0.86 against Qwen3-0.6B: it connects, keeps the conversation's prefix cached between requests,
+applies whole-file edits and commits them (the 0.6B model itself is not a reliable editor: use 4B or larger).
 
 What makes it work rather than merely connect:
 
@@ -328,10 +345,10 @@ src/main/java/org/robomiri/jllm/
   safetensors/           .safetensors reader (mmap + FFM)
   tokenizer/             BPE tokenizers, per-family chat templates, streaming UTF-8 decoder
   model/                 typed Architecture + per-family parsers, quantized tensors, cache file + converter, weights, RoPE, Backend interface
-  cpu/                   Vector API kernels (float and int8 activations), thread pool, KV cache, CPU forward pass
+  cpu/                   Vector API kernels (float, int8 and K-quant int8), thread pool, KV cache, CPU forward pass
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
-  engine/                generation loop, prefix cache, stop strings
+  engine/                generation loop, prefix cache, stop strings, KV cache files
   server/                HTTP server, OpenAI-compatible API, web UI
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
@@ -339,16 +356,17 @@ docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
   src/main/java/org/robomiri/jllm/web/
-    models/              Hugging Face links, download / load jobs, loaded models, models on disk
+    models/              Hugging Face links, download / load jobs, loaded models and slots, models on disk, saved conversations
     chat/                /api/chat (the agent loop) and what it shares with the OpenAI endpoints
     tools/               tool-call prompt format and parsing, built-in tools (search, fetch, calculator, time)
     mcp/                 MCP client: stdio, Streamable HTTP and SSE transports, server manager
     openai/              /v1 endpoints
     settings/            jllm.properties view and persisted overrides
-    api/                 /api management, tools and integrations (opencode.json) endpoints, API key filter
+    api/                 /api management, tools and integrations (opencode, Continue, aider, Cline) endpoints, API key filter
     logs/                captured engine output
   src/main/resources/static/   the console (plain HTML/CSS/JS modules, no build step)
-  run.sh, opencode.sh    launcher; writes an opencode.json for the running console into the current directory
+  run.sh                 launcher
+  agent-config.sh        writes opencode / Continue / aider settings for the running console (prints Cline's); opencode.sh = agent-config.sh opencode
 ```
 
 ## License

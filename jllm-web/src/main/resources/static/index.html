@@ -213,6 +213,16 @@
         </ol>
       </div>
       <div class="card">
+        <h2>Continue, aider, Cline</h2>
+        <p class="muted">Ready-made settings for the loaded models (the same coding-agent advice applies: a context of 32768 and 2 slots).
+          From a terminal: <code>./jllm-web/agent-config.sh continue|aider|cline</code>.</p>
+        <div class="agent-tabs row" id="agent-tabs">
+          <button data-agent="continue" class="primary">Continue</button><button data-agent="aider">aider</button><button data-agent="cline">Cline</button>
+        </div>
+        <div id="agent-warnings"></div>
+        <div id="agent-body"><p class="muted">(load a model first)</p></div>
+      </div>
+      <div class="card">
         <h2>OpenAI-compatible API</h2>
         <p>Base URL <code id="base-url"></code> · the <code>model</code> field picks a loaded model (with a single model loaded, any name works).</p>
         <p id="api-key-note" class="muted"></p>

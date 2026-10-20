@@ -153,8 +153,10 @@ class WebApiTest {
 
     @Test
     void opencodeNeedsAModel() throws Exception {
-        mvc.perform(get("/api/integrations/opencode").header("Authorization", AUTH))
-                .andExpect(status().isConflict()).andExpect(jsonPath("$.error", containsString("no model is loaded")));
+        for (String agent : new String[]{"opencode", "continue", "aider", "cline"}) {
+            mvc.perform(get("/api/integrations/" + agent).header("Authorization", AUTH))
+                    .andExpect(status().isConflict()).andExpect(jsonPath("$.error", containsString("no model is loaded")));
+        }
         mvc.perform(post("/api/models/load").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"source\":\"Qwen/Qwen3-0.6B\",\"slots\":9}"))
                 .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error", containsString("slots")));

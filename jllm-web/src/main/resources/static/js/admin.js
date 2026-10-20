@@ -94,8 +94,59 @@ const Admin = (() => {
     }
   }
 
+  // Continue / aider / Cline: one card, a tab per agent
+  let agent = 'continue';
+  const AGENT_HELP = {
+    continue: `<a href="https://docs.continue.dev" target="_blank" rel="noopener">Continue ↗</a> (VS Code, JetBrains): save as
+      <code>~/.continue/config.yaml</code> (or copy the <code>models</code> entries into yours), then pick the model in Continue's chat.
+      Agent mode uses the models' tool calls; Qwen3 thinking is off through <code>extraBodyProperties</code>.`,
+    aider: `<a href="https://aider.chat" target="_blank" rel="noopener">aider ↗</a>: save the three files in the root of your repository,
+      then run <code>aider</code> there. Small models get <code>edit_format: whole</code> (rewriting a file is more reliable for them than
+      search/replace blocks), larger ones <code>diff</code>.`,
+    cline: `<a href="https://cline.bot" target="_blank" rel="noopener">Cline ↗</a> has no configuration file: in its settings (⚙️) choose the
+      API provider <b>OpenAI Compatible</b> and enter these values. Its prompt is long (~12k tokens), so the first request of a task takes a while on a CPU.`,
+  };
+
+  function fileBlock(name, text, type) {
+    const id = 'f' + Math.random().toString(36).slice(2);
+    setTimeout(() => {
+      $('#' + id + '-copy')?.addEventListener('click', e => copyText(text, e.target));
+      $('#' + id + '-dl')?.addEventListener('click', () => download(name.replace(/^.*\//, ''), text, type));
+    });
+    return `<h3>${esc(name)}</h3><pre class="code">${esc(text)}</pre>
+      <div class="row"><button id="${id}-copy" class="small">Copy</button><button id="${id}-dl" class="small">Download</button></div>`;
+  }
+
+  async function renderAgent() {
+    $$('#agent-tabs [data-agent]').forEach(b => b.classList.toggle('primary', b.dataset.agent === agent));
+    const body = $('#agent-body');
+    try {
+      const r = await api('/api/integrations/' + agent);
+      $('#agent-warnings').innerHTML = r.warnings.length
+        ? `<div class="warn-box"><b>Before you start</b><ul>${r.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '';
+      let html = `<p>${AGENT_HELP[agent]}</p>`;
+      if (agent === 'continue') {
+        html += fileBlock('~/.continue/config.yaml', r.file, 'application/yaml');
+      } else if (agent === 'aider') {
+        html += Object.entries(r.files).map(([n, t]) => fileBlock(n, t, n.endsWith('.json') ? 'application/json' : 'application/yaml')).join('');
+        if (r.apiKeyRequired) html += '<p class="hint">This server needs an API key: <code>export OPENAI_API_KEY=…</code> (the console\'s key) before running aider.</p>';
+      } else {
+        html += `<table class="table"><tr><th>API Provider</th><td>${esc(r.provider)}</td></tr>
+          <tr><th>Base URL</th><td><code>${esc(r.baseUrl)}</code></td></tr>
+          <tr><th>API Key</th><td><code>${esc(r.apiKey)}</code></td></tr>
+          ${r.models.map(m => `<tr><th>Model ID</th><td><code>${esc(m.modelId)}</code> · context window <b>${m.contextWindow}</b>
+            · max output tokens <b>${m.maxOutputTokens}</b> · supports images: off · computer use: off · prices: 0</td></tr>`).join('')}</table>`;
+      }
+      body.innerHTML = html;
+    } catch (e) {
+      $('#agent-warnings').innerHTML = '';
+      body.innerHTML = `<p class="muted">${esc(e.message)}</p>`;
+    }
+  }
+
   function renderApi() {
     renderOpencode();
+    renderAgent();
     const base = location.origin + '/v1';
     $('#base-url').textContent = base;
     const model = $('#chat-model').value || 'MODEL';
@@ -137,6 +188,7 @@ call = r.choices[0].message.tool_calls[0]          # finish_reason == "tool_call
     onTick.logs = pollLogs;
     onShow.api = renderApi;
     $('#oc-copy').addEventListener('click', e => { if (ocFile) copyText(ocFile, e.target); });
+    $$('#agent-tabs [data-agent]').forEach(b => b.addEventListener('click', () => { agent = b.dataset.agent; renderAgent(); }));
     $('#oc-download').addEventListener('click', () => { if (ocFile) download('opencode.json', ocFile, 'application/json'); });
     loadSettings();
   }
