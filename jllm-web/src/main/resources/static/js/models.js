@@ -27,6 +27,13 @@ const Models = (() => {
         || opts.ggufFiles.find(f => /Q4_K_M/i.test(f.name))?.name;
       if (pick) form.ggufFile.value = pick;
     }
+    form.querySelector('.coding-preset').addEventListener('click', () => {
+      form['backend.ctx'].value = 32768;
+      form['backend.kv-dtype'].value = 'f16';
+      form.slots.value = 2;
+      form['server.queue-timeout-ms'].value = 1800000; // a request may wait behind another one's long prefill
+      toast('Context 32768, f16 KV cache, 2 slots. On the CPU backend the KV caches live on the Java heap: about 3.7 GB per slot for a 0.6B model, more for bigger ones (JLLM_XMX).', 'info', 9000);
+    });
     let action = 'load';
     form.querySelectorAll('button[type=submit]').forEach(b => b.addEventListener('click', () => { action = b.value; }));
     form.addEventListener('submit', async ev => {
@@ -40,7 +47,7 @@ const Models = (() => {
         ggufFile: opts.gguf && opts.ggufFiles?.length ? form.ggufFile.value : (opts.ggufFile || null), ggufQuant: null, settings};
       try {
         if (action === 'download') await api('/api/models/download', {method: 'POST', body: req});
-        else await api('/api/models/load', {method: 'POST', body: {...req, id: form.id.value || null}});
+        else await api('/api/models/load', {method: 'POST', body: {...req, id: form.id.value || null, slots: form.slots.value ? Number(form.slots.value) : null}});
         form.closest('.inline-form')?.remove();
         $('#inspect-result').innerHTML = '';
         toast(`${action === 'download' ? 'Download' : 'Load'} started — progress under Jobs.`, 'ok');
@@ -79,7 +86,7 @@ const Models = (() => {
       ${list.map(m => `<tr>
         <td><strong>${esc(m.id)}</strong><div class="hint">${esc(m.description)}</div><div class="hint">template ${esc(m.template)} · loaded ${fmtTime(m.loadedAt)} in ${m.loadSeconds.toFixed(1)} s</div>
           <details data-id="${esc(m.id)}" ${open.has(m.id) ? 'open' : ''}><summary class="hint">load settings</summary><pre class="hint">${esc(Object.entries(m.settings).map(([k, v]) => k + ' = ' + v).join('\n'))}</pre></details></td>
-        <td class="small">${esc(m.backend)}</td><td>${fmtTok(m.contextLength)}</td><td>${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)}</div></td>
+        <td class="small">${esc(m.backend)}</td><td>${fmtTok(m.contextLength)}${m.slots > 1 ? `<div class="hint">${m.slots} slots${m.busy ? ', ' + m.busy + ' busy' : ''}</div>` : ''}</td><td>${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)}</div></td>
         <td>${m.requests} req${m.active ? ` <span class="badge load">${m.active} active</span>` : ''}<div class="hint">${m.generatedTokens} tokens${m.lastTokensPerSecond ? ' · ' + m.lastTokensPerSecond + ' tok/s' : ''}</div></td>
         <td style="white-space:nowrap"><button class="small" data-chat="${esc(m.id)}">chat</button> <button class="small danger" data-unload="${esc(m.id)}">unload</button></td></tr>`).join('')}</table>`;
     $$('[data-unload]', box).forEach(b => b.addEventListener('click', async () => {

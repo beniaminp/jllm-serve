@@ -6,7 +6,9 @@ import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
+import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.chat.ChatSupport;
+import org.robomiri.jllm.web.chat.ReasoningSplitter;
 import org.robomiri.jllm.web.chat.ChatSupport.RequestError;
 import org.robomiri.jllm.web.models.LoadedModel;
 import org.robomiri.jllm.web.models.ModelManager;
@@ -40,12 +42,14 @@ public class OpenAiController {
 
     private final ModelManager models;
     private final SettingsService settings;
+    private final WebProperties props;
     private final AtomicLong counter = new AtomicLong();
     private final AtomicBoolean thinkingNoted = new AtomicBoolean();
 
-    public OpenAiController(ModelManager models, SettingsService settings) {
+    public OpenAiController(ModelManager models, SettingsService settings, WebProperties props) {
         this.models = models;
         this.settings = settings;
+        this.props = props;
     }
 
     @GetMapping(value = "/v1/models", produces = "application/json")
@@ -143,111 +147,146 @@ public class OpenAiController {
         long created = System.currentTimeMillis() / 1000;
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
         ChatSupport.Deadline deadline = new ChatSupport.Deadline(s.getLong("server.request-timeout-ms"));
+        // the thinking block goes to reasoning_content unless the server or the request asks for it inline
+        boolean splitReasoning = chat && !"none".equalsIgnoreCase(Json.str(body, "reasoning_format", props.reasoningFormat()));
+        boolean startsInThink = splitReasoning && ReasoningSplitter.promptOpensThink(engine, prompt);
+        int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
 
-        if (!stream) {
+        try (LoadedModel.Slot slot = model.pick(prompt)) {
+            Engine e = slot.engine();
+            if (!stream) {
+                Engine.Result r;
+                try {
+                    r = e.generate(prompt, params, null, () -> model.closing() || deadline.getAsBoolean());
+                } catch (Engine.OverloadedException ex) {
+                    ChatSupport.send(res, 503, ChatSupport.error(ex.getMessage(), "server_error", "overloaded"));
+                    return;
+                } catch (IllegalArgumentException ex) {
+                    ChatSupport.send(res, 400, ChatSupport.error(ex.getMessage(), "invalid_request_error", "context_length_exceeded"));
+                    return;
+                }
+                model.record(r.stats());
+                String finish = deadline.finishReason(r);
+                Map<String, Object> choice;
+                if (chat) {
+                    String text = r.text();
+                    List<Object> calls = null;
+                    if (tools) {
+                        ToolCallFormat.Parsed parsed = ToolCallFormat.parse(text, toolNames);
+                        if (!parsed.calls().isEmpty()) {
+                            text = parsed.content();
+                            calls = toolCalls(parsed.calls(), false);
+                            finish = "tool_calls";
+                        }
+                    }
+                    Map<String, Object> message = Json.obj("role", "assistant");
+                    if (splitReasoning) {
+                        String[] parts = ReasoningSplitter.split(text, startsInThink);
+                        if (!parts[0].isEmpty()) {
+                            message.put("reasoning_content", parts[0]);
+                        }
+                        text = parts[1];
+                    }
+                    message.put("content", calls != null && text.isBlank() ? null : text);
+                    if (calls != null) {
+                        message.put("tool_calls", calls);
+                    }
+                    choice = Json.obj("index", 0, "message", message, "finish_reason", finish);
+                } else {
+                    choice = Json.obj("index", 0, "text", r.text(), "finish_reason", finish);
+                }
+                log(modelId, slot, chat, messages, toolNames.size(), r.stats(), finish);
+                ChatSupport.send(res, 200, Json.write(Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                        "choices", List.of(choice), "usage", ChatSupport.usage(r.stats()))));
+                return;
+            }
+
+            // the headers go out now and keep-alive comments while the prompt is prefilled (minutes for a coding
+            // agent's prompt on a CPU); a refusal after this point becomes an error event
+            ChatSupport.Sse sse = new ChatSupport.Sse(res);
+            IOException[] failure = new IOException[1];
+            startStream(sse, chat, id, object, created, modelId);
+            java.util.function.BiConsumer<String, String> send = (field, piece) -> {
+                if (failure[0] != null) {
+                    return;
+                }
+                Map<String, Object> choice = chat
+                        ? Json.obj("index", 0, "delta", Json.obj(field, piece), "finish_reason", null)
+                        : Json.obj("index", 0, "text", piece, "finish_reason", null);
+                try {
+                    sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
+                } catch (IOException ex) {
+                    failure[0] = ex; // the client went away: stop generating
+                }
+            };
+            ReasoningSplitter splitter = splitReasoning
+                    ? new ReasoningSplitter(piece -> send.accept("reasoning_content", piece), piece -> send.accept("content", piece), startsInThink)
+                    : null;
+            Engine.TextSink deltas = splitter != null ? splitter : piece -> send.accept("content", piece);
+            ToolCallFormat.Holdback holdback = tools ? new ToolCallFormat.Holdback(deltas) : null;
             Engine.Result r;
-            try {
-                r = engine.generate(prompt, params, null, () -> model.closing() || deadline.getAsBoolean());
-            } catch (Engine.OverloadedException e) {
-                ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "overloaded"));
+            try (AutoCloseable alive = sse.keepAlive()) {
+                r = e.generate(prompt, params, holdback != null ? holdback : deltas,
+                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
+            } catch (Engine.OverloadedException | IllegalArgumentException ex) {
+                sse.event(Json.obj("error", Json.obj("message", ex.getMessage(), "type",
+                        ex instanceof Engine.OverloadedException ? "server_error" : "invalid_request_error",
+                        "code", ex instanceof Engine.OverloadedException ? "overloaded" : "context_length_exceeded")));
                 return;
-            } catch (IllegalArgumentException e) {
-                ChatSupport.send(res, 400, ChatSupport.error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
-                return;
+            } catch (RuntimeException ex) {
+                sse.event(Json.obj("error", Json.obj("message", "internal server error", "type", "server_error")));
+                throw ex;
+            } catch (Exception ex) { // AutoCloseable.close: cannot happen
+                throw new IllegalStateException(ex);
             }
             model.record(r.stats());
             String finish = deadline.finishReason(r);
-            Map<String, Object> choice;
-            if (chat) {
-                Map<String, Object> message = Json.obj("role", "assistant", "content", r.text());
-                ToolCallFormat.Parsed parsed = tools ? ToolCallFormat.parse(r.text(), toolNames) : null;
-                if (parsed != null && !parsed.calls().isEmpty()) {
-                    message.put("content", parsed.content().isEmpty() ? null : parsed.content());
-                    message.put("tool_calls", toolCalls(parsed.calls(), false));
+            List<Object> calls = null;
+            if (holdback != null) {
+                ToolCallFormat.Parsed parsed = ToolCallFormat.parse(r.text(), toolNames);
+                if (!holdback.callStarted()) {
+                    holdback.finish(); // (a bare JSON call was streamed as text; the structured call follows anyway)
+                }
+                if (!parsed.calls().isEmpty()) {
+                    calls = toolCalls(parsed.calls(), true);
                     finish = "tool_calls";
                 }
-                choice = Json.obj("index", 0, "message", message, "finish_reason", finish);
-            } else {
-                choice = Json.obj("index", 0, "text", r.text(), "finish_reason", finish);
             }
-            ChatSupport.send(res, 200, Json.write(Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(choice), "usage", ChatSupport.usage(r.stats()))));
-            return;
+            if (splitter != null) {
+                splitter.finish();
+            }
+            log(modelId, slot, chat, messages, toolNames.size(), r.stats(), finish);
+            if (failure[0] != null || sse.failed()) {
+                return; // nothing more can be sent
+            }
+            if (calls != null) {
+                sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices",
+                        List.of(Json.obj("index", 0, "delta", Json.obj("tool_calls", calls), "finish_reason", null))));
+            }
+            Map<String, Object> last = chat
+                    ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
+                    : Json.obj("index", 0, "text", "", "finish_reason", finish);
+            Map<String, Object> event = Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                    "choices", List.of(last));
+            if (includeUsage && !separateUsage) {
+                event.put("usage", ChatSupport.usage(r.stats()));
+            }
+            sse.event(event);
+            if (includeUsage && separateUsage) {
+                sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                        "choices", List.of(), "usage", ChatSupport.usage(r.stats())));
+            }
+            sse.raw("data: [DONE]\n\n");
         }
+    }
 
-        // the stream starts at the first token: until then a queue timeout can still be a 503
-        ChatSupport.Sse sse = new ChatSupport.Sse(res);
-        IOException[] failure = new IOException[1];
-        Engine.TextSink deltas = piece -> {
-            if (failure[0] != null) {
-                return;
-            }
-            Map<String, Object> choice = chat
-                    ? Json.obj("index", 0, "delta", Json.obj("content", piece), "finish_reason", null)
-                    : Json.obj("index", 0, "text", piece, "finish_reason", null);
-            try {
-                startStream(sse, chat, id, object, created, modelId);
-                sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
-            } catch (IOException e) {
-                failure[0] = e; // the client went away: stop generating
-            }
-        };
-        ToolCallFormat.Holdback holdback = tools ? new ToolCallFormat.Holdback(deltas) : null;
-        Engine.Result r;
-        try {
-            r = engine.generate(prompt, params, holdback != null ? holdback : deltas,
-                    () -> failure[0] != null || model.closing() || deadline.getAsBoolean());
-        } catch (RuntimeException e) {
-            if (sse.started()) {
-                sse.event(Json.obj("error", Json.obj("message", "internal server error", "type", "server_error")));
-                throw e;
-            }
-            if (e instanceof Engine.OverloadedException) {
-                ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "overloaded"));
-            } else if (e instanceof IllegalArgumentException) {
-                ChatSupport.send(res, 400, ChatSupport.error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
-            } else {
-                throw e;
-            }
-            return;
-        }
-        model.record(r.stats());
-        String finish = deadline.finishReason(r);
-        if (holdback != null) {
-            ToolCallFormat.Parsed parsed = ToolCallFormat.parse(r.text(), toolNames);
-            if (!parsed.calls().isEmpty()) {
-                if (!holdback.callStarted()) {
-                    // a bare JSON call was streamed as text already; clients see the structured call below as well
-                    holdback.finish();
-                }
-                if (failure[0] == null) {
-                    startStream(sse, chat, id, object, created, modelId);
-                    sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices",
-                            List.of(Json.obj("index", 0, "delta", Json.obj("tool_calls", toolCalls(parsed.calls(), true)), "finish_reason", null))));
-                }
-                finish = "tool_calls";
-            } else {
-                holdback.finish();
-            }
-        }
-        if (failure[0] != null) {
-            return; // nothing more can be sent
-        }
-        startStream(sse, chat, id, object, created, modelId);
-        Map<String, Object> last = chat
-                ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
-                : Json.obj("index", 0, "text", "", "finish_reason", finish);
-        Map<String, Object> event = Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                "choices", List.of(last));
-        if (includeUsage && !separateUsage) {
-            event.put("usage", ChatSupport.usage(r.stats()));
-        }
-        sse.event(event);
-        if (includeUsage && separateUsage) {
-            sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(), "usage", ChatSupport.usage(r.stats())));
-        }
-        sse.raw("data: [DONE]\n\n");
+    /** One line per request in the log: enough to see what an agent is doing and where the time goes. */
+    private static void log(String model, LoadedModel.Slot slot, boolean chat, int messages, int tools, Engine.Stats st,
+                            String finish) {
+        System.err.printf("%s %s [slot %d] %d msg%s%s | prompt %d tok (%d cached) %.1f s | %d tok %.1f tok/s | %s%n",
+                chat ? "chat" : "completion", model, slot.index(), messages, messages == 1 ? "" : "s",
+                tools > 0 ? ", " + tools + " tools" : "", st.promptTokens(), st.cachedTokens(), st.prefillMs() / 1000,
+                st.generatedTokens(), st.tokPerSec(), finish);
     }
 
     /** OpenAI {@code tool_calls}; calls the model wrote unreadably are passed on with their raw error as arguments. */

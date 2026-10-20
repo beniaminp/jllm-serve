@@ -87,7 +87,7 @@ the arithmetic units. A loop that loads 1 byte per multiply-add is memory-bound 
 | `gateUp` | `[batch × 2·ffn]` | 1.5 MB | gate and up activations |
 | `hidden` | `[batch × ffn]` | 768 KB | `silu(gate) ⊙ up` |
 | `scratch` (`CpuMatmul`) | thread-local `float[max(ctx, experts, 4·maxCols)]`, `maxCols` the widest tensor of the model | 48 KB per thread | router logits, four dequantized rows (`MlaCpu` has its own tile scratch, like `KvCache`) |
-| `KvCache.scratch` | thread-local `float[tile·group·ctx + 2·headDim + tile·group]` | 128 KB per thread | attention scores of one tile ([7.5](#75-attention-kvcacheattention)) |
+| `KvCache.scratch` | thread-local, `float[ctx + …]` for f32 decode, grown on demand to `tile·group·(pos+n) + 128·headDim + tile·group` for prefill | up to 8 MB per thread | attention scores of one tile and one block of K / V rows ([7.5](#75-attention-kvcacheattention)) |
 | MoE: `routerLogits`, `assign`, `routeWeight`, `moeGateUp`, `moeHidden` | per-token | tiny | [12](12-mixture-of-experts.md) |
 
 All buffers are row-major `[token][feature]`, so token `t`'s vector starts at `t × width`. They are allocated
@@ -262,28 +262,36 @@ single token allows.
 
 **Prefill (`n > 1`) is tiled.** A K row of the cache is `kvDim × 4 B`; one layer's K at `ctx = 4096` is 16 MB,
 so with one task per `(token, head)` every K and V row was streamed from L3/DRAM `n × heads` times per layer.
-`attentionTiled` instead makes one task per `(kv head, tile of up to 8 consecutive tokens)` — the tile serves
-`tile × group` query heads — and runs three passes over the keys:
+`attentionTiled` instead makes one task per `(kv head, tile of consecutive tokens)` — the tile serves
+`tile × group` query heads — and walks the keys in blocks of 128 (`KEY_BLOCK`):
 
 ```
-for s in [sMin, sMax):                                   sMin/sMax: the union of the tile's causal (and window) ranges
-    K[s] (f32: in place; f16: expanded once into scratch)
-    for each token t of the tile with first_t <= s < len_t, for h < group:
-        sc[row(t,h) * ctx + s] = dot(q[t][g*group+h], K[s]) * scale        // the same dot, same bits
-for each (t, h): max, exp, sum over sc[row * ctx + first_t .. len_t) in ascending s; inv = 1/sum; att[t][h] = 0
-for s in [sMin, sMax):
-    V[s] (in place / expanded once)
-    for each (t, h) that sees s:  axpy(sc[row * ctx + s] * inv, V[s], att[t][h])                  // ascending s
+for each block [b0, b1) of the keys any row of the tile sees:
+    K[b0..b1) (f32: in place; f16: expanded once into scratch)
+    for s in the block, for the rows (t, h) that see s, four at a time:
+        sc[row * span + s] = dot(q[row], K[s]) * scale          // dot4: four dots sharing each K load, same bits as dot
+for each row: max, exp, sum over its keys in ascending s; inv = 1/sum; att[row] = 0
+for each block [b0, b1):
+    V[b0..b1) (in place / expanded once)
+    for the rows four at a time, for each headDim vector c:
+        acc_r = att[row_r][c]; for s ascending: acc_r = V[s][c] · (sc[row_r * span + s] · inv_r) + acc_r; att[row_r][c] = acc_r
 ```
 
-Each K and V row is now read (f32) or converted (f16) once per `tile × group` dot products instead of once
-each. Per output element the arithmetic is unchanged — the same `dot` over `headDim`, the max and the sum over
-the keys in ascending order, the same ascending `axpy` chain — so the tiled kernel is bit-identical to the
-per-head loop (`SmokeTest.kvCacheAttention` checks tiled prefill against per-token decode and against a
-double-precision reference, for f32 and f16, with and without window and soft-cap). The tile size is 8 tokens
-when `group × ctx` score rows fit in 32 K floats per thread (`ctx ≤ 2048` at `group = 2`), halving down to one
-token at long contexts, so the per-thread scratch stays near 128 KB. Tasks are handed out heaviest tile first
-(`forRangeFine`, chunk 1): later tokens see more keys, and the fine grain keeps the tail short.
+Each K and V row is read (f32) or converted (f16) once per tile instead of once per dot product, and the output
+accumulates in registers — four independent FMA chains, one per row — instead of a load / FMA / store through
+memory per key. Per output element the arithmetic is unchanged — the same `dot` over `headDim`, the max and the
+sum over the keys in ascending order, the same ascending FMA chain as `axpy` — so the tiled kernel is
+bit-identical to the per-head loop (`SmokeTest.kvCacheAttention` checks tiled prefill against per-token decode and
+against a double-precision reference, for f32 and f16, with and without window and soft-cap). A `headDim` that is
+not a multiple of the vector length falls back to the same loop one key at a time.
+
+The tile is up to 16 tokens, as long as its score rows over the `span = pos + n` keys fit 8 MB per thread, with
+at least two tasks per pool thread. Before, the tile was sized from `ctx` and shrank to one token per tile at
+`ctx = 32768`, so a long context's every K / V row was converted and read once per token. Measured with
+Qwen3-0.6B (28 layers, 8 kv heads, f16 cache, `ctx = 32768`, 4 cores): a 6 033-token prompt — the size of a coding
+agent's instructions and tool definitions — prefilled in 313 s before and 115 s with the span-sized tiles and the
+blocked loops (16- and 64-token tiles measured the same). Tasks are handed out
+heaviest tile first (`forRangeFine`, chunk 1): later tokens see more keys, and the fine grain keeps the tail short.
 
 **MLA (DeepSeek).** `MlaCpu` replaces the q/k/v projections and this attention for latent-attention models. Its
 cache holds one row per token and layer of `kvLora + rope` numbers (576 floats for DeepSeek-V2-Lite instead of the
@@ -591,8 +599,8 @@ auto-vectorizes the plain conversion loop, but the Vector API has no half-float 
 and `axpy` cannot read `short[]` directly. The f16 cache therefore runs the tiled kernel of
 [7.5](#75-attention-kvcacheattention) for every `n`, with `expand` converting each K / V row slice
 (`headDim` shorts → floats) into thread-local scratch once per tile: for decode that is once per kv head
-(`group = 2` query heads share it), for prefill once per `tile × group` query heads. The per-thread scratch is
-`tile × group × ctx + 2 × headDim + tile × group` floats, allocated once. Decode has `kvHeads` tasks per layer
+(`group = 2` query heads share it), for prefill once per `tile × group` query heads. The per-thread scratch grows
+to the largest tile's scores plus one block of 128 rows. Decode has `kvHeads` tasks per layer
 instead of the f32 path's `heads`, which on 10 cores costs nothing measurable.
 
 **Precision.** f16 keeps 11 significant bits (about 3 decimal digits) and a range of ±65 504; K and V values

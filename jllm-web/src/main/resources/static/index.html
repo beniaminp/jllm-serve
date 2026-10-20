@@ -19,7 +19,7 @@
       <button data-tab="tools"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.2L3 17.8V21h3.2l6.3-6.3a4 4 0 0 0 5.2-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg><span>Tools</span></button>
       <button data-tab="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
       <button data-tab="logs"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg><span>Logs</span></button>
-      <button data-tab="api"><svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>API</span></button>
+      <button data-tab="api"><svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Connect</span></button>
     </nav>
     <div class="rail-foot">
       <div id="status" class="status"></div>
@@ -191,13 +191,33 @@
 
     <!-- ============================================================== api -->
     <section id="tab-api" class="tab page">
-      <header class="page-head"><h1>API</h1><p class="muted">OpenAI-compatible endpoints over the loaded models, plus the management API this console uses.</p></header>
+      <header class="page-head"><h1>Connect</h1><p class="muted">Use the loaded models from coding agents and other OpenAI-compatible clients.</p></header>
       <div class="card">
+        <h2>opencode <a class="small" href="https://opencode.ai" target="_blank" rel="noopener">opencode.ai ↗</a></h2>
+        <ol class="steps">
+          <li>Load a model with the <b>⚡ Coding agent preset</b> (Models page): opencode's instructions and tool definitions alone are ~11k tokens,
+            and a second slot keeps the conversation cached while opencode generates titles. Qwen3 / Qwen2.5-Coder at 4B or larger handle agentic coding best.</li>
+          <li>Save this as <code>opencode.json</code> in your project (or merge it into <code>~/.config/opencode/opencode.json</code>):</li>
+        </ol>
+        <div id="oc-warnings"></div>
+        <pre id="oc-config" class="code">(load a model first)</pre>
+        <div class="row"><button id="oc-copy" class="primary">Copy</button><button id="oc-download">Download opencode.json</button>
+          <span class="muted small">or from a terminal in your project: <code id="oc-curl"></code></span></div>
+        <ol class="steps" start="3">
+          <li>Run <code>opencode</code> in the project and pick the model with <code>/models</code> (it is the default already).
+            Thinking is off for Qwen3 (<code>"enable_thinking": false</code>), which keeps each step fast; switch it on in the file for hard problems.
+            Every request shows up in <a href="#logs">Logs</a> with its prompt size, cached tokens and speed.</li>
+        </ol>
+      </div>
+      <div class="card">
+        <h2>OpenAI-compatible API</h2>
         <p>Base URL <code id="base-url"></code> · the <code>model</code> field picks a loaded model (with a single model loaded, any name works).</p>
         <p id="api-key-note" class="muted"></p>
         <h3>curl</h3><pre id="ex-curl" class="code"></pre>
         <h3>Python (openai)</h3><pre id="ex-python" class="code"></pre>
         <h3>Function calling</h3><pre id="ex-tools" class="code"></pre>
+        <p class="hint">A <code>&lt;think&gt;</code> block comes back as <code>reasoning_content</code> (DeepSeek style) apart from the answer;
+          send <code>"reasoning_format": "none"</code> to keep it inline. Qwen3 thinking follows <code>enable_thinking</code> (default: the <code>chat.thinking</code> setting).</p>
         <h3>Endpoints</h3>
         <table class="table">
           <tr><td><code>GET /v1/models</code></td><td>loaded models</td></tr>
@@ -235,10 +255,13 @@
       <label>Threads <input name="backend.threads" type="number" min="0" placeholder="(default)"></label>
       <label>Speculative <select name="engine.speculative"><option value="">(default)</option><option>off</option><option>ngram</option><option>draft</option></select></label>
       <label>Draft model <input name="engine.draft-model" placeholder="owner/name"></label>
+      <label title="each slot keeps one conversation's prefix in its own KV cache; requests go to the slot that already holds most of their prompt">Slots <input name="slots" type="number" min="1" max="8" placeholder="1"></label>
       <label class="check st-only"><input type="checkbox" name="model.low-disk"> low disk</label>
+      <input type="hidden" name="server.queue-timeout-ms">
     </div>
     <div class="row">
       <button type="submit" name="action" value="load" class="primary">Load</button>
+      <button type="button" class="ghost coding-preset" title="context 32768, f16 KV cache, 2 slots: what coding agents such as opencode need">⚡ Coding agent preset</button>
       <button type="submit" name="action" value="download" class="ghost dl-only">Download only</button>
     </div>
   </form>

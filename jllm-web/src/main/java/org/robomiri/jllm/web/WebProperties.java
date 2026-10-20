@@ -13,6 +13,9 @@ import java.util.List;
  * @param autoload     models (Hub repositories, links or local .gguf paths) loaded at startup
  * @param logLines     how many log lines the console keeps
  * @param toolsFile    tool settings and MCP servers (JSON)
+ * @param reasoningFormat how {@code /v1/chat/completions} returns a {@code <think>} block: {@code deepseek} (in
+ *                        {@code reasoning_content}, apart from the answer) or {@code none} (inline in the content);
+ *                        a request may override it with {@code "reasoning_format"}
  */
 @ConfigurationProperties("jllm.web")
 public record WebProperties(
@@ -20,7 +23,8 @@ public record WebProperties(
         @DefaultValue("") String apiKey,
         @DefaultValue List<String> autoload,
         @DefaultValue("2000") int logLines,
-        @DefaultValue("jllm-web-tools.json") String toolsFile) {
+        @DefaultValue("jllm-web-tools.json") String toolsFile,
+        @DefaultValue("deepseek") String reasoningFormat) {
 
     public boolean apiKeyRequired() {
         return apiKey != null && !apiKey.isBlank();

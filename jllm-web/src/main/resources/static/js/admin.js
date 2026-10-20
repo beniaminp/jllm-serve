@@ -78,7 +78,24 @@ const Admin = (() => {
 
   // ------------------------------------------------------------------ api page
 
+  let ocFile = '';
+  async function renderOpencode() {
+    $('#oc-curl').textContent = `curl -s ${location.origin}/api/integrations/opencode?raw=true > opencode.json`;
+    try {
+      const r = await api('/api/integrations/opencode');
+      ocFile = r.file;
+      $('#oc-config').textContent = r.file;
+      $('#oc-warnings').innerHTML = (r.warnings.length ? `<div class="warn-box"><b>Before you start</b><ul>${r.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul></div>` : '')
+        + (r.apiKeyRequired ? '<p class="hint">This server needs an API key: <code>export JLLM_API_KEY=…</code> before starting opencode.</p>' : '');
+    } catch (e) {
+      ocFile = '';
+      $('#oc-config').textContent = e.message;
+      $('#oc-warnings').innerHTML = '';
+    }
+  }
+
   function renderApi() {
+    renderOpencode();
     const base = location.origin + '/v1';
     $('#base-url').textContent = base;
     const model = $('#chat-model').value || 'MODEL';
@@ -119,6 +136,8 @@ call = r.choices[0].message.tool_calls[0]          # finish_reason == "tool_call
     onShow.logs = pollLogs;
     onTick.logs = pollLogs;
     onShow.api = renderApi;
+    $('#oc-copy').addEventListener('click', e => { if (ocFile) copyText(ocFile, e.target); });
+    $('#oc-download').addEventListener('click', () => { if (ocFile) download('opencode.json', ocFile, 'application/json'); });
     loadSettings();
   }
 

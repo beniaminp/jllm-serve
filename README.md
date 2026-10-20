@@ -159,6 +159,45 @@ a 0.6B model picks the right tool for simple requests but not for long chains. M
 processes with your user's rights, and the tools of an MCP server can do whatever that server allows (write files,
 call APIs), so only add servers you trust and enable their tools in chats where you want them.
 
+### Coding agents (opencode)
+
+The console serves [opencode](https://opencode.ai) (and other agents that speak the OpenAI API) directly:
+
+1. `./jllm-web/run.sh`, then on the Models page load a model with **⚡ Coding agent preset** — context 32768, f16 KV
+   cache, 2 slots, a long queue timeout. opencode's instructions and tool definitions alone are ~11k tokens.
+2. In your project: `./jllm-web/opencode.sh` (or *Connect* page → *Download opencode.json*). It writes an
+   `opencode.json` for the loaded models — provider `jllm` over `@ai-sdk/openai-compatible`, context and output
+   limits, `tool_call`, Qwen3 thinking off for speed (`"enable_thinking": false`, switch it on for hard tasks), no
+   overall request timeout — plus the warnings that apply (context too small, a single slot, a model family that
+   follows the tool-call format less reliably).
+3. Run `opencode`. Every request is one line in the console's Logs (slot, prompt and cached tokens, speed, finish).
+
+What makes it work rather than merely connect:
+
+- **Slots.** A model can be loaded with several KV caches on the same memory-mapped weights; each request goes to
+  the slot that already holds the longest prefix of its prompt. opencode sends a title request alongside every
+  message: with one cache that evicted the 10k-token conversation and the next step prefilled it all again; with two
+  slots the next step finds it cached (measured: 10 484-token prompt, 10 443 cached, prefilled in 2.5 s).
+- **Long first prefill without timeouts.** Streaming responses start at once and send an SSE keep-alive comment
+  every 15 s while the prompt is prefilled; a client that disconnects stops the prefill, and a retry of the same
+  prompt continues where it stopped.
+- **`reasoning_content`.** A `<think>` block is returned apart from the answer (DeepSeek style), as opencode, Open
+  WebUI and Continue expect; `"reasoning_format": "none"` keeps it inline.
+- **Prefill attention** over long prompts was reworked for this (span-sized tiles, key blocks, register
+  accumulation, same results bit for bit): a 6 033-token prompt prefills in 115 s instead of 313 s with Qwen3-0.6B
+  on 4 CPU cores ([docs/07](docs/07-cpu-backend.md#75-attention-kvcacheattention)).
+
+Measured end to end on a 4-core cloud VM with Qwen3-0.6B (`opencode run "Create a file named hello.txt containing
+exactly the text: hi"`): the first step prefilled opencode's 10 447-token prompt in 349 s and called `write`, the
+second step reused 10 443 cached tokens and answered in 2.5 s + generation. The first step of a session is the slow
+one on a CPU; later steps only prefill what is new. A larger model (Qwen3 4B+, Qwen2.5-Coder) plans and edits far
+better than 0.6B but prefills proportionally slower; on Apple Silicon the Metal backend is the one to use.
+
+Memory: on the CPU backend the KV caches live on the Java heap (3.8 GB per slot for Qwen3-0.6B at 32768 with f16;
+larger models need more). `run.sh` gives the JVM 60% of the RAM by default (`JLLM_XMX` to set it) with a small young
+generation, so the caches can use almost all of it; a load whose caches do not fit fails at once with a message
+saying how much is needed, instead of thrashing the garbage collector.
+
 The console binds to `127.0.0.1` by default: the management API can load models and delete files. Set
 `jllm.web.api-key` before exposing it; `/v1/**` and `/api/**` then need `Authorization: Bearer <key>`.
 Application settings are in `jllm-web/src/main/resources/application.properties`; `cd jllm-web && mvn test` runs
@@ -293,9 +332,10 @@ jllm-web/                Spring Boot web console + OpenAI API (separate Maven pr
     mcp/                 MCP client: stdio, Streamable HTTP and SSE transports, server manager
     openai/              /v1 endpoints
     settings/            jllm.properties view and persisted overrides
-    api/                 /api management and tools endpoints, API key filter
+    api/                 /api management, tools and integrations (opencode.json) endpoints, API key filter
     logs/                captured engine output
   src/main/resources/static/   the console (plain HTML/CSS/JS modules, no build step)
+  run.sh, opencode.sh    launcher; writes an opencode.json for the running console into the current directory
 ```
 
 ## License

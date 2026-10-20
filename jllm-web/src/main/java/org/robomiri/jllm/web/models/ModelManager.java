@@ -38,9 +38,14 @@ public class ModelManager implements DisposableBean {
      * @param source   a Hugging Face link, {@code owner/name}, {@code owner/name:QUANT} or a local {@code .gguf} path
      * @param id       the name clients use in the {@code model} field; empty = derived from the source
      * @param settings engine settings for this model only, e.g. {@code backend.ctx}, {@code backend}, {@code model.quant}
+     * @param slots    KV cache slots (1 to 8, default 1): each keeps one conversation's prefix cached; see {@link LoadedModel}
      */
     public record LoadRequest(String source, String id, String revision, String ggufFile, String ggufQuant,
-                              Map<String, String> settings) {
+                              Map<String, String> settings, Integer slots) {
+        public LoadRequest(String source, String id, String revision, String ggufFile, String ggufQuant,
+                           Map<String, String> settings) {
+            this(source, id, revision, ggufFile, ggufQuant, settings, null);
+        }
     }
 
     public record DownloadRequest(String source, String revision, String ggufFile, String ggufQuant,
@@ -191,6 +196,10 @@ public class ModelManager implements DisposableBean {
         Target t = target(r.source(), r.revision(), r.ggufFile(), r.ggufQuant(), r.id());
         Map<String, String> extra = settingsFor(t, r.settings());
         Settings s = settings.with(extra);
+        int slots = r.slots() == null ? 1 : r.slots();
+        if (slots < 1 || slots > 8) {
+            throw new IllegalArgumentException("slots must be 1 to 8");
+        }
         synchronized (this) {
             if (loaded.containsKey(t.id())) {
                 throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
@@ -222,18 +231,30 @@ public class ModelManager implements DisposableBean {
             if (!t.local()) {
                 writeMarker(s, t);
             }
+            List<org.robomiri.jllm.engine.Engine> extraSlots = new ArrayList<>();
+            try {
+                for (int i = 1; i < slots; i++) {
+                    job.phase = "creating slot " + (i + 1) + " of " + slots;
+                    extraSlots.add(ModelLoader.extraEngine(s, l));
+                }
+            } catch (Throwable e) {
+                extraSlots.forEach(org.robomiri.jllm.engine.Engine::close);
+                l.close();
+                throw e;
+            }
             Map<String, String> snapshot = new LinkedHashMap<>();
             for (String k : s.keys()) {
                 if (SettingsService.scope(k) == SettingsService.Scope.LOAD && !s.get(k).isEmpty()) {
                     snapshot.put(k, s.get(k));
                 }
             }
-            LoadedModel m = new LoadedModel(t.id(), t.model(), l, snapshot, (System.nanoTime() - t0) / 1e9);
+            snapshot.put("slots", String.valueOf(slots));
+            LoadedModel m = new LoadedModel(t.id(), t.model(), l, extraSlots, snapshot, (System.nanoTime() - t0) / 1e9);
             synchronized (this) {
                 loaded.put(t.id(), m);
             }
             System.err.println("Loaded " + t.id() + ": " + l.engine().backend().name() + ", ctx="
-                    + l.engine().backend().contextLength());
+                    + l.engine().backend().contextLength() + (slots > 1 ? ", " + slots + " slots" : ""));
         });
         return job.view();
     }
@@ -267,6 +288,13 @@ public class ModelManager implements DisposableBean {
                 job.finish(Job.State.DONE, null);
             } catch (CancellationException | InterruptedException e) {
                 job.finish(Job.State.CANCELLED, null);
+            } catch (OutOfMemoryError e) {
+                long max = Runtime.getRuntime().maxMemory();
+                String msg = String.format("out of memory (Java heap %.1f GB): the KV caches (context length x slots) do"
+                        + " not fit. Lower the context length or the slots, use KV cache f16, or restart with a larger"
+                        + " heap, e.g. JLLM_XMX=16g ./jllm-web/run.sh", max / 1e9);
+                job.finish(Job.State.FAILED, msg);
+                System.err.println(job.kind.name().toLowerCase(Locale.ROOT) + " of " + job.model + " failed: " + msg);
             } catch (Throwable e) {
                 if (Thread.currentThread().isInterrupted()) {
                     job.finish(Job.State.CANCELLED, null);

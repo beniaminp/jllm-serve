@@ -77,21 +77,36 @@ public final class ChatSupport {
         }
     }
 
-    /** Server-sent events written straight to the servlet response, flushed per event; started lazily. */
+    private static final java.util.concurrent.ScheduledExecutorService TIMER =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("sse-keepalive").daemon().factory());
+
+    /**
+     * Server-sent events written straight to the servlet response, flushed per event; started lazily. While a long
+     * prompt is being prefilled nothing else is sent, so {@link #keepAlive} writes an SSE comment every 15 s: clients
+     * with a header or idle-chunk timeout keep waiting, and a client that went away is noticed ({@link #failed}) so
+     * the engine can stop.
+     */
     public static final class Sse {
         private final HttpServletResponse res;
         private OutputStream out;
         private boolean started;
+        private volatile boolean failed;
+        private volatile long lastWrite = System.nanoTime();
 
         public Sse(HttpServletResponse res) {
             this.res = res;
         }
 
-        public boolean started() {
+        public synchronized boolean started() {
             return started;
         }
 
-        public void start() throws IOException {
+        /** True once a write failed: the client is gone. */
+        public boolean failed() {
+            return failed;
+        }
+
+        public synchronized void start() throws IOException {
             if (started) {
                 return;
             }
@@ -101,16 +116,38 @@ public final class ChatSupport {
             res.setHeader("X-Accel-Buffering", "no"); // nginx: do not buffer the stream
             out = res.getOutputStream();
             started = true;
+            out.flush(); // commits the headers now
         }
 
         public void event(Map<String, Object> e) throws IOException {
             raw("data: " + Json.write(e) + "\n\n");
         }
 
-        public void raw(String s) throws IOException {
+        public synchronized void raw(String s) throws IOException {
             start();
-            out.write(s.getBytes(StandardCharsets.UTF_8));
-            out.flush();
+            try {
+                out.write(s.getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                lastWrite = System.nanoTime();
+            } catch (IOException e) {
+                failed = true;
+                throw e;
+            }
+        }
+
+        /** Starts the stream now and keeps it alive until the returned handle is closed. */
+        public AutoCloseable keepAlive() throws IOException {
+            start();
+            var task = TIMER.scheduleAtFixedRate(() -> {
+                if (!failed && System.nanoTime() - lastWrite > 10_000_000_000L) {
+                    try {
+                        raw(": keep-alive\n\n");
+                    } catch (IOException e) {
+                        // failed is set; the generation stops at its next check
+                    }
+                }
+            }, 15, 15, java.util.concurrent.TimeUnit.SECONDS);
+            return () -> task.cancel(false);
         }
     }
 

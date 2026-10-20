@@ -137,10 +137,10 @@ public class ChatController {
             }
             ToolCallFormat.Holdback holdback = new ToolCallFormat.Holdback(piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)));
             Engine.Result r;
-            try {
-                r = engine.generate(prompt, params, byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback,
-                        () -> failure[0] != null || model.closing() || deadline.getAsBoolean());
-            } catch (RuntimeException e) {
+            try (LoadedModel.Slot slot = model.pick(prompt); AutoCloseable alive = sse.keepAlive()) {
+                r = slot.engine().generate(prompt, params, byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback,
+                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
+            } catch (Exception e) {
                 emit(sse, failure, Json.obj("type", "error", "message", e instanceof Engine.OverloadedException
                         ? e.getMessage() : "generation failed: " + e.getMessage()));
                 finish = "error";

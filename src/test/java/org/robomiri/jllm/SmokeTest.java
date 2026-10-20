@@ -940,7 +940,7 @@ public final class SmokeTest {
             Attention.Gqa cfg = gqa(cfg(tmp, "{\"model_type\":\"llama\",\"hidden_size\":128,\"intermediate_size\":64,"
                     + "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"vocab_size\":32}"), 0);
             int ctx = 40;
-            int n = 23; // several tiles of the f32 and f16 kernels (8 and 8 tokens per tile at this ctx)
+            int n = 23; // several tiles of the f32 and f16 kernels (at least two tasks per pool thread), plus remainders
             int hd = cfg.headDim();
             int qDim = cfg.qDim();
             int kvDim = cfg.kvDim();

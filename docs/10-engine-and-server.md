@@ -23,6 +23,7 @@ if cancelled(): return finish = "cancelled"                 # the client left wh
 reuse = length of common prefix(ids, cached), capped at len(ids) − 1      # 10.2
 pos = reuse
 while pos < len(ids):                                       # PREFILL in chunks of maxBatch (64)
+    if pos > reuse and cancelled(): cached = ids[0..pos); return finish = "cancelled"   # kept for a retry
     n = min(maxBatch, len(ids) − pos)
     backend.forward(ids, pos, n, pos, logits if this is the last chunk else null)
     pos += n
@@ -128,7 +129,9 @@ whatever is still pending is flushed (unless a stop string was hit).
 
 ## 10.4 Cancellation, the lock, statistics
 
-- **Cancellation.** `cancelled` is a `BooleanSupplier` polled before every token. `HttpServer` watches every
+- **Cancellation.** `cancelled` is a `BooleanSupplier` polled between prefill chunks and before every token. A
+  prefill stopped half-way keeps its finished positions as the cached prefix, so a client that times out and
+  retries the same prompt (coding agents do) continues where the first attempt stopped. `HttpServer` watches every
   connection while its request is handled (a virtual thread blocks reading the socket, which returns EOF the
   moment the client closes) and `ApiServer` ORs that flag into `cancelled` for both the streaming and the
   non-streaming path, so a client that closes its tab stops burning GPU time within one token (a request that is cancelled

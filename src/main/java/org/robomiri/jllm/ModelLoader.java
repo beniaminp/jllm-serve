@@ -158,6 +158,24 @@ public final class ModelLoader {
     }
 
     /**
+     * Another engine on the weights of {@code l}: its own backend and KV cache, the same tokenizer, template, stop
+     * tokens and queue timeout. Lets a server keep several conversations' prefixes cached at once (memory: one KV
+     * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
+     * does not (it would need its own copy).
+     */
+    public static Engine extraEngine(Settings s, Loaded l) throws Exception {
+        Engine first = l.engine();
+        Backend backend = newBackend(s, l.weights().arch, l.weights());
+        Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
+                first.template());
+        Speculator.Config spec = s.speculation();
+        if (spec.mode() == Speculator.Mode.NGRAM) {
+            e.enableSpeculation(spec, null);
+        }
+        return e;
+    }
+
+    /**
      * Resolves {@code model} (a Hugging Face repository, a local {@code .gguf} file, or a GGUF repository narrowed by
      * {@code file} / {@code quant}), downloads what is missing and loads its architecture, tokenizer and weights.
      * Used for the target model and for a draft model alike.
@@ -269,6 +287,16 @@ public final class ModelLoader {
     }
 
     public static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
+        try {
+            return newBackend(s, arch, weights);
+        } catch (Exception e) {
+            weights.close();
+            throw e;
+        }
+    }
+
+    /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
+    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
@@ -281,26 +309,19 @@ public final class ModelLoader {
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
         }
-        Backend backend;
-        try {
-            backend = switch (backendName) {
-                case "cpu" -> mamba
-                        ? new MambaCpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                                s.getBool("backend.cpu.int8-activations"))
-                        : new CpuBackend(weights, ctx, batch,
-                                threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                                s.getBool("backend.cpu.int8-activations"));
-                case "metal" -> mamba
-                        ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
-                        : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
-                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
-            };
-        } catch (Exception e) {
-            weights.close();
-            throw e;
-        }
-        return backend;
+        return switch (backendName) {
+            case "cpu" -> mamba
+                    ? new MambaCpuBackend(weights, ctx, batch,
+                            threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
+                            s.getBool("backend.cpu.int8-activations"))
+                    : new CpuBackend(weights, ctx, batch,
+                            threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
+                            s.getBool("backend.cpu.int8-activations"));
+            case "metal" -> mamba
+                    ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
+                    : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+            default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
+        };
     }
 
     /**

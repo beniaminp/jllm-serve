@@ -62,8 +62,8 @@ public final class Engine implements AutoCloseable {
     private final long queueTimeoutMs;
     private final int emptyPromptToken;
 
-    private int[] cached = new int[0]; // tokens currently in the KV cache
-    private int cachedLen;
+    private volatile int[] cached = new int[0]; // tokens currently in the KV cache
+    private volatile int cachedLen;
     private final ChatTemplate.Format template;
     private Speculator spec; // null = no speculative decoding
 
@@ -153,13 +153,42 @@ public final class Engine implements AutoCloseable {
         return backend;
     }
 
+    /** The token ids that end generation (end-of-sequence plus the template's end-of-turn ids). */
+    public Set<Integer> stopTokenIds() {
+        return eosIds;
+    }
+
+    /** How long a request may wait for this engine before {@link OverloadedException}; 0 = indefinitely. */
+    public long queueTimeoutMs() {
+        return queueTimeoutMs;
+    }
+
+    /** Whether a request is running (or the lock is otherwise held) right now. */
+    public boolean busy() {
+        return lock.isLocked();
+    }
+
+    /**
+     * How many leading tokens of {@code prompt} (as {@link #preparePrompt} returns it) are already in the KV cache,
+     * i.e. would not be prefilled again. A snapshot: another request may change it at any time.
+     */
+    public int cachedPrefix(int[] prompt) {
+        int[] c = cached;
+        int n = Math.min(cachedLen, Math.min(c.length, prompt.length - 1));
+        int i = 0;
+        while (i < n && c[i] == prompt[i]) {
+            i++;
+        }
+        return !backend.supportsPrefixReuse() && i < cachedLen ? 0 : i;
+    }
+
     public Result generate(String prompt, SamplingParams p, TextSink sink) {
         return generate(prompt, p, sink, () -> false);
     }
 
     /**
-     * @param cancelled polled once when generation starts and then before every token; generation stops with
-     *                  finish reason "cancelled" when true
+     * @param cancelled polled when generation starts, between prefill chunks and before every token; generation
+     *                  stops with finish reason "cancelled" when true (a prefill stopped half-way stays cached)
      */
     public Result generate(String prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
         return generate(tokenizer.encode(prompt), p, sink, cancelled);
@@ -244,6 +273,14 @@ public final class Engine implements AutoCloseable {
         int pos = reuse;
         int batch = backend.maxBatch();
         while (pos < prompt.length) {
+            if (pos > reuse && cancelled.getAsBoolean()) {
+                // the client gave up during a long prefill: keep what is done, so that a retry of the same
+                // prompt (agents retry after a timeout) continues from here instead of starting over
+                cached = java.util.Arrays.copyOf(prompt, pos);
+                cachedLen = pos;
+                return new Result("", new int[0], "cancelled",
+                        new Stats(prompt.length, reuse, 0, (System.nanoTime() - t0) / 1e6, 0));
+            }
             int n = Math.min(batch, prompt.length - pos);
             boolean last = pos + n == prompt.length;
             backend.forward(prompt, pos, n, pos, last ? logits : null);

@@ -26,6 +26,15 @@ class WebApiTest {
 
     private static final String AUTH = "Bearer secret";
 
+    static { // the settings files persist between runs: every run starts from the defaults
+        try {
+            Files.deleteIfExists(Path.of("target/test-settings/jllm-web.properties"));
+            Files.deleteIfExists(Path.of("target/test-settings/jllm-web-tools.json"));
+        } catch (java.io.IOException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
     @Autowired
     MockMvc mvc;
 
@@ -127,5 +136,14 @@ class WebApiTest {
         mvc.perform(post("/v1/completions").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"prompt\":\"x\",\"tools\":[]}"))
                 .andExpect(status().isNotFound()); // the model is resolved first
+    }
+
+    @Test
+    void opencodeNeedsAModel() throws Exception {
+        mvc.perform(get("/api/integrations/opencode").header("Authorization", AUTH))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.error", containsString("no model is loaded")));
+        mvc.perform(post("/api/models/load").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"source\":\"Qwen/Qwen3-0.6B\",\"slots\":9}"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error", containsString("slots")));
     }
 }

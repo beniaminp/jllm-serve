@@ -165,7 +165,7 @@ public class ToolsConfig {
     }
 
     /** Indented JSON, so the file stays pleasant to edit by hand. */
-    static String pretty(Object v, int indent) {
+    public static String pretty(Object v, int indent) {
         String pad = "  ".repeat(indent + 1);
         String end = "  ".repeat(indent);
         if (v instanceof Map<?, ?> m) {
