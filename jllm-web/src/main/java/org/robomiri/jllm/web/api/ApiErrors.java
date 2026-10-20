@@ -10,7 +10,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 
 /** Maps the management API's exceptions to {@code {"error": "..."}} responses. */
-@RestControllerAdvice(assignableTypes = ManagementController.class)
+@RestControllerAdvice(assignableTypes = {ManagementController.class, ToolsController.class})
 public class ApiErrors {
 
     @ExceptionHandler(IllegalArgumentException.class)

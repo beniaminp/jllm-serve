@@ -20,7 +20,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /** The console's endpoints without a model: settings round trip, validation and the OpenAI errors. */
 @SpringBootTest(properties = {"jllm.web.settings-file=target/test-settings/jllm-web.properties",
-        "jllm.web.api-key=secret"})
+        "jllm.web.tools-file=target/test-settings/jllm-web-tools.json", "jllm.web.api-key=secret"})
 @AutoConfigureMockMvc
 class WebApiTest {
 
@@ -86,5 +86,46 @@ class WebApiTest {
                         .content("{\"source\":\"Qwen/Qwen3-0.6B\",\"settings\":{\"model.repo\":\"x/y\"}}"))
                 .andExpect(status().isBadRequest());
         mvc.perform(get("/api/jobs").header("Authorization", AUTH)).andExpect(status().isOk());
+    }
+
+    @Test
+    void tools() throws Exception {
+        mvc.perform(get("/api/tools").header("Authorization", AUTH)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.tools[?(@.name == 'web_search')]").exists())
+                .andExpect(jsonPath("$.settings.search.provider").value("auto"));
+        mvc.perform(post("/api/tools/call").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"calculator\",\"arguments\":{\"expression\":\"6*7\"}}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.content").value("6*7 = 42")).andExpect(jsonPath("$.error").value(false));
+        mvc.perform(post("/api/tools/call").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"nope\",\"arguments\":{}}"))
+                .andExpect(status().isNotFound());
+        mvc.perform(put("/api/tools/settings").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"search\":{\"provider\":\"bing\",\"maxResults\":5},\"fetch\":{\"maxChars\":8000},"
+                                + "\"agent\":{\"maxRounds\":4,\"maxResultChars\":8000,\"timeoutSeconds\":60}}"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(put("/api/tools/settings").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"search\":{\"provider\":\"auto\",\"maxResults\":5},\"fetch\":{\"maxChars\":8000},"
+                                + "\"agent\":{\"maxRounds\":4,\"maxResultChars\":8000,\"timeoutSeconds\":60},\"disabledBuiltins\":[\"calculator\"]}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.settings.agent.maxRounds").value(4))
+                .andExpect(jsonPath("$.tools[?(@.name == 'calculator')].enabled").value(false));
+        mvc.perform(post("/api/tools/mcp").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"mcpServers\":{\"bad name\":{\"command\":\"x\"}}}"))
+                .andExpect(status().isBadRequest());
+        // a server whose command does not exist is stored, and reported as failed
+        mvc.perform(post("/api/tools/mcp").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"ghost\":{\"command\":\"/no/such/mcp-server\"}}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$[0].state").value("FAILED"));
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/tools/mcp/ghost")
+                .header("Authorization", AUTH)).andExpect(status().isOk());
+    }
+
+    @Test
+    void chatWithoutModel() throws Exception {
+        mvc.perform(post("/api/chat").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[\"web_search\"]}"))
+                .andExpect(status().isNotFound()).andExpect(jsonPath("$.error.code").value("model_not_found"));
+        mvc.perform(post("/v1/completions").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"prompt\":\"x\",\"tools\":[]}"))
+                .andExpect(status().isNotFound()); // the model is resolved first
     }
 }

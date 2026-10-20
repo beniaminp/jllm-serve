@@ -121,24 +121,43 @@ repository by its launcher).
 ./jllm-web/run.sh --jllm.web.autoload=unsloth/Qwen3-0.6B-GGUF:Q4_K_M   # load models at startup
 ```
 
-- **Chat**: streaming chat with any loaded model, several conversations (kept in the browser), system prompt,
-  Qwen3 thinking toggle (the `<think>` part is shown collapsible), per-chat sampling parameters, tokens/s per reply.
+- **Chat**: streaming chat with any loaded model; conversations kept in the browser (searchable, renamable, grouped
+  by date, exportable as Markdown); edit a message and resend, regenerate, copy; Markdown with tables and code blocks;
+  Qwen3 thinking toggle (the `<think>` part is collapsible); per-chat sampling parameters and system prompt; tokens/s
+  and a context-usage meter; light / dark theme.
+- **Tools**: pick per chat which functions the model may call. Built in: `web_search` (DuckDuckGo with no key,
+  or a SearXNG instance, or the Brave Search API), `fetch_url` (a page as readable text; private addresses refused
+  unless allowed), `calculator` and `current_time`. **MCP servers** add their tools: stdio commands
+  (`npx -y @modelcontextprotocol/server-filesystem ~/notes`, `uvx mcp-server-fetch`, ...), Streamable HTTP and
+  legacy SSE servers, with headers / environment for credentials; Claude Desktop / Cursor `mcpServers` JSON can be
+  pasted as it is. The server runs the calls, feeds the results back and lets the model continue (up to a set number
+  of rounds); each call shows as a card with its arguments and result. A *try a tool* panel runs any tool by hand.
+  Settings and servers are stored in `jllm-web-tools.json`.
 - **Models**: paste a Hugging Face link — the model page, `.../tree/<revision>`, `.../blob/main/<file>.gguf`,
-  `owner/name`, `owner/name:Q4_K_M` — or a local `.gguf` path; *Inspect* lists the repository's files (and the
-  GGUF files to pick from), then *Download only* or *Load* with per-model options: id, backend, context length,
-  KV cache type, weight quantization, batch, threads, speculative decoding / draft model, low-disk conversion.
-  Downloads and loads run as background jobs with progress and cancel. Several models can be loaded at once;
-  the `model` field of an API request picks one (with a single model loaded any name works). Loaded models show
-  their settings, requests and speed and can be unloaded (running requests are cancelled first). Models on disk
-  can be loaded again or deleted.
+  `owner/name`, `owner/name:Q4_K_M` — or a local `.gguf` path, or pick a popular one; *Inspect* lists the
+  repository's files (and the GGUF files to pick from), then *Download only* or *Load* with per-model options: id,
+  backend, context length, KV cache type, weight quantization, batch, threads, speculative decoding / draft model,
+  low-disk conversion. Downloads and loads run as background jobs with progress and cancel. Several models can be
+  loaded at once; the `model` field of an API request picks one (with a single model loaded any name works). Loaded
+  models show their settings, requests and speed and can be unloaded (running requests are cancelled first). Models
+  on disk can be loaded again or deleted.
 - **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
   from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
   `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and
   weight settings to the next load.
-- **Logs**: the engine's output (download progress, conversion, errors) live.
+- **Logs**: the engine's output (download progress, conversion, MCP server stderr, errors) live, with a filter.
 - **API**: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions` (same fields and streaming
-  behaviour as `jllm serve`), and the management API the console uses: `/api/models/load|download|loaded|local`,
-  `/api/hub/inspect`, `/api/jobs`, `/api/settings`, `/api/logs`, `/api/status`.
+  behaviour as `jllm serve`). Chat completions also accept OpenAI **function calling**: `tools` and `tool_choice`
+  (`auto`, `none`, `required` or a named function); the model's calls come back as `tool_calls` with finish reason
+  `tool_calls`, and `tool` messages carry the results back. `POST /api/chat` is the console's chat with server-side
+  tools (an event stream). The management API: `/api/models/load|download|loaded|local`, `/api/hub/inspect`,
+  `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`.
+
+Function calling uses the Hermes / Qwen format (`<tools>` in the system prompt, `<tool_call>` blocks in the answer,
+`<tool_response>` for results), which Qwen2.5 and Qwen3 were trained on; other families follow it less reliably, and
+a 0.6B model picks the right tool for simple requests but not for long chains. MCP stdio servers run as child
+processes with your user's rights, and the tools of an MCP server can do whatever that server allows (write files,
+call APIs), so only add servers you trust and enable their tools in chats where you want them.
 
 The console binds to `127.0.0.1` by default: the management API can load models and delete files. Set
 `jllm.web.api-key` before exposing it; `/v1/**` and `/api/**` then need `Authorization: Bearer <key>`.
@@ -269,11 +288,14 @@ scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model 
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
   src/main/java/org/robomiri/jllm/web/
     models/              Hugging Face links, download / load jobs, loaded models, models on disk
+    chat/                /api/chat (the agent loop) and what it shares with the OpenAI endpoints
+    tools/               tool-call prompt format and parsing, built-in tools (search, fetch, calculator, time)
+    mcp/                 MCP client: stdio, Streamable HTTP and SSE transports, server manager
     openai/              /v1 endpoints
     settings/            jllm.properties view and persisted overrides
-    api/                 /api management endpoints, API key filter
+    api/                 /api management and tools endpoints, API key filter
     logs/                captured engine output
-  src/main/resources/static/   the console (plain HTML/CSS/JS, no build step)
+  src/main/resources/static/   the console (plain HTML/CSS/JS modules, no build step)
 ```
 
 ## License

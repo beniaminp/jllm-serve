@@ -4,140 +4,222 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>jllm console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b6cf6'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3Ej%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
+<script>try { const t = localStorage.getItem('jllm.theme'); if (t && t !== '"auto"') document.documentElement.dataset.theme = JSON.parse(t); } catch {}</script>
 </head>
 <body>
-<header>
-  <div class="brand">jllm<span>console</span></div>
-  <nav>
-    <button data-tab="chat" class="active">Chat</button>
-    <button data-tab="models">Models</button>
-    <button data-tab="settings">Settings</button>
-    <button data-tab="logs">Logs</button>
-    <button data-tab="api">API</button>
-  </nav>
-  <div id="status" class="status"></div>
-</header>
+<div class="app">
+  <!-- ============================================================== navigation rail -->
+  <aside class="rail" id="rail">
+    <div class="brand"><span class="logo">j</span><span class="brand-text">jllm <em>console</em></span></div>
+    <nav>
+      <button data-tab="chat" class="active"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/></svg><span>Chat</span></button>
+      <button data-tab="models"><svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5zM3 13l9 5 9-5M3 17.5l9 5 9-5"/></svg><span>Models</span></button>
+      <button data-tab="tools"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.2L3 17.8V21h3.2l6.3-6.3a4 4 0 0 0 5.2-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg><span>Tools</span></button>
+      <button data-tab="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
+      <button data-tab="logs"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg><span>Logs</span></button>
+      <button data-tab="api"><svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>API</span></button>
+    </nav>
+    <div class="rail-foot">
+      <div id="status" class="status"></div>
+      <button id="theme-toggle" class="ghost small" title="Theme">◐ <span id="theme-label">auto</span></button>
+    </div>
+  </aside>
 
-<main>
-  <!-- ============================================================== chat -->
-  <section id="tab-chat" class="tab active">
-    <aside class="convs">
-      <button id="new-chat" class="primary wide">+ New chat</button>
-      <ul id="conv-list"></ul>
-    </aside>
-    <div class="chat">
-      <div class="chat-bar">
-        <label>Model <select id="chat-model"></select></label>
-        <label class="check"><input type="checkbox" id="chat-think"> thinking</label>
-        <button id="toggle-params" class="ghost">Parameters</button>
+  <main>
+    <!-- ============================================================== chat -->
+    <section id="tab-chat" class="tab active">
+      <aside class="convs" id="convs">
+        <div class="convs-head">
+          <button id="new-chat" class="primary wide">＋ New chat</button>
+          <input id="conv-search" type="search" placeholder="Search chats">
+        </div>
+        <div id="conv-list" class="conv-list"></div>
+      </aside>
+      <div class="chat">
+        <div class="chat-bar">
+          <button id="toggle-convs" class="icon-btn" title="Chats">☰</button>
+          <select id="chat-model" class="model-select" title="Model"></select>
+          <div class="popover-wrap">
+            <button id="tools-btn" class="chip" title="Tools the model may call">🛠 Tools <span id="tools-count" class="count"></span></button>
+            <div id="tools-pop" class="popover hidden"></div>
+          </div>
+          <label class="switch" title="Qwen3 thinking mode"><input type="checkbox" id="chat-think"><span></span> Think</label>
+          <button id="toggle-params" class="chip">⚙ Parameters</button>
+          <div class="spacer"></div>
+          <div id="ctx-meter" class="ctx-meter hidden" title="context used by the last turn"><div class="bar"><div></div></div><span></span></div>
+          <button id="export-chat" class="icon-btn" title="Export as Markdown">⤓</button>
+        </div>
+        <div class="chat-body">
+          <div id="messages" class="messages"></div>
+          <aside id="params" class="drawer hidden">
+            <div class="drawer-head"><h3>Parameters</h3><button class="icon-btn" id="close-params">✕</button></div>
+            <label>System prompt <textarea id="p-system" rows="4" placeholder="(none)"></textarea></label>
+            <div class="grid2">
+              <label>temperature <input id="p-temperature" type="number" step="0.05" min="0" placeholder="default"></label>
+              <label>top_p <input id="p-top_p" type="number" step="0.01" min="0" max="1" placeholder="default"></label>
+              <label>top_k <input id="p-top_k" type="number" step="1" min="0" placeholder="default"></label>
+              <label>min_p <input id="p-min_p" type="number" step="0.01" min="0" max="1" placeholder="default"></label>
+              <label>max_tokens <input id="p-max_tokens" type="number" step="1" min="1" placeholder="default"></label>
+              <label>repetition_penalty <input id="p-repetition_penalty" type="number" step="0.05" min="0" placeholder="default"></label>
+              <label>presence_penalty <input id="p-presence_penalty" type="number" step="0.1" placeholder="default"></label>
+              <label>seed <input id="p-seed" type="number" step="1" placeholder="random"></label>
+            </div>
+            <p class="hint">Empty fields use the server defaults (<a href="#settings">Settings</a>, <code>sampling.*</code>). Saved in this browser.</p>
+            <button id="reset-params" class="ghost small">Reset to defaults</button>
+          </aside>
+        </div>
+        <form id="composer" class="composer">
+          <div class="composer-box">
+            <textarea id="input" rows="1" placeholder="Message…"></textarea>
+            <div class="composer-row">
+              <span id="composer-hint" class="hint"></span>
+              <button type="button" id="stop" class="danger hidden">■ Stop</button>
+              <button type="submit" id="send" class="primary">Send ↵</button>
+            </div>
+          </div>
+        </form>
       </div>
-      <div id="params" class="params hidden">
-        <label>System prompt <textarea id="p-system" rows="2" placeholder="(none)"></textarea></label>
+    </section>
+
+    <!-- ============================================================== models -->
+    <section id="tab-models" class="tab page">
+      <header class="page-head"><h1>Models</h1><p class="muted">Download from Hugging Face, load with per-model settings, unload.</p></header>
+      <div class="card">
+        <h2>Add a model</h2>
+        <form id="inspect-form" class="row">
+          <input id="hf-link" placeholder="https://huggingface.co/Qwen/Qwen3-0.6B  ·  unsloth/Qwen3-0.6B-GGUF:Q4_K_M  ·  /path/model.gguf" required>
+          <button class="primary">Inspect</button>
+        </form>
+        <div class="quick" id="quick-picks"></div>
+        <div id="inspect-result"></div>
+      </div>
+      <div class="card"><h2>Loaded <span class="muted small">served on <code>/v1</code> and in the chat</span></h2><div id="loaded-list"></div></div>
+      <div class="card"><h2>Jobs <button id="clear-jobs" class="ghost small">clear finished</button></h2><div id="job-list"></div></div>
+      <div class="card"><h2>On disk <span id="model-dir" class="muted small"></span></h2><div id="local-list"></div></div>
+    </section>
+
+    <!-- ============================================================== tools -->
+    <section id="tab-tools" class="tab page">
+      <header class="page-head"><h1>Tools</h1><p class="muted">Functions the model can call in the chat: built-in ones and those of MCP servers. Stored in <code id="tools-file"></code>.</p></header>
+      <div class="card">
+        <h2>Built-in tools</h2>
+        <div id="builtin-list" class="tool-grid"></div>
+        <details class="sub" open>
+          <summary>Web search &amp; fetch</summary>
+          <div class="grid">
+            <label>Search provider <select id="ts-provider"><option value="auto">auto</option><option value="duckduckgo">DuckDuckGo (free, no key)</option><option value="searxng">SearXNG (self-hosted)</option><option value="brave">Brave Search API</option></select></label>
+            <label>SearXNG URL <input id="ts-searxng" placeholder="http://localhost:8888"></label>
+            <label>Brave API key <input id="ts-brave" type="password" placeholder="free tier: 2000 queries / month"></label>
+            <label>Results <input id="ts-max" type="number" min="1" max="20"></label>
+            <label>Fetch: max characters <input id="ts-fetch-max" type="number" min="500"></label>
+            <label class="check"><input type="checkbox" id="ts-private"> fetch may reach private / local addresses</label>
+          </div>
+          <p class="hint"><em>auto</em> uses SearXNG when a URL is set, else Brave when a key is set, else DuckDuckGo. DuckDuckGo needs no key but
+            sometimes answers servers with a bot check; a local SearXNG (<code>docker run -p 8888:8080 searxng/searxng</code>, with <code>json</code> in <code>search.formats</code>) is the most reliable free option.</p>
+        </details>
+        <details class="sub">
+          <summary>Agent loop</summary>
+          <div class="grid">
+            <label>Max tool rounds per answer <input id="ts-rounds" type="number" min="1" max="50"></label>
+            <label>Max characters per tool result <input id="ts-result" type="number" min="200"></label>
+            <label>Tool timeout (s) <input id="ts-timeout" type="number" min="1"></label>
+          </div>
+        </details>
+        <div class="row"><button id="ts-save" class="primary">Save tool settings</button><span id="ts-msg"></span></div>
+      </div>
+
+      <div class="card">
+        <h2>MCP servers <span class="muted small">Model Context Protocol: stdio processes, Streamable HTTP or SSE</span></h2>
+        <div id="mcp-list"></div>
+        <details class="sub" id="mcp-add">
+          <summary>＋ Add a server</summary>
+          <div class="tabs-inline" id="mcp-type">
+            <button data-type="stdio" class="active">Command (stdio)</button><button data-type="http">Streamable HTTP</button><button data-type="sse">SSE (legacy)</button><button data-type="json">Paste JSON</button>
+          </div>
+          <form id="mcp-form">
+            <div class="grid">
+              <label>Name <input name="name" placeholder="filesystem" pattern="[A-Za-z0-9_\-]{1,32}" required></label>
+              <label class="t-stdio">Command <input name="command" placeholder="npx"></label>
+              <label class="t-stdio wide2">Arguments (one per line) <textarea name="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/home/me/notes"></textarea></label>
+              <label class="t-stdio wide2">Environment (KEY=value per line) <textarea name="env" rows="2" placeholder="API_KEY=..."></textarea></label>
+              <label class="t-http t-sse wide2">URL <input name="url" placeholder="https://example.com/mcp"></label>
+              <label class="t-http t-sse wide2">Headers (Name: value per line) <textarea name="headers" rows="2" placeholder="Authorization: Bearer ..."></textarea></label>
+              <label class="t-json wide3">Claude Desktop / Cursor format <textarea name="json" rows="8" placeholder='{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}'></textarea></label>
+            </div>
+            <div class="row"><button class="primary">Add &amp; connect</button><span id="mcp-msg"></span></div>
+          </form>
+        </details>
+      </div>
+
+      <div class="card">
+        <h2>Try a tool</h2>
         <div class="grid">
-          <label>temperature <input id="p-temperature" type="number" step="0.05" min="0"></label>
-          <label>top_p <input id="p-top_p" type="number" step="0.01" min="0" max="1"></label>
-          <label>top_k <input id="p-top_k" type="number" step="1" min="0"></label>
-          <label>min_p <input id="p-min_p" type="number" step="0.01" min="0" max="1"></label>
-          <label>max_tokens <input id="p-max_tokens" type="number" step="1" min="1"></label>
-          <label>repetition_penalty <input id="p-repetition_penalty" type="number" step="0.05" min="0"></label>
-          <label>seed <input id="p-seed" type="number" step="1"></label>
+          <label>Tool <select id="try-tool"></select></label>
+          <label class="wide2">Arguments (JSON) <textarea id="try-args" rows="3" class="mono">{}</textarea></label>
         </div>
-        <p class="hint">Empty fields use the server defaults (Settings tab, <code>sampling.*</code>).</p>
+        <div class="row"><button id="try-run" class="primary">Run</button><span id="try-meta" class="muted small"></span></div>
+        <pre id="try-out" class="code hidden"></pre>
       </div>
-      <div id="messages" class="messages"></div>
-      <form id="composer" class="composer">
-        <textarea id="input" rows="3" placeholder="Message… (Enter to send, Shift+Enter for a new line)"></textarea>
-        <div class="composer-actions">
-          <button type="submit" id="send" class="primary">Send</button>
-          <button type="button" id="stop" class="danger hidden">Stop</button>
-        </div>
-      </form>
-    </div>
-  </section>
+    </section>
 
-  <!-- ============================================================== models -->
-  <section id="tab-models" class="tab">
-    <div class="card">
-      <h2>Add a model from Hugging Face</h2>
-      <form id="inspect-form" class="row">
-        <input id="hf-link" placeholder="https://huggingface.co/Qwen/Qwen3-0.6B  ·  unsloth/Qwen3-0.6B-GGUF:Q4_K_M  ·  /path/model.gguf" required>
-        <button class="primary">Inspect</button>
-      </form>
-      <div id="inspect-result"></div>
-    </div>
-
-    <div class="card">
-      <h2>Loaded <span class="muted small">(served on <code>/v1</code>)</span></h2>
-      <div id="loaded-list"></div>
-    </div>
-
-    <div class="card">
-      <h2>Jobs <button id="clear-jobs" class="ghost small">clear finished</button></h2>
-      <div id="job-list"></div>
-    </div>
-
-    <div class="card">
-      <h2>On disk <span id="model-dir" class="muted small"></span></h2>
-      <div id="local-list"></div>
-    </div>
-  </section>
-
-  <!-- ============================================================== settings -->
-  <section id="tab-settings" class="tab">
-    <div class="card">
-      <h2>Engine settings</h2>
-      <p class="hint">The keys of <code>jllm.properties</code>. Changes are stored in <code id="settings-file"></code>.
-        <span class="badge live">live</span> applies to the next request,
-        <span class="badge load">load</span> to the next model load (loaded models keep theirs),
-        <span class="badge cli">cli</span> is only used by the command line tools.</p>
-      <div class="row">
-        <input id="settings-filter" placeholder="filter…">
+    <!-- ============================================================== settings -->
+    <section id="tab-settings" class="tab page">
+      <header class="page-head"><h1>Engine settings</h1>
+        <p class="muted">The keys of <code>jllm.properties</code>. Changes are stored in <code id="settings-file"></code>.
+          <span class="badge live">live</span> next request · <span class="badge load">load</span> next model load · <span class="badge cli">cli</span> command line tools only.</p></header>
+      <div class="toolbar sticky">
+        <input id="settings-filter" type="search" placeholder="Filter settings…">
+        <span id="settings-dirty" class="muted small"></span>
+        <button id="settings-discard" class="ghost">Discard</button>
         <button id="settings-save" class="primary">Save changes</button>
       </div>
       <div id="settings-msg"></div>
       <div id="settings-list"></div>
-    </div>
-  </section>
+    </section>
 
-  <!-- ============================================================== logs -->
-  <section id="tab-logs" class="tab">
-    <div class="card fill">
-      <h2>Log <label class="check small"><input type="checkbox" id="log-follow" checked> follow</label></h2>
+    <!-- ============================================================== logs -->
+    <section id="tab-logs" class="tab page fill">
+      <header class="page-head row"><h1>Log</h1><div class="spacer"></div>
+        <input id="log-filter" type="search" placeholder="Filter…">
+        <label class="switch"><input type="checkbox" id="log-follow" checked><span></span> Follow</label>
+        <button id="log-clear" class="ghost small">Clear view</button></header>
       <pre id="log" class="log"></pre>
       <pre id="log-pending" class="log pending"></pre>
-    </div>
-  </section>
+    </section>
 
-  <!-- ============================================================== api -->
-  <section id="tab-api" class="tab">
-    <div class="card">
-      <h2>OpenAI-compatible API</h2>
-      <p>Base URL: <code id="base-url"></code> · the <code>model</code> field picks one of the loaded models (with a single model loaded, any name works).</p>
-      <p id="api-key-note"></p>
-      <h3>curl</h3>
-      <pre id="ex-curl" class="code"></pre>
-      <h3>Python (openai)</h3>
-      <pre id="ex-python" class="code"></pre>
-      <h3>Endpoints</h3>
-      <table class="table">
-        <tr><td><code>GET /v1/models</code></td><td>loaded models</td></tr>
-        <tr><td><code>POST /v1/chat/completions</code></td><td>chat, <code>stream</code>, <code>stream_options.include_usage</code>, <code>enable_thinking</code></td></tr>
-        <tr><td><code>POST /v1/completions</code></td><td>raw text completion</td></tr>
-        <tr><td><code>GET/PUT /api/settings</code></td><td>engine settings</td></tr>
-        <tr><td><code>POST /api/models/load</code>, <code>DELETE /api/models/loaded?id=</code></td><td>load / unload</td></tr>
-        <tr><td><code>POST /api/models/download</code>, <code>GET /api/jobs</code></td><td>downloads and their progress</td></tr>
-        <tr><td><code>GET /api/models/local</code>, <code>GET /api/hub/inspect?source=</code></td><td>models on disk, a repository's files</td></tr>
-        <tr><td><code>GET /api/status</code>, <code>GET /api/logs?after=</code></td><td>status, log</td></tr>
-      </table>
-    </div>
-    <div class="card">
-      <h2>API key</h2>
-      <p class="hint">Only needed when the server runs with <code>jllm.web.api-key</code>. Kept in this browser.</p>
-      <div class="row"><input id="api-key" type="password" placeholder="key"><button id="api-key-save" class="primary">Save</button></div>
-    </div>
-  </section>
-</main>
+    <!-- ============================================================== api -->
+    <section id="tab-api" class="tab page">
+      <header class="page-head"><h1>API</h1><p class="muted">OpenAI-compatible endpoints over the loaded models, plus the management API this console uses.</p></header>
+      <div class="card">
+        <p>Base URL <code id="base-url"></code> · the <code>model</code> field picks a loaded model (with a single model loaded, any name works).</p>
+        <p id="api-key-note" class="muted"></p>
+        <h3>curl</h3><pre id="ex-curl" class="code"></pre>
+        <h3>Python (openai)</h3><pre id="ex-python" class="code"></pre>
+        <h3>Function calling</h3><pre id="ex-tools" class="code"></pre>
+        <h3>Endpoints</h3>
+        <table class="table">
+          <tr><td><code>GET /v1/models</code></td><td>loaded models</td></tr>
+          <tr><td><code>POST /v1/chat/completions</code></td><td>chat; <code>stream</code>, <code>tools</code> / <code>tool_choice</code> (calls come back as <code>tool_calls</code>), <code>enable_thinking</code></td></tr>
+          <tr><td><code>POST /v1/completions</code></td><td>raw text completion</td></tr>
+          <tr><td><code>POST /api/chat</code></td><td>chat with server-side tools (<code>"tools": ["web_search", …]</code>), event stream</td></tr>
+          <tr><td><code>GET /api/tools</code>, <code>POST /api/tools/call</code>, <code>POST /api/tools/mcp</code></td><td>tools, a manual call, add MCP servers</td></tr>
+          <tr><td><code>POST /api/models/load</code>, <code>DELETE /api/models/loaded?id=</code></td><td>load / unload</td></tr>
+          <tr><td><code>POST /api/models/download</code>, <code>GET /api/jobs</code></td><td>downloads and their progress</td></tr>
+          <tr><td><code>GET/PUT /api/settings</code>, <code>GET /api/status</code>, <code>GET /api/logs?after=</code></td><td>settings, status, log</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2>API key</h2>
+        <p class="hint">Only needed when the server runs with <code>jllm.web.api-key</code>. Kept in this browser.</p>
+        <div class="row"><input id="api-key" type="password" placeholder="key"><button id="api-key-save" class="primary">Save</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts" class="toasts"></div>
 
 <template id="load-form-tpl">
   <form class="load-form">
@@ -162,6 +244,11 @@
   </form>
 </template>
 
-<script src="app.js"></script>
+<script src="js/core.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/chat.js"></script>
+<script src="js/models.js"></script>
+<script src="js/tools.js"></script>
+<script src="js/admin.js"></script>
 </body>
 </html>
