@@ -222,6 +222,8 @@ void jm_abort(void *ctx) {}
 
 int jm_commit_wait(void *ctx, char *err, int errlen) { return 0; }
 
+int jm_wait_pending(void *ctx, int keep, char *err, int errlen) { return 0; } // dispatches already ran
+
 void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, int nbuf, const void *params, int plen,
                  int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
     const Kernel &k = kernels()[(size_t) pipeline];

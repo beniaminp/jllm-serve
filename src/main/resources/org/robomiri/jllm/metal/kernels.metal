@@ -6,6 +6,7 @@
 //   5. mixture of experts   6. state space (Mamba)   7. DeepSeek MLA (latent cache store, query absorption)
 //   8. Q6_K (block format, row / tile walks and the _q6k instantiations of every matmul / moe kernel)
 //   9. flash-attention prefill (attention_fa: simdgroup-matrix QK^T and PV, online softmax)
+//  10. pipelined greedy decoding (embed_token: the embedding of a token id the GPU chose; argmax)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -2585,3 +2586,109 @@ template [[host_name("attention_fa_d128")]] kernel decltype(attention_fa<float, 
 template [[host_name("attention_fa_d128_h")]] kernel decltype(attention_fa<half, 128>) attention_fa<half, 128>;
 template [[host_name("attention_fa_d256")]] kernel decltype(attention_fa<float, 256>) attention_fa<float, 256>;
 template [[host_name("attention_fa_d256_h")]] kernel decltype(attention_fa<half, 256>) attention_fa<half, 256>;
+
+// ---------------------------------------------------------------------------------------------- 10. pipelined greedy decoding
+// A greedy decode step can be queued before the CPU has seen the previous token: argmax writes the chosen id into a
+// small ring of token slots and the next step's embed_token reads it from there, so the GPU goes from step to step
+// without waiting for the CPU (MetalBackend.GreedyPipe).
+
+struct EmbedParams {
+    int cols;        // model dim
+    int slot;        // token ring slot to read
+    float scale;     // the family's embedding multiplier (Gemma: sqrt(dim)), 1 otherwise
+};
+
+// 32 weights of quantization block b of row grow, as 8 float4 (any format of the embedding table)
+template <int QT>
+static inline void dequant_block(device const uchar *wq, device const float *ws, ulong grow, int nb, int b,
+                                 thread float4 *w) {
+    if (QT == 4) {
+        device const uchar4 *q = (device const uchar4 *)(wq + grow * nb * 16 + b * 16);
+        const float s = ws[grow * nb + b];
+        for (int k = 0; k < 4; k++) {
+            uchar4 v = q[k];
+            w[k] = (float4(v & uchar4(15)) - 8.0f) * s;
+            w[k + 4] = (float4(v >> uchar4(4)) - 8.0f) * s;
+        }
+    } else if (QT == 8) {
+        device const char4 *q = (device const char4 *)(wq + grow * nb * 32 + b * 32);
+        const float s = ws[grow * nb + b];
+        for (int k = 0; k < 8; k++) w[k] = float4(q[k]) * s;
+    } else if (QT >= GG_FIRST) {
+        gg_unit<QT>(wq, grow, nb, b, w);
+    } else if (QT == 6) {
+        q6k_sub_block(wq, grow, (nb + 7) >> 3, 2 * b, w);
+        q6k_sub_block(wq, grow, (nb + 7) >> 3, 2 * b + 1, w + 4);
+    } else {
+        q2k_sub_block(wq, grow, (nb + 7) >> 3, 2 * b, w);
+        q2k_sub_block(wq, grow, (nb + 7) >> 3, 2 * b + 1, w + 4);
+    }
+}
+
+// x[0, :] = scale * embedding row tok[slot]. One threadgroup; threads walk the blocks.
+template <int QT>
+kernel void embed_token(device const uchar *wq [[buffer(0)]],
+                        device const float *ws [[buffer(1)]],
+                        device const int *tok [[buffer(2)]],
+                        device float *x [[buffer(3)]],
+                        constant EmbedParams &p [[buffer(4)]],
+                        ushort tid [[thread_index_in_threadgroup]],
+                        ushort tpg [[threads_per_threadgroup]]) {
+    const int nb = p.cols / QK;
+    const ulong row = (ulong)tok[p.slot];
+    for (int b = tid; b < nb; b += tpg) {
+        float4 w[8];
+        dequant_block<QT>(wq, ws, row, nb, b, w);
+        device float4 *o = (device float4 *)(x + b * QK);
+        for (int k = 0; k < 8; k++) o[k] = w[k] * p.scale;
+    }
+}
+
+struct ArgmaxParams {
+    int n;           // candidates: the valid token ids
+    int slot;        // token ring slot to write
+};
+
+// tok[slot] = the index of the largest of v[0 .. n), the lowest index among equal maxima (as Sampler's argmax).
+// One threadgroup of ROW_THREADS threads.
+kernel void argmax(device const float *v [[buffer(0)]],
+                   device int *tok [[buffer(1)]],
+                   constant ArgmaxParams &p [[buffer(2)]],
+                   ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float bv[ROW_THREADS];
+    threadgroup int bi[ROW_THREADS];
+    float best = -INFINITY;
+    int idx = p.n;
+    for (int i = tid; i < p.n; i += ROW_THREADS) {
+        const float a = v[i];
+        if (a > best) {   // strictly greater: within a thread the lower index is kept
+            best = a;
+            idx = i;
+        }
+    }
+    bv[tid] = best;
+    bi[tid] = idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = ROW_THREADS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float o = bv[tid + s];
+            const int oi = bi[tid + s];
+            if (o > bv[tid] || (o == bv[tid] && oi < bi[tid])) {
+                bv[tid] = o;
+                bi[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) tok[p.slot] = bi[0] < p.n ? bi[0] : 0;
+}
+
+typedef decltype(embed_token<4>) embed_token_t;
+template [[host_name("embed_token_q4")]] kernel embed_token_t embed_token<4>;
+template [[host_name("embed_token_q8")]] kernel embed_token_t embed_token<8>;
+template [[host_name("embed_token_q2k")]] kernel embed_token_t embed_token<2>;
+template [[host_name("embed_token_q6k")]] kernel embed_token_t embed_token<6>;
+template [[host_name("embed_token_q4g")]] kernel embed_token_t embed_token<GG_Q4_0>;
+template [[host_name("embed_token_q8g")]] kernel embed_token_t embed_token<GG_Q8_0>;
+template [[host_name("embed_token_q4k")]] kernel embed_token_t embed_token<GG_Q4_K>;
+template [[host_name("embed_token_q5k")]] kernel embed_token_t embed_token<GG_Q5_K>;

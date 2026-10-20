@@ -30,7 +30,7 @@ import java.util.stream.Stream;
 public final class SafeTensors implements AutoCloseable {
 
     public enum DType {
-        F64(8), F32(4), F16(2), BF16(2), I64(8), I32(4), I16(2), I8(1), U8(1), BOOL(1);
+        F64(8), F32(4), F16(2), BF16(2), I64(8), I32(4), I16(2), I8(1), U64(8), U32(4), U16(2), U8(1), BOOL(1);
 
         public final int bytes;
 
@@ -43,8 +43,20 @@ public final class SafeTensors implements AutoCloseable {
     private static final ValueLayout.OfFloat FLOAT_LE = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfDouble DOUBLE_LE = ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    /** A tensor view over mapped file memory. */
-    public record Tensor(String name, DType dtype, long[] shape, MemorySegment data) {
+    /**
+     * A tensor view over mapped file memory, or a computed tensor ({@code reader} != null: its floats are produced by
+     * the reader, e.g. a dequantized MLX matrix; {@code data} is then the packed source and {@code dtype} its type).
+     */
+    public record Tensor(String name, DType dtype, long[] shape, MemorySegment data, Reader reader) {
+
+        /** Produces {@code n} floats from flat element index {@code start}. */
+        public interface Reader {
+            void toFloat(long start, float[] dst, int dstOff, int n);
+        }
+
+        public Tensor(String name, DType dtype, long[] shape, MemorySegment data) {
+            this(name, dtype, shape, data, null);
+        }
 
         public long numel() {
             long n = 1;
@@ -65,6 +77,10 @@ public final class SafeTensors implements AutoCloseable {
          * a plain array loop, instead of one bounds-checked segment access per element.
          */
         public void toFloat(long start, float[] dst, int dstOff, int n) {
+            if (reader != null) {
+                reader.toFloat(start, dst, dstOff, n);
+                return;
+            }
             switch (dtype) {
                 case F32 -> MemorySegment.copy(data, FLOAT_LE, start * 4, dst, dstOff, n);
                 case BF16 -> {

@@ -69,6 +69,7 @@ public final class SmokeTest {
         threadPool();
         prefixReuse(dir);
         persistCache(dir);
+        mlxQuant();
         deepseekConfigs();
         System.out.println("all smoke tests passed");
     }
@@ -1262,6 +1263,70 @@ public final class SmokeTest {
                     Files.deleteIfExists(f);
                 }
             }
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /**
+     * MLX affine quantization ({@link org.robomiri.jllm.model.MlxQuant}): codes packed little-endian into uint32 words
+     * here the way MLX packs them, f16 scales and biases per group; the dequantized view must give scale * q + bias
+     * exactly, for 4 and 8 bits, and the group size from config.json must win over the shape ambiguity of an 8-bit
+     * layer with groups of 64 (= the shapes of 4 bits with groups of 128).
+     */
+    static void mlxQuant() throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-mlx");
+        try {
+            Files.writeString(tmp.resolve("config.json"), "{\"quantization\": {\"group_size\": 64, \"bits\": 4}}");
+            org.robomiri.jllm.model.MlxQuant mq = org.robomiri.jllm.model.MlxQuant.read(tmp);
+            check(mq != null && mq.groupSize == 64 && mq.bits == 4, "MLX quantization read from config.json");
+            Random rnd = new Random(3);
+            for (int bits : new int[]{4, 8}) {
+                int rows = 3;
+                int cols = 256;
+                int groups = cols / 64;
+                java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofAuto();
+                var packed = arena.allocate((long) rows * cols * bits / 8);
+                var scales = arena.allocate((long) rows * groups * 2);
+                var biases = arena.allocate((long) rows * groups * 2);
+                int[][] q = new int[rows][cols];
+                float[][] sc = new float[rows][groups];
+                float[][] bi = new float[rows][groups];
+                var le = java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+                var le16 = java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (int r = 0; r < rows; r++) {
+                    for (int g = 0; g < groups; g++) {
+                        sc[r][g] = Float.float16ToFloat(Float.floatToFloat16(rnd.nextFloat() * 0.1f));
+                        bi[r][g] = Float.float16ToFloat(Float.floatToFloat16(-rnd.nextFloat()));
+                        scales.setAtIndex(le16, (long) r * groups + g, Float.floatToFloat16(sc[r][g]));
+                        biases.setAtIndex(le16, (long) r * groups + g, Float.floatToFloat16(bi[r][g]));
+                    }
+                    int perWord = 32 / bits;
+                    for (int c = 0; c < cols; c++) {
+                        q[r][c] = rnd.nextInt(1 << bits);
+                        long word = (long) r * (cols / perWord) + c / perWord;
+                        int old = packed.getAtIndex(le, word);
+                        packed.setAtIndex(le, word, old | (q[r][c] << ((c % perWord) * bits)));
+                    }
+                }
+                var u32 = new org.robomiri.jllm.safetensors.SafeTensors.Tensor("w", org.robomiri.jllm.safetensors.SafeTensors.DType.U32,
+                        new long[]{rows, (long) cols * bits / 32}, packed);
+                var f16s = new org.robomiri.jllm.safetensors.SafeTensors.Tensor("s", org.robomiri.jllm.safetensors.SafeTensors.DType.F16,
+                        new long[]{rows, groups}, scales);
+                var f16b = new org.robomiri.jllm.safetensors.SafeTensors.Tensor("b", org.robomiri.jllm.safetensors.SafeTensors.DType.F16,
+                        new long[]{rows, groups}, biases);
+                var t = mq.dequantized("w", u32, f16s, f16b);
+                float[] row = new float[cols];
+                boolean exact = t.dim(0) == rows && t.dim(1) == cols;
+                for (int r = 0; r < rows && exact; r++) {
+                    t.toFloat((long) r * cols, row, 0, cols);
+                    for (int c = 0; c < cols; c++) {
+                        exact &= row[c] == sc[r][c / 64] * q[r][c] + bi[r][c / 64];
+                    }
+                }
+                check(exact, "MLX " + bits + "-bit dequantization is scale * q + bias (" + t + ")");
+            }
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);
         }
     }

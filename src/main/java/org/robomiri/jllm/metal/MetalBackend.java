@@ -485,7 +485,129 @@ public final class MetalBackend implements Backend {
     }
 
     /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
+    /**
+     * Records the decoder layers for n tokens at pos (x holds their embeddings). For a single token the rmsnorm
+     * preceding a projection is folded into the projection kernel (the *_norm variants read x and normalise on the
+     * fly); otherwise it writes xb first. {@code split}: submit every COMMIT_LAYERS layers so the GPU starts while the
+     * rest is encoded (not in a pipelined step, which must stay one command buffer).
+     */
+    private void encodeLayers(int n, int pos, boolean split) {
+        int dim = c.dim();
+        boolean fuseNorm = n == 1 && fusedNormFits;
+        for (int l = 0; l < c.layers(); l++) {
+            LayerPlan L = plans[l];
+            L.attention().run(l, n, pos, fuseNorm);
+            if (L.postAttnNorm() != null) {
+                // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
+                k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f);
+                k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
+            } else {
+                k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f);
+            }
+            L.ffn().run(l, n, fuseNorm);
+            if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
+                k.commit(); // the GPU starts on these layers while the next ones are encoded
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ pipelined greedy decoding
+
+    private Pipe pipe; // the one pipe of this backend, created on first use
+
+    @Override
+    public GreedyPipe greedyPipe(int vocab) {
+        if (!k.metal.canWaitPending() || !PIPELINE) {
+            return null;
+        }
+        if (pipe == null) {
+            pipe = new Pipe();
+        }
+        pipe.vocab = Math.min(vocab, w.lmHead.rows);
+        return pipe;
+    }
+
+    /** {@code -Djllm.metal.pipeline=false} turns pipelined greedy decoding off. */
+    static final boolean PIPELINE = !"false".equals(System.getProperty("jllm.metal.pipeline"));
+
+    /**
+     * Step j reads its token from ring slot j % R (written by step j - 1's argmax, or by the CPU for an explicit token,
+     * which is only allowed when nothing is in flight) and its argmax goes to slot (j + 1) % R. Each step is one
+     * command buffer, so "step j is done" is "at most submitted - j - 1 buffers are unfinished" (jm_wait_pending).
+     */
+    private final class Pipe implements GreedyPipe {
+        private static final int R = 4;
+        private final Metal.Buffer ring = k.scratch(R * 4);
+        private long submitted;
+        private long read;
+        private boolean open; // a command buffer is being recorded (between begin / commit and commitAndWait)
+        int vocab;
+
+        @Override
+        public void submit(int token, int pos) {
+            if (pos >= ctx) {
+                throw new IllegalArgumentException("position " + pos + " is past the context");
+            }
+            int slot = (int) (submitted % R);
+            if (token >= 0) {
+                if (submitted != read) {
+                    throw new IllegalStateException("an explicit token while steps are in flight");
+                }
+                ring.contents().setAtIndex(ValueLayout.JAVA_INT, slot, token);
+            }
+            if (!open) {
+                k.begin();
+                open = true;
+            }
+            boolean ok = false;
+            try {
+                k.embedToken(w.embed, embedQ, ring, slot, x, c.dim(), c.embedScale());
+                encodeLayers(1, pos, false);
+                k.rmsnorm(x, 0, finalNorm, xb, 1, c.dim());
+                k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
+                k.argmax(logitsBuf, vocab, ring, (slot + 1) % R);
+                k.commit(); // runs now; a fresh command buffer is open for the next step
+                ok = true;
+            } finally {
+                if (!ok) {
+                    k.abort();
+                    open = false;
+                    read = submitted;
+                }
+            }
+            submitted++;
+        }
+
+        @Override
+        public int next() {
+            if (read >= submitted) {
+                throw new IllegalStateException("no step in flight");
+            }
+            k.metal.waitPending((int) (submitted - read - 1));
+            int t = ring.contents().getAtIndex(ValueLayout.JAVA_INT, (int) ((read + 1) % R));
+            read++;
+            return t;
+        }
+
+        @Override
+        public int pending() {
+            return (int) (submitted - read);
+        }
+
+        @Override
+        public void drain() {
+            if (open) {
+                open = false;
+                k.commitAndWait(); // the empty buffer opened by the last commit, after every step before it
+            }
+            read = submitted;
+        }
+    }
+
     private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+        if (pipe != null) {
+            pipe.drain(); // never interleave with pipelined steps
+        }
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
@@ -505,24 +627,7 @@ public final class MetalBackend implements Backend {
         k.begin();
         boolean committed = false;
         try {
-            // For a single token the rmsnorm preceding a projection is folded into the projection kernel
-            // (the *_norm variants read x and normalise on the fly); otherwise it writes xb first.
-            boolean fuseNorm = n == 1 && fusedNormFits;
-            for (int l = 0; l < c.layers(); l++) {
-                LayerPlan L = plans[l];
-                L.attention().run(l, n, pos, fuseNorm);
-                if (L.postAttnNorm() != null) {
-                    // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
-                    k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f);
-                    k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
-                } else {
-                    k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f);
-                }
-                L.ffn().run(l, n, fuseNorm);
-                if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
-                    k.commit(); // the GPU starts on these layers while the next ones are encoded
-                }
-            }
+            encodeLayers(n, pos, true);
             if (logits != null && stride > 0) {
                 // every row (speculative verification): rmsnorm and LM head over the n tokens
                 if (logitsAllBuf == null || logitsAllRows < n) {
@@ -578,6 +683,9 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void saveState(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        if (pipe != null) {
+            pipe.drain();
+        }
         if (stateFormat() == null) {
             Backend.super.saveState(n, out);
         }
@@ -604,6 +712,9 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void loadState(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        if (pipe != null) {
+            pipe.drain();
+        }
         if (stateFormat() == null) {
             Backend.super.loadState(n, in);
         }
@@ -640,6 +751,12 @@ public final class MetalBackend implements Backend {
             Backend.super.copyStateFrom(other, n);
         }
         MetalBackend o = (MetalBackend) other;
+        if (pipe != null) {
+            pipe.drain();
+        }
+        if (o.pipe != null) {
+            o.pipe.drain();
+        }
         long bytes = (long) n * rowBytes();
         for (int l = 0; l < c.layers(); l++) {
             MemorySegment.copy(o.keyCache[l].contents(), 0, keyCache[l].contents(), 0, bytes);
@@ -649,6 +766,13 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void close() {
+        if (pipe != null) {
+            try {
+                pipe.drain();
+            } catch (RuntimeException ignored) {
+                // closing anyway
+            }
+        }
         k.close();
     }
 }

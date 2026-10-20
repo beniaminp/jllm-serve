@@ -241,6 +241,25 @@ void jm_abort(void *ctx) {
     }
 }
 
+// Waits until at most `keep` of the command buffers submitted with jm_commit are still unfinished, oldest first
+// (the queue runs them in order), and forgets the finished ones. Lets the CPU read the result of one pipelined
+// decode step while the next is already running. Returns 0, or -1 with the error of a failed buffer.
+int jm_wait_pending(void *ctx, int keep, char *err, int errlen) {
+    @autoreleasepool {
+        JMContext *c = (__bridge JMContext *) ctx;
+        while ((int) c.inflight.count > keep) {
+            id<MTLCommandBuffer> cmd = c.inflight.firstObject;
+            [cmd waitUntilCompleted];
+            [c.inflight removeObjectAtIndex:0];
+            if (cmd.status == MTLCommandBufferStatusError) {
+                set_err(err, errlen, cmd.error ? cmd.error.localizedDescription : @"command buffer failed");
+                return -1;
+            }
+        }
+        return 0;
+    }
+}
+
 // Submits the recorded work and blocks until the GPU is done with it and with everything jm_commit
 // submitted before. Returns 0 on success.
 int jm_commit_wait(void *ctx, char *err, int errlen) {

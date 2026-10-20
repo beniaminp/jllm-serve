@@ -48,6 +48,15 @@ public final class Sampler {
         }
     }
 
+    /**
+     * Greedy without penalties: the next token is exactly the argmax of the logits (lowest index among equal maxima),
+     * which a device can compute itself (pipelined decoding).
+     */
+    public boolean greedyPlain() {
+        return (p.temperature() == 0f || p.topK() == 1) && p.repetitionPenalty() == 1f && p.presencePenalty() == 0f
+                && p.frequencyPenalty() == 0f;
+    }
+
     /** Samples the next token. {@code logits} is modified in place. */
     public int sample(float[] logits) {
         if (!prepare(logits)) {

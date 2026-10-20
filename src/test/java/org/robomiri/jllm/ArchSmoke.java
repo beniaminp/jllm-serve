@@ -161,6 +161,9 @@ public final class ArchSmoke {
                 failures += mamba ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
+            if (!mamba) {
+                failures += pipeCheck(w, lib, cfg, gpu, label);
+            }
             if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
                 for (KvDtype dt : KvDtype.values()) {
                     failures += kvStateChecks(w, lib, cfg, dt);
@@ -267,6 +270,41 @@ public final class ArchSmoke {
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
         }
         return bad;
+    }
+
+    /**
+     * Pipelined greedy decoding (Backend.GreedyPipe: the GPU feeds its own argmax to the next step) gives the tokens of
+     * plain forward + argmax on the same backend.
+     */
+    private static int pipeCheck(ModelWeights w, String lib, Architecture cfg, int[] want, String label) {
+        float[] logits = new float[cfg.core().vocabSize()];
+        try (MetalBackend b = new MetalBackend(w, 64, 16, lib)) {
+            Backend.GreedyPipe pipe = b.greedyPipe(cfg.core().vocabSize());
+            if (pipe == null) {
+                return 0;
+            }
+            b.forward(PROMPT, 0, PROMPT.length, 0, logits);
+            int[] got = new int[NEW_TOKENS];
+            int best = 0;
+            for (int t = 1; t < logits.length; t++) {
+                if (logits[t] > logits[best]) {
+                    best = t;
+                }
+            }
+            got[0] = best;
+            int pos = PROMPT.length;
+            pipe.submit(best, pos);
+            for (int i = 1; i < NEW_TOKENS; i++) {
+                if (i + 1 < NEW_TOKENS) {
+                    pipe.submit(-1, pos + i); // queued before the token it feeds is read
+                }
+                got[i] = pipe.next();
+            }
+            pipe.drain();
+            boolean ok = Arrays.equals(got, want);
+            System.out.println("  pipe  " + Arrays.toString(got) + (ok ? "" : "  PIPELINE MISMATCH"));
+            return ok ? 0 : 1;
+        }
     }
 
     private static int[] generate(Backend b, float[] logits) {

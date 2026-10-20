@@ -73,6 +73,8 @@ public final class ModelConverter {
     /** Per shard: how many planned tensor reads are still outstanding. */
     private final Map<String, Integer> remaining = new HashMap<>();
     private final Map<String, SafeTensors> open = new LinkedHashMap<>();
+    /** MLX-quantized checkpoint (packed weight + scales + biases per linear layer), or null. */
+    private final MlxQuant mlx;
 
     private ModelConverter(Path dir, Architecture arch, QType quant, QType head, ShardProvider provider)
             throws IOException {
@@ -86,6 +88,12 @@ public final class ModelConverter {
             throw new IOException("this checkpoint is block-quantized to FP8 (float8_e4m3fn weights with "
                     + "weight_scale_inv tensors, e.g. DeepSeek-V3 / R1); FP8 dequantization is not implemented, "
                     + "use a bf16/f16 checkpoint of the model");
+        }
+        this.mlx = MlxQuant.read(dir);
+        if (mlx != null) {
+            System.err.printf("MLX checkpoint (%d-bit, groups of %d): dequantized while converting to %s%s%n", mlx.bits,
+                    mlx.groupSize, quant, quant == QType.Q4_0 && mlx.bits <= 4
+                            ? " (re-quantized once more; --model.quant q8 keeps the MLX values almost exactly)" : "");
         }
         this.units = plan();
         for (Unit u : units) {
@@ -244,6 +252,9 @@ public final class ModelConverter {
             SafeTensors.Tensor t = s.getFirst();
             if (!Arrays.equals(t.shape(), shape)) {
                 throw new IOException(t + " does not match " + Arrays.toString(shape));
+            }
+            if (t.reader() != null) {
+                throw new IOException("stacked expert tensor " + t.name() + " is MLX-quantized: not supported, use the bf16 checkpoint");
             }
             SafeTensors.Tensor flat = new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{shape[0] * shape[1], shape[2]}, t.data());
             return quantize(a, type, flat, 0, flat.dim(0));
@@ -511,7 +522,14 @@ public final class ModelConverter {
             st = SafeTensors.open(provider.ensure(ShardProvider.checkName(dir, shard)));
             open.put(shard, st);
         }
-        return st.get(checkpointName.getOrDefault(name, name));
+        SafeTensors.Tensor t = st.get(checkpointName.getOrDefault(name, name));
+        if (mlx != null && t != null && t.dtype() == SafeTensors.DType.U32 && name.endsWith(".weight")) {
+            String base = name.substring(0, name.length() - ".weight".length());
+            if (shardOf.containsKey(base + ".scales") && shardOf.containsKey(base + ".biases")) {
+                return mlx.dequantized(name, t, tensor(base + ".scales"), tensor(base + ".biases"));
+            }
+        }
+        return t;
     }
 
     /**

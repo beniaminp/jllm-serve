@@ -459,6 +459,25 @@ final class MetalKernels implements AutoCloseable {
         }
     }
 
+    /** x row 0 = scale * embedding row tokens[slot] (the token a previous step's argmax chose). */
+    void embedToken(QTensor embed, Metal.Buffer embedBuf, Metal.Buffer tokens, int slot, Metal.Buffer x, int dim,
+                    float scale) {
+        bind(0, embedBuf, 0);
+        bind(1, embedBuf, scaleOff(embed));
+        bind(2, tokens, 0);
+        bind(3, x, 0);
+        p.reset(KernelParams.EMBED).i(dim).i(slot).f(scale);
+        dispatch(kernel("embed_token", embed.type, ""), 4, 0, 1, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** tokens[slot] = argmax of v[0 .. n) (lowest index among equal maxima). */
+    void argmax(Metal.Buffer v, int n, Metal.Buffer tokens, int slot) {
+        bind(0, v, 0);
+        bind(1, tokens, 0);
+        p.reset(KernelParams.ARGMAX).i(n).i(slot);
+        dispatch("argmax", 2, 0, 1, 1, 1, ROW_THREADS, 1, 1);
+    }
+
     /** Whether {@code attention_fa} exists for this head width. */
     static boolean flashPrefillFits(int headDim) {
         return headDim == 64 || headDim == 128 || headDim == 256;

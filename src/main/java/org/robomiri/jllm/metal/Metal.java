@@ -45,6 +45,7 @@ public final class Metal implements AutoCloseable {
     private static final Linker LINKER = Linker.nativeLinker();
 
     private final MethodHandle create;
+    private final MethodHandle waitPending; // null with a library built before jm_wait_pending existed
     private final MethodHandle destroy;
     private final MethodHandle deviceName;
     private final MethodHandle workingSet;
@@ -90,6 +91,8 @@ public final class Metal implements AutoCloseable {
         abort = handle(l, "jm_abort", FunctionDescriptor.ofVoid(ADDRESS));
         commit = handle(l, "jm_commit", FunctionDescriptor.ofVoid(ADDRESS));
         commitWait =handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        waitPending = l.find("jm_wait_pending").map(a -> LINKER.downcallHandle(a,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT))).orElse(null);
         try {
             ctx = (MemorySegment) create.invokeExact(arena.allocateFrom(shaderSource), err, ERR_LEN);
         } catch (Throwable t) {
@@ -353,6 +356,23 @@ public final class Metal implements AutoCloseable {
     public void commit() {
         try {
             commit.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** Whether {@link #waitPending} is available (the native library is recent enough). */
+    public boolean canWaitPending() {
+        return waitPending != null;
+    }
+
+    /** Waits until at most {@code keep} buffers submitted with {@link #commit} are unfinished (oldest first). */
+    public void waitPending(int keep) {
+        try {
+            int rc = (int) waitPending.invokeExact(ctx, keep, err, ERR_LEN);
+            if (rc != 0) {
+                throw new IllegalStateException("Metal command buffer failed: " + error());
+            }
         } catch (Throwable t) {
             throw rethrow(t);
         }

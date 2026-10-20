@@ -310,57 +310,78 @@ public final class Engine implements AutoCloseable {
             accepted0 = sp.accepted();
         }
 
-        for (int i = 0; i < maxTokens; i++) {
-            if (cancelled.getAsBoolean()) {
-                finish = "cancelled";
-                break;
-            }
-            boolean queued = rIdx < rLen;
-            int tok = queued ? ready[rIdx] : sampler.sample(logits);
-            boolean preAccepted = queued && rIdx < rPre;
-            if (queued) {
-                rIdx++;
-            }
-            if (eosIds.contains(tok)) {
-                finish = "stop";
-                break;
-            }
-            if (!preAccepted) {
-                sampler.accept(tok);
-            }
-            out.add(tok);
-            if (sp != null) {
-                sp.onToken(tok);
-            }
-            String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
-            if (!piece.isEmpty()) {
-                pending += piece;
-                int hit = findStop(pending, p.stop());
-                if (hit >= 0) {
-                    emit(pending.substring(0, hit), text, sink);
-                    pending = "";
-                    stopHit = true;
+        // greedy without penalties on a backend that can pick the argmax itself: each plain step is queued before the
+        // CPU has seen the previous token (the device feeds its own argmax), so the GPU never waits for the CPU
+        Backend.GreedyPipe pipe = sampler.greedyPlain() ? backend.greedyPipe(vocab) : null;
+        Runnable drainPipe = pipe == null ? null : pipe::drain;
+        boolean fromPipe = false; // the next token is the result of the oldest pipelined step
+        try {
+            for (int i = 0; i < maxTokens; i++) {
+                if (cancelled.getAsBoolean()) {
+                    finish = "cancelled";
+                    break;
+                }
+                boolean queued = rIdx < rLen;
+                int tok = queued ? ready[rIdx] : fromPipe ? pipe.next() : sampler.sample(logits);
+                boolean preAccepted = queued && rIdx < rPre;
+                if (queued) {
+                    rIdx++;
+                }
+                if (eosIds.contains(tok)) {
                     finish = "stop";
                     break;
                 }
-                int safe = maxStop == 0 ? pending.length() : Math.max(0, pending.length() - maxStop + 1);
-                if (safe > 0) {
-                    emit(pending.substring(0, safe), text, sink);
-                    pending = pending.substring(safe);
+                if (!preAccepted) {
+                    sampler.accept(tok);
+                }
+                out.add(tok);
+                if (sp != null) {
+                    sp.onToken(tok);
+                }
+                String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
+                if (!piece.isEmpty()) {
+                    pending += piece;
+                    int hit = findStop(pending, p.stop());
+                    if (hit >= 0) {
+                        emit(pending.substring(0, hit), text, sink);
+                        pending = "";
+                        stopHit = true;
+                        finish = "stop";
+                        break;
+                    }
+                    int safe = maxStop == 0 ? pending.length() : Math.max(0, pending.length() - maxStop + 1);
+                    if (safe > 0) {
+                        emit(pending.substring(0, safe), text, sink);
+                        pending = pending.substring(safe);
+                    }
+                }
+                if (i + 1 < maxTokens && rIdx >= rLen) { // (a queued token's K/V is already in the cache)
+                    if (sp != null && sp.step(tok, pos, ctx, maxTokens - i - 1, sampler, drainPipe)) {
+                        ready = sp.ready();
+                        rIdx = 0;
+                        rLen = sp.readyCount();
+                        rPre = sp.preAccepted();
+                        pos = sp.newPos();
+                        fromPipe = false;
+                    } else if (pipe != null) {
+                        if (pipe.pending() == 0) {
+                            pipe.submit(tok, pos); // else the step feeding tok at pos is already in flight
+                        }
+                        pos++;
+                        if (i + 2 < maxTokens) {
+                            pipe.submit(-1, pos); // feeds the token the step above will choose
+                        }
+                        fromPipe = true;
+                    } else {
+                        one[0] = tok;
+                        backend.forward(one, 0, 1, pos, logits);
+                        pos++;
+                    }
                 }
             }
-            if (i + 1 < maxTokens && rIdx >= rLen) { // (a queued token's K/V is already in the cache)
-                if (sp != null && sp.step(tok, pos, ctx, maxTokens - i - 1, sampler)) {
-                    ready = sp.ready();
-                    rIdx = 0;
-                    rLen = sp.readyCount();
-                    rPre = sp.preAccepted();
-                    pos = sp.newPos();
-                } else {
-                    one[0] = tok;
-                    backend.forward(one, 0, 1, pos, logits);
-                    pos++;
-                }
+        } finally {
+            if (pipe != null) {
+                pipe.drain(); // steps queued past the end write cache rows that are simply overwritten later
             }
         }
         if (!stopHit) { // EOS, length or cancelled: release the held-back text plus any incomplete UTF-8 sequence

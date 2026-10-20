@@ -159,6 +159,11 @@ public final class Speculator implements AutoCloseable {
      *         {@link #ready}, {@link #preAccepted} and {@link #newPos} describe the outcome
      */
     public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler) {
+        return step(tok, pos, ctxLimit, room, sampler, null);
+    }
+
+    /** @param beforeVerify run right before the verification pass, when there is one (drains a pipelined backend) */
+    public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler, Runnable beforeVerify) {
         int want = Math.min(Math.min(kNow, room - 1), ctxLimit - pos - 1);
         if (want < 1) {
             return false;
@@ -173,6 +178,9 @@ public final class Speculator implements AutoCloseable {
         }
         feed[0] = tok;
         System.arraycopy(drafts, 0, feed, 1, m);
+        if (beforeVerify != null) {
+            beforeVerify.run();
+        }
         target.forwardAll(feed, 0, m + 1, pos, rows, stride);
         int acc = 0;
         readyCount = 0;

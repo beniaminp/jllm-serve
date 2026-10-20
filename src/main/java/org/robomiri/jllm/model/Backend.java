@@ -83,6 +83,31 @@ public interface Backend extends AutoCloseable {
         throw new UnsupportedOperationException(name() + " cannot copy a cache");
     }
 
+    /**
+     * Pipelined greedy decoding: each step feeds one token and leaves the argmax of its logits on the device, where the
+     * next step can read it, so the next step is queued before the CPU has looked at the previous token. Used by the
+     * engine for greedy requests without penalties; while a pipe has steps in flight, no other method of the backend
+     * may be called (the engine drains it first).
+     */
+    interface GreedyPipe {
+        /** Queues the step that feeds {@code token} at {@code pos}, or with {@code token < 0} the argmax of the step before. */
+        void submit(int token, int pos);
+
+        /** The argmax token of the oldest step not read yet (waits for that step only). */
+        int next();
+
+        /** Steps submitted and not read yet. */
+        int pending();
+
+        /** Waits for every step in flight and drops their unread results (their cache rows are simply overwritten later). */
+        void drain();
+    }
+
+    /** A {@link GreedyPipe} over the token ids {@code [0, vocab)}, or null when this backend has none. */
+    default GreedyPipe greedyPipe(int vocab) {
+        return null;
+    }
+
     @Override
     void close();
 }
