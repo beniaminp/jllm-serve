@@ -48,3 +48,4 @@ jllm-web/jllm-web.properties
 /jllm-web-tools.json
 jllm-web/jllm-web-tools.json
 kv-cache/
+__pycache__/
