@@ -406,7 +406,8 @@ cheap. After each answer it prints the token count and tok/s from the final `usa
 Decoding streams every weight once per token, so a token costs the same whether the pass computes one position or
 several. Speculative decoding exploits that: guess the next few tokens, feed *all* of them in one pass, and keep
 the guesses the model itself would have produced. Code: `engine/Speculator.java`, `engine/DraftModel.java`,
-`Sampler.verify`, `Backend.forwardAll`. It is off by default (`engine.speculative=off`, measurements below).
+`Sampler.verify`, `Backend.forwardAll`. Prompt lookup is on by default (`engine.speculative=ngram`; `off` disables
+it, measurements below and in [17](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents)).
 
 ```
 tok  = sample(logits)                       # a normal step: the next token is always the target's own choice
@@ -433,10 +434,13 @@ vocabulary with 200 000 seeded draws and on a fake-backend engine run. The penal
 Mamba backends (`supportsPrefixReuse() == false`) cannot rewind their state: speculation is refused for them
 with a note.
 
-**Prompt lookup (`ngram`).** The longest suffix of prompt + output (at most `engine.ngram-max`, at least
-`engine.ngram-min` tokens) is searched backwards (last `engine.ngram-window` tokens); the tokens that followed
-its most recent earlier occurrence are the draft. It needs no second model and no memory, and works when the
-output copies the input: editing code, quoting a document, extracting fields, structured output.
+**Prompt lookup (`ngram`).** The longest suffix of prompt + output (at most `engine.ngram-max` = 8, at least
+`engine.ngram-min` = 3 tokens) is looked up in a hash index of every n-gram of the text (`NgramIndex`: constant time
+however long the context, `engine.ngram-window` = 0 searches all of it); the tokens that followed its most recent
+earlier occurrence are the draft, up to an adaptive length (doubling while whole drafts are accepted, up to
+`engine.draft-tokens` = 16). It needs no second model and no memory, and works when the output copies the input:
+editing code, quoting a document, extracting fields, structured output. Details and the math in
+[17 §17.1](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents).
 
 **Draft model (`draft`).** `engine.draft-model` names a smaller model of the same tokenizer (checked at start-up
 with a probe string), e.g. Qwen3-0.6B for Qwen3-30B-A3B. It gets its own backend (same `backend`, `backend.ctx`,
@@ -517,10 +521,10 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
 | `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
 | `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
-| `engine.speculative` | `off` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative` |
+| `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. Left at the default, MoE models run without it |
 | `engine.draft-model` | empty | Hub repo of the draft model for `draft` (same tokenizer); flag `--draft-model` |
-| `engine.draft-tokens` | `4` | most tokens proposed per verification pass; flag `--draft-tokens` |
-| `engine.ngram-max` / `engine.ngram-min` / `engine.ngram-window` | `3` / `2` / `4096` | prompt lookup: suffix lengths tried and how many recent tokens are searched |
+| `engine.draft-tokens` | `16` | most tokens proposed per verification pass (prompt lookup adapts below it); flag `--draft-tokens` |
+| `engine.ngram-max` / `engine.ngram-min` / `engine.ngram-window` | `8` / `3` / `0` | prompt lookup: longest / shortest suffix matched, how many recent tokens may be copied from (0 = all) |
 
 ---
 

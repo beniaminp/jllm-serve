@@ -283,7 +283,7 @@ the projection that follows it (the `*_norm` kernel variants normalise the input
 Gemma's logit soft-cap in its epilogue): **170 dispatches per decode step**, in 4 command buffers
 (`-Djllm.metal.commitLayers=8`). With `backend.kv-dtype=f16` the kernel names gain `_h` and k goes through
 a staging row — [8.9](#89-the-f16-kv-cache). With `-Djllm.metal.flashDecode=true` step 4 of a decode step
-over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11](#811-flash-decoding-opt-in).
+over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11](#811-flash-decoding-chosen-at-start-up).
 
 ### Dispatch list per MoE layer (Qwen3-30B-A3B: dim 2048, qDim 4096, kvDim 512, 128 experts, top-8, moeDim 768)
 
@@ -324,7 +324,7 @@ no struct is without a writer, and that the constants `MetalConstants` mirrors e
 | `NormParams` | n, eps | 8 |
 | `RopeParams` | headDim, qStride, kvStride, nHeads, pos0, eps, useNorm, rotOff, rotHalf | 36 |
 | `AttnParams` | nHeads, nKvHeads, qkDim, vDim, pos0, ctx, scale, qStride, kStride, vStride, oStride, window, tokenOffset, softcap | 56 |
-| `AttnSplitParams`, `AttnCombineParams` | flash decoding ([8.11](#811-flash-decoding-opt-in)) | 48, 12 |
+| `AttnSplitParams`, `AttnCombineParams` | flash decoding ([8.11](#811-flash-decoding-chosen-at-start-up)) | 48, 12 |
 | `RouterParams` / `RouterDsParams` | nExperts, dim, topK, normalize (+ DeepSeek's groups, method, scale) | 16 / 40 |
 | `MoeParams` | rowsPerExpert, cols, topK | 12 |
 | `MlaParams`, `MambaConvParams`, `MambaScanParams` | MLA latent store / absorption (nope, rope, kvLora, vDim, heads), Mamba conv and scan | 20, 12, 16 |
@@ -618,7 +618,7 @@ Where a decode step of the 0.6B model (~9 ms) goes:
 | **170 dispatches per token** | each costs a few µs of GPU front-end time plus the serial dependency between consecutive kernels; the fusions ([8.4](#84-recording-a-forward-pass-metalbackendforward)) brought the count down from 338 |
 | **under-filled grids** | `Wo`, `Wdown` have 1024 rows → 256 threadgroups of 128 threads = 32 768 threads on a GPU that wants hundreds of thousands in flight; the M1 Pro's 16 cores are mostly idle during these kernels |
 | **the LM head** | `151 936 × 1024` Q8 = 165 MB, a third of all bytes read per token, in one 37 984-threadgroup dispatch |
-| **attention reads the whole prefix** | per layer, per head: `len × 128 × 4 B` of keys and the same of values; at 4 096 tokens that is 4 MB per head per layer — the `half` cache halves it, flash decoding ([8.11](#811-flash-decoding-opt-in)) spreads it over more threadgroups |
+| **attention reads the whole prefix** | per layer, per head: `len × 128 × 4 B` of keys and the same of values; at 4 096 tokens that is 4 MB per head per layer — the `half` cache halves it, flash decoding ([8.11](#811-flash-decoding-chosen-at-start-up)) spreads it over more threadgroups |
 | **a CPU round trip per token** | `commitAndWait` + logits copy + sampling + embedding write: the GPU idles while the CPU samples |
 
 A prefill chunk of 64 tokens is bound by the matmuls' reads of the activations (the single-row kernels gather x
@@ -738,19 +738,25 @@ went from ~95 to ~300 tok/s (both loaded; attention over the growing prefix is a
 
 ---
 
-## 8.11 Flash decoding (opt-in)
+## 8.11 Flash decoding (chosen at start-up)
 
-`-Djllm.metal.flashDecode=true` changes a decode step over at least 512 cached positions
-(`-Djllm.metal.flashMinLen`): instead of one threadgroup per head walking the whole context,
+`attention_split` + `attention_combine` replace the single-pass kernel for a decode step over at least 512 cached
+positions (`-Djllm.metal.flashMinLen`): instead of one threadgroup per head walking the whole context,
 `attention_split` runs the three phases of `attention_t` on a sub-range of `flashChunk = 128` keys per
 threadgroup (grid `(heads, nSplit)`, `nSplit ≤ 32`), with the softmax relative to the sub-range's own maximum,
 and writes the unnormalised partial `(o[headDim], max, sum)`; `attention_combine` rescales every partial to the
-global maximum and divides by the combined sum. The combine adds the sub-ranges' sums and value accumulations
-in a different order from the single-pass kernel, so the results are not bit-identical and the option is off
-by default: on Qwen3-0.6B with a 3 176-token prompt at `--ctx 4096` (M1 Pro) decode goes 50–55 → 60–62 tok/s
-with the f32 cache (+3–5 % with f16), the greedy output is identical and the largest logit difference is
-4.4e-6 (relative 3.7e-7) with the same argmax on every step. Dense attention only; DeepSeek MLA keeps the
-single-pass kernel.
+global maximum and divides by the combined sum:
+
+```
+m = max_j m_j      l = Σ_j l_j · e^(m_j − m)      o = Σ_j o_j · e^(m_j − m) / l
+```
+
+The combine adds the sub-ranges' sums in a different order from the single-pass kernel, so results agree to
+rounding, not bit for bit. On Qwen3-0.6B with a 3 176-token prompt at `--ctx 4096` (M1 Pro) decode went
+50–55 → 60–62 tok/s with the f32 cache (+3–5 % with f16), with the same greedy output and the largest logit
+difference 4.4e-6. It used to be opt-in; now the start-up self-check ([8.14](#814-the-kernel-self-check-metaltuner))
+turns it on when it agrees with `attention_t` and is faster on the chip. `-Djllm.metal.flashDecode=true|false`
+forces the choice. Dense attention only; DeepSeek MLA keeps the single-pass kernel.
 
 ---
 
@@ -782,3 +788,115 @@ tokens and independent over channels. The conv window and the channel's weights 
 row (`mamba_scan`, up to `MAMBA_MAX_STATE` = 64) stay in registers for the whole chunk and are written back once,
 so a layer is one dispatch per stage regardless of the chunk size. The price is that a long prefill has only
 `d_inner` threads of parallelism. See [15](15-mamba.md).
+
+---
+
+## 8.13 Flash-attention prefill (`attention_fa`)
+
+🧸 Thirty-two children each need to compare their own question with every page of a big book. The old way: each
+child walks to the shelf and reads every page alone. The new way: the teacher takes a few pages off the shelf, puts
+them on the table, all 32 children read them together, and then the next few pages come out. The book leaves the
+shelf only once for the whole group. And nobody writes down every comparison on paper — each child keeps just a
+running score in their head.
+
+📐 For a prefill chunk of `n` tokens, `attention_t` gives every (head, query token) its own pass over the keys and
+keeps the scores in a scratch buffer. `attention_fa<KV, D>` is the flash-attention formulation: a threadgroup of
+4 simdgroups (`FA_THREADS` = 128) takes `FA_ROWS` = 32 query rows of one head (8 rows per simdgroup) and walks the
+keys they can see in blocks of `BK = 4096 / D` keys (32 for `D` = 128). Each block's K rows, then V rows, are staged
+in threadgroup memory (16 KB) once and used by all 32 rows, so K and V are read from memory `n / 32` times fewer.
+
+Per block, per row `i`, with running maximum `m_i`, running sum `l_i` and running output `o_i` (start
+`m = −∞, l = 0, o = 0`):
+
+```
+s_ij  = scale · q_i · k_j                     (masked to −∞ when j > pos_i, or outside the sliding window;
+                                               soft-cap: s = c · tanh(s / c))
+m'_i  = max(m_i, max_j s_ij)
+p_ij  = e^(s_ij − m'_i)
+l_i   = l_i · e^(m_i − m'_i) + Σ_j p_ij
+o_i   = o_i · e^(m_i − m'_i) + Σ_j p_ij v_j
+m_i   = m'_i
+                                    at the end:   out_i = o_i / l_i
+```
+
+This is exactly `softmax(s) · V`: whenever the maximum grows from `m` to `m'`, everything accumulated so far was
+weighted by `e^(s − m)` and must become `e^(s − m')`, i.e. be multiplied by `e^(m − m')`. Why bother with the
+maximum at all? `e^s` overflows f32 above `s ≈ 88`; `e^(s − m) ≤ 1` never does.
+
+`S = Q Kᵀ` (8 × BK per simdgroup) and `O += P V` run on `simdgroup_float8x8` multiply-accumulates over the head in
+8-wide slices. The row rescale `o_i · e^(m_i − m'_i)` is done as a product with a diagonal 8 × 8 matrix
+`diag(e^(m − m'))`, because how a simdgroup matrix's 64 elements are spread over the 32 lanes is not specified, so
+the kernel never addresses them one by one. Instances: `attention_fa_d64/d128/d256` and `_h` for a half KV cache
+(widened to f32 as it is staged). The summation order differs from `attention_t`, so the two agree to rounding
+(`kernel_tests.py` checks against a float64 reference, the self-check of [8.14](#814-the-kernel-self-check-metaltuner)
+against `attention_t` on the device); `-Djllm.metal.flashPrefill=true|false` forces it.
+
+---
+
+## 8.14 The kernel self-check (`MetalTuner`)
+
+🧸 Before using a new tool, a careful carpenter tries it on a scrap of wood next to the old tool. If the cut is the
+same and quicker, the new tool goes in the box; otherwise it stays on the shelf. And he writes it down so he
+doesn't have to test again tomorrow.
+
+📐 The newer kernels (`attention_fa`, flash decoding) are not bit-identical to the ones they replace, and GPUs and
+drivers differ. At load, `MetalTuner.decide` runs each candidate next to the established kernel on synthetic data
+of the model's shapes (head size, group size, f32 or half cache) and accepts it only if
+
+```
+max |candidate − reference|  ≤  1e-3 · max |reference| + 1e-5
+```
+
+and, on a real GPU, if it is also faster (best of a few timed runs). The decision is cached in
+`~/.cache/jllm/metal-tuning.properties` under the device name, a hash of the kernel source and the shape, so it runs
+once (a few hundred ms) and again only after a driver or kernel change. On the emulator, timings mean nothing, so
+correctness alone decides. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
+
+---
+
+## 8.15 Expert-grouped MoE prefill
+
+🧸 A class of 64 children each asks two of eight teachers a question. The old way: every child walks to the
+teacher's office alone, and the teacher opens her big book for each child. The new way: line the children up by
+teacher first; then each teacher opens her book once and answers her whole line together.
+
+📐 In an MoE layer every token picks `topK` experts. `moe_up` / `moe_down` give each slot (token, k) its own
+simdgroups, so in a chunk an expert's weights are read once **per slot** that picked it. For a prefill chunk of at
+least `jllm.metal.moeMmaMin` (16) tokens the grouped path runs instead:
+
+1. `moe_sort` (one threadgroup): a stable counting sort of the `n · topK` slots by expert — count per expert,
+   prefix sum, scatter — and the list of tiles `(expert, start, count)` of up to `MMA_BT` slots each. No atomics,
+   so the order and the result are deterministic.
+2. `moe_up_mma` / `moe_down_mma`: per tile, the simdgroup-matrix core of the dense prefill matmuls
+   ([8.10](#810-the-tiled-prefill-matmuls)), `mma_core_rows`, with each slot's activation row **gathered** through
+   `order[]`. The expert's weight rows are read once per tile, not once per slot.
+3. `moe_down_mma` writes each slot's weighted output row to its own place; `moe_combine` sums a token's `topK`
+   rows in k order, as `moe_down` does (no two tiles write the same element, no atomics).
+
+Memory read for expert weights drops from `≈ n · topK` expert-matrix reads to `≈ tiles` (about
+`experts_used + n·topK / MMA_BT`). Q6_K weights now also have a simdgroup-matrix path, so GGUF `Q6_K` layers use it
+too. `-Djllm.metal.moeMma=false` keeps the per-slot kernels.
+
+---
+
+## 8.16 Pipelined greedy decoding
+
+🧸 See [17 §17.4](17-agent-speedups.md#174-pipelined-decoding-on-the-gpu) for the relay-race picture.
+
+📐 For greedy sampling without penalties the GPU chooses the token itself: `argmax` (256 threads, ties go to the
+lower index — the same first-maximum rule as `Sampler`) writes the id into a ring of 4 slots, and the next step
+starts with `embed_token<QT>` reading that id and dequantizing its embedding row (`dequant_block`, one per format).
+So step `j + 1` can be encoded and submitted before the CPU knows step `j`'s token; the CPU reads ids one step
+behind through `jm_wait_pending(keep)`, which waits until at most `keep` command buffers are unfinished.
+`MetalBackend.Pipe` implements `Backend.GreedyPipe` (`submit`, `next`, `pending`, `drain`); every other
+backend call drains it first. `-Djllm.metal.pipeline=false` turns it off.
+
+---
+
+## 8.17 Saving, loading and copying the KV cache
+
+`MetalBackend.saveState` / `loadState` / `copyStateFrom` implement the backend-neutral cache file and the slot copy
+of [17 §17.2–17.3](17-agent-speedups.md#172-slots-that-share-a-prefix). The format string
+`kv f16 layers=L kvDim=K headDim=D` (or `f32`) is the same the CPU backend writes; rows are written as per layer,
+per position, K then V, little-endian. The cache buffers live in unified memory, so loading reads from the file
+straight into them, and a slot copy is a `memcpy` of `n` rows per layer between two engines' buffers.

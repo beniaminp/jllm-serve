@@ -4,18 +4,22 @@ These documents explain, from the ground up, how this project turns a 1.5 GB fil
 into a chatbot that streams answers over HTTP. They assume you can read Java but know nothing about machine
 learning. Math is introduced where it is needed, with concrete numbers from Qwen3-0.6B.
 
+New here, or want the intuition first? Start with **[00 Explained simply](00-explained-simply.md)**: every idea
+in the project told as a story for a five-year-old (🧸), followed by the exact math (📐).
+
 Suggested reading order:
 
 | # | Document | What you will learn |
 |---|---|---|
+| 0 | [Explained simply](00-explained-simply.md) | The whole project in pictures and stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
 | 1 | [Overview](01-overview.md) | What an LLM is, what "inference" means, the pipeline from text to text, the supported model families, project layout |
 | 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, downloading only the shards a model needs |
-| 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion) |
+| 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion), MLX 4-/8-bit checkpoints |
 | 4 | [The tokenizer](04-tokenizer.md) | Byte-level BPE from scratch, regex pre-tokenization, the chat template, streaming UTF-8 |
 | 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU, the KV cache — every formula the code implements |
 | 6 | [Quantization (Q4/Q8)](06-quantization.md) | Why 4-bit weights work, the Q4_0/Q8_0 block format, the error it introduces |
 | 7 | [The CPU backend](07-cpu-backend.md) | SIMD with the Vector API, dot-product kernels, prefill vs decode, the custom thread pool |
-| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM bindings, the Objective-C shim, each compute kernel |
+| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM bindings, the Objective-C shim, each compute kernel, flash-attention prefill, the start-up kernel self-check, expert-grouped MoE prefill, pipelined decoding |
 | 9 | [Sampling](09-sampling.md) | Softmax, temperature, top-k, top-p, min-p, repetition penalties |
 | 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix caching, stop strings, HTTP/1.1, SSE streaming, the OpenAI API |
 | 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers (Metal, CPU with int8 activations, f16 KV cache), what to improve next |
@@ -24,5 +28,7 @@ Suggested reading order:
 | 14 | [Model families](14-model-families.md) | One table of every supported family (Qwen3, Qwen2, Llama 3.x, Mistral, GLM / GLM-4, Phi-3 / 4, Gemma 2 / 3, DeepSeek-V2 / V3, Mamba): what differs (bias, QK-norm, sliding window, RoPE pairing and scaling, sandwich norms, GeLU, soft-capping, MoE routing, multi-head latent attention, BOS), verified tensor names, the typed `Architecture` model and how to add a family |
 | 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, why the prefix cache changes |
 | 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format: header, metadata and tensor directory byte by byte, the Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K block layouts, mapping metadata and tensor names onto the typed `Architecture`, why Llama's q/k rows are permuted (and how interleaved RoPE undoes it), zero-copy mapping on CPU and Metal, the tokenizer stored in the file, choosing and downloading one file of a GGUF repository |
+| 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding — measured |
+| 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

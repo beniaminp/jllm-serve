@@ -141,7 +141,7 @@ public final class ModelLoader {
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
-            Speculator.Config spec = s.speculation();
+            Speculator.Config spec = speculation(s, arch);
             if (spec.mode() != Speculator.Mode.OFF) {
                 DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch) : null;
                 if (engine.enableSpeculation(spec, draft)) {
@@ -158,6 +158,20 @@ public final class ModelLoader {
     }
 
     /**
+     * The speculation settings for this model: prompt lookup is the default, except for mixture-of-experts models,
+     * where a verification pass reads the experts of every drafted position and was measured not to pay
+     * (docs/11 §11.6), unless {@code engine.speculative} was set explicitly.
+     */
+    static Speculator.Config speculation(Settings s, Architecture arch) {
+        Speculator.Config spec = s.speculation();
+        boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
+        if (moe && spec.mode() == Speculator.Mode.NGRAM && "default".equals(s.source("engine.speculative"))) {
+            return new Speculator.Config(Speculator.Mode.OFF, spec.k(), spec.ngramMax(), spec.ngramMin(), spec.window());
+        }
+        return spec;
+    }
+
+    /**
      * Another engine on the weights of {@code l}: its own backend and KV cache, the same tokenizer, template, stop
      * tokens and queue timeout. Lets a server keep several conversations' prefixes cached at once (memory: one KV
      * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
@@ -168,7 +182,7 @@ public final class ModelLoader {
         Backend backend = newBackend(s, l.weights().arch, l.weights());
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
-        Speculator.Config spec = s.speculation();
+        Speculator.Config spec = speculation(s, l.weights().arch);
         if (spec.mode() == Speculator.Mode.NGRAM) {
             e.enableSpeculation(spec, null);
         }

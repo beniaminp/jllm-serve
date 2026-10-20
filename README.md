@@ -12,7 +12,8 @@ and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`m
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
 conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
-place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)).
+place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)). Apple **MLX** quantized checkpoints
+(`mlx-community/*-4bit`, `-8bit`) are read too: dequantized once while converting ([docs/03 §3.7](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 
 | Piece | Where | Written from scratch |
 |---|---|---|
@@ -29,6 +30,25 @@ place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)).
 | HTTP/1.1 server (virtual threads, chunked SSE) + OpenAI API + web chat UI | `server/` | yes |
 
 **Read [`docs/`](docs/README.md)** for a beginner-friendly walkthrough of how each part works, including the math.
+New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** tells every idea as a story first
+(🧸, for a five-year-old) and then gives the exact math (📐).
+
+### Beyond a plain port of llama.cpp
+
+| Feature | What it does | Docs |
+|---|---|---|
+| Prompt lookup for agents | an n-gram index over the whole context drafts up to 16 tokens that the model verifies in one pass; 20 → 81 tok/s when rewriting code from the prompt, −4 % on free text | [17 §17.1](docs/17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) |
+| Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
+| Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
+| Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
+| Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
+| Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
+| Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
+| Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
+
+The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
+not been measured on Apple hardware yet. Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
+`-Djllm.metal.pipeline=false` (passed through `JAVA_OPTS`) and `./jllm bench`.
 
 ## Requirements
 
@@ -313,6 +333,8 @@ The MLA latent KV cache of DeepSeek models is much smaller than a plain one (V2-
 ```sh
 mvn test                   # SmokeTest + ServerTest + MetalParamsTest + the GGUF checks (plain main() classes, no test framework)
 sh scripts/arch-smoke.sh   # 20 synthetic models x Q4/Q8/Q2_K, CPU == Metal; DeepSeek checked against a float64 reference
+METAL_EMU=1 sh scripts/arch-smoke.sh            # the same on any OS, Metal side on the CPU emulator (needs clang++, python3)
+sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   # single Metal kernels on the emulator vs numpy
 ```
 
 `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server

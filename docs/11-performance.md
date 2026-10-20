@@ -138,7 +138,7 @@ CPU the expert-grouped prefill reuses each dequantized expert row for all tokens
 4. **Attention.** For each of 28 layers × 16 heads the kernel streams the whole 413-position KV prefix
    (413 × 128 × 4 B × 2 = 423 KB per head) through one threadgroup; writing scores to device memory and
    reading them back twice costs extra traffic. The opt-in flash decoding (`-Djllm.metal.flashDecode=true`,
-   [08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) spreads long contexts over more threadgroups.
+   [08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) spreads long contexts over more threadgroups.
 5. **CPU-side work per token**: sampling over 151 936 logits (~0.3 ms), the embedding row copy, and the
    `commitAndWait` round trip. The command buffers are committed every 8 layers, so encoding overlaps GPU work and
    only the last part is exposed.
@@ -218,12 +218,17 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 |---|---|---|
 | `jllm.cpu.fastmath` | on | vectorized `exp` / `tanh` in the attention softmax and soft-caps, not bit-identical ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) |
 | `jllm.cpu.deterministic` | off | prefill through the single-token kernels, for exact comparisons; slower ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)) |
-| `jllm.metal.flashDecode` | off | flash decoding for decode steps over `jllm.metal.flashMinLen` (512) positions ([08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) |
+| `jllm.metal.flashDecode` | auto | flash decoding (auto = on when the start-up self-check finds it correct and faster) for decode steps over `jllm.metal.flashMinLen` (512) positions ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) |
 | `jllm.metal.commitLayers` | 8 | layers per Metal command buffer (0 = one per pass) |
 | `jllm.metal.prefillMinTokens` | 8 | smallest chunk that uses the tiled prefill matmuls |
 | `jllm.metal.mmaPrefill` | true | simdgroup-matrix prefill matmuls; `false` = the scalar tiled kernels (bit-identical to decode) |
 | `jllm.metal.mmaMinTokens` | 32 | smallest chunk that uses the simdgroup-matrix matmuls ([08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)) |
 | `jllm.metal.attnGroup` | 1 | query heads per attention threadgroup (2, 4, 8 measured no faster) |
+| `jllm.metal.flashPrefill` | auto | flash-attention prefill kernel `attention_fa` instead of `attention_t` (auto = start-up self-check decides; [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa)) |
+| `jllm.metal.moeMma` | true | expert-grouped simdgroup-matrix MoE prefill ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)); `false` = per-slot kernels |
+| `jllm.metal.moeMmaMin` | 16 | smallest chunk that uses the expert-grouped MoE kernels |
+| `jllm.metal.pipeline` | true | pipelined greedy decoding: the GPU picks the token and runs ahead ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) |
+| `jllm.metal.emulator` | false | run the Metal backend on the CPU emulator (with `jllm.metal.lib` = the emulator library; [18](18-metal-emulator.md)) |
 
 JIT warm-up matters: the first ~50 tokens run before C2 has compiled the kernels; `bench` discards a warm-up
 round for that reason.
@@ -244,7 +249,7 @@ Done:
 | **f16 KV cache**: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; speed equal or better, outputs unchanged on the test prompts | `cpu/KvCache`, `_h` kernels |
 | **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)) | each expert row dequantized once per chunk and reused for its tokens | `CpuBackend.moeBatched` |
 | **Tiled CPU attention** over (kv head, token tile) | each K / V row read once per tile; bit-identical | `KvCache.attentionTiled` |
-| **Flash decoding** on Metal, opt-in ([08 §8.11](08-metal-backend.md#811-flash-decoding-opt-in)) | +3–5 % decode at ~3 000 tokens of context, not bit-identical, so off by default | `attention_split`, `attention_combine` |
+| **Flash decoding** on Metal, chosen by the start-up self-check ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) | +3–5 % decode at ~3 000 tokens of context, not bit-identical (agrees to rounding) | `attention_split`, `attention_combine` |
 | **Vectorized `exp` / `tanh`** on CPU, default (`jllm.cpu.fastmath=false` to disable) | +5–9 % decode at ~3 000 tokens, −40 % long-prompt attention | `VectorKernels.expFast` |
 | **MLA latent cache** (DeepSeek): absorbed `W_kb`, one 576-wide row per token | 2.2 GB → 255 MB at `--ctx 4096` ([14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | `MlaCpu`, `MlaMetal` |
 
@@ -328,9 +333,16 @@ verification path the float kernels, [07 §7.14](07-cpu-backend.md#714-prefill-a
 both are valid greedy continuations of the same model. On the CPU, speculation also slows decode (int8 decode 49 tok/s vs
 the float multi-token path).
 
-**Default.** `engine.speculative=off`. Speculation never hurt by more than the noise on the dense 0.6B with the back-off, and helps
+**Default (then).** `engine.speculative=off`. Speculation never hurt by more than the noise on the dense 0.6B with the back-off, and helps
 (about +15 %) for text that copies its input, but it is neutral to harmful on the 30B MoE (the headline model: every verified
-position streams its own experts) and on the CPU, and no setting was a win everywhere. Enable `ngram` for editing, extraction
+position streams its own experts) and on the CPU, and no setting was a win everywhere.
+
+**Default (now).** `engine.speculative=ngram` for dense models, after prompt lookup was reworked for coding agents
+([17 §17.1](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents)): a hash index over the whole context, matches of 3 to 8
+tokens, drafts that grow to 16 tokens while they are accepted. On the CPU (4-core AVX-512, Qwen3-0.6B, greedy) rewriting
+an 80-line file from the prompt went from 19.9 to 81.2 tok/s (98 % of drafts accepted), and a free-form story cost about 4 %
+(23.3–23.4 vs 24.4 tok/s; 2-token matches cost 8 %, hence `engine.ngram-min=3`). MoE models keep it off unless it is set
+explicitly, for the reason above. Enable `ngram` for editing, extraction
 and quoting workloads on dense models; `draft` needs a draft model that agrees with the target on 80 % or more of the tokens and
 a backend whose multi-token pass is much cheaper than K single steps, which the Metal kernels of this repository are not yet.
 `engine.draft-tokens=4`, `engine.ngram-max=3`, `engine.ngram-min=2` were the best of the grid above.

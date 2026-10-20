@@ -237,3 +237,46 @@ Hugging Face layouts the source used ([12](12-mixture-of-experts.md)).
 | duplicate tensor names (also across shards), overlapping `data_offsets` | `SafeTensors.readFile` | a header that does not describe one tensor per name |
 | cache version (`QuantFile.VERSION`), converter layout version (`QuantFile.LAYOUT_VERSION`), `repo@revision`, config description | `QuantFile.open`, `ModelWeights.load` | format / converter changes, another revision in the same directory (reconverted automatically) |
 | index and sidecar written to a temporary file, fsynced, renamed | `QuantFile.Writer` | a crash can leave a half-written index; instead the cache is simply incomplete and the conversion resumes |
+
+## 3.7 MLX quantized checkpoints
+
+🧸 Some people ship their models already squeezed small, like a sweater vacuum-packed for a suitcase. Apple's MLX
+community does this for Macs. jllm-serve unpacks the sweater once, then folds it its own way for the cupboard.
+
+📐 The `mlx-community/*-4bit` (and `-8bit`, `-3bit`…) repositories are safetensors files written by
+`mlx_lm.convert -q`. Each quantized linear layer `X` is three tensors:
+
+| tensor | dtype | shape | holds |
+|---|---|---|---|
+| `X.weight` | U32 | `[out, in · bits / 32]` | the `bits`-wide codes `q ∈ [0, 2^bits)`, packed little-endian, lowest bits first |
+| `X.scales` | f16 / bf16 | `[out, in / g]` | one scale `s` per group of `g` columns |
+| `X.biases` | f16 / bf16 | `[out, in / g]` | one offset `z` per group (the group's minimum) |
+
+and `config.json` carries `"quantization": {"group_size": 64, "bits": 4}`. The value of a weight is **affine**:
+
+```
+w[r][c] = s[r][c / g] · q[r][c] + z[r][c / g]
+q[r][c] = (word[r][c / (32/bits)] >>> ((c mod (32/bits)) · bits)) & (2^bits − 1)
+```
+
+Example (4 bits, so 8 codes per word): the word `0x76543210` holds `q = 0, 1, 2, …, 7` for columns 0–7; with
+`s = 0.01, z = −0.08` those are `−0.08, −0.07, …, −0.01`. Q4_0 ([06](06-quantization.md)) stores only a scale
+(`w = d · (q − 8)`, symmetric around zero); the extra offset lets MLX fit groups that are not centred on zero.
+
+**Which bits?** Layers may differ from the config (MLX often keeps embeddings or the LM head at 6 or 8 bits). The
+shapes tell: `in = (in/g) · g` and `packed_cols · 32 = in · bits`. One ambiguity: an 8-bit layer of width `in` with groups of 64 has
+`in / 4` packed columns and `in / 64` scales, and so does a 4-bit layer of width `2·in` with groups of 128. So
+`MlxQuant.dequantized` tries the config's group size first, then 64, 32, 128, and accepts the
+first that gives 2, 4 or 8 bits.
+
+**How it is loaded.** `MlxQuant.read` recognises the checkpoint from `config.json` (only `mode: affine`), and
+`ModelConverter` reads each packed matrix through a `SafeTensors.Tensor` whose reader dequantizes on the fly, like
+any bf16 tensor. The converter then writes the engine's own format (`--quant`) into the usual cache
+(§3.5), so every family and both backends work unchanged and the MLX files are read only once. `q8` or `q6k` keep a
+4-bit checkpoint's values almost exactly; `q4` re-quantizes them a second time. Measured on Qwen3-0.6B: the
+dequantized 4-bit weights differ from the bf16 originals by about 9 % RMS (the 4-bit rounding itself), and the model
+answers correctly end to end.
+
+```
+./jllm chat --model mlx-community/Qwen3-0.6B-4bit --quant q8
+```
