@@ -67,7 +67,11 @@ public final class Metal implements AutoCloseable {
     private final List<Buffer> buffers = new ArrayList<>();
     private final Map<String, Integer> pipelines = new HashMap<>();
 
+    /** Identifies the compiled kernel source (MetalTuner caches its decisions per device and source). */
+    final String sourceHash;
+
     private Metal(Path lib, String shaderSource) {
+        this.sourceHash = Integer.toHexString(shaderSource.hashCode()) + (EMULATOR ? "-emu" : "");
         SymbolLookup l = SymbolLookup.libraryLookup(lib, arena);
         create = handle(l, "jm_create", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT));
         destroy = handle(l, "jm_destroy", FunctionDescriptor.ofVoid(ADDRESS));

@@ -36,7 +36,8 @@ public final class MetalBackend implements Backend {
 
     private String attnKernel;         // attention_t instantiation for headDim / attnGroup / cache type
     private int attnGroup;             // query heads per attention threadgroup
-    private final boolean flashDecode; // flash decoding enabled for this model (dense attention only)
+    private boolean flashDecode;       // flash decoding for long decode steps (decided by MetalTuner, dense attention only)
+    private boolean flashPrefill;      // attention_fa for prefill chunks (decided by MetalTuner)
     private Metal.Buffer flashPart;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
     // through an f32 staging row and rope_h rounds it into the cache after the rotation, attention_h
@@ -139,7 +140,6 @@ public final class MetalBackend implements Backend {
         this.ctx = ctx;
         this.maxBatch = maxBatch;
         this.kvHalf = kvDtype == KvDtype.F16;
-        this.flashDecode = MetalKernels.FLASH_DECODE && arch.attention() instanceof Attention.Gqa;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -200,6 +200,13 @@ public final class MetalBackend implements Backend {
         hidden = k.scratch((long) maxBatch * arch.maxMlpDim() * 4);
         scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * a.heads() * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
+        if (a instanceof Attention.Gqa g) {
+            MetalTuner.Decision d = MetalTuner.decide(k, g, kvHalf, attnKernel, attnGroup);
+            flashPrefill = d.flashPrefill();
+            flashDecode = d.flashDecode();
+            System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
+                    + (flashDecode ? "on" : "off") + " (" + d.note() + ")");
+        }
         flashPart = flashDecode ? k.scratch((long) a.heads() * MetalKernels.FLASH_SPLITS * (hd + 2) * 4) : null;
         if (arch.anyMoe()) {
             int slots = maxBatch * arch.maxTopK();
@@ -322,6 +329,11 @@ public final class MetalBackend implements Backend {
             if (flashDecode && n == 1 && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
                 k.flashAttention(kvHalf, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
                         hd, pos, ctx, g.scale(), g.qDim(), kvDim, g.window(), g.softcap());
+                return;
+            }
+            if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
+                k.flashPrefill(kvHalf, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
+                        g.scale(), g.qDim(), kvDim, g.qDim(), g.window(), g.softcap());
                 return;
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,

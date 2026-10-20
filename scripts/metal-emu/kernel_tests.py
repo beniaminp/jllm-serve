@@ -88,4 +88,33 @@ attention('attention_g1_d64', 64)
 attention('attention_g1_d128', 128)
 attention('attention_g1_d256', 256)
 attention('attention', 96)
+
+
+def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False):
+    rng = np.random.default_rng(3)
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    kc32 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    vc32 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    kc = kc32.astype(np.float16) if half else kc32
+    vc = vc32.astype(np.float16) if half else vc32
+    out = np.full((ntok, n_heads * hd), np.nan, np.float32)
+    scale = 1 / np.sqrt(hd)
+    # FlashParams: nHeads nKvHeads pos0 ntok scale qStride kStride oStride window softcap
+    p = pack('iiiifiiiif', n_heads, n_kv, pos0, ntok, scale, n_heads * hd, n_kv * hd, n_heads * hd, window, softcap)
+    name = 'attention_fa_d%d%s' % (hd, '_h' if half else '')
+    E.dispatch(name, [q, kc, vc, out], p, (n_heads, (ntok + 31) // 32), (128,))
+    ref = attention_ref(q, kc.astype(np.float32), vc.astype(np.float32), n_heads, n_kv, hd, pos0, ntok, scale,
+                        window, softcap)
+    err = np.abs(out - ref).max()
+    check(err < 2e-5, '%s pos0=%d ntok=%d window=%d softcap=%g: max err %.2e' % (name, pos0, ntok, window, softcap, err))
+
+
+flash(64)
+flash(128)
+flash(128, half=True)
+flash(64, pos0=0, ntok=32)
+flash(128, window=20, pos0=60, ntok=40)
+flash(64, softcap=5.0)
+flash(128, n_heads=8, n_kv=1, ntok=7)
+flash(256, ntok=33)
 sys.exit(1 if failures else 0)

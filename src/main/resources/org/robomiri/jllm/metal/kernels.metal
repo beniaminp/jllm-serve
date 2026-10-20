@@ -5,6 +5,7 @@
 //   0. constants   1. common (reductions, block formats)   2. matmul   3. norm + rope   4. attention
 //   5. mixture of experts   6. state space (Mamba)   7. DeepSeek MLA (latent cache store, query absorption)
 //   8. Q6_K (block format, row / tile walks and the _q6k instantiations of every matmul / moe kernel)
+//   9. flash-attention prefill (attention_fa: simdgroup-matrix QK^T and PV, online softmax)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -39,6 +40,8 @@ using namespace metal;
 #define FLASH_MAX_SPLITS 64     // partials attention_combine can merge
 #define MAMBA_MAX_STATE 64      // SSM state width held in registers
 #define MAMBA_MAX_CONV 8        // conv kernel width held in registers
+#define FA_ROWS 32              // query tokens per threadgroup of attention_fa (4 simdgroups x 8 rows)
+#define FA_THREADS 128          // attention_fa threadgroup
 #define TANH_CLAMP 20.0f        // |argument| bound of fast-math tanh (overflows to NaN beyond)
 #define SOFTPLUS_LINEAR 20.0f   // softplus(x) = x beyond this
 
@@ -2236,3 +2239,172 @@ GG_INSTANTIATE("q4g", GG_Q4_0)
 GG_INSTANTIATE("q8g", GG_Q8_0)
 GG_INSTANTIATE("q4k", GG_Q4_K)
 GG_INSTANTIATE("q5k", GG_Q5_K)
+
+// ---------------------------------------------------------------------------------------------- 9. flash-attention prefill
+// attention_fa<KV, D>: causal (optionally windowed, soft-capped) attention for a prefill chunk without a scores
+// scratch. A threadgroup of 4 simdgroups takes FA_ROWS = 32 query tokens of one head (8 rows per simdgroup) and walks
+// the keys they see in blocks of BK = 4096 / D keys, each block's K (then V) rows staged once in threadgroup memory
+// (16 KB) and shared by the 32 rows:
+//   S   = Q K^T          8 x BK per simdgroup, simdgroup_float8x8 multiply-accumulates over the head in 8-wide slices
+//   m'  = max(m, rowmax(S)),  P = exp(S - m'),  l = l * exp(m - m') + rowsum(P)        (online softmax, per row)
+//   O   = diag(exp(m - m')) O + P V
+// and finally O = diag(1 / l) O. The row rescales are products with a diagonal matrix, so the kernel never
+// addresses the elements of a simdgroup matrix directly (their distribution over the lanes is not specified); S and
+// P go through 8 x BK threadgroup scratch per simdgroup for the masking and the exponentials. Everything is f32 (a
+// half KV cache is widened as it is staged). Summation order differs from attention_t, so results agree to rounding
+// (kernel_tests.py checks it against a float64 reference; the Metal tuner against attention_t on the device).
+
+struct FlashParams {
+    int nHeads;
+    int nKvHeads;
+    int pos0;        // position of the chunk's first token
+    int ntok;        // tokens in the chunk
+    float scale;
+    int qStride;     // q row stride (nHeads * D)
+    int kStride;     // key / value cache row stride (nKvHeads * D)
+    int oStride;     // output row stride (nHeads * D)
+    int window;      // sliding-window length, 0 = full causal attention
+    float softcap;   // > 0: score = tanh(score / softcap) * softcap
+};
+
+template <typename KV, int D>
+kernel void attention_fa(device const float *q [[buffer(0)]],
+                         device const KV *kc [[buffer(1)]],
+                         device const KV *vc [[buffer(2)]],
+                         device float *out [[buffer(3)]],
+                         constant FlashParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int BK = 4096 / D;   // keys per block: one block of K or V rows is 16 KB
+    constexpr int NI = D / 8;      // 8-wide slices of the head
+    constexpr int NJ = BK / 8;     // 8-key slices of a block
+    threadgroup float kvs[BK * D];
+    threadgroup float sb[FA_THREADS / 32][8 * BK];
+    threadgroup float st[FA_THREADS / 32][64];
+
+    const int h = int(tgp.x);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int t0 = int(tgp.y) * FA_ROWS;
+    const int r0 = t0 + int(sg) * 8;                  // this simdgroup's first row (token of the chunk)
+    const int tEnd = min(p.ntok, t0 + FA_ROWS);
+    const int firstKey = p.window > 0 ? max(0, p.pos0 + t0 + 1 - p.window) : 0;
+    const int lastKey = p.pos0 + tEnd;                // one past the last key any row sees
+    device const KV *kb = kc + kvh * D;
+    device const KV *vb = vc + kvh * D;
+
+    // the simdgroup's 8 query rows as NI 8 x 8 slices; rows past the chunk are zeros
+    simdgroup_float8x8 qm[NI];
+    for (int i = 0; i < NI; i++) {
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            st[sg][e] = t < p.ntok ? q[(ulong)t * p.qStride + h * D + i * 8 + e % 8] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(qm[i], &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_float8x8 om[NI];
+    for (int i = 0; i < NI; i++) om[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m[8];
+    float l[8];
+    for (int r = 0; r < 8; r++) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+    }
+
+    for (int k0 = firstKey / BK * BK; k0 < lastKey; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup); // the previous block's V is no longer read
+        for (int e = tid; e < BK * D; e += FA_THREADS) {
+            const int key = k0 + e / D;
+            kvs[e] = key < lastKey ? float(kb[(ulong)key * p.kStride + e % D]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // S = Q K^T: K is loaded transposed, slice (dims i*8.., keys j*8..)
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, &kvs[j * 8 * D + i * 8], D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qm[i], kt, s);
+            }
+            simdgroup_store(s, &sb[sg][j * 8], BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // online softmax, row by row; the row rescale factors go on the diagonal of st
+        for (int r = 0; r < 8; r++) {
+            const int t = r0 + r;
+            const int len = p.pos0 + t + 1;
+            const int first = p.window > 0 ? max(0, len - p.window) : 0;
+            float mx = -INFINITY;
+            for (int c = lane; c < BK; c += 32) {
+                const int key = k0 + c;
+                float v = sb[sg][r * BK + c] * p.scale;
+                if (p.softcap > 0.0f) v = softcap_f(v, p.softcap);
+                if (t >= p.ntok || key < first || key >= len) v = -INFINITY;
+                sb[sg][r * BK + c] = v;
+                mx = max(mx, v);
+            }
+            mx = simd_max(mx);
+            const float mNew = max(m[r], mx);
+            float sum = 0.0f;
+            for (int c = lane; c < BK; c += 32) {
+                const float e = mNew == -INFINITY ? 0.0f : exp(sb[sg][r * BK + c] - mNew);
+                sb[sg][r * BK + c] = e;
+                sum += e;
+            }
+            sum = simd_sum(sum);
+            const float alpha = m[r] == -INFINITY ? 0.0f : exp(m[r] - mNew);
+            l[r] = l[r] * alpha + sum;
+            m[r] = mNew;
+            if (lane < 8) st[sg][r * 8 + lane] = int(lane) == r ? alpha : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dg;
+        simdgroup_load(dg, &st[sg][0], 8);
+        for (int i = 0; i < NI; i++) simdgroup_multiply(om[i], dg, om[i]);
+        // V block, then O += P V
+        threadgroup_barrier(mem_flags::mem_threadgroup); // every simdgroup is done with the K block
+        for (int e = tid; e < BK * D; e += FA_THREADS) {
+            const int key = k0 + e / D;
+            kvs[e] = key < lastKey ? float(vb[(ulong)key * p.kStride + e % D]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 pm;
+            simdgroup_load(pm, &sb[sg][j * 8], BK);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_float8x8 vm;
+                simdgroup_load(vm, &kvs[j * 8 * D + i * 8], D);
+                simdgroup_multiply_accumulate(om[i], pm, vm, om[i]);
+            }
+        }
+    }
+    // O / l, written row by row for the rows inside the chunk
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        for (int r = 0; r < 8; r++) st[sg][r * 8 + lane] = int(lane) == r && l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, &st[sg][0], 8);
+    for (int i = 0; i < NI; i++) {
+        simdgroup_float8x8 o;
+        simdgroup_multiply(o, dg, om[i]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(o, &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            if (t < p.ntok) out[(ulong)t * p.oStride + h * D + i * 8 + e % 8] = st[sg][e];
+        }
+    }
+}
+
+template [[host_name("attention_fa_d64")]] kernel decltype(attention_fa<float, 64>) attention_fa<float, 64>;
+template [[host_name("attention_fa_d64_h")]] kernel decltype(attention_fa<half, 64>) attention_fa<half, 64>;
+template [[host_name("attention_fa_d128")]] kernel decltype(attention_fa<float, 128>) attention_fa<float, 128>;
+template [[host_name("attention_fa_d128_h")]] kernel decltype(attention_fa<half, 128>) attention_fa<half, 128>;
+template [[host_name("attention_fa_d256")]] kernel decltype(attention_fa<float, 256>) attention_fa<float, 256>;
+template [[host_name("attention_fa_d256_h")]] kernel decltype(attention_fa<half, 256>) attention_fa<half, 256>;

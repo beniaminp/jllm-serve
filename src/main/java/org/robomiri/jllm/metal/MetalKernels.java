@@ -71,7 +71,15 @@ final class MetalKernels implements AutoCloseable {
      * FLASH_CHUNK keys and combines the partial softmaxes. Opt-in because the combine sums in a different order
      * from the single-pass kernel (results differ at the 1e-6 level, not bit-identical).
      */
-    static final boolean FLASH_DECODE = Boolean.getBoolean("jllm.metal.flashDecode");
+    /** {@code -Djllm.metal.flashDecode=true|false} forces flash decoding on or off; "auto": {@link MetalTuner} decides. */
+    static final String FLASH_DECODE_MODE = System.getProperty("jllm.metal.flashDecode", "auto");
+    /**
+     * Flash-attention prefill ({@code attention_fa}) for chunks of at least {@link #FLASH_PREFILL_MIN} tokens:
+     * {@code -Djllm.metal.flashPrefill=false} turns it off; otherwise the start-up self-check ({@link MetalTuner})
+     * decides on the device.
+     */
+    static final String FLASH_PREFILL = System.getProperty("jllm.metal.flashPrefill", "auto");
+    static final int FLASH_PREFILL_MIN = Integer.getInteger("jllm.metal.flashPrefillMin", 16);
     static final int FLASH_MIN_LEN = Integer.getInteger("jllm.metal.flashMinLen", 512);
     static final int FLASH_CHUNK = Integer.getInteger("jllm.metal.flashChunk", 128); // 64-128 measured best, 256+ slower
     static final int FLASH_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.flashSplits", 32));
@@ -450,6 +458,28 @@ final class MetalKernels implements AutoCloseable {
                     .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap);
             dispatch(kernel, 5, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
+    }
+
+    /** Whether {@code attention_fa} exists for this head width. */
+    static boolean flashPrefillFits(int headDim) {
+        return headDim == 64 || headDim == 128 || headDim == 256;
+    }
+
+    /**
+     * Flash-attention prefill of the n tokens at pos ({@code attention_fa}): one dispatch over (heads, n / FA_ROWS
+     * tiles), no scores scratch. kc / vc are the full caches with row stride kStride.
+     */
+    void flashPrefill(boolean kvHalf, int headDim, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
+                      int nHeads, int nKvHeads, int pos, int n, float scale, int qStride, int kStride, int oStride,
+                      int window, float softcap) {
+        bind(0, q, 0);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, 0);
+        p.reset(KernelParams.FLASH).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(kStride).i(oStride)
+                .i(window).f(softcap);
+        dispatch("attention_fa_d" + headDim + (kvHalf ? "_h" : ""), 4, 0, nHeads,
+                (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
     }
 
     /**

@@ -161,7 +161,10 @@ void emu_barrier();
 // all = 32 slots of `size` bytes in lane order; returns the mask of the lanes that took part
 uint32_t emu_simd_exchange(const void *mine, void *all, int size);
 static inline void threadgroup_barrier(mem_flags) { emu_barrier(); }
-static inline void simdgroup_barrier(mem_flags) { emu_barrier(); }
+static inline void simdgroup_barrier(mem_flags) { // every live lane of the simdgroup arrives
+    char none = 0, all[32];
+    emu_simd_exchange(&none, all, 1);
+}
 
 template <typename T, typename F>
 static inline T emu_simd_reduce(T v, F f) {

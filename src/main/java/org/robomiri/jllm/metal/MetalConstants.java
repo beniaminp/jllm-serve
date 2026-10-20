@@ -46,6 +46,10 @@ public final class MetalConstants {
     public static final int MAMBA_MAX_STATE = 64;
     /** Conv kernel width the Mamba conv holds in registers. */
     public static final int MAMBA_MAX_CONV = 8;
+    /** Query tokens per threadgroup of attention_fa. */
+    public static final int FA_ROWS = 32;
+    /** attention_fa threadgroup (4 simdgroups). */
+    public static final int FA_THREADS = 128;
     /** |argument| bound of the kernels' fast-math tanh. */
     public static final float TANH_CLAMP = 20.0f;
 
@@ -73,6 +77,8 @@ public final class MetalConstants {
         m.put("FLASH_MAX_SPLITS", (double) FLASH_MAX_SPLITS);
         m.put("MAMBA_MAX_STATE", (double) MAMBA_MAX_STATE);
         m.put("MAMBA_MAX_CONV", (double) MAMBA_MAX_CONV);
+        m.put("FA_ROWS", (double) FA_ROWS);
+        m.put("FA_THREADS", (double) FA_THREADS);
         m.put("TANH_CLAMP", (double) TANH_CLAMP);
         return m;
     }
