@@ -20,7 +20,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /** The console's endpoints without a model: settings round trip, validation and the OpenAI errors. */
 @SpringBootTest(properties = {"jllm.web.settings-file=target/test-settings/jllm-web.properties",
-        "jllm.web.tools-file=target/test-settings/jllm-web-tools.json", "jllm.web.api-key=secret"})
+        "jllm.web.tools-file=target/test-settings/jllm-web-tools.json", "jllm.web.api-key=secret",
+        "jllm.web.kv-cache-dir=target/test-settings/kv-cache"})
 @AutoConfigureMockMvc
 class WebApiTest {
 
@@ -45,6 +46,18 @@ class WebApiTest {
         mvc.perform(get("/api/status").header("Authorization", AUTH)).andExpect(status().isOk())
                 .andExpect(jsonPath("$.apiKeyRequired").value(true));
         mvc.perform(get("/index.html")).andExpect(status().isOk()); // the UI itself is public
+    }
+
+    @Test
+    void savedConversations() throws Exception {
+        mvc.perform(get("/api/kv-cache").header("Authorization", AUTH)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.enabled").value(true)).andExpect(jsonPath("$.files").value(0))
+                .andExpect(jsonPath("$.maxBytes").value(10_000_000_000L))
+                .andExpect(jsonPath("$.dir", containsString("kv-cache")));
+        mvc.perform(post("/api/kv-cache/save").header("Authorization", AUTH)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.files").value(0)); // no model loaded: nothing to save
+        mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/api/kv-cache")
+                .header("Authorization", AUTH)).andExpect(status().isOk()).andExpect(jsonPath("$.deleted").value(0));
     }
 
     @Test

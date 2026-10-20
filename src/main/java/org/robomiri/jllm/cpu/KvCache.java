@@ -8,6 +8,12 @@ import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 
 /**
@@ -167,6 +173,81 @@ public abstract class KvCache {
     /** Offset of chunk {@code c} of kv head {@code g} in an f32 transposed K array: {@code [kvHeads][chunks][hd][CHUNK]}. */
     final int keyChunk(int g, int c) {
         return (g * chunks() + c) * headDim * CHUNK;
+    }
+
+    /** Layout of {@link #write}: the element type and the shape, so a file is only read into an equal cache. */
+    public final String format() {
+        return (this instanceof F16 ? "f16" : "f32") + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
+    }
+
+    /** Rows per buffer of {@link #write} / {@link #read}. */
+    private static final int IO_ROWS = 256;
+
+    /**
+     * Writes positions {@code [0, n)} of every layer: per layer, per position, the K row then the V row in natural
+     * element order, little-endian, as f32 or f16 (the stored type, so nothing is rounded).
+     */
+    public final void write(int n, WritableByteChannel out) throws IOException {
+        boolean half = this instanceof F16;
+        int el = half ? 2 : 4;
+        float[] row = new float[kvDim];
+        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * kvDim * el).order(ByteOrder.LITTLE_ENDIAN);
+        for (int layer = 0; layer < layers; layer++) {
+            for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
+                buf.clear();
+                for (int s = s0; s < Math.min(n, s0 + IO_ROWS); s++) {
+                    for (int kind = 0; kind < 2; kind++) {
+                        for (int g = 0; g < kvHeads; g++) {
+                            expand(layer, kind == 1, s, g * headDim, row, g * headDim);
+                        }
+                        for (int i = 0; i < kvDim; i++) {
+                            if (half) {
+                                buf.putShort(Float.floatToFloat16(row[i]));
+                            } else {
+                                buf.putFloat(row[i]);
+                            }
+                        }
+                    }
+                }
+                buf.flip();
+                while (buf.hasRemaining()) {
+                    out.write(buf);
+                }
+            }
+        }
+    }
+
+    /** Reads what {@link #write} wrote for {@code n} positions into positions {@code [0, n)}. */
+    public final void read(int n, ReadableByteChannel in) throws IOException {
+        if (n > ctx) {
+            throw new IOException("the saved cache holds " + n + " positions, the context is " + ctx);
+        }
+        boolean half = this instanceof F16;
+        int el = half ? 2 : 4;
+        float[] k = new float[IO_ROWS * kvDim];
+        float[] v = new float[IO_ROWS * kvDim];
+        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * kvDim * el).order(ByteOrder.LITTLE_ENDIAN);
+        for (int layer = 0; layer < layers; layer++) {
+            for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
+                int m = Math.min(n - s0, IO_ROWS);
+                buf.clear().limit(m * 2 * kvDim * el);
+                while (buf.hasRemaining()) {
+                    if (in.read(buf) < 0) {
+                        throw new EOFException("the saved cache file is truncated");
+                    }
+                }
+                buf.flip();
+                for (int r = 0; r < m; r++) {
+                    for (int kind = 0; kind < 2; kind++) {
+                        float[] dst = kind == 0 ? k : v;
+                        for (int i = 0; i < kvDim; i++) {
+                            dst[r * kvDim + i] = half ? Float.float16ToFloat(buf.getShort()) : buf.getFloat();
+                        }
+                    }
+                }
+                store(layer, s0, k, v, m);
+            }
+        }
     }
 
     private static final boolean FASTMATH = VectorKernels.FASTMATH;

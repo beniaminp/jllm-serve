@@ -16,6 +16,11 @@ import java.util.List;
  * @param reasoningFormat how {@code /v1/chat/completions} returns a {@code <think>} block: {@code deepseek} (in
  *                        {@code reasoning_content}, apart from the answer) or {@code none} (inline in the content);
  *                        a request may override it with {@code "reasoning_format"}
+ * @param kvCache            save conversation KV caches to disk and restore them ({@code KvStore})
+ * @param kvCacheDir         where the saved caches live
+ * @param kvCacheMaxGb       disk budget; the least recently used caches are deleted beyond it
+ * @param kvCacheMinTokens   shorter caches are not saved
+ * @param kvCacheSaveAfterMs a request whose prefill took at least this long saves its slot's cache
  */
 @ConfigurationProperties("jllm.web")
 public record WebProperties(
@@ -24,7 +29,12 @@ public record WebProperties(
         @DefaultValue List<String> autoload,
         @DefaultValue("2000") int logLines,
         @DefaultValue("jllm-web-tools.json") String toolsFile,
-        @DefaultValue("deepseek") String reasoningFormat) {
+        @DefaultValue("deepseek") String reasoningFormat,
+        @DefaultValue("true") boolean kvCache,
+        @DefaultValue("kv-cache") String kvCacheDir,
+        @DefaultValue("10") double kvCacheMaxGb,
+        @DefaultValue("1024") int kvCacheMinTokens,
+        @DefaultValue("10000") long kvCacheSaveAfterMs) {
 
     public boolean apiKeyRequired() {
         return apiKey != null && !apiKey.isBlank();

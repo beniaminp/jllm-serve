@@ -165,7 +165,7 @@ public class OpenAiController {
                     ChatSupport.send(res, 400, ChatSupport.error(ex.getMessage(), "invalid_request_error", "context_length_exceeded"));
                     return;
                 }
-                model.record(r.stats());
+                model.record(slot, r.stats());
                 String finish = deadline.finishReason(r);
                 Map<String, Object> choice;
                 if (chat) {
@@ -239,7 +239,7 @@ public class OpenAiController {
             } catch (Exception ex) { // AutoCloseable.close: cannot happen
                 throw new IllegalStateException(ex);
             }
-            model.record(r.stats());
+            model.record(slot, r.stats());
             String finish = deadline.finishReason(r);
             List<Object> calls = null;
             if (holdback != null) {

@@ -383,6 +383,77 @@ public final class Engine implements AutoCloseable {
         return new Result(text.toString(), tokens, finish, stats);
     }
 
+    /** The tokens whose keys and values are in the cache now (a copy). */
+    public int[] cachedTokens() {
+        int n = cachedLen;
+        return java.util.Arrays.copyOf(cached, Math.min(n, cached.length));
+    }
+
+    /** Whether {@link #saveCache} / {@link #loadCache} work with this backend. */
+    public boolean canPersistCache() {
+        return backend.stateFormat() != null;
+    }
+
+    /**
+     * Saves the cached tokens and their keys and values to {@code file} (atomically: a temporary file is moved into
+     * place), waiting for a running request to finish first.
+     *
+     * @param fingerprint identifies the model and the settings that change its keys and values; a saved cache is
+     *                    only loaded back under the same fingerprint
+     * @return the number of positions saved (0: nothing cached, or the backend cannot save)
+     */
+    public int saveCache(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
+        String format = backend.stateFormat();
+        if (format == null) {
+            return 0;
+        }
+        acquire();
+        try {
+            int n = cachedLen;
+            if (n == 0) {
+                return 0;
+            }
+            int[] tokens = java.util.Arrays.copyOf(cached, n);
+            CacheFile.write(file, new CacheFile.Header(fingerprint, format, tokens), ch -> backend.saveState(n, ch));
+            return n;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Replaces the cache with the one saved in {@code file}, so that a prompt starting with its tokens skips their
+     * prefill. Waits for a running request to finish first.
+     *
+     * @return the number of positions restored
+     * @throws java.io.IOException when the file is not a cache of this model (fingerprint), not of this backend
+     *                             layout, or longer than the context; the current cache is then unchanged unless the
+     *                             failure happened while reading the keys and values, in which case it is emptied
+     */
+    public int loadCache(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
+        String format = backend.stateFormat();
+        if (format == null) {
+            throw new java.io.IOException(backend.name() + " cannot load a saved cache");
+        }
+        acquire();
+        try {
+            CacheFile.Header h = CacheFile.read(file, fingerprint, format, (hdr, ch) -> {
+                int n = hdr.tokens().length;
+                if (n >= backend.contextLength()) {
+                    throw new java.io.IOException("the saved cache holds " + n + " tokens, the context is "
+                            + backend.contextLength());
+                }
+                cachedLen = 0; // invalid until the whole state is in
+                backend.loadState(n, ch);
+            });
+            cached = h.tokens();
+            cachedLen = h.tokens().length;
+            return cachedLen;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private static void emit(String s, StringBuilder text, TextSink sink) {
         if (s.isEmpty()) {
             return;

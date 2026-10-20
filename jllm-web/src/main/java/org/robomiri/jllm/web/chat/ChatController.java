@@ -137,7 +137,9 @@ public class ChatController {
             }
             ToolCallFormat.Holdback holdback = new ToolCallFormat.Holdback(piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)));
             Engine.Result r;
+            LoadedModel.Slot used;
             try (LoadedModel.Slot slot = model.pick(prompt); AutoCloseable alive = sse.keepAlive()) {
+                used = slot;
                 r = slot.engine().generate(prompt, params, byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback,
                         () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
             } catch (Exception e) {
@@ -146,7 +148,7 @@ public class ChatController {
                 finish = "error";
                 break;
             }
-            model.record(r.stats());
+            model.record(used, r.stats());
             emit(sse, failure, Json.obj("type", "usage", "usage", ChatSupport.usage(r.stats())));
             finish = deadline.finishReason(r);
             ToolCallFormat.Parsed parsed = byName.isEmpty() ? new ToolCallFormat.Parsed(r.text(), List.of())

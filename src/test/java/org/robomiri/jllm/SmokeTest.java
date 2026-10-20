@@ -68,6 +68,7 @@ public final class SmokeTest {
         fastMath();
         threadPool();
         prefixReuse(dir);
+        persistCache(dir);
         deepseekConfigs();
         System.out.println("all smoke tests passed");
     }
@@ -1199,6 +1200,63 @@ public final class SmokeTest {
      * Engine prefix cache: a KV-cache backend resumes after the longest common prefix, a backend whose state cannot
      * be rewound (Mamba) only when the new prompt extends everything it has seen, otherwise it restarts at 0.
      */
+    /**
+     * {@link org.robomiri.jllm.engine.Engine#saveCache} / {@code loadCache} on the real model, for f32 and f16 caches:
+     * a cache saved by one engine and loaded into a fresh one (another backend on the same weights) holds the same
+     * tokens, saves back to an identical file, and continues a conversation exactly like the original engine; a wrong
+     * fingerprint is refused.
+     */
+    static void persistCache(Path dir) throws Exception {
+        Path tmp = Files.createTempDirectory("jllm-kvfile");
+        try {
+            for (String dtype : new String[]{"f32", "f16"}) {
+                org.robomiri.jllm.config.Settings st = org.robomiri.jllm.config.Settings.load(new String[]{"--backend", "cpu",
+                        "--model.dir", dir.toAbsolutePath().getParent().toString(), "--backend.ctx", "256", "--backend.kv-dtype", dtype, "--engine.speculative", "off"});
+                try (org.robomiri.jllm.ModelLoader.Loaded l = org.robomiri.jllm.ModelLoader.load(st,
+                        org.robomiri.jllm.ModelLoader.hub(st), dir.getFileName().toString());
+                     org.robomiri.jllm.engine.Engine fresh = org.robomiri.jllm.ModelLoader.extraEngine(st, l)) {
+                    org.robomiri.jllm.engine.Engine e = l.engine();
+                    SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 6, List.of());
+                    int[] p1 = e.tokenizer().encode("The capital of France is");
+                    e.generate(p1, greedy, null, () -> false);
+                    Path f = tmp.resolve("a.kv");
+                    int saved = e.saveCache(f, "test-model");
+                    check(saved > p1.length && Arrays.equals(org.robomiri.jllm.engine.CacheFile.readHeader(f).tokens(),
+                            e.cachedTokens()), dtype + " cache saved with its tokens (" + saved + ")");
+                    boolean refused = false;
+                    try {
+                        fresh.loadCache(f, "another-model");
+                    } catch (java.io.IOException ex) {
+                        refused = ex.getMessage().contains("another model");
+                    }
+                    check(refused && fresh.cachedTokens().length == 0, dtype + " cache of another model refused");
+                    int loaded = fresh.loadCache(f, "test-model");
+                    check(loaded == saved && Arrays.equals(fresh.cachedTokens(), e.cachedTokens()), dtype + " cache loaded: " + loaded);
+                    Path g = tmp.resolve("b.kv");
+                    fresh.saveCache(g, "test-model");
+                    check(Arrays.equals(Files.readAllBytes(f), Files.readAllBytes(g)), dtype + " loaded cache saves back identically");
+                    int[] cont = e.cachedTokens();
+                    int[] more = e.tokenizer().encode(" And of Italy?");
+                    int[] p2 = Arrays.copyOf(cont, cont.length + more.length);
+                    System.arraycopy(more, 0, p2, cont.length, more.length);
+                    org.robomiri.jllm.engine.Engine.Result a = e.generate(p2, greedy, null, () -> false);
+                    org.robomiri.jllm.engine.Engine.Result b = fresh.generate(p2, greedy, null, () -> false);
+                    check(b.stats().cachedTokens() == saved && a.stats().cachedTokens() == saved
+                                    && Arrays.equals(a.tokens(), b.tokens()),
+                            dtype + " restored engine continues like the original: " + Arrays.toString(b.tokens()) + " vs "
+                                    + Arrays.toString(a.tokens()) + ", reused " + b.stats().cachedTokens());
+                }
+            }
+        } finally {
+            try (var files = Files.list(tmp)) {
+                for (Path f : files.toList()) {
+                    Files.deleteIfExists(f);
+                }
+            }
+            Files.deleteIfExists(tmp);
+        }
+    }
+
     static void prefixReuse(Path dir) throws Exception {
         Path tmp = Files.createTempDirectory("jllm-engine");
         try {

@@ -47,3 +47,4 @@ jllm-web/jllm-web.properties
 !/jllm-web/src/main/java/org/robomiri/jllm/web/models/
 /jllm-web-tools.json
 jllm-web/jllm-web-tools.json
+kv-cache/

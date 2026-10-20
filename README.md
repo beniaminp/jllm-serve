@@ -151,7 +151,8 @@ repository by its launcher).
   (`auto`, `none`, `required` or a named function); the model's calls come back as `tool_calls` with finish reason
   `tool_calls`, and `tool` messages carry the results back. `POST /api/chat` is the console's chat with server-side
   tools (an event stream). The management API: `/api/models/load|download|loaded|local`, `/api/hub/inspect`,
-  `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`.
+  `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`,
+  `/api/kv-cache` (`GET`, `POST /save`, `DELETE`).
 
 Function calling uses the Hermes / Qwen format (`<tools>` in the system prompt, `<tool_call>` blocks in the answer,
 `<tool_response>` for results), which Qwen2.5 and Qwen3 were trained on; other families follow it less reliably, and
@@ -183,9 +184,21 @@ What makes it work rather than merely connect:
   prompt continues where it stopped.
 - **`reasoning_content`.** A `<think>` block is returned apart from the answer (DeepSeek style), as opencode, Open
   WebUI and Continue expect; `"reasoning_format": "none"` keeps it inline.
-- **Prefill attention** over long prompts was reworked for this (span-sized tiles, key blocks, register
-  accumulation, same results bit for bit): a 6 033-token prompt prefills in 115 s instead of 313 s with Qwen3-0.6B
-  on 4 CPU cores ([docs/07](docs/07-cpu-backend.md#75-attention-kvcacheattention)).
+- **Saved conversations.** A slot's KV cache is written to disk (`kv-cache/`) after a prefill of 10 s or more and
+  when a model is unloaded or the server stops; when a request's prompt starts with a saved conversation that covers
+  more than its slot holds, the cache is loaded back instead of prefilled. Every new opencode session starts with the
+  same ~10k tokens of instructions, so after a restart the first step costs a disk read instead of minutes (measured:
+  2 707-token prompt, 21.3 s prefill; after a restart restored in 0.9 s, 2 706 tokens reused). The Models page lists
+  the saved caches (*save now*, *delete all*); `jllm.web.kv-cache=false` turns it off, `jllm.web.kv-cache-max-gb`
+  (default 10) bounds the disk use (least recently used deleted first), `jllm.web.kv-cache-dir`,
+  `-min-tokens` (1024) and `-save-after-ms` (10000) tune it. A cache is only reused by the same model with the
+  same load settings (quantization, backend, KV type); f16 takes 2 bytes × 2 × layers × kv width per token (115 kB
+  for Qwen3-0.6B, so ~1.2 GB for opencode's 10k-token prompt).
+- **Long-prompt attention** was reworked for this: K stored transposed in 32-key chunks so scores need no per-key
+  reduction, the f16 cache converted with vector code, a vectorized softmax exp, register-blocked kernels, and
+  decode split across threads when a model has fewer kv heads than cores; prefill and decode still agree bit for
+  bit. A 6 033-token prompt prefills in 60 s (313 s originally, 115 s after the first round) and decode after it
+  runs at 7.6 tok/s instead of ~2–3, with Qwen3-0.6B on 4 CPU cores ([docs/07](docs/07-cpu-backend.md#75-attention-kvcacheattention)).
 
 Measured end to end on a 4-core cloud VM with Qwen3-0.6B (`opencode run "Create a file named hello.txt containing
 exactly the text: hi"`): the first step prefilled opencode's 10 447-token prompt in 349 s and called `write`, the

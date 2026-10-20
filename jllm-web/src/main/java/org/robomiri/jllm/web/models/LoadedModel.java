@@ -71,6 +71,7 @@ public final class LoadedModel {
 
     private final String id;
     private final String source;
+    private final KvStore store; // null: no saved caches
     private final ModelLoader.Loaded loaded;
     private final List<Slot> slots = new ArrayList<>();
     private final Map<String, String> settings;
@@ -85,9 +86,10 @@ public final class LoadedModel {
 
     /** @param extra the engines of slots 1.. (slot 0 is {@code loaded}'s) */
     LoadedModel(String id, String source, ModelLoader.Loaded loaded, List<Engine> extra, Map<String, String> settings,
-                double loadSeconds) {
+                double loadSeconds, KvStore store) {
         this.id = id;
         this.source = source;
+        this.store = store;
         this.loaded = loaded;
         slots.add(new Slot(loaded.engine(), 0));
         for (Engine e : extra) {
@@ -110,11 +112,33 @@ public final class LoadedModel {
         return loaded.engine();
     }
 
+    /** The load-time settings (those of {@link View#settings}). */
+    public Map<String, String> settings() {
+        return settings;
+    }
+
+    List<Slot> slots() {
+        return slots;
+    }
+
     /**
      * Reserves the slot to run {@code prompt} (prepared ids) on: an idle slot with the longest cached prefix, unless
-     * a busy slot holds a much longer one (waiting for it beats prefilling a long conversation again).
+     * a busy slot holds a much longer one (waiting for it beats prefilling a long conversation again). A conversation
+     * saved to disk ({@link KvStore}) that covers more of the prompt is then loaded into the slot.
      */
-    public synchronized Slot pick(int[] prompt) {
+    public Slot pick(int[] prompt) {
+        Slot s = choose(prompt);
+        if (store != null) {
+            try {
+                store.restore(this, s, prompt);
+            } catch (RuntimeException e) {
+                System.err.println("kv-cache: restore failed: " + e);
+            }
+        }
+        return s;
+    }
+
+    private synchronized Slot choose(int[] prompt) {
         Slot bestIdle = null;
         Slot bestAny = null;
         int idleLen = -1;
@@ -162,6 +186,14 @@ public final class LoadedModel {
         };
     }
 
+    /** Records a finished request on {@code slot}; an expensive prefill gets its cache saved to disk. */
+    public void record(Slot slot, Engine.Stats stats) {
+        record(stats);
+        if (store != null) {
+            store.afterRequest(this, slot, stats);
+        }
+    }
+
     public void record(Engine.Stats stats) {
         generated.addAndGet(stats.generatedTokens());
         if (stats.generatedTokens() > 1) {
@@ -176,6 +208,13 @@ public final class LoadedModel {
             return false;
         }
         try {
+            if (store != null) {
+                try {
+                    store.saveAll(this);
+                } catch (RuntimeException e) {
+                    System.err.println("kv-cache: saving on unload failed: " + e);
+                }
+            }
             for (int i = 1; i < slots.size(); i++) {
                 slots.get(i).engine.close();
             }

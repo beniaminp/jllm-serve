@@ -775,6 +775,27 @@ public final class CpuBackend implements Backend {
     }
 
     @Override
+    public String stateFormat() {
+        return kv == null ? null : "cpu-kv " + kv.format();
+    }
+
+    @Override
+    public void saveState(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        if (kv == null) {
+            Backend.super.saveState(n, out);
+        }
+        kv.write(n, out);
+    }
+
+    @Override
+    public void loadState(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        if (kv == null) {
+            Backend.super.loadState(n, in);
+        }
+        kv.read(n, in);
+    }
+
+    @Override
     public void close() {
         pool.close();
     }

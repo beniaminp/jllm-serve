@@ -153,6 +153,16 @@ const Models = (() => {
     }));
   }
 
+  function renderKv(kv) {
+    const box = $('#kv-list');
+    const head = `<p class="hint">${kv.enabled ? `Saved after a prefill of ${Math.round(kv.saveAfterMs / 1000)} s or more and on unload, when at least
+      ${kv.minTokens} tokens are cached; restored when a prompt starts with a saved conversation. ${fmtBytes(kv.bytes)} of ${fmtBytes(kv.maxBytes)}
+      in <code>${esc(kv.dir)}</code>.` : 'Disabled (<code>jllm.web.kv-cache=false</code>).'}</p>`;
+    box.innerHTML = head + (kv.saved.length ? `<table class="table"><tr><th>model</th><th>tokens</th><th>size</th><th>last used</th></tr>
+      ${kv.saved.map(e => `<tr><td>${esc(e.model)}</td><td>${e.tokens}</td><td>${fmtBytes(e.bytes)}</td>
+        <td>${new Date(e.usedAt).toLocaleString()}</td></tr>`).join('')}</table>` : '<p class="empty">Nothing saved yet.</p>');
+  }
+
   async function refresh(full) {
     try {
       const [loaded, jobs] = await Promise.all([refreshLoaded(), api('/api/jobs')]);
@@ -162,6 +172,7 @@ const Models = (() => {
       if ((full || busy || Date.now() - lastLocal > 15000) && !$('#local-list .inline-form')) {
         lastLocal = Date.now();
         renderLocal(await api('/api/models/local'));
+        renderKv(await api('/api/kv-cache'));
       }
     } catch (e) { $('#loaded-list').innerHTML = `<p class="error">${esc(e.message)}</p>`; }
   }
@@ -172,6 +183,15 @@ const Models = (() => {
     $$('#quick-picks [data-src]').forEach(b => b.addEventListener('click', () => { $('#hf-link').value = b.dataset.src; inspect(b.dataset.src); }));
     $('#inspect-form').addEventListener('submit', ev => { ev.preventDefault(); inspect($('#hf-link').value.trim()); });
     $('#clear-jobs').addEventListener('click', async () => { await api('/api/jobs', {method: 'DELETE'}); refresh(); });
+    $('#kv-save').addEventListener('click', async () => {
+      try { renderKv(await api('/api/kv-cache/save', {method: 'POST'})); toast('Saved the cached conversations.', 'ok'); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+    $('#kv-clear').addEventListener('click', async () => {
+      if (!confirm('Delete every saved conversation cache?')) return;
+      try { const r = await api('/api/kv-cache', {method: 'DELETE'}); toast(`Deleted ${r.deleted} files.`, 'ok'); renderKv(await api('/api/kv-cache')); }
+      catch (e) { toast(e.message, 'err'); }
+    });
     onShow.models = () => refresh(true);
     onTick.models = () => refresh(false);
   }

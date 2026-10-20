@@ -77,15 +77,17 @@ public class ModelManager implements DisposableBean {
 
     private final SettingsService settings;
     private final WebProperties props;
+    private final KvStore kvStore;
     private final Map<String, LoadedModel> loaded = new LinkedHashMap<>();
     private final Map<String, Job> jobs = new LinkedHashMap<>();
     private final ExecutorService downloads = Executors.newFixedThreadPool(2, Thread.ofPlatform().name("jllm-download-", 1).daemon().factory());
     private final ExecutorService loads = Executors.newSingleThreadExecutor(Thread.ofPlatform().name("jllm-load").daemon().factory());
     private final AtomicLong jobCounter = new AtomicLong();
 
-    public ModelManager(SettingsService settings, WebProperties props) {
+    public ModelManager(SettingsService settings, WebProperties props, KvStore kvStore) {
         this.settings = settings;
         this.props = props;
+        this.kvStore = kvStore;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -249,7 +251,8 @@ public class ModelManager implements DisposableBean {
                 }
             }
             snapshot.put("slots", String.valueOf(slots));
-            LoadedModel m = new LoadedModel(t.id(), t.model(), l, extraSlots, snapshot, (System.nanoTime() - t0) / 1e9);
+            LoadedModel m = new LoadedModel(t.id(), t.model(), l, extraSlots, snapshot, (System.nanoTime() - t0) / 1e9,
+                    kvStore);
             synchronized (this) {
                 loaded.put(t.id(), m);
             }

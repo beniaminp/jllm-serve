@@ -56,6 +56,24 @@ public interface Backend extends AutoCloseable {
         return true;
     }
 
+    /**
+     * The layout of {@link #saveState}'s output (cache type and shape), or null when this backend cannot save its
+     * state. A saved state is only loaded into a backend reporting the same format.
+     */
+    default String stateFormat() {
+        return null;
+    }
+
+    /** Writes the state after positions {@code [0, n)} (the KV cache). Only when {@link #stateFormat} is not null. */
+    default void saveState(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        throw new UnsupportedOperationException(name() + " cannot save its cache");
+    }
+
+    /** Replaces the state of positions {@code [0, n)} with what {@link #saveState} wrote. */
+    default void loadState(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        throw new UnsupportedOperationException(name() + " cannot load a saved cache");
+    }
+
     @Override
     void close();
 }

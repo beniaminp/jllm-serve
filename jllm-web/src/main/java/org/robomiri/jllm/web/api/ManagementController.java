@@ -39,11 +39,14 @@ public class ManagementController {
     private final ModelManager models;
     private final SettingsService settings;
     private final WebProperties props;
+    private final org.robomiri.jllm.web.models.KvStore kvStore;
 
-    public ManagementController(ModelManager models, SettingsService settings, WebProperties props) {
+    public ManagementController(ModelManager models, SettingsService settings, WebProperties props,
+                                org.robomiri.jllm.web.models.KvStore kvStore) {
         this.models = models;
         this.settings = settings;
         this.props = props;
+        this.kvStore = kvStore;
         LogBuffer.get().setCapacity(props.logLines());
     }
 
@@ -81,6 +84,26 @@ public class ManagementController {
     @PostMapping("/models/download")
     public Job.View download(@RequestBody ModelManager.DownloadRequest request) {
         return models.download(request);
+    }
+
+    /** Conversation caches saved to disk. */
+    @GetMapping("/kv-cache")
+    public org.robomiri.jllm.web.models.KvStore.View kvCache() {
+        return kvStore.view();
+    }
+
+    /** Saves every slot of every loaded model now (normally done after long prefills and on unload). */
+    @PostMapping("/kv-cache/save")
+    public org.robomiri.jllm.web.models.KvStore.View saveKvCache() {
+        for (var m : models.loaded()) {
+            kvStore.saveAll(m);
+        }
+        return kvStore.view();
+    }
+
+    @DeleteMapping("/kv-cache")
+    public Map<String, Object> clearKvCache() throws IOException {
+        return Map.of("deleted", kvStore.clear());
     }
 
     @GetMapping("/models/local")

@@ -105,6 +105,17 @@ Two cases make the bookkeeping more careful:
   then reuses the cache only when the new prompt extends *everything* that was fed before (`reuse == cachedLen`,
   as in a chat that appends turns) and otherwise restarts at position 0.
 
+**Saving the cache to disk.** `Engine.saveCache(file, fingerprint)` writes the cached token ids and their keys and
+values; `loadCache(file, fingerprint)` puts them back, after which a prompt starting with those tokens reuses them
+exactly as above. The file (`CacheFile`) is a small header (magic, the caller's model fingerprint, the backend's
+`stateFormat()`, the token ids), readable on its own for indexing, followed by the backend's state. The CPU
+backend writes its KV cache per layer, row by row, in the stored type (f32 or f16, so nothing is rounded twice);
+MLA, Mamba and Metal backends report no state format and are not saved. Both calls take the engine lock; a file
+of another fingerprint or format is refused, and a load that fails half-way leaves the cache empty rather than
+mixed. A loaded cache is bit-identical to the saved one (`SmokeTest.persistCache` saves it back and compares the
+files) and continues a conversation exactly like the engine that saved it. jllm-web builds its saved-conversation
+store on this (README, *Coding agents*).
+
 ---
 
 ## 10.3 Stop strings
