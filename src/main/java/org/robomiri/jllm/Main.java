@@ -207,7 +207,8 @@ public final class Main {
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         try (ModelWeights weights = l.weights(); Engine engine = l.engine();
-             ApiServer server = new ApiServer(engine, model, host, port, options)) {
+             ApiServer server = new ApiServer(engine, model, host, port, options).imageLimits(
+                     s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();
         }

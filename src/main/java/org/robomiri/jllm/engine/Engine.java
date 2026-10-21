@@ -371,6 +371,17 @@ public final class Engine implements AutoCloseable {
         return generateChoices(prompt.identity(), prompt, p, d, n, sink, cancelled);
     }
 
+    /** One completion of a prompt with pictures, streamed to {@code sink} (may be null). */
+    public Result generate(MediaPrompt prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
+        ChoiceSink cs = sink == null ? null : new ChoiceSink() {
+            @Override
+            public void text(int index, String text) {
+                sink.accept(text);
+            }
+        };
+        return generate(prompt, p, Decoding.NONE, 1, cs, cancelled).getFirst();
+    }
+
     private List<Result> generateChoices(int[] prompt, MediaPrompt mp, SamplingParams p, Decoding d, int n,
                                          ChoiceSink sink, BooleanSupplier cancelled) {
         acquire();

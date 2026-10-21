@@ -213,7 +213,8 @@ public class SettingsService {
 
     public static Scope scope(String key) {
         if (key.startsWith("sampling.") || key.startsWith("chat.") || key.startsWith("hub.")
-                || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")) {
+                || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")
+                || key.equals("vision.max-image-bytes") || key.equals("vision.max-image-pixels")) {
             return Scope.LIVE;
         }
         if (key.startsWith("bench.") || (key.startsWith("server.") && !key.equals("server.queue-timeout-ms"))) {

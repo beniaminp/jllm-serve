@@ -80,6 +80,11 @@ public final class ModelLoader {
             return hub.download(model, s.get("model.revision"), src.dir());
         }
         System.err.println(src.gguf());
+        try { // a vision-language repository: its multimodal projector comes with the model (vision.auto-download)
+            org.robomiri.jllm.vision.Mmproj.locate(s, hub, model, src.gguf());
+        } catch (IOException e) {
+            System.err.println("note: " + e.getMessage());
+        }
         return src.gguf();
     }
 

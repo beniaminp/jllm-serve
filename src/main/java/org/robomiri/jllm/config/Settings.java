@@ -241,7 +241,7 @@ public final class Settings {
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
         require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
-        for (String k : new String[]{"vision.enabled", "vision.auto-download"}) {
+        for (String k : new String[]{"vision.enabled", "vision.auto-download", "vision.allow-private-urls"}) {
             getBool(k);
         }
         for (String k : new String[]{"vision.image-min-tokens", "vision.image-max-tokens", "vision.cache-mb",

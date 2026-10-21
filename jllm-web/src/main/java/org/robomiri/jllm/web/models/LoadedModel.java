@@ -41,7 +41,7 @@ public final class LoadedModel {
     public record View(String id, String source, String description, String backend, int contextLength,
                        String quant, long weightBytes, String template, long loadedAt, double loadSeconds,
                        long requests, long generatedTokens, double lastTokensPerSecond, int active,
-                       Map<String, String> settings, int slots, int busy) {
+                       Map<String, String> settings, int slots, int busy, boolean vision, String projector) {
     }
 
     /** One engine (KV cache) of the model, reserved for a request until closed. */
@@ -317,6 +317,7 @@ public final class LoadedModel {
         return new View(id, source, w.arch.toString(), e.backend().name(), e.backend().contextLength(),
                 String.valueOf(w.quant), w.byteSize(), e.template().name(), loadedAt, loadSeconds, requests.get(),
                 generated.get(), Math.round(lastTokPerSec * 10) / 10.0, active.get(), settings, slots.size(),
-                (int) slots.stream().filter(s -> s.users.get() > 0).count());
+                (int) slots.stream().filter(s -> s.users.get() > 0).count(), e.vision() != null,
+                e.vision() == null ? null : e.vision().describe());
     }
 }

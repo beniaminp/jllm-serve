@@ -17,6 +17,21 @@ public final class ClipCpu implements VisionEncoder {
     private final ClipModel m;
     private final ThreadPool pool;
     private final boolean ownPool;
+    /** {@code -Djllm.vision.dump=<prefix>}: writes the activations after the patch embedding and each block (f32) for comparisons. */
+    private static final String DUMP = System.getProperty("jllm.vision.dump");
+
+    private static void dump(String name, float[] a, int n) {
+        if (DUMP == null) {
+            return;
+        }
+        try {
+            java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(n * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            bb.asFloatBuffer().put(a, 0, n);
+            java.nio.file.Files.write(java.nio.file.Path.of(DUMP + "." + name + ".f32"), bb.array());
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
 
     public ClipCpu(ClipModel m, int threads) {
         this(m, new ThreadPool(threads), true);
@@ -99,6 +114,9 @@ public final class ClipCpu implements VisionEncoder {
         for (int il = 0; il < m.nLayer; il++) {
             Layer l = m.layers.get(il);
             norm(rms, x, t, e, l.ln1W, l.ln1B, h);
+            if (il == 0) {
+                dump("ln1-0", h, t * e);
+            }
             if (l.qkv != null) {
                 float[] qkv = new float[t * 3 * e];
                 lin(l.qkv, l.qkvB, h, t, e, qkv, 3 * e);
@@ -134,6 +152,7 @@ public final class ClipCpu implements VisionEncoder {
                 lin(l.down, l.downB, f1, t, ldF, tmp, e);
             }
             VMath.addTo(pool, x, tmp, t * e);
+            dump("layer_out-" + il, x, t * e);
         }
     }
 
@@ -382,6 +401,7 @@ public final class ClipCpu implements VisionEncoder {
         if (preW != null) {
             norm(rms, x, t, e, preW, m.vecOpt("v.pre_ln.bias"), x);
         }
+        dump("inp", x, t * e);
         blocks(x, t, rms, oy, ox, 10000f, winStart, nWin);
         float[] pw = m.vecOpt("v.post_ln.weight");
         if (pw != null) {
