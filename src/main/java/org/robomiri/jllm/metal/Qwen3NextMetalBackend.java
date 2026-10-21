@@ -132,6 +132,9 @@ public final class Qwen3NextMetalBackend implements Backend {
         this.dn = arch.deltaNet();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
+        if (kvDtype == KvDtype.Q8) { // the kernels here store f32 or half rows; a q8 cache would be written past its buffer
+            throw new IllegalArgumentException("the Metal Qwen3-Next backend supports the f32 and f16 KV caches, not q8");
+        }
         this.kvHalf = kvDtype == KvDtype.F16;
         int hd = arch.attention().headDim();
         if (hd % 32 != 0 || hd > 256) {

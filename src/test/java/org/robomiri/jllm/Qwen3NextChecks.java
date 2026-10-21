@@ -239,6 +239,10 @@ public final class Qwen3NextChecks {
         int[] next = {PROMPT[3], PROMPT[5]};
         int bad = 0;
         for (KvDtype dt : KvDtype.values()) {
+            if (cpu != null && dt == KvDtype.Q8) { // the Metal backend (cpu != null marks its run) has no q8 cache
+                System.out.println("  " + label + " state, kv q8: not supported on Metal (the constructor refuses it)");
+                continue;
+            }
             float[] want = new float[vocab];
             float[] got = new float[vocab];
             try (Backend a = f.open(w, 64, 16, dt); Backend b = f.open(w, 64, 16, dt); Backend c = f.open(w, 64, 16, dt)) {
