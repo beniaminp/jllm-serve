@@ -18,10 +18,11 @@ import java.util.regex.Pattern;
  * ({@code blk.N.attn_q.weight}, ...), and the tensors are handed over as follows.
  *
  * <ul>
- *   <li><b>Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K</b>: viewed in place, no copy ({@link QTensor#mapped}); the kernels read the
- *       file's pages.</li>
- *   <li><b>Q3_K, Q4_1, Q5_0, Q5_1, F16, BF16, F32 matrices</b>: dequantized row by row and quantized to Q8_0
- *       in memory at load; *       the float types are meant for small models, since an F16 model becomes a Q8_0 one in RAM.</li>
+ *   <li><b>Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16</b>: viewed in
+ *       place, no copy ({@link QTensor#mapped}); the kernels read the file's pages. {@code -Djllm.gguf.requantize=<types>}
+ *       turns that off for the listed types (see {@link GgmlCodec}).</li>
+ *   <li><b>F32 matrices</b> (and the types listed in {@code jllm.gguf.requantize}): dequantized row by row and quantized
+ *       to Q8_0 in memory at load.</li>
  *   <li><b>gate and up of a dense MLP</b> (separate tensors in a GGUF, one stacked {@code [2·hidden, dim]} matrix in
  *       the engine): both are viewed in place and joined as a {@linkplain QTensor#split split} tensor (the GPU
  *       kernels bind the two halves separately, the CPU kernels route each row). Only Q2_K, whose kernels read
@@ -151,7 +152,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
 
     private QTensor matrix(GgufFile.Tensor t, boolean count) {
         QType q = GgmlCodec.nativeType(t.type());
-        if (q != null) {
+        if (q != null && colsOf(t) % q.blockSize == 0) {
             viewedBytes += count ? t.size() : 0;
             return QTensor.mapped(q, rowsOf(t), colsOf(t), gguf.data(t));
         }
@@ -162,8 +163,8 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     private QTensor requantize(int rows, int cols, GgufFile.Tensor... parts) {
         for (GgufFile.Tensor t : parts) {
             if (!GgmlCodec.canDequantize(t.type())) {
-                throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported (supported: F32, F16,"
-                        + " BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)");
+                throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported (supported: "
+                        + GgmlCodec.SUPPORTED + ")");
             }
             converted.merge(t.type(), 1, Integer::sum);
             convertedBytes += t.size();
