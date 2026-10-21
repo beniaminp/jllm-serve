@@ -43,8 +43,8 @@ public final class ExpertPlacementCheck {
             touched += cold(u[l]) > 0 ? 1 : 0;
             moved += cold(u[l]);
         }
-        if (touched != 1 || moved != 3) {
-            bad.add("uniform, 250 bytes: expected 3 experts of one layer, got " + moved + " in " + touched + " layers");
+        if (touched != 1 || moved != 8) {
+            bad.add("uniform, 250 bytes: expected one whole layer, got " + moved + " experts in " + touched + " layers");
         }
         boolean[][] u2 = ExpertPlacement.plan(1000, eb, ex, topK, null);
         int full = 0;
@@ -53,8 +53,17 @@ public final class ExpertPlacementCheck {
             full += cold(u2[l]) == 8 ? 1 : 0;
             moved += cold(u2[l]);
         }
-        if (full != 1 || moved != 10) {
-            bad.add("uniform, 1000 bytes: expected one whole layer + 2 experts, got " + full + " whole, " + moved + " experts");
+        if (full != 2 || moved != 16) {
+            bad.add("uniform, 1000 bytes: expected two whole layers, got " + full + " whole, " + moved + " experts");
+        }
+        // statistics for some layers only: the ones without are moved whole or not at all
+        long[][] partial = new long[5][];
+        partial[2] = new long[]{0, 0, 0, 900, 900, 900, 900, 900};
+        boolean[][] pp = ExpertPlacement.plan(250, eb, ex, topK, partial);
+        for (int l : new int[]{1, 3, 4}) {
+            if (cold(pp[l]) != 0 && cold(pp[l]) != 8) {
+                bad.add("a layer without statistics was split: layer " + l + " has " + cold(pp[l]) + " of 8 on the CPU");
+            }
         }
 
         // skewed: layer 1's experts 6 and 7 are never picked, the other layers are uniform -> those two go
@@ -101,11 +110,19 @@ public final class ExpertPlacementCheck {
                 }
                 for (int i = 0; i < e[l]; i++) {
                     freed += p[l][i] ? b[l] : 0;
-                    for (int j = 0; j < e[l] && c[l] != null; j++) {
+                    for (int j = 0; j < e[l] && c[l] != null; j++) { // with counts: only the least used move
                         if (p[l][i] && !p[l][j] && c[l][i] > c[l][j]) {
                             bad.add("trial " + trial + ": layer " + l + " moved expert " + i + " (" + c[l][i]
                                     + " picks) but kept " + j + " (" + c[l][j] + ")");
                         }
+                    }
+                }
+            }
+            for (int l = 0; l < layers; l++) {
+                if (b[l] > 0 && c[l] == null) {
+                    int n = cold(p[l]);
+                    if (n != 0 && n != e[l]) {
+                        bad.add("trial " + trial + ": layer " + l + " without statistics split " + n + " of " + e[l]);
                     }
                 }
             }

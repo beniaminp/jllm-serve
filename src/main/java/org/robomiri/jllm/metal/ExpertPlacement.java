@@ -21,11 +21,12 @@ import java.util.List;
  *     cost = Σ_{layers with a CPU expert} SYNC_US  +  Σ_{CPU experts (l, e)} p(l, e) · expertBytes(l) / CPU_BYTES_PER_US
  * </pre>
  * where {@code p(l, e)} is the expected number of times a token picks expert e of layer l (Σ_e p = topK), from the
- * counts of earlier runs plus one (so a layer without counts is uniform). It frees at least the bytes asked for,
- * greedily taking the move with the lowest cost per byte freed: either the next coldest expert of a layer that already
- * has CPU experts, or opening a new layer with its k coldest experts (the round trip spread over them). With uniform
- * counts this fills one layer completely before opening the next, i.e. whole layers; skewed counts move the cold
- * experts of a few layers. The two constants are estimates (Apple Silicon CPU bandwidth, a command-buffer round
+ * counts of earlier runs plus one. It frees at least the bytes asked for, greedily taking the move with the lowest
+ * cost per byte freed: either the next coldest expert of a layer that already has CPU experts, or opening a new layer
+ * with its k coldest experts (the round trip spread over them; k at most what is still needed). A layer without
+ * counts is uniform and is only ever moved whole: splitting it would cost a packed copy and a remap per step for no
+ * saving, since no expert of it is known to be colder than another. So without statistics the plan is whole layers;
+ * skewed counts move the cold experts of a few layers. The two constants are estimates (Apple Silicon CPU bandwidth, a command-buffer round
  * trip), not measurements; only their ratio matters.
  *
  * <p>The counts come from the GPU ({@code moe_remap} adds up every layer's choices while experts are split) and are
@@ -115,11 +116,18 @@ final class ExpertPlacement {
                     }
                     continue;
                 }
-                // opening the layer: the round trip shared by its k coldest experts, k at most what is still needed
+                // opening the layer: the round trip shared by its k coldest experts, k at most what is still needed;
+                // a layer without counts only whole
+                boolean known = counts != null && counts[l] != null && counts[l].length == experts[l];
                 int maxK = (int) Math.min(experts[l], (need - freed + expertBytes[l] - 1) / expertBytes[l]);
                 double sum = SYNC_US;
-                for (int k = 1; k <= maxK; k++) {
+                int kMin = known ? 1 : experts[l];
+                int kMax = known ? maxK : experts[l];
+                for (int k = 1; k <= kMax; k++) {
                     sum += cost[l][k - 1];
+                    if (k < kMin) {
+                        continue;
+                    }
                     double perByte = sum / ((double) k * expertBytes[l]);
                     if (perByte < bestPerByte) {
                         bestPerByte = perByte;
@@ -183,13 +191,18 @@ final class ExpertPlacement {
                     if (line.startsWith("#") || colon < 0) {
                         continue;
                     }
-                    int l = Integer.parseInt(line.substring(0, colon).trim());
-                    String[] v = line.substring(colon + 1).trim().split(",");
-                    if (l >= 0 && l < layers) {
-                        c[l] = new long[v.length];
+                    try { // a damaged line costs that layer's history, not the file's
+                        int l = Integer.parseInt(line.substring(0, colon).trim());
+                        String[] v = line.substring(colon + 1).trim().split(",");
+                        long[] row = new long[v.length];
                         for (int i = 0; i < v.length; i++) {
-                            c[l][i] = Long.parseLong(v[i].trim());
+                            row[i] = Math.max(0, Long.parseLong(v[i].trim()));
                         }
+                        if (l >= 0 && l < layers) {
+                            c[l] = row;
+                        }
+                    } catch (NumberFormatException e) {
+                        System.err.println("warning: skipping a damaged line of " + file);
                     }
                 }
                 return c;
@@ -202,7 +215,28 @@ final class ExpertPlacement {
 
     /** Adds {@code delta} to the saved counts (halving a layer's that pass MAX_COUNT) and writes the file atomically. */
     static void add(Path file, String modelKey, long[][] delta) {
+        // FILE_LOCK orders this process's backends, the lock file other processes on the same model (a server and a
+        // CLI run): each reads, adds and replaces the file whole
         synchronized (FILE_LOCK) {
+            try {
+                Files.createDirectories(file.getParent());
+            } catch (IOException e) {
+                System.err.println("warning: could not save expert statistics " + file + ": " + e.getMessage());
+                return;
+            }
+            try (java.nio.channels.FileChannel lockFile = java.nio.channels.FileChannel.open(
+                    file.resolveSibling(file.getFileName() + ".lock"), java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.WRITE);
+                 java.nio.channels.FileLock ignored = lockFile.lock()) {
+                addLocked(file, modelKey, delta);
+            } catch (IOException e) {
+                System.err.println("warning: could not save expert statistics " + file + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private static void addLocked(Path file, String modelKey, long[][] delta) throws IOException {
+        {
             long[][] c = load(file, delta.length, modelKey);
             if (c == null) {
                 c = new long[delta.length][];
@@ -230,13 +264,12 @@ final class ExpertPlacement {
                 }
                 lines.add(sb.toString());
             }
+            Path tmp = Files.createTempFile(file.getParent(), file.getFileName().toString(), ".tmp");
             try {
-                Files.createDirectories(file.getParent());
-                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
                 Files.write(tmp, lines, StandardCharsets.UTF_8);
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (IOException e) {
-                System.err.println("warning: could not save expert statistics " + file + ": " + e.getMessage());
+            } finally {
+                Files.deleteIfExists(tmp);
             }
         }
     }

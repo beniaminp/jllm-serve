@@ -179,21 +179,20 @@ public final class QTensor {
         if (type.gguf) {
             long size = rows * rowBytes;
             MemorySegment seg = arena.allocate(align(Math.max(size, 1), PAGE), PAGE).asSlice(0, size);
-            for (int i = 0; i < experts.length; i++) {
-                MemorySegment.copy(data, rowOffset(experts[i] * rowsPerExpert), seg, i * blockRun, blockRun);
-            }
+            IntStream.range(0, experts.length).parallel().forEach(i -> // gigabytes for a large model: copy in parallel
+                    MemorySegment.copy(data, rowOffset(experts[i] * rowsPerExpert), seg, i * blockRun, blockRun));
             return mapped(type, rows, cols, seg);
         }
         MemorySegment seg = arena.allocate(byteSize(type, rows, cols), PAGE);
         QTensor t = new QTensor(type, rows, cols, seg);
         long scaleRun = (long) rowsPerExpert * blocksPerRow() * type.scaleBytes;
-        for (int i = 0; i < experts.length; i++) {
+        IntStream.range(0, experts.length).parallel().forEach(i -> {
             int r = experts[i] * rowsPerExpert;
             MemorySegment.copy(data, rowOffset(r), seg, t.rowOffset(i * rowsPerExpert), blockRun);
             if (scaleRun > 0) {
                 MemorySegment.copy(data, scaleOffset(r), seg, t.scaleOffset(i * rowsPerExpert), scaleRun);
             }
-        }
+        });
         return t;
     }
 

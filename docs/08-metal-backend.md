@@ -917,14 +917,18 @@ routed experts are nearly all the bytes (Qwen3-30B-A3B at Q4_0: about 18 of 19.4
 experts out of the GPU's buffers is the cheapest way to fit. Those experts stay in the memory-mapped file and the
 CPU reads them like any file data.
 
-**How much must move.** With `W` the weights, `B` the GPU's own buffers (KV cache, activations) and `b_l` the
-bytes of one expert of layer `l`, leaving the set `C` of (layer, expert) pairs on the CPU keeps
+**How much must move.** The working set is the device's, so the budget covers everything on it: with `W` this
+model's weights, `B` one backend's buffers (KV cache, activations), `s` the number of backends that will run on
+these weights (a server's slots: `jllm-web` passes it at load; the later slots reuse the first one's placement), `O`
+what the other open backends hold (another model, a draft model), and `b_l` the bytes of one expert of layer `l`,
+leaving the set `C` of (layer, expert) pairs on the CPU keeps
 
 ```
-G(C) = W + B − Σ_{(l,e) ∈ C} b_l          on the GPU, and C is chosen so that G(C) ≤ working set
+G(C) = W + s · B + O − Σ_{(l,e) ∈ C} b_l          on the GPU, and C is chosen so that G(C) ≤ working set
 ```
 
-`auto` (the default) moves nothing when the model fits. `-Djllm.metal.workingSetGb=N` replaces Metal's figure, for
+`auto` (the default) moves nothing when everything fits. A backend whose load pushes the device past the working set
+(a draft model loaded after its target, say) prints a warning with the totals. `-Djllm.metal.workingSetGb=N` replaces Metal's figure, for
 example to leave memory to other programs. A number (`backend.metal.cpu-moe=6`) puts every expert of that many MoE
 layers on the CPU, `all` all of them, `off` none.
 
@@ -944,9 +948,10 @@ cost(C) = S · |{ layers with a CPU expert }|  +  Σ_{(l,e) ∈ C} p(l,e) · b_l
 with `S` = 100 µs and `BW_cpu` = 60 GB/s (estimates; `-Djllm.metal.cpuMoeSyncUs` changes `S`). It works greedily,
 taking the move with the lowest cost per byte freed: either the next-coldest expert of a layer that already has CPU
 experts, or opening a new layer with its `k` coldest experts (the round trip shared by the `k`). The usage `p` comes
-from earlier runs: counts plus one per expert, so a model without statistics looks uniform. With uniform usage,
-filling one layer is always cheaper than opening another, so the plan is **whole layers**; with real usage it
-moves the cold experts of a few layers instead. The start-up log shows both the bytes and the expected share of
+from earlier runs: counts plus one per expert. A layer without statistics is only ever moved whole (no expert of
+it is known to be colder, so splitting it would only add a packed copy and a remap per step), so a first run
+moves **whole layers**, freeing up to one layer more than needed; with real usage the plan moves the cold experts
+of a few layers instead. The start-up log shows both the bytes and the expected share of
 picks on the CPU:
 
 ```
@@ -954,15 +959,22 @@ Metal: 2.3 GB of experts run on the CPU (10 threads): 0 of 48 MoE layers entirel
 (placed by the usage of earlier runs); expected share of expert picks on the CPU 4 %; GPU share …
 ```
 
-**Where the usage comes from.** While any expert is on the CPU, a small kernel after each router, `moe_remap`,
-counts the picks per expert, one thread per expert over the step's slots, so the counts are exact and need no
-atomics. The backend adds them to `~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, halved once a
-layer passes 2³⁰ picks) every ten minutes and when it closes. The first run of a model that does not fit therefore
+**Where the usage comes from.** While any expert is on the CPU, every MoE layer's picks are counted. In a split
+layer, `moe_remap` (which runs after the router anyway) counts them, one thread per expert over the step's slots,
+so the counts are exact and need no atomics. A layer entirely on the CPU is counted by the CPU from the router's
+choices it reads anyway. A layer entirely on the GPU gets a `moe_remap` dispatch on one forward pass in 8
+(`-Djllm.metal.expertCountEvery`), because a dispatch per layer per token would cost more than it tells, and the
+planner only compares experts within a layer, so a sample is enough. The backend adds the counts to
+`~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, headed by the model's description, halved
+once a layer passes 2³⁰ picks) every ten minutes and when it closes. A lock file orders processes that save at
+the same time; a damaged line loses only that layer's history. The first run of a model that does not fit therefore
 moves whole layers; later runs place the experts from how you actually use it (code, chat, another language),
 improving as the counts grow. `-Djllm.metal.hotExperts=false` ignores the statistics.
 
 **A layer whose experts are split.** Its hot experts are copied once, at load, into memory of their own (`QTensor.
-gatherExperts`, in the tensor's own layout) and only that copy is given to the GPU. The mapped file stays untouched
+gatherExperts`, in the tensor's own layout, in parallel) and only that copy is given to the GPU. The copy and
+the CPU threads belong to the placement, which every backend on the same weights shares (a server's slots), so
+they exist once per model, not once per slot. The mapped file stays untouched
 for the CPU's cold ones. `moe_remap` also writes, for every slot, the expert's index in that copy, or −1 for a
 cold expert. `moe_up`, `moe_down`, `moe_sort` and `moe_combine` skip −1 slots, so the GPU kernels are the same ones
 running on the packed tensors. Then the CPU and GPU work **at the same time**:

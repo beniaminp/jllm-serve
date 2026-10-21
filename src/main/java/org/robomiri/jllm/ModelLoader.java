@@ -132,13 +132,27 @@ public final class ModelLoader {
     }
 
     public static Loaded load(Settings s, HuggingFaceHub hub, String model) throws Exception {
+        return load(s, hub, model, 1);
+    }
+
+    /**
+     * {@code slots}: how many engines will run on these weights ({@link #extraEngine} adds the others), so the Metal
+     * backend's expert placement budgets GPU memory for all of their KV caches.
+     */
+    public static Loaded load(Settings s, HuggingFaceHub hub, String model, int slots) throws Exception {
         Prepared p = prepare(s, hub, model, s.opt("model.gguf-file"), s.opt("model.gguf-quant"));
         Architecture arch = p.arch();
         Tokenizer tok = p.tok();
         ModelWeights weights = p.weights();
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
-        Backend backend = createBackend(s, arch, weights);
+        Backend backend;
+        try {
+            backend = newBackend(s, arch, weights, slots);
+        } catch (Exception e) {
+            weights.close();
+            throw e;
+        }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
@@ -180,7 +194,7 @@ public final class ModelLoader {
      */
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
-        Backend backend = newBackend(s, l.weights().arch, l.weights());
+        Backend backend = newBackend(s, l.weights().arch, l.weights(), 1);
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
         Speculator.Config spec = speculation(s, l.weights().arch);
@@ -303,7 +317,7 @@ public final class ModelLoader {
 
     public static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
         try {
-            return newBackend(s, arch, weights);
+            return newBackend(s, arch, weights, 1);
         } catch (Exception e) {
             weights.close();
             throw e;
@@ -311,7 +325,7 @@ public final class ModelLoader {
     }
 
     /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
-    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
+    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots) throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = s.getInt("backend.batch");
         String backendName = s.get("backend");
@@ -337,7 +351,7 @@ public final class ModelLoader {
                     : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
                             new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
                                     threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                                    s.getBool("backend.cpu.int8-activations")));
+                                    s.getBool("backend.cpu.int8-activations"), null, Math.max(1, slots)));
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }

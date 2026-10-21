@@ -225,7 +225,7 @@ public class ModelManager implements DisposableBean {
             checkInterrupted();
             job.phase = "loading";
             System.err.println("Loading " + t.id() + " (" + t.model() + ")");
-            ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model());
+            ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model(), slots); // budgets for every slot's cache
             if (Thread.currentThread().isInterrupted()) {
                 l.close();
                 throw new CancellationException();

@@ -14,8 +14,10 @@ package org.robomiri.jllm.metal;
  * @param int8Activations integer dot products for single tokens, as {@code backend.cpu.int8-activations}
  * @param cold            an explicit placement instead of {@code layers}: {@code cold[l][e]} for the experts of layer l
  *                        left on the CPU (null rows for none), e.g. to test split layers; normally null
+ * @param backends        how many backends will run on these weights (a server's slots): {@link #AUTO} budgets for
+ *                        all of their caches, since the later ones reuse the first one's placement
  */
-public record MoeSplit(int layers, int threads, boolean int8Activations, boolean[][] cold) {
+public record MoeSplit(int layers, int threads, boolean int8Activations, boolean[][] cold, int backends) {
 
     public static final int AUTO = -1;
 
@@ -23,18 +25,24 @@ public record MoeSplit(int layers, int threads, boolean int8Activations, boolean
     public static final MoeSplit OFF = new MoeSplit(0, 1, false);
 
     public MoeSplit(int layers, int threads, boolean int8Activations) {
-        this(layers, threads, int8Activations, null);
+        this(layers, threads, int8Activations, null, 1);
     }
 
     /** These experts on the CPU, the rest on the GPU. */
     public static MoeSplit experts(boolean[][] cold, int threads, boolean int8Activations) {
-        return new MoeSplit(0, threads, int8Activations, cold);
+        return new MoeSplit(0, threads, int8Activations, cold, 1);
     }
 
     public MoeSplit {
-        if (layers < AUTO || threads < 1) {
-            throw new IllegalArgumentException("bad MoE split " + layers + " layers, " + threads + " threads");
+        if (layers < AUTO || threads < 1 || backends < 1) {
+            throw new IllegalArgumentException("bad MoE split " + layers + " layers, " + threads + " threads, " + backends
+                    + " backends");
         }
+    }
+
+    /** What the placement depends on (backends sharing weights reuse a placement made for the same config). */
+    String config() {
+        return layers + "|" + java.util.Arrays.deepToString(cold);
     }
 
     /** {@code auto}, {@code off} (= 0), {@code all} or a number of layers. */

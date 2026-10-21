@@ -116,6 +116,8 @@ public final class MetalBackend implements Backend {
         final QTensor[] gateUp;   // per layer: the packed hot experts of a split layer, else null
         final QTensor[] down;
         final java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofShared();
+        /** The CPU threads for the experts, one set for all the backends (a pool runs one caller's job at a time). */
+        ThreadPool pool;
         int refs = 1;
 
         Placement(String config, boolean[][] cold) {
@@ -127,6 +129,30 @@ public final class MetalBackend implements Backend {
     }
 
     private static final java.util.Map<ModelWeights, Placement> PLACEMENTS = new java.util.IdentityHashMap<>();
+
+    /**
+     * Every open MetalBackend of the process: Metal's working set is the device's, so a placement must leave room for
+     * the other backends' weights and buffers (another model, a draft model, a server's other slots).
+     */
+    private static final java.util.Set<MetalBackend> LIVE = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+    /** GPU-resident bytes of all open backends but {@code self}: their buffers, and once per weights their GPU share. */
+    private static long othersOnDevice(MetalBackend self) {
+        synchronized (LIVE) {
+            long b = 0;
+            java.util.Set<ModelWeights> counted = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            for (MetalBackend o : LIVE) {
+                if (o == self) {
+                    continue;
+                }
+                b += o.k.metal.allocatedBytes();
+                if (o.w != self.w && counted.add(o.w)) {
+                    b += o.gpuBytes(o.placement.cold) - o.k.metal.allocatedBytes();
+                }
+            }
+            return b;
+        }
+    }
 
     /**
      * One decoder layer: its norm buffers, {@code o_proj}, and two strategy objects picked once from the layer's
@@ -294,11 +320,17 @@ public final class MetalBackend implements Backend {
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
         }
         long gpu = gpuBytes(cold);
+        long others = othersOnDevice(this);
+        synchronized (LIVE) {
+            LIVE.add(this);
+        }
         long ws = workingSet();
-        if (gpu > ws) {
-            System.err.printf("warning: the GPU's share of the model (%.1f GB with the caches) exceeds Metal's recommended "
-                    + "working set (%.1f GB); expect paging%s%n", gpu / 1e9, ws / 1e9,
-                    arch.anyMoe() ? " (backend.metal.cpu-moe moves experts to the CPU)" : "");
+        if (gpu + others > ws) {
+            System.err.printf("warning: the GPU holds %.1f GB (this model's share and caches %.1f GB, other backends %.1f GB), "
+                            + "more than Metal's recommended working set (%.1f GB); expect paging%s%n", (gpu + others) / 1e9,
+                    gpu / 1e9, others / 1e9, ws / 1e9, arch.anyMoe()
+                            ? " (backend.metal.cpu-moe=auto leaves experts on the CPU; a placement shared by slots is made "
+                            + "when the first slot loads)" : "");
         }
     }
 
@@ -363,18 +395,26 @@ public final class MetalBackend implements Backend {
         }
         modelKey = arch + " | " + w.byteSize() + " bytes";
         statsFile = ExpertPlacement.statsFile(modelKey);
-        String config = split.layers() + "|" + java.util.Arrays.deepToString(split.cold());
-        synchronized (PLACEMENTS) {
-            Placement shared = PLACEMENTS.get(w);
+        String config = split.config();
+        // planning and packing (seconds, gigabytes) hold only this model's lock, not the other models' loads
+        synchronized (w) {
+            Placement shared;
+            synchronized (PLACEMENTS) {
+                shared = PLACEMENTS.get(w);
+                if (shared != null && shared.config.equals(config)) {
+                    shared.refs++;
+                }
+            }
             if (shared != null && shared.config.equals(config)) {
-                shared.refs++;
                 placement = shared;
                 placementShared = true;
             } else {
                 placement = newPlacement(config, perExpert, experts, topK);
-                if (shared == null) {
-                    PLACEMENTS.put(w, placement);
-                    placementShared = true;
+                synchronized (PLACEMENTS) {
+                    if (!PLACEMENTS.containsKey(w)) {
+                        PLACEMENTS.put(w, placement);
+                        placementShared = true;
+                    }
                 }
             }
         }
@@ -387,7 +427,12 @@ public final class MetalBackend implements Backend {
             cpuLayers += n > 0 ? 1 : 0;
         }
         if (cpuLayers > 0) {
-            cpuPool = new ThreadPool(split.threads());
+            synchronized (PLACEMENTS) {
+                if (placement.pool == null) {
+                    placement.pool = new ThreadPool(split.threads());
+                }
+            }
+            cpuPool = placement.pool;
             cpuExperts = MoeExperts.create(cpuPool, w, maxBatch, split.int8Activations());
             int slots = maxBatch * arch.maxTopK();
             cpuXb = new float[maxBatch * c.dim()];
@@ -431,7 +476,10 @@ public final class MetalBackend implements Backend {
                         ? split.cold()[l].clone() : new boolean[experts[l]]) : null;
             }
         } else if (split.layers() == MoeSplit.AUTO) {
-            long need = gpuBytes(new boolean[layers][]) - workingSet();
+            // the device holds this model's weights, every slot's buffers (estimated as this one's, the later slots
+            // are not created yet) and whatever the other open backends hold
+            long need = w.byteSize() + split.backends() * (k.metal.allocatedBytes() + laterUploads()) + othersOnDevice(this)
+                    - workingSet();
             usage = need > 0 && HOT_EXPERTS ? ExpertPlacement.load(statsFile, layers, modelKey) : null;
             cold = ExpertPlacement.plan(need, perExpert, experts, topK, usage);
         } else {
@@ -482,6 +530,21 @@ public final class MetalBackend implements Backend {
                     100 * cpuPicks / Math.max(moeLayers, 1), gpuBytes(cold) / 1e9, workingSet() / 1e9);
         }
         return p;
+    }
+
+    /**
+     * What the layer plans will still upload after the placement is made (routers, norms, biases: f32 copies, not
+     * wrapped weights), so the budget includes them; a slight overestimate.
+     */
+    private long laterUploads() {
+        long b = 0;
+        for (int l = 0; l < c.layers(); l++) {
+            b += 6L * c.dim() * 4; // up to four norms, q/k/v biases are smaller than the rest together
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                b += (long) m.experts() * (c.dim() + 1) * 4; // router (+ DeepSeek's bias)
+            }
+        }
+        return b;
     }
 
     /** Adds the expert picks counted since the last save to the statistics file and resets the counters. */
@@ -543,10 +606,12 @@ public final class MetalBackend implements Backend {
         MemorySegment.copy(xb.contents(), ValueLayout.JAVA_FLOAT, 0, cpuXb, 0, n * dim);
         MemorySegment.copy(routeWeight.contents(), ValueLayout.JAVA_FLOAT, 0, cpuWeight, 0, n * topK);
         java.util.Arrays.fill(cpuY, 0, n * dim, 0f);
-        if (n > 1) {
-            cpuExperts.batched(mw, spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
-        } else {
-            cpuExperts.token(mw, topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
+        synchronized (cpuPool) { // shared by the slots of this model; it runs one job at a time
+            if (n > 1) {
+                cpuExperts.batched(mw, spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
+            } else {
+                cpuExperts.token(mw, topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
+            }
         }
         return true;
     }
@@ -1115,6 +1180,9 @@ public final class MetalBackend implements Backend {
                 if (placementShared) {
                     PLACEMENTS.remove(w, placement);
                 }
+                if (placement.pool != null) {
+                    placement.pool.close();
+                }
                 placement.arena.close();
             }
         }
@@ -1244,8 +1312,8 @@ public final class MetalBackend implements Backend {
         try {
             k.close();
         } finally {
-            if (cpuPool != null) {
-                cpuPool.close();
+            synchronized (LIVE) {
+                LIVE.remove(this);
             }
             releasePlacement();
         }
