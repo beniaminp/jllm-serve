@@ -40,7 +40,7 @@ public final class Speech {
     }
 
     /** Splits at sentence ends, then at commas and spaces, into pieces of at most {@code max} characters. */
-    static List<String> split(String text, int max) {
+    public static List<String> split(String text, int max) {
         List<String> out = new ArrayList<>();
         String t = text.strip().replaceAll("\\s+", " ");
         StringBuilder cur = new StringBuilder();

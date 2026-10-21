@@ -9,7 +9,9 @@ final class WhisperMetalLoader {
     }
 
     /** {@code -Djllm.audio.metalExact=true}: float weight tiles for the linear layers too (the checkpoint's precision). */
-    static final boolean EXACT = Boolean.getBoolean("jllm.audio.metalExact");
+    static boolean exact() {
+        return Boolean.getBoolean("jllm.audio.metalExact");
+    }
 
     static WhisperNet tryCreate(WhisperWeights w, int threads) {
         try {
@@ -18,7 +20,7 @@ final class WhisperMetalLoader {
                 return null;
             }
             try {
-                return new WhisperMetal(w, g, threads, EXACT);
+                return new WhisperMetal(w, g, threads, exact());
             } catch (RuntimeException | Error e) {
                 g.close();
                 throw e;
