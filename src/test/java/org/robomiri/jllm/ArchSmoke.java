@@ -1061,16 +1061,22 @@ public final class ArchSmoke {
         }
         ExecutorService ex = Executors.newFixedThreadPool(b.length);
         try {
-            List<Future<int[]>> fs = new ArrayList<>();
-            for (int i = 0; i < b.length; i++) {
-                int k = i;
-                fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab)));
-            }
+            // Whether steps meet in a pass depends on the three threads being scheduled within the group's 2 ms window; on a
+            // busy machine they can run apart for a whole generation. The tokens must be right on every attempt, and
+            // some attempt (of up to 5) must have shared a pass.
             boolean same = true;
-            for (int i = 0; i < b.length; i++) {
-                same &= Arrays.equals(fs.get(i).get(), alone[i]);
-            }
             long[] st = g.stats();
+            for (int attempt = 0; attempt < 5 && same && st[1] == 0; attempt++) {
+                List<Future<int[]>> fs = new ArrayList<>();
+                for (int i = 0; i < b.length; i++) {
+                    int k = i;
+                    fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab)));
+                }
+                for (int i = 0; i < b.length; i++) {
+                    same &= Arrays.equals(fs.get(i).get(), alone[i]);
+                }
+                st = g.stats();
+            }
             boolean ok = same && st[1] > 0;
             System.out.printf("  batch group, 3 threads: tokens %s, %d decode steps in shared passes (%d passes) -> %s%n",
                     same ? "same" : "DIFFERENT", st[1], st[0], ok ? "ok" : "GROUP MISMATCH");
