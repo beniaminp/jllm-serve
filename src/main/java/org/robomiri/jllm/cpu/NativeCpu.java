@@ -45,7 +45,8 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 public final class NativeCpu {
 
     /** Type ids of the C interface. */
-    static final int T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6;
+    static final int T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6,
+            T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12;
 
     private static final int ABI = 1;
     private static final Linker LINKER = Linker.nativeLinker();
@@ -55,6 +56,8 @@ public final class NativeCpu {
     private final MethodHandle quantize;
     private final MethodHandle setLevel;
     private final MethodHandle levelName;
+    /** {@code jllm_cpu_has_type} (null in a library without it: the formats added later are not available). */
+    private final MethodHandle hasType;
     private final int detected;
 
     private NativeCpu(Path path) {
@@ -78,6 +81,8 @@ public final class NativeCpu {
                 FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS), critical);
         setLevel = LINKER.downcallHandle(l.findOrThrow("jllm_cpu_set_level"), FunctionDescriptor.of(JAVA_INT, JAVA_INT));
         levelName = LINKER.downcallHandle(l.findOrThrow("jllm_cpu_level_name"), FunctionDescriptor.of(ADDRESS, JAVA_INT));
+        hasType = l.find("jllm_cpu_has_type").map(a -> LINKER.downcallHandle(a, FunctionDescriptor.of(JAVA_INT, JAVA_INT)))
+                .orElse(null);
         try {
             detected = (int) LINKER.downcallHandle(l.findOrThrow("jllm_cpu_detected_level"),
                     FunctionDescriptor.of(JAVA_INT)).invokeExact();
@@ -249,8 +254,32 @@ public final class NativeCpu {
             case Q4_K -> T_Q4_K;
             case Q5_K -> T_Q5_K;
             case Q6_K -> T_Q6_K;
+            case Q4_1 -> T_Q4_1;
+            case Q5_0 -> T_Q5_0;
+            case Q5_1 -> T_Q5_1;
+            case IQ4_NL -> T_IQ4_NL;
+            case MXFP4 -> T_MXFP4;
+            case IQ4_XS -> T_IQ4_XS;
             default -> -1;
         };
+    }
+
+    /** Whether the level in use has a kernel for the format (tests). */
+    boolean hasKernelFor(QType t) {
+        int id = typeId(t);
+        return id >= 0 && hasKernel(id);
+    }
+
+    /** Whether the level in use has a kernel for the C type id (the formats from {@link #T_Q4_1} on exist on AArch64 only). */
+    private boolean hasKernel(int type) {
+        if (type < T_Q4_1) {
+            return true;
+        }
+        try {
+            return hasType != null && (int) hasType.invokeExact(type) != 0;
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
     }
 
     /** Whether the library has a kernel for {@code w} (for a split tensor: both of its parts). */
@@ -259,10 +288,10 @@ public final class NativeCpu {
             return supports(w.partOf(0)) && supports(w.second);
         }
         int t = typeId(w.type);
-        if (t < 0) {
+        if (t < 0 || !hasKernel(t)) {
             return false;
         }
-        return t >= T_Q4_K ? w.cols % Ggml.QK_K == 0 : w.cols % QType.BLOCK == 0;
+        return t == T_Q4_K || t == T_Q5_K || t == T_Q6_K || t == T_IQ4_XS ? w.cols % Ggml.QK_K == 0 : w.cols % QType.BLOCK == 0;
     }
 
     /**
@@ -374,7 +403,11 @@ public final class NativeCpu {
             if (q != null) {
                 return q;
             }
-            for (QType t : new QType[]{QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K}) {
+            for (QType t : new QType[]{QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K,
+                    QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS}) {
+                if (!hasKernel(typeId(t))) {
+                    continue;
+                }
                 String f = checkType(arena, rnd, t, 3, 256, true);
                 if (f == null) {
                     f = checkType(arena, rnd, t, 3, t.blockSize == Ggml.QK_K ? 512 : 96, false);
@@ -458,6 +491,7 @@ public final class NativeCpu {
         float[] row = new float[cols];
         for (int r = 0; r < rows; r++) {
             float java = KQuantKernels.supports(w) ? KQuantKernels.dotRow(w, r, perm, xs, sums, 0)
+                    : GgufInt8Kernels.supports(w) ? GgufInt8Kernels.dotRow(w, r, perm, xs, sums, 0)
                     : Int8Kernels.dotRow(w, r, perm, xs, 0);
             float n = nat[1 + r];
             if (exact) {
@@ -523,6 +557,21 @@ public final class NativeCpu {
                         }
                         for (int j = 8; j < 12; j++) {
                             seg.set(ValueLayout.JAVA_BYTE, blk + Ggml.K_SCALES + j, (byte) 0x11);
+                        }
+                    }
+                }
+                case Q4_1, Q5_1 -> {
+                    seg.set(f16, blk, d);
+                    seg.set(f16, blk + 2, dmin);
+                }
+                case Q5_0, IQ4_NL -> seg.set(f16, blk, d);
+                case MXFP4 -> seg.set(ValueLayout.JAVA_BYTE, blk, (byte) (unit ? 128 : 118 + rnd.nextInt(8))); // 1.0, or 2^-10 .. 2^-3
+                case IQ4_XS -> {
+                    seg.set(f16, blk, d);
+                    if (unit && !randomSub) { // every sub-block scale ls - 32 = 1
+                        seg.set(f16, blk + 2, (short) 0xAAAA);
+                        for (int j = 0; j < 4; j++) {
+                            seg.set(ValueLayout.JAVA_BYTE, blk + 4 + j, (byte) 0x11);
                         }
                     }
                 }

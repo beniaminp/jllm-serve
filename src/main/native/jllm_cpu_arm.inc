@@ -170,4 +170,95 @@ TGT static inline float F(dot_q6_k)(const uint8_t *q, int nsb, const int8_t *x, 
     return vaddvq_f32(vaddq_f32(acc0, acc1));
 }
 
+
+/*
+ * Q4_1 / Q5_1 / Q5_0 / IQ4_NL / MXFP4 / IQ4_XS (ggml 32-weight blocks, low nibbles = weights 0..15, high = 16..31).
+ * The fifth bit of Q5_* weight j is bit j of qh: a byte table lookup (vqtbl1q_u8) puts qh's byte j / 8 in lane j, a
+ * vtstq against {1, 2, 4, ..., 128} turns it into 0xFF / 0, and masking with 16 gives the bit's value 16.
+ */
+TGT static inline uint8x16_t F(qh_bits)(uint8x16_t qhv, int hi) {
+    static const uint8_t idx_lo[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+    static const uint8_t idx_hi[16] = {2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+    static const uint8_t bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    uint8x16_t sel = vqtbl1q_u8(qhv, vld1q_u8(hi ? idx_hi : idx_lo));
+    return vandq_u8(vtstq_u8(sel, vld1q_u8(bits)), vdupq_n_u8(16));
+}
+
+TGT static inline float F(dot_q41)(const uint8_t *q, int nb, const int8_t *x, const float *xd, const int32_t *xs, int q5) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    float32x4_t acc = vdupq_n_f32(0);
+    float minus = 0;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * (q5 ? Q5_1_BYTES : Q4_1_BYTES);
+        uint8x16_t r = vld1q_u8(k + (q5 ? 8 : 4));
+        uint8x16_t lo = vandq_u8(r, m4), hi = vshrq_n_u8(r, 4);
+        if (q5) {
+            uint8x16_t qhv = vld1q_u8(k + 4);
+            lo = vorrq_u8(lo, F(qh_bits)(qhv, 0));
+            hi = vorrq_u8(hi, F(qh_bits)(qhv, 1));
+        }
+        const int8_t *xb = x + b * QK;
+        int32x4_t p = F(dot16)(F(dot16)(vdupq_n_s32(0), vreinterpretq_s8_u8(lo), vld1q_s8(xb)), vreinterpretq_s8_u8(hi),
+                               vld1q_s8(xb + 16));
+        float f = f16_to_f32(k) * xd[b];
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), f);
+        minus += f16_to_f32(k + 2) * xd[b] * (float) xs[b];
+    }
+    return vaddvq_f32(acc) + minus;
+}
+
+TGT static inline float F(dot_q50)(const uint8_t *q, int nb, const int8_t *x, const float *xd) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t c16 = vdupq_n_s8(16);
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * Q5_0_BYTES;
+        uint8x16_t r = vld1q_u8(k + 6);
+        uint8x16_t qhv = vld1q_u8(k + 2);
+        int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(r, m4), F(qh_bits)(qhv, 0))), c16);
+        int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(r, 4), F(qh_bits)(qhv, 1))), c16);
+        const int8_t *xb = x + b * QK;
+        int32x4_t p = F(dot16)(F(dot16)(vdupq_n_s32(0), lo, vld1q_s8(xb)), hi, vld1q_s8(xb + 16));
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), f16_to_f32(k) * xd[b]);
+    }
+    return vaddvq_f32(acc);
+}
+
+TGT static inline float F(dot_tab)(const uint8_t *q, int nb, const int8_t *x, const float *xd, int fp4) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t tab = vld1q_s8(fp4 ? KV_MXFP4 : KV_IQ4NL);
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * (fp4 ? MXFP4_BYTES : IQ4_NL_BYTES);
+        uint8x16_t r = vld1q_u8(k + (fp4 ? 1 : 2));
+        int8x16_t lo = vqtbl1q_s8(tab, vandq_u8(r, m4));
+        int8x16_t hi = vqtbl1q_s8(tab, vshrq_n_u8(r, 4));
+        const int8_t *xb = x + b * QK;
+        int32x4_t p = F(dot16)(F(dot16)(vdupq_n_s32(0), lo, vld1q_s8(xb)), hi, vld1q_s8(xb + 16));
+        float d = fp4 ? e8m0_half(k[0]) : f16_to_f32(k);
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), d * xd[b]);
+    }
+    return vaddvq_f32(acc);
+}
+
+TGT static inline float F(dot_iq4_xs)(const uint8_t *q, int nsb, const int8_t *x, const float *xd) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t tab = vld1q_s8(KV_IQ4NL);
+    float32x4_t acc = vdupq_n_f32(0);
+    for (int sb = 0; sb < nsb; sb++, q += IQ4_XS_BYTES) {
+        float d = f16_to_f32(q);
+        uint32_t sh = (uint32_t) (q[2] | (q[3] << 8));
+        for (int ib = 0; ib < 8; ib++) {
+            uint8x16_t r = vld1q_u8(q + 8 + 16 * ib);
+            int8x16_t lo = vqtbl1q_s8(tab, vandq_u8(r, m4));
+            int8x16_t hi = vqtbl1q_s8(tab, vshrq_n_u8(r, 4));
+            const int8_t *xb = x + (sb * 8 + ib) * QK;
+            int32x4_t p = F(dot16)(F(dot16)(vdupq_n_s32(0), lo, vld1q_s8(xb)), hi, vld1q_s8(xb + 16));
+            int ls = ((q[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF) | (int) (((sh >> (2 * ib)) & 3) << 4);
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), d * (float) (ls - 32) * xd[sb * 8 + ib]);
+        }
+    }
+    return vaddvq_f32(acc);
+}
+
 #undef F

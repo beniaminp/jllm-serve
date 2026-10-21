@@ -14,6 +14,8 @@
  *                block sums of q, for the K-quants' min terms and Q4_0's -8 offset), from jllm_cpu_quantize
  *   Q4_0 / Q8_0  the engine's layout: rows of 16 / 32 byte blocks, then (at scales_off) rows of f32 block scales
  *   Q4_0G, Q8_0G ggml blocks (f16 scale + 16 / 32 bytes), Q4_K, Q5_K, Q6_K ggml super-blocks of 256 weights
+ *   Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4 ggml 32-weight blocks and IQ4_XS super-blocks (AArch64 and the scalar level only:
+ *   jllm_cpu_has_type tells; the x86-64 levels leave them to the Java kernels)
  *
  * Exactness: every 32 (Q6_K: 16) weight sub-block's integer dot product is computed exactly, then multiplied by the
  * combined scale (weight scale * activation scale, rounded to float exactly as the Java code does) and summed in
@@ -36,7 +38,10 @@
 #define JCAT2(a, b) a##_##b
 #define JCAT(a, b) JCAT2(a, b)
 
-enum { T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6, T_COUNT = 7 };
+enum {
+    T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6,
+    T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12, T_COUNT = 13
+};
 
 enum {
     L_SCALAR = 0, L_NEON = 1, L_DOTPROD = 2, L_AVX2 = 3, L_AVXVNNI = 4, L_AVX512VNNI = 5, L_COUNT = 6
@@ -52,6 +57,16 @@ static const char *LEVEL_NAMES[L_COUNT] = {"scalar", "neon", "neon-dotprod", "av
 #define Q4_K_BYTES 144
 #define Q5_K_BYTES 176
 #define Q6_K_BYTES 210
+#define Q4_1_BYTES 20
+#define Q5_0_BYTES 22
+#define Q5_1_BYTES 24
+#define IQ4_NL_BYTES 18
+#define MXFP4_BYTES 17
+#define IQ4_XS_BYTES 136
+
+/* ggml's kvalues_iq4nl and kvalues_mxfp4 (the latter doubled: the block scale carries the factor 1/2) */
+static const int8_t KV_IQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+static const int8_t KV_MXFP4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
 typedef void (*rows_fn)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,
                         const int8_t *xq, const float *xd, const int32_t *xs, float *out, int32_t acc);
@@ -85,6 +100,20 @@ static inline float f16_to_f32(const uint8_t *p) {
 static inline float ld_f32(const uint8_t *p) {
     float f;
     memcpy(&f, p, 4);
+    return f;
+}
+
+static inline uint32_t ld_u32(const uint8_t *p) { /* little-endian, like every target this library supports */
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/* ggml_e8m0_to_fp32_half: 2^(e - 128), a subnormal for e < 2 */
+static inline float e8m0_half(uint32_t e) {
+    uint32_t bits = e < 2 ? 0x00200000u << e : (e - 1) << 23;
+    float f;
+    memcpy(&f, &bits, 4);
     return f;
 }
 
@@ -235,6 +264,84 @@ static float dot_q6_k_scalar(const uint8_t *q, int nsb, const int8_t *x, const f
     return sum;
 }
 
+/* Q4_1 / Q5_1: w = d q + m, so a block's product is d xd (sum q x) + m xd (sum x), the latter from the activation's block sums. */
+static float dot_q41_scalar(const uint8_t *q, int nb, const int8_t *x, const float *xd, const int32_t *xs, int q5) {
+    float sum = 0, minus = 0;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * (q5 ? Q5_1_BYTES : Q4_1_BYTES);
+        const uint8_t *qs = k + (q5 ? 8 : 4);
+        uint32_t qh = q5 ? ld_u32(k + 4) : 0;
+        const int8_t *xb = x + b * QK;
+        int32_t isum = 0;
+        for (int j = 0; j < 16; j++) {
+            int lo = (qs[j] & 0xF) | (q5 ? (int) (((qh >> j) & 1) << 4) : 0);
+            int hi = (qs[j] >> 4) | (q5 ? (int) (((qh >> (j + 16)) & 1) << 4) : 0);
+            isum += lo * xb[j] + hi * xb[j + 16];
+        }
+        float f = f16_to_f32(k) * xd[b];
+        sum += (float) isum * f;
+        minus += f16_to_f32(k + 2) * xd[b] * (float) xs[b];
+    }
+    return sum + minus;
+}
+
+/* Q5_0: w = (q5 - 16) d */
+static float dot_q50_scalar(const uint8_t *q, int nb, const int8_t *x, const float *xd) {
+    float sum = 0;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * Q5_0_BYTES;
+        const uint8_t *qs = k + 6;
+        uint32_t qh = ld_u32(k + 2);
+        const int8_t *xb = x + b * QK;
+        int32_t isum = 0;
+        for (int j = 0; j < 16; j++) {
+            int lo = ((qs[j] & 0xF) | (int) (((qh >> j) & 1) << 4)) - 16;
+            int hi = ((qs[j] >> 4) | (int) (((qh >> (j + 16)) & 1) << 4)) - 16;
+            isum += lo * xb[j] + hi * xb[j + 16];
+        }
+        sum += (float) isum * (f16_to_f32(k) * xd[b]);
+    }
+    return sum;
+}
+
+/* IQ4_NL (f16 scale, nibbles at byte 2) and MXFP4 (e8m0 byte, nibbles at byte 1): w = d table[nibble] */
+static float dot_tab_scalar(const uint8_t *q, int nb, const int8_t *x, const float *xd, int fp4) {
+    const int8_t *tab = fp4 ? KV_MXFP4 : KV_IQ4NL;
+    float sum = 0;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *k = q + b * (fp4 ? MXFP4_BYTES : IQ4_NL_BYTES);
+        const uint8_t *qs = k + (fp4 ? 1 : 2);
+        const int8_t *xb = x + b * QK;
+        int32_t isum = 0;
+        for (int j = 0; j < 16; j++) {
+            isum += tab[qs[j] & 0xF] * xb[j] + tab[qs[j] >> 4] * xb[j + 16];
+        }
+        float d = fp4 ? e8m0_half(k[0]) : f16_to_f32(k);
+        sum += (float) isum * (d * xd[b]);
+    }
+    return sum;
+}
+
+/* IQ4_XS: eight IQ4_NL-style 32-weight sub-blocks per 256 with their own 6-bit scales */
+static float dot_iq4_xs_scalar(const uint8_t *q, int nsb, const int8_t *x, const float *xd) {
+    float sum = 0;
+    for (int sb = 0; sb < nsb; sb++, q += IQ4_XS_BYTES) {
+        float d = f16_to_f32(q);
+        uint32_t sh = (uint32_t) (q[2] | (q[3] << 8));
+        for (int ib = 0; ib < 8; ib++) {
+            const uint8_t *qs = q + 8 + 16 * ib;
+            const int8_t *xb = x + (sb * 8 + ib) * QK;
+            int32_t isum = 0;
+            for (int j = 0; j < 16; j++) {
+                isum += KV_IQ4NL[qs[j] & 0xF] * xb[j] + KV_IQ4NL[qs[j] >> 4] * xb[j + 16];
+            }
+            int ls = ((q[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF) | (int) (((sh >> (2 * ib)) & 3) << 4);
+            sum += (float) isum * (d * (float) (ls - 32) * xd[sb * 8 + ib]);
+        }
+    }
+    return sum;
+}
+
 /* Row loops shared by every level: ROWS_BODY(dot expression using row pointer `rw` and scale pointer `rs`). */
 #define NB32 (cols / QK)
 #define NBK (cols / QK_K)
@@ -299,6 +406,63 @@ static float dot_q6_k_scalar(const uint8_t *q, int nsb, const int8_t *x, const f
     }
 
 DEFINE_ROWS(scalar, )
+
+/* Row loops of the formats added later: the scalar and AArch64 levels only (the x86-64 levels do not define them). */
+#define DEFINE_ROWS_NEW(SFX, ATTR)                                                                                      \
+    ATTR static void JCAT(rows_q4_1, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,        \
+                                         const int8_t *xq, const float *xd, const int32_t *xs, float *out,             \
+                                         int32_t acc) {                                                                \
+        size_t rb = (size_t) NB32 * Q4_1_BYTES;                                                                        \
+        (void) soff;                                                                                                   \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_q41, SFX)(w + r * rb, NB32, xq, xd, xs, 0), acc);                             \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_q5_1, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,        \
+                                         const int8_t *xq, const float *xd, const int32_t *xs, float *out,             \
+                                         int32_t acc) {                                                                \
+        size_t rb = (size_t) NB32 * Q5_1_BYTES;                                                                        \
+        (void) soff;                                                                                                   \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_q41, SFX)(w + r * rb, NB32, xq, xd, xs, 1), acc);                             \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_q5_0, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,        \
+                                         const int8_t *xq, const float *xd, const int32_t *xs, float *out,             \
+                                         int32_t acc) {                                                                \
+        size_t rb = (size_t) NB32 * Q5_0_BYTES;                                                                        \
+        (void) soff;                                                                                                   \
+        (void) xs;                                                                                                     \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_q50, SFX)(w + r * rb, NB32, xq, xd), acc);                                    \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_iq4_nl, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,      \
+                                           const int8_t *xq, const float *xd, const int32_t *xs, float *out,           \
+                                           int32_t acc) {                                                              \
+        size_t rb = (size_t) NB32 * IQ4_NL_BYTES;                                                                      \
+        (void) soff;                                                                                                   \
+        (void) xs;                                                                                                     \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_tab, SFX)(w + r * rb, NB32, xq, xd, 0), acc);                                 \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_mxfp4, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,       \
+                                          const int8_t *xq, const float *xd, const int32_t *xs, float *out,            \
+                                          int32_t acc) {                                                               \
+        size_t rb = (size_t) NB32 * MXFP4_BYTES;                                                                       \
+        (void) soff;                                                                                                   \
+        (void) xs;                                                                                                     \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_tab, SFX)(w + r * rb, NB32, xq, xd, 1), acc);                                 \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_iq4_xs, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,      \
+                                           const int8_t *xq, const float *xd, const int32_t *xs, float *out,           \
+                                           int32_t acc) {                                                              \
+        size_t rb = (size_t) NBK * IQ4_XS_BYTES;                                                                       \
+        (void) soff;                                                                                                   \
+        (void) xs;                                                                                                     \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_iq4_xs, SFX)(w + r * rb, NBK, xq, xd), acc);                                  \
+    }
+
+DEFINE_ROWS_NEW(scalar, )
 
 /* ------------------------------------------------------------------------------------------------ SIMD levels */
 
@@ -393,6 +557,7 @@ static unsigned supported = (1u << L_SCALAR) | (1u << L_NEON);
 #define KIND 0
 #include "jllm_cpu_arm.inc"
 DEFINE_ROWS(neon, TGT)
+DEFINE_ROWS_NEW(neon, TGT)
 #undef SFX
 #undef TGT
 #undef KIND
@@ -402,6 +567,7 @@ DEFINE_ROWS(neon, TGT)
 #define KIND 1
 #include "jllm_cpu_arm.inc"
 DEFINE_ROWS(dotprod, TGT)
+DEFINE_ROWS_NEW(dotprod, TGT)
 #undef SFX
 #undef TGT
 #undef KIND
@@ -452,11 +618,20 @@ static int active = L_SCALAR;
     TABLE[L][T_Q5_K] = JCAT(rows_q5_k, SFX);                                                                           \
     TABLE[L][T_Q6_K] = JCAT(rows_q6_k, SFX);
 
+#define FILL_NEW(L, SFX)                                                                                               \
+    TABLE[L][T_Q4_1] = JCAT(rows_q4_1, SFX);                                                                           \
+    TABLE[L][T_Q5_0] = JCAT(rows_q5_0, SFX);                                                                           \
+    TABLE[L][T_Q5_1] = JCAT(rows_q5_1, SFX);                                                                           \
+    TABLE[L][T_IQ4_NL] = JCAT(rows_iq4_nl, SFX);                                                                       \
+    TABLE[L][T_MXFP4] = JCAT(rows_mxfp4, SFX);                                                                         \
+    TABLE[L][T_IQ4_XS] = JCAT(rows_iq4_xs, SFX);
+
 static void init(void) {
     if (detected >= 0) {
         return;
     }
     FILL(L_SCALAR, scalar)
+    FILL_NEW(L_SCALAR, scalar)
 #if defined(__x86_64__) || defined(_M_X64)
     FILL(L_AVX2, avx2)
     FILL(L_AVXVNNI, avxvnni)
@@ -464,6 +639,8 @@ static void init(void) {
 #elif defined(__aarch64__) || defined(_M_ARM64)
     FILL(L_NEON, neon)
     FILL(L_DOTPROD, dotprod)
+    FILL_NEW(L_NEON, neon)
+    FILL_NEW(L_DOTPROD, dotprod)
 #endif
     detected = detect_level();
     active = detected;
@@ -483,6 +660,12 @@ JLLM_API int32_t jllm_cpu_level(void) {
 JLLM_API int32_t jllm_cpu_detected_level(void) {
     init();
     return detected;
+}
+
+/* Whether the active level has a kernel for the type (the formats added later are not compiled for x86-64). */
+JLLM_API int32_t jllm_cpu_has_type(int32_t type) {
+    init();
+    return type >= 0 && type < T_COUNT && TABLE[active][type] != NULL;
 }
 
 JLLM_API const char *jllm_cpu_level_name(int32_t level) {
@@ -536,7 +719,7 @@ JLLM_API void jllm_cpu_dot_rows(int32_t type, const uint8_t *w, int64_t scales_o
                                 int32_t cols, const int8_t *xq, const float *xd, const int32_t *xs, float *out,
                                 int32_t accumulate) {
     init();
-    if (type < 0 || type >= T_COUNT) {
+    if (type < 0 || type >= T_COUNT || TABLE[active][type] == NULL) {
         return;
     }
     TABLE[active][type](w, scales_off, r0, r1, cols, xq, xd, xs, out, accumulate);

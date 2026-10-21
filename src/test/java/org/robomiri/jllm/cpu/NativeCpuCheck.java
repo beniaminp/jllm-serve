@@ -69,7 +69,15 @@ public final class NativeCpuCheck {
         }
     }
 
-    private static final QType[] TYPES = {QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K};
+    private static final QType[] TYPES = {QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K,
+            QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS};
+
+    /** The Java int8 kernel for {@code w}: what the native one must agree with. */
+    private static float javaDot(QTensor w, int r, short[] xq, float[] xs, int[] sums, int xo) {
+        return KQuantKernels.supports(w) ? KQuantKernels.dotRow(w, r, xq, xs, sums, xo)
+                : GgufInt8Kernels.supports(w) ? GgufInt8Kernels.dotRow(w, r, xq, xs, sums, xo)
+                : Int8Kernels.dotRow(w, r, xq, xs, xo);
+    }
 
     private static void runLevel(NativeCpu n, String level) {
         Random rnd = new Random(7);
@@ -78,6 +86,9 @@ public final class NativeCpuCheck {
         }
         try (Arena arena = Arena.ofConfined()) {
             for (QType t : TYPES) {
+                if (NativeCpu.typeId(t) >= NativeCpu.T_Q4_1 && !n.hasKernelFor(t)) {
+                    continue; // the formats added later have no kernels at the x86-64 levels
+                }
                 boolean k = t.blockSize == Ggml.QK_K;
                 int[] exactCols = k ? new int[]{256} : new int[]{32, 96, 160, 256};
                 for (int cols : exactCols) {
@@ -146,7 +157,7 @@ public final class NativeCpuCheck {
                 continue;
             }
             int xo = xBlock * QType.BLOCK;
-            float java = KQuantKernels.supports(w) ? KQuantKernels.dotRow(w, r, xq, xs, sums, xo) : Int8Kernels.dotRow(w, r, xq, xs, xo);
+            float java = javaDot(w, r, xq, xs, sums, xo);
             float want = base[i] + java;
             if (!(Math.abs(out[i] - want) <= 1e-4f * (1 + Math.abs(want)))) {
                 return "row " + r + ": " + out[i] + " vs " + want;
@@ -179,7 +190,7 @@ public final class NativeCpuCheck {
             java.util.Arrays.fill(out, Float.NaN);
             n.dotRows(w, rg[0], rg[1], act, 0, out, rg[0], false);
             for (int r = rg[0]; r < rg[1]; r++) {
-                float java = KQuantKernels.supports(w) ? KQuantKernels.dotRow(w, r, xq, xs, sums, 0) : Int8Kernels.dotRow(w, r, xq, xs, 0);
+                float java = javaDot(w, r, xq, xs, sums, 0);
                 if (!(Math.abs(out[r] - java) <= 1e-4f * (1 + Math.abs(java)))) {
                     return "rows " + rg[0] + ".." + rg[1] + ", row " + r + ": " + out[r] + " vs " + java;
                 }
@@ -193,6 +204,9 @@ public final class NativeCpuCheck {
         Random rnd = new Random(11);
         try (Arena arena = Arena.ofShared(); ThreadPool pool = new ThreadPool(3)) {
             for (QType t : TYPES) {
+                if (NativeCpu.typeId(t) >= NativeCpu.T_Q4_1 && !n.hasKernelFor(t)) {
+                    continue;
+                }
                 int cols = t.blockSize == Ggml.QK_K ? 1024 : 1056;
                 for (int rows : new int[]{17, 333}) {
                     QTensor w = NativeCpu.randomTensor(arena, t, rows, cols, rnd, false, false);
