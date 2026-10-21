@@ -140,4 +140,54 @@ final class MlaMetal {
                 aw, kvl, pos, ctx, m.scale(), heads * aw, stride, stride, heads * kvl, 0, 0f, n);
         k.mlaApplyV(oLat, b.wv, mb.att, m, n);
     }
+
+    /**
+     * {@link #run} for a batched decode step across slots: row t of xb is one token of the conversation whose latent
+     * cache {@code owners[t]} holds, at {@code positions[t]}. The projections, the absorption of q and the value
+     * up-projection run over the n rows; the rotation, the cache store and attention once per row, with the row's
+     * position and its owner's cache.
+     */
+    void runRows(int l, int n, MlaMetal[] owners, int[] positions) {
+        Bufs b = bufs[l];
+        AttnWeights.Mla mw = b.w;
+        int heads = m.heads();
+        int qk = m.qkDim();
+        int nope = m.nope();
+        int rd = m.rope();
+        int kvl = m.kvLoraRank();
+        int aw = m.latentDim();
+        switch (mw.query()) {
+            case AttnWeights.Mla.Proj p -> k.matmul(p.w(), b.qProj, mb.xb, 0, mb.q, 0, n, false, null, 0f);
+            case AttnWeights.Mla.Lora q -> {
+                k.matmul(q.a(), b.qA, mb.xb, 0, qa, 0, n, false, null, 0f);
+                k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
+                k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
+            }
+        }
+        k.matmul(mw.kvA(), b.kvA, mb.xb, 0, lat, 0, n, false, null, 0f);
+        k.matmul(mw.kPe(), b.kPe, mb.xb, 0, kpe, 0, n, false, null, 0f);
+        k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
+        Metal.Buffer cos = mb.ropeCos[m.ropeTable()];
+        Metal.Buffer sin = mb.ropeSin[m.ropeTable()];
+        for (int t = 0; t < n; t++) {
+            int pos = positions[t];
+            long qOff = (long) t * heads * qk * 4;
+            long kpeOff = (long) t * rd * 4;
+            k.ropeRow(true, false, mb.q, qOff, mb.q, qOff, mb.q, qOff, null, null, cos, sin, qk, heads * qk, heads * qk,
+                    heads, 0, pos, nope, rd / 2);
+            k.ropeRow(true, false, kpe, kpeOff, kpe, kpeOff, kpe, kpeOff, null, null, cos, sin, rd, rd, rd, 1, 0, pos, 0,
+                    rd / 2);
+            k.mlaLatStoreRow(kv, latNorm, (long) t * kvl * 4, kpe, kpeOff, owners[t].cache[l], pos * kv.rowBytes(aw, 1), m);
+        }
+        k.mlaAbsorbQ(mb.q, b.wk, qAbs, m, n);
+        int stride = kv.rowStride(aw, 1);
+        String kernel = "attention_mla" + MetalKernels.kvSuffix(kv);
+        for (int t = 0; t < n; t++) {
+            Metal.Buffer cache = owners[t].cache[l];
+            k.attentionRow(kernel, 1, qAbs, (long) t * heads * aw * 4, cache, cache, oLat, (long) t * heads * kvl * 4,
+                    mb.scores, heads, 1, aw, kvl, positions[t], ctx, m.scale(), heads * aw, stride, stride, heads * kvl,
+                    0, 0f);
+        }
+        k.mlaApplyV(oLat, b.wv, mb.att, m, n);
+    }
 }
