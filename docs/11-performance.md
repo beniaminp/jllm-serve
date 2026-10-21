@@ -62,11 +62,12 @@ kernels still get no reuse across tokens.
 ### Current numbers
 
 Apple M1 Pro, Q4_0 weights (Q8_0 embedding / LM head), 413-token prompt, 128 generated tokens, after JIT warm-up
-(`./jllm bench --ctx 1024`, otherwise idle machine, 2026-10-16):
+(`./jllm bench --ctx 1024`, otherwise idle machine, 2026-10-16; the Metal Qwen3-0.6B row re-measured by
+`scripts/mac-validate.sh` on 2026-10-21, at the default 4096 context, where the model stops after 91 tokens):
 
 | model | backend | prefill | decode | weight traffic at that decode rate | % of bandwidth ceiling |
 |---|---|---|---|---|---|
-| Qwen3-0.6B | **Metal** (f32 or f16 KV cache) | **~1 360 tok/s** (~533 with `-Djllm.metal.mmaPrefill=false`) | **~111 tok/s** | 50 GB/s | 25 % |
+| Qwen3-0.6B | **Metal** (f32, f16 or q8 KV cache) | **~1 430 tok/s** (~536 with `-Djllm.metal.mmaPrefill=false`) | **~117 tok/s** | 53 GB/s | 26 % |
 | Qwen3-0.6B | **CPU, int8 activations** (default) | **~275 tok/s** | **~51 tok/s** | 23 GB/s | 11 % |
 | Qwen3-0.6B | CPU, float activations | ~237 tok/s | ~13 tok/s | 6 GB/s | 3 % |
 | Qwen3-30B-A3B | **Metal** | **~49 tok/s** | **~25 tok/s** | 51 GB/s (≈ 2.05 GB per token) | 26 % |
@@ -158,8 +159,23 @@ for a mixture-of-experts row, `--llama-quant Q4_K_M` for another file of the rep
    labelled as favoured by the repetitive prompt.
 
 It needs `llama-bench` (`brew install llama.cpp`, or `LLAMA_BENCH=/path`) and `python3` (to read llama-bench's
-JSON). No comparison has been run yet; until one is, the gap to llama.cpp is an estimate (prefill well behind,
-decode closer; see 11.2).
+JSON).
+
+Measured on the M1 Pro (plugged in, no thermal warning) on 2026-10-21 against llama.cpp 0.7.0 from Homebrew
+(build 11669, commit 620d2225c, Metal), 3 rounds:
+
+| model file | engine | prefill tok/s | decode tok/s | note |
+|---|---|---|---|---|
+| Qwen3-0.6B-Q4_0.gguf | jllm (Metal) | 1352.1 | 104.2 | prompt 413 tok, 128 generated |
+| | llama.cpp | 3068.5 | 204.8 | decode at depth 413 |
+| | jllm / llama.cpp | 0.44x | 0.51x | |
+| | jllm, default speculation | | 207.4 | the bench prompt repeats itself, so this favours speculation |
+
+llama.cpp prefills 2.3× and decodes 2× faster on the same file. The file is 382 MB, so jllm's decode reads ~40 GB/s
+of weights and llama.cpp's ~78 GB/s, both well under the ~200 GB/s roof, so the gap is most likely the dispatch and
+latency overhead of 11.2, not bandwidth. (jllm's decode here is lower than the ~117 tok/s of 11.1 partly because all 128
+tokens are generated, where its own Q4_0 cache stops at 91.) The speculation row matches llama.cpp only because the
+bench prompt is repetitive.
 
 ## 11.2 Where the time goes
 

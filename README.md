@@ -59,12 +59,17 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
-The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
-not been measured on Apple hardware yet: `scripts/mac-validate.sh` does both on a Mac and prints a table
-([08 §8.20](docs/08-metal-backend.md#820-validating-on-a-mac)). Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
-`-Djllm.metal.pipeline=false`, `-Djllm.metal.replay=false` (passed through `JAVA_OPTS`) and `./jllm bench`. `scripts/mac-validate.sh --vs-llama` also runs
-llama.cpp's `llama-bench` on the same GGUF file with the same prompt and output lengths and prints both side by side
-([11 §11.1](docs/11-performance.md#against-llamacpp-scriptsmac-validatesh---vs-llama)).
+The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
+batched decoding and draft speculation were merged after it and are verified on the emulator only) were verified for correctness on the emulator (every family, CPU == Metal) and on an M1 Pro
+by `scripts/mac-validate.sh`, which also measures each one on and off and prints a table
+([08 §8.20](docs/08-metal-backend.md#820-validating-on-a-mac)). On Qwen3-0.6B the simdgroup-matrix prefill is the big
+one (536 → 1 430 tok/s), flash prefill adds ~6 %, while pipelined decoding, the f16 and the q8 KV cache leave decode
+at ~113–118 tok/s; the kernel self-check keeps flash decode off on that GPU. Compare yourself with
+`-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`, `-Djllm.metal.pipeline=false`, `-Djllm.metal.replay=false`,
+`-Djllm.metal.hmma=false` (passed through `JAVA_OPTS`) and `./jllm bench`. `scripts/mac-validate.sh --vs-llama` also runs llama.cpp's `llama-bench` on the same
+GGUF file with the same prompt and output lengths: llama.cpp is still about 2× faster (see
+[below](#measured-on-an-apple-m1-pro-10-cores-32-gb) and
+[11 §11.1](docs/11-performance.md#against-llamacpp-scriptsmac-validatesh---vs-llama)).
 
 ## Requirements
 
@@ -383,13 +388,25 @@ The server is meant for your own machine. Keep these in mind before changing the
 
 | Model | Backend | Prefill | Decode |
 |---|---|---|---|
-| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~533 tok/s | ~111 tok/s |
+| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~1 430 tok/s | ~117 tok/s |
 | Qwen3-0.6B Q4_0, 413-token prompt | CPU (NEON 128-bit, 10 threads), int8 activations (`backend.cpu.int8-activations`, the default) | ~275 tok/s | ~51 tok/s |
 | Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~49 tok/s | ~25 tok/s |
 | Qwen3-30B-A3B Q4_0 (19.4 GB cache) | CPU, int8 activations | ~12 tok/s | ~6 tok/s |
 
 Float activations on the CPU (`--backend.cpu.int8-activations false`) decode about 4× slower; the full history of
 measurements is in [docs/11](docs/11-performance.md#111-measured).
+
+Against llama.cpp 0.7.0 (Homebrew, build 11669, Metal) on the same `unsloth/Qwen3-0.6B-GGUF` Q4_0 file, 413-token
+prompt, 128 tokens decoded at depth 413, speculation off (`scripts/mac-validate.sh --vs-llama`, 2026-10-21):
+
+| Engine | Prefill | Decode |
+|---|---|---|
+| jllm (Metal) | 1 352 tok/s | 104 tok/s |
+| llama.cpp (`llama-bench`, best of flash attention off/on) | 3 069 tok/s | 205 tok/s |
+| jllm / llama.cpp | 0.44× | 0.51× |
+
+With its default n-gram speculation jllm decodes this benchmark at 207 tok/s, but the bench prompt repeats one
+sentence, which flatters speculation; llama-bench has none.
 
 Both backends produce identical greedy output with float activations on the CPU (checked on every merge for
 Qwen3 and the 30B MoE, and across 20 synthetic models of all families × 3 quantization formats by
