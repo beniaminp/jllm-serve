@@ -746,9 +746,10 @@ def q4_rows(x):
     return np.ascontiguousarray(out), ((c.astype(np.float32) - np.float32(7.5)) * d[:, :, None]).reshape(rows, -1)
 
 
-def kv_store_q4(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, ring=8):
+def kv_store_q4(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, ring=8, rotate=True):
     """kv_store_q4 rotates and quantizes k, quantizes v, rotates the queries in place and fills the ring and its tags,
-    all bit for bit as numpy (and KvQ4 / KvCache.Q4) does."""
+    all bit for bit as numpy (and KvQ4 / KvCache.Q4) does. With rotate=False (the accuracy study's switch) k and the
+    queries stay as they are."""
     rng = np.random.default_rng(6)
     kv_dim = n_kv * hd
     k = (rng.standard_normal((ntok, kv_dim)) * rng.random((ntok, 1)) * 4).astype(np.float32)
@@ -765,28 +766,29 @@ def kv_store_q4(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, ring=8):
     kr = np.zeros((ring, kv_dim), np.float16)
     vr = np.zeros((ring, kv_dim), np.float16)
     tags = np.full(ring, -1, np.int32)
-    # KvStoreQ4Params: headDim kvDim nKvHeads qStride stride pos0 ringCap
+    # KvStoreQ4Params: headDim kvDim nKvHeads qStride stride pos0 ringCap rotate
     E.dispatch('kv_store_q4', [k, v, kb, vb, q, kr, vr, tags],
-               pack('iiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, pos0, ring), (2 * n_kv + n_heads, ntok), (32,))
-    krot = q4_rotate(k.reshape(ntok, n_kv, hd)).reshape(ntok, kv_dim)
+               pack('iiiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, pos0, ring, int(rotate)), (2 * n_kv + n_heads, ntok), (32,))
+    krot = q4_rotate(k.reshape(ntok, n_kv, hd)).reshape(ntok, kv_dim) if rotate else k
     want_k, kd = q4_rows(krot)
     want_v, vd = q4_rows(v)
     ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
-    okq = (q == q4_rotate(q0.reshape(ntok, n_heads, hd)).reshape(ntok, -1)).all()
+    okq = (q == (q4_rotate(q0.reshape(ntok, n_heads, hd)).reshape(ntok, -1) if rotate else q0)).all()
     slots = [(pos0 + t) % ring for t in range(ntok)]
     okr = all((kr[s] == krot[t].astype(np.float16)).all() and (vr[s] == v[t].astype(np.float16)).all()
               and tags[s] == pos0 + t for t, s in enumerate(slots))
     # error: within half a step max|x| / 15 of each group (plus the half rounding of the scale)
     gk = np.abs(krot.reshape(ntok, -1, 32)).max(axis=2)
     err = (np.abs(kd - krot).reshape(ntok, -1, 32).max(axis=2) / np.where(gk > 0, gk / 15, 1)).max()
-    check(ok and okq and okr and err <= 1.002, 'kv_store_q4 hd=%d: rows as numpy %s, queries %s, ring %s, max error '
-          '%.3f of max|x| / 15' % (hd, 'yes' if ok else 'NO', 'yes' if okq else 'NO', 'yes' if okr else 'NO', err))
+    check(ok and okq and okr and err <= 1.002, 'kv_store_q4 hd=%d rotate=%s: rows as numpy %s, queries %s, ring %s, max error '
+          '%.3f of max|x| / 15' % (hd, rotate, 'yes' if ok else 'NO', 'yes' if okq else 'NO', 'yes' if okr else 'NO', err))
 
 
 kv_store_q4(128)
 kv_store_q4(64, n_kv=3, n_heads=6)
 kv_store_q4(96)
 kv_store_q4(256, n_kv=1, ntok=3)
+kv_store_q4(128, rotate=False)
 
 
 def ex_from(tags, cap, recent, p):

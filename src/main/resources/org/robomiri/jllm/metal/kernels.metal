@@ -3918,6 +3918,7 @@ struct KvStoreQ4Params {
     int stride;      // bytes per cache row: kvDim / 2 + kvDim / 16
     int pos0;        // position of the chunk's first token
     int ringCap;     // ring slots, 0 = no recent window
+    int rotate;      // 1: Hadamard-rotate k and the queries (always, except in the accuracy study: -Djllm.kv.q4.rotate=false)
 };
 
 // kv_store_q4: grid (2 * nKvHeads + nHeads, ntok), one simdgroup (32 threads) per row. x < nKvHeads: k head x rotated
@@ -3944,6 +3945,7 @@ kernel void kv_store_q4(device const float *k [[buffer(0)]],
     if (x >= 2 * p.nKvHeads) {
         device float *qr = q + (ulong)t * p.qStride + (x - 2 * p.nKvHeads) * p.headDim;
         for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? qr[lane + i * 32] : 0.0f;
+        if (p.rotate == 0) return;
         q4_rotate(r, per, B, lane);
         for (int i = 0; i < MAX_PER; i++) if (i < per) qr[lane + i * 32] = r[i];
         return;
@@ -3952,7 +3954,7 @@ kernel void kv_store_q4(device const float *k [[buffer(0)]],
     const int h = isV ? x - p.nKvHeads : x;
     device const float *src = (isV ? v : k) + (ulong)t * p.kvDim + h * p.headDim;
     for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? src[lane + i * 32] : 0.0f;
-    if (!isV) q4_rotate(r, per, B, lane);
+    if (!isV && p.rotate != 0) q4_rotate(r, per, B, lane);
     device uchar *row = (isV ? vc : kc) + (ulong)t * p.stride;
     device half *sc = (device half *)(row + p.kvDim / 2);
     for (int i = 0; i < MAX_PER; i++) {
@@ -4110,7 +4112,7 @@ struct AttnSplitQ4Params {
     int window;
     float softcap;
     int nSplit;
-    int chunk;       // keys per split
+    int chunk;       // keys per split; <= 0: ceil(keys / nSplit), computed by the kernel
     int recent;
     int ringCap;
 };
@@ -4140,8 +4142,10 @@ kernel void attention_split_q4(device const float *q [[buffer(0)]],
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + 1;
     const int first = p.window > 0 ? max(0, len - p.window) : 0;
-    const int s0 = first + split * p.chunk;
-    const int s1 = min(len, s0 + p.chunk);
+    // chunk <= 0: ceil(keys / nSplit), derived here so that a recorded decode step only patches the position
+    const int chunk = p.chunk > 0 ? p.chunk : (len - first + p.nSplit - 1) / p.nSplit;
+    const int s0 = first + split * chunk;
+    const int s1 = min(len, s0 + chunk);
     const int per = p.headDim / 32;
     const int kvDim = p.nKvHeads * p.headDim;
     const int exact = p.recent > 0 ? max(first, q4_held_from(tags, p.ringCap, p.pos0, p.recent, lane)) : len;

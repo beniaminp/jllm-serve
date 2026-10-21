@@ -843,7 +843,7 @@ public final class MetalBackend implements Backend {
                 MetalKernels.Q4Ring ring = q4Rings == null ? null : q4Rings[layer];
                 k.kvStoreQ4(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, ring, hd, g.kvHeads(),
                         g.heads(), pos, n);
-                float scale = g.scale() / KvQ4.block(hd); // (Hq)·(Hk) = B q·k
+                float scale = g.scale() / KvQ4.scaleDivisor(hd); // (Hq)·(Hk) = B q·k
                 if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                     k.flashAttentionQ4(q, keyCache[layer], valCache[layer], flashPart, scores, att, ring, g.heads(),
                             g.kvHeads(), hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
@@ -895,6 +895,7 @@ public final class MetalBackend implements Backend {
             int dim = c.dim();
             int kvDim = g.kvDim();
             int hd = g.headDim();
+            boolean q4 = kvDtype == KvDtype.Q4;
             boolean q8 = kvDtype == KvDtype.Q8;
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
@@ -911,9 +912,22 @@ public final class MetalBackend implements Backend {
                 long kvOff = (long) t * kvDim * 4;
                 Metal.Buffer kc = o.keyCache[layer];
                 Metal.Buffer vc = o.valCache[layer];
-                k.ropeRow(adjacent, kvHalf, q, qOff, rowK, kvOff, q8 ? rowK : kc, q8 ? kvOff : cacheOff,
+                k.ropeRow(adjacent, kvHalf, q, qOff, rowK, kvOff, q8 || q4 ? rowK : kc, q8 || q4 ? kvOff : cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), kvDim, g.heads(),
                         g.kvHeads(), pos, 0, rotHalf);
+                if (q4) { // the owner's ring and q4 rows, as the owner's own decode step
+                    MetalKernels.Q4Ring ring = o.q4Rings == null ? null : o.q4Rings[layer];
+                    k.kvStoreQ4Row(rowK, kvOff, rowV, kvOff, kc, vc, cacheOff, q, qOff, ring, hd, g.kvHeads(), g.heads(), pos);
+                    float scale = g.scale() / KvQ4.scaleDivisor(hd);
+                    if (flashDecode && pos + 1 >= k.flashMinLen) {
+                        k.flashAttentionQ4Row(q, qOff, kc, vc, flashPart, scores, att, qOff, ring, g.heads(), g.kvHeads(), hd,
+                                pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
+                    } else {
+                        k.attentionQ4Row(attnKernel, q, qOff, kc, vc, att, qOff, scores, ring, g.heads(), g.kvHeads(), hd, pos,
+                                ctx, scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
+                    }
+                    continue;
+                }
                 if (q8) {
                     k.kvStoreQ8Row(rowK, kvOff, rowV, kvOff, kc, vc, cacheOff, hd, g.kvHeads());
                 } else {
@@ -1775,14 +1789,18 @@ public final class MetalBackend implements Backend {
         }
     }
 
-    /** Reads what {@link #saveRecent} wrote (the ring forgets every other position). */
-    private void loadRecent(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+    /**
+     * Reads what {@link #saveRecent} wrote for {@code stored} positions into the ring of the first {@code n}
+     * ({@code n <= stored}): the saved window is {@code [stored - R, stored)}, a shorter prefix keeps the part below
+     * {@code n}, and the ring forgets every other position (the q4 rows are read for it).
+     */
+    private void loadRecent(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
         int kvDim = ((Attention.Gqa) arch.attention()).kvDim();
         for (MetalKernels.Q4Ring r : q4Rings) {
-            int first = Math.max(0, n - r.recent());
-            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim))
+            int first = Math.max(0, stored - r.recent());
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(Math.max(1, stored - first) * (4 + 4 * kvDim))
                     .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            buf.limit((n - first) * (4 + 4 * kvDim));
+            buf.limit((stored - first) * (4 + 4 * kvDim));
             while (buf.hasRemaining()) {
                 if (in.read(buf) < 0) {
                     throw new java.io.EOFException("the saved cache file is truncated");
@@ -1790,7 +1808,7 @@ public final class MetalBackend implements Backend {
             }
             MemorySegment b = MemorySegment.ofBuffer(buf.flip());
             r.tags().contents().fill((byte) -1);
-            for (int s = first; s < n; s++) {
+            for (int s = first; s < Math.min(stored, n); s++) {
                 long o = (long) (s - first) * (4 + 4 * kvDim);
                 if (b.get(ValueLayout.JAVA_INT_UNALIGNED, o) != 0) {
                     int slot = s % r.cap();
@@ -1910,7 +1928,7 @@ public final class MetalBackend implements Backend {
             Backend.skipState(in, (long) (stored - n) * segs * row);
         }
         if (q4Rings != null) {
-            loadRecent(n, in);
+            loadRecent(n, stored, in);
         }
     }
 

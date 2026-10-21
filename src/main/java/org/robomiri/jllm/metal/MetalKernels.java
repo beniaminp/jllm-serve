@@ -2,6 +2,7 @@ package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 
@@ -799,7 +800,7 @@ final class MetalKernels implements AutoCloseable {
         bind(4, q, 0);
         bindRing(5, ring);
         p.reset(KernelParams.KV_STORE_Q4).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
-                .i((int) KvDtype.Q4.rowBytes(kvDim, kvHeads)).i(pos).i(ring == null ? 0 : ring.cap());
+                .i((int) KvDtype.Q4.rowBytes(kvDim, kvHeads)).iv(DecodeProgram.VAR_POS, pos).i(ring == null ? 0 : ring.cap()).i(KvQ4.ROTATE ? 1 : 0);
         dispatch("kv_store_q4", 8, 0, 2 * kvHeads + heads, n, 1, 32, 1, 1);
     }
 
@@ -817,7 +818,7 @@ final class MetalKernels implements AutoCloseable {
         bind(4, scores, 0);
         bindRing(5, ring);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
-            p.reset(KernelParams.ATTN_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
+            p.reset(KernelParams.ATTN_Q4).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale).i(qStride).i(stride)
                     .i(oStride).i(window).i(t0).f(softcap).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
             dispatch(kernel, 8, 0, nHeads, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
@@ -842,19 +843,17 @@ final class MetalKernels implements AutoCloseable {
     void flashAttentionQ4(Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part, Metal.Buffer scores,
                           Metal.Buffer out, Q4Ring ring, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
                           float scale, int qStride, int stride, int window, float softcap) {
-        int len = pos + 1;
-        int first = window > 0 ? Math.max(0, len - window) : 0;
-        int keys = len - first;
-        int nSplit = Math.min(FLASH_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
-        int chunk = (keys + nSplit - 1) / nSplit;
+        int nSplit = flashSplits(pos, window);
         bind(0, q, 0);
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, scores, 0);
         bindRing(5, ring);
-        p.reset(KernelParams.ATTN_SPLIT_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
-                .i(window).f(softcap).i(nSplit).i(chunk).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+        // chunk 0: the kernel derives the keys per split from the position (as attention_split), so a recorded decode
+        // step stays valid while nSplit does
+        p.reset(KernelParams.ATTN_SPLIT_Q4).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
+                .i(qStride).i(stride).i(window).f(softcap).i(nSplit).i(0).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
         dispatch("attention_split_q4", 8, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
@@ -1284,6 +1283,59 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
                 .i(window).f(softcap).i(nSplit).i(chunk);
         dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        bind(0, part, 0);
+        bind(1, out, outOff);
+        p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+        dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * {@link #kvStoreQ4} of one token: its f32 staging rows at bytes kOff / vOff, its q row (rotated in place) at byte
+     * qOff of q, its cache rows at byte offset off, and the ring slot of its position in the owner's {@code ring}.
+     */
+    void kvStoreQ4Row(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                      long off, Metal.Buffer q, long qOff, Q4Ring ring, int headDim, int kvHeads, int heads, int pos) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, qOff);
+        bindRing(5, ring);
+        p.reset(KernelParams.KV_STORE_Q4).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q4.rowBytes(kvDim, kvHeads)).i(pos).i(ring == null ? 0 : ring.cap()).i(KvQ4.ROTATE ? 1 : 0);
+        dispatch("kv_store_q4", 8, 0, 2 * kvHeads + heads, 1, 1, 32, 1, 1);
+    }
+
+    /** {@link #attentionQ4} of the one token at pos whose (rotated) q row starts at byte qOff; its output goes to byte outOff. */
+    void attentionQ4Row(String kernel, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
+                        long outOff, Metal.Buffer scores, Q4Ring ring, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
+                        float scale, int qStride, int stride, int oStride, int window, float softcap) {
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, outOff);
+        bind(4, scores, 0);
+        bindRing(5, ring);
+        p.reset(KernelParams.ATTN_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
+                .i(oStride).i(window).i(0).f(softcap).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+        dispatch(kernel, 8, 0, nHeads, 1, 1, ATT_THREADS, 1, 1);
+    }
+
+    /** {@link #flashAttentionQ4} of the one token at pos whose q row starts at byte qOff; its output goes to byte outOff. */
+    void flashAttentionQ4Row(Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
+                             Metal.Buffer scores, Metal.Buffer out, long outOff, Q4Ring ring, int nHeads, int nKvHeads,
+                             int headDim, int pos, int ctx, float scale, int qStride, int stride, int window, float softcap) {
+        int nSplit = flashSplits(pos, window);
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, scores, 0);
+        bindRing(5, ring);
+        p.reset(KernelParams.ATTN_SPLIT_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
+                .i(window).f(softcap).i(nSplit).i(0).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+        dispatch("attention_split_q4", 8, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, outOff);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);

@@ -355,7 +355,7 @@ public abstract class KvCache {
             org.robomiri.jllm.model.Backend.skipState(in, (long) (stored - n) * 2 * rb);
         }
         for (int layer = 0; q4 != null && q4.recent > 0 && layer < layers; layer++) {
-            q4.readRecent(layer, n, in);
+            q4.readRecent(layer, n, stored, in);
         }
     }
 
@@ -1526,7 +1526,9 @@ public abstract class KvCache {
                 for (int g = 0; g < kvHeads; g++) {
                     int src = t * kvDim + g * headDim;
                     System.arraycopy(k, src, row, 0, headDim);
-                    KvQ4.rotate(row, 0, headDim);
+                    if (KvQ4.ROTATE) {
+                        KvQ4.rotate(row, 0, headDim);
+                    }
                     KvQ4.quantize(row, 0, headDim, nib, 0, sc, 0);
                     int kb = keyByteChunk(g, s / CHUNK) + s % CHUNK;
                     for (int i = 0; i < headDim / 2; i++) {
@@ -1604,10 +1606,10 @@ public abstract class KvCache {
                 qRot = new float[len];
             }
             System.arraycopy(q, 0, qRot, 0, len);
-            for (int o = 0; o < len; o += headDim) {
+            for (int o = 0; KvQ4.ROTATE && o < len; o += headDim) {
                 KvQ4.rotate(qRot, o, headDim);
             }
-            float s = scale / block; // (Hq)·(Hk) = B q·k, and B is a power of two
+            float s = scale / KvQ4.scaleDivisor(headDim); // (Hq)·(Hk) = B q·k, and B is a power of two
             if (n == 1 && vectorized() && kvHeads < pool.threads()) {
                 attentionDecode(pool, layer, pos, qRot, att, window, s, softcap);
             } else {
@@ -1793,11 +1795,16 @@ public abstract class KvCache {
             }
         }
 
-        /** Reads what {@link #writeRecent} wrote. */
-        void readRecent(int layer, int n, ReadableByteChannel in) throws IOException {
-            int first = Math.max(0, n - recent);
-            ByteBuffer buf = ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
-            buf.limit((n - first) * (4 + 4 * kvDim));
+        /**
+         * Reads what {@link #writeRecent} wrote for {@code stored} positions into the ring of the first {@code n}
+         * ({@code n <= stored}): the window of the saved cache is {@code [stored - R, stored)}, so the rows of a shorter
+         * prefix keep only the part of it below {@code n}; older positions of the prefix's own window are then read from
+         * the q4 rows (the ring forgets them, as after a rollback).
+         */
+        void readRecent(int layer, int n, int stored, ReadableByteChannel in) throws IOException {
+            int first = Math.max(0, stored - recent);
+            ByteBuffer buf = ByteBuffer.allocate(Math.max(1, stored - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
+            buf.limit((stored - first) * (4 + 4 * kvDim));
             while (buf.hasRemaining()) {
                 if (in.read(buf) < 0) {
                     throw new EOFException("the saved cache file is truncated");
@@ -1806,8 +1813,8 @@ public abstract class KvCache {
             buf.flip();
             Arrays.fill(ringPos[layer], -1);
             float[] row = new float[kvDim];
-            for (int s = first; s < n; s++) {
-                boolean held = buf.getInt() != 0;
+            for (int s = first; s < stored; s++) {
+                boolean held = buf.getInt() != 0 && s < n;
                 int slot = s % ringCap;
                 for (int kind = 0; kind < 2; kind++) {
                     for (int i = 0; i < kvDim; i++) {

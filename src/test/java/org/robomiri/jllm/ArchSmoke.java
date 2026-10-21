@@ -213,6 +213,16 @@ public final class ArchSmoke {
                 failures += replayCheck(w, lib, cfg, KvDtype.Q8);
                 failures += replayBatchCheck(w, lib, cfg, KvDtype.F32);
                 failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
+                // q4: without a window, and with one short enough that decode steps cross from the ring to the q4 rows
+                for (int recent : new int[]{0, 6}) {
+                    KvDtype.setQ4Recent(recent);
+                    try {
+                        failures += replayCheck(w, lib, cfg, KvDtype.Q4);
+                    } finally {
+                        KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
+                    }
+                }
+                failures += replayBatchCheck(w, lib, cfg, KvDtype.Q4);
                 if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
                     failures += replayCheck(w, lib, cfg, KvDtype.F16);
                 }
@@ -525,6 +535,24 @@ public final class ArchSmoke {
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
                     sameFormat && crossOk ? "ok" : "MISMATCH", diff);
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
+            if (dt == KvDtype.Q4) { // the first n - 2 positions of a longer state: the ring keeps only the window below them
+                int m = n - 2;
+                b.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(bytes.toByteArray())));
+                cpu.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+                b.forward(next, 0, 1, m, got);
+                float[] cpuLogits = new float[vocab];
+                cpu.forward(next, 0, 1, m, cpuLogits);
+                float sc = 0;
+                float df = 0;
+                for (int i = 0; i < vocab; i++) {
+                    sc = Math.max(sc, Math.abs(cpuLogits[i]));
+                    df = Math.max(df, Math.abs(cpuLogits[i] - got[i]));
+                }
+                boolean prefixOk = df <= 1e-3f * sc + 1e-4f;
+                System.out.printf("  kv %s: first %d of %d saved positions, cpu vs metal max diff %.1e -> %s%n", a.stateFormat(), m,
+                        n, df, prefixOk ? "ok" : "MISMATCH");
+                bad += prefixOk ? 0 : 1;
+            }
         }
         return bad;
     }

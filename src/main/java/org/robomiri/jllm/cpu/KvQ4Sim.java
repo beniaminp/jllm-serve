@@ -13,6 +13,8 @@ public final class KvQ4Sim extends KvCache {
     static final int RECENT = Integer.getInteger("q4.recent", 0);
     static final int GROUP = Integer.getInteger("q4.group", 32);
     static final int BITS = Integer.getInteger("q4.bits", 4);
+    static final boolean QK = Boolean.parseBoolean(System.getProperty("q4.qk", "true"));
+    static final boolean QV = Boolean.parseBoolean(System.getProperty("q4.qv", "true"));
     static final boolean SYMH = Boolean.getBoolean("q4.symh");
     /** 8 = q8-style per-row (headDim) symmetric int8, for cross-checking. */
 
@@ -155,8 +157,12 @@ public final class KvQ4Sim extends KvCache {
         float[] k0 = kq.clone();
         float[] v0 = vq.clone();
         for (int r = 0; r < n * kvHeads; r++) {
-            qdq(kq, r * headDim, headDim, ASYM_K);
-            qdq(vq, r * headDim, headDim, ASYM_V);
+            if (QK) {
+                qdq(kq, r * headDim, headDim, ASYM_K);
+            }
+            if (QV) {
+                qdq(vq, r * headDim, headDim, ASYM_V);
+            }
             stat(0, k0, kq, r * headDim, headDim);
             stat(1, v0, vq, r * headDim, headDim);
         }

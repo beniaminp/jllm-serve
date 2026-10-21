@@ -28,7 +28,19 @@ public final class KvQ4 {
     /** Values per quantization group (and per scale). */
     public static final int GROUP = 32;
 
+    /**
+     * Whether keys (and queries) are Hadamard-rotated: on, except for the accuracy study of docs/07 §7.13, which sets
+     * {@code -Djllm.kv.q4.rotate=false} to measure what the rotation buys. Read once; the CPU cache and the Metal
+     * kernels follow it alike.
+     */
+    public static final boolean ROTATE = !"false".equalsIgnoreCase(System.getProperty("jllm.kv.q4.rotate"));
+
     private KvQ4() {
+    }
+
+    /** What the score scale is divided by: {@link #block} with the rotation, 1 without. */
+    public static int scaleDivisor(int headDim) {
+        return ROTATE ? block(headDim) : 1;
     }
 
     /** Whether a head width can be stored as q4 (whole groups); other widths fall back to q8. */
