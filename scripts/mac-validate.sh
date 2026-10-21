@@ -11,6 +11,8 @@
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
 #   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
+#   scripts/mac-validate.sh --audio speech.wav               plus the audio rows (Whisper small and OuteTTS: CPU, Metal encoder,
+#                                                            Metal decoder, half and float weight tiles; q8 and q4 speech model)
 #
 # The llama.cpp comparison needs llama-bench (brew install llama.cpp, or LLAMA_BENCH=/path/to/llama-bench) and
 # python3. Both engines read the same .gguf file (default unsloth/Qwen3-0.6B-GGUF, Q4_0; --llama-quant to change),
@@ -30,6 +32,7 @@ LLAMA_ONLY=""
 LLAMA_DENSE=unsloth/Qwen3-0.6B-GGUF
 LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
+AUDIO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) DENSE="$2"; shift 2 ;;
@@ -41,6 +44,7 @@ while [ $# -gt 0 ]; do
     --llama-model) LLAMA_DENSE="$2"; shift 2 ;;
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
+    --audio) AUDIO="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -121,6 +125,28 @@ mvn -q compile test-compile
 [ -f target/native/libjllm_metal.dylib ] || ./scripts/build-native.sh >/dev/null
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
+# audio (docs/21): the real-time factor (seconds of work per second of audio, lower is better) of one run of the command line
+# tools, each in a fresh JVM, so it includes warm-up; scripts/audio-bench.sh has the steady-state stages
+if [ -n "$AUDIO" ] && [ -z "$LLAMA_ONLY" ]; then
+  audio_row() { # label java-opts args...
+    local label="$1" opts="$2" rtf
+    shift 2
+    rtf=$(JAVA_OPTS="$opts" JLLM_CONFIG=/dev/null ./jllm "$@" 2>&1 >/dev/null | grep -o 'real-time factor [0-9.]*' | tail -1 | grep -o '[0-9.]*$' || true)
+    echo "| $label | ${rtf:-failed} |"
+  }
+  echo
+  echo "| audio | real-time factor |"
+  echo "|---|---|"
+  for k in cpu "metal --audio.metal.decoder off" "metal --audio.metal.decoder on"; do
+    # shellcheck disable=SC2086
+    audio_row "whisper-small, backend $k" "" transcribe --model openai/whisper-small --audio "$AUDIO" --audio.backend $k
+  done
+  audio_row "whisper-small, backend metal, float weight tiles" "-Djllm.audio.metalExact=true" transcribe --model openai/whisper-small \
+    --audio "$AUDIO" --audio.backend metal
+  audio_row "OuteTTS 0.3 500M, q8 language model" "" speak --model OuteAI/OuteTTS-0.3-500M --prompt "Speech synthesis is the artificial production of human speech." --out "$OUT/s8.wav"
+  audio_row "OuteTTS 0.3 500M, q4 language model" "" speak --model OuteAI/OuteTTS-0.3-500M --prompt "Speech synthesis is the artificial production of human speech." --audio.tts.quant q4 --out "$OUT/s4.wav"
+fi
+
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64

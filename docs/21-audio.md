@@ -383,7 +383,7 @@ en_male_1 --out hello.wav [--speed 1.2]` do the same from a terminal and print t
 | `audio.threads` | `0` | CPU threads of the audio models (0 = `backend.threads`, then all) |
 | `audio.resident-mb` | `1500` | heap for Whisper weights as floats; bigger models stay mapped and are converted per use |
 | `audio.ffmpeg` | `auto` | ffmpeg for other audio formats and mp3/opus/aac/flac output (`off` or a path) |
-| `audio.max-seconds`, `audio.max-upload-mb`, `audio.tts.max-chars` | `7200`, `100`, `4096` | limits |
+| `audio.max-seconds`, `audio.max-upload-mb`, `audio.tts.max-chars` | `3600`, `100`, `4096` | limits |
 | `audio.stt-model`, `audio.tts-model` | empty | models `./jllm serve` loads at start |
 | `audio.codec-repo`, `audio.codec-file` | `ggml-org/WavTokenizer`, `WavTokenizer-Large-75-F16.gguf` | the codec |
 | `audio.tts.quant`, `audio.tts.ctx` | `q8`, `8192` | the speech language model's weights and context |
