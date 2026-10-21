@@ -85,12 +85,48 @@ public final class MetalBackend implements Backend {
     private int[] cpuAssign;
     private float[] cpuWeight;
     private int cpuLayers;            // MoE layers with at least one expert on the CPU
-    private java.lang.foreign.Arena hotArena; // packed copies of the GPU's experts of split layers
+    private Placement placement;      // where the experts are, and the packed hot experts of split layers
+    private boolean placementShared;  // placement is the weights' entry in PLACEMENTS (else this backend's own)
     private Metal.Buffer gassign;     // moe_remap output: each slot's expert among the layer's GPU experts, or -1
-    private Metal.Buffer[] counts;    // per MoE layer: how often each expert was picked (while experts are split)
+    // how often each expert was picked, per MoE layer, while any expert is on the CPU: counted by moe_remap on the GPU
+    // (layers with GPU experts) or here (layers entirely on the CPU, from the router's choices the CPU reads anyway)
+    private Metal.Buffer[] counts;
+    private long[][] hostCounts;
+    private boolean countStep;        // this forward pass counts the layers entirely on the GPU (every COUNT_EVERY-th)
+    private long steps;
     private java.nio.file.Path statsFile;
     private String modelKey;
     private long lastStatsSave;
+    private boolean closed;
+
+    /**
+     * Layers whose experts are all on the GPU are counted on one forward pass in this many (a moe_remap dispatch per
+     * layer per token would cost more than it tells): the planner compares experts within a layer, so a sample is enough.
+     */
+    private static final int COUNT_EVERY = Math.max(1, Integer.getInteger("jllm.metal.expertCountEvery", 8));
+
+    /**
+     * Where the experts of one {@link ModelWeights} live, and the packed copies of the hot experts of its split layers.
+     * Shared by every MetalBackend on those weights with the same {@link MoeSplit} (a server's extra slots), so the
+     * copies exist once and every slot runs the same plan; freed with the last of them.
+     */
+    private static final class Placement {
+        final String config;
+        final boolean[][] cold;
+        final QTensor[] gateUp;   // per layer: the packed hot experts of a split layer, else null
+        final QTensor[] down;
+        final java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofShared();
+        int refs = 1;
+
+        Placement(String config, boolean[][] cold) {
+            this.config = config;
+            this.cold = cold;
+            this.gateUp = new QTensor[cold.length];
+            this.down = new QTensor[cold.length];
+        }
+    }
+
+    private static final java.util.Map<ModelWeights, Placement> PLACEMENTS = new java.util.IdentityHashMap<>();
 
     /**
      * One decoder layer: its norm buffers, {@code o_proj}, and two strategy objects picked once from the layer's
@@ -327,6 +363,65 @@ public final class MetalBackend implements Backend {
         }
         modelKey = arch + " | " + w.byteSize() + " bytes";
         statsFile = ExpertPlacement.statsFile(modelKey);
+        String config = split.layers() + "|" + java.util.Arrays.deepToString(split.cold());
+        synchronized (PLACEMENTS) {
+            Placement shared = PLACEMENTS.get(w);
+            if (shared != null && shared.config.equals(config)) {
+                shared.refs++;
+                placement = shared;
+                placementShared = true;
+            } else {
+                placement = newPlacement(config, perExpert, experts, topK);
+                if (shared == null) {
+                    PLACEMENTS.put(w, placement);
+                    placementShared = true;
+                }
+            }
+        }
+        boolean[][] cold = placement.cold;
+        for (int l = 0; l < layers; l++) {
+            int n = 0;
+            for (int e = 0; cold[l] != null && e < experts[l]; e++) {
+                n += cold[l][e] ? 1 : 0;
+            }
+            cpuLayers += n > 0 ? 1 : 0;
+        }
+        if (cpuLayers > 0) {
+            cpuPool = new ThreadPool(split.threads());
+            cpuExperts = MoeExperts.create(cpuPool, w, maxBatch, split.int8Activations());
+            int slots = maxBatch * arch.maxTopK();
+            cpuXb = new float[maxBatch * c.dim()];
+            cpuY = new float[maxBatch * c.dim()];
+            cpuAssign = new int[slots];
+            cpuWeight = new float[slots];
+            gassign = k.scratch((long) slots * 4);
+            counts = new Metal.Buffer[layers];
+            hostCounts = new long[layers][];
+            for (int l = 0; l < layers; l++) {
+                if (cold[l] == null) {
+                    continue;
+                }
+                boolean allCold = true;
+                for (boolean v : cold[l]) {
+                    allCold &= v;
+                }
+                if (allCold) {
+                    hostCounts[l] = new long[experts[l]];
+                } else {
+                    counts[l] = k.metal.newBuffer((long) experts[l] * 4); // zeroed
+                }
+            }
+            lastStatsSave = System.nanoTime();
+        }
+        return cold;
+    }
+
+    /**
+     * Plans where the experts go (see {@link #coldExperts}), packs the hot experts of split layers into memory of
+     * their own, and logs the plan.
+     */
+    private Placement newPlacement(String config, long[] perExpert, int[] experts, int[] topK) {
+        int layers = c.layers();
         long[][] usage = null;
         boolean[][] cold;
         if (split.cold() != null) {
@@ -337,62 +432,56 @@ public final class MetalBackend implements Backend {
             }
         } else if (split.layers() == MoeSplit.AUTO) {
             long need = gpuBytes(new boolean[layers][]) - workingSet();
-            usage = need > 0 && HOT_EXPERTS ? ExpertPlacement.load(statsFile, layers) : null;
+            usage = need > 0 && HOT_EXPERTS ? ExpertPlacement.load(statsFile, layers, modelKey) : null;
             cold = ExpertPlacement.plan(need, perExpert, experts, topK, usage);
         } else {
             cold = ExpertPlacement.lastLayers(split.layers(), perExpert, experts);
         }
+        Placement p = new Placement(config, cold);
         int moeLayers = 0;
         int full = 0;
         int mixed = 0;
         long moved = 0;
-        double picks = 0;
         double cpuPicks = 0;
-        for (int l = 0; l < layers; l++) {
-            if (cold[l] == null) {
-                continue;
-            }
-            moeLayers++;
-            int n = 0;
-            double total = 0;
-            for (int e = 0; e < experts[l]; e++) {
-                total += usage != null && usage[l] != null && usage[l].length == experts[l] ? usage[l][e] + 1 : 1;
-            }
-            for (int e = 0; e < experts[l]; e++) {
-                double p = (usage != null && usage[l] != null && usage[l].length == experts[l] ? usage[l][e] + 1 : 1) / total;
-                picks += p;
-                if (cold[l][e]) {
-                    n++;
-                    cpuPicks += p;
+        try {
+            for (int l = 0; l < layers; l++) {
+                if (cold[l] == null) {
+                    continue;
+                }
+                moeLayers++;
+                double[] share = ExpertPlacement.shares(usage != null ? usage[l] : null, experts[l]);
+                int[] hot = new int[experts[l]];
+                int nHot = 0;
+                for (int e = 0; e < experts[l]; e++) {
+                    if (cold[l][e]) {
+                        cpuPicks += share[e];
+                        moved += perExpert[l];
+                    } else {
+                        hot[nHot++] = e;
+                    }
+                }
+                full += nHot == 0 ? 1 : 0;
+                if (nHot > 0 && nHot < experts[l]) {
+                    mixed++;
+                    // the hot experts, packed into memory of their own; the mapped tensors stay untouched for the CPU
+                    MlpWeights.Moe mw = w.decoderLayer(l).moe();
+                    int[] h = java.util.Arrays.copyOf(hot, nHot);
+                    p.gateUp[l] = mw.expGateUp().gatherExperts(p.arena, h, 2 * ((Mlp.Moe) arch.layers().get(l).mlp()).moeDim());
+                    p.down[l] = mw.expDown().gatherExperts(p.arena, h, c.dim());
                 }
             }
-            moved += n * perExpert[l];
-            full += n == experts[l] ? 1 : 0;
-            mixed += n > 0 && n < experts[l] ? 1 : 0;
+        } catch (RuntimeException | Error e) {
+            p.arena.close();
+            throw e;
         }
-        cpuLayers = full + mixed;
-        if (cpuLayers > 0) {
-            cpuPool = new ThreadPool(split.threads());
-            cpuExperts = MoeExperts.create(cpuPool, w, maxBatch, split.int8Activations());
-            int slots = maxBatch * arch.maxTopK();
-            cpuXb = new float[maxBatch * c.dim()];
-            cpuY = new float[maxBatch * c.dim()];
-            cpuAssign = new int[slots];
-            cpuWeight = new float[slots];
-            gassign = k.scratch((long) slots * 4);
-            hotArena = java.lang.foreign.Arena.ofShared();
-            counts = new Metal.Buffer[layers];
-            for (int l = 0; l < layers; l++) {
-                counts[l] = cold[l] != null ? k.metal.newBuffer((long) experts[l] * 4) : null; // zeroed
-            }
-            lastStatsSave = System.nanoTime();
+        if (full + mixed > 0) {
             System.err.printf("Metal: %.1f GB of experts run on the CPU (%d threads): %d of %d MoE layers entirely, %d in part "
                             + "(%s); expected share of expert picks on the CPU %.0f %%; GPU share %.1f GB of a %.1f GB "
                             + "working set%n", moved / 1e9, split.threads(), full, moeLayers, mixed,
                     usage != null ? "placed by the usage of earlier runs" : "no usage statistics yet: whole layers",
-                    100 * cpuPicks / Math.max(picks, 1e-9), gpuBytes(cold) / 1e9, workingSet() / 1e9);
+                    100 * cpuPicks / Math.max(moeLayers, 1), gpuBytes(cold) / 1e9, workingSet() / 1e9);
         }
-        return cold;
+        return p;
     }
 
     /** Adds the expert picks counted since the last save to the statistics file and resets the counters. */
@@ -403,17 +492,20 @@ public final class MetalBackend implements Backend {
         long[][] delta = new long[counts.length][];
         boolean any = false;
         for (int l = 0; l < counts.length; l++) {
-            if (counts[l] == null) {
-                continue;
+            if (hostCounts[l] != null) {
+                delta[l] = hostCounts[l].clone();
+                java.util.Arrays.fill(hostCounts[l], 0);
+            } else if (counts[l] != null) {
+                MemorySegment cs = counts[l].contents();
+                delta[l] = new long[(int) (counts[l].size() / 4)];
+                for (int i = 0; i < delta[l].length; i++) {
+                    delta[l][i] = Integer.toUnsignedLong(cs.getAtIndex(ValueLayout.JAVA_INT, i));
+                }
+                cs.fill((byte) 0);
             }
-            MemorySegment cs = counts[l].contents();
-            int e = (int) (counts[l].size() / 4);
-            delta[l] = new long[e];
-            for (int i = 0; i < e; i++) {
-                delta[l][i] = Integer.toUnsignedLong(cs.getAtIndex(ValueLayout.JAVA_INT, i));
+            for (int i = 0; delta[l] != null && i < delta[l].length; i++) {
                 any |= delta[l][i] != 0;
             }
-            cs.fill((byte) 0);
         }
         if (any) {
             ExpertPlacement.add(statsFile, modelKey, delta);
@@ -426,11 +518,15 @@ public final class MetalBackend implements Backend {
      * and the router's choices (the command buffer that recorded them must be finished): all of them, or with
      * {@code cold} only the slots whose expert is cold. Results go to {@link #cpuY} so the GPU may add its own experts
      * into x meanwhile ({@code addToX} later). False when no slot was the CPU's (cpuY is then not written).
+     * {@code hostCount}: adds the router's choices to it (a layer counted here instead of by moe_remap).
      */
-    private boolean cpuRouted(MlpWeights.Moe mw, Mlp.Moe spec, int n, boolean[] cold) {
+    private boolean cpuRouted(MlpWeights.Moe mw, Mlp.Moe spec, int n, boolean[] cold, long[] hostCount) {
         int dim = c.dim();
         int topK = spec.topK();
         MemorySegment.copy(assign.contents(), ValueLayout.JAVA_INT, 0, cpuAssign, 0, n * topK);
+        for (int s = 0; hostCount != null && s < n * topK; s++) {
+            hostCount[cpuAssign[s]]++;
+        }
         boolean any = cold == null;
         if (cold != null) { // only the slots whose expert stays on the CPU; the GPU computes the others
             for (int s = 0; s < n * topK; s++) {
@@ -624,7 +720,8 @@ public final class MetalBackend implements Backend {
         private final boolean[] cold;   // null: all on the GPU; else true for an expert left on the CPU
         private final boolean allCold;
         private final Metal.Buffer map; // moe_remap: expert -> index among the GPU experts, or -1
-        private final Metal.Buffer counts;
+        private final Metal.Buffer counts;   // moe_remap counts this layer's picks (null: not counted on the GPU)
+        private final long[] hostCount;      // the CPU counts them (a layer entirely on the CPU)
         private final int gpuExperts;   // experts in expGateUp / expDown (all, or the packed hot ones)
         private final QTensor expGateUp;
         private final QTensor expDown;
@@ -649,6 +746,7 @@ public final class MetalBackend implements Backend {
             this.cold = nCold > 0 ? cold : null;
             allCold = nCold == e;
             counts = MetalBackend.this.counts != null ? MetalBackend.this.counts[layer] : null;
+            hostCount = hostCounts != null ? hostCounts[layer] : null;
             int[] hot = new int[e - nCold];
             int[] toGpu = new int[e];
             for (int i = 0, j = 0; i < e; i++) {
@@ -669,9 +767,8 @@ public final class MetalBackend implements Backend {
                 bExpGateUp = null;   // not on the GPU at all
                 bExpDown = null;
             } else if (this.cold != null) {
-                // the hot experts, packed into memory of their own; the mapped tensors stay untouched for the CPU
-                expGateUp = w.expGateUp().gatherExperts(hotArena, hot, 2 * spec.moeDim());
-                expDown = w.expDown().gatherExperts(hotArena, hot, c.dim());
+                expGateUp = placement.gateUp[layer]; // the packed hot experts (see newPlacement)
+                expDown = placement.down[layer];
                 bExpGateUp = k.wrap(expGateUp.data);
                 bExpDown = k.wrap(expDown.data);
             } else {
@@ -714,7 +811,7 @@ public final class MetalBackend implements Backend {
         public void run(int layer, int n, boolean fuseNorm) {
             k.rmsnorm(x, 0, ffnNorm, xb, n, c.dim());
             route.run(n);
-            if (counts != null) {
+            if (counts != null && (cold != null || countStep)) { // a split layer needs gassign on every step
                 k.moeRemap(assign, map, gassign, counts, spec.experts(), spec.topK(), n);
             }
             if (allCold) {
@@ -757,13 +854,13 @@ public final class MetalBackend implements Backend {
                 shared(n);
                 k.commit();               // the shared experts, running while ...
                 k.metal.waitPending(1);   // ... the CPU, once the router is done,
-                cpuRouted(weights, spec, n, null);
+                cpuRouted(weights, spec, n, null, hostCount);
                 k.commitAndWait();        // (the empty buffer the last commit opened: waits for the shared experts)
                 addToX(n);
                 k.begin();
             } else {
                 k.commitAndWait();
-                cpuRouted(weights, spec, n, null);
+                cpuRouted(weights, spec, n, null, hostCount);
                 addToX(n);
                 k.begin();
                 shared(n);
@@ -783,14 +880,14 @@ public final class MetalBackend implements Backend {
                 shared(n);
                 k.commit();               // the hot experts, running while ...
                 k.metal.waitPending(1);   // ... the CPU takes the cold ones, once the router is done
-                if (cpuRouted(weights, spec, n, cold)) {
+                if (cpuRouted(weights, spec, n, cold, null)) {
                     k.commitAndWait();    // the GPU's experts are in x: add the CPU's
                     addToX(n);
                     k.begin();
                 }                         // else the GPU just goes on; the open buffer records the next layer
             } else {
                 k.commitAndWait();
-                boolean any = cpuRouted(weights, spec, n, cold);
+                boolean any = cpuRouted(weights, spec, n, cold, null);
                 if (any) {
                     addToX(n);
                 }
@@ -966,6 +1063,7 @@ public final class MetalBackend implements Backend {
             MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
         }
 
+        countStep = counts != null && steps++ % COUNT_EVERY == 0;
         k.begin();
         boolean committed = false;
         try {
@@ -1005,6 +1103,22 @@ public final class MetalBackend implements Backend {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
                     Math.min(w.lmHead.rows, logits.length));
         }
+    }
+
+    /** Drops this backend's hold on its placement; the last backend on it frees the packed experts. */
+    private void releasePlacement() {
+        if (placement == null) {
+            return;
+        }
+        synchronized (PLACEMENTS) {
+            if (--placement.refs == 0) {
+                if (placementShared) {
+                    PLACEMENTS.remove(w, placement);
+                }
+                placement.arena.close();
+            }
+        }
+        placement = null;
     }
 
     // ------------------------------------------------------------------ saved caches
@@ -1111,6 +1225,10 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
         if (pipe != null) {
             try {
                 pipe.drain();
@@ -1129,9 +1247,7 @@ public final class MetalBackend implements Backend {
             if (cpuPool != null) {
                 cpuPool.close();
             }
-            if (hotArena != null) {
-                hotArena.close();
-            }
+            releasePlacement();
         }
     }
 }

@@ -273,6 +273,24 @@ public final class ArchSmoke {
         }
         java.nio.file.Files.delete(stats);
         System.clearProperty("jllm.metal.expertStatsDir");
+        // two backends on the same weights at once (a server's slots) share one placement and its packed experts; each
+        // gives the same result, and closing one leaves the other working
+        try (Backend a = new MetalBackend(w, 64, 32, lib, KvDtype.F32, MoeSplit.experts(alternate, 4, false))) {
+            float[] la = new float[cfg.core().vocabSize()];
+            float[] lb = new float[cfg.core().vocabSize()];
+            int[] ga;
+            try (Backend b = new MetalBackend(w, 64, 32, lib, KvDtype.F32, MoeSplit.experts(alternate, 4, false))) {
+                ga = generate(a, la);
+                int[] gb = generate(b, lb);
+                boolean same = Arrays.equals(ga, gb) && Arrays.equals(la, lb);
+                System.out.println("  two slots sharing a placement: " + (same ? "identical" : "DIFFERENT"));
+                bad += same ? 0 : 1;
+            }
+            int[] again = generate(a, la);
+            boolean ok = Arrays.equals(ga, again);
+            System.out.println("  first slot after the second closed: " + (ok ? "ok" : "BROKEN"));
+            bad += ok ? 0 : 1;
+        }
         long expect = -1;
         boolean statsOk = true;
         for (int l = 0; l < layers; l++) {

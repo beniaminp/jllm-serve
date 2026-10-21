@@ -46,6 +46,23 @@ final class ExpertPlacement {
     }
 
     /**
+     * The share of a layer's picks each of its {@code experts} gets: {@code (count + 1) / Σ (count + 1)}, uniform
+     * without counts (a null row or one of another length).
+     */
+    static double[] shares(long[] counts, int experts) {
+        long[] c = counts != null && counts.length == experts ? counts : new long[experts];
+        double total = 0;
+        for (long v : c) {
+            total += v + 1;
+        }
+        double[] p = new double[experts];
+        for (int i = 0; i < experts; i++) {
+            p[i] = (c[i] + 1) / total;
+        }
+        return p;
+    }
+
+    /**
      * The experts to leave on the CPU: {@code cold[l][e]}, null for a dense layer.
      *
      * @param need        bytes the GPU must give up (nothing moves when {@code need <= 0})
@@ -66,15 +83,10 @@ final class ExpertPlacement {
             }
             int e = experts[l];
             cold[l] = new boolean[e];
-            long[] c = counts != null && counts[l] != null && counts[l].length == e ? counts[l] : new long[e];
-            double total = 0;
-            for (long v : c) {
-                total += v + 1;
-            }
-            double[] p = new double[e];
+            double[] p = shares(counts != null ? counts[l] : null, e);
             Integer[] idx = new Integer[e];
             for (int i = 0; i < e; i++) {
-                p[i] = (c[i] + 1) / total * topK[l];
+                p[i] *= topK[l];
                 idx[i] = i;
             }
             Arrays.sort(idx, (a, b) -> a.equals(b) ? 0 : p[a] != p[b] ? Double.compare(p[a], p[b]) : Integer.compare(a, b));
@@ -149,15 +161,24 @@ final class ExpertPlacement {
         return base.resolve(Integer.toHexString(modelKey.hashCode()) + "-" + Integer.toHexString(modelKey.length()) + ".txt");
     }
 
-    /** The saved counts (one row per layer, null for a dense layer or none saved), or null without a file. */
-    static long[][] load(Path file, int layers) {
+    private static final String HEADER = "# jllm expert usage: <layer>: picks per expert, summed over runs; ";
+
+    /**
+     * The saved counts (one row per layer, null for a dense layer or none saved), or null without a file or when the
+     * file belongs to another model (its header names the model key; the file name is only a hash of it).
+     */
+    static long[][] load(Path file, int layers, String modelKey) {
         synchronized (FILE_LOCK) {
             try {
                 if (!Files.isRegularFile(file)) {
                     return null;
                 }
+                List<String> all = Files.readAllLines(file, StandardCharsets.UTF_8);
+                if (all.isEmpty() || !all.get(0).equals(HEADER + modelKey)) {
+                    return null;
+                }
                 long[][] c = new long[layers][];
-                for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                for (String line : all) {
                     int colon = line.indexOf(':');
                     if (line.startsWith("#") || colon < 0) {
                         continue;
@@ -182,12 +203,12 @@ final class ExpertPlacement {
     /** Adds {@code delta} to the saved counts (halving a layer's that pass MAX_COUNT) and writes the file atomically. */
     static void add(Path file, String modelKey, long[][] delta) {
         synchronized (FILE_LOCK) {
-            long[][] c = load(file, delta.length);
+            long[][] c = load(file, delta.length, modelKey);
             if (c == null) {
                 c = new long[delta.length][];
             }
             List<String> lines = new ArrayList<>();
-            lines.add("# jllm expert usage: <layer>: picks per expert, summed over runs; " + modelKey);
+            lines.add(HEADER + modelKey);
             for (int l = 0; l < delta.length; l++) {
                 if (delta[l] == null) {
                     continue;
