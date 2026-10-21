@@ -148,7 +148,7 @@ public final class ModelLoader {
         int batch = batch(s, arch);
         Backend backend;
         try {
-            backend = batched(s, weights, newBackend(s, arch, weights, slots));
+            backend = batched(s, weights, newBackend(s, arch, weights, slots, true));
         } catch (Exception e) {
             weights.close();
             throw e;
@@ -207,10 +207,14 @@ public final class ModelLoader {
 
     /** {@code backend} as a member of its weights' batch group, or as it is when batching is off. */
     private static Backend batched(Settings s, ModelWeights weights, Backend backend) {
-        if (!s.getBool("engine.batch-decode")) {
-            return backend;
-        }
-        return GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup()).join(backend);
+        org.robomiri.jllm.engine.BatchGroup g = group(s, weights);
+        return g == null ? backend : g.join(backend);
+    }
+
+    /** The batch group of {@code weights}, or null with engine.batch-decode off. */
+    private static org.robomiri.jllm.engine.BatchGroup group(Settings s, ModelWeights weights) {
+        return s.getBool("engine.batch-decode")
+                ? GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup()) : null;
     }
 
     /**
@@ -221,7 +225,7 @@ public final class ModelLoader {
      */
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
-        Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1));
+        Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1, true));
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
         Speculator.Config spec = speculation(s, l.weights().arch);
@@ -344,7 +348,7 @@ public final class ModelLoader {
 
     public static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
         try {
-            return newBackend(s, arch, weights, 1);
+            return newBackend(s, arch, weights, 1, false);
         } catch (Exception e) {
             weights.close();
             throw e;
@@ -352,7 +356,9 @@ public final class ModelLoader {
     }
 
     /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
-    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots) throws Exception {
+    /** {@code member}: the backend will join its weights' batch group (and share the group's CPU threads). */
+    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots, boolean member)
+            throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
         String backendName = s.get("backend");
@@ -369,6 +375,10 @@ public final class ModelLoader {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
+                            s.getBool("backend.cpu.int8-activations"))
+                    : member && group(s, weights) != null // a group's slots share one pool: they never compute at once
+                    ? new CpuBackend(weights, ctx, batch, group(s, weights).cpuPool(
+                            threads > 0 ? threads : Runtime.getRuntime().availableProcessors()), kvDtype,
                             s.getBool("backend.cpu.int8-activations"))
                     : new CpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,

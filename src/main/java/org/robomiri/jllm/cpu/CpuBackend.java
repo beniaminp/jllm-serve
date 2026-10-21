@@ -40,6 +40,7 @@ public final class CpuBackend implements Backend {
     private final int ctx;
     private final int maxBatch;
     final ThreadPool pool;
+    private final boolean ownsPool;
     /** One table per {@link Decoder#ropeTables()} entry. */
     private final Rope[] ropes;
 
@@ -76,12 +77,26 @@ public final class CpuBackend implements Backend {
      *                        (Q4_0 and Q8_0 weights; other formats keep the float path)
      */
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, KvDtype kvDtype, boolean int8Activations) {
+        this(w, ctx, maxBatch, new ThreadPool(threads), true, kvDtype, int8Activations);
+    }
+
+    /**
+     * On a thread pool lent by the caller (not closed with this backend): the slots of a batch group, which never
+     * compute at the same time, share one pool instead of keeping one set of threads each.
+     */
+    public CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, KvDtype kvDtype, boolean int8Activations) {
+        this(w, ctx, maxBatch, pool, false, kvDtype, int8Activations);
+    }
+
+    private CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, boolean ownsPool, KvDtype kvDtype,
+                       boolean int8Activations) {
         this.w = w;
         this.arch = w.decoder();
         this.c = arch.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
-        this.pool = new ThreadPool(threads);
+        this.pool = pool;
+        this.ownsPool = ownsPool;
         ropes = new Rope[arch.ropeTables().size()];
         for (int i = 0; i < ropes.length; i++) {
             ropes[i] = new Rope(arch.ropeTables().get(i), ctx);
@@ -719,6 +734,8 @@ public final class CpuBackend implements Backend {
 
     @Override
     public void close() {
-        pool.close();
+        if (ownsPool) {
+            pool.close();
+        }
     }
 }

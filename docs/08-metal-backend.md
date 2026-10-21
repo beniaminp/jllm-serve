@@ -847,7 +847,10 @@ max |candidate − reference|  ≤  1e-3 · max |reference| + 1e-5
 and, on a real GPU, if it is also faster (best of a few timed runs). The decision is cached in
 `~/.cache/jllm/metal-tuning.properties` under the device name, a hash of the kernel source and the shape, so it runs
 once (a few hundred ms) and again only after a driver or kernel change. On the emulator, timings mean nothing, so
-correctness alone decides. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
+correctness alone decides. It also chooses the threadgroup size of the plain single-token matmul (one
+simdgroup per output row: 64, 128 or 256 threads, i.e. 2, 4 or 8 rows per threadgroup): it times the three on the
+model's own output projection, checks that the results are bit-identical, and keeps the fastest. Small matrices fill
+the GPU better with smaller threadgroups, and which size pays differs between chips. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
 
 ---
 

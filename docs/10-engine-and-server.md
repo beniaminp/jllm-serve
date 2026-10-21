@@ -578,6 +578,44 @@ Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run
 
 ---
 
+## 10.9b Batched decoding across slots
+
+🧸 A teacher reads a page of the big book aloud to answer one child's question. If three children each ask about
+the same book, she can read the page once and answer all three, instead of reading it three times.
+
+📐 Generating one token means reading every weight of the model once (decode is limited by memory bandwidth, see
+[11](11-performance.md)). A server with several slots (`jllm-web`, one engine per slot) used to read them once
+per conversation. With `engine.batch-decode=true` (the default) the slots of a model form an
+`engine.BatchGroup`, and the next tokens of all conversations generating at the same time come out of one pass
+(`Backend.forwardBatch`):
+
+```
+one at a time:   n conversations · (W / bandwidth)              per round of n tokens
+batched:         W / bandwidth  +  n · (attention + small ops)  per round of n tokens
+```
+
+`W` is the weight bytes. The projections, the MLP and the LM head treat the n tokens as the rows of one
+multi-token matmul, so each weight block is read (and dequantized) once for all of them. RoPE, the KV-cache store
+and attention run per row, each in its own conversation's cache at its own position.
+
+**How the steps meet.** Every slot's backend is wrapped in a `BatchGroup.Member`:
+- A one-token `forward` (a decode step) joins a queue.
+- Whichever thread takes the group's device lock first becomes the leader. It waits up to 2 ms
+  (`-Djllm.engine.batchWindowMicros`) for the other slots that decoded within the last 200 ms, runs every queued
+  step as one pass and hands each step its logits. The other threads just wait for their own result.
+- A slot alone never waits.
+- Prefill, verification passes and saved-cache operations take the same lock, so slots never compute at the same
+  time. They also share one CPU thread pool.
+- Pipelined GPU decoding ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) is used only while a slot
+  is alone in its group.
+
+**Results.** A batched step uses the multi-token kernels, which add up in a different order than the single-token
+ones, so its logits agree with a step taken alone to rounding (with int8 activations, to the int8 rounding). The
+greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU). The CPU backend implements
+`forwardBatch` for every attention family except DeepSeek's MLA. Mamba and the Metal backend fall back to running
+the queued steps one after another, as before: on Metal each slot has its own command queue and buffers, and one
+pass over several slots' caches is not implemented yet.
+
 ## 10.10 Configuration
 
 Every tunable is a key in the bundled `src/main/resources/jllm.properties`, each with a comment. `Settings.load`

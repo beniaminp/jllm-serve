@@ -260,6 +260,10 @@ Where the guesses come from (an index of every 2..8-token sequence of the text) 
 
 ---
 
+When several people talk to the same model at once, their next words are computed together: reading the model's
+weights is the slow part, and one reading can serve every conversation
+([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)).
+
 ## 13. Why the first answer of a coding agent is slow, and later ones are fast
 
 🧸 A coding agent's first message comes with a 10 000-word instruction book. The friend must read it all once

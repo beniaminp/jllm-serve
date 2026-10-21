@@ -31,6 +31,8 @@ public final class BatchGroup {
     private static final long ACTIVE_NANOS = 200_000_000L;
 
     private final ReentrantLock device = new ReentrantLock();
+    /** The CPU threads the members' CPU backends share (they never compute at the same time); closed with the last. */
+    private org.robomiri.jllm.cpu.ThreadPool cpuPool;
     private final List<Member> members = new ArrayList<>();
     private final List<Step> pending = new ArrayList<>();
     private long batches;
@@ -57,6 +59,14 @@ public final class BatchGroup {
         Member m = new Member(inner);
         members.add(m);
         return m;
+    }
+
+    /** The CPU thread pool for a member's CPU backend: created by the first, shared by the others. */
+    public synchronized org.robomiri.jllm.cpu.ThreadPool cpuPool(int threads) {
+        if (cpuPool == null) {
+            cpuPool = new org.robomiri.jllm.cpu.ThreadPool(threads);
+        }
+        return cpuPool;
     }
 
     /** Decode steps run, and how many of them shared a pass with another (for the logs and tests). */
@@ -304,6 +314,12 @@ public final class BatchGroup {
                 members.remove(this);
             }
             locked(inner::close);
+            synchronized (BatchGroup.this) {
+                if (members.isEmpty() && cpuPool != null) {
+                    cpuPool.close();
+                    cpuPool = null;
+                }
+            }
         }
     }
 }

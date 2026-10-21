@@ -39,6 +39,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Feature | What it does | Docs |
 |---|---|---|
 | Prompt lookup for agents | an n-gram index over the whole context drafts up to 16 tokens that the model verifies in one pass; 20 → 81 tok/s when rewriting code from the prompt, −4 % on free text | [17 §17.1](docs/17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) |
+| Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
