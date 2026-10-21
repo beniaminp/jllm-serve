@@ -264,6 +264,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.prefillMinTokens` | 8 | smallest chunk that uses the tiled prefill matmuls |
 | `jllm.metal.mmaPrefill` | true | simdgroup-matrix prefill matmuls; `false` = the scalar tiled kernels (bit-identical to decode) |
 | `jllm.metal.mmaMinTokens` | 32 | smallest chunk that uses the simdgroup-matrix matmuls ([08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)) |
+| `jllm.metal.hmma` | auto | which form of those matmuls: auto = per matrix shape, as the start-up check timed f32 `*_mma` against half-weight `*_hmma` on this chip; `true` / `false` = half-weight everywhere / nowhere ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
+| `jllm.metal.flashPrefillKernel` | auto | flash prefill form `fa` or `fb` (K and V staged together, half staging for f16 / q8 caches); auto = the faster one that agrees ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
 | `jllm.metal.attnGroup` | 1 | query heads per attention threadgroup (2, 4, 8 measured no faster) |
 | `jllm.metal.flashPrefill` | auto | flash-attention prefill kernel `attention_fa` instead of `attention_t` (auto = start-up self-check decides; [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa)) |
 | `jllm.metal.moeMma` | true | expert-grouped simdgroup-matrix MoE prefill ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)); `false` = per-slot kernels |
@@ -322,10 +324,10 @@ Remaining, by expected payoff:
 | # | change | expected effect | where |
 |---|---|---|---|
 | 1 | **Continuous batching**: several sequences per forward pass so each weight read serves many tokens | turns decode from memory-bound toward compute-bound: near-linear throughput scaling with concurrent users | `Backend.forward` (batch of sequences), per-sequence KV cache slots, `Engine` scheduler, `ApiServer` lock |
-| 2 | **Expert-grouped MoE prefill on Metal**: gather the tokens routed to each expert and run one matmul per expert over them | MoE prefill from "stream all experts, no reuse" to dense-like reuse; the CPU backend already does it | `moe_up` / `moe_down` kernels (+ gather / scatter) |
+| 2 | ~~Expert-grouped MoE prefill on Metal~~ (done: `moe_sort` + `moe_up_mma` / `moe_down_mma`, [08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)) | | |
 | 3 | **Speculative decoding** with a small draft model (e.g. 0.6B drafting for 30B-A3B), verified in one batched forward of the big model | 1.5–3× decode when the draft agrees often | new `Engine` loop, `Backend.forward` with verification of `k` tokens |
-| 4 | **Flash-style prefill attention**: online softmax that never writes `scores` to device memory, a tile of query tokens per threadgroup (flash decoding covers decode only) | removes the score round trip at long context | `attention_t` |
-| 5 | **`simdgroup_matrix`** (Apple's MMA) for prefill matmuls | different accumulation order, so opt-in; prefill gain | `kernels.metal` |
+| 4 | ~~Flash-style prefill attention~~ (done: `attention_fa`, and `attention_fb`, [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa), [§8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) | | |
+| 5 | ~~`simdgroup_matrix` prefill matmuls~~ (done: `*_mma`, and the half-weight `*_hmma` with the per-shape choice, [11.8](#118-the-prefill-kernels-against-llamacpps-design)); next: **measure `*_hmma` on a Mac**, then larger tiles (64 × 64 with 8 simdgroups) or Metal 4 tensor ops on M5-class GPUs | see 11.8 | `kernels.metal`, `MetalTuner` |
 | 6 | **Mixed-precision low-bit formats** (a Q2_K / Q3_K mix with higher-precision sensitive tensors) | smaller files and fewer bytes per token ([13](13-q2k-quantization.md)) | quantizer, `QType`, kernels |
 | 7 | Smaller items: fuse RMSNorm into the next matmul on CPU, wider threadgroups for small Metal matmuls, coalesced router weight reads, parallel shard downloads | each a few percent to 2× in its own corner | `CpuBackend`, `kernels.metal`, `HuggingFaceHub` |
 
@@ -429,3 +431,67 @@ cheap when they fail, and 3-token minimum matches cost less on free text than 2.
   1 + 0.36 (n−1) single steps on the dense 0.6B and 1 + 0.55 (n−1) on the 30B MoE, so it gains only for text that
   copies its input (+15 % for code editing with prompt lookup) and loses on the MoE.
 - Memory is dominated by the weights and the KV cache (`--ctx` and `backend.kv-dtype` are the knobs).
+
+---
+
+## 11.8 The prefill kernels against llama.cpp's design
+
+🧸 Two bakeries use the same oven. One bakes 266 big loaves an hour, the other a few thousand small rolls; to know
+which bakes better you count the flour that goes through the oven, not the loaves. Counted that way, our prefill
+uses about a third of the oven time llama.cpp does, and the new kernels are built to close part of that gap.
+Whether they do can only be weighed on a real Mac, so below is the arithmetic of what to expect, not a measurement.
+
+📐 **Where llama.cpp is.** Its published Apple Silicon table gives an M1 Pro (16-core GPU) about 266 tok/s of
+prompt processing (pp512) for LLaMA-7B Q4_0. A 7B model does `2 × 6.5 · 10⁹ ≈ 13 GFLOP` of matmul per token, so
+`kernel_mul_mm` sustains `266 × 13 · 10⁹ ≈ 3.5 TFLOP/s`, about two thirds of the GPU's f32 peak
+(`16 cores × 128 lanes × 2 FLOP × 1.3 GHz ≈ 5.3 TFLOP/s`) on large matrices. Its tile is the one our `*_mma`
+kernels already used (64 rows × 32 tokens, 4 simdgroups, 8 accumulators each, 32-wide k steps, two barriers per
+step); it differs in storing the dequantized weights as half, in 8 × 8-blocked threadgroup tiles, and in writing
+full tiles straight to device memory.
+
+**Where we are.** Qwen3-0.6B does `2 × 28 × (2.10 + 1.05 + 1.05 + 2.10 + 6.29 + 3.15) M ≈ 0.88 GFLOP` of matmul
+per prefill token (q, k, v, o, gate+up, down; the LM head only for the last token). At ~1 360 tok/s that is at most
+`1 360 × 0.88 · 10⁹ ≈ 1.2 TFLOP/s` even if prefill were all matmul: about a third of llama.cpp's rate. (The ~533
+tok/s quoted for this model elsewhere is the scalar `matmul_pf` path, `-Djllm.metal.mmaPrefill=false`.)
+
+**What each change of the `*_hmma` kernels buys** ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)):
+
+| change | bytes / work per 32-wide k step of one threadgroup | expected effect |
+|---|---|---|
+| half weight tile | threadgroup tile 8 KB → 4 KB; total 12 KB → 8 KB | resident threadgroups per core 2 → 4 (if a core holds 32 KB), twice the simdgroups to cover barrier and load stalls; the weight `simdgroup_load`s move half the bytes |
+| 8 × 8-blocked tiles | each of the 24 loads per simdgroup reads one contiguous 128 / 256 B block instead of 8 rows 128 B apart | up to 8 bank passes → 1–2 per load; the loads are 6 per 8 multiply-accumulates, so this is the step most likely to matter on the dense shapes |
+| next step's bytes in registers | Q4_0: 8 B + scale, Q8_0: 16 B + scale, 32 B of activations per thread | device latency (hundreds of cycles) hidden behind 32 multiply-accumulates per simdgroup |
+| skip empty 8-token blocks | MoE tile with `c` slots: `⌈c / 8⌉` of 4 blocks multiplied | expert tiles average 16 slots at 256-token chunks (128 experts, top-8): ~⅓ fewer multiply-accumulates in `moe_up` / `moe_down` (count spread 8–24); the freed ALU time helps the other resident threadgroups, not the tile's own latency |
+| direct stores | 2 048 floats per full tile not copied through threadgroup memory, one barrier fewer | a few % of a tile at 1 024-wide rows (32 k steps) |
+
+**Expected prefill speed** (assumptions stated, to be replaced by `scripts/mac-validate.sh` numbers):
+
+- *Qwen3-0.6B, 413-token prompt.* Today's ~0.74 ms per token splits into matmul time `T_mm` and the rest (norms,
+  rope, attention, ~170 dispatches per chunk). If matmuls are ~70 % (`T_mm ≈ 0.51 ms`, i.e. ~1.7 TFLOP/s already) and
+  the `*_hmma` kernels reach 2–3 TFLOP/s (60–85 % of llama.cpp's large-matrix rate; these matrices are small, 1 024–
+  6 144 rows, so the GPU is less full than with 7B shapes), `T_mm` becomes 0.29–0.44 ms and prefill
+  **~1 500–1 950 tok/s (1.1–1.45×)**. Larger dense models, where matmuls are a bigger share and fill the GPU better,
+  should gain more (up to the ratio of matmul rates, ~1.5–2×).
+- *Qwen3-30B-A3B, 256-token chunks.* Matmul work per token: experts `8 × 3 × 768 × 2 048 × 2 × 48 ≈ 3.6 GFLOP`,
+  attention projections `2 × 48 × 18.9 M ≈ 1.8 GFLOP`. Reading every expert once per chunk is
+  `≈ 19.5 GB / 200 GB/s ≈ 0.1 s` per 256 tokens (a ~2 600 tok/s bandwidth bound), so the grouped prefill is
+  compute-bound: with half-empty tiles the `*_mma` expert kernels do ~7.2 GFLOP-equivalents per token, the
+  `*_hmma` ones ~4.8 (blocks skipped) to 3.6 (perfectly packed). At 2–3 TFLOP/s for all matmuls that is a ceiling
+  of roughly 300–450 tok/s before, 400–650 after, i.e. up to ~1.4× on the MoE share of the time. The measured
+  ~49 tok/s predates the grouped MoE kernels; what they and `*_hmma` give together is for the Mac run to show.
+- *Long prompts.* At 2 000 tokens attention is `2 × 2 × 128 × ~1 000 keys × 16 heads × 28 layers ≈ 0.23 GFLOP`
+  per token, a quarter of the matmul work. `attention_fb` halves its barriers (2 instead of 4 per key block),
+  removes the 8-row bank conflicts of its 2 × 64 K / V loads per block and simdgroup (at D = 128, BK = 32), and halves
+  the staged bytes for f16 and q8 caches; if that makes the kernel 1.2–2× faster, prefill at 2 000 tokens gains
+  ~5–15 % on top of the matmul gain.
+
+**Accuracy cost.** Half weights add a relative error of `≈ u / √3 ≈ 2.8e-4` per dot product (`u = 2⁻¹¹`; measured
+1.3e-4 to 4.5e-4 of `max |y|` in `kernel_tests.py`, against ~1e-7 to 1e-6 for the f32 MMA kernels), about 1 % of
+the Q4_0 quantization error itself; the start-up check rejects the half-weight form for any shape where it
+differs from the f32 one by more than `1e-3 · max |y| + 1e-5`. `attention_fb` rounds nothing `attention_fa` keeps.
+
+**Not measurable here.** All of the above was checked for correctness on the CPU emulator
+([18](18-metal-emulator.md)), whose timings say nothing about a GPU (one CPU fiber per GPU thread). The deciding
+numbers are the `half-weight MMA prefill forced on / off` and `flash prefill form fa / fb` rows of
+`scripts/mac-validate.sh` (with `--moe` for the 30B, and the ~2 000-token rows), and `--vs-llama` for the gap that
+remains.

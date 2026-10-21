@@ -76,12 +76,23 @@ bench "flash prefill off" "$DENSE" "-Djllm.metal.flashPrefill=false"
 bench "flash decode off" "$DENSE" "-Djllm.metal.flashDecode=false"
 bench "pipelined decoding off" "$DENSE" "-Djllm.metal.pipeline=false"
 bench "simdgroup-matrix prefill off" "$DENSE" "-Djllm.metal.mmaPrefill=false"
+# the prefill kernels' two forms: f32 *_mma vs half-weight *_hmma (default: per shape, as the start-up check timed them),
+# and attention_fa vs attention_fb; the 2000-token rows weigh attention more
+bench "half-weight MMA prefill forced on" "$DENSE" "-Djllm.metal.hmma=true"
+bench "half-weight MMA prefill off (f32 MMA)" "$DENSE" "-Djllm.metal.hmma=false"
+bench "flash prefill form fa" "$DENSE" "-Djllm.metal.flashPrefillKernel=fa"
+bench "flash prefill form fb" "$DENSE" "-Djllm.metal.flashPrefillKernel=fb"
+bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
+bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
+bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16
 bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64
   bench "grouped MoE prefill off" "$MOE" "-Djllm.metal.moeMma=false"
+  bench "half-weight MMA prefill forced on" "$MOE" "-Djllm.metal.hmma=true"
+  bench "half-weight MMA prefill off (f32 MMA)" "$MOE" "-Djllm.metal.hmma=false"
   bench "experts of 4 layers on the CPU" "$MOE" "" --backend.metal.cpu-moe 4
   bench "experts of 4 layers on the CPU, int8 off" "$MOE" "" --backend.metal.cpu-moe 4 --backend.cpu.int8-activations false
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off

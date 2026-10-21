@@ -49,6 +49,9 @@
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 #        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
 #                                            (scripts/build-metal-emu.sh, needs clang++), so no Apple GPU is needed
+# The prefill matmuls run in their f32 form (-Djllm.metal.hmma=false): the half-weight form differs from the CPU by
+# ~2e-4 of the logits by design, which the q8-cache comparisons (int8 rounding of K / V) amplify past their bound.
+# JAVA_OPTS="-Djllm.metal.hmma=true" overrides it; its kernels are checked by scripts/metal-emu/kernel_tests.py.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -x /opt/homebrew/opt/openjdk@26/bin/java ] && export JAVA_HOME=/opt/homebrew/opt/openjdk@26
@@ -108,7 +111,7 @@ gen qwen3next2 Qwen3Next2ForCausalLM
 for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
   REF_Q8=1 python3 scripts/deepseek-ref.py "$M/${P}-$n" >/dev/null
 done
-"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false -Djllm.metal.hmma=false ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef "$METAL_LIB" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
@@ -126,7 +129,7 @@ done
   -cp target/classes:target/test-classes org.robomiri.jllm.Qwen3NextChecks "$METAL_LIB" \
   "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
 
-exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
+exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false -Djllm.metal.hmma=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \

@@ -8,6 +8,8 @@
 //   9. flash-attention prefill (attention_fa: simdgroup-matrix QK^T and PV, online softmax)
 //  10. pipelined greedy decoding (embed_token: the embedding of a token id the GPU chose; argmax)
 //  11. Qwen3-Next (Gated DeltaNet conv / delta rule / gated norm, the attention output gate, the shared-expert gate)
+//  12. half-weight MMA prefill (*_hmma: the section 2b / 5 MMA kernels with half weight tiles, chosen per shape)
+//  13. flash prefill, second form (attention_fb: K and V staged together, half staging for f16 / q8 caches)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -3023,3 +3025,579 @@ kernel void shared_gate_add(device const float *xb [[buffer(0)]],
     device float *out = x + (ulong)tg * p.n;
     for (int i = tid; i < p.n; i += tpg) out[i] += s * yr[i];
 }
+// ---------------------------------------------------------------------------------------------- 12. half-weight MMA prefill
+// The *_hmma kernels are a second form of the simdgroup-matrix prefill matmuls of section 2b (matmul_mma, matmul3_mma,
+// matmul_swiglu_mma, moe_up_mma, moe_down_mma), with the same output tile (MMA_BR = 64 rows x MMA_BT = 32 tokens per
+// threadgroup of 4 simdgroups, each owning a 32 x 16 quarter = 8 accumulators), the same buffers, parameters and grids,
+// so the host picks either per matrix shape (MetalTuner times both on the device and keeps the faster if they agree).
+// What differs:
+//   - the dequantized weight tile is stored as half (4 KB instead of 8 KB): q * scale rounded once to 11 significant
+//     bits, as llama.cpp's kernel_mul_mm does; activations stay f32 and the accumulators are f32 (the multiply is
+//     simdgroup_float8x8 x simdgroup_half8x8 -> float), so the only new rounding is the weight's;
+//   - both tiles are kept as contiguous 8 x 8 blocks (block (rb, kb) at (rb * 4 + kb) * 64): every simdgroup_load reads
+//     128 or 256 contiguous bytes instead of 8 rows 128 bytes apart (rows at a 128-byte stride fall into the same
+//     threadgroup-memory banks);
+//   - the next block's weight bytes and activations are loaded into registers before the multiply-accumulates of the
+//     current one (one tile in threadgroup memory, so still two barriers per 32-wide k step, but the device latency
+//     overlaps the arithmetic);
+//   - 8-token blocks past the tile's last valid token are not multiplied (MoE tiles hold ~n * topK / experts slots,
+//     often 16 of 32; the last tile of a chunk is partial too);
+//   - full tiles of matmul (no bias / soft-cap) and of matmul3's q and k ranges (no bias) are stored straight from the
+//     accumulators to device memory (accumulating onto out by starting from its tile), skipping the staging pass.
+// Total threadgroup memory 8 KB (the f32 result tile of the staging epilogue aliases both input tiles), so up to four
+// threadgroups share a GPU core's 32 KB where the f32 kernels (12 KB) fit two.
+
+#define HM_SMEM 2048        // floats of threadgroup memory per *_hmma threadgroup: half weights 64 x 32 + f32 x 32 x 32
+
+// 16 weights (k = 16h .. 16h + 15 of the 32-weight block / unit u) of row grow of a GGUF tensor, dequantized as gg_unit
+// does. The legacy Q4_0 keeps llama.cpp's nibble order (low nibbles = weights 0..15), so for it half h is the low and
+// high nibbles of bytes 8h .. 8h + 7 = weights 8h .. 8h + 7 (w[0..1]) and 16 + 8h .. 16 + 8h + 7 (w[2..3]).
+template <int QT>
+static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, int h, thread float4 *w) {
+    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+        constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
+        device const uchar *blk = wq + (grow * nb + u) * BYTES;
+        const float d = float(*(device const half *)blk);
+        device const ushort *p = (device const ushort *)(blk + 2);
+        if (QT == GG_Q4_0) {
+            for (int k = 0; k < 2; k++) {
+                const uchar4 v = as_type<uchar4>(uint(p[4 * h + 2 * k]) | (uint(p[4 * h + 2 * k + 1]) << 16));
+                w[k] = (float4(v & uchar4(15)) - 8.0f) * d;
+                w[2 + k] = (float4(v >> uchar4(4)) - 8.0f) * d;
+            }
+        } else {
+            for (int k = 0; k < 4; k++) {
+                w[k] = float4(as_type<char4>(uint(p[8 * h + 2 * k]) | (uint(p[8 * h + 2 * k + 1]) << 16))) * d;
+            }
+        }
+    } else {
+        constexpr bool Q5 = QT == GG_Q5_K;
+        constexpr int BYTES = Q5 ? 176 : 144;
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * BYTES;
+        const int j = u & 7;
+        const float2 dd = float2(as_type<half2>(*(device const uint *)blk));
+        device const uchar *sc = blk + 4;
+        uint s;
+        uint m;
+        if (j < 4) {
+            s = sc[j] & 63;
+            m = sc[j + 4] & 63;
+        } else {
+            s = (sc[j + 4] & 15) | ((uint(sc[j - 4]) >> 6) << 4);
+            m = (sc[j + 4] >> 4) | ((uint(sc[j]) >> 6) << 4);
+        }
+        const float dl = dd.x * float(s);
+        const float ml = dd.y * float(m);
+        const uchar sh = uchar((j & 1) << 2);
+        device const uchar4 *q = (device const uchar4 *)(blk + (Q5 ? 48 : 16) + (j >> 1) * 32);
+        device const uchar4 *hb = (device const uchar4 *)(blk + 16);
+        for (int k = 0; k < 4; k++) {
+            uchar4 v = (q[4 * h + k] >> uchar4(sh)) & uchar4(15);
+            if (Q5) v |= ((hb[4 * h + k] >> uchar4(j)) & uchar4(1)) << uchar4(4);
+            w[k] = float4(v) * dl - ml;
+        }
+    }
+}
+
+// The raw bytes of this thread's share of block b for the engine's own formats (Q4_0: 8 quant bytes, Q8_0: 16, plus
+// the f32 scale), loaded one k step ahead; the other formats are decoded straight from device memory by hm_weights.
+template <int QT>
+static inline void hm_fetch(device const uchar *rwq, device const float *rws, ulong grow, int nb, int b, int h,
+                            thread uchar4 *rq, thread float &rs) {
+    if (QT == 4) {
+        device const uchar4 *q = (device const uchar4 *)(rwq + (grow * nb + b) * 16 + h * 8);
+        rq[0] = q[0];
+        rq[1] = q[1];
+        rs = rws[grow * nb + b];
+    } else if (QT == 8) {
+        device const uchar4 *q = (device const uchar4 *)(rwq + (grow * nb + b) * 32 + h * 16);
+        for (int k = 0; k < 4; k++) rq[k] = q[k];
+        rs = rws[grow * nb + b];
+    }
+}
+
+// Thread (row, h) writes its 16 weights of block b, as half, into the row's 8-wide k blocks of the weight tile;
+// wd = sa + (row >> 3) * 256 + (row & 7) * 8 is the row inside its 8-row band (k block kb at + kb * 64).
+// Q4_0 (and GGUF Q4_0): bytes 8h.. hold weights 8h.. (low nibbles, k block h) and 16 + 8h.. (high, k block 2 + h);
+// every other format: weights 16h .. 16h + 15 = k blocks 2h and 2h + 1.
+template <int QT>
+static inline void hm_weights(device const uchar *rwq, ulong grow, int nb, int b, int h, thread const uchar4 *rq,
+                              float rs, threadgroup half *wd) {
+    if (QT == 4) {
+        for (int k = 0; k < 2; k++) {
+            *(threadgroup half4 *)(wd + h * 64 + k * 4) = half4((float4(rq[k] & uchar4(15)) - 8.0f) * rs);
+            *(threadgroup half4 *)(wd + (2 + h) * 64 + k * 4) = half4((float4(rq[k] >> uchar4(4)) - 8.0f) * rs);
+        }
+    } else if (QT == 8) {
+        for (int k = 0; k < 4; k++) {
+            *(threadgroup half4 *)(wd + (2 * h + (k >> 1)) * 64 + (k & 1) * 4) = half4(float4(as_type<char4>(rq[k])) * rs);
+        }
+    } else {
+        float4 w[4];
+        if (QT == 2) {
+            q2k_sub_block(rwq, grow, (nb + 7) >> 3, 2 * b + h, w);
+        } else if (QT == 6) {
+            q6k_sub_block(rwq, grow, (nb + 7) >> 3, 2 * b + h, w);
+        } else {
+            gg_half<QT>(rwq, grow, nb, b, h, w);
+        }
+        const int kb0 = QT == GG_Q4_0 ? h : 2 * h;
+        const int kb1 = QT == GG_Q4_0 ? 2 + h : 2 * h + 1;
+        *(threadgroup half4 *)(wd + kb0 * 64) = half4(w[0]);
+        *(threadgroup half4 *)(wd + kb0 * 64 + 4) = half4(w[1]);
+        *(threadgroup half4 *)(wd + kb1 * 64) = half4(w[2]);
+        *(threadgroup half4 *)(wd + kb1 * 64 + 4) = half4(w[3]);
+    }
+}
+
+// The k loop of every *_hmma kernel. Thread tid dequantizes 16 weights of tile row tid >> 1 (its global row rgrow of
+// rwq / rws, clamped by the caller for a partial row tile) and stages 8 activations of tile token tid >> 2 from xrow
+// (clamped to the last valid token; ntv tokens of the tile are valid). With `direct` the accumulators go straight to
+// dout (row stride ldo; with accLoad they start from dout's tile, i.e. out += W x); otherwise the f32 result tile
+// is left in smem as sc[t * MMA_BR + r] for the caller's epilogue. Must be called by all 128 threads (barriers).
+template <int QT>
+static inline void hm_core(device const uchar *rwq, device const float *rws, ulong rgrow, int nb,
+                           device const float *xrow, int ntv, threadgroup float *smem,
+                           bool direct, device float *dout, ulong ldo, bool accLoad, ushort tid, ushort sg) {
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup float *sb = smem + MMA_BR * QK / 2;
+    const ushort sr = sg & 1;   // rows 32 sr .. 32 sr + 31 of the tile
+    const ushort st = sg >> 1;  // tokens 16 st .. 16 st + 15
+    const int ni = clamp((ntv - int(st) * 16 + 7) / 8, 0, 2);   // 8-token blocks of the quarter holding valid tokens
+    simdgroup_float8x8 acc[8];
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 4; j++) {
+            if (direct && accLoad) {
+                simdgroup_load(acc[i * 4 + j], dout + (ulong)(st * 16 + i * 8) * ldo + sr * 32 + j * 8, ldo);
+            } else {
+                acc[i * 4 + j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+        }
+    }
+    const int lr = tid >> 1;
+    const int h = tid & 1;
+    const int lt = tid >> 2;
+    const int lp = tid & 3;
+    threadgroup half *wd = sa + (lr >> 3) * 256 + (lr & 7) * 8;
+    threadgroup float4 *xd = (threadgroup float4 *)(sb + ((lt >> 3) * 4 + lp) * 64 + (lt & 7) * 8);
+    device const float4 *xr = (device const float4 *)xrow + lp * 2;
+    uchar4 rq[4];
+    for (int k = 0; k < 4; k++) rq[k] = uchar4(0);
+    float rs = 0.0f;
+    hm_fetch<QT>(rwq, rws, rgrow, nb, 0, h, rq, rs);
+    float4 x0 = xr[0];
+    float4 x1 = xr[1];
+    for (int b = 0; b < nb; b++) {
+        hm_weights<QT>(rwq, rgrow, nb, b, h, rq, rs, wd);
+        xd[0] = x0;
+        xd[1] = x1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b + 1 < nb) {
+            hm_fetch<QT>(rwq, rws, rgrow, nb, b + 1, h, rq, rs);
+            x0 = xr[(b + 1) * 8];
+            x1 = xr[(b + 1) * 8 + 1];
+        }
+        if (ni > 0) {
+            for (int kk = 0; kk < 4; kk++) {
+                simdgroup_half8x8 w[4];
+                for (int j = 0; j < 4; j++) simdgroup_load(w[j], sa + ((sr * 4 + j) * 4 + kk) * 64, 8, ulong2(0, 0), true);
+                for (int i = 0; i < 2; i++) {
+                    if (i < ni) {
+                        simdgroup_float8x8 a;
+                        simdgroup_load(a, sb + ((st * 2 + i) * 4 + kk) * 64, 8);
+                        for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i * 4 + j], a, w[j], acc[i * 4 + j]);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 4; j++) {
+            if (direct) {
+                simdgroup_store(acc[i * 4 + j], dout + (ulong)(st * 16 + i * 8) * ldo + sr * 32 + j * 8, ldo);
+            } else {
+                simdgroup_store(acc[i * 4 + j], smem + (st * 16 + i * 8) * MMA_BR + sr * 32 + j * 8, MMA_BR);
+            }
+        }
+    }
+    if (!direct) threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <int QT>
+kernel void matmul_hmma(device const uchar *wq [[buffer(0)]],
+                        device const float *ws [[buffer(1)]],
+                        device const float *x [[buffer(2)]],
+                        device float *out [[buffer(3)]],
+                        device const float *nw [[buffer(4)]],
+                        device const float *bias [[buffer(5)]],
+                        constant MatmulParams &p [[buffer(6)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[HM_SMEM];
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int ntv = min(MMA_BT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    const ulong grow = (ulong)min(row0 + int(tid >> 1), p.rows - 1);
+    device const float *xrow = x + (ulong)(t0 + min(int(tid >> 2), ntv - 1)) * p.cols;
+    const bool direct = ntv == MMA_BT && row0 + MMA_BR <= p.rows && !p.hasBias && !(p.softcap > 0.0f);
+    hm_core<QT>(wq, ws, grow, nb, xrow, ntv, smem, direct, out + (ulong)t0 * p.rows + row0, (ulong)p.rows,
+                p.accumulate != 0, tid, sg);
+    if (direct) return;
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, r = i % MMA_BR;
+        if (t < ntv && row0 + r < p.rows) {
+            const float v = p.hasBias ? smem[t * MMA_BR + r] + bias[row0 + r] : smem[t * MMA_BR + r];
+            const ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
+            out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
+        }
+    }
+}
+
+template <int QT, typename VT>
+kernel void matmul3_hmma(device const uchar *wq0 [[buffer(0)]],
+                         device const float *ws0 [[buffer(1)]],
+                         device const uchar *wq1 [[buffer(2)]],
+                         device const float *ws1 [[buffer(3)]],
+                         device const uchar *wq2 [[buffer(4)]],
+                         device const float *ws2 [[buffer(5)]],
+                         device const float *x [[buffer(6)]],
+                         device float *out0 [[buffer(7)]],
+                         device float *out1 [[buffer(8)]],
+                         device VT *out2 [[buffer(9)]],
+                         device const float *nw [[buffer(10)]],
+                         device const float *b0 [[buffer(11)]],
+                         device const float *b1 [[buffer(12)]],
+                         device const float *b2 [[buffer(13)]],
+                         constant Matmul3Params &p [[buffer(14)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[HM_SMEM];
+    const int total = p.rows0 + p.rows1 + p.rows2;
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int ntv = min(MMA_BT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    const int lrow = min(row0 + int(tid >> 1), total - 1);
+    device const uchar *rwq;
+    device const float *rws;
+    ulong grow;
+    if (lrow < p.rows0) { rwq = wq0; rws = ws0; grow = (ulong)lrow; }
+    else if (lrow < p.rows0 + p.rows1) { rwq = wq1; rws = ws1; grow = (ulong)(lrow - p.rows0); }
+    else { rwq = wq2; rws = ws2; grow = (ulong)(lrow - p.rows0 - p.rows1); }
+    device const float *xrow = x + (ulong)(t0 + min(int(tid >> 2), ntv - 1)) * p.cols;
+    // a full tile inside the q or the k range (no bias) is stored straight from the accumulators
+    const bool full = ntv == MMA_BT && !p.hasBias;
+    const bool inQ = full && row0 + MMA_BR <= p.rows0;
+    const bool inK = full && row0 >= p.rows0 && row0 + MMA_BR <= p.rows0 + p.rows1;
+    device float *dst = inQ ? out0 + (ulong)t0 * p.rows0 + row0 : out1 + (ulong)t0 * p.rows1 + (row0 - p.rows0);
+    hm_core<QT>(rwq, rws, grow, nb, xrow, ntv, smem, inQ || inK, dst, (ulong)(inQ ? p.rows0 : p.rows1), false, tid, sg);
+    if (inQ || inK) return;
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, r = i % MMA_BR;
+        const int row = row0 + r;
+        if (t < ntv && row < total) {
+            float v = smem[t * MMA_BR + r];
+            if (row < p.rows0) {
+                if (p.hasBias) v += b0[row];
+                out0[(ulong)(t0 + t) * p.rows0 + row] = v;
+            } else if (row < p.rows0 + p.rows1) {
+                const int g = row - p.rows0;
+                if (p.hasBias) v += b1[g];
+                out1[(ulong)(t0 + t) * p.rows1 + g] = v;
+            } else {
+                const int g = row - p.rows0 - p.rows1;
+                if (p.hasBias) v += b2[g];
+                out2[(ulong)(t0 + t) * p.rows2 + g] = VT(v);
+            }
+        }
+    }
+}
+
+// Tile rows [0, 32) = gate units [unit0, unit0 + 32), rows [32, 64) = the matching up rows (as matmul_swiglu_mma).
+template <int QT>
+kernel void matmul_swiglu_hmma(device const uchar *wq [[buffer(0)]],
+                               device const float *ws [[buffer(1)]],
+                               device const float *x [[buffer(2)]],
+                               device float *out [[buffer(3)]],
+                               device const float *nw [[buffer(4)]],
+                               constant SwigluParams &p [[buffer(5)]],
+                               uint2 tgp [[threadgroup_position_in_grid]],
+                               ushort tid [[thread_index_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[HM_SMEM];
+    const int unit0 = int(tgp.x) * (MMA_BR / 2);
+    const int t0 = int(tgp.y) * MMA_BT;
+    const int ntv = min(MMA_BT, p.ntok - t0);
+    const int nb = p.cols / QK;
+    const int lr = tid >> 1;
+    const int unit = min(unit0 + (lr & 31), p.hidden - 1);
+    device const uchar *rwq = (QT >= GG_FIRST && lr >= 32) ? (device const uchar *)ws : wq;
+    const ulong grow = (ulong)((lr < 32 || QT >= GG_FIRST) ? unit : p.hidden + unit);
+    device const float *xrow = x + (ulong)(t0 + min(int(tid >> 2), ntv - 1)) * p.cols;
+    hm_core<QT>(rwq, ws, grow, nb, xrow, ntv, smem, false, out, 0, false, tid, sg);
+    for (int i = tid; i < (MMA_BR / 2) * MMA_BT; i += MM_THREADS) {
+        const int t = i / (MMA_BR / 2), j = i % (MMA_BR / 2);
+        if (t < ntv && unit0 + j < p.hidden) {
+            const float g = smem[t * MMA_BR + j];
+            const float u = smem[t * MMA_BR + 32 + j];
+            out[(ulong)(t0 + t) * p.hidden + unit0 + j] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+// moe_up_mma / moe_down_mma on the half-weight core: the same tiles of moe_sort, the same outputs.
+template <int QT>
+kernel void moe_up_hmma(device const uchar *wq [[buffer(0)]],
+                        device const float *ws [[buffer(1)]],
+                        device const float *x [[buffer(2)]],
+                        device const int *order [[buffer(3)]],
+                        device const int *tiles [[buffer(4)]],
+                        device float *out [[buffer(5)]],
+                        constant MoeParams &p [[buffer(6)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[HM_SMEM];
+    const int ti = int(tgp.y);
+    if (ti >= tiles[0]) return;
+    const int e = tiles[1 + 3 * ti];
+    const int start = tiles[2 + 3 * ti];
+    const int cnt = tiles[3 + 3 * ti];
+    const int m = p.rowsPerExpert / 2;
+    const int unit0 = int(tgp.x) * (MMA_BR / 2);
+    const int nb = p.cols / QK;
+    const int lr = tid >> 1;
+    const int unit = min(unit0 + (lr & 31), m - 1);
+    device const uchar *rwq = (QT >= GG_FIRST && lr >= 32) ? (device const uchar *)ws : wq;
+    const ulong grow = QT >= GG_FIRST ? (ulong)e * m + unit : (ulong)e * p.rowsPerExpert + (lr < 32 ? unit : m + unit);
+    const int slot = order[start + min(int(tid >> 2), cnt - 1)];
+    hm_core<QT>(rwq, ws, grow, nb, x + (ulong)(slot / p.topK) * p.cols, cnt, smem, false, out, 0, false, tid, sg);
+    for (int i = tid; i < (MMA_BR / 2) * MMA_BT; i += MM_THREADS) {
+        const int t = i / (MMA_BR / 2), j = i % (MMA_BR / 2);
+        if (t < cnt && unit0 + j < m) {
+            const float g = smem[t * MMA_BR + j];
+            const float u = smem[t * MMA_BR + 32 + j];
+            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+        }
+    }
+}
+
+template <int QT>
+kernel void moe_down_hmma(device const uchar *wq [[buffer(0)]],
+                          device const float *ws [[buffer(1)]],
+                          device const float *h [[buffer(2)]],
+                          device const int *order [[buffer(3)]],
+                          device const int *tiles [[buffer(4)]],
+                          device const float *rw [[buffer(5)]],
+                          device float *ys [[buffer(6)]],
+                          constant MoeParams &p [[buffer(7)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[HM_SMEM];
+    const int ti = int(tgp.y);
+    if (ti >= tiles[0]) return;
+    const int e = tiles[1 + 3 * ti];
+    const int start = tiles[2 + 3 * ti];
+    const int cnt = tiles[3 + 3 * ti];
+    const int row0 = int(tgp.x) * MMA_BR;
+    const int nb = p.cols / QK;
+    const int row = min(row0 + int(tid >> 1), p.rowsPerExpert - 1);
+    const int slot = order[start + min(int(tid >> 2), cnt - 1)];
+    hm_core<QT>(wq, ws, (ulong)e * p.rowsPerExpert + row, nb, h + (ulong)slot * p.cols, cnt, smem, false, ys, 0, false,
+                tid, sg);
+    for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
+        const int t = i / MMA_BR, j = i % MMA_BR;
+        if (t < cnt && row0 + j < p.rowsPerExpert) {
+            const int s = order[start + t];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * smem[t * MMA_BR + j];
+        }
+    }
+}
+
+typedef decltype(matmul_hmma<4>) matmul_hmma_t;
+typedef decltype(matmul3_hmma<4, float>) matmul3_hmma_t;
+typedef decltype(matmul3_hmma<4, half>) matmul3_hmma_h_t;
+typedef decltype(matmul_swiglu_hmma<4>) matmul_swiglu_hmma_t;
+typedef decltype(moe_up_hmma<4>) moe_up_hmma_t;
+typedef decltype(moe_down_hmma<4>) moe_down_hmma_t;
+#define HM_INSTANTIATE(SUF, QTV)                                                                                  \
+    template [[host_name("matmul_hmma_" SUF)]] kernel matmul_hmma_t matmul_hmma<QTV>;                             \
+    template [[host_name("matmul3_hmma_" SUF)]] kernel matmul3_hmma_t matmul3_hmma<QTV, float>;                   \
+    template [[host_name("matmul3_hmma_" SUF "_h")]] kernel matmul3_hmma_h_t matmul3_hmma<QTV, half>;             \
+    template [[host_name("matmul_swiglu_hmma_" SUF)]] kernel matmul_swiglu_hmma_t matmul_swiglu_hmma<QTV>;       \
+    template [[host_name("moe_up_hmma_" SUF)]] kernel moe_up_hmma_t moe_up_hmma<QTV>;                             \
+    template [[host_name("moe_down_hmma_" SUF)]] kernel moe_down_hmma_t moe_down_hmma<QTV>;
+HM_INSTANTIATE("q4", 4)
+HM_INSTANTIATE("q8", 8)
+HM_INSTANTIATE("q2k", 2)
+HM_INSTANTIATE("q6k", 6)
+HM_INSTANTIATE("q4g", GG_Q4_0)
+HM_INSTANTIATE("q8g", GG_Q8_0)
+HM_INSTANTIATE("q4k", GG_Q4_K)
+HM_INSTANTIATE("q5k", GG_Q5_K)
+
+// ---------------------------------------------------------------------------------------------- 13. flash prefill, second form
+// attention_fb<KV, ST, D>: the online-softmax prefill attention of attention_fa (same grid, parameters, masking and
+// math) with a different staging of the keys and values:
+//   - a block's K and V rows are staged together: one load pass and two barriers per block instead of two and four;
+//   - in ST = half for the f16 and q8 caches, which is exact (f16 values; int8 values, whose per-row scales are kept
+//     apart in kq / vq and applied once per key to the block's score column, s_ij * scale_j, and probability column,
+//     p_ij * scale_j, instead of to every staged element), and in f32 for the f32 cache: nothing is rounded that
+//     attention_fa keeps;
+//   - rows padded by 16 bytes (row stride LD = D + 16 / sizeof(ST)), so the 8 rows one simdgroup_load reads do not all
+//     start in the same threadgroup-memory bank, as they do with a stride of D (a multiple of 128 bytes);
+//   - BK = 8 KB / (D * sizeof(ST)) keys per block (32 at D = 128 with half staging, 16 with f32).
+// S = Q K^T and O += P V are f32 x ST multiply-accumulates into f32: P and the accumulators stay f32 (a half P would
+// round every probability to 11 bits, ~2.4e-4 relative, for no saving in the staged bytes).
+
+template <typename KV, typename ST, int D>
+kernel void attention_fb(device const float *q [[buffer(0)]],
+                         device const KV *kc [[buffer(1)]],
+                         device const KV *vc [[buffer(2)]],
+                         device float *out [[buffer(3)]],
+                         constant FlashParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int BK = 8192 / (D * int(sizeof(ST)));
+    constexpr int LD = D + 16 / int(sizeof(ST));
+    constexpr int NI = D / 8;
+    constexpr int NJ = BK / 8;
+    threadgroup ST ks[BK * LD];
+    threadgroup ST vs[BK * LD];
+    threadgroup float kq[BK];
+    threadgroup float vq[BK];
+    threadgroup float sb[FA_THREADS / 32][8 * BK];
+    threadgroup float st[FA_THREADS / 32][64];
+
+    const int h = int(tgp.x);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int t0 = int(tgp.y) * FA_ROWS;
+    const int r0 = t0 + int(sg) * 8;
+    const int tEnd = min(p.ntok, t0 + FA_ROWS);
+    const int firstKey = p.window > 0 ? max(0, p.pos0 + t0 + 1 - p.window) : 0;
+    const int lastKey = p.pos0 + tEnd;
+    device const KV *kb = kc + kvh * D;
+    device const KV *vb = vc + kvh * D;
+
+    simdgroup_float8x8 qm[NI];
+    for (int i = 0; i < NI; i++) {
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            st[sg][e] = t < p.ntok ? q[(ulong)t * p.qStride + h * D + i * 8 + e % 8] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(qm[i], &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_float8x8 om[NI];
+    for (int i = 0; i < NI; i++) om[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m[8];
+    float l[8];
+    for (int r = 0; r < 8; r++) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+    }
+
+    for (int k0 = firstKey / BK * BK; k0 < lastKey; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup); // the previous block's K and V are no longer read
+        for (int e = tid; e < BK * D; e += FA_THREADS) {
+            const int r = e / D;
+            const int c = e % D;
+            const int key = k0 + r;
+            const bool in = key < lastKey;
+            ks[r * LD + c] = in ? ST(kb[(ulong)key * p.kStride + c]) : ST(0.0f);
+            vs[r * LD + c] = in ? ST(vb[(ulong)key * p.kStride + c]) : ST(0.0f);
+        }
+        if (tid < BK) {
+            const int key = k0 + int(tid);
+            const bool in = key < lastKey;
+            kq[tid] = in ? kv_scale(kc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+            vq[tid] = in ? kv_scale(vc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_matrix<ST, 8, 8> kt;
+                simdgroup_load(kt, &ks[j * 8 * LD + i * 8], LD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qm[i], kt, s);
+            }
+            simdgroup_store(s, &sb[sg][j * 8], BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int r = 0; r < 8; r++) {
+            const int t = r0 + r;
+            const int len = p.pos0 + t + 1;
+            const int first = p.window > 0 ? max(0, len - p.window) : 0;
+            float mx = -INFINITY;
+            for (int c = lane; c < BK; c += 32) {
+                const int key = k0 + c;
+                float v = sb[sg][r * BK + c] * (p.scale * kq[c]);
+                if (p.softcap > 0.0f) v = softcap_f(v, p.softcap);
+                if (t >= p.ntok || key < first || key >= len) v = -INFINITY;
+                sb[sg][r * BK + c] = v;
+                mx = max(mx, v);
+            }
+            mx = simd_max(mx);
+            const float mNew = max(m[r], mx);
+            float sum = 0.0f;
+            for (int c = lane; c < BK; c += 32) {
+                const float e = mNew == -INFINITY ? 0.0f : exp(sb[sg][r * BK + c] - mNew);
+                sb[sg][r * BK + c] = e * vq[c];
+                sum += e;
+            }
+            sum = simd_sum(sum);
+            const float alpha = m[r] == -INFINITY ? 0.0f : exp(m[r] - mNew);
+            l[r] = l[r] * alpha + sum;
+            m[r] = mNew;
+            if (lane < 8) st[sg][r * 8 + lane] = int(lane) == r ? alpha : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dg;
+        simdgroup_load(dg, &st[sg][0], 8);
+        for (int i = 0; i < NI; i++) simdgroup_multiply(om[i], dg, om[i]);
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 pm;
+            simdgroup_load(pm, &sb[sg][j * 8], BK);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_matrix<ST, 8, 8> vm;
+                simdgroup_load(vm, &vs[j * 8 * LD + i * 8], LD);
+                simdgroup_multiply_accumulate(om[i], pm, vm, om[i]);
+            }
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        for (int r = 0; r < 8; r++) st[sg][r * 8 + lane] = int(lane) == r && l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, &st[sg][0], 8);
+    for (int i = 0; i < NI; i++) {
+        simdgroup_float8x8 o;
+        simdgroup_multiply(o, dg, om[i]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(o, &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            if (t < p.ntok) out[(ulong)t * p.oStride + h * D + i * 8 + e % 8] = st[sg][e];
+        }
+    }
+}
+
+#define FB_INSTANTIATE(D)                                                                                         \
+    template [[host_name("attention_fb_d" #D)]] kernel decltype(attention_fb<float, float, D>) attention_fb<float, float, D>; \
+    template [[host_name("attention_fb_d" #D "_h")]] kernel decltype(attention_fb<half, half, D>) attention_fb<half, half, D>; \
+    template [[host_name("attention_fb_d" #D "_q8")]] kernel decltype(attention_fb<char, half, D>) attention_fb<char, half, D>;
+FB_INSTANTIATE(64)
+FB_INSTANTIATE(128)
+FB_INSTANTIATE(256)
