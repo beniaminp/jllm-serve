@@ -270,6 +270,12 @@ final class MetalKernels implements AutoCloseable {
      */
     void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
                 int n, boolean acc, Metal.Buffer norm, float softcap) {
+        matmul(t, wbuf, in, inOff, out, outOff, n, acc, norm, softcap, null);
+    }
+
+    /** As above with a per-row {@code bias} (f32, {@code t.rows}) added to every product before it is stored or accumulated. */
+    void matmul(QTensor t, Metal.Buffer wbuf, Metal.Buffer in, long inOff, Metal.Buffer out, long outOff,
+                int n, boolean acc, Metal.Buffer norm, float softcap, Metal.Buffer bias) {
         if (norm != null && n != 1) {
             throw new IllegalArgumentException("fused rmsnorm needs a single token");
         }
@@ -281,16 +287,17 @@ final class MetalKernels implements AutoCloseable {
         bind(2, in, inOff);
         bind(3, out, outOff);
         bindOrDummy(4, norm);
-        p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);
+        bindOrDummy(5, bias);
+        p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap).i(bias != null);
         if (norm == null && useMma(n, t.type)) {
-            dispatch(kernel("matmul_mma", t.type, ""), 5, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+            dispatch(kernel("matmul_mma", t.type, ""), 6, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
-            dispatch(kernel("matmul_pf", t.type, ""), 5, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+            dispatch(kernel("matmul_pf", t.type, ""), 6, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n == 1) {
             int sgs = decodeThreads / 32;
-            dispatch(kernel("matmul", t.type, ""), 5, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
+            dispatch(kernel("matmul", t.type, ""), 6, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
         } else {
-            dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
+            dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 6, normTgMem(norm, t.cols),
                     rowGrid(t.rows), tokTiles(n), 1, MM_THREADS, 1, 1);
         }
     }

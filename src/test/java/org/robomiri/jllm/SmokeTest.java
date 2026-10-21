@@ -838,6 +838,25 @@ public final class SmokeTest {
             check(gqa(cfg(tmp, """
                     {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
                      "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":151936}"""), 0).qkNorm(), "qwen3 qk-norm");
+            // attention_bias: q/k/v and o_proj for Llama / Qwen3 / Gemma, q/k/v only for Qwen2 / GLM, refused for Mistral
+            String biased = """
+                    {"model_type":"%s","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":2,
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":64,"vocab_size":1000,"attention_bias":true}""";
+            for (String mt : new String[]{"llama", "qwen3", "gemma2", "gemma3_text"}) {
+                Architecture a = cfg(tmp, biased.formatted(mt));
+                check(gqa(a, 1).bias() && gqa(a, 1).outBias() && a.core().description().contains(" bias obias"),
+                        mt + " attention_bias: q/k/v and o_proj biases: " + a.core().description());
+            }
+            check(!gqa(cfg(tmp, biased.formatted("llama").replace("true", "false")), 0).outBias()
+                    && !gqa(q2, 0).outBias() && gqa(cfg(tmp, biased.formatted("glm")), 0).bias()
+                    && !gqa(cfg(tmp, biased.formatted("glm")), 0).outBias(), "no o_proj bias for qwen2 / glm or without the key");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, biased.formatted("mistral"));
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "attention_bias", "mistral attention_bias rejected");
             expectIae(() -> {
                 try {
                     cfg(tmp, "{\"model_type\":\"mistral\",\"hidden_size\":32,\"intermediate_size\":37,\"num_hidden_layers\":2,"
@@ -1372,7 +1391,7 @@ public final class SmokeTest {
      * i >= 23 are divided by 40, in between ramp = (i - 10) / 13 blends: i = 16 gives
      * 0.00025 * 6/13 + 0.01 * 7/13 = 0.0055.
      */
-    static void yarnRope() {
+    static void yarnRope() throws Exception {
         double[] f = Rope.yarnInvFreq(64, 1e4, 40, 4096, 32, 1);
         check(f.length == 32 && f[0] == 1.0, "yarn keeps the fastest pair");
         check(Math.abs(f[5] - Math.pow(1e4, -5.0 / 32)) < 1e-15 && Math.abs(f[10] - 0.056234132519034905) < 1e-15,
@@ -1394,6 +1413,53 @@ public final class SmokeTest {
         double m = 1.3688879454113936 / 1.2608037774058554;
         check(Math.abs(r2.cos[0] - m) < 1e-6 && Math.abs(r2.sin[32 + 16] - Math.sin(0.0055) * m) < 1e-6,
                 "yarn table scaled by mscale / mscale_all_dim");
+        check(Rope.amplitude(new Scaling.Yarn(40, 4096, 32, 1, 1.0, 0.707, 1.5)) == 1.5, "yarn attention_factor override");
+
+        // rope_scaling yarn in a Qwen3 config.json (the long-context recipe: factor 4 over 32768): the same
+        // frequencies as the DeepSeek path for the same parameters, the paper's amplitude 0.1 ln 4 + 1
+        Path tmp = Files.createTempDirectory("jllm-yarn");
+        try {
+            String base = """
+                    {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":2,
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":1000,
+                     "rope_theta":1000000,"max_position_embeddings":40960,"rope_scaling":%s}""";
+            Architecture q = cfg(tmp, base.formatted(
+                    "{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768}"));
+            RopeTable t = rope(q);
+            check(t.scaling() instanceof Scaling.Yarn y && y.factor() == 4 && y.originalMaxPositions() == 32768
+                    && y.betaFast() == 32 && y.betaSlow() == 1 && q.core().description().endsWith(" rope=yarnx4.0"),
+                    "qwen3 yarn config: " + t.scaling() + " / " + q.core().description());
+            check(Arrays.equals(Rope.invFreq(t, 40960), Rope.yarnInvFreq(128, 1e6, 4, 32768, 32, 1))
+                            && Arrays.equals(Rope.invFreq(t, 40960),
+                            Rope.invFreq(128, 1e6, new Scaling.Yarn(4, 32768, 32, 1, 1, 0), 40960)),
+                    "qwen3 yarn frequencies equal the DeepSeek path's");
+            double amp = 0.1 * Math.log(4) + 1;
+            check(Math.abs(Rope.amplitude(t.scaling()) - amp) < 1e-15
+                            && Rope.amplitude(t.scaling()) == Rope.amplitude(new Scaling.Yarn(4, 32768, 32, 1, 1, 0)),
+                    "qwen3 yarn amplitude 0.1 ln(factor) + 1 = " + Rope.amplitude(t.scaling()));
+            Rope r3 = new Rope(t, 3);
+            check(Math.abs(r3.cos[0] - amp) < 1e-6 && Math.abs(r3.sin[2 * 64 + 63] - Math.sin(2 * Rope.invFreq(t, 3)[63]) * amp) < 1e-6,
+                    "qwen3 yarn table scaled by the amplitude");
+            // attention_factor / mscale pair / missing original length (falls back to max_position_embeddings)
+            Scaling a = rope(cfg(tmp, base.formatted("{\"type\":\"yarn\",\"factor\":2.0,\"attention_factor\":1.25}"))).scaling();
+            check(a instanceof Scaling.Yarn y && y.originalMaxPositions() == 40960 && Rope.amplitude(a) == 1.25,
+                    "yarn attention_factor and default original length: " + a);
+            Scaling ms = rope(cfg(tmp, base.formatted(
+                    "{\"type\":\"yarn\",\"factor\":40,\"mscale\":1.0,\"mscale_all_dim\":0.707,\"beta_fast\":16}"))).scaling();
+            check(ms instanceof Scaling.Yarn y && y.betaFast() == 16 && Math.abs(Rope.amplitude(ms) - m) < 1e-12,
+                    "yarn mscale / mscale_all_dim: " + ms);
+            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}", "{\"type\":\"yarn\",\"factor\":4,\"truncate\":false}"}) {
+                try {
+                    cfg(tmp, base.formatted(bad));
+                    check(false, "rejected yarn config " + bad);
+                } catch (IllegalArgumentException e) {
+                    check(e.getMessage().contains("yarn"), "rejected yarn config: " + e.getMessage());
+                }
+            }
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
     }
 
     /** The three DeepSeek routing rules on hand-made score matrices. */
@@ -1530,9 +1596,13 @@ public final class SmokeTest {
                             .equals("<｜begin▁of▁sentence｜>Be brief.\n\nUser: Hi\n\nAssistant: Hello<｜end▁of▁sentence｜>"
                                     + "User: Bye\n\nAssistant:"), "deepseek-v2 chat template");
             check(ChatTemplate.forModelType("deepseek_v3").name().equals("deepseek-r1"), "deepseek_v3 uses the V3/R1 template");
-            // an FP8 checkpoint (V3 / R1 as published) is refused up front with an explanation
+            // the FP8 block of V3 / R1 as published (QuantFormatsTest converts FP8 checkpoints end to end); weight_scale_inv
+            // tensors under another quant_method are refused up front
+            org.robomiri.jllm.model.Fp8Quant fq = org.robomiri.jllm.model.Fp8Quant.read(tmp);
+            check(fq.blockRows == 128 && fq.blockCols == 128, "deepseek-v3 FP8 weight_block_size [128, 128]");
             Path fp8 = Files.createTempDirectory("jllm-fp8");
             try {
+                Files.writeString(fp8.resolve("config.json"), "{\"quantization_config\":{\"quant_method\":\"gptq\"}}");
                 Files.writeString(fp8.resolve("model.safetensors.index.json"),
                         "{\"weight_map\":{\"model.embed_tokens.weight\":\"a.safetensors\","
                                 + "\"model.layers.0.self_attn.q_a_proj.weight\":\"a.safetensors\","
@@ -1540,11 +1610,12 @@ public final class SmokeTest {
                 try {
                     org.robomiri.jllm.model.ModelConverter.convert(fp8, v3, org.robomiri.jllm.model.QType.Q4_0,
                             org.robomiri.jllm.model.ShardProvider.local(fp8));
-                    check(false, "fp8 checkpoint must be refused");
+                    check(false, "weight_scale_inv with quant_method gptq must be refused");
                 } catch (java.io.IOException e) {
-                    check(e.getMessage().contains("FP8"), "fp8 checkpoint refused: " + e.getMessage());
+                    check(e.getMessage().contains("gptq"), "weight_scale_inv with another quant_method refused: " + e.getMessage());
                 }
             } finally {
+                Files.deleteIfExists(fp8.resolve("config.json"));
                 Files.deleteIfExists(fp8.resolve("model.safetensors.index.json"));
                 Files.deleteIfExists(fp8);
             }

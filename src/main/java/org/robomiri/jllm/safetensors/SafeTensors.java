@@ -30,7 +30,11 @@ import java.util.stream.Stream;
 public final class SafeTensors implements AutoCloseable {
 
     public enum DType {
-        F64(8), F32(4), F16(2), BF16(2), I64(8), I32(4), I16(2), I8(1), U64(8), U32(4), U16(2), U8(1), BOOL(1);
+        F64(8), F32(4), F16(2), BF16(2), I64(8), I32(4), I16(2), I8(1), U64(8), U32(4), U16(2), U8(1), BOOL(1),
+        /** OCP FP8 {@code float8_e4m3fn}: 1 sign, 4 exponent (bias 7), 3 mantissa bits, no infinities, NaN = S.1111.111. */
+        F8_E4M3(1),
+        /** OCP FP8 {@code float8_e5m2}: the upper byte of an IEEE half (bias 15, 2 mantissa bits, with inf and NaN). */
+        F8_E5M2(1);
 
         public final int bytes;
 
@@ -42,6 +46,37 @@ public final class SafeTensors implements AutoCloseable {
     private static final ValueLayout.OfShort SHORT_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfFloat FLOAT_LE = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfDouble DOUBLE_LE = ValueLayout.JAVA_DOUBLE_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    /** The 256 values of {@link DType#F8_E4M3} and of {@link DType#F8_E5M2}, indexed by the unsigned byte. */
+    private static final float[] E4M3 = new float[256];
+    private static final float[] E5M2 = new float[256];
+
+    static {
+        for (int b = 0; b < 256; b++) {
+            int exp = (b >>> 3) & 0xF;
+            int man = b & 7;
+            float v;
+            if (exp == 0xF && man == 7) {
+                v = Float.NaN;
+            } else if (exp == 0) {
+                v = Math.scalb((float) man, -9);             // subnormal: man/8 * 2^(1-7)
+            } else {
+                v = Math.scalb((float) (8 + man), exp - 10); // (1 + man/8) * 2^(exp-7)
+            }
+            E4M3[b] = (b & 0x80) != 0 ? -v : v;
+            E5M2[b] = Float.float16ToFloat((short) (b << 8));
+        }
+    }
+
+    /** The exact value of an FP8 E4M3 ({@code float8_e4m3fn}) byte. */
+    public static float e4m3ToFloat(int b) {
+        return E4M3[b & 0xFF];
+    }
+
+    /** The exact value of an FP8 E5M2 byte (the upper half of a float16). */
+    public static float e5m2ToFloat(int b) {
+        return E5M2[b & 0xFF];
+    }
 
     /**
      * A tensor view over mapped file memory, or a computed tensor ({@code reader} != null: its floats are produced by
@@ -97,6 +132,14 @@ public final class SafeTensors implements AutoCloseable {
                         dst[dstOff + i] = Float.float16ToFloat(s[i]);
                     }
                 }
+                case F8_E4M3, F8_E5M2 -> {
+                    byte[] b = byteScratch(n);
+                    MemorySegment.copy(data, ValueLayout.JAVA_BYTE, start, b, 0, n);
+                    float[] table = dtype == DType.F8_E4M3 ? E4M3 : E5M2;
+                    for (int i = 0; i < n; i++) {
+                        dst[dstOff + i] = table[b[i] & 0xFF];
+                    }
+                }
                 case F64 -> {
                     double[] d = new double[n];
                     MemorySegment.copy(data, DOUBLE_LE, start * 8, d, 0, n);
@@ -109,6 +152,16 @@ public final class SafeTensors implements AutoCloseable {
         }
 
         private static final ThreadLocal<short[]> SHORT_SCRATCH = ThreadLocal.withInitial(() -> new short[0]);
+        private static final ThreadLocal<byte[]> BYTE_SCRATCH = ThreadLocal.withInitial(() -> new byte[0]);
+
+        private static byte[] byteScratch(int n) {
+            byte[] b = BYTE_SCRATCH.get();
+            if (b.length < n) {
+                b = new byte[Math.max(n, 4096)];
+                BYTE_SCRATCH.set(b);
+            }
+            return b;
+        }
 
         private static short[] shortScratch(int n) {
             short[] s = SHORT_SCRATCH.get();

@@ -133,6 +133,7 @@ Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 heads=16/8 headDim=128 vocab=151936
 | `rope.freq_base` | `rope_theta` |
 | `rope.dimension_count` (when smaller than the head) | `partial_rotary_factor` |
 | `rope.scaling.type = linear`, `rope.scaling.factor` | `rope_scaling` linear |
+| `rope.scaling.type = yarn`, `rope.scaling.factor`, `original_context_length`, `yarn_beta_fast`, `yarn_beta_slow`, `attn_factor` | `rope_scaling` yarn: `factor`, `original_max_position_embeddings`, `beta_fast`, `beta_slow`, `attention_factor = attn_factor · (0.1 ln factor + 1)` (below) |
 | tensor `rope_freqs.weight` (Llama 3.x) | `rope_scaling` llama3 when the table is the Llama 3 one, else a longrope table |
 | `context_length` | `max_position_embeddings` |
 | `expert_count`, `expert_used_count`, `expert_feed_forward_length` | `num_experts`, `num_experts_per_tok`, `moe_intermediate_size` |
@@ -140,10 +141,42 @@ Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 heads=16/8 headDim=128 vocab=151936
 | absence of `output.weight` | `tie_word_embeddings = true` |
 | `tokenizer.ggml.bos_token_id`, `eos_token_id`, `eot_token_id` | `bos_token_id`, `eos_token_id` |
 
-`yarn` rope scaling, per-layer head counts and every other architecture are refused with a message that names
-them. The model's chat template is the engine's own for the family ([04](04-tokenizer.md)); the Jinja string in
+Per-layer head counts, other rope scaling types (and DeepSeek's `rope.scaling.yarn_log_multiplier`) and every other
+architecture are refused with a message that names them. The model's chat template is the engine's own for the family ([04](04-tokenizer.md)); the Jinja string in
 `tokenizer.chat_template` is ignored, but a warning is printed when it lacks the family's marker
 (`<|im_start|>` for Qwen, `<|start_header_id|>` for Llama 3).
+
+### 16.2.1 YaRN (long-context Qwen GGUFs)
+
+🧸 A model learned to count positions up to 32 768. To read four times further, YaRN slows down only the slow
+"clock hands" of the position code (the ones that never went all the way round during training) by 4 and leaves the
+fast hands alone, then turns the volume of every clock up a little so attention stays as sharp as before.
+
+📐 llama.cpp's converter writes a config's `rope_scaling: {"rope_type": "yarn", "factor": s,
+"original_max_position_embeddings": L}` as `<arch>.rope.scaling.type = "yarn"`, `rope.scaling.factor = s`,
+`rope.scaling.original_context_length = L` (plus `yarn_beta_fast` / `yarn_beta_slow` when the config sets the betas,
+defaults 32 / 1). `GgufArchitecture` maps them back to that `rope_scaling` map, so the GGUF and the safetensors loads
+go through the same `Families.yarn` → `Scaling.Yarn` → `Rope.yarnInvFreq` (14.11.2):
+
+```
+f_i       = θ^(-2i/d)                                  i = 0 … d/2 − 1, d = rotary dims
+dim(β)    = d · ln(L / (β · 2π)) / (2 ln θ)
+low, high = max(floor(dim(beta_fast)), 0), min(ceil(dim(beta_slow)), d − 1)
+ramp(i)   = clamp((i − low) / (high − low), 0, 1)
+inv_freq  = f_i / s · ramp(i) + f_i · (1 − ramp(i))
+cos, sin *= attention_factor = attn_factor · (0.1 · ln s + 1)
+```
+
+The amplitude: ggml's `rope_yarn` multiplies cos and sin by `attn_factor · (1 + 0.1 ln(1/freq_scale))` with
+`freq_scale = 1/s`, so a file's `rope.scaling.attn_factor` (default 1) is a multiplier *on top of* the paper's
+`0.1 ln s + 1`, while transformers' `attention_factor` *replaces* it; the mapping above makes the two the same number.
+Example, Qwen3 with `s = 4`, `L = 32768`, `θ = 10^6`, `d = 128`: `dim(32) = 128 · ln(32768/(32·2π)) / (2 ln 10^6)
+= 23.60`, so `low = 23`; `dim(1) = 39.65`, so `high = 40`. Pairs 0 – 23 keep their frequency, pairs 40 – 63 are
+divided by 4, pairs 24 – 39 blend linearly; `attention_factor = 0.1 · ln 4 + 1 = 1.1386`.
+
+`GgufModelTest` writes tiny `qwen3` and `llama` models with `rope_scaling` yarn (factor 4 over 64 positions, betas
+16 / 2, attention factor 1.2) as safetensors and as GGUF with those keys, and requires identical inverse frequencies,
+the same amplitude (to the f32 rounding of `attn_factor`) and the same logits (3.5e-7 relative for the F32 file).
 
 ---
 
@@ -433,8 +466,8 @@ the load is dominated by the tokenizer.
 * **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe` only. Gemma 2/3, Phi-3, GLM-4, DeepSeek-2 and Mamba are
   supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are not mapped yet.
 * **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.
-* **RoPE**: `yarn` scaling (long-context Qwen3 GGUFs) is not implemented; `linear`, Llama 3 and a longrope-style
-  table are.
+* **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
+  variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
   (Qwen2-MoE, DeepSeek) are not mapped.
 * **Tokenizer**: pre-tokenizers other than `qwen2`, `llama-bpe`, `gpt-2` need the original repository's

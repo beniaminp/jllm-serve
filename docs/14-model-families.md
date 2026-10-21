@@ -21,18 +21,18 @@ means the value comes from `config.json`; defaults are those of the family's tra
 
 | `model_type` | Architecture class | q/k/v bias | QK-norm | Sliding window | RoPE (pairing; scaling) | Norms | MLP | BOS (from the tokenizer) | Tied head | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `llama` | `LlamaForCausalLM` | no | no | none | `HALF`; `rope_scaling` `llama3` (3.1+), `linear` | `PRE` | dense SiLU | yes | config (default false) | |
+| `llama` | `LlamaForCausalLM` | `attention_bias` (default false; also `o_proj`) | no | none | `HALF`; `rope_scaling` `llama3` (3.1+), `linear` | `PRE` | dense SiLU | yes | config (default false) | |
 | `mistral` | `MistralForCausalLM` | no | no | `sliding_window` on every layer (null in v0.3) | `HALF`; none | `PRE` | dense SiLU | yes | config (false) | |
 | `qwen2` | `Qwen2ForCausalLM` | **always** (the key is absent) | no | layers ≥ `max_window_layers`, only if `use_sliding_window` | `HALF`; none | `PRE` | dense SiLU | no (R1-Distill-Qwen: yes) | config | |
-| `qwen3` | `Qwen3ForCausalLM` | no | **yes** | same rule as `qwen2` | `HALF`; none | `PRE` | dense SiLU | no | config | |
-| `qwen3_moe` | `Qwen3MoeForCausalLM` | no | yes | same rule as `qwen2` | `HALF`; none | `PRE` | MoE, `Router.Softmax`, `norm_topk_prob` from config; dense in `mlp_only_layers` and off the `decoder_sparse_step` grid | no | config | chapter 12 |
+| `qwen3` | `Qwen3ForCausalLM` | as `llama` | **yes** | same rule as `qwen2` | `HALF`; none | `PRE` | dense SiLU | no | config | |
+| `qwen3_moe` | `Qwen3MoeForCausalLM` | as `llama` | yes | same rule as `qwen2` | `HALF`; none | `PRE` | MoE, `Router.Softmax`, `norm_topk_prob` from config; dense in `mlp_only_layers` and off the `decoder_sparse_step` grid | no | config | chapter 12 |
 | `glm` | `GlmForCausalLM` | `attention_bias`, **default true** | no | none | `INTERLEAVED`, `partial_rotary_factor` default 0.5 | `PRE` | dense SiLU, fused `gate_up_proj` | no (`[gMASK]<sop>`) | config | eps default 1.5625e-7; 14.8 |
 | `glm4` | `Glm4ForCausalLM` | as `glm` | no | none | as `glm` | `SANDWICH_GLM4` (4 norms) | dense SiLU, fused `gate_up_proj` | no | config | 14.8 |
 | `phi3` | `Phi3ForCausalLM` | no | no | `sliding_window` on every layer | `HALF`; `longrope` (short/long factors), `partial_rotary_factor` | `PRE` | dense SiLU; fused `qkv_proj`, `gate_up_proj` | no | config | eps default 1e-5; 14.9 |
-| `gemma2` | `Gemma2ForCausalLM` | no | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
-| `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | no | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
+| `gemma2` | `Gemma2ForCausalLM` | as `llama` | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
+| `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | as `llama` | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | rejected | no | none | MLA rotary slice `INTERLEAVED`, `yarn` | `PRE` | dense for the first `first_k_dense_replace` layers, then MoE + shared experts; `Router.DeepSeek` softmax, `greedy` / `group_limited_greedy` | yes | config (false) | MLA latent KV cache; 14.11 |
-| `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints refused (14.11.7) |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints dequantized by the converter (14.11.7) |
 | `mamba` | `MambaForCausalLM` | n/a | n/a | n/a (no attention) | none (no positions) | one RMSNorm per block | no MLP: conv + selective scan mixer | no | default true | `MambaArch`; chapter 15 |
 
 Reading the table: *Norms* are the `LayerSpec.Norms` value of 14.12 (`PRE` = `input_layernorm` + `post_attention_layernorm`
@@ -55,13 +55,13 @@ The checkpoints each row was verified against:
 | `gemma2` | Gemma 2 2B / 9B / 27B (14.10) | `unsloth/gemma-2-2b-it` (mirror of the gated `google/gemma-2-2b-it`) |
 | `gemma3_text` | Gemma 3 1B / 4B / 12B / 27B (14.10) | `unsloth/gemma-3-1b-it`, `unsloth/gemma-3-4b-it` |
 | `deepseek_v2` | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct (14.11) | config, safetensors header and `modeling_deepseek.py` on the Hub; tiny random models |
-| `deepseek_v3` | DeepSeek-V3 / R1 (**not loadable**, 14.11.7) | config and header only; tiny random models |
+| `deepseek_v3` | DeepSeek-V3 / R1 (FP8 or bf16; too large to run here, 14.11.7) | config and header only; tiny random models |
 | `mamba` | `state-spaces/mamba-130m-hf` … `mamba-2.8b-hf` | chapter 15 |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
-`gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` outside `qwen2` and `glm` (it would also add an `o_proj`
-bias), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope` (`su` is the legacy spelling of
-`longrope`) is rejected at load time with a message naming the field; `yarn` is accepted for the DeepSeek families only.
+`gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` for `mistral`, `phi3` or DeepSeek (transformers ignores
+it for the first two; DeepSeek would also bias `q_a_proj` / `kv_a_proj_with_mqa`), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope`/`yarn` (`su` is the legacy spelling of
+`longrope`; `yarn` follows 14.11.2 in every family) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
 quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 256
@@ -71,7 +71,7 @@ quantization block), and the Metal backend additionally needs `head_dim` to be a
 
 | Feature | Llama 3.x | Mistral | Qwen2 / 2.5 | Qwen3 |
 |---|---|---|---|---|
-| q/k/v bias (`attention_bias`) | no | no | **yes** (always, even though the key is absent) | no |
+| q/k/v bias (`attention_bias`) | no (q/k/v/o if set) | no | **yes** (always, even though the key is absent; no `o_proj` bias) | no (q/k/v/o if set) |
 | per-head q/k RMSNorm | no | no | no | **yes** |
 | sliding window | no | `sliding_window` (null in v0.3), all layers | only if `use_sliding_window`, layers ≥ `max_window_layers` | same rule as Qwen2 |
 | RoPE scaling | `llama3` (3.1+) | none | none | none |
@@ -84,10 +84,27 @@ quantization block), and the Metal backend additionally needs `head_dim` to be a
 How each is implemented:
 
 - **Bias.** `Attention.Gqa.bias` is true for `qwen2` (always) and for `glm` / `glm4` (`attention_bias`, default true);
-  every other family rejects `attention_bias: true`, because transformers would then also add an `o_proj` bias, which
-  is not implemented. The converter stores `self_attn.{q,k,v}_proj.bias` as f32 (they are tiny); the backends add
-  them right after the q/k/v matmuls and *before* RoPE. CPU: `addBias`, a loop over the freshly written rows; Metal:
-  the bias is an epilogue argument of the fused `matmul3` kernel that projects q, k and v, so it costs no dispatch.
+  the converter stores `self_attn.{q,k,v}_proj.bias` as f32 (they are tiny); the backends add them right after the
+  q/k/v matmuls and *before* RoPE. CPU: `addBias`, a loop over the freshly written rows; Metal: the bias is an
+  epilogue argument of the fused `matmul3` kernel that projects q, k and v, so it costs no dispatch.
+- **`o_proj` bias.** In transformers' Llama, Qwen3 (and Qwen3-MoE) and Gemma 2 / 3 attention one flag,
+  `attention_bias`, biases all four projections; Qwen2 and GLM hard-code `o_proj` without one. So for `llama`, `qwen3`
+  and `gemma` (`Draft.Bias.CONFIG_QKVO`) `attention_bias: true` sets both `Attention.Gqa.bias` and `outBias`, the
+  converter also keeps `self_attn.o_proj.bias [dim]` as f32 (`DecoderLayer.bo`), and the description gains `obias`.
+  The bias belongs to the projection, so it is added *before* the residual add and, for Gemma's sandwich norms,
+  before the post-attention norm:
+
+  ```
+  plain:      x = x + (W_o · att + b_o)
+  sandwich:   x = x + rmsnorm(W_o · att + b_o) · g_post
+  ```
+
+  CPU (`CpuBackend.addPlain` / `addPostNormed`): with a bias the product is staged in `xb` and `x[t, i] += xb[t, i] +
+  b_o[i]`, or `b_o` is added to `xb` before `addNormed`. Metal: `MatmulParams.hasBias` and a bias buffer (index 5) in
+  `matmul`, `matmul_pf` and `matmul_mma`, added in the epilogue (`v + b`, then accumulated into `x` or stored for
+  `rmsnorm_add`), so it costs no dispatch either. The MLA layers share this code (`DecoderLayer.bo`), but DeepSeek keeps
+  rejecting `attention_bias`. Checked by the `LlamaBias` and `Gemma2Bias` tiny models of the arch smoke (CPU == Metal,
+  14.7) and `SmokeTest.modelConfigs`.
 - **QK-norm.** `Attention.Gqa.qkNorm` is true for `qwen3` / `qwen3_moe` and `gemma3_text`; `ModelWeights` checks that
   the `q_norm`/`k_norm` tensors exist exactly when it is set. The norm is applied per head right before RoPE (on Metal
   inside the `rope` kernel, so the same dispatch).
@@ -202,9 +219,8 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
   `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
-- `yarn` outside the DeepSeek families (14.11.2), `dynamic` RoPE scaling; FP8 checkpoints (14.11.7); `hidden_act`
-  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; an `o_proj`
-  bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
+- `dynamic` RoPE scaling, YaRN with `truncate: false`; `hidden_act`
+  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
   vocabularies with byte fallback. That is the tokenizer's job (chapter 4), not the model's.
 - Hub test checkpoints: `hf-internal-testing/tiny-random-LlamaForCausalLM` has `hidden_size = 16`, which is not a
@@ -228,10 +244,10 @@ deterministic, so any disagreement is a bug in a backend. The models:
 
 | family | tiny models (what each isolates) |
 |---|---|
-| Llama / Mistral / Qwen2 | plain Llama (GQA, untied head); Llama 3 `rope_scaling` (MHA, tied); Mistral with `sliding_window = 4`; Qwen2 with bias and a window on layers ≥ 2 |
+| Llama / Mistral / Qwen2 | plain Llama (GQA, untied head); Llama 3 `rope_scaling` (MHA, tied); Llama with `attention_bias` (q/k/v and `o_proj` biases); Mistral with `sliding_window = 4`; Qwen2 with bias and a window on layers ≥ 2 |
 | GLM (14.8) | `glm` (bias, `head_dim` 32, factor 0.5); `glmedge` (`head_dim` 64, factor 1.0, no bias, tied); `glm4` (four norms) |
 | Phi-3 (14.9) | fused weights + longrope long factors + partial rotary + window; the same with short factors and tied embeddings; `head_dim` 64 MHA with plain RoPE |
-| Gemma (14.10) | Gemma 2 (`head_dim` 64, cap 1.0 so that it matters on random weights, final cap 30, local layers 0 and 2 with window 6); Gemma 3 text (q/k norm, 5 local + 1 global, linear ×8 global and 10 000-base local RoPE); the multimodal wrapper layout; `head_dim` 256 variants of both |
+| Gemma (14.10) | Gemma 2 (`head_dim` 64, cap 1.0 so that it matters on random weights, final cap 30, local layers 0 and 2 with window 6); Gemma 3 text (q/k norm, 5 local + 1 global, linear ×8 global and 10 000-base local RoPE); the multimodal wrapper layout; `head_dim` 256 variants of both; Gemma 2 with `attention_bias` (the `o_proj` bias before the post-attention norm) |
 | DeepSeek (14.11) | `deepseek_v2` (`q_lora_rank` null, group-limited routing, 2 shared experts), `deepseek_v2q` (q LoRA, `norm_topk_prob`, scaling 2.5), `deepseek_v3` (sigmoid, `noaux_tc`) |
 | Mamba (chapter 15) | `mamba` (d_model 64, tied head) and `mamba3` (d_model 128, state 8, conv 3, untied head), plus chunking-invariance and state checks |
 
@@ -567,7 +583,7 @@ caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU ==
 
 Images (the vision tower and projector are skipped, so Gemma 3 4B+ is text-only);
 the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
-configs above were read), no real weights were run; `yarn` and `dynamic` RoPE scaling; Gemma 3n and
+configs above were read), no real weights were run; `dynamic` RoPE scaling; Gemma 3n and
 Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
@@ -580,7 +596,7 @@ Code: `Families.deepseek`, `model/Attention.Mla`, `model/Router.DeepSeek` + `mod
 | `model_type` | Architecture class | Examples | Weights |
 |---|---|---|---|
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | `deepseek-ai/DeepSeek-V2-Lite` (15.7 B, 27 layers), `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` | bf16, supported |
-| `deepseek_v3` | `DeepseekV3ForCausalLM` | `deepseek-ai/DeepSeek-V3`, `DeepSeek-R1` (671 B) | **FP8, not supported** (14.11.7) |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | `deepseek-ai/DeepSeek-V3`, `DeepSeek-R1` (671 B) | FP8, dequantized while converting (14.11.7) |
 
 The R1-*Distill* models are plain Qwen2/Llama checkpoints and were already supported (14.1).
 
@@ -706,6 +722,17 @@ Pairs 0 – 10 keep their frequency, pairs 23 – 31 are divided by 40, pairs 11
 Finally the cos/sin tables are multiplied by `yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)`
 (exactly 1 for V2-Lite and V3, where the two are equal). Rope types other than `yarn` / none are rejected for DeepSeek.
 
+**The other families** (Qwen2 / Qwen3 long context: `{"rope_type": "yarn", "factor": 4.0,
+"original_max_position_embeddings": 32768}`) use the same frequencies over their rotary dimensions (`Families.yarn`,
+transformers' `_compute_yarn_parameters`): `beta_fast` / `beta_slow` default to 32 / 1, the original length falls
+back to `max_position_embeddings`, and the cos/sin amplitude is `attention_factor` if given, else
+`yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)` when both are set, else
+`0.1 · ln(factor) + 1` (1.1386 for factor 4). One deliberate difference from transformers, which replaces `factor`
+by `max_position_embeddings / original_max_position_embeddings` when the latter is given: the map's `factor` is used,
+as llama.cpp, vLLM and the GGUF metadata do (Qwen's own recipe adds the map without raising
+`max_position_embeddings`, which would otherwise give 40960/32768 = 1.25 instead of 4). `SmokeTest.yarnRope` checks
+that a Qwen3 config gives exactly the DeepSeek frequencies for the same parameters and the expected amplitude.
+
 ### 14.11.3 Mixture of experts: dense prefix, routed + shared experts
 
 Layer `l` is MoE when `l ≥ first_k_dense_replace` and `l % moe_layer_freq == 0`, otherwise a dense SwiGLU MLP with
@@ -800,15 +827,15 @@ token** (f32; 574 MB at `--ctx 4096`), where the expanded per-head cache would h
 10 MB per token (40 GB at `--ctx 4096`); the dequantized `kv_b_proj` halves are 64 MB per layer, 4 GB in all. It cannot
 run on a 32 GB laptop (not even on 128 GB; the 1.37 TB FP8 download alone exceeds the disk).
 
-### 14.11.7 FP8 checkpoints (V3, R1) are not supported
+### 14.11.7 FP8 checkpoints (V3, R1)
 
 The published V3/R1 weights are block-quantized FP8: every large matrix is `F8_E4M3` (`float8_e4m3fn`) with a companion
-`<name>.weight_scale_inv` tensor of dtype F32 holding one inverse scale per 128 × 128 block (e.g. `q_a_proj.weight`
+`<name>.weight_scale_inv` tensor of dtype F32 holding one scale per 128 × 128 block (e.g. `q_a_proj.weight`
 `[1536, 7168]` has `weight_scale_inv` `[12, 56]`); `config.json` carries `quantization_config: {quant_method: fp8,
-weight_block_size: [128, 128]}`. `SafeTensors` has no FP8 dtype and the converter does not dequantize
-(`w = fp8_value · scale_inv[block]`). The converter refuses such a checkpoint up front with an explanatory error (any
-index containing `weight_scale_inv`). Supporting V3 needs an FP8 dequantization path in `ModelConverter` plus bf16
-re-uploads (e.g. a community bf16 conversion works as is), and a machine with more than 400 GB of memory to run it.
+weight_block_size: [128, 128]}`. The converter dequantizes them on the fly (`w = fp8_value · scale_inv[r/128][c/128]`,
+`model/Fp8Quant`, exact decoding in `SafeTensors`, see [03 §3.8](03-safetensors.md)) and writes the engine's own format,
+like any bf16 checkpoint; the embedding, head, norms and routers are bf16 in these files and read as they are. Running
+V3 still needs a machine with more than 400 GB of memory; the path is tested on tiny FP8 checkpoints (`QuantFormatsTest`).
 
 ### 14.11.8 Testing
 
@@ -825,7 +852,7 @@ on weights rounded to Q8_0 the same way the converter does: the largest differen
 (Without the rounding the engine is 1 – 6 % off, which is plain quantization noise: random weights with sharp attention
 are sensitive.) `mvn test` checks the YaRN frequencies against hand-computed values (14.11.2, `SmokeTest.yarnRope`), the
 routing rules on hand-made score matrices (14.11.4, `deepseekRouting`), the V2-Lite and V3 configs (`deepseekConfigs`),
-the V2 chat template and the FP8 refusal.
+the V2 chat template and V3's FP8 block size.
 
 ## 14.12 The typed model: `Architecture`
 

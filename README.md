@@ -8,12 +8,13 @@ module; the engine itself does not depend on it.
 Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`, `qwen3_moe`), **Qwen2 / 2.5**
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
-**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16 checkpoints only) and **Mamba** (`mamba`).
+**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting) and **Mamba** (`mamba`).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
 conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
 place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)). Apple **MLX** quantized checkpoints
-(`mlx-community/*-4bit`, `-8bit`) are read too: dequantized once while converting ([docs/03 §3.7](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
+(`mlx-community/*-4bit`, `-8bit`, and the `mxfp4` / `mxfp8` modes) and block-quantized **FP8** checkpoints are read too:
+dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 
 | Piece | Where | Written from scratch |
 |---|---|---|

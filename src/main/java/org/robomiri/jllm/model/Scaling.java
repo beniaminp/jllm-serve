@@ -45,8 +45,19 @@ public sealed interface Scaling permits Scaling.None, Scaling.Linear, Scaling.Ll
         }
     }
 
-    /** DeepSeek YaRN: {@code mscale} / {@code mscaleAllDim} as in {@code modeling_deepseek.py}. */
+    /**
+     * YaRN: frequencies by {@link Rope#yarnInvFreq}; cos and sin multiplied by {@code attentionFactor} when it is
+     * positive, else by {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscaleAllDim)} as in
+     * {@code modeling_deepseek.py} (with {@code mscale} 1 and {@code mscaleAllDim} 0 that is the plain
+     * {@code 0.1 ln(factor) + 1} of the YaRN paper, which Qwen-style configs get).
+     */
     record Yarn(double factor, int originalMaxPositions, double betaFast, double betaSlow, double mscale,
-                double mscaleAllDim) implements Scaling {
+                double mscaleAllDim, double attentionFactor) implements Scaling {
+
+        /** DeepSeek's form: the amplitude derived from {@code mscale} / {@code mscaleAllDim}. */
+        public Yarn(double factor, int originalMaxPositions, double betaFast, double betaSlow, double mscale,
+                    double mscaleAllDim) {
+            this(factor, originalMaxPositions, betaFast, betaSlow, mscale, mscaleAllDim, 0);
+        }
     }
 }

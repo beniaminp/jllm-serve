@@ -95,8 +95,12 @@ final class Families {
 
     // ------------------------------------------------------------------ families
 
-    /** Llama 3.x: the reference decoder, every default of {@link Draft} is Llama's (rotate-half RoPE, llama3 scaling read generically). */
+    /**
+     * Llama 3.x: the reference decoder, every default of {@link Draft} is Llama's (rotate-half RoPE, llama3 scaling
+     * read generically); {@code attention_bias} biases q, k, v and o_proj, as in transformers' LlamaAttention.
+     */
     private static Decoder llama(Draft d) {
+        d.bias = Draft.Bias.CONFIG_QKVO;
         return ggufRope(d).build();
     }
 
@@ -120,8 +124,12 @@ final class Families {
         return d.build();
     }
 
-    /** Qwen3 dense and MoE: per-head q/k RMSNorm; the window rule of Qwen2 without the biases; MoE from {@code num_experts}. */
+    /**
+     * Qwen3 dense and MoE: per-head q/k RMSNorm; the window rule of Qwen2; no biases unless {@code attention_bias}
+     * (then q, k, v and o_proj); MoE from {@code num_experts}.
+     */
     private static Decoder qwen3(Draft d) {
+        d.bias = Draft.Bias.CONFIG_QKVO;
         d.qkNorm = true;
         d.window = Draft.Window.FROM_MAX_WINDOW_LAYERS;
         return d.build();
@@ -165,6 +173,7 @@ final class Families {
             throw new IllegalArgumentException("unsupported hidden_activation '" + ga + "': Gemma needs gelu_pytorch_tanh");
         }
         d.gemma = true;
+        d.bias = Draft.Bias.CONFIG_QKVO; // Gemma2/3Attention: q, k, v and o_proj all follow attention_bias
         d.act = Activation.GELU_TANH;
         d.norms = Norms.SANDWICH_GEMMA;
         d.normPlusOne = true;
@@ -352,12 +361,17 @@ final class Families {
 
         /** How {@code attention_bias} is read. */
         enum Bias {
-            /** Rejected when true: transformers would also add an o_proj bias, which is not implemented. */
+            /**
+             * Rejected when true: the family's transformers class does not read it (Mistral, Phi-3), or it would
+             * bias projections this engine does not model (DeepSeek's q_a / kv_a).
+             */
             REJECT,
-            /** Always present, whatever the config says (Qwen2). */
+            /** q/k/v biases always present, whatever the config says (Qwen2); no o_proj bias. */
             ALWAYS,
-            /** The config value, true when absent (GLM). */
-            CONFIG_DEFAULT_TRUE
+            /** q/k/v biases from the config value, true when absent (GLM); no o_proj bias. */
+            CONFIG_DEFAULT_TRUE,
+            /** The config value, false when absent, biases q, k, v and o_proj (Llama, Qwen3, Gemma). */
+            CONFIG_QKVO
         }
 
         final Map<String, Object> c;
@@ -452,13 +466,16 @@ final class Families {
             boolean attnBias = switch (bias) {
                 case ALWAYS -> true;
                 case CONFIG_DEFAULT_TRUE -> Json.bool(c, "attention_bias", true);
+                case CONFIG_QKVO -> Json.bool(c, "attention_bias", false);
                 case REJECT -> {
                     if (Json.bool(c, "attention_bias", false)) {
-                        throw new IllegalArgumentException("attention_bias=true is only supported for qwen2 and glm (q/k/v bias)");
+                        throw new IllegalArgumentException("attention_bias=true is not supported for " + modelType
+                                + " (supported: llama, qwen2, qwen3, glm, gemma)");
                     }
                     yield false;
                 }
             };
+            boolean outBias = attnBias && bias == Bias.CONFIG_QKVO;
             double partialRotary = Json.dbl(c, "partial_rotary_factor",
                     Json.dbl(globalRope, "partial_rotary_factor", partialRotaryDefault));
             if (partialRotary <= 0 || partialRotary > 1 || (int) (headDim * partialRotary) < 2) {
@@ -527,7 +544,7 @@ final class Families {
                 boolean windowed = sw > 0 && (window == Window.PER_LAYER ? local[l] : l >= windowFrom);
                 Attention attn = mla != null ? mla
                         : new Attention.Gqa(heads, kvHeads, headDim, windowed ? sw : 0, anyLocal && local[l] ? 1 : 0,
-                        qkNorm, attnBias, scale, attnSoftcap);
+                        qkNorm, attnBias, outBias, scale, attnSoftcap);
                 Mlp mlp = isMoe[l] ? new Mlp.Moe(numExperts, topK, moeDim, normTopK, router, shared)
                         : new Mlp.Dense(hiddenDim, act);
                 specs.add(new LayerSpec(attn, mlp, norms));
@@ -543,7 +560,7 @@ final class Families {
                         mla.kvLoraRank(), mla.nope(), mla.rope(), mla.vDim(), nShared, firstKDense, r.topK().key())
                         + (yarn != null ? " yarnx" + yarn.factor() : "");
             }
-            String extra = mlaS + (attnBias ? " bias" : "") + (sw > 0 ? " window=" + sw
+            String extra = mlaS + (attnBias ? " bias" : "") + (outBias ? " obias" : "") + (sw > 0 ? " window=" + sw
                     + (windowFrom > 0 ? "@" + windowFrom : "") : "")
                     + (!(scaling instanceof Scaling.None) ? " rope=" + scalingKey(scaling) + "x" + scalingFactor(scaling) : "")
                     + (pairing == Pairing.INTERLEAVED ? " rope=interleaved/" + rotaryDim : "")
@@ -635,10 +652,40 @@ final class Families {
                     throw new IllegalArgumentException("invalid linear rope_scaling: " + rs);
                 }
                 return new Scaling.Linear(factor);
+            case "yarn":
+                return yarn(rs, c);
             default:
                 throw new IllegalArgumentException("unsupported rope_scaling type '" + type
-                        + "' (supported: default, linear, llama3, longrope)");
+                        + "' (supported: default, linear, llama3, longrope, yarn)");
         }
+    }
+
+    /**
+     * A {@code yarn} scaling map (Qwen2 / Qwen3 long context and the like): as transformers'
+     * {@code _compute_yarn_parameters}, with {@code beta_fast} 32 and {@code beta_slow} 1 by default, the
+     * pretrained length from {@code original_max_position_embeddings} (else {@code max_position_embeddings}) and
+     * the amplitude {@code attention_factor}, else {@code mscale / mscale_all_dim} when both are set, else
+     * {@code 0.1 ln(factor) + 1}. One deliberate difference: transformers replaces {@code factor} by
+     * {@code max_position_embeddings / original_max_position_embeddings} when the latter is given; here the
+     * {@code factor} of the map is used, as llama.cpp and vLLM do (and as a GGUF stores it), so a config that
+     * enables YaRN without raising {@code max_position_embeddings} still gets the factor it asked for.
+     */
+    private static Scaling.Yarn yarn(Map<String, Object> rs, Map<String, Object> c) {
+        double factor = Json.dbl(rs, "factor", 1.0);
+        int orig = (int) Json.num(rs, "original_max_position_embeddings", Json.num(c, "max_position_embeddings", 0));
+        double betaFast = Json.dbl(rs, "beta_fast", 32);
+        double betaSlow = Json.dbl(rs, "beta_slow", 1);
+        double attention = Json.dbl(rs, "attention_factor", 0);
+        if (!(factor > 0) || orig <= 0 || !(betaFast > betaSlow) || !(betaSlow > 0) || attention < 0) {
+            throw new IllegalArgumentException("invalid yarn rope_scaling: " + rs);
+        }
+        if (!Json.bool(rs, "truncate", true)) {
+            throw new IllegalArgumentException("yarn rope_scaling with truncate=false is not supported");
+        }
+        double mscale = Json.dbl(rs, "mscale", 0);
+        double mscaleAllDim = Json.dbl(rs, "mscale_all_dim", 0);
+        boolean both = mscale != 0 && mscaleAllDim != 0;
+        return new Scaling.Yarn(factor, orig, betaFast, betaSlow, both ? mscale : 1, both ? mscaleAllDim : 0, attention);
     }
 
     private static double[] factors(Map<String, Object> rs, String key, int n) {

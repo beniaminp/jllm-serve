@@ -304,13 +304,13 @@ Each kernel takes a small `struct` by `constant` reference. Java has no struct t
 as `plen`:
 
 ```java
-p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap);   // MatmulParams
-dispatch(kernel("matmul", t.type, ""), 5, tgmem, gx, gy, 1, MM_THREADS, 1, 1);   // plen = p.done() = 24
+p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap).i(bias != null);   // MatmulParams
+dispatch(kernel("matmul", t.type, ""), 6, tgmem, gx, gy, 1, MM_THREADS, 1, 1);   // params at 6, plen = p.done() = 28
 ```
 
 This only works if the C++ struct has the same layout, which is guaranteed when every member is a 4-byte `int`
 or `float` (no padding is ever inserted). Three checks keep the two sides together: `KernelParams` lists each
-struct's name and field kinds (`MATMUL("MatmulParams", "iiiiff")`), `Params.done()` fails the dispatch if a
+struct's name and field kinds (`MATMUL("MatmulParams", "iiiiffi")`), `Params.done()` fails the dispatch if a
 writer wrote a different number or kind of fields, and `MetalParamsTest` parses the `struct` blocks of
 `kernels.metal` and asserts that every layout has the same field count, kinds and byte size as its struct, that
 no struct is without a writer, and that the constants `MetalConstants` mirrors equal the shader's `#define`s
@@ -318,7 +318,7 @@ no struct is without a writer, and that the constants `MetalConstants` mirrors e
 
 | struct | fields | bytes |
 |---|---|---|
-| `MatmulParams` | rows, cols, ntok, accumulate, eps, softcap | 24 |
+| `MatmulParams` | rows, cols, ntok, accumulate, eps, softcap, hasBias (the `o_proj` bias, buffer 5) | 28 |
 | `Matmul3Params` | rows0, rows1, rows2, cols, ntok, eps, hasBias | 28 |
 | `SwigluParams` | hidden, cols, ntok, eps, gelu | 20 |
 | `NormParams` | n, eps | 8 |

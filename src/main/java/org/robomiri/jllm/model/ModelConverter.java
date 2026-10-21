@@ -75,6 +75,8 @@ public final class ModelConverter {
     private final Map<String, SafeTensors> open = new LinkedHashMap<>();
     /** MLX-quantized checkpoint (packed weight + scales + biases per linear layer), or null. */
     private final MlxQuant mlx;
+    /** FP8 block-quantized checkpoint ({@code weight} + {@code weight_scale_inv} per linear layer), or null. */
+    private final Fp8Quant fp8;
 
     private ModelConverter(Path dir, Architecture arch, QType quant, QType head, ShardProvider provider)
             throws IOException {
@@ -84,15 +86,15 @@ public final class ModelConverter {
         this.head = head;
         this.provider = provider;
         this.shardOf = shardMap();
-        if (shardOf.keySet().stream().anyMatch(n -> n.endsWith(".weight_scale_inv"))) {
-            throw new IOException("this checkpoint is block-quantized to FP8 (float8_e4m3fn weights with "
-                    + "weight_scale_inv tensors, e.g. DeepSeek-V3 / R1); FP8 dequantization is not implemented, "
-                    + "use a bf16/f16 checkpoint of the model");
+        this.fp8 = shardOf.keySet().stream().anyMatch(n -> n.endsWith(".weight_scale_inv")) ? Fp8Quant.read(dir) : null;
+        if (fp8 != null) {
+            System.err.printf("FP8 checkpoint (%dx%d blocks): dequantized while converting to %s%n", fp8.blockRows,
+                    fp8.blockCols, quant);
         }
         this.mlx = MlxQuant.read(dir);
         if (mlx != null) {
-            System.err.printf("MLX checkpoint (%d-bit, groups of %d): dequantized while converting to %s%s%n", mlx.bits,
-                    mlx.groupSize, quant, quant == QType.Q4_0 && mlx.bits <= 4
+            System.err.printf("MLX checkpoint (%s, %d-bit, groups of %d): dequantized while converting to %s%s%n",
+                    mlx.mode.key, mlx.bits, mlx.groupSize, quant, quant == QType.Q4_0 && mlx.bits <= 4
                             ? " (re-quantized once more; --model.quant q8 keeps the MLX values almost exactly)" : "");
         }
         this.units = plan();
@@ -254,7 +256,8 @@ public final class ModelConverter {
                 throw new IOException(t + " does not match " + Arrays.toString(shape));
             }
             if (t.reader() != null) {
-                throw new IOException("stacked expert tensor " + t.name() + " is MLX-quantized: not supported, use the bf16 checkpoint");
+                throw new IOException("stacked expert tensor " + t.name()
+                        + " is MLX- or FP8-quantized: not supported, use the bf16 checkpoint");
             }
             SafeTensors.Tensor flat = new SafeTensors.Tensor(t.name(), t.dtype(), new long[]{shape[0] * shape[1], shape[2]}, t.data());
             return quantize(a, type, flat, 0, flat.dim(0));
@@ -349,6 +352,9 @@ public final class ModelConverter {
                         for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
                             rules.add(quantize(p + "self_attn." + n + ".weight", quant));
                         }
+                    }
+                    if (g.outBias()) {
+                        rules.add(f32(p + "self_attn.o_proj.bias", p + "self_attn.o_proj.bias"));
                     }
                 }
                 case Attention.Mla m -> rules.addAll(mlaRules(p, m, dim));
@@ -523,8 +529,15 @@ public final class ModelConverter {
             open.put(shard, st);
         }
         SafeTensors.Tensor t = st.get(checkpointName.getOrDefault(name, name));
+        if (fp8 != null && (t.dtype() == SafeTensors.DType.F8_E4M3 || t.dtype() == SafeTensors.DType.F8_E5M2)
+                && shardOf.containsKey(name + "_scale_inv")) {
+            return fp8.dequantized(name, t, tensor(name + "_scale_inv"));
+        }
         if (mlx != null && t != null && t.dtype() == SafeTensors.DType.U32 && name.endsWith(".weight")) {
             String base = name.substring(0, name.length() - ".weight".length());
+            if (shardOf.containsKey(base + ".scales") && mlx.mode != MlxQuant.Mode.AFFINE) {
+                return mlx.dequantized(name, t, tensor(base + ".scales"), null);
+            }
             if (shardOf.containsKey(base + ".scales") && shardOf.containsKey(base + ".biases")) {
                 return mlx.dequantized(name, t, tensor(base + ".scales"), tensor(base + ".biases"));
             }

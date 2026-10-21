@@ -156,9 +156,12 @@ public final class CpuBackend implements Backend {
         }
     }
 
-    /** {@code x += proj(in)}, or {@code x += rmsnorm(proj(in)) * norm} where the family normalizes the output. */
+    /**
+     * {@code x += proj(in) + bias}, or {@code x += rmsnorm(proj(in) + bias) * norm} where the family normalizes the
+     * output; {@code bias} (o_proj's) is usually null.
+     */
     private interface Residual {
-        void add(QTensor proj, float[] in, float[] norm, int n);
+        void add(QTensor proj, float[] bias, float[] in, float[] norm, int n);
     }
 
     /** Reads {@link #xb}, adds the feed-forward output to {@link #x}. */
@@ -272,13 +275,29 @@ public final class CpuBackend implements Backend {
         }
     }
 
-    private void addPlain(QTensor proj, float[] in, float[] norm, int n) {
-        matmul(proj, in, x, 0, n, true);
+    /** {@code x += proj(in)}; with a bias {@code x += (proj(in) + bias)}, the projection staged in {@link #xb}. */
+    private void addPlain(QTensor proj, float[] bias, float[] in, float[] norm, int n) {
+        if (bias == null) {
+            matmul(proj, in, x, 0, n, true);
+            return;
+        }
+        int dim = c.dim();
+        matmul(proj, in, xb, 0, n, false);
+        pool.forRange(n, 1, (t0, t1) -> {
+            for (int t = t0; t < t1; t++) {
+                for (int i = 0, o = t * dim; i < dim; i++, o++) {
+                    x[o] += xb[o] + bias[i];
+                }
+            }
+        });
     }
 
-    /** Glm4 / Gemma: {@code x += rmsnorm(proj(in)) * norm}; {@link #xb} is free as the temporary at both call sites. */
-    private void addPostNormed(QTensor proj, float[] in, float[] norm, int n) {
+    /** Glm4 / Gemma: {@code x += rmsnorm(proj(in) + bias) * norm}; {@link #xb} is free as the temporary at both call sites. */
+    private void addPostNormed(QTensor proj, float[] bias, float[] in, float[] norm, int n) {
         matmul(proj, in, xb, 0, n, false);
+        if (bias != null) {
+            addBias(xb, 0, bias, n);
+        }
         addNormed(xb, norm, n);
     }
 
@@ -306,7 +325,7 @@ public final class CpuBackend implements Backend {
             } else {
                 siluMul(n, hdim);
             }
-            residual.add(w.down(), hidden, postMlpNorm, n);
+            residual.add(w.down(), null, hidden, postMlpNorm, n);
         }
     }
 
@@ -401,7 +420,7 @@ public final class CpuBackend implements Backend {
             DecoderLayer L = p.weights();
             rmsnorm(x, xb, L.attnNorm(), n, dim);
             p.attention().run(l, n, pos);
-            p.residual().add(L.wo(), att, L.postAttnNorm(), n);
+            p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
         }

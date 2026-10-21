@@ -15,6 +15,8 @@
 #   hf-internal-testing_tiny-random-Qwen2ForCausalLM      generated: the repo does not exist on the Hub; q/k/v bias,
 #                                                         tied embeddings, sliding window on layers >= 2
 #   hf-internal-testing_tiny-random-Llama3RopeForCausalLM generated: llama3 rope_scaling, MHA, tied embeddings
+#   hf-internal-testing_tiny-random-LlamaBiasForCausalLM  generated: plain Llama with attention_bias (q/k/v and o_proj
+#                                                         biases; o_proj's accumulates into the residual)
 #   hf-internal-testing_tiny-random-Phi3ForCausalLM       generated: fused qkv_proj / gate_up_proj, longrope (long factors
 #                                                         at ctx 64), partial_rotary_factor 0.75, sliding window 6
 #   hf-internal-testing_tiny-random-Phi3ShortForCausalLM  generated: as above with the short factors, tied embeddings
@@ -24,6 +26,8 @@
 #   hf-internal-testing_tiny-random-Gemma3ForCausalLM     generated: q/k norm, 5 local + 1 global layers, two RoPE bases
 #   hf-internal-testing_tiny-random-Gemma3MMForCausalLM   generated: the same decoder in the multimodal wrapper layout
 #   hf-internal-testing_tiny-random-Gemma{2,3}Hd256ForCausalLM  generated: head_dim 256, the largest Metal supports
+#   hf-internal-testing_tiny-random-Gemma2BiasForCausalLM generated: Gemma 2 with attention_bias (the o_proj bias
+#                                                         before the post-attention norm)
 #   hf-internal-testing_tiny-random-MambaForCausalLM      generated: Mamba v1, d_model 64, state 16, conv 4, tied head
 #   hf-internal-testing_tiny-random-Mamba3ForCausalLM     generated: Mamba v1, d_model 128, state 8, conv 3, untied head
 #                                                         (Mamba models additionally check that chunking the prompt
@@ -74,6 +78,7 @@ gen llama LlamaPlainForCausalLM
 gen mistral MistralForCausalLM
 gen qwen2 Qwen2ForCausalLM
 gen llama3rope Llama3RopeForCausalLM
+gen llama LlamaBiasForCausalLM --attention-bias
 gen glm GlmForCausalLM
 gen glmedge GlmEdgeForCausalLM
 gen glm4 Glm4ForCausalLM
@@ -85,6 +90,7 @@ gen gemma3 Gemma3ForCausalLM
 gen gemma3mm Gemma3MMForCausalLM
 gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
 gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
+gen gemma2 Gemma2BiasForCausalLM --attention-bias
 gen mamba MambaForCausalLM
 gen mamba3 Mamba3ForCausalLM
 gen qwen3moe Qwen3MoeForCausalLM
@@ -104,6 +110,7 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
+  "$M/${P}-LlamaBiasForCausalLM" "$M/${P}-Gemma2BiasForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
   "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \

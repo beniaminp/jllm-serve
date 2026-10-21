@@ -66,8 +66,14 @@ public final class GgufModelTest {
         return a;
     }
 
-    static Tiny tiny(String family, long seed) {
+    /** YaRN of the {@code -yarn} variants: factor 4 over a pretrained length of 64, betas 16 / 2, attention factor 1.2. */
+    static final Map<String, Object> YARN = Json.obj("rope_type", "yarn", "factor", 4.0, "original_max_position_embeddings", 64L,
+            "beta_fast", 16.0, "beta_slow", 2.0, "attention_factor", 1.2);
+
+    static Tiny tiny(String variant, long seed) {
         Random r = new Random(seed);
+        boolean yarn = variant.endsWith("-yarn");
+        String family = yarn ? variant.substring(0, variant.length() - 5) : variant;
         boolean moe = family.equals("qwen3_moe");
         boolean qwen3 = family.startsWith("qwen3");
         boolean bias = family.equals("qwen2");
@@ -78,6 +84,9 @@ public final class GgufModelTest {
                 "bos_token_id", 1L, "eos_token_id", 2L);
         if (qwen3) {
             c.put("head_dim", (long) HD);
+        }
+        if (yarn) {
+            c.put("rope_scaling", YARN);
         }
         if (moe) {
             c.put("num_experts", (long) EXPERTS);
@@ -257,6 +266,7 @@ public final class GgufModelTest {
                 .f32(a + "attention.layer_norm_rms_epsilon", 1e-5f).u32(a + "attention.key_length", HD)
                 .u32(a + "rope.dimension_count", HD);
         w.u32("tokenizer.ggml.bos_token_id", 1).u32("tokenizer.ggml.eos_token_id", 2);
+        yarnMeta(w, a, t);
         boolean moe = t.family().equals("qwen3_moe");
         if (moe) {
             w.u32(a + "expert_count", EXPERTS).u32(a + "expert_used_count", TOPK).u32(a + "expert_feed_forward_length", MOE_DIM);
@@ -293,6 +303,23 @@ public final class GgufModelTest {
         }
         w.write(p);
         effective.putAll(out);
+    }
+
+    /**
+     * The keys convert_hf_to_gguf.py writes for a yarn {@code rope_scaling}: type, factor, original context and the
+     * betas; {@code attention_factor} becomes ggml's {@code attn_factor}, the multiplier of its own
+     * {@code 0.1 ln(factor) + 1}.
+     */
+    private static void yarnMeta(GgufWriter w, String a, Tiny t) {
+        if (t.config().get("rope_scaling") instanceof Map<?, ?> rs) {
+            double factor = ((Number) rs.get("factor")).doubleValue();
+            w.str(a + "rope.scaling.type", "yarn").f32(a + "rope.scaling.factor", (float) factor)
+                    .u32(a + "rope.scaling.original_context_length", ((Number) rs.get("original_max_position_embeddings")).intValue())
+                    .f32(a + "rope.scaling.yarn_beta_fast", ((Number) rs.get("beta_fast")).floatValue())
+                    .f32(a + "rope.scaling.yarn_beta_slow", ((Number) rs.get("beta_slow")).floatValue())
+                    .f32(a + "rope.scaling.attn_factor", (float) (((Number) rs.get("attention_factor")).doubleValue()
+                            / (0.1 * Math.log(factor) + 1)));
+        }
     }
 
     /** Adds a tensor with ggml dims (innermost first); with {@code q8} its values become the dequantized Q8_0 ones in {@code effective}. */
@@ -353,7 +380,7 @@ public final class GgufModelTest {
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("gguf-model-test");
         try {
-            for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe"}) {
+            for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe", "qwen3-yarn", "llama-yarn"}) {
                 family(dir, family);
             }
             malformed(dir);
@@ -369,9 +396,10 @@ public final class GgufModelTest {
         }
     }
 
-    private static void family(Path root, String family) throws Exception {
-        Tiny t = tiny(family, 42 + family.hashCode());
-        Path hfDir = Files.createDirectories(root.resolve("hf-" + family));
+    private static void family(Path root, String variant) throws Exception {
+        Tiny t = tiny(variant, 42 + variant.hashCode());
+        String family = t.family();
+        Path hfDir = Files.createDirectories(root.resolve("hf-" + variant));
         Files.writeString(hfDir.resolve("config.json"), Json.write(t.config()));
         writeSafetensors(hfDir.resolve("model.safetensors"), t.hf(), t.shapes());
         Architecture hfArch = Architecture.load(hfDir);
@@ -379,8 +407,8 @@ public final class GgufModelTest {
         boolean llama = family.equals("llama");
         int[] prompt = {1, 5, 17, 33, 2, 40, 9, 77};
 
-        Path f32 = root.resolve(family + "-f32.gguf");
-        Path q8 = root.resolve(family + "-q8.gguf");
+        Path f32 = root.resolve(variant + "-f32.gguf");
+        Path q8 = root.resolve(variant + "-q8.gguf");
         Map<String, float[]> effF32 = new LinkedHashMap<>();
         Map<String, float[]> effQ8 = new LinkedHashMap<>();
         Map<String, long[]> dims = new LinkedHashMap<>();
@@ -395,6 +423,19 @@ public final class GgufModelTest {
                 check(llama ? d.startsWith(want) && d.contains("rope=interleaved/" + HD) : d.equals(want),
                         family + ": description '" + d + "' vs '" + want + "'");
                 check(g.architecture().core().modelType().equals(hfArch.core().modelType()), family + ": model type");
+                if (t.config().containsKey("rope_scaling")) {
+                    // the GGUF metadata must give the scaling the config gives: the same frequencies and amplitude
+                    var gs = ((org.robomiri.jllm.model.Decoder) g.architecture()).ropeTables().getFirst().scaling();
+                    var hs = ((org.robomiri.jllm.model.Decoder) hfArch).ropeTables().getFirst().scaling();
+                    double[] gf = org.robomiri.jllm.model.Rope.invFreq(HD, 500000, gs, 256);
+                    double[] hfF = org.robomiri.jllm.model.Rope.invFreq(HD, 500000, hs, 256);
+                    double ga = org.robomiri.jllm.model.Rope.amplitude(gs);
+                    double ha = org.robomiri.jllm.model.Rope.amplitude(hs);
+                    check(java.util.Arrays.equals(gf, hfF) && Math.abs(ga - ha) < 1e-6 && Math.abs(ha - 1.2) < 1e-12
+                            && d.contains("rope=yarnx4.0"), variant + ": GGUF yarn " + gs + " vs config " + hs);
+                    check(gf[0] == 1.0 && gf[HD / 2 - 1] == 1.0 / (4 * Math.pow(500000, (HD - 2.0) / HD)),
+                            variant + ": fastest pair kept, slowest pair interpolated: " + java.util.Arrays.toString(gf));
+                }
                 var pairing = ((org.robomiri.jllm.model.Decoder) g.architecture()).ropeTables().getFirst().pairing();
                 check(pairing == (llama ? org.robomiri.jllm.model.RopeTable.Pairing.INTERLEAVED
                         : org.robomiri.jllm.model.RopeTable.Pairing.HALF), family + ": rope pairing " + pairing);
@@ -405,7 +446,7 @@ public final class GgufModelTest {
                 }
             }
             // Q8_0 blocks read in place vs the F32 file holding the same dequantized values (requantized: same blocks)
-            Path deq = root.resolve(family + "-deq.gguf");
+            Path deq = root.resolve(variant + "-deq.gguf");
             writeDequantized(deq, t, effQ8, dims, arch);
             try (GgufModel g = GgufModel.open(q8); GgufModel gd = GgufModel.open(deq)) {
                 float[][] a;
@@ -449,6 +490,7 @@ public final class GgufModelTest {
                 .u32(a + "context_length", 256).f32(a + "rope.freq_base", 500000f)
                 .f32(a + "attention.layer_norm_rms_epsilon", 1e-5f).u32(a + "attention.key_length", HD)
                 .u32(a + "rope.dimension_count", HD).u32("tokenizer.ggml.bos_token_id", 1).u32("tokenizer.ggml.eos_token_id", 2);
+        yarnMeta(w, a, t);
         if (t.family().equals("qwen3_moe")) {
             w.u32(a + "expert_count", EXPERTS).u32(a + "expert_used_count", TOPK).u32(a + "expert_feed_forward_length", MOE_DIM);
         }
@@ -540,7 +582,7 @@ public final class GgufModelTest {
         d = decoder(root, "rot.gguf", llamaMeta().u32("llama.rope.dimension_count", 32).u32("llama.attention.key_length", 64));
         check(d.core().description().contains("rope=interleaved/32"), "partial rotary: " + d.core().description());
         check(d.core().vocabSize() == 96 && d.core().tiedEmbeddings(), "vocab from token_embd rows, tied without output.weight");
-        for (String bad : new String[]{"yarn", "unknown-scaling"}) {
+        for (String bad : new String[]{"unknown-scaling"}) {
             Path p = root.resolve("bad.gguf");
             llamaMeta().str("llama.rope.scaling.type", bad).write(p);
             expectFail(p, "unsupported rope scaling type '" + bad + "'");

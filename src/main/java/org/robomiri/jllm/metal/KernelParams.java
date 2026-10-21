@@ -8,7 +8,7 @@ package org.robomiri.jllm.metal;
  * added on one side cannot silently shift the others.
  */
 public enum KernelParams {
-    MATMUL("MatmulParams", "iiiiff"),
+    MATMUL("MatmulParams", "iiiiffi"),
     MATMUL3("Matmul3Params", "iiiiifi"),
     SWIGLU("SwigluParams", "iiifi"),
     NORM("NormParams", "if"),
