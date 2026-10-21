@@ -68,6 +68,13 @@ static inline float wh_tg_max(float v, threadgroup float *buf, ushort sg, ushort
     return r;
 }
 
+
+// 4-wide loads (any alignment of the element type) and stores of the staging loops of wh_gemm
+static inline float4 wh_ld4(device const half *p) { return float4(*(device const packed_half4 *)p); }
+static inline float4 wh_ld4(device const float *p) { return *(device const packed_float4 *)p; }
+static inline void wh_st4(threadgroup half *d, float4 v) { *(threadgroup half4 *)d = half4(v); }
+static inline void wh_st4(threadgroup float *d, float4 v) { *(threadgroup float4 *)d = v; }
+
 // ---------------------------------------------------------------------------------------------- 2. wh_gemm
 // out[t * ldo + r] (+)= act(bias[r] + sum_k x[t * ldx + k] * w[r * ldw + k]) for r < rows, t < ntok, k < cols, with
 // WT the element type of the weights (half or float) and TT the type of the weight tile in threadgroup memory (half:
@@ -122,18 +129,26 @@ kernel void wh_gemm(device const WT *w [[buffer(0)]],
     threadgroup TT *wd = sa + (lr >> 3) * 256 + (lr & 7) * 8;           // block row band, row inside the band
     threadgroup float *xd = sb + ((lt >> 3) * 4 + lp) * 64 + (lt & 7) * 8;
     for (int k0 = 0; k0 < p.cols; k0 += 32) {
-        // stage 16 weights: k = k0 + 16 lh .. +15 into blocks 2 lh and 2 lh + 1 of this row
+        // stage 16 weights: k = k0 + 16 lh .. +15 into blocks 2 lh and 2 lh + 1 of this row, and 8 activations
         const int kw = k0 + 16 * lh;
-        for (int b = 0; b < 2; b++) {
-            threadgroup TT *dst = wd + (2 * lh + b) * 64;
-            for (int j = 0; j < 8; j++) {
-                const int kk = kw + b * 8 + j;
-                dst[j] = kk < p.cols ? TT(wrow[kk]) : TT(0);
-            }
-        }
         const int kx = k0 + 8 * lp;
-        for (int j = 0; j < 8; j++) {
-            xd[j] = kx + j < p.cols ? xrow[kx + j] : 0.0f;
+        threadgroup TT *dst0 = wd + (2 * lh) * 64;
+        threadgroup TT *dst1 = dst0 + 64;
+        if (k0 + 32 <= p.cols) {                          // a whole k step: 4-wide loads
+            device const WT *src = wrow + kw;
+            wh_st4(dst0, wh_ld4(src));
+            wh_st4(dst0 + 4, wh_ld4(src + 4));
+            wh_st4(dst1, wh_ld4(src + 8));
+            wh_st4(dst1 + 4, wh_ld4(src + 12));
+            device const float *xs = xrow + kx;
+            *(threadgroup float4 *)xd = *(device const packed_float4 *)xs;
+            *(threadgroup float4 *)(xd + 4) = *(device const packed_float4 *)(xs + 4);
+        } else {                                          // the last, partial step: zero past the end
+            for (int j = 0; j < 8; j++) {
+                dst0[j] = kw + j < p.cols ? TT(wrow[kw + j]) : TT(0);
+                dst1[j] = kw + 8 + j < p.cols ? TT(wrow[kw + 8 + j]) : TT(0);
+                xd[j] = kx + j < p.cols ? xrow[kx + j] : 0.0f;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int kk = 0; kk < 4; kk++) {

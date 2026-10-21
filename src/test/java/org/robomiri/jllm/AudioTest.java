@@ -287,6 +287,16 @@ public final class AudioTest {
                     "time stretch x" + speed + ": " + out.length + " samples, pitch " + Math.round(hz) + " Hz (440)");
         }
         check(TimeStretch.stretch(in, rate, 1.0) == in, "speed 1 returns the input");
+        float[] padded = new float[rate * 3];
+        for (int i = 0; i < 480; i++) {
+            padded[i] = 0.007f * (1 - i / 480f);                  // the codec's start-up blip
+        }
+        for (int i = rate * 3 / 2; i < rate * 5 / 2; i++) {
+            padded[i] = (float) (0.3 * Math.sin(2 * Math.PI * 300.0 * i / rate));
+        }
+        float[] trimmed = Speech.trimSilence(padded, rate);
+        check(Math.abs(trimmed.length - (rate + rate * 32 / 100)) <= rate / 50 && Math.abs(trimmed[0]) < 1e-6,
+                "silence around speech is trimmed to 0.12 s before and 0.2 s after: " + trimmed.length + " samples");
         List<String> pieces = Speech.split("First sentence. Second one is here! Third? " + "word ".repeat(100), 60);
         boolean fits = pieces.stream().allMatch(p -> p.length() <= 60);
         check(pieces.size() > 3 && fits, "long text is split into pieces of at most the given size: " + pieces.size() + " pieces");

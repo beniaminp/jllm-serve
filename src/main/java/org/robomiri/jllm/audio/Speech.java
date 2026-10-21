@@ -39,6 +39,52 @@ public final class Speech {
         return TimeStretch.stretch(pcm, model.sampleRate(), o.speed());
     }
 
+    /**
+     * Cuts the silence around speech: windows of 10 ms whose RMS is below 8 % of the loudest window's (and 0.003) are
+     * silence; 0.12 s before the first speech window and 0.2 s after the last stay, with a 5 ms fade at both ends.
+     */
+    public static float[] trimSilence(float[] pcm, int rate) {
+        int w = Math.max(1, rate / 100);
+        int n = pcm.length / w;
+        if (n < 4) {
+            return pcm;
+        }
+        double[] rms = new double[n];
+        double max = 0;
+        for (int i = 0; i < n; i++) {
+            double s = 0;
+            for (int j = 0; j < w; j++) {
+                s += (double) pcm[i * w + j] * pcm[i * w + j];
+            }
+            rms[i] = Math.sqrt(s / w);
+            max = Math.max(max, rms[i]);
+        }
+        double thr = Math.max(0.003, 0.08 * max);
+        int first = -1;
+        int last = -1;
+        for (int i = 0; i < n; i++) {
+            if (rms[i] >= thr) {
+                if (first < 0) {
+                    first = i;
+                }
+                last = i;
+            }
+        }
+        if (first < 0) {
+            return pcm;
+        }
+        int start = Math.max(0, (first - 12) * w);
+        int end = Math.min(pcm.length, (last + 1 + 20) * w);
+        float[] out = java.util.Arrays.copyOfRange(pcm, start, end);
+        int fade = Math.min(out.length / 2, rate / 200);
+        for (int i = 0; i < fade; i++) {
+            float g = (float) i / fade;
+            out[i] *= g;
+            out[out.length - 1 - i] *= g;
+        }
+        return out;
+    }
+
     /** Splits at sentence ends, then at commas and spaces, into pieces of at most {@code max} characters. */
     public static List<String> split(String text, int max) {
         List<String> out = new ArrayList<>();

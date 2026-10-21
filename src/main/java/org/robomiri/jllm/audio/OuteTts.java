@@ -252,6 +252,9 @@ public final class OuteTts implements SpeechModel {
         o.progress().accept(n);
         long c0 = System.nanoTime();
         float[] pcm = codec.decode(java.util.Arrays.copyOf(codes, n));
+        if (cfg.ttsTrim()) {
+            pcm = Speech.trimSilence(pcm, sampleRate());
+        }
         if (TRACE) {
             Engine.Stats st = r.stats();
             System.err.printf("tts: prompt %d tokens (%d cached), prefill %.0f ms; %d tokens in %.0f ms (%.1f tok/s), %d frames = %.2f s;"
