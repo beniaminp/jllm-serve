@@ -32,7 +32,7 @@ means the value comes from `config.json`; defaults are those of the family's tra
 | `gemma2` | `Gemma2ForCausalLM` | no | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
 | `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | no | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | rejected | no | none | MLA rotary slice `INTERLEAVED`, `yarn` | `PRE` | dense for the first `first_k_dense_replace` layers, then MoE + shared experts; `Router.DeepSeek` softmax, `greedy` / `group_limited_greedy` | yes | config (false) | MLA latent KV cache; 14.11 |
-| `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints refused (14.11.7) |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints dequantized by the converter (14.11.7) |
 | `mamba` | `MambaForCausalLM` | n/a | n/a | n/a (no attention) | none (no positions) | one RMSNorm per block | no MLP: conv + selective scan mixer | no | default true | `MambaArch`; chapter 15 |
 
 Reading the table: *Norms* are the `LayerSpec.Norms` value of 14.12 (`PRE` = `input_layernorm` + `post_attention_layernorm`
@@ -55,7 +55,7 @@ The checkpoints each row was verified against:
 | `gemma2` | Gemma 2 2B / 9B / 27B (14.10) | `unsloth/gemma-2-2b-it` (mirror of the gated `google/gemma-2-2b-it`) |
 | `gemma3_text` | Gemma 3 1B / 4B / 12B / 27B (14.10) | `unsloth/gemma-3-1b-it`, `unsloth/gemma-3-4b-it` |
 | `deepseek_v2` | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct (14.11) | config, safetensors header and `modeling_deepseek.py` on the Hub; tiny random models |
-| `deepseek_v3` | DeepSeek-V3 / R1 (**not loadable**, 14.11.7) | config and header only; tiny random models |
+| `deepseek_v3` | DeepSeek-V3 / R1 (FP8 or bf16; too large to run here, 14.11.7) | config and header only; tiny random models |
 | `mamba` | `state-spaces/mamba-130m-hf` … `mamba-2.8b-hf` | chapter 15 |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
@@ -202,7 +202,7 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
   `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
-- `dynamic` RoPE scaling, YaRN with `truncate: false`; FP8 checkpoints (14.11.7); `hidden_act`
+- `dynamic` RoPE scaling, YaRN with `truncate: false`; `hidden_act`
   other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; an `o_proj`
   bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
@@ -580,7 +580,7 @@ Code: `Families.deepseek`, `model/Attention.Mla`, `model/Router.DeepSeek` + `mod
 | `model_type` | Architecture class | Examples | Weights |
 |---|---|---|---|
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | `deepseek-ai/DeepSeek-V2-Lite` (15.7 B, 27 layers), `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` | bf16, supported |
-| `deepseek_v3` | `DeepseekV3ForCausalLM` | `deepseek-ai/DeepSeek-V3`, `DeepSeek-R1` (671 B) | **FP8, not supported** (14.11.7) |
+| `deepseek_v3` | `DeepseekV3ForCausalLM` | `deepseek-ai/DeepSeek-V3`, `DeepSeek-R1` (671 B) | FP8, dequantized while converting (14.11.7) |
 
 The R1-*Distill* models are plain Qwen2/Llama checkpoints and were already supported (14.1).
 
@@ -811,15 +811,15 @@ token** (f32; 574 MB at `--ctx 4096`), where the expanded per-head cache would h
 10 MB per token (40 GB at `--ctx 4096`); the dequantized `kv_b_proj` halves are 64 MB per layer, 4 GB in all. It cannot
 run on a 32 GB laptop (not even on 128 GB; the 1.37 TB FP8 download alone exceeds the disk).
 
-### 14.11.7 FP8 checkpoints (V3, R1) are not supported
+### 14.11.7 FP8 checkpoints (V3, R1)
 
 The published V3/R1 weights are block-quantized FP8: every large matrix is `F8_E4M3` (`float8_e4m3fn`) with a companion
-`<name>.weight_scale_inv` tensor of dtype F32 holding one inverse scale per 128 × 128 block (e.g. `q_a_proj.weight`
+`<name>.weight_scale_inv` tensor of dtype F32 holding one scale per 128 × 128 block (e.g. `q_a_proj.weight`
 `[1536, 7168]` has `weight_scale_inv` `[12, 56]`); `config.json` carries `quantization_config: {quant_method: fp8,
-weight_block_size: [128, 128]}`. `SafeTensors` has no FP8 dtype and the converter does not dequantize
-(`w = fp8_value · scale_inv[block]`). The converter refuses such a checkpoint up front with an explanatory error (any
-index containing `weight_scale_inv`). Supporting V3 needs an FP8 dequantization path in `ModelConverter` plus bf16
-re-uploads (e.g. a community bf16 conversion works as is), and a machine with more than 400 GB of memory to run it.
+weight_block_size: [128, 128]}`. The converter dequantizes them on the fly (`w = fp8_value · scale_inv[r/128][c/128]`,
+`model/Fp8Quant`, exact decoding in `SafeTensors`, see [03 §3.8](03-safetensors.md)) and writes the engine's own format,
+like any bf16 checkpoint; the embedding, head, norms and routers are bf16 in these files and read as they are. Running
+V3 still needs a machine with more than 400 GB of memory; the path is tested on tiny FP8 checkpoints (`QuantFormatsTest`).
 
 ### 14.11.8 Testing
 
@@ -836,7 +836,7 @@ on weights rounded to Q8_0 the same way the converter does: the largest differen
 (Without the rounding the engine is 1 – 6 % off, which is plain quantization noise: random weights with sharp attention
 are sensitive.) `mvn test` checks the YaRN frequencies against hand-computed values (14.11.2, `SmokeTest.yarnRope`), the
 routing rules on hand-made score matrices (14.11.4, `deepseekRouting`), the V2-Lite and V3 configs (`deepseekConfigs`),
-the V2 chat template and the FP8 refusal.
+the V2 chat template and V3's FP8 block size.
 
 ## 14.12 The typed model: `Architecture`
 

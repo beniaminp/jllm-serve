@@ -1576,9 +1576,13 @@ public final class SmokeTest {
                             .equals("<｜begin▁of▁sentence｜>Be brief.\n\nUser: Hi\n\nAssistant: Hello<｜end▁of▁sentence｜>"
                                     + "User: Bye\n\nAssistant:"), "deepseek-v2 chat template");
             check(ChatTemplate.forModelType("deepseek_v3").name().equals("deepseek-r1"), "deepseek_v3 uses the V3/R1 template");
-            // an FP8 checkpoint (V3 / R1 as published) is refused up front with an explanation
+            // the FP8 block of V3 / R1 as published (QuantFormatsTest converts FP8 checkpoints end to end); weight_scale_inv
+            // tensors under another quant_method are refused up front
+            org.robomiri.jllm.model.Fp8Quant fq = org.robomiri.jllm.model.Fp8Quant.read(tmp);
+            check(fq.blockRows == 128 && fq.blockCols == 128, "deepseek-v3 FP8 weight_block_size [128, 128]");
             Path fp8 = Files.createTempDirectory("jllm-fp8");
             try {
+                Files.writeString(fp8.resolve("config.json"), "{\"quantization_config\":{\"quant_method\":\"gptq\"}}");
                 Files.writeString(fp8.resolve("model.safetensors.index.json"),
                         "{\"weight_map\":{\"model.embed_tokens.weight\":\"a.safetensors\","
                                 + "\"model.layers.0.self_attn.q_a_proj.weight\":\"a.safetensors\","
@@ -1586,11 +1590,12 @@ public final class SmokeTest {
                 try {
                     org.robomiri.jllm.model.ModelConverter.convert(fp8, v3, org.robomiri.jllm.model.QType.Q4_0,
                             org.robomiri.jllm.model.ShardProvider.local(fp8));
-                    check(false, "fp8 checkpoint must be refused");
+                    check(false, "weight_scale_inv with quant_method gptq must be refused");
                 } catch (java.io.IOException e) {
-                    check(e.getMessage().contains("FP8"), "fp8 checkpoint refused: " + e.getMessage());
+                    check(e.getMessage().contains("gptq"), "weight_scale_inv with another quant_method refused: " + e.getMessage());
                 }
             } finally {
+                Files.deleteIfExists(fp8.resolve("config.json"));
                 Files.deleteIfExists(fp8.resolve("model.safetensors.index.json"));
                 Files.deleteIfExists(fp8);
             }

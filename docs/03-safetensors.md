@@ -269,7 +269,24 @@ shapes tell: `in = (in/g) · g` and `packed_cols · 32 = in · bits`. One ambigu
 `MlxQuant.dequantized` tries the config's group size first, then 64, 32, 128, and accepts the
 first that gives 2, 4 or 8 bits.
 
-**How it is loaded.** `MlxQuant.read` recognises the checkpoint from `config.json` (only `mode: affine`), and
+**Microscaling modes (`mode: mxfp4`, `mxfp8`).** Newer MLX versions also write the OCP "MX" formats. The codes are
+packed into uint32 words exactly as above, but there are no biases and no free group size: every group of 32 columns
+shares one power-of-two scale, stored as a **uint8 E8M0** exponent in `X.scales` (U8, `[out, in / 32]`):
+
+```
+w[r][c] = fp(q[r][c]) · 2^(scales[r][c / 32] − 127)                (scale byte 255 = NaN)
+
+mxfp4: q is 4 bits, FP4 E2M1 = sign | 2-bit exponent | 1-bit mantissa
+       code  0    1    2    3    4    5    6    7          codes 8-15: the same values negated
+       fp    0   0.5   1   1.5   2    3    4    6
+mxfp8: q is 8 bits, FP8 E4M3 (§3.8)
+```
+
+Example (mxfp4): the word `0x76543210` holds codes 0 – 7; with the scale byte 126 (`2^−1`) the eight weights are
+`0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3`, and with 129 (`2^2`) `0, 2, 4, 6, 8, 12, 16, 24`. `nvfp4` (groups of 16 with FP8
+scales) is refused with a message naming the supported modes.
+
+**How it is loaded.** `MlxQuant.read` recognises the checkpoint from `config.json` (`mode` affine, mxfp4 or mxfp8), and
 `ModelConverter` reads each packed matrix through a `SafeTensors.Tensor` whose reader dequantizes on the fly, like
 any bf16 tensor. The converter then writes the engine's own format (`--quant`) into the usual cache
 (§3.5), so every family and both backends work unchanged and the MLX files are read only once. `q8` or `q6k` keep a
@@ -280,3 +297,49 @@ answers correctly end to end.
 ```
 ./jllm chat --model mlx-community/Qwen3-0.6B-4bit --quant q8
 ```
+
+`SmokeTest.mlxQuant` checks affine dequantization; `QuantFormatsTest` checks mxfp4 / mxfp8 on hand-computed words and
+converts a tiny model written in each mode, whose logits must equal those of an F32 checkpoint holding the values the
+codes stand for.
+
+## 3.8 FP8 checkpoints
+
+🧸 Some models are shipped with every number written on a tiny card that only has room for 8 bits. To keep the cards
+useful, each 128 × 128 patch of the table also gets one "zoom" number. jllm-serve reads each card, multiplies by the
+patch's zoom, and from then on treats the table like any other.
+
+📐 DeepSeek-V3 / R1 and other `"quant_method": "fp8"` releases store each linear layer `X` as
+
+| tensor | dtype | shape | holds |
+|---|---|---|---|
+| `X.weight` | `F8_E4M3` | `[out, in]` | one FP8 code per weight |
+| `X.weight_scale_inv` | F32 | `[⌈out / bh⌉, ⌈in / bw⌉]` | one scale per `bh × bw` block |
+
+with the block from `quantization_config.weight_block_size` (`[128, 128]` when absent; a one-element scale is a
+per-tensor scale). Despite its name the scale is multiplied, as in DeepSeek's `weight_dequant`:
+
+```
+w[r][c] = fp8(X.weight[r][c]) · X.weight_scale_inv[r / bh][c / bw]      (integer division; edge blocks are partial)
+```
+
+The two FP8 formats safetensors names (`SafeTensors.DType`), decoded exactly through a 256-entry table:
+
+```
+F8_E4M3 (float8_e4m3fn):  s | eeee | mmm,  bias 7
+   e = 1…15:  (−1)^s · (1 + m/8) · 2^(e − 7)          largest: 0x7E = 1.75 · 2^8 = 448
+   e = 0:     (−1)^s · (m/8) · 2^−6                   subnormals; smallest 0x01 = 2^−9
+   s.1111.111 (0x7F, 0xFF): NaN                       no infinities
+F8_E5M2:                  s | eeeee | mm, bias 15 — the upper byte of an IEEE float16 (with inf and NaN),
+                          so it is decoded as Float.float16ToFloat(byte << 8)
+```
+
+Examples: `0x38` = 1.0, `0xC4` = −1 · 1.5 · 2 = −3, `0x08` = 2^−6 = 0.015625. A weight with code `0x3A` (1.25) in a block
+whose scale is 0.002 is 0.0025.
+
+**How it is loaded.** The converter sees `weight_scale_inv` tensors in the index, reads the block size
+(`Fp8Quant.read`; a `quant_method` other than fp8 is refused), and wraps every FP8 `X.weight` that has a scale in a
+`SafeTensors.Tensor` whose reader decodes and multiplies on the fly (`Fp8Quant.dequantized`), the MLX mechanism of §3.7.
+The engine format it then writes (`--quant`) is the usual cache, so both backends run the model unchanged; `q8` keeps
+the FP8 values within Q8_0's rounding. `QuantFormatsTest` checks all 256 codes of both formats against a decoder
+written from the definitions, partial blocks and a per-tensor scale, and a tiny Llama written as FP8 (24 × 40 blocks)
+by a reference encoder: its converted logits are identical to those of an F32 checkpoint holding the decoded values.

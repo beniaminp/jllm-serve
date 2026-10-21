@@ -183,7 +183,7 @@ the 452 MB cache. The MoE model keeps 128 experts per layer in memory but runs o
 
 Qwen3 is the running example, but the same pipeline runs the other supported families: Qwen2 / 2.5 (and the
 DeepSeek-R1 distills of Qwen2 and Llama), Llama 3.x, Mistral, GLM-4, Phi-3 / 3.5 / 4, Gemma 2 / 3 (text),
-DeepSeek V2 / V3 (bf16 only; the FP8 checkpoints are refused) and Mamba. What differs between them is parsed from
+DeepSeek V2 / V3 (bf16, or FP8 dequantized while converting) and Mamba. What differs between them is parsed from
 `config.json` once into a typed `Architecture` ([14](14-model-families.md), [15](15-mamba.md)); the backends never
 look at the `model_type`. Weights can be stored as Q4_0 (default), Q8_0 or Q2_K (`model.quant`), and the KV cache
 as f32 or f16 (`backend.kv-dtype`).

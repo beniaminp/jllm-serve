@@ -185,6 +185,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- FP8 and MLX microscaling checkpoints: exact decoding, tiny models converted end to end -->
+                    <execution>
+                        <id>quant-formats-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.QuantFormatsTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <execution>
                         <id>gguf-backends-test</id>
                         <phase>test</phase>
