@@ -303,7 +303,9 @@ server's defaults ([09 §9.10](09-sampling.md#910-where-each-setting-comes-from)
 
 `usage` carries the standard three counters plus jllm's extras (`cached_tokens`, `prefill_ms`, `decode_ms`,
 `drafted_tokens`, `accepted_draft_tokens` (speculative decoding, [10.9](#109-speculative-decoding), 0 when off),
-`tokens_per_second`), which OpenAI clients ignore.
+`forced_tokens` (tokens a JSON or tool-call constraint forced and jump-forward appended without sampling,
+[17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)), `tokens_per_second`), which OpenAI
+clients ignore.
 
 ### Chat, streaming (`"stream": true`)
 
@@ -374,8 +376,10 @@ jllm reports the log-softmax of the **raw model logits**, before repetition and 
 distribution, the same whatever the sampling settings, so values are comparable across requests and summing them
 scores a text (OpenAI documents its values as the model's distribution too). The cost is one pass over the
 vocabulary per token (`TokenLogprob.of`, a max, a sum of exponentials and a short sorted list for the
-alternatives). A request with logprobs, `echo` scoring or a JSON constraint decodes every step on the CPU from its
-own logits: speculative decoding (10.9) and the pipelined greedy path are off for it.
+alternatives). A request with logprobs or `echo` scoring decodes every step on the CPU from its own logits:
+speculative decoding (10.9), jump-forward and the pipelined greedy path are off for it. A JSON constraint alone
+keeps speculation (drafts are checked against it, 10.9) and adds jump-forward; only the device-side greedy pipe,
+which picks tokens the CPU never sees, is off.
 
 - Chat: `"logprobs": true` and optionally `"top_logprobs": k` (0 to 20) return per choice
   `"logprobs": {"content": [{"token", "logprob", "bytes", "top_logprobs": [{"token", "logprob", "bytes"}, …]}, …],
@@ -408,12 +412,18 @@ How the mask works (`JsonConstraint`). Every token's bytes are taken from the to
 so far is the state of a byte-level pushdown automaton: a stack of frames (object, array, string, number,
 literal) that knows, for instance, "inside an object of schema S, keys `a` and `b` seen, expecting `,` or `}`".
 A token is allowed when its bytes, fed one by one to a copy of that state, are all accepted. Testing all ~150,000
-tokens at every step would cost more than the forward pass, so `Sampler.sample(logits, allowed)` checks lazily:
-it takes the 256 most likely tokens (after penalties and bias), tests them most likely first, and keeps the
-allowed ones; only if none of them is allowed (typically the first token, when the model wanted to write
-"Sure") does it scan the whole vocabulary, where a table of allowed first bytes, built from the state once more
-than 512 tokens were tested, rejects most tokens without a copy. Greedy takes the first allowed token, i.e. the
-argmax of the masked distribution. Sampling renormalizes over the allowed candidates and applies temperature,
+tokens at every step would cost more than the forward pass, so `Sampler.sample(logits, allowed)` checks lazily.
+Greedy first tests the argmax: when the model's own choice is allowed (most steps) nothing else is looked at.
+Otherwise it takes the 256 most likely tokens (after penalties and bias), tests them most likely first, and keeps
+the allowed ones; only if none of them is allowed (typically the first token, when the model wanted to write
+"Sure") does it search the whole vocabulary. That search no longer feeds 150,000 tokens one by one: after 300
+checks in one state the constraint computes the whole allowed set by walking a **byte trie of the vocabulary**
+(`TokenTrie`: one node per distinct token prefix) alongside the automaton, so a shared prefix is tested once and a
+refused byte prunes its whole subtree; in a structural position only the subtrees under the few allowed first bytes
+are visited. The resulting bit mask answers every later check, and is memoized by the automaton state (the whole
+frame stack, schemas by identity) in a small cache shared by the constraints of one schema or tool set, so a
+recurring state costs a lookup the next time (`ByteConstraint`). Greedy takes the first allowed token, i.e. the
+argmax of the masked distribution. Per-token cost, measured in [17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward). Sampling renormalizes over the allowed candidates and applies temperature,
 top-k (the k most likely *allowed* tokens), top-p and min-p to that distribution; allowed tokens outside the 256
 candidates are left out, an approximation that only drops tail mass. Whitespace between JSON tokens is limited to
 one newline and 64 bytes per gap, so a reluctant model cannot fill `max_tokens` with blank lines. If
@@ -432,6 +442,19 @@ OpenAPI's `nullable`. Annotations (`title`, `description`, `default`, `examples`
 ignored. Any other keyword (`pattern`, `minimum`, `allOf`, tuple `items`, …) is a 400 naming it, rather than a
 schema that is silently enforced only in part. Keys are not reordered: the model writes them in the order it
 likes. Duplicate keys are refused in any object.
+
+**Jump-forward.** Where the automaton allows exactly one continuation (the rest of `true` after `t`, the rest of an
+enum value or of the only key that fits, `"` after `{` in an object with required keys) the engine does not sample
+it: the forced bytes are tokenized and appended in one pass (`TokenConstraint.jump`, details in
+[17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)). With free whitespace, as here,
+little is forced; tool calls use a fixed layout and gain much more.
+
+**Tool calls (web console `/v1`).** With `tools` the model's `<tool_call>` blocks are constrained too: the function
+name must be one of the tools and the arguments must match its `parameters` schema, compiled *leniently* (keywords
+the automaton cannot enforce, such as `pattern` or `minimum`, are ignored rather than refused, since the client did
+not write the schema for us). `tool_choice: "required"` or a named function forces the call; `response_format`
+together with `tools` is allowed and means "tool calls or that JSON answer". See
+[17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward).
 
 **`echo` (completions): the prompt in front.** `"echo": true` returns the prompt followed by the completion in
 `text` (streamed: the prompt is the first chunk of each choice). With `logprobs` the prompt's tokens come first in
@@ -597,6 +620,14 @@ speculation equals the plain greedy output bit for bit on Metal (the tiled kerne
 single-token ones, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)); on the CPU prefill and decode
 kernels differ in the last bits, so it holds only with `-Djllm.cpu.deterministic=true
 --backend.cpu.int8-activations false` ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)).
+
+**Under a constraint** (`response_format`, tool calls) speculation stays on. The draft is cut at its first token
+the constraint does not allow, checked on copies of the constraint (`TokenConstraint.copy`), so only drafts that
+could be emitted are verified; an end-of-sequence draft counts only where the output may end. Row *j* of the
+verification pass is then decided with the constrained rule against the constraint as it stands after the first
+*j* drafts (`Sampler.verify(row, draft, constraint, isStop)`): greedy takes the masked argmax, sampling accepts the
+draft with its probability under the masked distribution. Greedy output is therefore exactly the non-speculative
+constrained output (`ToolCallTest` checks it on a scripted fake model and on Qwen3-0.6B).
 
 Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).

@@ -2,6 +2,7 @@ package org.robomiri.jllm.engine;
 
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.sampling.Sampler;
+import org.robomiri.jllm.sampling.TokenConstraint;
 
 import java.util.Arrays;
 import java.util.Locale;
@@ -83,6 +84,7 @@ public final class Speculator implements AutoCloseable {
     private long acceptedTotal;
     private int kNow;     // adaptive draft length (prompt lookup)
     private final NgramIndex index;
+    private final TokenConstraint[] forks;
 
     /**
      * @param stride    logits row width of the target (its model vocabulary size)
@@ -109,6 +111,7 @@ public final class Speculator implements AutoCloseable {
         this.feed = new int[maxDrafts + 1];
         this.drafts = new int[maxDrafts];
         this.ready = new int[maxDrafts + 1];
+        this.forks = new TokenConstraint[maxDrafts + 1];
         this.index = cfg.mode() == Mode.NGRAM ? new NgramIndex(cfg.ngramMin(), cfg.ngramMax()) : null;
     }
 
@@ -164,6 +167,17 @@ public final class Speculator implements AutoCloseable {
 
     /** @param beforeVerify run right before the verification pass, when there is one (drains a pipelined backend) */
     public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler, Runnable beforeVerify) {
+        return step(tok, pos, ctxLimit, room, sampler, beforeVerify, null);
+    }
+
+    /**
+     * @param con the output's constraint after {@code tok}, or null. The draft is cut at its first token the
+     *            constraint does not allow (checked on copies, so the caller's constraint is not touched), and each
+     *            row is verified with the sampler's constrained rule against the constraint as it would stand at that
+     *            position: greedy output is exactly the non-speculative constrained output
+     */
+    public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler, Runnable beforeVerify,
+                        TokenConstraint con) {
         int want = Math.min(Math.min(kNow, room - 1), ctxLimit - pos - 1);
         if (want < 1) {
             return false;
@@ -173,6 +187,29 @@ public final class Speculator implements AutoCloseable {
             return false;
         }
         int m = cfg.mode() == Mode.NGRAM ? lookup(want) : draft.propose(hist, len, want, drafts, vocab, stopIds);
+        TokenConstraint[] at = null; // at[j]: the constraint after tok, d1..dj
+        if (con != null && m >= 1) {
+            at = forks;
+            at[0] = con.copy();
+            int ok = 0;
+            while (ok < m) {
+                int d = drafts[ok];
+                boolean stop = stopIds.contains(d);
+                if (stop ? !at[ok].canEnd() : !at[ok].allows(d)) {
+                    break;
+                }
+                ok++;
+                if (stop) {
+                    break; // nothing is verified after an end-of-sequence draft
+                }
+                at[ok] = at[ok - 1].copy();
+                at[ok].accept(d);
+                if (at[ok].mustEnd()) {
+                    break; // the output is complete: nothing may follow
+                }
+            }
+            m = ok;
+        }
         if (m < 1) {
             return false;
         }
@@ -186,8 +223,17 @@ public final class Speculator implements AutoCloseable {
         readyCount = 0;
         for (int j = 0; j <= m; j++) {
             System.arraycopy(rows, j * stride, row, 0, stride);
-            int s = j < m ? sampler.verify(row, drafts[j]) : sampler.sample(row);
+            int s;
+            if (at == null) {
+                s = j < m ? sampler.verify(row, drafts[j]) : sampler.sample(row);
+            } else {
+                s = j < m ? sampler.verify(row, drafts[j], at[j], stopIds::contains)
+                        : sampler.sample(row, at[j], stopIds::contains);
+            }
             ready[readyCount++] = s;
+            if (s < 0) {
+                break; // the constraint allows nothing (the engine ends the output there)
+            }
             if (j < m && s == drafts[j]) {
                 acc++;
                 if (stopIds.contains(s)) {

@@ -57,8 +57,9 @@ public final class OpenAiFeatures {
         public Engine.Decoding decoding(Tokenizer tok) {
             JsonConstraint.Schema f = format;
             byte[][] table = f == null ? null : JsonConstraint.tokenTable(tok);
+            Object masks = f == null ? null : JsonConstraint.newMaskCache(); // shared by the request's choices
             return new Engine.Decoding(logitBias, logprobs || bestOf > n, topLogprobs, echo && logprobs,
-                    f == null ? null : () -> new JsonConstraint(f, table));
+                    f == null ? null : () -> new JsonConstraint(f, table, masks));
         }
     }
 
@@ -246,6 +247,7 @@ public final class OpenAiFeatures {
         int gen = 0;
         int drafted = 0;
         int accepted = 0;
+        int forced = 0;
         double prefill = 0;
         double decode = 0;
         for (Engine.Result r : all) {
@@ -253,10 +255,11 @@ public final class OpenAiFeatures {
             gen += s.generatedTokens();
             drafted += s.draftedTokens();
             accepted += s.acceptedTokens();
+            forced += s.forcedTokens();
             prefill += s.prefillMs();
             decode += s.decodeMs();
         }
-        return new Engine.Stats(f.promptTokens(), f.cachedTokens(), gen, prefill, decode, drafted, accepted);
+        return new Engine.Stats(f.promptTokens(), f.cachedTokens(), gen, prefill, decode, drafted, accepted, forced);
     }
 
     /** A token's text: its bytes as UTF-8 (a fragment of a multi-byte character shows as U+FFFD). */

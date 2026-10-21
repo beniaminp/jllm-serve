@@ -133,6 +133,7 @@ public class OpenAiController {
         int[] prompt;
         SamplingParams params;
         OpenAiFeatures.Options o;
+        Engine.Decoding decoding;
         int echoFrom; // the prompt tokens an echo returns start here (after a BOS the engine put in front)
         String echoText = "";
         Set<String> toolNames = new HashSet<>();
@@ -157,6 +158,9 @@ public class OpenAiController {
                 echoText = rawText(body);
             }
             params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length, o.echo());
+            // tool calls are constrained to the offered functions and their schemas (docs/17 §17.7)
+            decoding = chat ? ToolCallFormat.decoding(o.decoding(tok), body, engine, prompt, o.format(),
+                    ChatSupport.thinking(body, s.getBool("chat.thinking")) && !o.json()) : o.decoding(tok);
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));
             return;
@@ -177,7 +181,6 @@ public class OpenAiController {
         boolean splitReasoning = chat && !"none".equalsIgnoreCase(Json.str(body, "reasoning_format", props.reasoningFormat()));
         boolean startsInThink = splitReasoning && ReasoningSplitter.promptOpensThink(engine, prompt);
         int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
-        Engine.Decoding decoding = o.decoding(tok);
         int count = o.count();
 
         try (LoadedModel.Slot slot = model.pick(prompt)) {

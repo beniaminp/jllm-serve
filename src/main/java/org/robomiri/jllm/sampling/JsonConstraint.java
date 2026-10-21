@@ -17,8 +17,9 @@ import java.util.WeakHashMap;
  * Constrained decoding for JSON output (OpenAI {@code response_format}): a token is allowed only when the output
  * with its bytes appended is still the prefix of a JSON value that matches the {@link Schema}. The check runs a
  * byte-level pushdown automaton (a stack of frames: object, array, string, number, literal) on a copy of the
- * current state, so testing a candidate costs a copy of a few frames plus one step per byte; a first-byte table
- * rules out most of the vocabulary at once when the sampler has to look beyond its top candidates. Once the value
+ * current state, so testing a candidate costs a copy of a few frames plus one step per byte; when the sampler has
+ * to look beyond its top candidates the whole allowed set is computed with the vocabulary trie
+ * ({@link ByteConstraint}). Once the value
  * is complete nothing more is allowed ({@link #mustEnd}); a top-level number may end at any digit ({@link #canEnd}).
  *
  * <p>Whitespace between tokens is allowed but capped at one newline and {@value #MAX_WS} bytes in a row (enough
@@ -26,7 +27,7 @@ import java.util.WeakHashMap;
  * lines forever. Strings must be valid UTF-8 without raw control
  * characters; escapes are checked (a {@code u} escape needs four hex digits).
  */
-public final class JsonConstraint implements TokenConstraint {
+public final class JsonConstraint extends ByteConstraint {
 
     /** Longest run of whitespace allowed between JSON tokens. */
     static final int MAX_WS = 64;
@@ -86,20 +87,35 @@ public final class JsonConstraint implements TokenConstraint {
 
         /** @throws IllegalArgumentException for unsupported keywords or a malformed schema, naming the problem */
         public static Schema compile(Map<String, Object> schema) {
+            return compile(schema, false);
+        }
+
+        /**
+         * @param lenient for schemas the client did not write for us (tool parameters): a keyword the automaton
+         *                cannot enforce ({@code pattern}, {@code minimum}, {@code allOf}, ...) is ignored instead of
+         *                rejected, as are tuple {@code items}, non-local {@code $ref}s and unknown types (they allow
+         *                anything), and {@code anyOf} / {@code oneOf} alternatives of the same JSON type are merged
+         *                into that type: the constraint is then looser than the schema, never stricter
+         * @throws IllegalArgumentException for a malformed schema (or, when not lenient, an unsupported keyword)
+         */
+        public static Schema compile(Map<String, Object> schema, boolean lenient) {
             Map<String, Schema> refs = new HashMap<>();
             List<Runnable> checks = new ArrayList<>();
             Schema root = new Schema(); // registered first, so that a "$ref": "#" inside finds it
             refs.put("#", root);
-            root.target = compile(schema, schema, refs, "#", checks);
+            Compiler compiler = new Compiler(schema, refs, checks, lenient);
+            root.target = compiler.compile(schema, "#");
             for (Runnable c : checks) { // with every $ref filled in
                 c.run();
             }
             return root;
         }
 
-        private static Schema compile(Object node, Map<String, Object> root, Map<String, Schema> refs, String path,
-                                      List<Runnable> checks) {
-            if (Boolean.TRUE.equals(node)) {
+        /** One compilation: the root document, the $ref targets so far, the checks to run at the end. */
+        private record Compiler(Map<String, Object> root, Map<String, Schema> refs, List<Runnable> checks,
+                                boolean lenient) {
+        private Schema compile(Object node, String path) {
+            if (Boolean.TRUE.equals(node) || (lenient && !(node instanceof Map<?, ?>))) {
                 return any();
             }
             if (!(node instanceof Map<?, ?>)) {
@@ -108,7 +124,7 @@ public final class JsonConstraint implements TokenConstraint {
             @SuppressWarnings("unchecked")
             Map<String, Object> m = (Map<String, Object>) node;
             for (String k : m.keySet()) {
-                if (!SUPPORTED.contains(k) && !IGNORED.contains(k)) {
+                if (!SUPPORTED.contains(k) && !IGNORED.contains(k) && !lenient) {
                     throw new IllegalArgumentException("JSON schema keyword '" + k + "' (at " + path + ") is not"
                             + " supported; supported: " + String.join(", ", new java.util.TreeSet<>(SUPPORTED)));
                 }
@@ -117,9 +133,18 @@ public final class JsonConstraint implements TokenConstraint {
             if (m.get("$ref") instanceof String ref) {
                 Schema t = refs.get(ref);
                 if (t == null) {
+                    Object target;
+                    try {
+                        target = pointer(root, ref);
+                    } catch (IllegalArgumentException e) {
+                        if (lenient) {
+                            return any();
+                        }
+                        throw e;
+                    }
                     t = new Schema(); // placeholder first: a recursive reference finds it
                     refs.put(ref, t);
-                    t.target = compile(pointer(root, ref), root, refs, ref, checks);
+                    t.target = compile(target, ref);
                 }
                 return t;
             } else if (m.containsKey("$ref")) {
@@ -138,7 +163,12 @@ public final class JsonConstraint implements TokenConstraint {
                         case "integer" -> T_INTEGER;
                         case "boolean" -> T_BOOLEAN;
                         case "null" -> T_NULL;
-                        default -> throw new IllegalArgumentException("unknown JSON schema type '" + t + "' at " + path);
+                        default -> {
+                            if (lenient) {
+                                yield T_ANY;
+                            }
+                            throw new IllegalArgumentException("unknown JSON schema type '" + t + "' at " + path);
+                        }
                     };
                 }
                 typed = true;
@@ -162,13 +192,24 @@ public final class JsonConstraint implements TokenConstraint {
                     }
                     Schema[] alt = new Schema[alts.size()];
                     for (int i = 0; i < alts.size(); i++) {
-                        alt[i] = compile(alts.get(i), root, refs, path + "/" + key + "/" + i, checks);
+                        alt[i] = compile(alts.get(i), path + "/" + key + "/" + i);
                     }
                     s.alternatives = alt;
+                    boolean explicit = type != null;
                     checks.add(() -> { // (an alternative may be a $ref that is not filled in yet)
                         int seen = 0;
                         for (Schema a : alt) {
                             int k = a.kinds();
+                            if ((k & seen) != 0 && lenient) { // merge: any value of the alternatives' types
+                                int all = 0;
+                                for (Schema b : alt) {
+                                    all |= b.kinds();
+                                }
+                                int t = typesOf(all);
+                                s.alternatives = null;
+                                s.types = explicit && (s.types & t) != 0 ? s.types & t : t;
+                                return;
+                            }
                             if ((k & seen) != 0) {
                                 throw new IllegalArgumentException("'" + key + "' at " + path + ": the alternatives"
                                         + " must differ in JSON type (object, array, string, number, boolean, null),"
@@ -191,7 +232,7 @@ public final class JsonConstraint implements TokenConstraint {
             if (props != null) {
                 Map<String, Schema> p = new LinkedHashMap<>();
                 for (Map.Entry<String, Object> e : props.entrySet()) {
-                    p.put(encode(e.getKey()), compile(e.getValue(), root, refs, path + "/properties/" + e.getKey(), checks));
+                    p.put(encode(e.getKey()), compile(e.getValue(), path + "/properties/" + e.getKey()));
                     names.add(e.getKey());
                 }
                 s.properties = p;
@@ -213,13 +254,16 @@ public final class JsonConstraint implements TokenConstraint {
             if (add instanceof Boolean b) {
                 s.additional = b;
             } else if (add != null) {
-                s.additionalSchema = compile(add, root, refs, path + "/additionalProperties", checks);
+                s.additionalSchema = compile(add, path + "/additionalProperties");
             }
             if (m.containsKey("items")) {
                 if (m.get("items") instanceof List<?>) {
-                    throw new IllegalArgumentException("tuple 'items' (an array of schemas) at " + path + " is not supported");
+                    if (!lenient) {
+                        throw new IllegalArgumentException("tuple 'items' (an array of schemas) at " + path + " is not supported");
+                    }
+                } else {
+                    s.items = compile(m.get("items"), path + "/items");
                 }
-                s.items = compile(m.get("items"), root, refs, path + "/items", checks);
             }
             s.minItems = count(m, "minItems", 0, path);
             s.maxItems = count(m, "maxItems", Integer.MAX_VALUE, path);
@@ -238,6 +282,14 @@ public final class JsonConstraint implements TokenConstraint {
                 throw new IllegalArgumentException("'type' at " + path + " is empty");
             }
             return s;
+        }
+        }
+
+        /** The schema types of value kinds (a number kind allows any number). */
+        private static int typesOf(int kinds) {
+            return ((kinds & K_OBJECT) != 0 ? T_OBJECT : 0) | ((kinds & K_ARRAY) != 0 ? T_ARRAY : 0)
+                    | ((kinds & K_STRING) != 0 ? T_STRING : 0) | ((kinds & K_NUMBER) != 0 ? T_NUMBER | T_INTEGER : 0)
+                    | ((kinds & K_BOOLEAN) != 0 ? T_BOOLEAN : 0) | ((kinds & K_NULL) != 0 ? T_NULL : 0);
         }
 
         private static List<?> asList(Object o, String key, String path) {
@@ -380,14 +432,89 @@ public final class JsonConstraint implements TokenConstraint {
         }
     }
 
-    private static final class State {
+    /**
+     * The automaton's state: a stack of frames. In <b>canonical</b> mode (tool-call arguments) the whitespace is
+     * fixed to what Python's {@code json.dumps} writes, the format the chat templates render tool calls in: one
+     * space after every {@code :} and {@code ,} between tokens, none anywhere else ({@code {"a": 1, "b": [1, 2]}}).
+     * The model loses nothing (it was trained on that layout) and the structure between values becomes a single
+     * possible byte sequence, which jump-forward can append without sampling.
+     */
+    static final class State implements ByteConstraint.State {
         Frame[] stack = new Frame[8];
         int depth;
         int ws;
         int nl; // newlines in the current whitespace run
+        final boolean canonical;
+        boolean needSpace; // canonical: the byte after a structural ':' or ',' must be a space
 
-        State copy() {
-            State s = new State();
+        State(boolean canonical) {
+            this.canonical = canonical;
+        }
+
+        /** The start state of a value of {@code schema}. */
+        static State start(Schema schema, boolean canonical) {
+            State s = new State(canonical);
+            s.push(s.value(schema));
+            return s;
+        }
+
+        @Override
+        public boolean canEnd() {
+            return canEndValue();
+        }
+
+        @Override
+        public boolean done() {
+            return depth == 0;
+        }
+
+        /** Inside a string value, or a key of an object that takes any key. */
+        @Override
+        public boolean wide() {
+            if (depth == 0) {
+                return false;
+            }
+            Frame f = stack[depth - 1];
+            return f.kind == F_STRING && (f.owner == null || f.owner.schema.additional);
+        }
+
+        /**
+         * The whole stack: kinds, schemas (by identity), phases, keys seen, partial key bytes, counters. Literal
+         * frames (enum matching in progress) are not memoized.
+         */
+        @Override
+        public Object key() {
+            List<Object> k = new ArrayList<>(depth * 6 + 4);
+            k.add(canonical);
+            k.add(needSpace);
+            k.add(ws);
+            k.add(nl);
+            for (int i = 0; i < depth; i++) {
+                Frame f = stack[i];
+                if (f.kind == F_LITERAL) {
+                    return null;
+                }
+                k.add(f.kind);
+                k.add(new Ident(f.schema));
+                k.add(f.phase);
+                k.add(List.of(f.seen));
+                k.add(f.key == null ? "" : f.key);
+                Schema fs = f.schema;
+                boolean counted = fs != null && (f.kind == F_STRING && f.owner == null
+                        ? fs.minLength > 0 || fs.maxLength < Integer.MAX_VALUE
+                        : f.kind == F_ARRAY && (fs.minItems > 0 || fs.maxItems < Integer.MAX_VALUE));
+                k.add(counted ? f.count : 0); // (a count without limits does not change what is allowed)
+                k.add(f.esc * 8 + f.cont);
+                k.add(f.buf == null ? "" : new String(f.buf, 0, f.len, StandardCharsets.ISO_8859_1));
+                k.add(f.num * 2 + (f.integer ? 1 : 0));
+            }
+            return k;
+        }
+
+        @Override
+        public State copy() {
+            State s = new State(canonical);
+            s.needSpace = needSpace;
             s.stack = new Frame[stack.length];
             for (int i = 0; i < depth; i++) {
                 Frame f = stack[i].copy();
@@ -418,7 +545,15 @@ public final class JsonConstraint implements TokenConstraint {
             return f;
         }
 
-        boolean feed(int b) {
+        @Override
+        public boolean feed(int b) {
+            if (needSpace) {
+                if (b != ' ') {
+                    return false;
+                }
+                needSpace = false;
+                return true;
+            }
             while (true) {
                 if (depth == 0) {
                     return false; // the value is complete: nothing may follow
@@ -440,6 +575,9 @@ public final class JsonConstraint implements TokenConstraint {
 
         /** Whitespace between tokens: at most one newline and {@value #MAX_WS} bytes in a row (indentation fits). */
         private int whitespace(int b) {
+            if (canonical) {
+                return FAIL; // (the one space after ':' and ',' is taken in feed)
+            }
             if (b == '\n' && ++nl > 1) {
                 return FAIL;
             }
@@ -566,6 +704,7 @@ public final class JsonConstraint implements TokenConstraint {
                 if (b != ':') {
                     return FAIL;
                 }
+                needSpace = canonical;
                 f.phase = P_VALUE;
                 Schema v = s.properties.get(f.key);
                 push(value(v != null ? v : s.additionalSchema != null ? s.additionalSchema : ANY));
@@ -580,6 +719,7 @@ public final class JsonConstraint implements TokenConstraint {
                     if (!canAddKey(f)) {
                         return FAIL;
                     }
+                    needSpace = canonical;
                     f.phase = P_NEXT;
                     return OK;
                 }
@@ -633,6 +773,7 @@ public final class JsonConstraint implements TokenConstraint {
                     if (f.count >= s.maxItems) {
                         return FAIL;
                     }
+                    needSpace = canonical;
                     f.phase = P_NEXT;
                     return OK;
                 }
@@ -789,7 +930,7 @@ public final class JsonConstraint implements TokenConstraint {
             return FAIL;
         }
 
-        boolean canEnd() {
+        boolean canEndValue() {
             if (depth == 0) {
                 return true;
             }
@@ -845,6 +986,19 @@ public final class JsonConstraint implements TokenConstraint {
         return w.substring(1, w.length() - 1);
     }
 
+    /** Identity wrapper, so that a memoization key compares schemas by identity. */
+    private record Ident(Object o) {
+        @Override
+        public boolean equals(Object x) {
+            return x instanceof Ident(Object other) && other == o;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(o);
+        }
+    }
+
     // ------------------------------------------------------------------ the constraint
 
     private static final Map<Tokenizer, byte[][]> TABLES = new WeakHashMap<>();
@@ -866,89 +1020,42 @@ public final class JsonConstraint implements TokenConstraint {
         }
     }
 
-    private final byte[][] tokens;
-    private State state;
-    /** For the current state: which first bytes can be valid; built once many candidates were checked. */
-    private boolean[] firstOk;
-    private int checks;
-
     /** @param tokens the bytes of each token id ({@link #tokenTable}) */
     public JsonConstraint(Schema schema, byte[][] tokens) {
-        this.tokens = tokens;
-        this.state = new State();
-        state.push(state.value(schema));
+        this(schema, tokens, false, null);
     }
 
-    /** Whether {@code text} (UTF-8) is accepted from the current state; for tests and diagnostics. */
-    public boolean allowsText(String text) {
-        State s = state.copy();
-        for (byte b : text.getBytes(StandardCharsets.UTF_8)) {
-            if (!s.feed(b & 0xff)) {
-                return false;
-            }
-        }
-        return true;
+    /**
+     * @param canonical fixed {@code json.dumps} whitespace ({@link State}) instead of free whitespace
+     * @param cache     memoized masks shared by the constraints of this schema, or null
+     */
+    JsonConstraint(Schema schema, byte[][] tokens, boolean canonical, MaskCache cache) {
+        super(tokens, State.start(schema, canonical), cache);
     }
 
-    /** Whether {@code text} (UTF-8) is accepted from the current state and completes the value; for tests. */
-    public boolean completesWith(String text) {
-        State s = state.copy();
-        for (byte b : text.getBytes(StandardCharsets.UTF_8)) {
-            if (!s.feed(b & 0xff)) {
-                return false;
-            }
-        }
-        return s.canEnd();
+    private JsonConstraint(JsonConstraint o) {
+        super(o);
     }
 
     @Override
-    public boolean allows(int token) {
-        byte[] b = token >= 0 && token < tokens.length ? tokens[token] : null;
-        if (b == null) {
-            return false;
-        }
-        if (firstOk == null && ++checks > 512) { // a scan beyond the top candidates: rule out most tokens at once
-            firstOk = new boolean[256];
-            for (int c = 0; c < 256; c++) {
-                firstOk[c] = state.copy().feed(c);
-            }
-        }
-        if (firstOk != null && !firstOk[b[0] & 0xff]) {
-            return false;
-        }
-        State s = state.copy();
-        for (byte x : b) {
-            if (!s.feed(x & 0xff)) {
-                return false;
-            }
-        }
-        return true;
+    public JsonConstraint copy() {
+        return new JsonConstraint(this);
     }
 
-    @Override
-    public void accept(int token) {
-        byte[] b = token >= 0 && token < tokens.length ? tokens[token] : null;
-        if (b == null) {
-            throw new IllegalArgumentException("token " + token + " cannot be part of JSON output");
+    /** For benchmarks: how many full allowed-token masks were computed by trie walks, and the nodes they visited. */
+    public static long[] maskStats() {
+        synchronized (ByteConstraint.class) {
+            return new long[]{masksComputed, nodesVisited};
         }
-        State s = state.copy();
-        for (byte x : b) {
-            if (!s.feed(x & 0xff)) {
-                throw new IllegalArgumentException("token " + token + " is not valid here");
-            }
-        }
-        state = s;
-        firstOk = null;
-        checks = 0;
     }
 
-    @Override
-    public boolean canEnd() {
-        return state.canEnd();
+    /** A cache of allowed-token masks for the constraints of one schema ({@link Schema} keys are by identity). */
+    public static Object newMaskCache() {
+        return new MaskCache();
     }
 
-    @Override
-    public boolean mustEnd() {
-        return state.depth == 0;
+    /** @param cache from {@link #newMaskCache}, shared by the constraints of {@code schema}; may be null */
+    public JsonConstraint(Schema schema, byte[][] tokens, Object cache) {
+        this(schema, tokens, false, (MaskCache) cache);
     }
 }

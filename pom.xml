@@ -346,6 +346,30 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- ToolCallTest: constrained tool calls, jump-forward, speculation under constraints (fake model
+                         and Qwen3-0.6B; deterministic CPU kernels so that speculative and plain greedy runs compare) -->
+                    <execution>
+                        <id>tool-call-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-Djllm.cpu.deterministic=true</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.ToolCallTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
             <plugin>

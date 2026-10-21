@@ -37,11 +37,18 @@ public final class Engine implements AutoCloseable {
     /**
      * @param draftedTokens  speculative tokens proposed for verification during this request (0 without speculation)
      * @param acceptedTokens how many of them the target model accepted
+     * @param forcedTokens   tokens a constraint forced and jump-forward appended without sampling (included in
+     *                       {@code generatedTokens})
      */
     public record Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs,
-                        int draftedTokens, int acceptedTokens) {
+                        int draftedTokens, int acceptedTokens, int forcedTokens) {
         public Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs) {
-            this(promptTokens, cachedTokens, generatedTokens, prefillMs, decodeMs, 0, 0);
+            this(promptTokens, cachedTokens, generatedTokens, prefillMs, decodeMs, 0, 0, 0);
+        }
+
+        public Stats(int promptTokens, int cachedTokens, int generatedTokens, double prefillMs, double decodeMs,
+                     int draftedTokens, int acceptedTokens) {
+            this(promptTokens, cachedTokens, generatedTokens, prefillMs, decodeMs, draftedTokens, acceptedTokens, 0);
         }
 
         public double tokPerSec() {
@@ -91,9 +98,13 @@ public final class Engine implements AutoCloseable {
                            Supplier<TokenConstraint> constraint) {
         public static final Decoding NONE = new Decoding(null, false, 0, false, null);
 
-        /** Whether every step needs its own logits on the CPU (no speculation, no pipelined greedy decoding). */
+        /**
+         * Whether every step needs its own logits on the CPU (no speculation, no jump-forward, no pipelined greedy
+         * decoding). A constraint alone does not: drafts are checked against it and forced text is appended
+         * (docs/17 §17.5); only the device-side greedy pipe, which picks tokens the CPU never sees, is off with it.
+         */
         boolean exact() {
-            return logprobs || promptLogprobs || constraint != null;
+            return logprobs || promptLogprobs;
         }
     }
 
@@ -135,6 +146,8 @@ public final class Engine implements AutoCloseable {
     private final ChatTemplate.Format template;
     private volatile PromptCache promptCache; // null = every prompt is tokenized in full
     private Speculator spec; // null = no speculative decoding
+    /** Jump-forward under constraints (docs/17 §17.7); {@code -Djllm.jump-forward=false} turns it off. */
+    private volatile boolean jumpForward = Boolean.parseBoolean(System.getProperty("jllm.jump-forward", "true"));
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
         this(backend, tokenizer, arch, eosIds, 0);
@@ -202,6 +215,14 @@ public final class Engine implements AutoCloseable {
             lock.unlock();
         }
         return true;
+    }
+
+    /**
+     * Turns jump-forward on or off: text a constraint forces ({@link TokenConstraint#jump}) is appended without
+     * sampling and fed in one pass. On by default; off makes the model write every token itself (for comparisons).
+     */
+    public void setJumpForward(boolean on) {
+        jumpForward = on;
     }
 
     public Tokenizer tokenizer() {
@@ -384,9 +405,8 @@ public final class Engine implements AutoCloseable {
         int vocab = Math.min(model.vocabSize(), tokenizer.vocabSize());
         float[] logits = new float[model.vocabSize()];
         Sampler sampler = new Sampler(p, vocab, prompt, d.logitBias());
+        // an end-of-sequence token is allowed exactly when the constrained output is complete (Sampler.sample)
         TokenConstraint con = d.constraint() == null ? null : d.constraint().get();
-        // an end-of-sequence token is allowed exactly when the constrained output is complete
-        IntPredicate allowed = con == null ? null : id -> eosIds.contains(id) ? con.canEnd() : con.allows(id);
         List<TokenLogprob> promptLp = d.promptLogprobs() ? new ArrayList<>(prompt.length) : null;
 
         // prefix cache: reuse the longest common prefix, but always recompute at least the last token
@@ -432,19 +452,18 @@ public final class Engine implements AutoCloseable {
             choices.prefilled(index, promptLp);
         }
 
-        List<Integer> out = new ArrayList<>();
-        StreamDecoder dec = new StreamDecoder(tokenizer); // strips the leading space SentencePiece decoders drop, like decode()
-        StringBuilder text = new StringBuilder();
-        String pending = ""; // text held back because it could be the start of a stop string
-        int maxStop = p.stop().stream().mapToInt(String::length).max().orElse(0);
-        String finish = "length";
-        boolean stopHit = false; // a stop string was found: everything after it is discarded
+        Out o = new Out(tokenizer, p, sink, choices, index, d.logprobs() ? new ArrayList<>() : null, d.topLogprobs(), sampler,
+                con, vocab);
         int maxTokens = Math.min(p.maxTokens(), ctx - prompt.length);
         int[] one = new int[1];
         boolean exact = d.exact(); // every step's logits are needed here: no speculation, no pipelined greedy steps
         float[] raw = d.logprobs() ? new float[vocab] : null; // the model's logits before the sampler changes them
-        List<TokenLogprob> lps = d.logprobs() ? new ArrayList<>() : null;
         Speculator sp = exact ? null : spec;
+        o.sp = sp;
+        // jump-forward: text the constraint forces is appended without sampling, fed in one pass
+        boolean jump = con != null && !exact && jumpForward;
+        int[] feed = jump ? new int[batch] : null;
+        IntPredicate isStop = eosIds::contains;
         long drafted0 = 0;
         long accepted0 = 0;
         int[] ready = null; // tokens a verification pass already decided: ready[rIdx..rLen), the first rPre accepted
@@ -459,27 +478,26 @@ public final class Engine implements AutoCloseable {
 
         // greedy without penalties on a backend that can pick the argmax itself: each plain step is queued before the
         // CPU has seen the previous token (the device feeds its own argmax), so the GPU never waits for the CPU
-        Backend.GreedyPipe pipe = sampler.greedyPlain() && !exact ? backend.greedyPipe(vocab) : null;
+        Backend.GreedyPipe pipe = sampler.greedyPlain() && !exact && con == null ? backend.greedyPipe(vocab) : null;
         Runnable drainPipe = pipe == null ? null : pipe::drain;
         boolean fromPipe = false; // the next token is the result of the oldest pipelined step
         try {
-            for (int i = 0; i < maxTokens; i++) {
+            while (o.out.size() < maxTokens) {
                 if (cancelled.getAsBoolean()) {
-                    finish = "cancelled";
+                    o.finish = "cancelled";
                     break;
                 }
                 if (con != null && con.mustEnd()) { // the constrained output is complete: end it
-                    finish = "stop";
+                    o.finish = "stop";
                     break;
                 }
                 boolean queued = rIdx < rLen;
                 if (raw != null) {
                     System.arraycopy(logits, 0, raw, 0, vocab);
                 }
-                int tok = queued ? ready[rIdx] : fromPipe ? pipe.next()
-                        : con != null ? sampler.sample(logits, allowed) : sampler.sample(logits);
+                int tok = queued ? ready[rIdx] : fromPipe ? pipe.next() : sampler.sample(logits, con, isStop);
                 if (tok < 0) { // the constraint allows no token at all (a vocabulary without the needed bytes)
-                    finish = "stop";
+                    o.finish = "stop";
                     break;
                 }
                 boolean preAccepted = queued && rIdx < rPre;
@@ -487,45 +505,37 @@ public final class Engine implements AutoCloseable {
                     rIdx++;
                 }
                 if (eosIds.contains(tok)) {
-                    finish = "stop";
+                    o.finish = "stop";
                     break;
                 }
-                if (!preAccepted) {
-                    sampler.accept(tok);
+                if (o.emit(tok, preAccepted, raw)) {
+                    break;
                 }
-                if (con != null) {
-                    con.accept(tok);
-                }
-                if (lps != null) {
-                    TokenLogprob lp = TokenLogprob.of(raw, vocab, tok, d.topLogprobs());
-                    lps.add(lp);
-                    if (choices != null) {
-                        choices.token(index, lp);
+                if (o.out.size() < maxTokens && rIdx >= rLen) { // (a queued token's K/V is already in the cache)
+                    int n = 0;
+                    if (jump) {
+                        int room = Math.min(Math.min(batch - 1, maxTokens - o.out.size()), ctx - pos - 2);
+                        int[] forced = con.jump(tokenizer, room);
+                        feed[0] = tok;
+                        for (int f : forced) {
+                            if (eosIds.contains(f) || o.emit(f, false, null)) {
+                                n = -1;
+                                break;
+                            }
+                            feed[++n] = f;
+                        }
+                        if (n < 0) {
+                            break; // a stop string in the forced text
+                        }
+                        o.jumped += n;
+                        if (n > 0 && o.out.size() >= maxTokens) {
+                            break; // nothing more will be sampled: no need to feed
+                        }
                     }
-                }
-                out.add(tok);
-                if (sp != null) {
-                    sp.onToken(tok);
-                }
-                String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
-                if (!piece.isEmpty()) {
-                    pending += piece;
-                    int hit = findStop(pending, p.stop());
-                    if (hit >= 0) {
-                        emit(pending.substring(0, hit), text, sink);
-                        pending = "";
-                        stopHit = true;
-                        finish = "stop";
-                        break;
-                    }
-                    int safe = maxStop == 0 ? pending.length() : Math.max(0, pending.length() - maxStop + 1);
-                    if (safe > 0) {
-                        emit(pending.substring(0, safe), text, sink);
-                        pending = pending.substring(safe);
-                    }
-                }
-                if (i + 1 < maxTokens && rIdx >= rLen) { // (a queued token's K/V is already in the cache)
-                    if (sp != null && sp.step(tok, pos, ctx, maxTokens - i - 1, sampler, drainPipe)) {
+                    if (n > 0) { // tok and the forced tokens in one pass, like a prefill chunk
+                        backend.forward(feed, 0, n + 1, pos, logits);
+                        pos += n + 1;
+                    } else if (sp != null && sp.step(tok, pos, ctx, maxTokens - o.out.size(), sampler, drainPipe, con)) {
                         ready = sp.ready();
                         rIdx = 0;
                         rLen = sp.readyCount();
@@ -537,7 +547,7 @@ public final class Engine implements AutoCloseable {
                             pipe.submit(tok, pos); // else the step feeding tok at pos is already in flight
                         }
                         pos++;
-                        if (i + 2 < maxTokens) {
+                        if (o.out.size() + 1 < maxTokens) {
                             pipe.submit(-1, pos); // feeds the token the step above will choose
                         }
                         fromPipe = true;
@@ -553,6 +563,13 @@ public final class Engine implements AutoCloseable {
                 pipe.drain(); // steps queued past the end write cache rows that are simply overwritten later
             }
         }
+        List<Integer> out = o.out;
+        StreamDecoder dec = o.dec;
+        StringBuilder text = o.text;
+        String pending = o.pending;
+        String finish = o.finish;
+        boolean stopHit = o.stopHit;
+        List<TokenLogprob> lps = o.lps;
         if (!stopHit) { // EOS, length or cancelled: release the held-back text plus any incomplete UTF-8 sequence
             emit(pending + dec.flush(), text, sink);
         }
@@ -569,8 +586,92 @@ public final class Engine implements AutoCloseable {
 
         int[] tokens = out.stream().mapToInt(Integer::intValue).toArray();
         Stats stats = new Stats(prompt.length, reuse, tokens.length, (t1 - t0) / 1e6, (t2 - t1) / 1e6,
-                sp == null ? 0 : (int) (sp.drafted() - drafted0), sp == null ? 0 : (int) (sp.accepted() - accepted0));
+                sp == null ? 0 : (int) (sp.drafted() - drafted0), sp == null ? 0 : (int) (sp.accepted() - accepted0),
+                o.jumped);
         return new Result(text.toString(), tokens, finish, stats, lps, promptLp);
+    }
+
+
+    /** The output of one sequence as it is produced: tokens, streamed text, stop strings, logprobs. */
+    private static final class Out {
+        final SamplingParams p;
+        final TextSink sink;
+        final ChoiceSink choices;
+        final int index;
+        final List<TokenLogprob> lps;
+        final int top;
+        final Sampler sampler;
+        final TokenConstraint con;
+        final int vocab;
+        final int maxStop;
+        Speculator sp;
+        final List<Integer> out = new ArrayList<>();
+        final StreamDecoder dec;
+        final StringBuilder text = new StringBuilder();
+        String pending = ""; // text held back because it could be the start of a stop string
+        String finish = "length";
+        boolean stopHit; // a stop string was found: everything after it is discarded
+        int jumped; // tokens appended by jump-forward
+
+        Out(Tokenizer tok, SamplingParams p, TextSink sink, ChoiceSink choices, int index, List<TokenLogprob> lps,
+            int top, Sampler sampler, TokenConstraint con, int vocab) {
+            this.p = p;
+            this.sink = sink;
+            this.choices = choices;
+            this.index = index;
+            this.lps = lps;
+            this.top = top;
+            this.sampler = sampler;
+            this.con = con;
+            this.vocab = vocab;
+            this.maxStop = p.stop().stream().mapToInt(String::length).max().orElse(0);
+            this.dec = new StreamDecoder(tok); // strips the leading space SentencePiece decoders drop, like decode()
+        }
+
+        /**
+         * Appends a token that is not end-of-sequence: penalties (unless the sampler saw it already), constraint,
+         * logprob, speculation history, text and stop strings.
+         *
+         * @param raw the model's logits for the logprob, or null
+         * @return true when a stop string ended the output
+         */
+        boolean emit(int tok, boolean preAccepted, float[] raw) {
+            if (!preAccepted) {
+                sampler.accept(tok);
+            }
+            if (con != null) {
+                con.accept(tok);
+            }
+            if (lps != null) {
+                TokenLogprob lp = TokenLogprob.of(raw, vocab, tok, top);
+                lps.add(lp);
+                if (choices != null) {
+                    choices.token(index, lp);
+                }
+            }
+            out.add(tok);
+            if (sp != null) {
+                sp.onToken(tok);
+            }
+            String piece = dec.push(tok); // id-based: lets the decoder apply the first-token rules (Metaspace)
+            if (!piece.isEmpty()) {
+                pending += piece;
+                int hit = findStop(pending, p.stop());
+                if (hit >= 0) {
+                    Engine.emit(pending.substring(0, hit), text, sink);
+                    pending = "";
+                    stopHit = true;
+                    finish = "stop";
+                    return true;
+                }
+                int safe = maxStop == 0 ? pending.length() : Math.max(0, pending.length() - maxStop + 1);
+                if (safe > 0) {
+                    Engine.emit(pending.substring(0, safe), text, sink);
+                    pending = pending.substring(safe);
+                }
+            }
+            return false;
+        }
     }
 
     /**

@@ -83,8 +83,10 @@ public final class Sampler {
 
     /**
      * Samples the next token among those {@code allowed} accepts (constrained decoding), or returns -1 when none
-     * is. The constraint is checked lazily: the {@value #CONSTRAINED_POOL} most likely tokens (after penalties and
-     * bias) are tested, most likely first; only if none of them is allowed is the whole vocabulary scanned. Greedy
+     * is. Greedy first tests the argmax: when the model's own choice is allowed (most steps) that is the answer and
+     * nothing else is checked. Otherwise the constraint is checked lazily: the {@value #CONSTRAINED_POOL} most likely
+     * tokens (after penalties and bias) are tested, most likely first; only if none of them is allowed is the whole
+     * vocabulary scanned (the constraint then computes its full allowed set once, {@link ByteConstraint}). Greedy
      * takes the first allowed token. Sampling draws from the allowed tokens among those candidates, renormalized:
      * top-k keeps the k most likely allowed tokens, top-p and min-p apply to the renormalized distribution, so the
      * tail beyond the candidates (negligible next to them) is left out. {@code logits} is modified in place.
@@ -94,24 +96,132 @@ public final class Sampler {
             return sample(logits);
         }
         applyPenalties(logits);
+        return masked(logits, allowed, -1, null);
+    }
+
+    /**
+     * {@link #verify(float[], int)} under a constraint: the result is distributed like
+     * {@link #sample(float[], IntPredicate)} and equals {@code draft} (an allowed token) exactly when the draft is
+     * accepted. Greedy: the masked argmax, whatever the draft.
+     */
+    public int verify(float[] logits, int draft, IntPredicate allowed) {
+        if (allowed == null) {
+            return verify(logits, draft);
+        }
+        applyPenalties(logits);
+        return masked(logits, allowed, draft, null);
+    }
+
+    /**
+     * Sampling where nearly everything is allowed ({@link TokenConstraint#relaxed}, free text between tool calls):
+     * a plain sample, kept when {@code allowed} accepts it; otherwise a masked sample ({@link #sample(float[],
+     * IntPredicate)}). The result is distributed exactly as the plain distribution restricted to the allowed tokens
+     * whenever the masked fallback covers them (p(x) + (1 − A) p(x) / A = p(x) / A for an allowed x, A the allowed
+     * mass), and free text is the unconstrained text token for token.
+     */
+    public int sampleRelaxed(float[] logits, IntPredicate allowed) {
+        applyPenalties(logits);
+        int t = build(logits) ? draw(logits) : argmax(logits);
+        return allowed.test(t) ? t : masked(logits, allowed, -1, null);
+    }
+
+    /** {@link #verify(float[], int)} where nearly everything is allowed; the fallback as in {@link #sampleRelaxed}. */
+    public int verifyRelaxed(float[] logits, int draft, IntPredicate allowed) {
+        applyPenalties(logits);
+        int t;
+        if (!build(logits)) {
+            t = argmax(logits);
+        } else {
+            t = -1;
+            for (int i = 0; i < keep && t < 0; i++) {
+                if (idx[i] == draft) {
+                    if (val[i] > 0 && rng.nextDouble() * total < val[i]) {
+                        t = draft;
+                    } else {
+                        total -= val[i];
+                        val[i] = 0f;
+                    }
+                    break;
+                }
+            }
+            if (t < 0) {
+                t = draw(logits);
+            }
+        }
+        return allowed.test(t) ? t : masked(logits, allowed, -1, null);
+    }
+
+    /**
+     * The next token under {@code c} (null = unconstrained): an end-of-sequence token ({@code isStop}) is allowed
+     * exactly when the constrained output may end. Relaxed states sample as {@link #sampleRelaxed}.
+     *
+     * @return the token, or -1 when the constraint allows none
+     */
+    public int sample(float[] logits, TokenConstraint c, IntPredicate isStop) {
+        if (c == null) {
+            return sample(logits);
+        }
+        IntPredicate allowed = id -> isStop.test(id) ? c.canEnd() : c.allows(id);
+        if (c.relaxed()) {
+            return sampleRelaxed(logits, allowed);
+        }
+        applyPenalties(logits);
+        return masked(logits, allowed, -1, c);
+    }
+
+    /** {@link #verify(float[], int)} under {@code c} (null = unconstrained), like {@link #sample(float[], TokenConstraint, IntPredicate)}. */
+    public int verify(float[] logits, int draft, TokenConstraint c, IntPredicate isStop) {
+        if (c == null) {
+            return verify(logits, draft);
+        }
+        IntPredicate allowed = id -> isStop.test(id) ? c.canEnd() : c.allows(id);
+        if (c.relaxed()) {
+            return verifyRelaxed(logits, draft, allowed);
+        }
+        applyPenalties(logits);
+        return masked(logits, allowed, draft, c);
+    }
+
+    /**
+     * The masked choice (penalties already applied): candidates, then greedy pick or a draw; with {@code draft >= 0}
+     * the speculative accept / resample rule over the masked distribution.
+     *
+     * @param c when not null and the output may not end here, its {@link TokenConstraint#allowedTokens} (if any)
+     *          are the candidates, instead of the allowed tokens among the most likely of the whole vocabulary
+     */
+    private int masked(float[] logits, IntPredicate allowed, int draft, TokenConstraint c) {
         boolean greedy = p.temperature() == 0f || p.topK() == 1;
+        if (greedy) {
+            int a = argmax(logits);
+            if (allowed.test(a)) {
+                return a;
+            }
+        }
         int want = greedy ? 1 : p.topK() > 0 ? Math.min(p.topK(), CONSTRAINED_POOL) : CONSTRAINED_POOL;
         int pool = Math.min(vocab, CONSTRAINED_POOL);
         if (cIdx == null) {
             cIdx = new int[pool];
             cVal = new float[pool];
         }
-        int m = topK(logits, pool, cIdx, cVal, null);
-        int n = 0;
-        for (int i = 0; i < m && n < want; i++) {
-            if (allowed.test(cIdx[i])) {
-                cIdx[n] = cIdx[i];
-                cVal[n] = cVal[i];
-                n++;
+        boolean listed = c != null && !c.canEnd(); // (the list leaves out end-of-sequence tokens)
+        int[] list = listed ? c.allowedTokens(false) : null;
+        int n;
+        if (list != null) { // the whole allowed set is known and small: no pass over the vocabulary
+            n = topOf(list, logits, want);
+        } else {
+            n = 0;
+            int m = topK(logits, pool, cIdx, cVal, null);
+            for (int i = 0; i < m && n < want; i++) {
+                if (allowed.test(cIdx[i])) {
+                    cIdx[n] = cIdx[i];
+                    cVal[n] = cVal[i];
+                    n++;
+                }
             }
-        }
-        if (n == 0 && m < vocab) { // nothing likely is allowed: search everything
-            n = topK(logits, want, cIdx, cVal, allowed);
+            if (n == 0 && m < vocab) { // nothing likely is allowed: the allowed set, or else a search of everything
+                list = listed ? c.allowedTokens(true) : null;
+                n = list != null ? topOf(list, logits, want) : topK(logits, want, cIdx, cVal, allowed);
+            }
         }
         if (n == 0) {
             return -1;
@@ -144,6 +254,18 @@ public final class Sampler {
             }
             t += cVal[i];
         }
+        if (draft >= 0) {
+            for (int i = 0; i < kept; i++) {
+                if (cIdx[i] == draft) {
+                    if (cVal[i] > 0 && rng.nextDouble() * t < cVal[i]) {
+                        return draft;
+                    }
+                    t -= cVal[i];
+                    cVal[i] = 0f;
+                    break;
+                }
+            }
+        }
         double r = rng.nextDouble() * t;
         double acc = 0;
         for (int i = 0; i < kept; i++) {
@@ -152,7 +274,37 @@ public final class Sampler {
                 return cIdx[i];
             }
         }
+        for (int i = 0; i < kept; i++) { // rounding: the last token with weight
+            if (cVal[kept - 1 - i] > 0) {
+                return cIdx[kept - 1 - i];
+            }
+        }
         return cIdx[0];
+    }
+
+    /** The {@code want} most likely of {@code list} into cIdx/cVal, sorted descending; returns how many. */
+    private int topOf(int[] list, float[] logits, int want) {
+        int n = 0;
+        for (int id : list) {
+            if (id >= vocab) {
+                continue;
+            }
+            float x = logits[id];
+            if (n < want) {
+                cVal[n] = x;
+                cIdx[n] = id;
+                siftUp(cIdx, cVal, n++);
+            } else if (x > cVal[0]) {
+                cVal[0] = x;
+                cIdx[0] = id;
+                siftDown(cIdx, cVal, 0, n);
+            }
+        }
+        for (int end = n - 1; end > 0; end--) {
+            swap(cIdx, cVal, 0, end);
+            siftDown(cIdx, cVal, 0, end);
+        }
+        return n;
     }
 
     /**
@@ -193,6 +345,11 @@ public final class Sampler {
      */
     private boolean prepare(float[] logits) {
         applyPenalties(logits);
+        return build(logits);
+    }
+
+    /** {@link #prepare} without the penalties (already applied). */
+    private boolean build(float[] logits) {
         if (p.temperature() == 0f || p.topK() == 1) {
             return false;
         }

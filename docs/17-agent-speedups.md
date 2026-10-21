@@ -15,6 +15,7 @@ simply first and then exactly:
 | [17.4](#174-pipelined-decoding-on-the-gpu) | the GPU runs the next step before the CPU has looked at the last one | `Backend.GreedyPipe`, `MetalBackend.Pipe` |
 | [17.5](#175-tokenizing-only-what-is-new) | a resent conversation is tokenized only from where it is new | `tokenizer/PromptCache`, `Tokenizer.SequenceEncoder` |
 | [17.6](#176-noticing-a-client-that-left) | a request nobody waits for stops within one prefill chunk or one token | `web/chat/ClientGone` |
+| [17.7](#177-constrained-tool-calls-and-jump-forward) | tool calls that are always valid, their fixed parts written without sampling | `sampling/ToolCallConstraint`, `ByteConstraint`, `TokenTrie`, `web/tools/ToolCallFormat` |
 
 ---
 
@@ -314,3 +315,157 @@ within about one forward call and no token to be fed afterwards. **Measured** (o
 decoding (19 of 2 000 tokens generated) and 156 ms after it left half-way through a 3 001-token prefill; streaming,
 25 ms and 166 ms. Before, the non-streaming request would have run to its 2 000 tokens (40 s) and the stream until
 the next keep-alive comment failed.
+## 17.7 Constrained tool calls and jump-forward
+
+🧸 Filling in a form is easier than writing a letter: the boxes and their labels are printed already, you only write
+the answers, and the form will not let you write a phone number where the date goes. A tool call is such a form —
+`<tool_call>`, `{"name": "`, one of the tool names, `", "arguments": {`, the fields — so jllm-serve prints the fixed
+parts itself, all at once, and only lets the model write answers that fit their boxes. The model cannot produce a
+broken call, and it spends no time writing the labels.
+
+📐 Coding agents live on tool calls, and a small model's most common failure is a malformed one: a missing brace, a
+misspelled tool, a string where the schema wants an integer, a key the tool does not have. Each costs a round trip
+(the agent reports the error and the model tries again). Four mechanisms remove that failure and make the calls
+cheaper to produce.
+
+**The constraint** (`sampling/ToolCallConstraint`). A byte-level automaton over the whole output:
+
+```
+free text ── "<tool_call>" ──▶ "\n{\"name\": \"" NAME "\", \"arguments\": " ARGS "}\n</tool_call>" ──▶ free text …
+    │                                   │                                      │
+    └─ "<think>" … "</think>" (free)     one of the tools' names               JSON object matching that tool's
+                                         (a trie over the names)                parameters (JsonConstraint, canonical)
+```
+
+Free text is not constrained (`TokenConstraint.relaxed()`: the sampler draws as if unconstrained and only falls back
+to the masked distribution when the drawn token would start a malformed call, so free text is token for token the
+unconstrained text). The constraint switches on when the bytes `<tool_call>` complete — whether the model wrote
+Qwen's single added token or spelled it out — and off after `</tool_call>`; text inside a `<think>` block is free (a
+call written while thinking is not a call, as `ToolCallFormat.parse` agrees). Inside a call, the envelope is fixed
+text in exactly the layout the Qwen templates render calls in (`{"name": …, "arguments": …}`, Python `json.dumps`
+spacing), the name is checked against a trie of the tools' (JSON-escaped) names, and the arguments run through the
+`response_format` automaton ([10 §10.6](10-engine-and-server.md#more-than-one-answer-probabilities-and-structured-output))
+in **canonical** whitespace mode: exactly one space after every `:` and `,` between tokens, none elsewhere. Earlier
+calls in the conversation are rendered the same way (`ToolCallFormat.canonical`), so the model sees one layout.
+
+The parameter schemas are compiled **leniently** (`Schema.compile(schema, true)`): agents send schemas they did not
+write for us, full of `pattern`, `minimum`, `format`, `allOf`, `$schema`. What the automaton can enforce is enforced —
+`type`, `properties`, `required`, `additionalProperties`, `enum`/`const`, `items`, `anyOf`/`oneOf` of different
+JSON types, string/array lengths, local `$ref` — and any other keyword, a tuple `items`, a non-local `$ref` or an
+unknown type allows anything; `anyOf` alternatives of the same JSON type (two object shapes, say) are merged into
+"any value of that type". The constraint is then looser than the schema, never stricter, so a valid call is never
+refused. Arguments are always an object.
+
+| `tool_choice` | constraint |
+|---|---|
+| `"auto"` (default) | calls optional; free text free; the end of the turn allowed outside a call |
+| `"required"` | the reply must start with `<tool_call>` (after a `<think>` block if Qwen3 thinks); the turn may end only after a call |
+| `{"function": {"name": "f"}}` | as required, and only `f` (an unknown name is a 400) |
+| `"none"` | no tools, no constraint |
+| with `response_format` | the reply is calls, or the JSON answer matching the format (`"tools"` + `"response_format"` was a 400 before) |
+
+**Jump-forward** (`TokenConstraint.jump`, `ByteConstraint.forcedBytes`). Whenever the automaton allows exactly one
+next byte (and the output may not end), that byte is forced; the run of forced bytes is the *forced text*. After
+`<tool_call>` it is `\n{"name": "`; once the name prefix is unambiguous (`get_w` → `eather`), the rest of the name
+plus `", "arguments": {`; inside the arguments, `"` after `{` when a key is required, the rest of a key once only one
+unused key of a closed object fits, `: ` after a key, the rest of an enum value, of `true`/`false`/`null`; after the
+arguments, `}\n</tool_call>`. Computing it: try the 256 byte values on copies of the state and stop at the second
+accepted one; repeat. The engine then appends the forced tokens without sampling and runs them, together with the
+token just sampled, through the model in **one** `forward` call — a prefill chunk — instead of one pass per token:
+
+```
+sample tok → constraint.accept(tok) → forced = constraint.jump(tokenizer, room)
+emit tok, forced[0..k)                     (stop strings, max_tokens, logprob bookkeeping as for sampled tokens)
+backend.forward([tok, forced...], pos)     one pass, the logits after the last forced token
+```
+
+*Tokenization.* The forced text is encoded with the model's own tokenizer as ordinary text (`encode(text, false)`:
+added tokens such as `</tool_call>` still match, special ones cannot appear), i.e. the way the model saw such text in
+training, and each token is checked to spell the forced bytes and to be accepted by the constraint. The forced text
+is first cut back to whole UTF-8 characters. The **last** token is held back unless no vocabulary token extends it
+(`TokenTrie.extendable`): at the boundary between forced and free text the model's natural tokenization may merge
+across it — after the forced `": "` the model would rather write ` "Paris` than `"` + `Paris` — so the model picks
+that token itself, from the constrained choices (which include the held-back token, longer tokens that continue the
+forced text into the free part, and shorter ones). An added token like `</tool_call>` is never extended, so the
+closing of a call is committed whole. Example on the Qwen3 vocabulary: after `<tool_call>`, the forced head
+`\n{"name": "` becomes `\n` `{"` `name` `":` (4 tokens in one pass) and ` "` is left to the model; after the
+arguments, `}\n</tool_call>` is `}\n` `</tool_call>`, both committed. The output always parses: it is accepted by the
+same automaton that defines a valid call. Jump-forward is off with `logprobs` (forced tokens have no distribution),
+and `Engine.setJumpForward(false)` / `-Djllm.jump-forward=false` turns it off for comparisons.
+
+**Speculation under the constraint** ([10 §10.9](10-engine-and-server.md#109-speculative-decoding)). Previously a JSON
+constraint switched speculation off. Now prompt-lookup or draft-model drafts are checked against copies of the
+constraint and cut at the first disallowed token (tool calls repeat the shapes of earlier calls, so prompt lookup
+drafts them well), and each verification row is decided by the constrained sampling rule against the constraint as
+it stands at that row. Greedy output is exactly the plain constrained greedy output: `ToolCallTest` checks it on a
+scripted fake model (whose logits depend on the whole cached history) and on Qwen3-0.6B with deterministic CPU
+kernels, with and without jump-forward.
+
+**Cheaper masks** (`ByteConstraint`, `TokenTrie`). Per step the old path took the 256 most likely tokens (a heap
+pass over 151 936 logits) and tested them; when none was allowed it tested the whole vocabulary token by token. Now:
+
+1. *argmax first* (greedy): the model's own choice is checked first; usually it is allowed and nothing else runs;
+2. *trie mask*: when a search goes beyond 300 candidates, the allowed set is computed once by walking a byte trie of
+   the vocabulary alongside the automaton (shared prefixes tested once, a refused byte prunes its subtree; ~780
+   nodes visited per structural state on the Qwen3 vocabulary, instead of 151 669 tokens fed one by one), and later
+   checks are bit tests;
+3. *memoized masks*: a mask is cached under the automaton state's key (the frame stack with schemas by identity), per
+   schema / tool set, and the compiled tool sets are kept across requests (`ToolCallFormat`: agents resend the same
+   tools every time), so a recurring state — the start of a tool's arguments, the position after a value — costs a
+   lookup;
+4. *small allowed lists*: where the allowed set is small (≤ 2 048 tokens: structural positions, keys of a closed
+   object, enum values, the envelope) and the walk stays under 6 000 nodes, the constraint hands the sampler the list
+   (`TokenConstraint.allowedTokens`), which picks among those tokens without any pass over the vocabulary. The walk is
+   done at once when the most likely tokens contain nothing allowed, otherwise the second time a state is met (the
+   memo marks it the first time), so one-off states never pay for it; string contents (most of the vocabulary
+   allowed) are never walked.
+
+**Measured.** All on the shared 4-core test machine under heavy load from other jobs (load average 20–30), so treat
+the numbers as ±30 %.
+
+*Per-token cost of the mask* (`ConstraintBench`: the Qwen3 vocabulary, a teacher-forced 68-token tool-argument object
+with a closed schema, Gaussian-noise logits; µs per sampling call, best of 10–25 rounds; "warm" = the rounds share the
+mask memo, as the requests of an agent sharing a tool set do):
+
+| logits | sampling | before | after, cold | after, warm |
+|---|---|---|---|---|
+| model agrees (reference token on top) | greedy | 420 | 95 | 106 |
+| | T = 0.7 | 436 | 545 | 300 |
+| distracted (40 other tokens above it) | greedy | 331 | 239 | 127 |
+| | T = 0.7 | 550 | 452 | 408 |
+| disagrees (nothing allowed in the top 256 at structural positions) | greedy | 1 422 | 350 | 144 |
+| | T = 0.7 | 2 414 | 545 | 292 |
+
+Greedy decoding costs a single argmax pass when the model agrees (the floor: unconstrained greedy pays the same pass)
+and at most a few hundred µs otherwise, against ~25–40 ms for a forward pass of Qwen3-0.6B; the worst case
+(a full-vocabulary search) dropped from 1.4–2.4 ms to 0.15–0.55 ms. Cold sampled decoding of agreeing logits got a
+little slower (the second visit of a state pays for its walk); warm it is faster everywhere.
+
+*Jump-forward and speculation* (`ToolCallTest`, Qwen3-0.6B Q8_0, CPU, 2 threads, a 76-token prompt, the 32-token
+call `<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", "days": 3, "unit": "celsius"}}\n</tool_call>`
+with `tool_choice: "required"`, greedy):
+
+| | forced tokens | decode time |
+|---|---|---|
+| constrained, every token sampled | 0 | 11.5 s |
+| + prompt-lookup speculation | 0 (10 of 14 drafts accepted) | 8.5 s |
+| + jump-forward | 18 of 32 | **4.6 s** |
+| + jump-forward and speculation | 18 (4 of 8 drafts accepted) | 5.5 s |
+
+The output is the same call in all four. Jump-forward removes 18 of the 32 passes (the head, the name once
+unambiguous, the key and value openings, the closing): 2.5× here; speculation adds nothing on top in this short call
+because the text it would have drafted is the text jump-forward already forced. On the scripted fake model the same
+holds for pass counts: 78 passes without either, 63 with speculation, 48 with jump-forward, for a 77-token reply with
+two calls. With deterministic CPU kernels (`-Djllm.cpu.deterministic=true`) the speculative constrained output equals
+the plain constrained output token for token, with and without jump-forward (`ToolCallTest`).
+
+*Reliability.* Every call the constrained engine writes parses and matches the schema subset: on the fake model that
+is tempted by line breaks and tabs inside the call (`ToolCallTest`, `ToolCallApiTest`) and on Qwen3-0.6B. What the
+constraint cannot do is choose *well*: a model that wants to answer in prose is forced, under `"required"`, into a
+call whose argument values it then has to invent.
+
+*Costs and limits.* The device-side greedy pipe ([17.4](#174-pipelined-decoding-on-the-gpu)) is off for constrained
+requests (it picks tokens the CPU never checks); `logprobs` turn jump-forward off. The layout of a call is fixed to the
+Hermes / Qwen one; families whose own tool format differs (Llama 3's bare JSON, Mistral's `[TOOL_CALLS]`) are served
+through the same Hermes prompt, as before. The console's own chat (`/api/chat`) is not constrained yet; the `/v1`
+endpoints are.
