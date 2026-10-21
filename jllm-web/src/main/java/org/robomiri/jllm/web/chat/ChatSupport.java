@@ -176,11 +176,12 @@ public final class ChatSupport {
         return (semi >= 0 ? contentType.substring(0, semi) : contentType).trim().equalsIgnoreCase("application/json");
     }
 
-    /** Rejects request features the engine cannot honour rather than silently ignoring them. */
+    /**
+     * Rejects request features the engine cannot honour rather than silently ignoring them, and checks the tool
+     * fields. The other OpenAI extras ({@code n}, {@code logprobs}, {@code response_format}, ...) are validated by
+     * {@code OpenAiFeatures.parse}.
+     */
     public static void checkUnsupported(Map<String, Object> b, boolean chat) {
-        if (Json.num(b, "n", 1) != 1) {
-            throw RequestError.invalid("'n' other than 1 is not supported");
-        }
         Object tools = b.get("tools");
         if (tools != null && !chat) {
             throw RequestError.invalid("'tools' is only supported on /v1/chat/completions");
@@ -202,25 +203,10 @@ public final class ChatSupport {
             throw RequestError.invalid("'tool_choice' must be \"none\", \"auto\", \"required\" or {\"type\": \"function\", \"function\": {\"name\": ...}}");
         }
         Map<String, Object> format = Json.map(b, "response_format");
-        if (format != null && !"text".equals(Json.str(format, "type", "text"))) {
-            throw RequestError.invalid("'response_format' other than text is not supported");
-        }
-        Object logprobs = b.get("logprobs");
-        if (Boolean.TRUE.equals(logprobs) || logprobs instanceof Number n && n.intValue() != 0) {
-            throw RequestError.invalid("'logprobs' is not supported");
-        }
-        Map<String, Object> bias = Json.map(b, "logit_bias");
-        if (bias != null && !bias.isEmpty()) {
-            throw RequestError.invalid("'logit_bias' is not supported");
-        }
-        if (Boolean.TRUE.equals(b.get("echo"))) {
-            throw RequestError.invalid("'echo' is not supported");
-        }
-        if (b.get("suffix") != null) {
-            throw RequestError.invalid("'suffix' is not supported");
-        }
-        if (Json.num(b, "best_of", 1) != 1) {
-            throw RequestError.invalid("'best_of' other than 1 is not supported");
+        if (tools instanceof List<?> l && !l.isEmpty() && !"none".equals(choice) && format != null
+                && !"text".equals(Json.str(format, "type", "text"))) {
+            throw RequestError.invalid("'response_format' cannot be combined with 'tools': the JSON constraint would"
+                    + " keep the model from calling them");
         }
         if (!chat && b.get("prompt") instanceof List<?> l && (l.size() != 1 || !(l.getFirst() instanceof String))) {
             throw RequestError.invalid("'prompt' must be a string or a single-element array of strings"
@@ -278,6 +264,14 @@ public final class ChatSupport {
 
     /** @param room how many tokens the context has left after the prompt (at least 1) */
     public static SamplingParams params(Map<String, Object> b, SamplingParams d, int room) {
+        return params(b, d, room, false);
+    }
+
+    /**
+     * @param room      how many tokens the context has left after the prompt (at least 1)
+     * @param allowZero whether {@code max_tokens: 0} is valid (an echo that only scores the prompt)
+     */
+    public static SamplingParams params(Map<String, Object> b, SamplingParams d, int room, boolean allowZero) {
         List<String> stop = new ArrayList<>();
         Object s = b.get("stop");
         if (s instanceof String str) {
@@ -288,8 +282,8 @@ public final class ChatSupport {
             }
         }
         long maxTokens = Json.num(b, "max_completion_tokens", Json.num(b, "max_tokens", d.maxTokens()));
-        if (maxTokens <= 0) {
-            throw RequestError.invalid("max_tokens must be at least 1");
+        if (maxTokens < (allowZero ? 0 : 1)) {
+            throw RequestError.invalid("max_tokens must be at least " + (allowZero ? 0 : 1));
         }
         maxTokens = Math.min(maxTokens, room);
         return new SamplingParams(
