@@ -288,9 +288,36 @@ public final class WhisperMetal implements WhisperNet {
     public Session encode(float[][] mel) {
         lock.lock();
         try {
-            return encodeLocked(mel);
+            for (int attempt = 0; ; attempt++) {
+                try {
+                    return encodeLocked(mel);
+                } catch (IllegalStateException e) {
+                    if (!transient_(e) || attempt >= 2) {
+                        throw e;
+                    }
+                    pause(attempt);
+                }
+            }
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * macOS kills a command buffer when the GPU is too busy to answer the display ("Impacting Interactivity") or has been
+     * reset; the work is idempotent (every pass starts from uploaded inputs), so a pass is tried again a little later.
+     */
+    private static boolean transient_(IllegalStateException e) {
+        String m = String.valueOf(e.getMessage());
+        return m.contains("command buffer failed");
+    }
+
+    private static void pause(int attempt) {
+        System.err.println("whisper: the GPU refused a command buffer, trying again");
+        try {
+            Thread.sleep(250L * (attempt + 1));
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -415,7 +442,17 @@ public final class WhisperMetal implements WhisperNet {
             try {
                 for (int done = 0; done < n; done += DEC_CHUNK) {
                     int m = Math.min(DEC_CHUNK, n - done);
-                    chunk(this, tokens, off + done, m, pos + done, done + m == n ? logits : null);
+                    for (int attempt = 0; ; attempt++) {
+                        try {
+                            chunk(this, tokens, off + done, m, pos + done, done + m == n ? logits : null);
+                            break;
+                        } catch (IllegalStateException e) {
+                            if (!transient_(e) || attempt >= 2) {
+                                throw e;
+                            }
+                            pause(attempt);
+                        }
+                    }
                 }
             } finally {
                 lock.unlock();
