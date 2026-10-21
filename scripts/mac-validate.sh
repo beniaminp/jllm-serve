@@ -93,6 +93,10 @@ bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off
 bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
 bench "q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off
+bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 0 --engine.speculative off
+bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
+bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200
+bench "~2000-token prompt: q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off --bench.prompt-repeat 200
 # draft-model speculation on the GPU (the draft is the dense model itself: every draft is accepted, so this measures
 # what a pass of k drafts costs against k plain steps; a real draft is smaller and accepts less)
 bench "speculation off" "$DENSE" "" --engine.speculative off
