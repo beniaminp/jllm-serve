@@ -385,7 +385,7 @@ public final class CpuBackend implements Backend {
             if (!p.attention().runRows(l, owners, positions)) {
                 throw new IllegalStateException("layer " + l + " cannot attend per row"); // kv != null: GQA only
             }
-            p.residual().add(L.wo(), att, L.postAttnNorm(), n);
+            p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
         }
