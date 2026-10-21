@@ -66,7 +66,7 @@ const AudioEditor = (() => {
         <input id="ed-smin" type="number" step="0.1" min="0.05" value="0.5" aria-label="Minimum silence in seconds" style="width:52px"><span class="muted small">min s</span>
         <input id="ed-skeep" type="number" step="0.05" min="0" value="0.1" aria-label="Seconds to keep" style="width:52px"><span class="muted small">keep s</span></div>
         <div class="row"><button id="ed-sprev">Preview</button><button id="ed-sgo">Remove</button><span id="ed-smsg" class="muted small"></span></div></div>
-      <div class="au-op"><h4>Mix another clip in at the cursor</h4><div class="row">
+      <div class="au-op"><h4>Mix another clip in (at the cursor or selection start)</h4><div class="row">
         <button id="ed-mfile">Load…</button><input type="file" id="ed-mfile-in" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg" class="hidden">
         <button id="ed-mspeech" title="The last clip made in Text to speech">Generated speech</button>
         <button id="ed-mstt" title="The clip loaded in Speech to text">Transcribed clip</button></div>
@@ -617,7 +617,7 @@ const AudioEditor = (() => {
     el('ed-mgain').addEventListener('input', () => { el('ed-mgain-v').textContent = el('ed-mgain').value + ' dB'; });
     on('ed-mix', () => op('Mix', () => {
       if (!S.second) return;
-      commit(E.mix(S.clip, S.second.clip, S.cursor, +el('ed-mgain').value), {cursor: S.cursor});
+      commit(E.mix(S.clip, S.second.clip, hasSel() ? S.sel.a : S.cursor, +el('ed-mgain').value), {cursor: S.cursor});
       if (infoPeak > 1) toast('The mix is louder than 0 dBFS; lower its gain or normalize.', 'info', 6000);
     }));
     on('ed-export', exportWav);
@@ -891,7 +891,7 @@ const AudioEditor = (() => {
 
   function initEditByText() {
     const box = el('ed-et-words');
-    box.contentEditable = 'plaintext-only';
+    try { box.contentEditable = 'plaintext-only'; } catch { /* older Firefox */ }
     if (box.contentEditable !== 'plaintext-only') box.contentEditable = 'true';
     box.addEventListener('input', etRenderChanges);
     box.addEventListener('paste', ev => { ev.preventDefault(); document.execCommand('insertText', false, (ev.clipboardData || window.clipboardData).getData('text/plain')); });
@@ -960,7 +960,9 @@ const AudioEditor = (() => {
   }
 
   /** The editor became visible: its canvas has a size now. */
-  function shown() { if (root && !root.classList.contains('hidden')) { requestAnimationFrame(() => { resize(); }); } }
+  function shown() {
+    if (root && !root.classList.contains('hidden')) { refresh(); requestAnimationFrame(() => { resize(); }); }
+  }
 
   return {init, load, shown, modelsChanged, hasClip: () => !!S.clip};
 })();

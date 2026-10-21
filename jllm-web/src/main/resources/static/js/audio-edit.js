@@ -70,6 +70,16 @@
    * Windowed-sinc resampling of one channel (Lanczos kernel, a = 8 lobes); when going down the kernel is stretched so
    * that nothing above the new Nyquist frequency remains.
    */
+  const LANCZOS_TABLE = 2048;                                      // entries per unit of the kernel's argument
+  const LANCZOS = (() => {
+    const lobes = 8, t = new Float64Array(lobes * LANCZOS_TABLE + 2);
+    for (let i = 0; i < t.length; i++) {
+      const d = i / LANCZOS_TABLE;
+      t[i] = d === 0 ? 1 : d >= lobes ? 0 : lobes * Math.sin(Math.PI * d) * Math.sin(Math.PI * d / lobes) / (Math.PI * Math.PI * d * d);
+    }
+    return t;
+  })();
+
   AudioEdit.resampleChannel = (x, from, to) => {
     if (from === to || x.length === 0) return x.slice();
     const ratio = to / from;
@@ -83,11 +93,10 @@
       const lo = Math.max(0, Math.ceil(t - support)), hi = Math.min(x.length - 1, Math.floor(t + support));
       let acc = 0, wsum = 0;
       for (let j = lo; j <= hi; j++) {
-        const d = (j - t) * scale;
-        let w;
-        if (d === 0) w = 1;
-        else if (Math.abs(d) >= lobes) continue;
-        else { const pd = Math.PI * d; w = lobes * Math.sin(pd) * Math.sin(pd / lobes) / (pd * pd); }
+        const d = Math.abs(j - t) * scale;
+        if (d >= lobes) continue;
+        const f = d * LANCZOS_TABLE, k = f | 0;                    // kernel from a table, linearly interpolated
+        const w = LANCZOS[k] + (LANCZOS[k + 1] - LANCZOS[k]) * (f - k);
         acc += w * x[j];
         wsum += w;
       }
@@ -335,6 +344,7 @@
     const out = new Float32Array(outLen + frame), norm = new Float32Array(outLen + frame);
     const win = new Float32Array(frame);
     for (let i = 0; i < frame; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * (i + 0.5) / frame);
+    const stride = x.length > sampleRate * 180 ? 4 : x.length > sampleRate * 60 ? 2 : 1;   // coarser search on long audio
     let prevPos = 0;                                                   // where the previous chosen frame started in x
     for (let o = 0, k = 0; o < outLen; o += hop, k++) {
       let pos = Math.round(k * anaHop);
@@ -344,7 +354,7 @@
         const target = prevPos + hop;
         let best = pos, bestScore = -Infinity;
         const lo = Math.max(0, pos - seek), hi = Math.min(x.length - frame, pos + seek);
-        for (let cand = lo; cand <= hi; cand += 1) {
+        for (let cand = lo; cand <= hi; cand += stride) {
           let s = 0;
           for (let i = 0; i < hop; i += 2) s += x[cand + i] * x[target + i];
           if (s > bestScore) { bestScore = s; best = cand; }
