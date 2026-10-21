@@ -9,7 +9,7 @@
 #
 # Multi-platform images are built with docker buildx (a docker-container builder is created once, named jllm);
 # the Java build runs once on this machine's platform and is copied into each platform's image, so no emulation is
-# needed for it. Proxy variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY) are passed to the build; EXTRA_CA_CERT=<pem>
+# needed for it; the small C library of native CPU kernels (libjllm_cpu.so) is compiled per target platform. Proxy variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY) are passed to the build; EXTRA_CA_CERT=<pem>
 # adds a CA for a TLS-intercepting proxy to the build only; BUILDX_CREATE_OPTS is passed to `docker buildx create`.
 set -eu
 cd "$(dirname "$0")/.."

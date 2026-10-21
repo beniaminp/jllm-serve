@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.MlpWeights;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
+import org.robomiri.jllm.model.QType;
 
 import java.util.Arrays;
 
@@ -66,7 +67,23 @@ public final class MoeExperts {
         QTensor expGateUp = w.expGateUp();
         QTensor expDown = w.expDown();
         // all selected experts' gate/up rows in one parallel loop
-        if (mm.useInt8(expGateUp)) {
+        if (mm.nativeInt8(expGateUp)) { // one downcall per run of rows of the same slot within a chunk
+            mm.quantizeNative(xb, xo, dim);
+            pool.forRange(topK * gu, 32, (i0, i1) -> {
+                for (int i = i0; i < i1; ) {
+                    int k = i / gu;
+                    int end = Math.min(i1, (k + 1) * gu);
+                    int e = assign[ao + k];
+                    if (e < 0) {
+                        Arrays.fill(gateUp, i, end, 0f);
+                    } else {
+                        int r = e * gu + i - k * gu;
+                        mm.nativeRows(expGateUp, r, r + end - i, 0, gateUp, i, false);
+                    }
+                    i = end;
+                }
+            });
+        } else if (mm.useInt8(expGateUp)) {
             short[] xq = mm.quantizeInt8(xb, xo, dim);
             float[] xs = mm.xs();
             pool.forRange(topK * gu, 32, (i0, i1) -> {
@@ -90,7 +107,27 @@ public final class MoeExperts {
         for (int k = 0; k < topK; k++) {
             VectorKernels.siluMul(gateUp, k * gu, gateUp, k * gu + m, hidden, k * m, m);
         }
-        if (mm.useInt8(expDown)) {
+        if (mm.nativeInt8(expDown)) {
+            // per chunk of output rows: each slot's rows into down[k * dim + r], then the same sum in slot order
+            mm.quantizeNative(hidden, 0, topK * m);   // slot k starts at block k * m / 32
+            pool.forRange(dim, 8, (r0, r1) -> {
+                for (int k = 0; k < topK; k++) {
+                    int e = assign[ao + k];
+                    if (e >= 0) {
+                        mm.nativeRows(expDown, e * dim + r0, e * dim + r1, k * m / QType.BLOCK, down, k * dim + r0, false);
+                    }
+                }
+                for (int r = r0; r < r1; r++) {
+                    float sum = 0;
+                    for (int k = 0; k < topK; k++) {
+                        if (assign[ao + k] >= 0) {
+                            sum += routeWeight[ao + k] * down[k * dim + r];
+                        }
+                    }
+                    x[xo + r] += sum;
+                }
+            });
+        } else if (mm.useInt8(expDown)) {
             short[] xq = mm.quantizeInt8(hidden, 0, topK * m);   // slot k starts at block offset k * m
             float[] xs = mm.xs();
             pool.forRange(dim, 8, (r0, r1) -> {

@@ -75,7 +75,7 @@ public final class MambaCpuBackend implements Backend {
 
     @Override
     public String name() {
-        return "cpu mamba (" + VectorKernels.describe() + (mm.int8() ? ", " + Int8Kernels.describe() : "")
+        return "cpu mamba (" + VectorKernels.describe() + (mm.int8() ? ", " + mm.describeInt8() : "")
                 + (CpuBackend.DETERMINISTIC ? ", deterministic" : "") + ", " + pool.threads() + " threads)";
     }
 

@@ -9,6 +9,8 @@
 #   HF_TOKEN           Hugging Face token for gated or private models
 #   JLLM_EXTRA_CA_CERT a PEM file (mounted into the container) with the CA of a TLS-intercepting proxy, trusted in
 #                      addition to the JDK's own CAs for downloads
+#   JLLM_CPU_NATIVE    backend.cpu.native: auto (default: the image's native int8 kernels when they load and pass
+#                      their self-check, else the Java kernels), true (require them), false (the Java kernels)
 #   JAVA_OPTS          extra JVM options; arguments after the image name go to the console (--server.port=…, …)
 set -eu
 cd /data
@@ -44,6 +46,14 @@ if [ -n "${JLLM_EXTRA_CA_CERT:-}" ]; then
   done
   rm -rf "$dir"
   JAVA_OPTS="${JAVA_OPTS:-} -Djavax.net.ssl.trustStore=$store -Djavax.net.ssl.trustStorePassword=changeit"
+fi
+
+# the native int8 CPU kernels built for this platform (Dockerfile stage "native"); absent: the Java kernels are used
+if [ -f /opt/jllm/native/libjllm_cpu.so ]; then
+  JAVA_OPTS="${JAVA_OPTS:-} -Djllm.cpu.nativeLib=/opt/jllm/native/libjllm_cpu.so"
+fi
+if [ -n "${JLLM_CPU_NATIVE:-}" ]; then
+  JAVA_OPTS="${JAVA_OPTS:-} -Djllm.cpu.native=$JLLM_CPU_NATIVE"
 fi
 
 # shellcheck disable=SC2086

@@ -111,6 +111,20 @@ float run a prose paragraph) — with a 0.6B model, greedy decoding amplifies an
 size into a different continuation after the first near-tie, which is the expected behaviour of two
 equally valid quantization noises, not a degradation.
 
+### CPU native int8 kernels (`backend.cpu.native`, [07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu))
+
+4-core Xeon with AVX512-VNNI, Qwen3-0.6B Q4_0, 4 threads. The machine was shared with three other agents' builds
+(load average 35–50), so only the ratios mean something:
+
+| | one token's matmuls (the `auto` probe) | decode |
+|---|---|---|
+| int8, native `avx512-vnni` (what `auto` picks with the library) | 76–79 ms | 4.2–5.2 tok/s |
+| float (what `auto` picks without it) | 130–188 ms | 2.4–3.3 tok/s |
+| int8, Java kernels | 268–337 ms | 0.5–4.7 tok/s (C2 trouble under load) |
+
+Single-threaded row kernels: native is 2.8× (Q4_0) to 8× (Q6_K) faster than the Java int8 kernels. Prefill is
+unchanged. Details and the per-type table are in 07 §7.16.
+
 ### Qwen3-30B-A3B
 
 Qwen3-30B-A3B-Thinking-2507 (Q4_0, 19.4 GB cache, same 413-token prompt): Metal **~49 tok/s prefill, ~25 tok/s
@@ -241,6 +255,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | property | default | effect |
 |---|---|---|
 | `jllm.cpu.fastmath` | on | vectorized `exp` / `tanh` in the attention softmax and soft-caps, not bit-identical ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) |
+| `jllm.cpu.native` | auto | the native int8 kernels when `backend.cpu.native` is not set (the Docker image's `JLLM_CPU_NATIVE`); `true` / `false` ([07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)) |
+| `jllm.cpu.nativeLib` | search | path of `libjllm_cpu.so` / `.dylib` (the `jllm` launcher passes `target/native/`'s) |
 | `jllm.cpu.deterministic` | off | prefill through the single-token kernels, for exact comparisons; slower ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)) |
 | `jllm.metal.flashDecode` | auto | flash decoding (auto = on when the start-up self-check finds it correct and faster) for decode steps over `jllm.metal.flashMinLen` (512) positions ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) |
 | `jllm.metal.commitLayers` | 8 | layers per Metal command buffer (0 = one per pass) |
@@ -292,6 +308,7 @@ Done:
 | **Simdgroup-matrix prefill matmuls on Metal** (64 rows × 32 tokens per threadgroup, f32 MMA, not bit-identical) | prefill 533 → ~1 360 tok/s; largest logit difference 8.6e-6 | `matmul_mma` family, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls) |
 | **Tiled prefill matmuls on Metal** (2 rows × 8 tokens per simdgroup, bit-identical) | prefill 380 → 533 tok/s | `matmul_pf` family, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls) |
 | **Int8 activations on CPU** ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | Q4 row kernel 6× faster, decode 13 → 51 tok/s (~3.9×), ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuMatmul` |
+| **Native int8 kernels** (`libjllm_cpu`, FFM, VNNI / AVX2 / `sdot`; [07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)) | single-thread row kernels 2.8–8× faster than the Java int8 ones on AVX512-VNNI; one token of matmuls 1.7–2× faster than float, so `auto` now picks int8 on x86 ([11.1](#cpu-native-int8-kernels-backendcpunative-07-716)) | `src/main/native/jllm_cpu.c`, `cpu/NativeCpu` |
 | **f16 KV cache**: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; speed equal or better, outputs unchanged on the test prompts | `cpu/KvCache`, `_h` kernels |
 | **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoeffn-moeexperts)) | each expert row dequantized once per chunk and reused for its tokens | `MoeExperts.batched` |
 | **Tiled CPU attention** over (kv head, token tile) | each K / V row read once per tile; bit-identical | `KvCache.attentionTiled` |

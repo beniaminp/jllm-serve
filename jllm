@@ -12,12 +12,22 @@ set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
 
+CPU_LIB="$DIR/target/native/libjllm_cpu.so"
+[ "$(uname)" = "Darwin" ] && CPU_LIB="$DIR/target/native/libjllm_cpu.dylib"
+
 # Incremental compile: Maven only recompiles changed sources, so this is cheap when up to date.
 if [ -z "${JLLM_NO_BUILD:-}" ]; then
   (cd "$DIR" && mvn -q compile) || { echo "compilation failed" >&2; exit 1; }
   if [ "$(uname)" = "Darwin" ] && [ ! -f "$DIR/target/native/libjllm_metal.dylib" ]; then
     "$DIR/scripts/build-native.sh" >&2 || echo "warning: Metal library not built, using the CPU backend" >&2
   fi
+  # the native int8 CPU kernels (optional: without a C compiler the Java kernels are used)
+  if [ ! -f "$CPU_LIB" ] || [ -n "$(find "$DIR/src/main/native" -name 'jllm_cpu*' -newer "$CPU_LIB" 2>/dev/null)" ]; then
+    "$DIR/scripts/build-native-cpu.sh" --optional >&2 || true
+  fi
+fi
+if [ -f "$CPU_LIB" ]; then
+  JAVA_OPTS="${JAVA_OPTS:-} -Djllm.cpu.nativeLib=$CPU_LIB"
 fi
 
 # The Metal library is looked up relative to the working directory by default; point at the repo's copy.

@@ -370,6 +370,13 @@ public final class ModelLoader {
             backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
         }
         int threads = s.getInt("backend.threads");
+        // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)
+        // (-Djllm.cpu.native, as the Docker image's JLLM_CPU_NATIVE sets it, stands in for an unset backend.cpu.native)
+        String nativeMode = s.get("backend.cpu.native");
+        if ("default".equals(s.source("backend.cpu.native")) && System.getProperty("jllm.cpu.native") != null) {
+            nativeMode = System.getProperty("jllm.cpu.native");
+        }
+        org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         boolean mamba = arch instanceof MambaArch;
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16

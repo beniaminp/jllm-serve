@@ -52,6 +52,7 @@ Upgrade: `docker pull` the new image, `docker rm -f jllm`, and run it again with
 | `HF_TOKEN` | | Hugging Face token for gated or private models |
 | `JLLM_EXTRA_CA_CERT` | | path (inside the container) of a PEM file with the CA of a TLS-intercepting proxy |
 | `HTTPS_PROXY` | | not read by Java; add `JAVA_OPTS="-Dhttps.proxyHost=… -Dhttps.proxyPort=…"` instead |
+| `JLLM_CPU_NATIVE` | auto | `backend.cpu.native` when the console's settings leave it unset: `auto` uses the image's native int8 CPU kernels (`/opt/jllm/native/libjllm_cpu.so`) when they load and pass their self-check, `true` requires them, `false` uses the Java kernels |
 | `JAVA_OPTS` | | extra JVM options |
 
 Arguments after the image name go to the console, e.g. `… <you>/jllm-serve --server.port=9000`.
@@ -99,6 +100,16 @@ bytecode is the same on every platform, so the build stage runs once on the buil
 stage's `apt-get` runs under emulation for the foreign platform (Docker Desktop has QEMU built in; on Linux run
 `docker run --privileged --rm tonistiigi/binfmt --install arm64` once).
 
+The one piece of C, the native int8 CPU kernels `libjllm_cpu.so` ([07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)),
+is built in its own stage, `native`, for each target platform: that stage has no `--platform`, so like the runtime
+stage it runs on the target platform (emulated in a cross-platform build; it is one gcc call of a few seconds). It
+starts from the runtime image's base, so the library links against the same C library, and one binary covers every
+SIMD level of its architecture (x86-64: AVX2, AVX-VNNI, AVX512-VNNI; arm64: NEON, dotprod), chosen when it loads. The
+runtime image copies it to `/opt/jllm/native/` and `entrypoint.sh` passes `-Djllm.cpu.nativeLib` when the file is
+there. If the stage cannot build it (`build-native-cpu.sh --optional` exits 0 without output), the image still works
+with the Java kernels; the log says which kernels run (`native CPU kernels: avx512-vnni (...)` or `... using the Java
+kernels`), and so does the backend name.
+
 Behind a TLS-intercepting proxy:
 
 ```sh
@@ -113,5 +124,10 @@ BUILDX_CREATE_OPTS="--buildkitd-config buildkitd.toml" …   # registry CA for t
 - **amd64:** the image was built and run on a 4-core x86 Linux machine. It became healthy, printed and kept its
   generated key across a restart, and rejected requests without the key (401). It loaded Qwen3-0.6B from the
   volume (CPU backend, AVX-512) and answered a chat completion through `/v1/chat/completions`.
+- **native kernels (amd64):** the `native` stage alone (`docker buildx build --target native`) compiled
+  `libjllm_cpu.so` in 4.4 s, and `NativeCpuCheck` run inside that image against it passed (678 checks, levels
+  scalar / avx2 / avx512-vnni). The full image with this stage has not been rebuilt here. For arm64 the same C code
+  was cross-compiled and run under qemu-aarch64 (`src/test/native/jllm_cpu_levels.c`, NEON and dotprod against
+  scalar), but not as a Docker build.
 - **arm64:** the image was built (650 MB amd64, 673 MB arm64) but could not be run on that machine. Run it on an
   ARM machine or a Mac before publishing.

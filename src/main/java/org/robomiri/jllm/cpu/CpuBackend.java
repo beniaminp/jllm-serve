@@ -360,7 +360,7 @@ public final class CpuBackend implements Backend {
 
     @Override
     public String name() {
-        return "cpu (" + VectorKernels.describe() + (mm.int8() ? ", " + Int8Kernels.describe() : "")
+        return "cpu (" + VectorKernels.describe() + (mm.int8() ? ", " + mm.describeInt8() : "")
                 + (DETERMINISTIC ? ", deterministic" : "") + (VectorKernels.FASTMATH ? ", fastmath" : "")
                 + ", " + pool.threads() + " threads)";
     }
