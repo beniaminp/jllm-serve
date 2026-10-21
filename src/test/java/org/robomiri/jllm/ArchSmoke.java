@@ -172,9 +172,12 @@ public final class ArchSmoke {
             if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += q8Check(w, lib, cfg, cpu);
             }
-            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
+            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
+                boolean latent = ((Decoder) cfg).attention() instanceof Attention.Mla;
                 for (KvDtype dt : KvDtype.values()) {
-                    failures += kvStateChecks(w, lib, cfg, dt);
+                    if (!(latent && dt == KvDtype.Q8)) { // a q8 latent cache is not saved
+                        failures += kvStateChecks(w, lib, cfg, dt);
+                    }
                 }
             }
             // the argmax of a random model can be degenerate, so also compare the full final logits

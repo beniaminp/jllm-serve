@@ -96,6 +96,14 @@ a following prompt that does not contain them just diverges at that point.
 
 The cache is a single `int[] cached` + `cachedLen` — no eviction policy, because there is one sequence.
 
+**The same idea before the model: tokenizing.** 🧸 Re-sending the whole conversation also means re-*reading* it:
+before the prefix cache can compare ids, the text has to become ids again. The prompt cache remembers how far it
+read last time and reads only the new part. 📐 `Engine.renderChat` goes through a `PromptCache`
+(`engine.prompt-cache-mb`) that keeps the ids of recent prompts under hashes of their template pieces and resumes
+the tokenizer right after the last added token the new prompt shares with a cached one, where the encoding of the
+rest cannot depend on what came before; the ids equal a full tokenization
+([17 §17.5](17-agent-speedups.md#175-tokenizing-only-what-is-new)).
+
 Two cases make the bookkeeping more careful:
 
 - **Failure.** Prefill overwrites the KV cache, so `generateLocked` sets `cachedLen = 0` *before* the first
@@ -109,13 +117,23 @@ Two cases make the bookkeeping more careful:
 **Saving the cache to disk.** `Engine.saveCache(file, fingerprint)` writes the cached token ids and their keys and
 values; `loadCache(file, fingerprint)` puts them back, after which a prompt starting with those tokens reuses them
 exactly as above. The file (`CacheFile`) is a small header (magic, the caller's model fingerprint, the backend's
-`stateFormat()`, the token ids), readable on its own for indexing, followed by the backend's state. The CPU
-backend writes its KV cache per layer, row by row, in the stored type (f32 or f16, so nothing is rounded twice);
-MLA, Mamba and Metal backends report no state format and are not saved. Both calls take the engine lock; a file
-of another fingerprint or format is refused, and a load that fails half-way leaves the cache empty rather than
-mixed. A loaded cache is bit-identical to the saved one (`SmokeTest.persistCache` saves it back and compares the
-files) and continues a conversation exactly like the engine that saved it. jllm-web builds its saved-conversation
-store on this (README, *Coding agents*).
+`stateFormat()`, the token ids), readable on its own for indexing, followed by the backend's state. The CPU and
+Metal backends write their cache per layer, row by row, in the stored type (f32 or f16, so nothing is rounded
+twice): the K and V rows of standard attention, or the latent rows of DeepSeek's MLA; Mamba reports no state format
+and is not saved. A file of another fingerprint or format is refused, and a load that fails half-way leaves the
+cache empty rather than mixed. A loaded cache is bit-identical to the saved one (`SmokeTest.persistCache` saves it
+back and compares the files) and continues a conversation exactly like the engine that saved it. jllm-web builds
+its saved-conversation store on this (README, *Coding agents*; [17 §17.3](17-agent-speedups.md#173-saved-conversations)).
+
+🧸 Saving is like photocopying the first 40 pages of a notebook that is still in use: you may keep writing on page
+41 and beyond while the copier runs, but you must not erase page 12 until it is done.
+
+📐 `beginSave(file, fingerprint)` takes the engine lock only to copy the cached ids and pins positions `[0, n)`;
+`PendingSave.write()` writes the rows from any thread. A request computes `reuse` (above) and waits for the save only
+if `reuse < n`, i.e. if it would rewrite a pinned row; a load or prefix copy into the engine always waits. So the
+next turn of the saved conversation (which extends it, `reuse ≥ n`) runs while its predecessor is written to disk.
+`loadCache(file, fingerprint, limit)` loads only the first `limit` positions of a longer file
+(`Backend.loadState(n, stored, in)` reads `n` rows per layer and seeks past the rest).
 
 ---
 
@@ -151,6 +169,13 @@ whatever is still pending is flushed (unless a stop string was hit).
   wall-clock limit per request, measured from the moment generation starts; when it fires the answer ends with
   `finish_reason: "length"`. A streaming
   client that stops *reading* is cut off after `server.write-timeout-ms` (10.5).
+
+  🧸 Before saying each next word, the teacher glances at the door: if the child who asked has left, she stops.
+
+  📐 In the web console the servlet container owns the socket, so there is no probe thread; `ClientGone` asks
+  Tomcat's connection for available input with a non-blocking read instead (once the body is read, input can only
+  be the end of the stream), at most every 50 ms from the `cancelled` supplier. An abandoned request, streaming or
+  not, stops within one prefill chunk or one token and frees its slot ([17 §17.6](17-agent-speedups.md#176-noticing-a-client-that-left)).
 - **The lock.** The backend owns exactly one KV cache, so generation runs under a **fair** `ReentrantLock`:
   concurrent HTTP requests are served one at a time in arrival order, and virtual threads make the waiting cheap.
   The wait is bounded by `server.queue-timeout-ms` (default 60 s, 0 = forever): after that `generate` throws
@@ -673,6 +698,7 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
 | `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
 | `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
+| `engine.prompt-cache-mb` | `64` | memory for the ids of recently rendered chat prompts: a resent conversation is tokenized only from where it is new, with the ids of a full tokenization ([17 §17.5](17-agent-speedups.md#175-tokenizing-only-what-is-new)); 0 = off |
 | `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. Left at the default, MoE models run without it |
 | `engine.draft-model` | empty | Hub repo of the draft model for `draft` (same tokenizer); flag `--draft-model` |
 | `engine.draft-tokens` | `16` | most tokens proposed per verification pass (prompt lookup adapts below it); flag `--draft-tokens` |

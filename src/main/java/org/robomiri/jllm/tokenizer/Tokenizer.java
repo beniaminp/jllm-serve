@@ -430,6 +430,25 @@ public final class Tokenizer {
      *                        the chat format (DeepSeek's {@code <｜User｜>}) and so must not be matched in content
      */
     public SequenceEncoder newSequence(Set<String> protectedTokens) {
+        return new SequenceEncoder(contentTokens(protectedTokens));
+    }
+
+    /**
+     * An encoder that continues after {@code prefix}: the ids a {@link SequenceEncoder} had produced when it reported
+     * a {@link SequenceEncoder.Boundary} with {@code prefix.length} ids. Appending the rest of the pieces (the
+     * boundary's own piece from its offset on) then gives exactly the ids of encoding all pieces in one pass.
+     */
+    public SequenceEncoder resumeSequence(Set<String> protectedTokens, int[] prefix) {
+        if (prefix.length == 0) {
+            throw new IllegalArgumentException("a boundary always follows at least one token");
+        }
+        SequenceEncoder e = new SequenceEncoder(contentTokens(protectedTokens));
+        e.out.addAll(prefix);
+        e.consumed = true;
+        return e;
+    }
+
+    private IntPredicate contentTokens(Set<String> protectedTokens) {
         Set<Integer> ids = new HashSet<>();
         for (String t : protectedTokens) {
             Integer id = addedTokens.get(t);
@@ -437,10 +456,21 @@ public final class Tokenizer {
                 ids.add(id);
             }
         }
-        return new SequenceEncoder(ids.isEmpty() ? nonSpecial : id -> !specialIds.contains(id) && !ids.contains(id));
+        return ids.isEmpty() ? nonSpecial : id -> !specialIds.contains(id) && !ids.contains(id);
     }
 
     public final class SequenceEncoder {
+        /**
+         * Told about every point where the ids so far are final and the encoding of the rest does not depend on what
+         * came before: right after an added token (one that does not swallow the whitespace after it), with no text
+         * pending. Encoding the rest from such a point with {@link #resumeSequence} gives the ids of one pass.
+         */
+        @FunctionalInterface
+        public interface Boundary {
+            /** @param offset where the rest starts in the piece being appended; {@code ids} ids precede it */
+            void at(int offset, int ids);
+        }
+
         private final IntList out = new IntList(64);
         private final StringBuilder run = new StringBuilder();
         /** Which added tokens the content path may match. */
@@ -448,30 +478,47 @@ public final class Tokenizer {
         private boolean consumed; // anything (text or token) precedes the current run
         private boolean runAtStart;
         private boolean pendingRstrip;
+        private Boundary boundaries;
 
         private SequenceEncoder(IntPredicate contentTokens) {
             this.contentTokens = contentTokens;
         }
 
+        /** Reports the {@link Boundary boundaries} inside the pieces appended from now on. */
+        public SequenceEncoder onBoundary(Boundary b) {
+            this.boundaries = b;
+            return this;
+        }
+
         /** Appends a control string; added tokens in it become their ids. */
         public SequenceEncoder special(String text) {
-            return scan(text, ANY_TOKEN);
+            return scan(text, 0, ANY_TOKEN);
         }
 
         /** Appends untrusted text: special (and protected) tokens in it stay text, other added tokens are matched. */
         public SequenceEncoder text(String text) {
-            return scan(text, contentTokens);
+            return scan(text, 0, contentTokens);
+        }
+
+        /** {@link #special(String)} of a piece from a {@link Boundary} on (the part before it is encoded already). */
+        public SequenceEncoder special(String text, int from) {
+            return scan(text, from, ANY_TOKEN);
+        }
+
+        /** {@link #text(String)} of a piece from a {@link Boundary} on. */
+        public SequenceEncoder text(String text, int from) {
+            return scan(text, from, contentTokens);
         }
 
         /** Leftmost-longest scan for the added tokens accepted by {@code allowed}; the rest is ordinary text. */
-        private SequenceEncoder scan(String text, IntPredicate allowed) {
+        private SequenceEncoder scan(String text, int from, IntPredicate allowed) {
             if (addedTrie == null) {
-                appendRun(text);
+                appendRun(from == 0 ? text : text.substring(from));
                 return this;
             }
             int len = text.length();
-            int last = 0; // start of the plain text not yet appended
-            int i = 0;
+            int last = from; // start of the plain text not yet appended
+            int i = from;
             while (i < len) {
                 if (!addedTrie.mayStart(text.charAt(i))) {
                     i++;
@@ -504,6 +551,9 @@ public final class Tokenizer {
                 pendingRstrip = rs && end == len;
                 last = end;
                 i = end;
+                if (!rs && boundaries != null) {
+                    boundaries.at(end, out.n);
+                }
             }
             if (last < len) {
                 appendRun(text.substring(last));

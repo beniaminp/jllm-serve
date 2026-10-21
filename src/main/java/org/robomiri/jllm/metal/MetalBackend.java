@@ -1370,22 +1370,33 @@ public final class MetalBackend implements Backend {
     // ------------------------------------------------------------------ saved caches
 
     /**
-     * The KV cache rows as CpuBackend saves them ({@code KvCache.write}): per layer, per position, the K row then the V
-     * row, little-endian f32 or IEEE half, or q8's kvDim int8 values followed by the kvHeads f32 scales; Metal's
-     * {@code half} has the same bits and its q8 cache rows are that layout already, so a cache saved by either backend
-     * has the same layout. DeepSeek's latent cache is not saved.
+     * The cache rows as CpuBackend saves them: for standard attention ({@code KvCache.write}) per layer, per position,
+     * the K row then the V row, little-endian f32 or IEEE half, or q8's kvDim int8 values followed by the kvHeads f32
+     * scales; for DeepSeek's latent attention ({@code MlaCpu.write}) per layer, per position, the latent row
+     * {@code [c | k_pe]} in f32 or half. Metal's {@code half} has the same bits and its q8 cache rows are that layout
+     * already, so a cache saved by either backend has the same layout. A q8 latent cache is not saved.
      */
     @Override
     public String stateFormat() {
-        if (!(arch.attention() instanceof Attention.Gqa g)) {
-            return null;
+        if (arch.attention() instanceof Attention.Gqa g) {
+            return "kv " + kvDtype + " layers=" + c.layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
         }
-        return "kv " + kvDtype + " layers=" + c.layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
+        return mla != null && kvDtype != KvDtype.Q8 ? "mla " + mla.format() : null;
     }
 
+    /** Bytes of one row of one cache segment. */
     private long rowBytes() {
+        if (mla != null) {
+            return mla.rowBytes();
+        }
         Attention.Gqa g = (Attention.Gqa) arch.attention();
         return kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+    }
+
+    /** The cache segments of layer {@code l} whose rows are saved one after the other per position: K and V, or the latent rows. */
+    private MemorySegment[] segments(int l) {
+        return mla != null ? new MemorySegment[]{mla.cache(l)}
+                : new MemorySegment[]{keyCache[l].contents(), valCache[l].contents()};
     }
 
     @Override
@@ -1393,23 +1404,40 @@ public final class MetalBackend implements Backend {
         if (pipe != null) {
             pipe.drain();
         }
+        saveRows(n, out);
+    }
+
+    @Override
+    public boolean canSaveWhileServing() {
+        return stateFormat() != null;
+    }
+
+    /** Copies rows {@code [0, n)} out of the shared buffers without touching the command queue or the pipe. */
+    @Override
+    public void saveStateWhileServing(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        saveRows(n, out);
+    }
+
+    private void saveRows(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
         if (stateFormat() == null) {
             Backend.super.saveState(n, out);
+            return;
         }
         long row = rowBytes();
-        int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (2 * row)));
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect((int) (rows * 2 * row));
+        int segs = mla != null ? 1 : 2;
+        int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (segs * row)));
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect((int) (rows * segs * row));
         MemorySegment b = MemorySegment.ofBuffer(buf);
         for (int l = 0; l < c.layers(); l++) {
-            MemorySegment kc = keyCache[l].contents();
-            MemorySegment vc = valCache[l].contents();
+            MemorySegment[] seg = segments(l);
             for (int s0 = 0; s0 < n; s0 += rows) {
                 int m = Math.min(rows, n - s0);
                 for (int r = 0; r < m; r++) {
-                    MemorySegment.copy(kc, (s0 + r) * row, b, 2 * r * row, row);
-                    MemorySegment.copy(vc, (s0 + r) * row, b, (2L * r + 1) * row, row);
+                    for (int j = 0; j < segs; j++) {
+                        MemorySegment.copy(seg[j], (s0 + r) * row, b, ((long) segs * r + j) * row, row);
+                    }
                 }
-                buf.clear().limit((int) (2 * m * row));
+                buf.clear().limit((int) (segs * m * row));
                 while (buf.hasRemaining()) {
                     out.write(buf);
                 }
@@ -1419,25 +1447,33 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void loadState(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        loadState(n, n, in);
+    }
+
+    @Override
+    public void loadState(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
         if (pipe != null) {
             pipe.drain();
         }
         if (stateFormat() == null) {
-            Backend.super.loadState(n, in);
+            throw new UnsupportedOperationException(name() + " cannot load a saved cache");
         }
         if (n > ctx) {
             throw new java.io.IOException("the saved cache holds " + n + " positions, the context is " + ctx);
         }
+        if (n > stored) {
+            throw new IllegalArgumentException(n + " positions requested, " + stored + " saved");
+        }
         long row = rowBytes();
-        int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (2 * row)));
-        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect((int) (rows * 2 * row));
+        int segs = mla != null ? 1 : 2;
+        int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (segs * row)));
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocateDirect((int) (rows * segs * row));
         MemorySegment b = MemorySegment.ofBuffer(buf);
         for (int l = 0; l < c.layers(); l++) {
-            MemorySegment kc = keyCache[l].contents();
-            MemorySegment vc = valCache[l].contents();
+            MemorySegment[] seg = segments(l);
             for (int s0 = 0; s0 < n; s0 += rows) {
                 int m = Math.min(rows, n - s0);
-                buf.clear().limit((int) (2 * m * row));
+                buf.clear().limit((int) (segs * m * row));
                 while (buf.hasRemaining()) {
                     if (in.read(buf) < 0) {
                         throw new java.io.EOFException("the saved cache file is truncated");
@@ -1445,10 +1481,12 @@ public final class MetalBackend implements Backend {
                 }
                 // straight into the cache buffers: on unified memory they are the GPU's memory
                 for (int r = 0; r < m; r++) {
-                    MemorySegment.copy(b, 2 * r * row, kc, (s0 + r) * row, row);
-                    MemorySegment.copy(b, (2L * r + 1) * row, vc, (s0 + r) * row, row);
+                    for (int j = 0; j < segs; j++) {
+                        MemorySegment.copy(b, ((long) segs * r + j) * row, seg[j], (s0 + r) * row, row);
+                    }
                 }
             }
+            Backend.skipState(in, (long) (stored - n) * segs * row);
         }
     }
 
@@ -1456,8 +1494,8 @@ public final class MetalBackend implements Backend {
     public void copyStateFrom(Backend other, int n) {
         if (stateFormat() == null || !(other instanceof MetalBackend o) || !stateFormat().equals(o.stateFormat())) {
             Backend.super.copyStateFrom(other, n);
+            return;
         }
-        MetalBackend o = (MetalBackend) other;
         if (pipe != null) {
             pipe.drain();
         }
@@ -1466,8 +1504,11 @@ public final class MetalBackend implements Backend {
         }
         long bytes = (long) n * rowBytes();
         for (int l = 0; l < c.layers(); l++) {
-            MemorySegment.copy(o.keyCache[l].contents(), 0, keyCache[l].contents(), 0, bytes);
-            MemorySegment.copy(o.valCache[l].contents(), 0, valCache[l].contents(), 0, bytes);
+            MemorySegment[] from = o.segments(l);
+            MemorySegment[] to = segments(l);
+            for (int j = 0; j < to.length; j++) {
+                MemorySegment.copy(from[j], 0, to[j], 0, bytes);
+            }
         }
     }
 

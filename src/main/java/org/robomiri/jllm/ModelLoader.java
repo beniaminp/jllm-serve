@@ -156,6 +156,10 @@ public final class ModelLoader {
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
+            long promptCacheMb = s.getLong("engine.prompt-cache-mb");
+            if (promptCacheMb > 0) {
+                engine.setPromptCache(new org.robomiri.jllm.tokenizer.PromptCache(tok, promptCacheMb << 20));
+            }
             Speculator.Config spec = speculation(s, arch);
             if (spec.mode() != Speculator.Mode.OFF) {
                 DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch) : null;

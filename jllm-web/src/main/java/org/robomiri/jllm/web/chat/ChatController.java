@@ -79,13 +79,15 @@ public class ChatController {
             return;
         }
         try (LoadedModel.Lease lease = model.lease()) {
-            run(body, model, res);
+            run(body, model, res, ClientGone.of(req));
         } catch (LoadedModel.UnavailableException e) {
             ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "model_unavailable"));
         }
     }
 
-    private void run(Map<String, Object> body, LoadedModel model, HttpServletResponse res) throws IOException {
+    /** @param gone whether the client closed the connection (generation and tool calls stop) */
+    private void run(Map<String, Object> body, LoadedModel model, HttpServletResponse res,
+                     java.util.function.BooleanSupplier gone) throws IOException {
         Engine engine = model.engine();
         Settings s = settings.current();
         long maxPromptBytes = s.getLong("engine.max-prompt-bytes") > 0
@@ -120,7 +122,7 @@ public class ChatController {
         emit(sse, failure, Json.obj("type", "start", "model", model.id(), "tools", new ArrayList<>(byName.keySet())));
         String finish = "stop";
         for (int round = 0; ; round++) {
-            if (failure[0] != null) {
+            if (failure[0] != null || gone.getAsBoolean()) {
                 return;
             }
             int[] prompt;
@@ -141,7 +143,8 @@ public class ChatController {
             try (LoadedModel.Slot slot = model.pick(prompt); AutoCloseable alive = sse.keepAlive()) {
                 used = slot;
                 r = slot.engine().generate(prompt, params, byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback,
-                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
+                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
+                                || gone.getAsBoolean());
             } catch (Exception e) {
                 emit(sse, failure, Json.obj("type", "error", "message", e instanceof Engine.OverloadedException
                         ? e.getMessage() : "generation failed: " + e.getMessage()));
@@ -176,7 +179,7 @@ public class ChatController {
                 break;
             }
             for (ToolCallFormat.Call c : parsed.calls()) {
-                if (failure[0] != null || model.closing()) {
+                if (failure[0] != null || model.closing() || gone.getAsBoolean()) {
                     return;
                 }
                 emit(sse, failure, Json.obj("type", "tool_call", "id", c.id(), "name", c.name(), "arguments", c.arguments()));

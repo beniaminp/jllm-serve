@@ -155,6 +155,84 @@ final class MlaCpu {
         attend(l, n, pos);
     }
 
+    // ------------------------------------------------------------------ saved caches
+
+    /**
+     * Layout of {@link #write}: the latent rows {@code [c | k_pe]}, per layer and position, little-endian f32 or IEEE
+     * half (what the cache stores, so nothing is rounded); the Metal backend writes the same bytes.
+     */
+    String format() { // null for a q8 latent cache, which is not saved
+        return cache8 != null ? null : (cache16 != null ? "f16" : "f32") + " layers=" + layers.length + " width=" + aw;
+    }
+
+    private int rowBytes() {
+        return aw * (cache16 != null ? 2 : 4);
+    }
+
+    /** Rows per buffer of {@link #write} / {@link #read}. */
+    private static final int IO_ROWS = 256;
+
+    /** Writes positions {@code [0, n)} of every layer; only reads the cache (safe while positions {@code >= n} change). */
+    void write(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(IO_ROWS * rowBytes()).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int l = 0; l < layers.length; l++) {
+            for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
+                int m = Math.min(n - s0, IO_ROWS);
+                buf.clear();
+                if (cache32 != null) {
+                    buf.asFloatBuffer().put(cache32[l], s0 * aw, m * aw);
+                } else {
+                    buf.asShortBuffer().put(cache16[l], s0 * aw, m * aw);
+                }
+                buf.limit(m * rowBytes());
+                while (buf.hasRemaining()) {
+                    out.write(buf);
+                }
+            }
+        }
+    }
+
+    /** Reads positions {@code [0, n)} of what {@link #write} wrote for {@code stored >= n} positions. */
+    void read(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        int ctx = (cache32 != null ? cache32[0].length : cache16[0].length) / aw;
+        if (n > ctx) {
+            throw new java.io.IOException("the saved cache holds " + n + " positions, the context is " + ctx);
+        }
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(IO_ROWS * rowBytes()).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int l = 0; l < layers.length; l++) {
+            for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
+                int m = Math.min(n - s0, IO_ROWS);
+                buf.clear().limit(m * rowBytes());
+                while (buf.hasRemaining()) {
+                    if (in.read(buf) < 0) {
+                        throw new java.io.EOFException("the saved cache file is truncated");
+                    }
+                }
+                buf.flip();
+                if (cache32 != null) {
+                    buf.asFloatBuffer().get(cache32[l], s0 * aw, m * aw);
+                } else {
+                    buf.asShortBuffer().get(cache16[l], s0 * aw, m * aw);
+                }
+            }
+            org.robomiri.jllm.model.Backend.skipState(in, (long) (stored - n) * rowBytes());
+        }
+    }
+
+    /** Positions {@code [0, n)} of every layer copied from {@code o}, a cache of the same {@link #format}. */
+    void copyFrom(MlaCpu o, int n) {
+        if (!format().equals(o.format())) {
+            throw new IllegalArgumentException("cannot copy a " + o.format() + " cache into a " + format() + " one");
+        }
+        for (int l = 0; l < layers.length; l++) {
+            if (cache32 != null) {
+                System.arraycopy(o.cache32[l], 0, cache32[l], 0, n * aw);
+            } else {
+                System.arraycopy(o.cache16[l], 0, cache16[l], 0, n * aw);
+            }
+        }
+    }
+
     /** Cache row {@code s} of layer {@code l} = [lat[t] | kpe[t]]. */
     private void store(int l, int s, int t) {
         int kvl = m.kvLoraRank();

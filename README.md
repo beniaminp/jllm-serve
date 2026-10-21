@@ -259,18 +259,23 @@ What makes it work rather than merely connect:
   message: with one cache that evicted the 10k-token conversation and the next step prefilled it all again; with two
   slots the next step finds it cached (measured: 10 484-token prompt, 10 443 cached, prefilled in 2.5 s).
 - **Long first prefill without timeouts.** Streaming responses start at once and send an SSE keep-alive comment
-  every 15 s while the prompt is prefilled; a client that disconnects stops the prefill, and a retry of the same
-  prompt continues where it stopped.
+  every 15 s while the prompt is prefilled; a client that disconnects — streaming or not — stops its request within
+  one prefill chunk or one token and frees the slot, and a retry of the same prompt continues where it stopped.
+- **Tokenizing only what is new.** Each request resends the whole conversation; the ids of recent prompts are kept
+  (`engine.prompt-cache-mb`, 64), so only the new messages are tokenized, with exactly the ids of a full
+  tokenization (a 100k-character, 50-turn conversation: 15.6 ms → 0.5 ms per request, [docs/17](docs/17-agent-speedups.md#175-tokenizing-only-what-is-new)).
 - **`reasoning_content`.** A `<think>` block is returned apart from the answer (DeepSeek style), as opencode, Open
   WebUI and Continue expect; `"reasoning_format": "none"` keeps it inline.
-- **Saved conversations.** A slot's KV cache is written to disk (`kv-cache/`) after a prefill of 10 s or more and
-  when a model is unloaded or the server stops; when a request's prompt starts with a saved conversation that covers
-  more than its slot holds, the cache is loaded back instead of prefilled. Every new opencode session starts with the
+- **Saved conversations.** A slot's KV cache is written to disk (`kv-cache/`) after a prefill of 2 s or more and
+  when a model is unloaded or the server stops, in the background: the next request of the conversation runs while
+  the file is written. When a request's prompt shares a prefix with a saved conversation that covers more than its
+  slot holds, that prefix is loaded back instead of prefilled (the rest of the file is skipped). DeepSeek's latent
+  (MLA) caches are saved too. Every new opencode session starts with the
   same ~10k tokens of instructions, so after a restart the first step costs a disk read instead of minutes (measured:
   2 707-token prompt, 21.3 s prefill; after a restart restored in 0.9 s, 2 706 tokens reused). The Models page lists
   the saved caches (*save now*, *delete all*); `jllm.web.kv-cache=false` turns it off, `jllm.web.kv-cache-max-gb`
   (default 10) bounds the disk use (least recently used deleted first), `jllm.web.kv-cache-dir`,
-  `-min-tokens` (1024) and `-save-after-ms` (10000) tune it. A cache is only reused by the same model with the
+  `-min-tokens` (512) and `-save-after-ms` (2000) tune it ([docs/17 §17.3](docs/17-agent-speedups.md#173-saved-conversations)). A cache is only reused by the same model with the
   same load settings (quantization, backend, KV type); f16 takes 2 bytes × 2 × layers × kv width per token (115 kB
   for Qwen3-0.6B, so ~1.2 GB for opencode's 10k-token prompt).
 - **Long-prompt attention** was reworked for this: K stored transposed in 32-key chunks so scores need no per-key

@@ -106,6 +106,12 @@ done
   -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef "$METAL_LIB" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
+# saved / copied / partially loaded caches, standard and latent (MLA), CPU and Metal; the engine checks use the
+# Qwen3 tokenizer when models/Qwen_Qwen3-0.6B is there
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.KvStateTest models/Qwen_Qwen3-0.6B --metal "$METAL_LIB" \
+  "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM"
+
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \

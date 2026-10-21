@@ -720,32 +720,59 @@ public final class CpuBackend implements Backend {
     }
 
     @Override
-    public String stateFormat() {
-        return kv == null ? null : "kv " + kv.format(); // the same rows as MetalBackend writes
+    public String stateFormat() { // the same rows as MetalBackend writes
+        return kv != null ? "kv " + kv.format() : mla != null && mla.format() != null ? "mla " + mla.format() : null;
     }
 
     @Override
     public void saveState(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
-        if (kv == null) {
+        if (kv != null) {
+            kv.write(n, out);
+        } else if (mla != null) {
+            mla.write(n, out);
+        } else {
             Backend.super.saveState(n, out);
         }
-        kv.write(n, out);
+    }
+
+    @Override
+    public boolean canSaveWhileServing() {
+        return stateFormat() != null;
+    }
+
+    /** {@link #saveState} only reads the cache arrays (rows below {@code n}): safe while later rows are written. */
+    @Override
+    public void saveStateWhileServing(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        saveState(n, out);
     }
 
     @Override
     public void copyStateFrom(Backend other, int n) {
-        if (kv == null || !(other instanceof CpuBackend o) || o.kv == null) {
+        if (!(other instanceof CpuBackend o) || stateFormat() == null || !stateFormat().equals(o.stateFormat())) {
             Backend.super.copyStateFrom(other, n);
+            return;
         }
-        kv.copyFrom(((CpuBackend) other).kv, n);
+        if (kv != null) {
+            kv.copyFrom(o.kv, n);
+        } else {
+            mla.copyFrom(o.mla, n);
+        }
     }
 
     @Override
     public void loadState(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
-        if (kv == null) {
-            Backend.super.loadState(n, in);
+        loadState(n, n, in);
+    }
+
+    @Override
+    public void loadState(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        if (kv != null) {
+            kv.read(n, stored, in);
+        } else if (mla != null) {
+            mla.read(n, stored, in);
+        } else {
+            throw new UnsupportedOperationException(name() + " cannot load a saved cache");
         }
-        kv.read(n, in);
     }
 
     @Override

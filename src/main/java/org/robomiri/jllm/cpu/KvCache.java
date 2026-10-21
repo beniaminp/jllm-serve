@@ -246,8 +246,19 @@ public abstract class KvCache {
 
     /** Reads what {@link #write} wrote for {@code n} positions into positions {@code [0, n)}. */
     public final void read(int n, ReadableByteChannel in) throws IOException {
+        read(n, n, in);
+    }
+
+    /**
+     * Reads positions {@code [0, n)} of what {@link #write} wrote for {@code stored >= n} positions, skipping the rest
+     * of each layer (a seek when {@code in} is a file).
+     */
+    public final void read(int n, int stored, ReadableByteChannel in) throws IOException {
         if (n > ctx) {
             throw new IOException("the saved cache holds " + n + " positions, the context is " + ctx);
+        }
+        if (n > stored) {
+            throw new IllegalArgumentException(n + " positions requested, " + stored + " saved");
         }
         boolean half = this instanceof F16;
         Q8 q8 = this instanceof Q8 c ? c : null;
@@ -282,6 +293,7 @@ public abstract class KvCache {
                 }
                 store(layer, s0, k, v, m);
             }
+            org.robomiri.jllm.model.Backend.skipState(in, (long) (stored - n) * 2 * rb);
         }
     }
 

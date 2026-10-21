@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -23,14 +24,21 @@ import java.util.TreeMap;
  * Conversation KV caches on disk, so that a restart (or a conversation that was pushed out of its slot) does not pay
  * the long first prefill again: a coding agent's first request carries ~10 000 tokens of instructions and tool
  * definitions, minutes of prefill on a CPU, and every later session of the agent starts with the same tokens.
+ * See docs/17 §17.3.
  *
  * <ul>
- *   <li><b>Save</b>: a slot's cache is written after a request whose prefill took at least
+ *   <li><b>Save</b>: a slot's cache is saved after a request whose prefill took at least
  *       {@code jllm.web.kv-cache-save-after-ms}, when a model is unloaded or the server stops, and before a restore
- *       overwrites it; only caches of at least {@code jllm.web.kv-cache-min-tokens} tokens. A cache that extends a
+ *       overwrites it; only caches of at least {@code jllm.web.kv-cache-min-tokens} tokens. The save holds the engine
+ *       only to take the token list ({@link Engine#beginSave}); the rows are written by a background thread while the
+ *       next request runs (it waits only if it rewrites a row not written yet). After a request, a save is skipped
+ *       when a saved file already covers most of the cache (fewer than {@code max(min-tokens, covered / 4)} new
+ *       tokens), so a growing conversation is rewritten every so often, not after every turn. A cache that extends a
  *       saved one replaces it (one file per conversation); one that a saved file already covers is not written.</li>
  *   <li><b>Restore</b>: when a request is assigned a slot, the saved cache sharing the longest prefix with its
- *       prompt is loaded into the slot if it covers at least 256 more tokens than the slot holds.</li>
+ *       prompt is found by a binary search in the saved token lists sorted lexicographically, and only that prefix is
+ *       loaded (the rest of the file is skipped), if it covers at least {@link #MIN_GAIN} more tokens than the slot
+ *       holds.</li>
  *   <li><b>Budget</b>: the least recently used files are deleted beyond {@code jllm.web.kv-cache-max-gb}.</li>
  * </ul>
  *
@@ -68,8 +76,12 @@ public class KvStore {
 
     private final WebProperties props;
     private final Path dir;
-    /** Fingerprint hash -> entries; a directory is scanned the first time its model is used. */
-    private final Map<String, List<Entry>> index = new LinkedHashMap<>();
+    /**
+     * Fingerprint hash -> entries by token list, in lexicographic order: the saved list sharing the longest prefix
+     * with a prompt is next to where the prompt would be inserted. A directory is scanned the first time its model is
+     * used.
+     */
+    private final Map<String, TreeMap<int[], Entry>> index = new LinkedHashMap<>();
     /** Fingerprint hash -> model id, for the console. */
     private final Map<String, String> names = new TreeMap<>();
 
@@ -108,13 +120,13 @@ public class KvStore {
     }
 
     /** The entries of a model's directory, scanning it on first use. */
-    private synchronized List<Entry> entries(String h, String fingerprint, String modelId) {
+    private synchronized TreeMap<int[], Entry> entries(String h, String fingerprint, String modelId) {
         names.put(h, modelId);
-        List<Entry> list = index.get(h);
-        if (list != null) {
-            return list;
+        TreeMap<int[], Entry> map = index.get(h);
+        if (map != null) {
+            return map;
         }
-        list = new ArrayList<>();
+        map = new TreeMap<>(Arrays::compare);
         Path d = dir.resolve(h);
         if (Files.isDirectory(d)) {
             try (var files = Files.list(d)) {
@@ -122,7 +134,11 @@ public class KvStore {
                     try {
                         CacheFile.Header hd = CacheFile.readHeader(f);
                         if (hd.fingerprint().equals(fingerprint)) {
-                            list.add(new Entry(f, hd.tokens(), Files.size(f), Files.getLastModifiedTime(f).toMillis()));
+                            Entry en = new Entry(f, hd.tokens(), Files.size(f), Files.getLastModifiedTime(f).toMillis());
+                            Entry dup = map.put(en.tokens, en);
+                            if (dup != null) { // the same conversation twice: keep one
+                                Files.deleteIfExists(dup.file);
+                            }
                         }
                     } catch (IOException e) {
                         System.err.println("kv-cache: ignoring unreadable " + f + ": " + e.getMessage());
@@ -132,8 +148,8 @@ public class KvStore {
                 System.err.println("kv-cache: cannot list " + d + ": " + e.getMessage());
             }
         }
-        index.put(h, list);
-        return list;
+        index.put(h, map);
+        return map;
     }
 
     /** Length of the common prefix of {@code a} and {@code b}. */
@@ -147,8 +163,25 @@ public class KvStore {
     }
 
     /**
-     * Before a request runs on {@code slot}: loads the saved cache that covers the most of {@code prompt}, when that
-     * beats what the slot holds. The slot's own cache is saved first if it is worth keeping.
+     * The entry sharing the longest prefix with {@code tokens}. In lexicographic order the common prefix with
+     * {@code tokens} only shrinks moving away from where {@code tokens} would be inserted, so it is the entry just
+     * before or just after that point: two comparisons instead of one per saved file.
+     */
+    static <V> Map.Entry<int[], V> longestPrefix(TreeMap<int[], V> map, int[] tokens) {
+        Map.Entry<int[], V> lo = map.floorEntry(tokens);
+        Map.Entry<int[], V> hi = map.higherEntry(tokens);
+        if (lo == null) {
+            return hi;
+        }
+        if (hi == null) {
+            return lo;
+        }
+        return commonPrefix(hi.getKey(), tokens) > commonPrefix(lo.getKey(), tokens) ? hi : lo;
+    }
+
+    /**
+     * Before a request runs on {@code slot}: loads the prefix of a saved cache that covers the most of {@code prompt},
+     * when that beats what the slot holds. The slot's own cache is saved first if it is worth keeping.
      */
     public void restore(LoadedModel m, LoadedModel.Slot slot, int[] prompt) {
         Engine e = slot.engine();
@@ -158,55 +191,64 @@ public class KvStore {
         String fp = fingerprint(m);
         String h = hash(fp);
         int have = e.cachedPrefix(prompt);
-        Entry best = null;
-        int bestLen = 0;
+        Entry best;
+        int bestLen;
         synchronized (this) {
-            for (Entry en : entries(h, fp, m.id())) {
-                int len = Math.min(commonPrefix(en.tokens, prompt), prompt.length - 1);
-                if (len > bestLen) {
-                    best = en;
-                    bestLen = len;
-                }
-            }
+            Map.Entry<int[], Entry> x = longestPrefix(entries(h, fp, m.id()), prompt);
+            best = x == null ? null : x.getValue();
+            bestLen = x == null ? 0 : Math.min(commonPrefix(x.getKey(), prompt), prompt.length - 1);
         }
         if (best == null || bestLen - have < MIN_GAIN) {
             return;
         }
-        save(m, slot, "before restoring another conversation into slot " + slot.index());
+        save(m, slot, "before restoring another conversation into slot " + slot.index(), Mode.BEFORE_RESTORE);
         long t0 = System.nanoTime();
         try {
-            int n = e.loadCache(best.file, fp);
+            int n = e.loadCache(best.file, fp, bestLen); // only the shared prefix: the rest would be overwritten
             best.used = System.currentTimeMillis();
             touch(best.file);
-            System.err.printf("kv-cache: restored %d tokens of %s into slot %d from %s in %.1f s (%d of the prompt's %d"
-                            + " tokens reusable)%n", n, m.id(), slot.index(), best.file.getFileName(),
-                    (System.nanoTime() - t0) / 1e9, bestLen, prompt.length);
+            System.err.printf("kv-cache: restored %d of the %d saved tokens of %s into slot %d from %s in %.1f s (the"
+                            + " prompt has %d)%n", n, best.tokens.length, m.id(), slot.index(), best.file.getFileName(),
+                    (System.nanoTime() - t0) / 1e9, prompt.length);
         } catch (IOException | RuntimeException ex) {
             System.err.println("kv-cache: cannot restore " + best.file + ": " + ex.getMessage() + " (deleting it)");
             forget(h, best);
         }
     }
 
-    /** After a request: saves the slot's cache in the background when the prefill was expensive. */
+    /**
+     * After a request, while its slot is still reserved: saves the slot's cache when the prefill was expensive. Only
+     * the token list is taken here; the rows are written in the background.
+     */
     public void afterRequest(LoadedModel m, LoadedModel.Slot slot, Engine.Stats stats) {
-        if (enabled() && slot.engine().canPersistCache() && stats.prefillMs() >= props.kvCacheSaveAfterMs()) {
-            Thread.ofVirtual().name("kv-cache-save").start(() -> save(m, slot, "after a " + Math.round(stats.prefillMs() / 1000)
-                    + " s prefill"));
+        if (enabled() && slot.engine().canPersistCache() && stats.prefillMs() >= props.kvCacheSaveAfterMs()
+                && !slot.engine().saving()) {
+            save(m, slot, "after a " + String.format("%.1f", stats.prefillMs() / 1000) + " s prefill", Mode.AFTER_REQUEST);
         }
     }
 
-    /** Saves every slot of a model (unload, shutdown, or on request). */
+    /** Saves every slot of a model (unload, shutdown, or on request), waiting for the files to be written. */
     public void saveAll(LoadedModel m) {
         if (!enabled()) {
             return;
         }
         for (LoadedModel.Slot s : m.slots()) {
-            save(m, s, "on unload");
+            save(m, s, "on unload", Mode.NOW);
         }
     }
 
-    /** Writes the slot's cache unless it is short or a saved file already holds it. */
-    void save(LoadedModel m, LoadedModel.Slot slot, String why) {
+    /** Why a save happens: what is skipped and whether the caller waits for the file. */
+    enum Mode {
+        /** after a request: skipped when a saved file already covers most of the cache; written in the background */
+        AFTER_REQUEST,
+        /** before a restore overwrites the slot: written in the background (the restore waits for it) */
+        BEFORE_RESTORE,
+        /** unload / shutdown / the console's button: written before returning */
+        NOW
+    }
+
+    /** Saves the slot's cache unless it is short or a saved file already holds it. */
+    void save(LoadedModel m, LoadedModel.Slot slot, String why, Mode mode) {
         Engine e = slot.engine();
         if (!e.canPersistCache()) {
             return;
@@ -218,38 +260,76 @@ public class KvStore {
         String fp = fingerprint(m);
         String h = hash(fp);
         synchronized (this) {
-            for (Entry en : entries(h, fp, m.id())) {
-                if (en.tokens.length >= tokens.length && commonPrefix(en.tokens, tokens) == tokens.length) {
-                    en.used = System.currentTimeMillis();
-                    return; // already on disk (the same tokens, or more)
+            TreeMap<int[], Entry> map = entries(h, fp, m.id());
+            Map.Entry<int[], Entry> ceil = map.ceilingEntry(tokens); // the first list that may extend tokens
+            if (ceil != null && commonPrefix(ceil.getKey(), tokens) == tokens.length) {
+                ceil.getValue().used = System.currentTimeMillis();
+                return; // already on disk (the same tokens, or more)
+            }
+            if (mode == Mode.AFTER_REQUEST) {
+                int covered = 0;
+                for (Entry en : map.values()) {
+                    if (en.tokens.length < tokens.length && commonPrefix(en.tokens, tokens) == en.tokens.length) {
+                        covered = Math.max(covered, en.tokens.length);
+                    }
+                }
+                if (tokens.length - covered < Math.max(props.kvCacheMinTokens(), covered / 4)) {
+                    return; // most of it is on disk: saved again once it has grown more
                 }
             }
         }
-        Path file = dir.resolve(h).resolve(System.currentTimeMillis() + "-" + tokens.length + ".kv");
+        Path file = dir.resolve(h).resolve(System.currentTimeMillis() + "-" + tokens.length + "-" + slot.index() + ".kv");
         long t0 = System.nanoTime();
+        Engine.PendingSave pending;
         try {
             Files.createDirectories(file.getParent());
             Path about = file.getParent().resolve("model.txt");
             if (!Files.exists(about)) {
                 Files.writeString(about, m.id() + "\n" + fp + "\n");
             }
-            if (e.saveCache(file, fp) == 0) {
-                return;
-            }
-            int[] saved = CacheFile.readHeader(file).tokens(); // the cache may have moved on since the check above
+            pending = e.beginSave(file, fp); // takes the token list now; the rows are written below
+        } catch (IOException | RuntimeException ex) {
+            System.err.println("kv-cache: cannot save " + file + ": " + ex.getMessage());
+            return;
+        }
+        if (pending == null) {
+            return;
+        }
+        double beginMs = (System.nanoTime() - t0) / 1e6;
+        Runnable write = () -> finish(m, slot, why, pending, fp, h, t0, beginMs);
+        if (mode == Mode.NOW) {
+            write.run();
+        } else {
+            Thread.ofVirtual().name("kv-cache-save").start(write);
+        }
+    }
+
+    /** Writes the rows of a begun save and indexes the file. */
+    private void finish(LoadedModel m, LoadedModel.Slot slot, String why, Engine.PendingSave pending, String fp,
+                        String h, long t0, double beginMs) {
+        Path file = pending.file();
+        try {
+            pending.write();
+            int[] saved = pending.tokens();
             Entry fresh = new Entry(file, saved, Files.size(file), System.currentTimeMillis());
-            System.err.printf("kv-cache: saved %d tokens of %s (slot %d, %s) to %s, %.0f MB in %.1f s%n", saved.length,
-                    m.id(), slot.index(), why, file, fresh.bytes / 1e6, (System.nanoTime() - t0) / 1e9);
+            System.err.printf("kv-cache: saved %d tokens of %s (slot %d, %s) to %s, %.0f MB in %.1f s (the slot was"
+                            + " held %.0f ms)%n", saved.length, m.id(), slot.index(), why, file, fresh.bytes / 1e6,
+                    (System.nanoTime() - t0) / 1e9, beginMs);
             List<Entry> stale = new ArrayList<>();
             synchronized (this) {
-                List<Entry> list = entries(h, fp, m.id());
-                for (Entry en : list) {
+                TreeMap<int[], Entry> map = entries(h, fp, m.id());
+                for (Entry en : map.values()) {
                     if (en.tokens.length < saved.length && commonPrefix(en.tokens, saved) == en.tokens.length) {
                         stale.add(en); // the conversation grew: the new file covers the old one
                     }
                 }
-                list.removeAll(stale);
-                list.add(fresh);
+                for (Entry en : stale) {
+                    map.remove(en.tokens);
+                }
+                Entry dup = map.put(saved, fresh);
+                if (dup != null && !dup.file.equals(file)) {
+                    stale.add(dup); // saved twice meanwhile (two saves of the same tokens): keep the new file
+                }
             }
             for (Entry en : stale) {
                 Files.deleteIfExists(en.file);
@@ -275,9 +355,9 @@ public class KvStore {
 
     private void forget(String h, Entry en) {
         synchronized (this) {
-            List<Entry> list = index.get(h);
-            if (list != null) {
-                list.remove(en);
+            TreeMap<int[], Entry> map = index.get(h);
+            if (map != null && map.get(en.tokens) == en) {
+                map.remove(en.tokens);
             }
         }
         try {
@@ -293,14 +373,14 @@ public class KvStore {
         List<Path> delete = new ArrayList<>();
         synchronized (this) {
             List<Map.Entry<String, Entry>> all = new ArrayList<>();
-            index.forEach((h, list) -> list.forEach(en -> all.add(Map.entry(h, en))));
+            index.forEach((h, map) -> map.values().forEach(en -> all.add(Map.entry(h, en))));
             long total = all.stream().mapToLong(x -> x.getValue().bytes).sum();
             all.sort(Comparator.comparingLong(x -> x.getValue().used));
             for (var x : all) {
                 if (total <= max) {
                     break;
                 }
-                index.get(x.getKey()).remove(x.getValue());
+                index.get(x.getKey()).remove(x.getValue().tokens);
                 total -= x.getValue().bytes;
                 delete.add(x.getValue().file);
             }
@@ -322,13 +402,13 @@ public class KvStore {
     /** Deletes every saved cache. */
     public synchronized int clear() throws IOException {
         int n = 0;
-        for (List<Entry> list : index.values()) {
-            for (Entry en : list) {
+        for (TreeMap<int[], Entry> map : index.values()) {
+            for (Entry en : map.values()) {
                 if (Files.deleteIfExists(en.file)) {
                     n++;
                 }
             }
-            list.clear();
+            map.clear();
         }
         if (Files.isDirectory(dir)) {
             try (var walk = Files.walk(dir)) {
@@ -362,7 +442,7 @@ public class KvStore {
         List<SavedView> saved = new ArrayList<>();
         long bytes = 0;
         for (var en : index.entrySet()) {
-            for (Entry e : en.getValue()) {
+            for (Entry e : en.getValue().values()) {
                 saved.add(new SavedView(names.getOrDefault(en.getKey(), en.getKey()), e.tokens.length, e.bytes, e.used));
                 bytes += e.bytes;
             }

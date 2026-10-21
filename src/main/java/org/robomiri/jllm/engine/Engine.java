@@ -6,6 +6,7 @@ import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.sampling.TokenConstraint;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
+import org.robomiri.jllm.tokenizer.PromptCache;
 import org.robomiri.jllm.tokenizer.StreamDecoder;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 
@@ -132,6 +133,7 @@ public final class Engine implements AutoCloseable {
     private volatile int[] cached = new int[0]; // tokens currently in the KV cache
     private volatile int cachedLen;
     private final ChatTemplate.Format template;
+    private volatile PromptCache promptCache; // null = every prompt is tokenized in full
     private Speculator spec; // null = no speculative decoding
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
@@ -213,7 +215,23 @@ public final class Engine implements AutoCloseable {
 
     /** Renders a conversation to prompt ids with the family template (content cannot inject control tokens). */
     public int[] renderChat(java.util.List<ChatTemplate.Message> messages, boolean enableThinking) {
-        return template.renderTokens(tokenizer, messages, true, enableThinking);
+        return template.renderTokens(tokenizer, messages, true, enableThinking, promptCache);
+    }
+
+    /**
+     * Keeps the ids of recently rendered prompts, so that a conversation's next request tokenizes only what is new
+     * ({@code engine.prompt-cache-mb}); null turns it off. The ids are the same either way.
+     */
+    public void setPromptCache(PromptCache cache) {
+        if (cache != null && cache.tokenizer() != tokenizer) {
+            throw new IllegalArgumentException("the prompt cache is for another tokenizer");
+        }
+        this.promptCache = cache;
+    }
+
+    /** The prompt cache, or null. */
+    public PromptCache promptCache() {
+        return promptCache;
     }
 
     public Backend backend() {
@@ -384,6 +402,7 @@ public final class Engine implements AutoCloseable {
             reuse = 0; // every prompt position's logits are needed
             promptLp.add(null); // nothing predicts the first token
         }
+        awaitSave(reuse); // positions from reuse on are rewritten: a save still reading them finishes first
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
         cachedLen = 0;
@@ -603,6 +622,7 @@ public final class Engine implements AutoCloseable {
                 if (n <= have) {
                     return 0;
                 }
+                awaitSave(0);
                 cachedLen = 0;
                 backend.copyStateFrom(src.backend, n);
                 cached = java.util.Arrays.copyOf(src.cached, n);
@@ -634,58 +654,200 @@ public final class Engine implements AutoCloseable {
 
     /**
      * Saves the cached tokens and their keys and values to {@code file} (atomically: a temporary file is moved into
-     * place), waiting for a running request to finish first.
+     * place), waiting for a running request to finish first. {@link #beginSave} + {@link PendingSave#write}.
      *
      * @param fingerprint identifies the model and the settings that change its keys and values; a saved cache is
      *                    only loaded back under the same fingerprint
      * @return the number of positions saved (0: nothing cached, or the backend cannot save)
      */
     public int saveCache(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
+        PendingSave p = beginSave(file, fingerprint);
+        return p == null ? 0 : p.write();
+    }
+
+    /**
+     * A save whose tokens are fixed and whose rows are still to be written ({@link #write}). Until then positions
+     * {@code [0, positions())} of the engine's cache are <em>pinned</em>: requests that only write later positions
+     * (the next turn of the conversation) run meanwhile; one that would rewrite a pinned row, a load and a prefix copy
+     * into this engine wait for the write to finish.
+     */
+    public final class PendingSave {
+        private final java.nio.file.Path file;
+        private final CacheFile.Header header;
+        private boolean finished;
+
+        private PendingSave(java.nio.file.Path file, CacheFile.Header header, boolean finished) {
+            this.file = file;
+            this.header = header;
+            this.finished = finished;
+        }
+
+        /** The saved tokens. */
+        public int[] tokens() {
+            return header.tokens();
+        }
+
+        public java.nio.file.Path file() {
+            return file;
+        }
+
+        /**
+         * Writes the rows (on any thread, without holding the engine) and releases the pin, also when writing fails.
+         * Call exactly once.
+         *
+         * @return the number of positions saved
+         */
+        public int write() throws java.io.IOException {
+            synchronized (this) {
+                if (finished) {
+                    return header.tokens().length;
+                }
+                finished = true;
+            }
+            try {
+                int n = header.tokens().length;
+                CacheFile.write(file, header, ch -> backend.saveStateWhileServing(n, ch));
+                return n;
+            } finally {
+                synchronized (saveMonitor) {
+                    savingUpTo = 0;
+                    saveMonitor.notifyAll();
+                }
+                saves.release();
+            }
+        }
+    }
+
+    /** One save at a time per engine; held from {@link #beginSave} to the end of {@link PendingSave#write}. */
+    private final java.util.concurrent.Semaphore saves = new java.util.concurrent.Semaphore(1);
+    private final Object saveMonitor = new Object();
+    private int savingUpTo; // positions [0, savingUpTo) are being written out; guarded by saveMonitor
+    private volatile boolean closed;
+
+    /**
+     * Starts saving the cache to {@code file}: takes the cached tokens under the engine lock (waiting for a running
+     * request) and returns. When the backend {@link Backend#canSaveWhileServing can}, the rows are written by
+     * {@link PendingSave#write}, typically on a background thread while later requests run (they wait only if they
+     * would rewrite a row not written yet); otherwise they are written here, under the lock, and the returned save is
+     * already finished. Waits for an earlier save of this engine to finish first.
+     *
+     * @return the save, or null when nothing is cached or the backend cannot save
+     */
+    public PendingSave beginSave(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
         String format = backend.stateFormat();
         if (format == null) {
-            return 0;
+            return null;
         }
-        acquire();
         try {
-            int n = cachedLen;
-            if (n == 0) {
-                return 0;
+            while (!saves.tryAcquire(1, TimeUnit.SECONDS)) {
+                if (closed) {
+                    return null;
+                }
             }
-            int[] tokens = java.util.Arrays.copyOf(cached, n);
-            CacheFile.write(file, new CacheFile.Header(fingerprint, format, tokens), ch -> backend.saveState(n, ch));
-            return n;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+        boolean handedOver = false;
+        try {
+            acquire();
+            try {
+                int n = cachedLen;
+                if (n == 0 || closed) {
+                    return null;
+                }
+                CacheFile.Header h = new CacheFile.Header(fingerprint, format, java.util.Arrays.copyOf(cached, n));
+                if (!backend.canSaveWhileServing()) {
+                    CacheFile.write(file, h, ch -> backend.saveState(n, ch));
+                    return new PendingSave(file, h, true);
+                }
+                synchronized (saveMonitor) {
+                    savingUpTo = n;
+                }
+                handedOver = true;
+                return new PendingSave(file, h, false);
+            } finally {
+                lock.unlock();
+            }
         } finally {
-            lock.unlock();
+            if (!handedOver) {
+                saves.release();
+            }
+        }
+    }
+
+    /** Whether a save of this engine has begun and is still writing its rows. */
+    public boolean saving() {
+        return saves.availablePermits() == 0;
+    }
+
+    /** Waits until no save reads positions {@code >= from} (they are about to be rewritten). Called holding the lock. */
+    private void awaitSave(int from) {
+        synchronized (saveMonitor) {
+            boolean interrupted = false;
+            while (savingUpTo > from) {
+                try {
+                    saveMonitor.wait();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
     /**
      * Replaces the cache with the one saved in {@code file}, so that a prompt starting with its tokens skips their
-     * prefill. Waits for a running request to finish first.
+     * prefill. Waits for a running request to finish first. {@link #loadCache(java.nio.file.Path, String, int)} without
+     * a limit.
+     */
+    public int loadCache(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
+        return loadCache(file, fingerprint, Integer.MAX_VALUE);
+    }
+
+    /**
+     * Replaces the cache with the first {@code limit} positions (or all, when fewer) of the cache saved in {@code file}:
+     * a prompt that shares only a prefix with a saved conversation loads just that prefix, and the rest of the file
+     * is skipped (a backend that cannot load part of a file loads all of it, when it fits the context).
      *
      * @return the number of positions restored
      * @throws java.io.IOException when the file is not a cache of this model (fingerprint), not of this backend
      *                             layout, or longer than the context; the current cache is then unchanged unless the
      *                             failure happened while reading the keys and values, in which case it is emptied
      */
-    public int loadCache(java.nio.file.Path file, String fingerprint) throws java.io.IOException {
+    public int loadCache(java.nio.file.Path file, String fingerprint, int limit) throws java.io.IOException {
         String format = backend.stateFormat();
         if (format == null) {
             throw new java.io.IOException(backend.name() + " cannot load a saved cache");
         }
         acquire();
         try {
+            int[] loaded = new int[1];
             CacheFile.Header h = CacheFile.read(file, fingerprint, format, (hdr, ch) -> {
-                int n = hdr.tokens().length;
+                int stored = hdr.tokens().length;
+                int n = Math.min(stored, Math.max(limit, 1));
                 if (n >= backend.contextLength()) {
                     throw new java.io.IOException("the saved cache holds " + n + " tokens, the context is "
                             + backend.contextLength());
                 }
+                awaitSave(0);
                 cachedLen = 0; // invalid until the whole state is in
-                backend.loadState(n, ch);
+                try {
+                    backend.loadState(n, stored, ch);
+                } catch (UnsupportedOperationException e) { // nothing read yet: the whole file, if it fits
+                    if (stored >= backend.contextLength()) {
+                        throw new java.io.IOException("the saved cache holds " + stored + " tokens, the context is "
+                                + backend.contextLength());
+                    }
+                    backend.loadState(stored, ch);
+                    n = stored;
+                }
+                loaded[0] = n;
             });
-            cached = h.tokens();
-            cachedLen = h.tokens().length;
+            cached = java.util.Arrays.copyOf(h.tokens(), loaded[0]);
+            cachedLen = loaded[0];
             return cachedLen;
         } finally {
             lock.unlock();
@@ -716,8 +878,17 @@ public final class Engine implements AutoCloseable {
         return best;
     }
 
+    /** Closes the backend, after a save that is still writing its rows (for at most a minute). */
     @Override
     public void close() {
+        closed = true;
+        try {
+            if (!saves.tryAcquire(60, TimeUnit.SECONDS)) {
+                System.err.println("warning: closing the engine while a cache save is still writing");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         if (spec != null) {
             spec.close();
         }
