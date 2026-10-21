@@ -113,6 +113,12 @@ public final class ImagePipeline implements AutoCloseable {
         return unet.sampleSize * vae.scale;
     }
 
+    /** Images larger than {@code tile} latent pixels per side go through the VAE in tiles that overlap by {@code overlap}. */
+    public void setVaeTiling(int tile, int overlap) {
+        vae.tileLatents = tile;
+        vae.tileOverlap = overlap;
+    }
+
     /** Pixel size must be a multiple of this (the UNet halves the latent several times). */
     public int sizeMultiple() {
         return vae.scale << (unet.blockCount - 1);
