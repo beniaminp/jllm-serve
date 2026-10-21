@@ -21,8 +21,11 @@ public final class VisionDump {
         Path mm = Path.of(a[0]);
         Rgb img = ImageDecoder.decode(Files.readAllBytes(Path.of(a[1])));
         int threads = a.length > 3 ? Integer.parseInt(a[3]) : Runtime.getRuntime().availableProcessors();
-        try (ClipModel m = ClipModel.open(mm); ClipCpu enc = new ClipCpu(m, threads)) {
-            System.out.println(m.projector + " layers=" + m.nLayer + " embd=" + m.nEmbd + " image " + img.width() + "x" + img.height());
+        String backend = System.getProperty("jllm.vision.backend", "cpu");
+        try (ClipModel m = ClipModel.open(mm);
+             VisionEncoder enc = VisionEncoders.create(m, new VisionContext.Options(backend, threads, Preprocess.Limits.NONE, 0))) {
+            System.out.println(m.projector + " layers=" + m.nLayer + " embd=" + m.nEmbd + " image " + img.width() + "x" + img.height()
+                    + " on " + enc.name());
             long t0 = System.nanoTime();
             Preprocess.Prepared pp = Preprocess.preprocess(m, img, Preprocess.Limits.NONE);
             System.out.printf("preprocess %.1f ms: %d tiles, grid %dx%d, overview %s%n", (System.nanoTime() - t0) / 1e6,
@@ -35,6 +38,10 @@ public final class VisionDump {
             for (Preprocess.Pixels px : all) {
                 long t1 = System.nanoTime();
                 VisionEncoder.Encoded e = enc.encode(px);
+                if (Boolean.getBoolean("jllm.vision.twice")) { // the second run: weights uploaded, pipelines compiled
+                    t1 = System.nanoTime();
+                    e = enc.encode(px);
+                }
                 System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d) in %.0f ms%n", i, px.width(), px.height(), e.tokens(),
                         e.nx(), e.ny(), (System.nanoTime() - t1) / 1e6);
                 ByteBuffer bb = ByteBuffer.allocate(e.embd().length * 4).order(ByteOrder.LITTLE_ENDIAN);

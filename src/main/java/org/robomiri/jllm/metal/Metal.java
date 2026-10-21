@@ -128,11 +128,16 @@ public final class Metal implements AutoCloseable {
      *                optional kernel instantiations. Compiler line numbers still refer to kernels.metal.
      */
     public static Metal create(String explicitLib, String defines) {
+        return create(explicitLib, defines, "kernels.metal");
+    }
+
+    /** As above with another shader source of this package ({@code vision.metal}: the vision encoder's own context). */
+    public static Metal create(String explicitLib, String defines, String resource) {
         Path lib = findLibrary(explicitLib);
         String src;
-        try (InputStream in = Metal.class.getResourceAsStream("kernels.metal")) {
+        try (InputStream in = Metal.class.getResourceAsStream(resource)) {
             if (in == null) {
-                throw new IllegalStateException("kernels.metal resource missing");
+                throw new IllegalStateException(resource + " resource missing");
             }
             src = new String(in.readAllBytes(), StandardCharsets.UTF_8);
         } catch (IOException e) {

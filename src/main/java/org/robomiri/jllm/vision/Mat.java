@@ -62,6 +62,11 @@ public final class Mat {
         return type;
     }
 
+    /** The mapped bytes of the whole matrix (rows contiguous in the file's own type); for zero-copy use on the GPU. */
+    public MemorySegment segment() {
+        return seg;
+    }
+
     @Override
     public String toString() {
         return name + " " + type + " [" + rows + " x " + cols + "]";

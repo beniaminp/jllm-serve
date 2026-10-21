@@ -34,8 +34,13 @@ public final class VisionContext implements AutoCloseable {
      * @param threads  CPU threads (0 = all cores)
      * @param limits   image token budget overrides
      * @param cacheMb  megabytes of encoded pictures to keep
+     * @param metalLib explicit path of libjllm_metal (null = the usual places)
      */
-    public record Options(String backend, int threads, Preprocess.Limits limits, int cacheMb) {
+    public record Options(String backend, int threads, Preprocess.Limits limits, int cacheMb, String metalLib) {
+        public Options(String backend, int threads, Preprocess.Limits limits, int cacheMb) {
+            this(backend, threads, limits, cacheMb, null);
+        }
+
         public static Options defaults() {
             return new Options("cpu", 0, Preprocess.Limits.NONE, 256);
         }

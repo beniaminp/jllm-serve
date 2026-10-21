@@ -233,7 +233,7 @@ public final class ModelLoader {
         }
         return new org.robomiri.jllm.vision.VisionContext.Options(backend, s.getInt("backend.threads"),
                 new org.robomiri.jllm.vision.Preprocess.Limits(s.getInt("vision.image-min-tokens"), s.getInt("vision.image-max-tokens")),
-                s.getInt("vision.cache-mb"));
+                s.getInt("vision.cache-mb"), s.opt("backend.metal.lib"));
     }
 
     /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
