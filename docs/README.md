@@ -32,5 +32,6 @@ Suggested reading order:
 | 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding — measured |
 | 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
 | 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push to Docker Hub, run; the /data volume, the API key, memory sizing, proxies, what was verified |
+| 20 | [Pictures as input](20-vision.md) | Vision-language models: the second GGUF (`mmproj`), llama.cpp-exact picture preprocessing (Pillow resize), the vision transformer on CPU and Metal (patches, 2-D rotary, windows, learned positions), the projectors (pixel shuffle, pooling, 2 x 2 merge, Qwen3-VL deepstack), embeddings in place of placeholder tokens, M-RoPE by rewriting rotary rows, a KV cache keyed by the picture, `image_url` parts, the console and the `describe_image` tool, checked against llama.cpp, measured |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).
