@@ -39,13 +39,14 @@ public final class Rope {
 
     /**
      * Multiplier of cos and sin (so of {@code q.k} squared): LongRoPE's {@link #attentionFactor}, YaRN's
-     * {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)} (modeling_deepseek.py),
-     * 1 for every other scaling.
+     * {@code attention_factor} or else {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)}
+     * (modeling_deepseek.py), 1 for every other scaling.
      */
     public static double amplitude(Scaling s) {
         return switch (s) {
             case Scaling.LongRope lr -> attentionFactor(lr);
-            case Scaling.Yarn y -> yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim());
+            case Scaling.Yarn y -> y.attentionFactor() > 0 ? y.attentionFactor()
+                    : yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim());
             case Scaling.None n -> 1.0;
             case Scaling.Linear l -> 1.0;
             case Scaling.Llama3 l -> 1.0;

@@ -1,6 +1,7 @@
 package org.robomiri.jllm.gguf;
 
 import org.robomiri.jllm.model.Architecture;
+import org.robomiri.jllm.model.Rope;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -169,8 +170,31 @@ final class GgufArchitecture {
                 rs.put("rope_type", "linear");
                 rs.put("factor", g.dbl(p + "rope.scaling.factor", 1.0));
             }
+            case "yarn" -> {
+                // the keys convert_hf_to_gguf.py writes for a rope_scaling of type yarn; attn_factor multiplies
+                // ggml's own 0.1 ln(factor) + 1 (ggml_rope_yarn), which is transformers' attention_factor
+                double factor = g.dbl(p + "rope.scaling.factor", 1.0);
+                rs.put("rope_type", "yarn");
+                rs.put("factor", factor);
+                if (g.get(p + "rope.scaling.original_context_length") instanceof Number o) {
+                    rs.put("original_max_position_embeddings", o.longValue());
+                }
+                if (g.get(p + "rope.scaling.yarn_beta_fast") instanceof Number b) {
+                    rs.put("beta_fast", b.doubleValue());
+                }
+                if (g.get(p + "rope.scaling.yarn_beta_slow") instanceof Number b) {
+                    rs.put("beta_slow", b.doubleValue());
+                }
+                double attn = g.dbl(p + "rope.scaling.attn_factor", 1.0);
+                if (attn != 1.0) {
+                    rs.put("attention_factor", attn * Rope.yarnMscale(factor, 1));
+                }
+                if (g.dbl(p + "rope.scaling.yarn_log_multiplier", 0) != 0) {
+                    throw new IOException(p + "rope.scaling.yarn_log_multiplier (DeepSeek's mscale_all_dim) is not supported");
+                }
+            }
             default -> throw new IOException("unsupported rope scaling type '" + type + "' (" + p + "rope.scaling.type);"
-                    + " supported: none, linear, and llama3 via rope_freqs.weight");
+                    + " supported: none, linear, yarn, and llama3 via rope_freqs.weight");
         }
         if (g.hasTensor("rope_freqs.weight")) {
             // llama.cpp stores Llama 3.x's scaled frequencies as per-pair divisors

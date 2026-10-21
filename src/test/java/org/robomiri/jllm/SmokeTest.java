@@ -1371,7 +1371,7 @@ public final class SmokeTest {
      * i >= 23 are divided by 40, in between ramp = (i - 10) / 13 blends: i = 16 gives
      * 0.00025 * 6/13 + 0.01 * 7/13 = 0.0055.
      */
-    static void yarnRope() {
+    static void yarnRope() throws Exception {
         double[] f = Rope.yarnInvFreq(64, 1e4, 40, 4096, 32, 1);
         check(f.length == 32 && f[0] == 1.0, "yarn keeps the fastest pair");
         check(Math.abs(f[5] - Math.pow(1e4, -5.0 / 32)) < 1e-15 && Math.abs(f[10] - 0.056234132519034905) < 1e-15,
@@ -1393,6 +1393,53 @@ public final class SmokeTest {
         double m = 1.3688879454113936 / 1.2608037774058554;
         check(Math.abs(r2.cos[0] - m) < 1e-6 && Math.abs(r2.sin[32 + 16] - Math.sin(0.0055) * m) < 1e-6,
                 "yarn table scaled by mscale / mscale_all_dim");
+        check(Rope.amplitude(new Scaling.Yarn(40, 4096, 32, 1, 1.0, 0.707, 1.5)) == 1.5, "yarn attention_factor override");
+
+        // rope_scaling yarn in a Qwen3 config.json (the long-context recipe: factor 4 over 32768): the same
+        // frequencies as the DeepSeek path for the same parameters, the paper's amplitude 0.1 ln 4 + 1
+        Path tmp = Files.createTempDirectory("jllm-yarn");
+        try {
+            String base = """
+                    {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":2,
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":1000,
+                     "rope_theta":1000000,"max_position_embeddings":40960,"rope_scaling":%s}""";
+            Architecture q = cfg(tmp, base.formatted(
+                    "{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768}"));
+            RopeTable t = rope(q);
+            check(t.scaling() instanceof Scaling.Yarn y && y.factor() == 4 && y.originalMaxPositions() == 32768
+                    && y.betaFast() == 32 && y.betaSlow() == 1 && q.core().description().endsWith(" rope=yarnx4.0"),
+                    "qwen3 yarn config: " + t.scaling() + " / " + q.core().description());
+            check(Arrays.equals(Rope.invFreq(t, 40960), Rope.yarnInvFreq(128, 1e6, 4, 32768, 32, 1))
+                            && Arrays.equals(Rope.invFreq(t, 40960),
+                            Rope.invFreq(128, 1e6, new Scaling.Yarn(4, 32768, 32, 1, 1, 0), 40960)),
+                    "qwen3 yarn frequencies equal the DeepSeek path's");
+            double amp = 0.1 * Math.log(4) + 1;
+            check(Math.abs(Rope.amplitude(t.scaling()) - amp) < 1e-15
+                            && Rope.amplitude(t.scaling()) == Rope.amplitude(new Scaling.Yarn(4, 32768, 32, 1, 1, 0)),
+                    "qwen3 yarn amplitude 0.1 ln(factor) + 1 = " + Rope.amplitude(t.scaling()));
+            Rope r3 = new Rope(t, 3);
+            check(Math.abs(r3.cos[0] - amp) < 1e-6 && Math.abs(r3.sin[2 * 64 + 63] - Math.sin(2 * Rope.invFreq(t, 3)[63]) * amp) < 1e-6,
+                    "qwen3 yarn table scaled by the amplitude");
+            // attention_factor / mscale pair / missing original length (falls back to max_position_embeddings)
+            Scaling a = rope(cfg(tmp, base.formatted("{\"type\":\"yarn\",\"factor\":2.0,\"attention_factor\":1.25}"))).scaling();
+            check(a instanceof Scaling.Yarn y && y.originalMaxPositions() == 40960 && Rope.amplitude(a) == 1.25,
+                    "yarn attention_factor and default original length: " + a);
+            Scaling ms = rope(cfg(tmp, base.formatted(
+                    "{\"type\":\"yarn\",\"factor\":40,\"mscale\":1.0,\"mscale_all_dim\":0.707,\"beta_fast\":16}"))).scaling();
+            check(ms instanceof Scaling.Yarn y && y.betaFast() == 16 && Math.abs(Rope.amplitude(ms) - m) < 1e-12,
+                    "yarn mscale / mscale_all_dim: " + ms);
+            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}", "{\"type\":\"yarn\",\"factor\":4,\"truncate\":false}"}) {
+                try {
+                    cfg(tmp, base.formatted(bad));
+                    check(false, "rejected yarn config " + bad);
+                } catch (IllegalArgumentException e) {
+                    check(e.getMessage().contains("yarn"), "rejected yarn config: " + e.getMessage());
+                }
+            }
+        } finally {
+            Files.deleteIfExists(tmp.resolve("config.json"));
+            Files.deleteIfExists(tmp);
+        }
     }
 
     /** The three DeepSeek routing rules on hand-made score matrices. */

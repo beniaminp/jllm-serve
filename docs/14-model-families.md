@@ -60,8 +60,8 @@ The checkpoints each row was verified against:
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
 `gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` outside `qwen2` and `glm` (it would also add an `o_proj`
-bias), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope` (`su` is the legacy spelling of
-`longrope`) is rejected at load time with a message naming the field; `yarn` is accepted for the DeepSeek families only.
+bias), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope`/`yarn` (`su` is the legacy spelling of
+`longrope`; `yarn` follows 14.11.2 in every family) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
 quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 256
@@ -202,7 +202,7 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
   `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
-- `yarn` outside the DeepSeek families (14.11.2), `dynamic` RoPE scaling; FP8 checkpoints (14.11.7); `hidden_act`
+- `dynamic` RoPE scaling, YaRN with `truncate: false`; FP8 checkpoints (14.11.7); `hidden_act`
   other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; an `o_proj`
   bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
@@ -567,7 +567,7 @@ caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU ==
 
 Images (the vision tower and projector are skipped, so Gemma 3 4B+ is text-only);
 the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
-configs above were read), no real weights were run; `yarn` and `dynamic` RoPE scaling; Gemma 3n and
+configs above were read), no real weights were run; `dynamic` RoPE scaling; Gemma 3n and
 Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
@@ -705,6 +705,17 @@ Pairs 0 – 10 keep their frequency, pairs 23 – 31 are divided by 40, pairs 11
 `f = 0.01`, ramp 6/13, `inv_freq = 0.00025 · 6/13 + 0.01 · 7/13 = 0.0055` (checked in `SmokeTest.yarnRope`).
 Finally the cos/sin tables are multiplied by `yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)`
 (exactly 1 for V2-Lite and V3, where the two are equal). Rope types other than `yarn` / none are rejected for DeepSeek.
+
+**The other families** (Qwen2 / Qwen3 long context: `{"rope_type": "yarn", "factor": 4.0,
+"original_max_position_embeddings": 32768}`) use the same frequencies over their rotary dimensions (`Families.yarn`,
+transformers' `_compute_yarn_parameters`): `beta_fast` / `beta_slow` default to 32 / 1, the original length falls
+back to `max_position_embeddings`, and the cos/sin amplitude is `attention_factor` if given, else
+`yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)` when both are set, else
+`0.1 · ln(factor) + 1` (1.1386 for factor 4). One deliberate difference from transformers, which replaces `factor`
+by `max_position_embeddings / original_max_position_embeddings` when the latter is given: the map's `factor` is used,
+as llama.cpp, vLLM and the GGUF metadata do (Qwen's own recipe adds the map without raising
+`max_position_embeddings`, which would otherwise give 40960/32768 = 1.25 instead of 4). `SmokeTest.yarnRope` checks
+that a Qwen3 config gives exactly the DeepSeek frequencies for the same parameters and the expected amplitude.
 
 ### 14.11.3 Mixture of experts: dense prefix, routed + shared experts
 

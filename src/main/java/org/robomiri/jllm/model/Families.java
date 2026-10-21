@@ -635,10 +635,40 @@ final class Families {
                     throw new IllegalArgumentException("invalid linear rope_scaling: " + rs);
                 }
                 return new Scaling.Linear(factor);
+            case "yarn":
+                return yarn(rs, c);
             default:
                 throw new IllegalArgumentException("unsupported rope_scaling type '" + type
-                        + "' (supported: default, linear, llama3, longrope)");
+                        + "' (supported: default, linear, llama3, longrope, yarn)");
         }
+    }
+
+    /**
+     * A {@code yarn} scaling map (Qwen2 / Qwen3 long context and the like): as transformers'
+     * {@code _compute_yarn_parameters}, with {@code beta_fast} 32 and {@code beta_slow} 1 by default, the
+     * pretrained length from {@code original_max_position_embeddings} (else {@code max_position_embeddings}) and
+     * the amplitude {@code attention_factor}, else {@code mscale / mscale_all_dim} when both are set, else
+     * {@code 0.1 ln(factor) + 1}. One deliberate difference: transformers replaces {@code factor} by
+     * {@code max_position_embeddings / original_max_position_embeddings} when the latter is given; here the
+     * {@code factor} of the map is used, as llama.cpp and vLLM do (and as a GGUF stores it), so a config that
+     * enables YaRN without raising {@code max_position_embeddings} still gets the factor it asked for.
+     */
+    private static Scaling.Yarn yarn(Map<String, Object> rs, Map<String, Object> c) {
+        double factor = Json.dbl(rs, "factor", 1.0);
+        int orig = (int) Json.num(rs, "original_max_position_embeddings", Json.num(c, "max_position_embeddings", 0));
+        double betaFast = Json.dbl(rs, "beta_fast", 32);
+        double betaSlow = Json.dbl(rs, "beta_slow", 1);
+        double attention = Json.dbl(rs, "attention_factor", 0);
+        if (!(factor > 0) || orig <= 0 || !(betaFast > betaSlow) || !(betaSlow > 0) || attention < 0) {
+            throw new IllegalArgumentException("invalid yarn rope_scaling: " + rs);
+        }
+        if (!Json.bool(rs, "truncate", true)) {
+            throw new IllegalArgumentException("yarn rope_scaling with truncate=false is not supported");
+        }
+        double mscale = Json.dbl(rs, "mscale", 0);
+        double mscaleAllDim = Json.dbl(rs, "mscale_all_dim", 0);
+        boolean both = mscale != 0 && mscaleAllDim != 0;
+        return new Scaling.Yarn(factor, orig, betaFast, betaSlow, both ? mscale : 1, both ? mscaleAllDim : 0, attention);
     }
 
     private static double[] factors(Map<String, Object> rs, String key, int n) {
