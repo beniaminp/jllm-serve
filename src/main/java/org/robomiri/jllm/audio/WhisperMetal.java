@@ -30,6 +30,8 @@ public final class WhisperMetal implements WhisperNet {
     private static final float LN_EPS = 1e-5f;
     /** Tokens per decoder call (longer prompts are fed in pieces). */
     private static final int DEC_CHUNK = 64;
+    /** The encoder is submitted every this many layers (without waiting), so no command buffer runs for seconds. */
+    private static final int COMMIT_LAYERS = 3;
     private static final int GELU = 2;
     private static final int BIAS = 1;
     private static final int ACC = 4;
@@ -323,7 +325,11 @@ public final class WhisperMetal implements WhisperNet {
             g.run("wh_im2col_s2", GpuCtx.ceilDiv(t2 * d * 3, 256), 1, 1, 256, 1, 1, new Object[]{t2, d, frames}, h1, col2);
             linear(conv2, col2, x, t2, GELU | ACC);
             float scale = (float) (1.0 / Math.sqrt(hd));
+            int layerNo = 0;
             for (GLayer l : enc) {
+                if (layerNo++ % COMMIT_LAYERS == COMMIT_LAYERS - 1) {
+                    g.metal.commit();      // a command buffer that holds the GPU for seconds is killed by the system's watchdog
+                }
                 layerNorm(x, xn, l.ln1g(), l.ln1b(), t2, d);
                 linear(l.q(), xn, qb, t2, 0);
                 linear(l.k(), xn, kb, t2, 0);
