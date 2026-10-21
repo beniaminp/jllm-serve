@@ -3284,17 +3284,18 @@ kernel void shared_gate_add(device const float *xb [[buffer(0)]],
 // Total threadgroup memory 8 KB (the f32 result tile of the staging epilogue aliases both input tiles), so up to four
 // threadgroups share a GPU core's 32 KB where the f32 kernels (12 KB) fit two.
 
-#define HM_SMEM 2048        // floats of threadgroup memory per *_hmma threadgroup: half weights 64 x 32 + f32 x 32 x 32
+#define HM_SMEM 2560        // floats of threadgroup memory per *_hmma threadgroup: half weights 64 x 32 + f32 x 32 x 32 + 8 diagonal 8 x 8 scale matrices
 
 // 16 weights (k = 16h .. 16h + 15 of the 32-weight block / unit u) of row grow of a GGUF tensor, dequantized as gg_unit
 // does. The legacy Q4_0 keeps llama.cpp's nibble order (low nibbles = weights 0..15), so for it half h is the low and
 // high nibbles of bytes 8h .. 8h + 7 = weights 8h .. 8h + 7 (w[0..1]) and 16 + 8h .. 16 + 8h + 7 (w[2..3]).
-template <int QT>
+// With RAW (Q4_0 / Q8_0 only) the integers come back unscaled: the *_hmma kernels apply the scale in f32 (hm_exact).
+template <int QT, bool RAW = false>
 static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, int h, thread float4 *w) {
     if (QT == GG_Q4_0 || QT == GG_Q8_0) {
         constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
         device const uchar *blk = wq + (grow * nb + u) * BYTES;
-        const float d = float(*(device const half *)blk);
+        const float d = RAW ? 1.0f : float(*(device const half *)blk);
         device const ushort *p = (device const ushort *)(blk + 2);
         if (QT == GG_Q4_0) {
             for (int k = 0; k < 2; k++) {
@@ -3337,6 +3338,13 @@ static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, in
     }
 }
 
+// Formats whose weight is an integer times one f32 scale per 32-weight block: the integers are exact in half, so the
+// *_hmma kernels keep the half tile exact (the integers only) and apply the scale in f32 after the multiply-accumulates
+// of the block (hm_core: a diagonal scale matrix and one more MMA per accumulator and block). The k-quants have
+// sub-block scales and minimums; their half tile holds q * scale rounded to half (relative error <= 2^-11 per weight).
+template <int QT>
+static inline constexpr bool hm_exact() { return QT == 4 || QT == 8 || QT == GG_Q4_0 || QT == GG_Q8_0; }
+
 // The raw bytes of this thread's share of block b for the engine's own formats (Q4_0: 8 quant bytes, Q8_0: 16, plus
 // the f32 scale), loaded one k step ahead; the other formats are decoded straight from device memory by hm_weights.
 template <int QT>
@@ -3351,6 +3359,8 @@ static inline void hm_fetch(device const uchar *rwq, device const float *rws, ul
         device const uchar4 *q = (device const uchar4 *)(rwq + (grow * nb + b) * 32 + h * 16);
         for (int k = 0; k < 4; k++) rq[k] = q[k];
         rs = rws[grow * nb + b];
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) { // only the block's f16 scale; hm_weights reads the quants
+        rs = float(*(device const half *)(rwq + (grow * nb + b) * (QT == GG_Q4_0 ? 18 : 34)));
     }
 }
 
@@ -3361,14 +3371,16 @@ static inline void hm_fetch(device const uchar *rwq, device const float *rws, ul
 template <int QT>
 static inline void hm_weights(device const uchar *rwq, ulong grow, int nb, int b, int h, thread const uchar4 *rq,
                               float rs, threadgroup half *wd) {
+    // exact formats: the tile holds the integers (exact in half); the scale goes to the diagonal matrices (hm_core)
+    const float f = hm_exact<QT>() ? 1.0f : rs;
     if (QT == 4) {
         for (int k = 0; k < 2; k++) {
-            *(threadgroup half4 *)(wd + h * 64 + k * 4) = half4((float4(rq[k] & uchar4(15)) - 8.0f) * rs);
-            *(threadgroup half4 *)(wd + (2 + h) * 64 + k * 4) = half4((float4(rq[k] >> uchar4(4)) - 8.0f) * rs);
+            *(threadgroup half4 *)(wd + h * 64 + k * 4) = half4((float4(rq[k] & uchar4(15)) - 8.0f) * f);
+            *(threadgroup half4 *)(wd + (2 + h) * 64 + k * 4) = half4((float4(rq[k] >> uchar4(4)) - 8.0f) * f);
         }
     } else if (QT == 8) {
         for (int k = 0; k < 4; k++) {
-            *(threadgroup half4 *)(wd + (2 * h + (k >> 1)) * 64 + (k & 1) * 4) = half4(float4(as_type<char4>(rq[k])) * rs);
+            *(threadgroup half4 *)(wd + (2 * h + (k >> 1)) * 64 + (k & 1) * 4) = half4(float4(as_type<char4>(rq[k])) * f);
         }
     } else {
         float4 w[4];
@@ -3377,7 +3389,7 @@ static inline void hm_weights(device const uchar *rwq, ulong grow, int nb, int b
         } else if (QT == 6) {
             q6k_sub_block(rwq, grow, (nb + 7) >> 3, 2 * b + h, w);
         } else {
-            gg_half<QT>(rwq, grow, nb, b, h, w);
+            gg_half<QT, hm_exact<QT>()>(rwq, grow, nb, b, h, w);
         }
         const int kb0 = QT == GG_Q4_0 ? h : 2 * h;
         const int kb1 = QT == GG_Q4_0 ? 2 + h : 2 * h + 1;
@@ -3399,6 +3411,7 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
                            bool direct, device float *dout, ulong ldo, bool accLoad, ushort tid, ushort sg) {
     threadgroup half *sa = (threadgroup half *)smem;
     threadgroup float *sb = smem + MMA_BR * QK / 2;
+    threadgroup float *dg = smem + MMA_BR * QK;   // exact formats: per 8-row band an 8 x 8 matrix, the row scales on its diagonal
     const ushort sr = sg & 1;   // rows 32 sr .. 32 sr + 31 of the tile
     const ushort st = sg >> 1;  // tokens 16 st .. 16 st + 15
     const int ni = clamp((ntv - int(st) * 16 + 7) / 8, 0, 2);   // 8-token blocks of the quarter holding valid tokens
@@ -3425,8 +3438,13 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
     hm_fetch<QT>(rwq, rws, rgrow, nb, 0, h, rq, rs);
     float4 x0 = xr[0];
     float4 x1 = xr[1];
+    if (hm_exact<QT>()) { // the off-diagonal entries stay zero for good
+        for (int i = tid; i < 8 * 64; i += MM_THREADS) dg[i] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     for (int b = 0; b < nb; b++) {
         hm_weights<QT>(rwq, rgrow, nb, b, h, rq, rs, wd);
+        if (hm_exact<QT>() && h == 0) dg[(lr >> 3) * 64 + (lr & 7) * 9] = rs;
         xd[0] = x0;
         xd[1] = x1;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3435,7 +3453,31 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
             x0 = xr[(b + 1) * 8];
             x1 = xr[(b + 1) * 8 + 1];
         }
-        if (ni > 0) {
+        if (hm_exact<QT>()) {
+            // the block's integer products in f32 per (token block, row block), then acc += tmp * diag(scale): the
+            // scale is applied in f32, as the CPU and the scalar kernels do, instead of rounding q * scale to half
+            if (ni > 0) {
+                simdgroup_float8x8 a[2][4];
+                for (int kk = 0; kk < 4; kk++) {
+                    for (int i = 0; i < 2; i++) {
+                        if (i < ni) simdgroup_load(a[i][kk], sb + ((st * 2 + i) * 4 + kk) * 64, 8);
+                    }
+                }
+                for (int j = 0; j < 4; j++) {
+                    simdgroup_half8x8 w[4];
+                    for (int kk = 0; kk < 4; kk++) simdgroup_load(w[kk], sa + ((sr * 4 + j) * 4 + kk) * 64, 8, ulong2(0, 0), true);
+                    simdgroup_float8x8 dm;
+                    simdgroup_load(dm, dg + (sr * 4 + j) * 64, 8);
+                    for (int i = 0; i < 2; i++) {
+                        if (i < ni) {
+                            simdgroup_float8x8 t = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                            for (int kk = 0; kk < 4; kk++) simdgroup_multiply_accumulate(t, a[i][kk], w[kk], t);
+                            simdgroup_multiply_accumulate(acc[i * 4 + j], t, dm, acc[i * 4 + j]);
+                        }
+                    }
+                }
+            }
+        } else if (ni > 0) {
             for (int kk = 0; kk < 4; kk++) {
                 simdgroup_half8x8 w[4];
                 for (int j = 0; j < 4; j++) simdgroup_load(w[j], sa + ((sr * 4 + j) * 4 + kk) * 64, 8, ulong2(0, 0), true);

@@ -253,7 +253,9 @@ final class MetalTuner {
                     .replace(' ', '_').replace('=', '_').replace(':', '_');
             String cached = cache.getProperty(ck);
             boolean use;
-            if (cached != null) {
+            if (!hmmaAllowed(pr)) { // the lossy K-quant kernels are opt-in (jllm.metal.hmmaKQuants), never chosen by timing
+                use = false;
+            } else if (cached != null) {
                 use = cached.equals("1");
             } else {
                 use = checkHmma(k, pr, log);
@@ -273,6 +275,19 @@ final class MetalTuner {
             System.err.println("Metal prefill matmuls: half-weight MMA for " + on + " of " + total + " shapes"
                     + (changed ? " (" + log.toString().trim() + ")" : " (cached)"));
         }
+    }
+
+    /** Whether the probe's formats have exact {@code *_hmma} kernels (or the lossy ones were asked for). */
+    private static boolean hmmaAllowed(Probe pr) {
+        if (MetalKernels.HMMA_KQUANTS) {
+            return true;
+        }
+        for (QTensor t : pr.t()) {
+            if (!MetalKernels.hmmaExact(t.type)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The distinct prefill matmul shapes of the model's layers. */

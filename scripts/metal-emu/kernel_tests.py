@@ -386,6 +386,14 @@ def fmt_weights(fmt, rows, cols, rng):
 
 
 GGUF = ('q4g', 'q8g', 'q4k', 'q5k')
+# Formats whose *_hmma kernels are exact: the half tile holds the integers and the per-block scale is applied in f32
+# after the multiply-accumulates (they are checked as strictly as the f32 *_mma kernels, against the exact weights).
+HMMA_EXACT = ('q4', 'q8', 'q4g', 'q8g')
+
+
+def rounds_half(fmt, kind):
+    """True for a kernel that rounds each dequantized weight to half (hmma on the k-quants)."""
+    return kind == 'hmma' and fmt not in HMMA_EXACT
 
 
 def rel_errs(out, w, x_ref_fn):
@@ -422,7 +430,7 @@ def mm_test(fmt, kind, rows, cols, ntok, acc=False, bias=False, softcap=0.0):
             r = np.tanh(r / softcap) * softcap
         return r + (out0 if acc else 0)
     report(name, '%dx%d, %d tokens%s%s%s' % (rows, cols, ntok, ', acc' if acc else '', ', bias' if bias else '',
-                                             ', softcap' if softcap else ''), out, w, ref, kind == 'hmma')
+                                             ', softcap' if softcap else ''), out, w, ref, rounds_half(fmt, kind))
 
 
 def mm3_test(fmt, kind, rows, cols, ntok, half=False, bias=False):
@@ -447,7 +455,7 @@ def mm3_test(fmt, kind, rows, cols, ntok, half=False, bias=False):
               % (name, rows, ntok, ', bias' if bias else '', eh, ee))
         return
     report(name, '%s, %d tokens%s' % (rows, ntok, ', bias' if bias else ''), out, w,
-           lambda wm: x.astype(np.float64) @ wm.T + (b if bias else 0), kind == 'hmma')
+           lambda wm: x.astype(np.float64) @ wm.T + (b if bias else 0), rounds_half(fmt, kind))
 
 
 def silu(g):
@@ -477,7 +485,7 @@ def swiglu_test(fmt, kind, hidden, cols, ntok, use_gelu=False):
         y = x.astype(np.float64) @ wm.T
         return act(y[:, :hidden]) * y[:, hidden:]
     report(name, 'hidden %d x %d, %d tokens%s' % (hidden, cols, ntok, ', gelu' if use_gelu else ''), out, w, ref,
-           kind == 'hmma')
+           rounds_half(fmt, kind))
 
 
 def moe_tiles(counts, experts, rng):
@@ -524,7 +532,7 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     got = hid[:slots]
     sc = np.abs(exact).max()
     eh, ee = np.abs(got - halfw).max() / sc, np.abs(got - exact).max() / sc
-    ok = (eh < 2e-5 and ee < 2e-3) if kind == 'hmma' else ee < 1e-5
+    ok = (eh < 2e-5 and ee < 2e-3) if rounds_half(fmt, kind) else ee < 1e-5
     check(ok, '%s m=%d dim=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, m, dim, list(counts), eh, ee))
 
     # down: ys[s] = rw[s] * W_e h[s], rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
@@ -545,7 +553,7 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     halfw = down_ref(dw.astype(np.float16).astype(np.float64))
     sc = np.abs(exact).max()
     eh, ee = np.abs(ys - halfw).max() / sc, np.abs(ys - exact).max() / sc
-    ok = (eh < 2e-5 and ee < 2e-3) if kind == 'hmma' else ee < 1e-5
+    ok = (eh < 2e-5 and ee < 2e-3) if rounds_half(fmt, kind) else ee < 1e-5
     check(ok, '%s dim=%d m=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), eh, ee))
 
 
