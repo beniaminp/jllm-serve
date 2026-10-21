@@ -13,14 +13,20 @@ final class WhisperMetalLoader {
         return Boolean.getBoolean("jllm.audio.metalExact");
     }
 
-    static WhisperNet tryCreate(WhisperWeights w, int threads) {
+    /**
+     * @param decoder "on", "off" or "auto" (the decoder runs on the GPU when the model is at least 768 wide: for small
+     *                models a step costs more in dispatches than the CPU needs to compute it)
+     */
+    static WhisperNet tryCreate(WhisperWeights w, int threads, String decoder) {
         try {
             GpuCtx g = GpuCtx.create(System.getProperty("jllm.metal.lib"));
             if (g == null) {
                 return null;
             }
             try {
-                return new WhisperMetal(w, g, threads, exact());
+                decoder = System.getProperty("jllm.audio.metalDecoder", decoder);   // tests and experiments
+                boolean gpuDecoder = decoder.equals("on") || (decoder.equals("auto") && w.cfg.dModel() >= 768);
+                return new WhisperMetal(w, g, threads, exact(), gpuDecoder);
             } catch (RuntimeException | Error e) {
                 g.close();
                 throw e;

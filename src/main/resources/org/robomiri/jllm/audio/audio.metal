@@ -9,7 +9,7 @@
 //   4. wh_im2col_*    convolutions as products: the patches of conv1 (mel, channel-major) and conv2 (stride 2, time-major)
 //   5. wh_split_heads q / k / v [n][d] to the per-head layouts attention uses (q scaled), k and v appended at a position
 //   6. wh_softmax     rows of the score matrix, optionally causal
-//   7. wh_copy_rows   x[t][:] = table[idx(t)][:] + pos[...] (embedding lookups) and plain copies
+//   7. wh_embed / wh_add   x[t] = table[token t] + pos[pos0 + t] (the decoder's input), x += y
 
 #include <metal_stdlib>
 using namespace metal;
@@ -21,7 +21,7 @@ using namespace metal;
 #define WH_THREADS 128          // wh_gemm: 4 simdgroups, each owns a 32-row x 16-token quarter of the tile
 #define WH_ROW_THREADS 256      // wh_layernorm / wh_softmax
 
-#define WH_BIAS 1               // GemmParams.flags
+#define WH_BIAS 1               // WhGemmParams.flags
 #define WH_GELU 2
 #define WH_ACC 4
 
@@ -77,7 +77,7 @@ static inline float wh_tg_max(float v, threadgroup float *buf, ushort sg, ushort
 // One 32-wide k step per iteration: thread tid stages 16 weights of tile row tid >> 1 (halves of k) and 8 activations
 // of tile token tid >> 2, then the four simdgroups multiply their 32 x 16 quarters block by block.
 
-struct GemmParams {
+struct WhGemmParams {
     int rows;
     int cols;
     int ntok;
@@ -95,7 +95,7 @@ kernel void wh_gemm(device const WT *w [[buffer(0)]],
                     device const float *x [[buffer(1)]],
                     device float *out [[buffer(2)]],
                     device const float *bias [[buffer(3)]],
-                    constant GemmParams &p [[buffer(4)]],
+                    constant WhGemmParams &p [[buffer(4)]],
                     uint3 tgp [[threadgroup_position_in_grid]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -172,7 +172,7 @@ template [[host_name("wh_gemm_hf")]] kernel decltype(wh_gemm<half, float>) wh_ge
 // ---------------------------------------------------------------------------------------------- 3. wh_layernorm
 // out[row] = (x[row] - mean) / sqrt(var + eps) * gamma + beta, one threadgroup per row of n values. out may be x.
 
-struct LnParams {
+struct WhLnParams {
     int n;
     float eps;
     int hasBeta;
@@ -182,7 +182,7 @@ kernel void wh_layernorm(device const float *x [[buffer(0)]],
                          device float *out [[buffer(1)]],
                          device const float *gamma [[buffer(2)]],
                          device const float *beta [[buffer(3)]],
-                         constant LnParams &p [[buffer(4)]],
+                         constant WhLnParams &p [[buffer(4)]],
                          uint row [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
@@ -207,7 +207,7 @@ kernel void wh_layernorm(device const float *x [[buffer(0)]],
 
 // ---------------------------------------------------------------------------------------------- 4. im2col
 
-struct ConvParams {
+struct WhConvParams {
     int t;          // output positions
     int c;          // input channels
     int tin;        // input positions
@@ -216,7 +216,7 @@ struct ConvParams {
 // conv1: patches X[t][ch * 3 + k] = mel[ch][t + k - 1] (zero outside), mel channel-major [c][tin]; one thread per element
 kernel void wh_im2col_mel(device const float *mel [[buffer(0)]],
                           device float *col [[buffer(1)]],
-                          constant ConvParams &p [[buffer(2)]],
+                          constant WhConvParams &p [[buffer(2)]],
                           uint gid [[thread_position_in_grid]]) {
     const int total = p.t * p.c * 3;
     if (int(gid) >= total) return;
@@ -230,7 +230,7 @@ kernel void wh_im2col_mel(device const float *mel [[buffer(0)]],
 // conv2 (stride 2): patches X[t][ch * 3 + k] = h[2 t + k - 1][ch], h time-major [tin][c]
 kernel void wh_im2col_s2(device const float *h [[buffer(0)]],
                          device float *col [[buffer(1)]],
-                         constant ConvParams &p [[buffer(2)]],
+                         constant WhConvParams &p [[buffer(2)]],
                          uint gid [[thread_position_in_grid]]) {
     const int total = p.t * p.c * 3;
     if (int(gid) >= total) return;
@@ -245,7 +245,7 @@ kernel void wh_im2col_s2(device const float *h [[buffer(0)]],
 // q, k, v [n][d] (token-major) into  qh[h][n][hd] (times scale),  kh[h][cap][hd] rows pos0 .. pos0 + n,  vt[h][hd][cap]
 // columns pos0 .. pos0 + n. One thread per (token, feature).
 
-struct SplitParams {
+struct WhSplitParams {
     int n;
     int heads;
     int hd;
@@ -262,7 +262,7 @@ kernel void wh_split_heads(device const float *q [[buffer(0)]],
                            device float *qh [[buffer(3)]],
                            device float *kh [[buffer(4)]],
                            device float *vt [[buffer(5)]],
-                           constant SplitParams &p [[buffer(6)]],
+                           constant WhSplitParams &p [[buffer(6)]],
                            uint gid [[thread_position_in_grid]]) {
     const int d = p.heads * p.hd;
     if (int(gid) >= p.n * d) return;
@@ -281,7 +281,7 @@ kernel void wh_split_heads(device const float *q [[buffer(0)]],
 // In place over the rows of S[h][n][len]: row (h, t) is softmax'ed over its first vis = causal ? min(len, pos0 + t + 1) : len
 // entries; the rest are set to 0. One threadgroup per row; grid (n, heads).
 
-struct SoftmaxParams {
+struct WhSoftmaxParams {
     int n;
     int len;
     int causal;
@@ -289,7 +289,7 @@ struct SoftmaxParams {
 };
 
 kernel void wh_softmax(device float *s [[buffer(0)]],
-                       constant SoftmaxParams &p [[buffer(1)]],
+                       constant WhSoftmaxParams &p [[buffer(1)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]],
@@ -315,14 +315,37 @@ kernel void wh_softmax(device float *s [[buffer(0)]],
 
 // ---------------------------------------------------------------------------------------------- 7. copies
 
-struct CopyParams {
+struct WhCopyParams {
     int n;          // elements
 };
 
 // out[i] = a[i] + b[i]  (adding a position table to a conv output, say)
 kernel void wh_add(device float *a [[buffer(0)]],
                    device const float *b [[buffer(1)]],
-                   constant CopyParams &p [[buffer(2)]],
+                   constant WhCopyParams &p [[buffer(2)]],
                    uint gid [[thread_position_in_grid]]) {
     if (int(gid) < p.n) a[gid] += b[gid];
 }
+
+struct WhEmbedParams {
+    int n;          // tokens
+    int d;
+    int pos0;       // position of the first token
+};
+
+// x[t][i] = table[tok[t]][i] + pos[pos0 + t][i]: the decoder's token embedding plus its learned position, WT = half or float
+template <typename WT>
+kernel void wh_embed(device const WT *table [[buffer(0)]],
+                     device const float *pos [[buffer(1)]],
+                     device const int *tok [[buffer(2)]],
+                     device float *x [[buffer(3)]],
+                     constant WhEmbedParams &p [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n * p.d) return;
+    const int t = int(gid) / p.d;
+    const int i = int(gid) % p.d;
+    x[gid] = float(table[(ulong)tok[t] * (ulong)p.d + (ulong)i]) + pos[(ulong)(p.pos0 + t) * (ulong)p.d + (ulong)i];
+}
+
+template [[host_name("wh_embed_h")]] kernel decltype(wh_embed<half>) wh_embed<half>;
+template [[host_name("wh_embed_f")]] kernel decltype(wh_embed<float>) wh_embed<float>;

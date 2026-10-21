@@ -28,13 +28,19 @@ public final class WhisperModel implements AutoCloseable {
      * @param residentMb heap budget for the weights as floats; a bigger model is converted per use from the mapped file
      */
     public static WhisperModel load(Path dir, String backend, int threads, long residentMb) throws IOException {
+        return load(dir, backend, threads, residentMb, "auto");
+    }
+
+    /** @param metalDecoder "auto", "on" or "off": whether the decoder runs on the GPU too (the Metal backend) */
+    public static WhisperModel load(Path dir, String backend, int threads, long residentMb, String metalDecoder)
+            throws IOException {
         WhisperWeights w = WhisperWeights.load(dir, residentMb << 20);
         try {
             Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
             WhisperNet net = null;
             if (!"cpu".equals(backend)) {
                 try {
-                    net = WhisperMetalLoader.tryCreate(w, threads);
+                    net = WhisperMetalLoader.tryCreate(w, threads, metalDecoder);
                 } catch (RuntimeException | LinkageError e) {
                     if ("metal".equals(backend)) {
                         throw e;

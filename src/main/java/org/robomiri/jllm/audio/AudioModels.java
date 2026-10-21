@@ -65,7 +65,7 @@ public final class AudioModels implements AutoCloseable {
         long t0 = System.nanoTime();
         Entry e;
         if (kind == Kind.SPEECH_TO_TEXT) {
-            WhisperModel m = WhisperModel.load(dir, a.backend(), AudioSettings.cpuThreads(s), a.residentMb());
+            WhisperModel m = WhisperModel.load(dir, a.backend(), AudioSettings.cpuThreads(s), a.residentMb(), a.metalDecoder());
             e = new Entry(id, kind, source, m.net.name(), System.currentTimeMillis(), (System.nanoTime() - t0) / 1e9, m, null);
         } else {
             OuteTts m = OuteTts.load(s, hub, dir);

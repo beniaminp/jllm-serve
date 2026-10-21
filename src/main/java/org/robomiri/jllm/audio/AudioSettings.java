@@ -6,7 +6,7 @@ import org.robomiri.jllm.config.Settings;
  * The {@code audio.*} settings, validated once ({@link Settings#validate} calls {@link #of}), so a typo fails at start-up
  * instead of at the first request.
  */
-public record AudioSettings(String backend, int threads, long residentMb, String ffmpeg, double maxSeconds, long maxUploadBytes,
+public record AudioSettings(String backend, String metalDecoder, int threads, long residentMb, String ffmpeg, double maxSeconds, long maxUploadBytes,
                             int ttsMaxChars, String ttsQuant, int ttsCtx, String ttsModel, String sttModel, String codecRepo, String codecFile,
                             double ttsTemperature, int ttsTopK, double ttsTopP, double ttsRepetitionPenalty,
                             boolean sttFallback, boolean sttConditionOnPrevious) {
@@ -15,6 +15,9 @@ public record AudioSettings(String backend, int threads, long residentMb, String
         String backend = s.get("audio.backend").trim().toLowerCase(java.util.Locale.ROOT);
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), s, "audio.backend",
                 "must be cpu, metal or auto");
+        String metalDecoder = s.get("audio.metal.decoder").trim().toLowerCase(java.util.Locale.ROOT);
+        require(metalDecoder.equals("auto") || metalDecoder.equals("on") || metalDecoder.equals("off"), s, "audio.metal.decoder",
+                "must be auto, on or off");
         int threads = s.getInt("audio.threads");
         require(threads >= 0, s, "audio.threads", "must be 0 (= backend.threads) or positive");
         long resident = s.getLong("audio.resident-mb");
@@ -46,7 +49,7 @@ public record AudioSettings(String backend, int threads, long residentMb, String
         String codecFile = s.get("audio.codec-file").trim();
         require(codecFile.isEmpty() || codecFile.toLowerCase(java.util.Locale.ROOT).endsWith(".gguf"), s, "audio.codec-file",
                 "must be the name of a .gguf file");
-        return new AudioSettings(backend, threads, resident, ffmpeg, maxSeconds, upload << 20, chars, quant, ttsCtx,
+        return new AudioSettings(backend, metalDecoder, threads, resident, ffmpeg, maxSeconds, upload << 20, chars, quant, ttsCtx,
                 s.get("audio.tts-model").trim(), s.get("audio.stt-model").trim(), s.get("audio.codec-repo").trim(), codecFile,
                 temp, topK, topP, rep, s.getBool("audio.stt.fallback"), s.getBool("audio.stt.condition-on-previous"));
     }

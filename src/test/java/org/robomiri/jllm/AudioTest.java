@@ -367,13 +367,15 @@ public final class AudioTest {
         if (Metal.available(System.getProperty("jllm.metal.lib"))) {
             backends.add("metal");
             backends.add("metal-exact");
+            backends.add("metal-gpu-decoder");
         }
         String[] firstText = new String[1];
         for (String backend : backends) {
             System.setProperty("jllm.audio.metalExact", String.valueOf(backend.equals("metal-exact")));
+            System.setProperty("jllm.audio.metalDecoder", backend.equals("metal-gpu-decoder") ? "on" : "off");
             try (WhisperModel wm = WhisperModel.load(dir, backend.startsWith("metal") ? "metal" : "cpu", 4, 100)) {
                 // half-precision weight tiles (the fast Metal mode) round every weight to 11 bits: ~1e-2 on this random model
-                double tol = backend.equals("cpu") ? 2e-4 : backend.equals("metal") ? 1.5e-2 : 2e-3;
+                double tol = backend.equals("cpu") ? 2e-4 : backend.equals("metal-exact") ? 2e-3 : 1.5e-2;
                 try (WhisperNet.Session s = wm.net.encode(mel)) {
                     float[] enc = s.encoderOutput();
                     double encErr = 0;

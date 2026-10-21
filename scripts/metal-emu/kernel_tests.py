@@ -847,4 +847,19 @@ def wh_softmax(n=9, heads=2, length=70, causal=True, pos0=3):
 
 wh_softmax()
 wh_softmax(causal=False, length=300)
+
+
+def wh_embed(half_table, n=5, d=40, vocab=30, pos0=3):
+    rng = np.random.default_rng(16)
+    table = rng.standard_normal((vocab, d)).astype(np.float16 if half_table else np.float32)
+    pos = rng.standard_normal((20, d)).astype(np.float32)
+    tok = rng.integers(0, vocab, n).astype(np.int32)
+    x = np.zeros((n, d), np.float32)
+    E.dispatch('wh_embed_' + ('h' if half_table else 'f'), [table, pos, tok, x], pack('iii', n, d, pos0), ((n * d + 255) // 256,), (256,))
+    ref = table[tok].astype(np.float32) + pos[pos0:pos0 + n]
+    check(np.array_equal(x, ref), 'wh_embed_%s: token embedding plus learned position %d.., exact' % ('h' if half_table else 'f', pos0))
+
+
+wh_embed(True)
+wh_embed(False)
 sys.exit(1 if failures else 0)
