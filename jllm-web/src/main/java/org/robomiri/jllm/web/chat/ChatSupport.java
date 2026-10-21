@@ -202,12 +202,7 @@ public final class ChatSupport {
                 && !(choice instanceof Map<?, ?> && Json.str(Json.map(choice, "function"), "name", null) != null)) {
             throw RequestError.invalid("'tool_choice' must be \"none\", \"auto\", \"required\" or {\"type\": \"function\", \"function\": {\"name\": ...}}");
         }
-        Map<String, Object> format = Json.map(b, "response_format");
-        if (tools instanceof List<?> l && !l.isEmpty() && !"none".equals(choice) && format != null
-                && !"text".equals(Json.str(format, "type", "text"))) {
-            throw RequestError.invalid("'response_format' cannot be combined with 'tools': the JSON constraint would"
-                    + " keep the model from calling them");
-        }
+        // 'response_format' with 'tools': the reply is either tool calls or the JSON answer (ToolCallFormat.constraint)
         if (!chat && b.get("prompt") instanceof List<?> l && (l.size() != 1 || !(l.getFirst() instanceof String))) {
             throw RequestError.invalid("'prompt' must be a string or a single-element array of strings"
                     + " (batches and token-id arrays are not supported)");
@@ -224,6 +219,7 @@ public final class ChatSupport {
                 "decode_ms", Math.round(s.decodeMs()),
                 "drafted_tokens", s.draftedTokens(),
                 "accepted_draft_tokens", s.acceptedTokens(),
+                "forced_tokens", s.forcedTokens(),
                 "tokens_per_second", Math.round(s.tokPerSec() * 10) / 10.0);
     }
 

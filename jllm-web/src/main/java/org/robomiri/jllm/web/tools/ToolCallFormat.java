@@ -2,13 +2,19 @@ package org.robomiri.jllm.web.tools;
 
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.sampling.JsonConstraint;
+import org.robomiri.jllm.sampling.TokenConstraint;
+import org.robomiri.jllm.sampling.ToolCallConstraint;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
+import org.robomiri.jllm.tokenizer.Tokenizer;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * Function calling on top of the plain chat templates, in the Hermes / Qwen format: the function signatures go into
@@ -17,6 +23,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * render a {@code tool} message that way natively; for the other families the result is a user turn). Qwen2.5 /
  * Qwen3 were trained on exactly this; Llama 3, Mistral and others follow it reasonably well, and a bare JSON object
  * naming a known function (Llama 3.2's habit) is accepted as a call too.
+ *
+ * <p>Generation is constrained ({@link #constraint}): once the model writes {@code <tool_call>}, the call can only be
+ * {@code {"name": <one of the tools>, "arguments": <an object matching its schema>}} in the template's layout, and
+ * the fixed parts of it are appended without sampling (docs/17 §17.5). Earlier calls in the conversation are
+ * rendered in the same layout ({@link #canonical}).
  */
 public final class ToolCallFormat {
 
@@ -97,7 +108,7 @@ public final class ToolCallFormat {
                             if (!sb.isEmpty()) {
                                 sb.append('\n');
                             }
-                            sb.append(OPEN).append('\n').append(Json.write(Json.obj("name", name, "arguments", args == null ? Map.of() : args)))
+                            sb.append(OPEN).append('\n').append(canonical(Json.obj("name", name, "arguments", args == null ? Map.of() : args)))
                                     .append('\n').append(CLOSE);
                         }
                     }
@@ -123,6 +134,112 @@ public final class ToolCallFormat {
             out.addFirst(new ChatTemplate.Message("system", toolsBlock));
         }
         return out;
+    }
+
+    /**
+     * JSON in the layout of the chat templates' {@code tojson} (Python's {@code json.dumps}): {@code ": "} after keys
+     * and {@code ", "} between items, nothing else, non-ASCII characters as they are. The tool-call constraint makes
+     * the model write its calls this way, so earlier calls in the prompt look the same.
+     */
+    public static String canonical(Object v) {
+        StringBuilder sb = new StringBuilder();
+        canonical(v, sb);
+        return sb.toString();
+    }
+
+    private static void canonical(Object v, StringBuilder sb) {
+        if (v instanceof Map<?, ?> m) {
+            sb.append('{');
+            boolean first = true;
+            for (Map.Entry<?, ?> e : m.entrySet()) {
+                sb.append(first ? "" : ", ").append(Json.write(String.valueOf(e.getKey()))).append(": ");
+                canonical(e.getValue(), sb);
+                first = false;
+            }
+            sb.append('}');
+        } else if (v instanceof List<?> l) {
+            sb.append('[');
+            for (int i = 0; i < l.size(); i++) {
+                sb.append(i == 0 ? "" : ", ");
+                canonical(l.get(i), sb);
+            }
+            sb.append(']');
+        } else {
+            Json.write(v, sb);
+        }
+    }
+
+    /** Compiled tool sets by (tools, tokenizer): agents send the same tools with every request. */
+    private static final Map<SpecKey, ToolCallConstraint.Spec> SPECS = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<SpecKey, ToolCallConstraint.Spec> e) {
+            return size() > 16;
+        }
+    };
+
+    /** The tools' JSON and the tokenizer (by identity: the memoized masks are over its token ids). */
+    private record SpecKey(String tools, Tokenizer tok) {
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof SpecKey(String t, Tokenizer k) && t.equals(tools) && k == tok;
+        }
+
+        @Override
+        public int hashCode() {
+            return tools.hashCode() * 31 + System.identityHashCode(tok);
+        }
+    }
+
+    /**
+     * The constraint for a chat request's tool calls (OpenAI {@code tools} / {@code tool_choice}), or null when no
+     * tools are in play. {@code "auto"}: calls are optional and free text stays free; {@code "required"}: the reply
+     * must start with a call (after a thinking block when the model thinks); a named function: that call. With
+     * {@code answer} ({@code response_format}) a reply that is not a call must be that JSON.
+     *
+     * @param thinking      whether the model may think before a forced call (Qwen3 with thinking on)
+     * @param promptInThink whether the prompt left a {@code <think>} block open
+     * @throws IllegalArgumentException for a malformed parameter schema or an unknown named function
+     */
+    public static Supplier<TokenConstraint> constraint(Map<String, Object> body, Tokenizer tok,
+                                                       JsonConstraint.Schema answer, boolean thinking,
+                                                       boolean promptInThink) {
+        List<Object> tools = Json.list(body, "tools");
+        Object choice = body.get("tool_choice");
+        if (tools == null || tools.isEmpty() || "none".equals(choice)) {
+            return null;
+        }
+        SpecKey key = new SpecKey(Json.write(tools), tok);
+        ToolCallConstraint.Spec spec;
+        synchronized (SPECS) {
+            spec = SPECS.get(key);
+        }
+        if (spec == null) {
+            spec = ToolCallConstraint.Spec.compile(tools);
+            synchronized (SPECS) {
+                SPECS.put(key, spec);
+            }
+        }
+        if (choice instanceof Map<?, ?>) {
+            spec = spec.only(Json.str(Json.map(choice, "function"), "name", ""));
+        } else if ("required".equals(choice)) {
+            spec = spec.required(true);
+        }
+        ToolCallConstraint.Spec s = spec.thinking(thinking).answer(answer);
+        byte[][] table = JsonConstraint.tokenTable(tok);
+        return () -> new ToolCallConstraint(s, table, promptInThink);
+    }
+
+    /**
+     * {@code decoding} with the tool-call constraint of the request in place of its {@code response_format} one
+     * (which the tool constraint takes over as the answer schema); unchanged when no tools are in play.
+     */
+    public static Engine.Decoding decoding(Engine.Decoding decoding, Map<String, Object> body, Engine engine,
+                                           int[] prompt, JsonConstraint.Schema answer, boolean thinking) {
+        Supplier<TokenConstraint> c = constraint(body, engine.tokenizer(), answer,
+                thinking && engine.template().name().equals("chatml-qwen3"),
+                org.robomiri.jllm.web.chat.ReasoningSplitter.promptOpensThink(engine, prompt));
+        return c == null ? decoding : new Engine.Decoding(decoding.logitBias(), decoding.logprobs(),
+                decoding.topLogprobs(), decoding.promptLogprobs(), c);
     }
 
     /** A message's text: a string, or the text parts of a multi-part content array. */
