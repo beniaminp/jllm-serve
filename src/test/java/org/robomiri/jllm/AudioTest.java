@@ -442,6 +442,10 @@ public final class AudioTest {
 
     // ------------------------------------------------------------------ the API functions
 
+    static byte[] signalWav(double seconds) {
+        return Wav.write16(signal((int) (seconds * 16000)), 16000);
+    }
+
     /** A fake speech model: a tone whose length is 50 ms per character. */
     static final class Tone implements SpeechModel {
         @Override
@@ -518,6 +522,15 @@ public final class AudioTest {
             f.remove("temperature");
             r = AudioApi.transcribe(wm, dec, "not audio".getBytes(StandardCharsets.UTF_8), f::get, false, wd, () -> false);
             check(r.status() == 400, "transcriptions: an unreadable file is a 400");
+            List<Map<String, Object>> events = new ArrayList<>();
+            f.put("stream", "true");
+            AudioApi.Reply streamed = AudioApi.transcribeStream(wm, dec, signalWav(3), f::get, false, wd, () -> false, events::add);
+            check(streamed == null && !events.isEmpty() && "transcript.text.done".equals(events.getLast().get("type"))
+                    && events.stream().anyMatch(e -> "transcript.progress".equals(e.get("type")))
+                    && Json.map(events.getLast(), "transcript").containsKey("segments"),
+                    "transcriptions with stream: progress events, then transcript.text.done with the verbose transcript (" + events.size() + " events)");
+            streamed = AudioApi.transcribeStream(wm, dec, null, f::get, false, wd, () -> false, events::add);
+            check(streamed != null && streamed.status() == 400, "transcriptions with stream: a bad request is still a plain 400");
             f.put("language", "klingon");
             r = AudioApi.transcribe(wm, dec, wav, f::get, false, wd, () -> false);
             check(r.status() == 400, "transcriptions: an unknown language is a 400");

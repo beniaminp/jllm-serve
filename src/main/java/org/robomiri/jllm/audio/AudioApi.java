@@ -33,14 +33,13 @@ public final class AudioApi {
         }
     }
 
-    /**
-     * Transcribes (or translates) an uploaded file.
-     *
-     * @param field  the multipart form fields by name (null for an absent one)
-     * @param file   the file's bytes
-     */
-    public static Reply transcribe(WhisperModel model, AudioDecoder decoder, byte[] file, Function<String, String> field,
-                                   boolean translate, WhisperDefaults defaults, BooleanSupplier cancelled) {
+    /** A validated transcription request: the samples, the decoding options and the response format. */
+    private record Prepared(float[] audio, WhisperTranscriber.Options options, String format) {
+    }
+
+    /** @return a {@link Prepared} or, for a bad request, the 400 {@link Reply} */
+    private static Object prepare(AudioDecoder decoder, byte[] file, Function<String, String> field, boolean translate,
+                                  WhisperDefaults defaults, BooleanSupplier cancelled) {
         if (file == null || file.length == 0) {
             return Reply.bad("the 'file' field is required (an audio file)");
         }
@@ -69,13 +68,10 @@ public final class AudioApi {
         } catch (IOException e) {
             return Reply.bad("cannot read the audio: " + e.getMessage());
         }
-        String language = blankToNull(field.apply("language"));
-        if (translate) {
-            language = blankToNull(language);
-        }
         WhisperTranscriber.Options o = WhisperTranscriber.Options.defaults()
-                .withLanguage(language).withTranslate(translate).withPrompt(blankToNull(field.apply("prompt")))
-                .withTemperature(temperature).withCallbacks(cancelled, f -> { }, s -> { });
+                .withLanguage(blankToNull(field.apply("language"))).withTranslate(translate)
+                .withPrompt(blankToNull(field.apply("prompt"))).withTemperature(temperature)
+                .withCallbacks(cancelled, f -> { }, s -> { });
         String gran = field.apply("timestamp_granularities[]");
         if (gran == null) {
             gran = field.apply("timestamp_granularities");
@@ -83,15 +79,62 @@ public final class AudioApi {
         if (gran != null && gran.contains("word")) {
             o = o.withWords(true);        // "words" in verbose_json (and in every segment)
         }
-        o = defaults.apply(o);
+        return new Prepared(audio, defaults.apply(o), format);
+    }
+
+    /**
+     * Transcribes (or translates) an uploaded file.
+     *
+     * @param field  the multipart form fields by name (null for an absent one)
+     * @param file   the file's bytes
+     */
+    public static Reply transcribe(WhisperModel model, AudioDecoder decoder, byte[] file, Function<String, String> field,
+                                   boolean translate, WhisperDefaults defaults, BooleanSupplier cancelled) {
+        Object prep = prepare(decoder, file, field, translate, defaults, cancelled);
+        if (prep instanceof Reply r) {
+            return r;
+        }
+        Prepared p = (Prepared) prep;
         try {
-            Transcript tr = model.transcriber.transcribe(audio, o);
-            return new Reply(200, Transcript.contentType(format), tr.render(format).getBytes(StandardCharsets.UTF_8));
+            Transcript tr = model.transcriber.transcribe(p.audio(), p.options());
+            return new Reply(200, Transcript.contentType(p.format()), tr.render(p.format()).getBytes(StandardCharsets.UTF_8));
         } catch (IllegalArgumentException e) {
             return Reply.bad(e.getMessage());
         } catch (WhisperTranscriber.Cancelled e) {
             return Reply.error(499, "cancelled", "invalid_request_error", "cancelled");
         }
+    }
+
+    /**
+     * The same as {@link #transcribe} with {@code stream=true}: a bad request is returned as a {@link Reply} (nothing was
+     * streamed); otherwise {@code null} after the events went to {@code events} as JSON objects, to be written as server-sent
+     * events: {@code {"type":"transcript.text.segment", "id", "start", "end", "text"}} per segment as soon as its window is
+     * decoded, {@code {"type":"transcript.progress", "progress"}} after each window and a last
+     * {@code {"type":"transcript.text.done", "text", "language", "duration", "transcript": <the verbose_json object>}}.
+     * A failure in the middle ends with {@code {"type":"error", "error": {...}}}.
+     */
+    public static Reply transcribeStream(WhisperModel model, AudioDecoder decoder, byte[] file, Function<String, String> field,
+                                         boolean translate, WhisperDefaults defaults, BooleanSupplier cancelled,
+                                         java.util.function.Consumer<Map<String, Object>> events) {
+        Object prep = prepare(decoder, file, field, translate, defaults, cancelled);
+        if (prep instanceof Reply r) {
+            return r;
+        }
+        Prepared p = (Prepared) prep;
+        WhisperTranscriber.Options o = p.options().withCallbacks(cancelled,
+                f -> events.accept(Json.obj("type", "transcript.progress", "progress", Math.round(f * 1000) / 1000.0)),
+                sg -> events.accept(Json.obj("type", "transcript.text.segment", "id", (long) sg.id(), "start", sg.start(),
+                        "end", sg.end(), "text", sg.text())));
+        try {
+            Transcript tr = model.transcriber.transcribe(p.audio(), o);
+            events.accept(Json.obj("type", "transcript.text.done", "text", tr.text(), "language", tr.language(), "duration",
+                    tr.duration(), "transcript", tr.verbose()));
+        } catch (IllegalArgumentException e) {
+            events.accept(Json.obj("type", "error", "error", Json.obj("message", e.getMessage(), "type", "invalid_request_error")));
+        } catch (WhisperTranscriber.Cancelled e) {
+            events.accept(Json.obj("type", "error", "error", Json.obj("message", "cancelled", "type", "invalid_request_error")));
+        }
+        return null;
     }
 
     /** The transcription settings of {@code audio.stt.*}. */

@@ -325,6 +325,9 @@ const AudioIO = (() => {
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   }
 
+  const SILENT_MSG = 'The microphone recorded only silence: it may be muted, or the wrong input device is selected.';
+  const isSilent = clip => AudioEdit.peak(clip) < 0.002;
+
   /**
    * Wires a record / stop toggle button with a level meter (an element whose first child is the bar) and an elapsed time
    * element. onClip(clip) gets the finished recording. Returns {toggle, cancel, recording}.
@@ -359,7 +362,9 @@ const AudioIO = (() => {
       clearInterval(tick);
       setUi(false);
       const clip = await r.stop();
-      if (clip) onClip(clip); else toast('Nothing was recorded.', 'err');
+      if (!clip) { toast('Nothing was recorded.', 'err'); return; }
+      if (isSilent(clip)) toast(SILENT_MSG, 'err', 8000);
+      onClip(clip);
     }
     function cancel() { if (rec) { rec.cancel(); rec = null; clearInterval(tick); setUi(false); } }
     button.addEventListener('click', () => (rec ? stop() : start()));
@@ -367,6 +372,6 @@ const AudioIO = (() => {
     return {toggle: () => (rec ? stop() : start()), cancel, get recording() { return !!rec; }};
   }
 
-  return {bindRecorder, ctx, decode, toWavBlob, audioBuffer, player, Recorder, micMessage, transcribe, speak, uploadClip, clipUrl, voices, normalize,
+  return {isSilent, SILENT_MSG, bindRecorder, ctx, decode, toWavBlob, audioBuffer, player, Recorder, micMessage, transcribe, speak, uploadClip, clipUrl, voices, normalize,
     langName, saveBlob, failure};
 })();

@@ -94,13 +94,37 @@ public final class AudioRoutes {
                 gran.append(gran.isEmpty() ? "" : ",").append(p.text());
             }
         }
-        AudioApi.Reply r = AudioApi.transcribe(m.stt(), decoder, file == null ? null : file.data(), name -> {
+        java.util.function.Function<String, String> field = name -> {
             if (name.startsWith("timestamp_granularities")) {
                 return gran.isEmpty() ? null : gran.toString();
             }
             return Multipart.field(parts, name);
-        }, translate, AudioApi.WhisperDefaults.of(settings), req::clientGone);
-        send(res, r);
+        };
+        byte[] data = file == null ? null : file.data();
+        if ("true".equalsIgnoreCase(Multipart.field(parts, "stream"))) { // server-sent events, one per segment
+            boolean[] started = {false};
+            AudioApi.Reply bad = AudioApi.transcribeStream(m.stt(), decoder, data, field, translate,
+                    AudioApi.WhisperDefaults.of(settings), req::clientGone, event -> {
+                        try {
+                            if (!started[0]) {
+                                res.startStream(200, "text/event-stream");
+                                started[0] = true;
+                            }
+                            res.write("data: " + Json.write(event) + "\n\n");
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    });
+            if (bad != null) {
+                send(res, bad);
+            } else {
+                res.write("data: [DONE]\n\n");
+                res.end();
+            }
+            return;
+        }
+        send(res, AudioApi.transcribe(m.stt(), decoder, data, field, translate, AudioApi.WhisperDefaults.of(settings),
+                req::clientGone));
     }
 
     private void speech(HttpServer.Request req, HttpServer.Response res) throws IOException {

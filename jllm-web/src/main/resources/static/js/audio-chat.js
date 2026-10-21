@@ -76,6 +76,7 @@ const AudioChat = (() => {
     }
     const clip = await stopRec(dict, micBtn, MIC_OFF);
     if (!clip) { toast('Nothing was recorded.', 'err'); return; }
+    if (AudioIO.isSilent(clip)) { toast(AudioIO.SILENT_MSG, 'err', 8000); return; }     // Whisper would invent text for silence
     dict.busy = true; setBusyUi(micBtn, true);
     try {
       const model = AudioState.stt()[0];

@@ -78,6 +78,32 @@ public class AudioController {
             fields.put("timestamp_granularities[]", String.join(",", gran));
         }
         Map<String, String> f = fields;
+        if ("true".equalsIgnoreCase(f.get("stream"))) {        // server-sent events, one per segment (see AudioApi.transcribeStream)
+            boolean[] started = {false};
+            AudioApi.Reply bad = AudioApi.transcribeStream(m.stt(), audio.decoder(), bytes, f::get, translate,
+                    audio.whisperDefaults(), gone, event -> {
+                        try {
+                            if (!started[0]) {
+                                res.setStatus(200);
+                                res.setContentType("text/event-stream");
+                                res.setCharacterEncoding("UTF-8");
+                                res.setHeader("Cache-Control", "no-cache");
+                                started[0] = true;
+                            }
+                            res.getWriter().write("data: " + Json.write(event) + "\n\n");
+                            res.flushBuffer();
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    });
+            if (bad != null) {
+                reply(res, bad);
+            } else {
+                res.getWriter().write("data: [DONE]\n\n");
+                res.flushBuffer();
+            }
+            return;
+        }
         AudioApi.Reply r = AudioApi.transcribe(m.stt(), audio.decoder(), bytes, f::get, translate,
                 audio.whisperDefaults(), gone);
         reply(res, r);
