@@ -268,7 +268,8 @@ head). Deep random networks amplify float32 rounding (at the 130m shape, 8 layer
 
 - **Mamba-2 (`model_type: mamba2`)**, Falcon-Mamba (`falcon_mamba`), Jamba and other hybrids: different block
   structure (grouped heads, extra norm, scalar `A`), rejected at load time with the usual "unsupported model" message.
-  Mamba v1 only.
+  Mamba v1 only. (Qwen3-Next, a hybrid of a related recurrent layer, the Gated DeltaNet, with attention, is
+  supported: [14.13](14-model-families.md#1413-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe).)
 - `use_bias: true` (biases on `in_proj`/`out_proj`): no released checkpoint uses it; rejected with a message.
   `use_conv_bias: false` is supported.
 - `state_size` above 64 or `conv_kernel` above 8; `hidden_act` other than `silu`.

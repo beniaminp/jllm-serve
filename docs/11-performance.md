@@ -171,6 +171,7 @@ and the scalar `exp` / `silu` loops are still visible here (fast math, now the d
 | KV cache at `--ctx 4096` | 940 MB | 805 MB |
 | KV cache with `backend.kv-dtype=f16` (2 B per element) | 117 MB per 1 024 tokens; **470 MB** at `--ctx 4096` | 101 MB per 1 024 tokens; **403 MB** at `--ctx 4096` |
 | KV cache, DeepSeek-V2-Lite (MLA latent cache, [14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | 27 layers × 1024 × (512 + 64) × 4 B = 64 MB per 1 024 tokens; **255 MB** at `--ctx 4096`, 127 MB at f16 (the expanded per-head cache of the first version was 553 KB per token, 2.2 GB at `--ctx 4096`); plus 216 MB of dequantized `kv_b_proj` halves | — |
+| KV cache + fixed state, Qwen3-Next-80B-A3B (12 attention + 36 Gated DeltaNet layers, [14 §14.13](14-model-families.md#1413-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)) | — | 12 × 1024 × 512 × 8 B = **50 MB per 1 024 tokens** (a quarter of the 30B's 201 MB with the same attention shape), 201 MB at `--ctx 4096` (100 MB at f16), plus **79 MB** of DeltaNet state (36 × (2 MB recurrent + 96 KB conv)) whatever the context |
 | attention score scratch (Metal) `min(32, batch) × heads × ctx × 4 B` | 32 × 16 × 4096 × 4 = 8.4 MB | 32 × 32 × 2048 × 4 = 8.4 MB |
 | activations, logits, MoE slot buffers | < 50 MB | < 100 MB |
 | JVM + classes | ≈ 100 MB | ≈ 100 MB |

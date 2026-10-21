@@ -26,7 +26,11 @@ public enum KernelParams {
     ARGMAX("ArgmaxParams", "ii"),
     MLA("MlaParams", "iiiii"),
     MAMBA_CONV("MambaConvParams", "iii"),
-    MAMBA_SCAN("MambaScanParams", "iiii");
+    MAMBA_SCAN("MambaScanParams", "iiii"),
+    GDN_CONV("GdnConvParams", "iiiii"),
+    GDN_RULE("GdnRuleParams", "iiiiiiiif"),
+    GDN_NORM("GdnNormParams", "iiiif"),
+    GATE("GateParams", "i");
 
     /** The struct's name in kernels.metal. */
     public final String struct;

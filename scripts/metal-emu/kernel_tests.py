@@ -117,4 +117,83 @@ flash(128, window=20, pos0=60, ntok=40)
 flash(64, softcap=5.0)
 flash(128, n_heads=8, n_kv=1, ntok=7)
 flash(256, ntok=33)
+
+
+def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
+    """Qwen3-Next causal conv: y = silu(conv over (state, x)), the state advanced past the chunk."""
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((ntok, in_stride)).astype(np.float32)
+    w = rng.standard_normal((channels, kc)).astype(np.float32)
+    state = rng.standard_normal((channels, kc - 1)).astype(np.float32)
+    y = np.zeros((ntok, channels), np.float32)
+    seq = np.concatenate([state.T, x[:, :channels]], axis=0).astype(np.float64)  # [kc - 1 + ntok, channels]
+    ref = np.stack([np.sum(seq[t:t + kc] * w.T, axis=0) for t in range(ntok)])
+    ref = ref / (1 + np.exp(-ref))
+    want_state = seq[-(kc - 1):].T
+    s = state.copy()
+    E.dispatch('gdn_conv', [x, w, s, y], pack('iiiii', channels, kc, ntok, in_stride, channels),
+               ((channels + 63) // 64,), (64,))
+    err = max(np.abs(y - ref).max(), np.abs(s - want_state).max())
+    check(err < 1e-5, 'gdn_conv channels=%d kernel=%d ntok=%d: max err %.2e' % (channels, kc, ntok, err))
+
+
+def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5):
+    """The gated delta rule: l2norm(q) / sqrt(dk), l2norm(k), beta = sigmoid(b), g = A softplus(a + dt_bias),
+    S = exp(g) S; S += k ((v - S^T k) beta)^T; o = S^T q, against a float64 loop (state stored [head][j][dk])."""
+    rng = np.random.default_rng(5)
+    kw = nk * dk
+    conv = 2 * kw + nv * dv
+    proj_stride = conv + nv * dv + 2 * nv
+    qkv = rng.standard_normal((ntok, conv)).astype(np.float32)
+    proj = rng.standard_normal((ntok, proj_stride)).astype(np.float32)
+    A = -rng.uniform(0.1, 4, nv).astype(np.float32)
+    dtb = rng.standard_normal(nv).astype(np.float32)
+    S0 = (0.1 * rng.standard_normal((nv, dv, dk))).astype(np.float32)
+    out = np.zeros((ntok, nv * dv), np.float32)
+    S = S0.astype(np.float64).transpose(0, 2, 1).copy()  # [h, dk, dv] like transformers
+    ref = np.zeros((ntok, nv, dv))
+    r = nv // nk
+    b_off = conv + nv * dv
+    for t in range(ntok):
+        for h in range(nv):
+            kh = h // r
+            q = qkv[t, kh * dk:(kh + 1) * dk].astype(np.float64)
+            k = qkv[t, kw + kh * dk:kw + (kh + 1) * dk].astype(np.float64)
+            v = qkv[t, 2 * kw + h * dv:2 * kw + (h + 1) * dv].astype(np.float64)
+            q = q / np.sqrt(q @ q + 1e-6) / np.sqrt(dk)
+            k = k / np.sqrt(k @ k + 1e-6)
+            beta = 1 / (1 + np.exp(-proj[t, b_off + h]))
+            g = A[h] * np.log1p(np.exp(proj[t, b_off + nv + h] + dtb[h]))
+            S[h] *= np.exp(g)
+            d = (v - S[h].T @ k) * beta
+            S[h] += np.outer(k, d)
+            ref[t, h] = S[h].T @ q
+    st = S0.copy()
+    E.dispatch('gdn_rule', [qkv, proj, A, dtb, st, out],
+               pack('iiiiiiiif', nk, nv, dk, dv, ntok, conv, proj_stride, b_off, 1e-6), ((dv + 3) // 4, nv), (128,))
+    err = max(np.abs(out - ref.reshape(ntok, -1)).max(), np.abs(st - S.transpose(0, 2, 1)).max())
+    check(err < 1e-5, 'gdn_rule nk=%d nv=%d dk=%d dv=%d ntok=%d: max err %.2e' % (nk, nv, dk, dv, ntok, err))
+
+
+def gdn_norm_gate(nv=3, dv=40, ntok=4, eps=1e-6):
+    rng = np.random.default_rng(6)
+    z_off = 7
+    proj_stride = z_off + nv * dv + 5
+    o = rng.standard_normal((ntok, nv * dv)).astype(np.float32)
+    proj = rng.standard_normal((ntok, proj_stride)).astype(np.float32)
+    w = rng.standard_normal(dv).astype(np.float32)
+    x = o.reshape(ntok, nv, dv).astype(np.float64)
+    z = proj[:, z_off:z_off + nv * dv].reshape(ntok, nv, dv).astype(np.float64)
+    ref = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * w * (z / (1 + np.exp(-z)))
+    E.dispatch('gdn_norm_gate', [o, proj, w], pack('iiiif', dv, nv, proj_stride, z_off, eps), (ntok * nv,), (64,))
+    err = np.abs(o - ref.reshape(ntok, -1)).max()
+    check(err < 1e-5, 'gdn_norm_gate nv=%d dv=%d: max err %.2e' % (nv, dv, err))
+
+
+gdn_conv()
+gdn_conv(channels=70, kc=3, ntok=1, in_stride=80)
+gdn_rule()
+gdn_rule(nk=2, nv=2, dk=128, dv=32, ntok=3)
+gdn_rule(nk=1, nv=3, dk=32, dv=5, ntok=7)
+gdn_norm_gate()
 sys.exit(1 if failures else 0)

@@ -46,7 +46,7 @@ public final class Qwen3NextChecks {
     public static void main(String[] args) throws Exception {
         String lib = args[0].equals("-") ? null : args[0];
         boolean metal = Metal.available(lib);
-        int failures = 0;
+        int failures = realConfig() + workedExample();
         for (int i = 1; i < args.length; i++) {
             failures += check(Path.of(args[i]), lib, metal);
         }
@@ -55,6 +55,55 @@ public final class Qwen3NextChecks {
             System.exit(1);
         }
         System.out.println("qwen3-next checks passed");
+    }
+
+    /** config.json of Qwen/Qwen3-Next-80B-A3B-Instruct as published on the Hub (keys that do not matter here dropped). */
+    private static final String REAL_CONFIG = """
+            {"architectures": ["Qwen3NextForCausalLM"], "bos_token_id": 151643, "decoder_sparse_step": 1,
+             "eos_token_id": 151645, "full_attention_interval": 4, "head_dim": 256, "hidden_act": "silu",
+             "hidden_size": 2048, "intermediate_size": 5120, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+             "linear_num_key_heads": 16, "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+             "max_position_embeddings": 262144, "mlp_only_layers": [], "model_type": "qwen3_next",
+             "moe_intermediate_size": 512, "norm_topk_prob": true, "num_attention_heads": 16, "num_experts": 512,
+             "num_experts_per_tok": 10, "num_hidden_layers": 48, "num_key_value_heads": 2, "partial_rotary_factor": 0.25,
+             "rms_norm_eps": 1e-06, "rope_scaling": null, "rope_theta": 10000000, "shared_expert_intermediate_size": 512,
+             "tie_word_embeddings": false, "torch_dtype": "bfloat16", "use_sliding_window": false, "vocab_size": 151936}
+            """;
+
+    /**
+     * The real 80B config resolves to 12 full-attention layers (3, 7, ..., 47) and 36 DeltaNet layers, all MoE, with the
+     * sizes docs/14.13 quotes: a 12352-row fused input projection, 8192 conv channels, a 2 MiB recurrent state per layer.
+     */
+    private static int realConfig() {
+        Qwen3NextArch a = (Qwen3NextArch) Architecture.parse(Json.parseObject(REAL_CONFIG));
+        var d = a.deltaNet();
+        boolean ok = a.fullLayers() == 12 && a.linearLayers() == 36 && a.isFull(3) && a.isFull(47) && !a.isFull(4)
+                && a.kindIndex(47) == 11 && a.kindIndex(46) == 35 && a.rope().rotaryDim() == 64
+                && a.attention().kvDim() == 512 && a.attention().qDim() == 4096 && d.convDim() == 8192
+                && d.projDim() == 12352 && d.stateSize() * 4 == 2 * 1024 * 1024 && d.convStateSize() == 8192 * 3
+                && a.maxExperts() == 512 && a.maxTopK() == 10 && a.maxMlpDim() == 512
+                && a.mlps().stream().allMatch(m -> m instanceof org.robomiri.jllm.model.Mlp.Moe)
+                && a.core().eosTokenIds().equals(List.of(151645));
+        System.out.println("Qwen3-Next-80B-A3B config: " + a + " -> " + (ok ? "ok" : "WRONG"));
+        return ok ? 0 : 1;
+    }
+
+    /**
+     * The worked example of docs/14.13.2: one state column s = (1, 0), decay 0.5, key k = q = (0.6, 0.8), value 2. With
+     * beta = 1 the update overwrites what k reads: s = (1.52, 1.36) and s . k = 2 exactly; with beta = 0.5 it moves half
+     * way from the old reading 0.3 to 2: s = (1.01, 0.68), output 1.15.
+     */
+    private static int workedExample() {
+        float[] k = {0.6f, 0.8f};
+        float[] out = new float[1];
+        float[] s1 = {1f, 0f};
+        Qwen3NextCpuBackend.recurrentStep(s1, 0, 2, k, 0, k, 0, 2f, 0.5f, 1f, out, 0);
+        boolean ok = Math.abs(s1[0] - 1.52f) < 1e-6f && Math.abs(s1[1] - 1.36f) < 1e-6f && Math.abs(out[0] - 2f) < 1e-6f;
+        float[] s2 = {1f, 0f};
+        Qwen3NextCpuBackend.recurrentStep(s2, 0, 2, k, 0, k, 0, 2f, 0.5f, 0.5f, out, 0);
+        ok &= Math.abs(s2[0] - 1.01f) < 1e-6f && Math.abs(s2[1] - 0.68f) < 1e-6f && Math.abs(out[0] - 1.15f) < 1e-6f;
+        System.out.println("delta rule worked example (docs/14.13.2): " + (ok ? "ok" : "WRONG"));
+        return ok ? 0 : 1;
     }
 
     private interface Factory {

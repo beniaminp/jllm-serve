@@ -361,7 +361,7 @@ public final class Qwen3NextCpuBackend implements Backend {
      * One token of one state column {@code s[so .. so + dk)}: {@code s *= gamma; d = (v - s.k) beta; s += d k;
      * out[oo] = s.q}, with k at {@code kv[ko..]} and q at {@code qv[qo..]}.
      */
-    static void recurrentStep(float[] s, int so, int dk, float[] kv, int ko, float[] qv, int qo, float v, float gamma,
+    public static void recurrentStep(float[] s, int so, int dk, float[] kv, int ko, float[] qv, int qo, float v, float gamma,
                               float beta, float[] out, int oo) {
         VectorKernels.scale(s, so, dk, gamma);
         float kvMem = VectorKernels.dot(s, so, kv, ko, dk);

@@ -8,7 +8,8 @@ module; the engine itself does not depend on it.
 Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`, `qwen3_moe`), **Qwen2 / 2.5**
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
-**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16 checkpoints only) and **Mamba** (`mamba`).
+**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16 checkpoints only), **Mamba** (`mamba`) and **Qwen3-Next**
+(`qwen3_next`: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache, [docs/14 §14.13](docs/14-model-families.md#1413-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
 conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
@@ -108,7 +109,7 @@ and the verification.
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
 Family details (what differs between them, verified tensor names, limits) are in
 [docs/14](docs/14-model-families.md) and [docs/15](docs/15-mamba.md). Note: the Llama/Mistral/Qwen2/GLM/Phi/
-Gemma/DeepSeek/Mamba paths were verified against reference implementations on synthetic checkpoints and on
+Gemma/DeepSeek/Mamba/Qwen3-Next paths were verified against reference implementations on synthetic checkpoints and on
 tokenizer fixtures, not yet on the real published weights — run a real checkpoint before relying on them.
 
 The `./jllm` launcher compiles the Java code and the native Metal library on first use. Equivalent manual steps:

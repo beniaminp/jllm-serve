@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture smoke test: Llama / Mistral / Qwen2 / Qwen3-MoE / GLM / Phi-3 / Gemma / Mamba / DeepSeek pipeline on tiny random checkpoints.
+# Architecture smoke test: Llama / Mistral / Qwen2 / Qwen3-MoE / GLM / Phi-3 / Gemma / Mamba / DeepSeek / Qwen3-Next pipeline on tiny random checkpoints.
 #
 # For every model it converts to q4, q8, q2k and q6k (plus q4 with a q6k embedding / LM head), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
@@ -34,6 +34,10 @@
 #                                                         yarn, group-limited softmax routing (q_lora null / set) and
 #                                                         sigmoid noaux_tc routing; also checked against deepseek-ref.py
 #
+#   ...-Qwen3NextForCausalLM / -Qwen3Next2ForCausalLM    generated: Qwen3-Next hybrids (Gated DeltaNet + gated attention +
+#                                                         MoE with a gated shared expert); checked against qwen3next-ref.py
+#                                                         (Qwen3NextChecks: reference, chunked vs token loop, saved states)
+#                                                         and, like Mamba, for chunking invariance
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
 #   hf-internal-testing_tiny-random-Glm4ForCausalLM       generated: glm4, four norms per layer, partial interleaved rope
@@ -91,6 +95,8 @@ gen qwen3moe Qwen3MoeForCausalLM
 gen deepseek_v2 DeepseekV2ForCausalLM
 gen deepseek_v2q DeepseekV2QLoraForCausalLM
 gen deepseek_v3 DeepseekV3ForCausalLM
+gen qwen3next Qwen3NextForCausalLM
+gen qwen3next2 Qwen3Next2ForCausalLM
 
 # DeepSeek: engine vs. the independent float64 reference (scripts/deepseek-ref.py) on Q8_0-rounded weights
 for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
@@ -99,6 +105,15 @@ done
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef "$METAL_LIB" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
+
+# Qwen3-Next: engine vs. the independent float64 reference (scripts/qwen3next-ref.py, needs numpy) on Q8_0-rounded
+# weights, the chunked delta rule vs. the token loop, and exact saved / loaded / copied states
+for n in Qwen3NextForCausalLM Qwen3Next2ForCausalLM; do
+  REF_Q8=1 python3 scripts/qwen3next-ref.py "$M/${P}-$n" >/dev/null
+done
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.Qwen3NextChecks "$METAL_LIB" \
+  "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.expertCountEvery=1 ${JAVA_OPTS:-} \
@@ -109,4 +124,5 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
   "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
-  "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
+  "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \
+  "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
