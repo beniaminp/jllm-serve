@@ -354,21 +354,27 @@ existing encoder ([04](04-tokenizer.md)), so there is one BPE implementation:
 
 * **`tokenizer.ggml.model = gpt2`**: byte-level BPE. `tokens` are the vocabulary and `merges` the merge list.
   `token_type` separates `CONTROL` tokens (added tokens flagged `special`: `<|im_start|>`, `<|endoftext|>`) and
-  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary. `tokenizer.ggml.pre` picks
-  the pre-tokenizer regex: `qwen2` (Qwen's, with an NFC normalizer as in its tokenizer.json), `llama-bpe` / `llama3`
-  (Llama 3's, with `ignore_merges`), `gpt-2`. Any other value is refused with its name; the loader then fetches the
+  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary; as in llama.cpp,
+  tokens it knows by name (`<|im_end|>`, `</s>`, the fill-in-the-middle markers...) are control tokens whatever the
+  file says. `tokenizer.ggml.pre` picks the pre-tokenizer: a list of regular expressions applied one after the other
+  plus `ignore_merges`, exactly llama.cpp's (80 values, 16.12; a missing key or `default` is llama.cpp's `default`,
+  which is **not** the GPT-2 regex). Any other value is refused with its name; the loader then fetches the
   original model's `tokenizer.json` from the repository named in `general.base_model.0.repo_url` /
   `general.source.url`, and fails clearly if the file names none.
-* **`tokenizer.ggml.model = llama`**: SentencePiece BPE (Llama 2, Mistral 7B, TinyLlama). The file has **scores**, not
-  merges, so — as `transformers` does when it converts such a model — every split of a token into two vocabulary
-  tokens becomes a merge, ranked by the merged token's score. Spaces become `▁`, a dummy `▁` is prepended (unlike
-  Metaspace it is added even if the text starts with a space), unknown characters fall back to the `<0xXX>` byte tokens.
+* **`tokenizer.ggml.model = llama`**: SentencePiece (Llama 2, Mistral 7B, TinyLlama, Gemma, Phi-3). The file has
+  **scores**, not merges, and llama.cpp segments with them directly: the characters are the first symbols, then the
+  adjacent pair whose concatenation is a token of the vocabulary (of any type) with the best score is merged, equal
+  scores leftmost first, until none is; a character that is no token becomes its `<0xXX>` byte tokens (`SpmGreedy`).
+  This differs from turning the scores into BPE merges, as `transformers` does, as soon as two scores are equal
+  (Gemma's are all 0). Spaces become `▁`; a `▁` is put in front of the text *and of the text after every special
+  token* when `add_space_prefix` (default true; Gemma: false).
 
-Checked two ways (`GgufTokenizerTest`): llama.cpp's own tokenizer tests (`ggml-vocab-llama-spm`, `-llama-bpe`,
-`-qwen2`, `-gpt-2`: 47 strings each, ids must equal llama.cpp's — **188 of 188**; `llama-spm` ships in
-`src/test/resources/gguf/vocab`), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python
-`tokenizers` package: **150 of 150** strings, the same decodings, and the **44** chat renders of
-`src/test/resources/tokenizers/qwen3.json`.
+Checked three ways (`GgufTokenizerTest`, `scripts/gguf-tokenizer-check.sh`): llama.cpp's own tokenizer tests
+(`ggml-vocab-llama-spm`, `-phi-3`, `-deepseek-coder`: 47 strings each, ids must equal llama.cpp's; the other 11
+fixtures are checked by hand), vocabularies generated for every pre value and compared with `llama-tokenize`
+(16.12), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python `tokenizers` package: **145 of
+145** strings, the same decodings, and the **44** chat renders of `src/test/resources/tokenizers/qwen3.json`; 5 more
+strings differ from the Hugging Face tokenizer by design, as llama.cpp does (16.12).
 
 ---
 
@@ -470,8 +476,9 @@ the load is dominated by the tokenizer.
   variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
   (Qwen2-MoE, DeepSeek) are not mapped.
-* **Tokenizer**: pre-tokenizers other than `qwen2`, `llama-bpe`, `gpt-2` need the original repository's
-  `tokenizer.json`.
+* **Tokenizer**: the pre-tokenizers that are not a list of regexes (`kimi-k2`, `afmoe`, `tiny_aya`, `superbpe`, `chameleon`,
+  the SPM-style BPE `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`) and `exaone-moe` need the original repository's
+  `tokenizer.json`; `tokenizer.ggml.add_eos_token` and the WordPiece (`bert`) vocabularies are not applied (16.12).
 
 ---
 

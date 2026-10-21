@@ -402,7 +402,8 @@ public final class GgufTokenizerLlamaCpp {
                 "<|endoftext|>", "a<|im_start|>user\nhi<|im_end|>\n", "<think>reasoning</think>", " <|im_end|> ", "<|im_start|><|im_start|>", "x<|endoftext|>y",
                 "<unk>", "<|endoftext|", "<|end", "<s>", "</s>", "<|fim_prefix|>x", "<|im_end|>\n", "\n<|im_end|>", "  <think>  x  </think>  ",
                 "<start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n", "<|user|>\nHi<|end|>\n<|assistant|>\n", "<|user|>  \n  Hi  <|end|>  x",
-                "<s> hello </s>", "<s>hello</s><s>", "<0x0A>", "<0x41>b", "a<0x41>", "\n\n\n\n\n\n\n\n\n",
+                "x <|im_end|> y", "\n<think>\n", "<|im_start|>\n", "text<|endoftext|>\n\ntext", "<think><think>", "<|user|>\n  \t Hi<|end|>\n",
+                "a\u2581b", "\u2581", "\u2581\u2581a", " \u2581 ", "<s> hello </s>", "<s>hello</s><s>", "<0x0A>", "<0x41>b", "a<0x41>", "\n\n\n\n\n\n\n\n\n",
                 "The quick brown fox jumps over the lazy dog.", "the the the the", " the  the   the", "worldworld world", "foo foo  foo",
                 "A", "a", "", "?", "\u00e9", "\u4e2d"));
         return c;
@@ -421,7 +422,7 @@ public final class GgufTokenizerLlamaCpp {
             {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "'S", "'RE", "'LL"},
             // non-ASCII letters, marks, digits, symbols, spaces, CJK
             {"\u00e9", "\u00f1", "\u00fc", "\u00df", "\u00c5", "\u0141", "\u0416", "\u03a9", "\u05d0", "\u0627", "\u0e01", "\u0915", "\u4e2d", "\u6587", "\u3042", "\u30ab", "\ud55c",
-                    "\u0301", "\u0308", "\u200d", "\u0663", "\u00b2", "\u00bd", "\u2460", "\u0966", "\u20ac", "\u00a9", "\u2192", "\u2211", "\uff01", "\u3001", "\u3002", "\u201c", "\u2019", "\u2014",
+                    "\u2581", "\u0301", "\u0308", "\u200d", "\u0663", "\u00b2", "\u00bd", "\u2460", "\u0966", "\u20ac", "\u00a9", "\u2192", "\u2211", "\uff01", "\u3001", "\u3002", "\u201c", "\u2019", "\u2014",
                     "\u00a0", "\u3000", "\u2003", "\u2028", "\u200b", "\u00ad", "\ufeff", "\u0085", "\u0001", "\u007f", "\ud83d\ude00", "\ud83c\udf89", "\ud83d\udc4d", "\ud835\udc00", "\ud840\udc00"},
     };
 
@@ -442,29 +443,54 @@ public final class GgufTokenizerLlamaCpp {
                 out.add(s);
             }
         }
+        // dense lowercase text over the pieces of the SentencePiece vocabularies: many competing merges
+        String dense = "abcdefghijklmnopqrstuvwxyz abcde .,123";
+        for (int i = 0; i < n / 3; i++) {
+            StringBuilder sb = new StringBuilder();
+            int len = 1 + r.nextInt(60);
+            for (int k = 0; k < len; k++) {
+                sb.append(dense.charAt(r.nextInt(dense.length())));
+            }
+            out.add(sb.toString());
+        }
         return out;
     }
 
     /** Every code point from {@code from} to {@code to} (step {@code step}) in four contexts: after a letter, between a space and a letter, before a digit, doubled. */
     static List<String> sweep(int from, int to, int step) throws IOException {
+        return sweep(from, to, step, false);
+    }
+
+    /**
+     * @param frozen leave out every code point llama.cpp has no category for, not only those Java has one for: the
+     *               list then does not depend on the JDK's Unicode version (the stored ids are keyed on it)
+     */
+    static List<String> sweep(int from, int to, int step, boolean frozen) throws IOException {
         List<String> out = new ArrayList<>();
         int[][] undefined = llamaUndefined();
         for (int cp = from; cp < to; cp += step) {
-            if (cp >= 0xD800 && cp <= 0xDFFF || cp == 0) {
-                continue;
-            }
-            // llama.cpp's Unicode tables are older than Java's: a character assigned since has no category there
-            // (a known difference, see docs/16-gguf.md 16.12); where Java has none either the two agree and it is tested
-            if (Character.getType(cp) != Character.UNASSIGNED && isUndefined(undefined, cp)) {
-                continue;
-            }
-            String c = new String(Character.toChars(cp));
-            out.add("a" + c);
-            out.add(" " + c + "b");
-            out.add(c + "1");
-            out.add(c + c + " ");
+            addSweep(out, cp, undefined, frozen);
+        }
+        for (int cp = 0xE0000; cp < 0xE0200; cp += Math.max(1, step / 8)) { // tags and variation selectors
+            addSweep(out, cp, undefined, frozen);
         }
         return out;
+    }
+
+    private static void addSweep(List<String> out, int cp, int[][] undefined, boolean frozen) {
+        if (cp >= 0xD800 && cp <= 0xDFFF || cp == 0) {
+            return;
+        }
+        // llama.cpp's Unicode tables are older than Java's: a character assigned since has no category there
+        // (a known difference, see docs/16-gguf.md 16.12); where Java has none either the two agree and it is tested
+        if ((frozen || Character.getType(cp) != Character.UNASSIGNED) && isUndefined(undefined, cp)) {
+            return;
+        }
+        String c = new String(Character.toChars(cp));
+        out.add("a" + c);
+        out.add(" " + c + "b");
+        out.add(c + "1");
+        out.add(c + c + " ");
     }
 
     /** The code points llama.cpp b11669 has no category for (from its unicode-data.cpp): src/test/resources/gguf/llama-cpp-undefined.txt. */
@@ -577,7 +603,10 @@ public final class GgufTokenizerLlamaCpp {
     }
 
     /** One vocabulary to check. */
-    record Case(String label, Path file) {
+    record Case(String label, Path file, String sep) {
+        Case(String label, Path file) {
+            this(label, file, SEP);
+        }
     }
 
     static String show(String s) {
@@ -621,12 +650,13 @@ public final class GgufTokenizerLlamaCpp {
     /** @return the number of strings that differ */
     static int compare(String exe, Case c, List<String> all, Path tmp, int showMax, StringBuilder log) throws Exception {
         Tokenizer tok = load(c.file());
-        int sep = tok.tokenId(SEP);
+        int sep = tok.tokenId(c.sep());
         int bad = 0;
+        all = all.stream().filter(x -> !x.contains(c.sep())).toList();
         for (int from = 0; from < all.size(); from += CHUNK) {
             List<String> strings = all.subList(from, Math.min(all.size(), from + CHUNK));
             Path text = tmp.resolve("corpus-" + c.file().getFileName() + ".txt");
-            Files.writeString(text, joined(strings), StandardCharsets.UTF_8);
+            Files.writeString(text, String.join(c.sep(), strings), StandardCharsets.UTF_8);
             int[] want = llamaIds(exe, c.file(), text, false);
             if (want == null) {
                 log.append("   llama-tokenize failed on ").append(c.file().getFileName()).append('\n');
@@ -634,7 +664,7 @@ public final class GgufTokenizerLlamaCpp {
                 continue;
             }
             List<int[]> w = split(want, sep);
-            List<int[]> g = split(tok.encode(joined(strings), true), sep);
+            List<int[]> g = split(tok.encode(String.join(c.sep(), strings), true), sep);
             if (w.size() != strings.size() || g.size() != strings.size()) {
                 log.append("   separator count: llama.cpp ").append(w.size()).append(" ours ").append(g.size()).append(" expected ")
                         .append(strings.size()).append('\n');
@@ -733,14 +763,21 @@ public final class GgufTokenizerLlamaCpp {
         }
     }
 
-    static final int RECORDED_RANDOMS = 120;
+    static final int RECORDED_RANDOMS = 150;
+
+    /** The strings whose llama.cpp ids are stored: the corpus and every 1999th code point in four contexts. */
+    static List<String> recordedStrings() throws IOException {
+        List<String> c = corpus(RECORDED_RANDOMS);
+        c.addAll(sweep(0x20, 0x30000, 1999, true));
+        return c;
+    }
 
     static void record(Path dir, Path file) throws Exception {
         String exe = findLlamaTokenize();
         if (exe == null) {
             throw new IllegalStateException("llama-tokenize is not installed");
         }
-        List<String> strings = corpus(RECORDED_RANDOMS);
+        List<String> strings = recordedStrings();
         Path tmp = Files.createTempDirectory(dir, "rec");
         try (var out = new java.io.PrintWriter(new GZIPOutputStream(Files.newOutputStream(file)), false, StandardCharsets.UTF_8)) {
             for (Case c : recordedCases(dir)) {
@@ -759,7 +796,7 @@ public final class GgufTokenizerLlamaCpp {
 
     /** Compares our ids with the stored ones; returns {passed, failed} string counts. */
     static int[] verifyRecorded(Path file, Path tmp, StringBuilder log) throws Exception {
-        List<String> strings = corpus(RECORDED_RANDOMS);
+        List<String> strings = recordedStrings();
         Map<String, List<int[]>> stored = new LinkedHashMap<>();
         try (BufferedReader r = new BufferedReader(new InputStreamReader(new GZIPInputStream(Files.newInputStream(file)), StandardCharsets.UTF_8))) {
             String line;
@@ -830,6 +867,24 @@ public final class GgufTokenizerLlamaCpp {
         }
     }
 
+    /** A control token of the file that no corpus string contains: the text the comparison joins the strings with. */
+    static String separatorOf(Path gguf, List<String> strings) throws IOException {
+        try (GgufFile f = GgufFile.open(gguf)) {
+            String[] tokens = f.strings("tokenizer.ggml.tokens");
+            long[] types = f.longs("tokenizer.ggml.token_type");
+            for (boolean unique : new boolean[]{true, false}) { // a token no string contains; else the strings that do are left out
+                for (int i = 0; i < tokens.length; i++) {
+                    String t = tokens[i];
+                    if (types != null && types[i] == GgufTokenizer.CONTROL && t.length() >= 3 && !t.contains("unused")
+                            && (!unique || strings.stream().noneMatch(x -> x.contains(t)))) {
+                        return t;
+                    }
+                }
+            }
+        }
+        throw new IOException("no control token to separate the strings in " + gguf);
+    }
+
     /** Long runs of one kind of character through every pre-tokenizer: no StackOverflowError, no quadratic time. */
     static int stress(Path dir) throws Exception {
         String[] inputs = {"a".repeat(100_000), " ".repeat(100_000), "1".repeat(100_000), "ab ".repeat(30_000), "\n".repeat(100_000),
@@ -878,12 +933,18 @@ public final class GgufTokenizerLlamaCpp {
         int sweepTo = 0x30000;
         int randoms = 1500;
         String only = null;
+        List<Path> external = new ArrayList<>();
+        Path paragraphs = null;
+        boolean groups = false;
         int show = 4;
         for (int i = 1; i + 1 < args.length; i += 2) {
             switch (args[i]) {
                 case "--dir" -> dir = Path.of(args[i + 1]);
                 case "--randoms" -> randoms = Integer.parseInt(args[i + 1]);
                 case "--only" -> only = args[i + 1];
+                case "--gguf" -> external.add(Path.of(args[i + 1]));
+                case "--groups" -> groups = Boolean.parseBoolean(args[i + 1]);
+                case "--paragraphs" -> paragraphs = Path.of(args[i + 1]);
                 case "--show" -> show = Integer.parseInt(args[i + 1]);
                 case "--sweep" -> sweepStep = Integer.parseInt(args[i + 1]);
                 case "--sweep-from" -> sweepFrom = Integer.decode(args[i + 1]);
@@ -896,11 +957,22 @@ public final class GgufTokenizerLlamaCpp {
         if (sweepStep > 0) {
             strings.addAll(sweep(sweepFrom, sweepTo, sweepStep));
         }
+        if (paragraphs != null) { // real text: the paragraphs of the Markdown files under the directory
+            try (var files = Files.walk(paragraphs)) {
+                for (Path f : files.filter(x -> x.toString().endsWith(".md")).sorted().toList()) {
+                    strings.addAll(Arrays.asList(Files.readString(f, StandardCharsets.UTF_8).split("\n\n")));
+                }
+            }
+        }
         System.out.println("llama-tokenize: " + exe);
         System.out.println(strings.size() + " strings per vocabulary (" + handWritten().size() + " hand-written, " + randoms + " random)");
         Map<String, int[]> results = new TreeMap<>();
         int failedVocabs = 0;
-        for (Case c : writeAll(work)) {
+        List<Case> cases = !external.isEmpty() ? new ArrayList<>() : groups ? recordedCases(work) : writeAll(work);
+        for (Path f : external) {
+            cases.add(new Case(f.getFileName().toString(), f, separatorOf(f, strings)));
+        }
+        for (Case c : cases) {
             if (only != null && !c.label().contains(only)) {
                 continue;
             }
@@ -912,10 +984,14 @@ public final class GgufTokenizerLlamaCpp {
                 failedVocabs++;
                 System.out.print(log);
             }
-            Files.deleteIfExists(c.file());
+            if (external.isEmpty()) {
+                Files.deleteIfExists(c.file());
+            }
         }
-        System.out.println(results.size() - failedVocabs + " of " + results.size() + " vocabularies pass");
-        if (only == null || "bos".contains(only)) {
+        if (!results.isEmpty()) {
+            System.out.println(results.size() - failedVocabs + " of " + results.size() + " vocabularies pass");
+        }
+        if (external.isEmpty() && (only == null || "bos".contains(only))) {
             StringBuilder log = new StringBuilder();
             int bosFailed = checkBos(exe, work, log);
             System.out.print(log);

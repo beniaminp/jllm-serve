@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The tokenizer built from GGUF metadata against two references.
+ * The tokenizer built from GGUF metadata against three references.
  *
  * <ol>
  *   <li><b>llama.cpp's own tokenizer tests</b>: the vocabulary-only files {@code ggml-vocab-<name>.gguf} of
@@ -25,7 +25,14 @@ import java.util.Map;
  *   <li><b>The Hugging Face tokenizer.json of the same model</b>: with {@code --gguf FILE --hf DIR --fixture FILE}
  *       the fixture strings ({@code src/test/resources/tokenizers/qwen3.json}: ids produced by the Python
  *       {@code tokenizers} package) and the chat renders must give the ids of {@code DIR/tokenizer.json} and of the
- *       fixture, and decoding must round-trip.</li>
+ *       fixture, and decoding must round-trip. Two behaviors of llama.cpp (the reference of the first check) differ from
+ *       the Hugging Face tokenizer by design and are left out of that comparison: llama.cpp does not normalize to NFC,
+ *       and it promotes tokens such as {@code </s>} to control tokens by their name.</li>
+ *   <li><b>Vocabularies written by {@link GgufTokenizerLlamaCpp}, tokenized by llama.cpp</b>:
+ *       {@code synthetic-llama-cpp.txt.gz} next to the fixtures holds the ids {@code llama-tokenize} gave for the
+ *       strings of that class on a generated vocabulary for every distinct {@code tokenizer.ggml.pre} (and three
+ *       SentencePiece kinds). The generator is deterministic, so checking them needs no llama.cpp;
+ *       {@code scripts/gguf-tokenizer-check.sh} runs the comparison live.</li>
  * </ol>
  */
 public final class GgufTokenizerTest {
@@ -64,6 +71,16 @@ public final class GgufTokenizerTest {
                     llamaCppVocab(p);
                 }
             }
+            Path recorded = vocab.resolve("synthetic-llama-cpp.txt.gz");
+            if (Files.isRegularFile(recorded)) {
+                StringBuilder log = new StringBuilder();
+                int[] r = GgufTokenizerLlamaCpp.verifyRecorded(recorded, Files.createTempDirectory("gguf-tok"), log);
+                System.out.print(log);
+                check(r[1] == 0 && r[0] > 0, "synthetic vocabularies: " + r[0] + " of " + (r[0] + r[1]) + " strings give llama.cpp's ids");
+                System.out.printf("%-34s %d of %d strings give llama.cpp's ids (%d vocabularies)%n", recorded.getFileName(), r[0],
+                        r[0] + r[1], r[2]);
+            }
+            tables();
         }
         if (gguf != null && hf != null && fixture != null) {
             againstHf(gguf, hf, fixture, modelType);
@@ -72,6 +89,26 @@ public final class GgufTokenizerTest {
         if (failed > 0) {
             System.exit(1);
         }
+    }
+
+    /** What the pre-tokenizer table says; the values are those of llama.cpp b11669's llama-vocab.cpp. */
+    private static void tables() {
+        java.util.Set<String> known = org.robomiri.jllm.tokenizer.GgufTokenizer.knownPre();
+        for (String pre : new String[]{"llama-bpe", "llama3", "qwen2", "gpt-2", "default", "deepseek-llm", "deepseek-coder", "deepseek-v3",
+                "chatglm-bpe", "glm4", "olmo", "smollm", "stablelm2", "exaone", "exaone4", "command-r", "starcoder", "refact", "mpt",
+                "falcon", "tekken", "qwen35", "phi-2"}) {
+            check(known.contains(pre), "tokenizer.ggml.pre '" + pre + "' is supported");
+        }
+        check(!known.contains("granite") && !known.contains("no-such-pre"), "values llama.cpp rejects are rejected");
+        // an unknown value is refused with its name; the loader then fetches the original tokenizer.json
+        try {
+            org.robomiri.jllm.tokenizer.GgufTokenizer.build(new org.robomiri.jllm.tokenizer.GgufTokenizer.Spec("gpt2", "no-such-pre",
+                    new String[]{"a"}, null, null, new String[0], -1, -1, -1, null, true));
+            check(false, "an unknown pre-tokenizer is refused");
+        } catch (org.robomiri.jllm.tokenizer.GgufTokenizer.UnsupportedPreTokenizer e) {
+            check(e.getMessage().contains("no-such-pre"), "the refusal names the value");
+        }
+        System.out.println("pre-tokenizer table: " + known.size() + " tokenizer.ggml.pre values");
     }
 
     private static void llamaCppVocab(Path gguf) throws Exception {
@@ -117,10 +154,17 @@ public final class GgufTokenizerTest {
         Map<String, Object> fx = Json.parseObject(Files.readString(fixture));
         int n = 0;
         int same = 0;
+        int llamaCpp = 0;
         for (Object o : Json.list(fx, "cases")) {
             String text = Json.str(o, "text", "");
             int[] want = ((List<Object>) Json.list(o, "ids")).stream().mapToInt(x -> ((Number) x).intValue()).toArray();
             int[] got = tok.encode(text);
+            if (!java.text.Normalizer.isNormalized(text, java.text.Normalizer.Form.NFC) || text.contains("</s>")) {
+                // llama.cpp does not normalize to NFC and makes the token "</s>" a control token whatever its type says
+                // (Qwen3's vocabulary has it as a plain token); this tokenizer follows llama.cpp, see docs/16-gguf.md 16.12
+                llamaCpp++;
+                continue;
+            }
             n++;
             if (Arrays.equals(want, got)) {
                 same++;
@@ -152,7 +196,7 @@ public final class GgufTokenizerTest {
                 "special token ids match");
         check(tok.isSpecial(tok.tokenId("<|im_end|>")) && !tok.isSpecial(tok.tokenId("<think>")),
                 "<|im_end|> is special and <think> is not (as in tokenizer.json)");
-        System.out.printf("%s: %d/%d fixture strings give the Hugging Face ids, %d chat renders checked%n",
-                gguf.getFileName(), same, n, chats);
+        System.out.printf("%s: %d/%d fixture strings give the Hugging Face ids (%d more differ by design, as in llama.cpp), %d chat renders checked%n",
+                gguf.getFileName(), same, n, llamaCpp, chats);
     }
 }
