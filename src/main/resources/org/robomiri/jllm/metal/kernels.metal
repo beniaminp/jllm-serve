@@ -2657,7 +2657,7 @@ template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 //       30 MXFP4 (17 B: e8m0 e, 16 nibble bytes)                         w = kvalues_fp4[nibble] 2^(e - 128)
 //       31 F16, 32 BF16 (64 B per 32 weights)                            w = the half / bfloat16
 // Block sizes 22, 110, 18 and 17 are not multiples of 4: Q5_0 / Q3_K / IQ4_NL read their quants as ushorts (2-byte
-// aligned), MXFP4 byte by byte (17 B blocks are only 1-byte aligned). The 4-bit tables are packed 4 int8 to a uint.
+// aligned), MXFP4 byte by byte (17 B blocks are only 1-byte aligned). The 4-bit tables sit in constant memory.
 
 #define GG_NEW 24
 #define GG_Q4_1 24
@@ -2670,9 +2670,11 @@ template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 #define GG_F16 31
 #define GG_BF16 32
 
-// ggml's kvalues_iq4nl / kvalues_mxfp4 (int8), four to a little-endian uint
-#define GG_TAB_IQ4NL uint4(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u)
-#define GG_TAB_MXFP4 uint4(0x03020100u, 0x0c080604u, 0xfdfeff00u, 0xf4f8fafcu)
+// ggml's kvalues_iq4nl and kvalues_mxfp4 (int8, as floats) in constant memory
+constexpr constant static float GG_KV_IQ4NL[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                                                   1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f};
+constexpr constant static float GG_KV_MXFP4[16] = {0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
+                                                   0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f};
 
 // 4 bytes at any 2-byte aligned address as a uchar4
 static inline uchar4 gg_ld4(device const ushort *p, int i) {
@@ -2680,13 +2682,11 @@ static inline uchar4 gg_ld4(device const ushort *p, int i) {
 }
 
 // table[n] for four nibbles n
-static inline float4 gg_tab(uchar4 n, uint4 tab) {
-    float4 r;
-    for (int i = 0; i < 4; i++) {
-        const uint s = uint(n[i]) & 3u;
-        r[i] = float(int(tab[uint(n[i]) >> 2] << (24u - 8u * s)) >> 24);
-    }
-    return r;
+static inline float4 gg_tab_iq4nl(uchar4 n) {
+    return float4(GG_KV_IQ4NL[n.x], GG_KV_IQ4NL[n.y], GG_KV_IQ4NL[n.z], GG_KV_IQ4NL[n.w]);
+}
+static inline float4 gg_tab_mxfp4(uchar4 n) {
+    return float4(GG_KV_MXFP4[n.x], GG_KV_MXFP4[n.y], GG_KV_MXFP4[n.z], GG_KV_MXFP4[n.w]);
 }
 
 // The 6-bit scale (minus 32) number s (0..15) of a Q3_K block whose 12 scale bytes start at sc (ggml's kmask shuffle).
@@ -2752,7 +2752,7 @@ static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int
         const float d = float(*(device const half *)blk);
         for (int k = 0; k < NV; k++) {
             const int v = v0 + k;
-            w[k] = gg_tab((gg_ld4(p, 1 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_IQ4NL) * d;
+            w[k] = gg_tab_iq4nl((gg_ld4(p, 1 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * d;
         }
     } else if (QT == GG_IQ4_XS) {
         const int nsb = nb >> 3;
@@ -2765,7 +2765,7 @@ static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int
         device const uchar4 *q = (device const uchar4 *)(blk + 8 + 16 * ib);
         for (int k = 0; k < NV; k++) {
             const int v = v0 + k;
-            w[k] = gg_tab((q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_IQ4NL) * dl;
+            w[k] = gg_tab_iq4nl((q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * dl;
         }
     } else if (QT == GG_MXFP4) {
         device const uchar *blk = wq + (grow * nb + u) * 17;
@@ -2775,7 +2775,7 @@ static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int
             const int v = v0 + k;
             device const uchar *b = blk + 1 + 4 * (v & 3);
             const uchar4 nib = uchar4(b[0], b[1], b[2], b[3]);
-            w[k] = gg_tab((nib >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_MXFP4) * d;
+            w[k] = gg_tab_mxfp4((nib >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * d;
         }
     } else if (QT == GG_F16) {
         device const half4 *p = (device const half4 *)(wq + (grow * nb + u) * 64);
