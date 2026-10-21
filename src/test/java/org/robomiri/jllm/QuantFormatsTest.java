@@ -439,8 +439,11 @@ public final class QuantFormatsTest {
                 b = GgufModelTest.logits(w, prompt, 4);
             }
             double diff = GgufModelTest.maxDiff(b, a);
-            // the same Q8_0 weights either way; the last float bits of a run can still change when the JIT compiles the
-            // Vector API kernels between the two runs (interpreted and intrinsic lane reductions add in different orders)
+            // the same Q8_0 weights either way (every tensor byte-identical, none split) and the same kernels, but not
+            // bit-equal logits: reduceLanes(ADD) adds the lanes in order in the Vector API's Java fallback and as a tree
+            // once C2 intrinsifies it, and the hot VectorKernels.dot (single-token Q8_0 rows, CpuMatmul.mulOne) gets
+            // compiled between the two runs. Exact with -XX:TieredStopAtLevel=1, or with both runs warmed up. The bound is
+            // relative to the largest logit and well under the quantization noise checked below (> 1e-4)
             check(diff <= 1e-5 && n > 0, format + ": " + n + " quantized matrices converted, logits equal to the F32 checkpoint"
                     + " of the same values: max diff " + diff);
             // and the quantization is real: the logits differ from those of the original weights
