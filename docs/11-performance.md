@@ -119,7 +119,7 @@ expert traffic (8 of 128 experts per layer, ≈ 2 GB per token) — the same ~25
 dense model, so the MoE path is as efficient per byte as the dense one. Prefill is bandwidth-bound by streaming
 nearly all experts per chunk, which is why it is only ~2× decode here versus ~4.8× for the dense model; on the
 CPU the expert-grouped prefill reuses each dequantized expert row for all tokens routed to it
-([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)), on Metal that is still open
+([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoeffn-moeexperts)), on Metal that is still open
 ([11.5](#115-optimization-roadmap)).
 
 ---
@@ -266,7 +266,7 @@ Done:
 | **Tiled prefill matmuls on Metal** (2 rows × 8 tokens per simdgroup, bit-identical) | prefill 380 → 533 tok/s | `matmul_pf` family, [08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls) |
 | **Int8 activations on CPU** ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) | Q4 row kernel 6× faster, decode 13 → 51 tok/s (~3.9×), ~0.9 % RMS dot-product error | `cpu/Int8Kernels`, `CpuMatmul` |
 | **f16 KV cache**: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; speed equal or better, outputs unchanged on the test prompts | `cpu/KvCache`, `_h` kernels |
-| **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)) | each expert row dequantized once per chunk and reused for its tokens | `CpuBackend.moeBatched` |
+| **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoeffn-moeexperts)) | each expert row dequantized once per chunk and reused for its tokens | `MoeExperts.batched` |
 | **Tiled CPU attention** over (kv head, token tile) | each K / V row read once per tile; bit-identical | `KvCache.attentionTiled` |
 | **Flash decoding** on Metal, chosen by the start-up self-check ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) | +3–5 % decode at ~3 000 tokens of context, not bit-identical (agrees to rounding) | `attention_split`, `attention_combine` |
 | **Vectorized `exp` / `tanh`** on CPU, default (`jllm.cpu.fastmath=false` to disable) | +5–9 % decode at ~3 000 tokens, −40 % long-prompt attention | `VectorKernels.expFast` |

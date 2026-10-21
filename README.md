@@ -43,7 +43,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
-| Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
+| Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
 | Hot experts on the GPU, cold on the CPU | an MoE model too big for the GPU's memory budget leaves its rarely used experts (learned from your own usage) on the CPU, which computes them alongside the GPU, instead of paging | [08 §8.18](docs/08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
@@ -276,7 +276,7 @@ Notable keys besides the usual ones: `backend.kv-dtype` (`f32` or `f16`), `backe
 (default `true`; the CPU quantizes activations to int8 for integer dot products, several times faster decode but
 ~1 % different numerics; `false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
-the CPU; `off`, `all` or a number of whole layers) and the `server.*` limits listed under Security below.
+the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 
 Short flags:
 
@@ -334,7 +334,7 @@ The MLA latent KV cache of DeepSeek models is much smaller than a plain one (V2-
 
 ```sh
 mvn test                   # SmokeTest + ServerTest + MetalParamsTest + the GGUF checks (plain main() classes, no test framework)
-sh scripts/arch-smoke.sh   # 20 synthetic models x Q4/Q8/Q2_K, CPU == Metal; DeepSeek checked against a float64 reference
+sh scripts/arch-smoke.sh   # 21 synthetic models x 5 formats, CPU == Metal (MoE also with experts on the CPU); DeepSeek vs float64
 METAL_EMU=1 sh scripts/arch-smoke.sh            # the same on any OS, Metal side on the CPU emulator (needs clang++, python3)
 sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   # single Metal kernels on the emulator vs numpy
 ```

@@ -114,11 +114,16 @@ with its full logic.
 
 What it verified during this work:
 
-- every family in `scripts/arch-smoke.sh` (Llama, Mistral, Qwen2, GLM / GLM-4, Phi-3, Gemma 2 / 3, Mamba, DeepSeek-V2 / V3
-  with MLA and MoE, in several quantizations): Metal logits equal CPU logits within tolerance, 100/100 checks; pipelined decoding equals unpipelined, 90/90 checks; KV caches written
-  by the CPU backend load into the Metal backend;
-- `attention_fa`, `moe_sort` / the grouped MoE kernels, `embed_token`, `argmax`, Q6_K MMA against numpy references
-  (`kernel_tests.py`, 18 tests).
+- every family in `scripts/arch-smoke.sh` (Llama, Mistral, Qwen2, Qwen3-MoE, GLM / GLM-4, Phi-3, Gemma 2 / 3, Mamba,
+  DeepSeek-V2 / V3 with MLA and MoE, in five formats each):
+  - Metal logits equal CPU logits within tolerance (105 checks), and pipelined decoding equals unpipelined;
+  - KV caches written by the CPU backend load into the Metal backend;
+  - the MoE models also run with experts on the CPU in four placements (80 checks), with exact usage counts and
+    two slots sharing a placement;
+  - this end-to-end run is what exercises `moe_sort` and the grouped MoE kernels, `moe_remap`, `embed_token`,
+    `argmax` and the Q6_K matrix path;
+- attention (`attention_t` variants), the Q4_0 prefill matmuls and `attention_fa` (windows, soft-cap, half cache)
+  against float64 numpy references (`kernel_tests.py`, 18 tests).
 
 What it cannot tell you:
 

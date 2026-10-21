@@ -329,7 +329,7 @@ thread; for a chunk they are pool jobs over tokens or (token, head) pairs.
 
 ---
 
-## 7.7 Mixture of experts on CPU (`CpuBackend.moe`, `route`)
+## 7.7 Mixture of experts on CPU (`CpuBackend.MoeFfn`, `MoeExperts`)
 
 Per token: `route` computes 128 router logits with `VectorKernels.dot` (parallel over the experts for a decode
 token; in prefill every token is routed by its own thread, DeepSeek's router included, which keeps its logits,
@@ -341,7 +341,9 @@ sorting), and renormalizes. Then two parallel loops:
 2. `forRange(dim, 8, …)` — each output row sums `routeWeight[k] · dotRow(expDown, assign[k]*dim + r, h, k*m)`
    over the 8 slots and adds to `x`. One writer per element, no synchronization.
 
-Three pool jobs per token-layer (router, gate/up, down) instead of sixteen. Prefill (`moeBatched`) routes the
+Three pool jobs per token-layer (router, gate/up, down) instead of sixteen. The experts themselves live in
+`MoeExperts` (`token`, `batched`), which the Metal backend also uses for the experts it leaves on the CPU
+([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)). Prefill (`MoeExperts.batched`) routes the
 tokens in parallel, groups the `n × topK` slots by expert with a counting sort and runs each used expert once over
 all its slots (`expertMatmul`: four rows dequantized once, `dot4x4` over four slots at a time); the per-token combine
 `x[t] += Σ_k w_k · down_k` is `VectorKernels.combine`, lanes that follow the scalar sum order exactly (product

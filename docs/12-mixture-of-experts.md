@@ -1,8 +1,10 @@
 # 12. Mixture of Experts (Qwen3-30B-A3B)
 
 Code: `model/Mlp.Moe` + `model/Router` (the typed spec, built by `model/Families`), `model/MlpWeights.Moe`,
-`model/ModelConverter.moeRules`, `cpu/CpuBackend.MoeFfn` (`moeToken`, `moeBatched`, `expertMatmul`, `routeSoftmax`),
-`metal/MetalBackend.MoeStep`, `kernels.metal` section 5 (`router`, `moe_up`, `moe_down`)
+`model/ModelConverter.moeRules`, `cpu/CpuBackend.MoeFfn` (routing: `routeSoftmax`, `routeDeepseek`) and
+`cpu/MoeExperts` (the experts: `token`, `batched`, `expertMatmul`; shared with the Metal backend's CPU experts),
+`metal/MetalBackend.MoeStep`, `metal/ExpertPlacement`, `kernels.metal` section 5 (`router`, `moe_up`, `moe_down`,
+the grouped `moe_sort` / `moe_up_mma` / `moe_down_mma` / `moe_combine`, `moe_remap`)
 
 ## 12.1 The idea
 
@@ -90,9 +92,9 @@ The cache tensors of a layer are `mlp.router` (f32), `mlp.experts.gate_up` and `
 
 ## 12.4 CPU implementation
 
-Decode and prefill take different paths (`MoeFfn.run`).
+Decode and prefill take different paths (`MoeFfn.run` routes, then calls `MoeExperts`).
 
-**One token** (decode, `moeToken`):
+**One token** (decode, `MoeExperts.token`):
 
 1. route: 128 dot products with the SIMD `dot` (parallel over experts), softmax, 8 passes of argmax (128 entries: a
    sort would be slower), renormalize.
@@ -107,7 +109,7 @@ Decode and prefill take different paths (`MoeFfn.run`).
 
 Two `forRange` calls per token per layer instead of 16 keeps thread-pool overhead low.
 
-**Many tokens** (prefill, `moeBatched`): doing the above per token would stream every selected expert's weights once
+**Many tokens** (prefill, `MoeExperts.batched`): doing the above per token would stream every selected expert's weights once
 per token. Instead the whole chunk is grouped by expert:
 
 1. route every token, one token per thread (the router logits are then computed serially inside the thread);
@@ -184,11 +186,19 @@ Decode reads ~2 GB of weights per token (8 active experts), so the bandwidth cei
 0.6B model but the same as a dense 3B model. Prefill cannot share weights between tokens the way a dense matmul
 does: 64 tokens in a batch typically touch *all* 128 experts, so the whole 19 GB is streamed per chunk.
 
-The CPU path fixes the reuse side of this by grouping tokens by expert (section 12.4): a weight row is dequantized once
-per chunk and used for every token routed to that expert. The Metal `moe_up` / `moe_down` kernels still process one
-(token, expert) slot per simdgroup and re-read the expert's rows for every slot, relying on the GPU caches, so
-Metal prefill is only about twice its decode speed (49 vs 25 tok/s in 12.7), where a dense model gains far more.
-Grouping slots by expert on the GPU is the natural next optimization.
+📐 With `n` tokens per chunk, `E` experts and `topK` picks per token, an expert serves on average
+
+```
+tokens per expert = n · topK / E          64 · 8 / 128 = 4,     256 · 8 / 128 = 16
+```
+
+tokens of the chunk, and its weights are read (on the CPU: each group of 4 rows dequantized) once for all of them.
+The fixed cost per expert is shared by 4 tokens at `n = 64` and by 16 at `n = 256`. Both backends group the slots
+by expert: the CPU with a counting sort (12.4), Metal with `moe_sort` and the simdgroup-matrix tile kernels
+([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)). And MoE models prefill in **256-token chunks**
+unless `backend.batch` is set. Measured on the CPU expert path with one Qwen3-30B-A3B-shaped layer (Q4_0, 4
+cores), that is 1.5–1.6× faster per token than 64-token chunks; on Metal it is not measured yet
+([11](11-performance.md)).
 
 The same code serves DeepSeek-V2/V3 ([14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)):
 only the router (`Router.DeepSeek`) and the extra shared-expert matmul differ.
@@ -199,4 +209,29 @@ only the router (`Router.DeepSeek`) and the extra shared-expert matmul differ.
 layouts are accepted) and checks the stacked tensors; the DeepSeek tiny models of `scripts/arch-smoke.sh` (8 routed
 experts, shared experts, three routing rules; [14.11.8](14-model-families.md#14118-testing)) run the MoE kernels and the
 router on CPU and Metal and require identical tokens and logits within 1e-3, and `DeepSeekRef` compares them with an
-independent float64 reference. The Qwen3-30B numbers above come from the real model.
+independent float64 reference. A tiny `Qwen3MoeForCausalLM` (8 experts, top 2, one dense layer) runs there too, and
+every MoE model is also run with experts on the CPU: one whole layer, all layers, every other expert of every layer,
+and all but one expert of a layer, each against the CPU backend. Those runs also check a 20-token chunk, the usage
+counts, and two slots sharing one placement. `ExpertPlacementCheck` (in `mvn test`) checks the planner. The
+Qwen3-30B numbers above come from the real model.
+
+## 12.10 A model bigger than the GPU's memory budget
+
+🧸 Some specialists are asked all day, some almost never. When there isn't room for all of them at the GPU's desk,
+the rarely asked ones wait in the CPU's office. The GPU works through its part, and only when a word needs one of
+the CPU's specialists does the CPU answer, at the same time as the GPU does its own share.
+
+📐 Metal keeps only `recommendedMaxWorkingSetSize` (about two thirds to three quarters of RAM) resident for the GPU,
+and an MoE model is almost all experts (Qwen3-30B-A3B Q4_0: ~18 of 19.4 GB). `backend.metal.cpu-moe=auto` (the
+default) does nothing when everything fits. Otherwise it leaves just enough experts on the CPU, chosen to minimize
+
+```
+cost = 100 µs · (layers with a CPU expert)  +  Σ_{CPU experts} p(l,e) · expertBytes / CPU bandwidth
+```
+
+where `p(l,e)` is how often a token picks that expert, learned from earlier runs and saved in
+`~/.cache/jllm/expert-usage`. A first run, with no statistics, moves whole layers. Later runs move the rarely
+picked experts, so the CPU is called for a few percent of the picks instead of a whole layer's share. The hot
+experts of a split layer are packed into their own GPU memory; the GPU skips the cold slots (`moe_remap` marks them
+−1) while the CPU computes them with the same `MoeExperts` code as the CPU backend. Every detail, the timeline
+and the tests are in [08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe).

@@ -628,18 +628,15 @@ reading the whole prefix) dominates instead.
 
 ### What remains, by expected payoff
 
-1. **Expert-grouped MoE prefill** — the CPU backend already sorts slots by expert and runs each expert once over
-   its tokens ([7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoe-route)), but `moe_up` /
-   `moe_down` still handle one token per simdgroup, so a 64-token chunk reads every chosen expert's weights once
-   *per token*. A `TOK_TILE`-style loop over the tokens that share an expert would give the reuse the dense
-   matmul already has (the 30B prefills at 49 tok/s against 533 for the 0.6B).
-2. **Prefill attention** — a tile of query tokens per threadgroup sharing each K/V row, or an online-softmax
-   pass that never writes `scores` to device memory (flash decoding does the split for decode only).
-3. **Simdgroup matrix instructions for the MoE kernels** — the dense prefill matmuls already use them
-   ([8.10](#810-the-tiled-prefill-matmuls)); `moe_up` / `moe_down` do not.
-4. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
+*Done since this list was written:* expert-grouped MoE prefill on simdgroup-matrix tiles
+([8.15](#815-expert-grouped-moe-prefill)), with MoE models prefilling in 256-token chunks; flash-attention prefill
+([8.13](#813-flash-attention-prefill-attention_fa)); and GPU sampling with pipelined decoding
+([8.16](#816-pipelined-greedy-decoding)). Not yet measured on a Mac. What is left:
+
+1. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
-5. **Overlap** — pipeline the CPU's sampling with the next step's GPU work, or sample on the GPU.
+2. **Fusing `moe_remap` into the router kernels**, one dispatch fewer per split layer when experts run on the CPU
+   ([8.18](#818-experts-on-the-cpu-backendmetalcpu-moe)).
 
 ---
 
@@ -875,7 +872,9 @@ least `jllm.metal.moeMmaMin` (16) tokens the grouped path runs instead:
 
 Memory read for expert weights drops from `≈ n · topK` expert-matrix reads to `≈ tiles` (about
 `experts_used + n·topK / MMA_BT`). Q6_K weights now also have a simdgroup-matrix path, so GGUF `Q6_K` layers use it
-too. `-Djllm.metal.moeMma=false` keeps the per-slot kernels.
+too. `-Djllm.metal.moeMma=false` keeps the per-slot kernels. Because the reuse grows with the tokens per expert
+(`n · topK / E`: 4 at a 64-token chunk with 128 experts and top-8, 16 at 256), MoE models prefill in 256-token
+chunks unless `backend.batch` is set ([12 §12.8](12-mixture-of-experts.md#128-why-decode-is-fast-and-prefill-is-not)).
 
 ---
 

@@ -228,6 +228,7 @@ together but costs only 8 per word.
 📐 Router logits `r = W_router · x`, top-k with softmax weights `g_i = exp(r_i) / Σ_{j in top-k} exp(r_j)`, output
 `Σ_{i in top-k} g_i · Expert_i(x)`. Qwen3-30B-A3B has 30 B weights but reads ~3 B per token. On the GPU, a prompt's
 tokens are first **sorted by expert** so each specialist's weights are read once for all the tokens that chose it
+(and the prompt is read in pieces of 256 tokens, so each specialist has ~16 tokens to answer per read instead of ~4)
 ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)).
 
 When the specialists don't all fit on the GPU's desk, some stay with the CPU. jllm-serve remembers which
