@@ -118,6 +118,51 @@ test('activeRange / trimSilence', () => {
   assert.ok(E.length(E.trimSilence(c)) < 2200);
 });
 
+test('speechRange ignores a start click and the near-silence after it (text-to-speech output)', () => {
+  const rate = 8000;
+  const click = E.clip(rate, [Float32Array.from({length: 24}, (_, i) => (i < 12 ? 0.05 : -0.04))]);       // a pop of 3 ms
+  const quiet = E.clip(rate, [Float32Array.from({length: 4000}, () => 0.0008 * (Math.random() * 2 - 1))]);   // -62 dB noise
+  const speech = sine(rate, 200, 0.5, 0.3);
+  const tail = E.silent(rate, 1, 800);
+  const c = E.concat([click, quiet, speech, tail]);
+  const [a, b] = E.speechRange(c);
+  const s0 = 24 + 4000, s1 = s0 + 4000;
+  assert.ok(Math.abs(a - s0) <= 200, 'start ' + a + ' vs ' + s0);
+  assert.ok(Math.abs(b - s1) <= 200, 'end ' + b + ' vs ' + s1);
+  assert.ok(Math.abs(E.length(E.trimToSpeech(c, 0.01)) - (4000 + 160)) <= 400);
+  // activeRange alone is fooled by the click
+  assert.equal(E.activeRange(c, -45)[0], 0);
+  // silent or very short clips come back whole
+  assert.deepEqual(E.speechRange(E.silent(rate, 1, 5000)), [0, 5000]);
+  assert.deepEqual(E.speechRange(E.silent(rate, 1, 10)), [0, 10]);
+});
+
+test('speechRange drops a 50 ms burst before a long near-silence, keeps a lone short word', () => {
+  const rate = 8000;
+  const burst = sine(rate, 300, 0.05, 0.1);
+  const quiet = E.silent(rate, 1, 3200);
+  const word = sine(rate, 200, 0.4, 0.3);
+  const [a, b] = E.speechRange(E.concat([burst, quiet, word, E.silent(rate, 1, 400)]));
+  assert.ok(Math.abs(a - (400 + 3200)) <= 160, 'start ' + a);
+  assert.ok(Math.abs(b - (400 + 3200 + 3200)) <= 200, 'end ' + b);
+  const short = sine(rate, 200, 0.05, 0.3);
+  const [c0, c1] = E.speechRange(E.concat([E.silent(rate, 1, 800), short, E.silent(rate, 1, 800)]));
+  assert.ok(c0 < 1000 && c1 > 1100, `${c0} ${c1}`);
+});
+
+test('snapToValley finds the quiet spot near a word boundary', () => {
+  const rate = 8000;
+  const loud = sine(rate, 200, 0.5, 0.5);
+  const c = E.concat([loud, E.silent(rate, 1, 200), loud]);          // the gap is frames 4000..4200
+  const f = E.snapToValley(c, 3950, 400);
+  assert.ok(f >= 4000 && f <= 4200, 'snapped to ' + f);
+  assert.equal(E.snapToValley(c, 4100, 20), 4100);
+  assert.equal(E.snapToValley(loud, 2000, 300), 2000, 'no valley in continuous sound: unchanged');
+  const plan = E.planTextEdit([{text: 'a', s: 0, e: 100}, {text: 'b', s: 4000, e: 4100}, {text: 'c', s: 4200, e: 4300}],
+    [{type: 'replace', a0: 1, a1: 2, b0: 1, b1: 2}], ['a', 'x', 'c'], 250, fr => fr + 1);
+  assert.deepEqual([plan[0].cutA, plan[0].cutB], [4001, 4101]);
+});
+
 test('concatCrossfade is equal power and shortens by the overlap', () => {
   const a = E.clip(1000, [new Float32Array(100).fill(1)]);
   const b = E.clip(1000, [new Float32Array(100).fill(1)]);

@@ -276,6 +276,68 @@
     return [a, b];
   };
 
+  /**
+   * Where the speech is: [first, last+1) from the 20 ms RMS (every 10 ms). Windows within `relDb` of the loudest one are
+   * active; active runs closer than `gapSec` form a cluster, and a cluster shorter than `minClusterSec` at the start or
+   * the end of the clip is dropped when another cluster follows (or precedes) it: that is the click or burst that
+   * text-to-speech output often starts with, followed by half a second of near silence. A clip with a single cluster
+   * (one short word) is kept whole. Falls back to the whole clip.
+   */
+  AudioEdit.speechRange = (c, relDb = -32, minClusterSec = 0.08, gapSec = 0.12) => {
+    const n = length(c), hop = Math.max(1, Math.round(c.sampleRate * 0.01)), win = hop * 2;
+    if (n < win * 3) return [0, n];
+    const levels = [];
+    for (let s = 0; s + win <= n; s += hop) {
+      let sum = 0;
+      for (const ch of c.channels) for (let i = s; i < s + win; i++) sum += ch[i] * ch[i];
+      levels.push(Math.sqrt(sum / (win * c.channels.length)));
+    }
+    let top = 0;
+    for (const v of levels) if (v > top) top = v;
+    if (top < 1e-6) return [0, n];
+    const thr = Math.max(top * dbToGain(relDb), dbToGain(-60)), gapHops = Math.round(gapSec / 0.01), minHops = Math.round(minClusterSec / 0.01);
+    const clusters = [];                      // [firstWindow, lastWindow]
+    for (let k = 0; k < levels.length; k++) {
+      if (levels[k] < thr) continue;
+      const cur = clusters[clusters.length - 1];
+      if (cur && k - cur[1] <= gapHops) cur[1] = k; else clusters.push([k, k]);
+    }
+    if (!clusters.length) return [0, n];
+    while (clusters.length > 1 && clusters[0][1] - clusters[0][0] + 1 < minHops) clusters.shift();
+    while (clusters.length > 1 && clusters[clusters.length - 1][1] - clusters[clusters.length - 1][0] + 1 < minHops) clusters.pop();
+    return [clusters[0][0] * hop, Math.min(n, clusters[clusters.length - 1][1] * hop + win)];
+  };
+
+  /**
+   * The frame within +-radius of `frame` where the 5 ms RMS is lowest (nearest to `frame` among equals): a good place to
+   * cut speech, because the word boundaries from a recognizer are only good to ~50 ms.
+   */
+  AudioEdit.snapToValley = (c, frame, radius) => {
+    const n = length(c), w = Math.max(2, Math.round(c.sampleRate * 0.005));
+    frame = clamp(Math.round(frame), 0, n);
+    const lo = Math.max(0, frame - radius), hi = Math.min(n, frame + radius);
+    let best = frame, bestCost = Infinity, bestRaw = Infinity, total = 0, count = 0;
+    for (let p = lo; p <= hi + 1; p += Math.max(1, w >> 1)) {
+      if (p > hi) p = hi;
+      const s = Math.max(0, p - (w >> 1)), e = Math.min(n, s + w);
+      let sum = 0;
+      for (const ch of c.channels) for (let i = s; i < e; i++) sum += ch[i] * ch[i];
+      total += sum; count++;
+      const cost = sum * (1 + 0.15 * Math.abs(p - frame) / Math.max(1, radius)) + 1e-9 * Math.abs(p - frame);   // prefer the nearest quiet spot
+      if (cost < bestCost) { bestCost = cost; best = p; bestRaw = sum; }
+    }
+    // only a real valley counts (at least 12 dB under the average of the neighbourhood); continuous speech keeps the cut where it was
+    return count && bestRaw < (total / count) * 0.063 ? best : frame;
+  };
+
+  /** Cuts a clip to its speech (see speechRange), keeping `padSec` on both sides. */
+  AudioEdit.trimToSpeech = (c, padSec = 0.03, relDb = -32) => {
+    const [a, b] = AudioEdit.speechRange(c, relDb);
+    const pad = Math.round(padSec * c.sampleRate);
+    return AudioEdit.slice(c, a - pad, b + pad);
+  };
+
+
   AudioEdit.trimSilence = (c, thresholdDb = -45, padSec = 0.01) => {
     let [a, b] = AudioEdit.activeRange(c, thresholdDb);
     if (b <= a) return c;
@@ -570,7 +632,7 @@
    * the pause that follows the removed words (at most `maxPauseFrames` of it), so no double pause is left behind; an
    * insertion goes into the middle of the pause between its neighbours.
    */
-  AudioEdit.planTextEdit = (words, ops, newWords, maxPauseFrames) => {
+  AudioEdit.planTextEdit = (words, ops, newWords, maxPauseFrames, snap = null) => {
     const out = [];
     for (const op of ops) {
       const text = newWords.slice(op.b0, op.b1).join(' ');
@@ -592,6 +654,13 @@
       }
     }
     out.sort((x, y) => x.cutA - y.cutA || x.cutB - y.cutB);
+    if (snap) {       // move the cut points into the nearest quiet spot, without crossing the previous region
+      let prev = 0;
+      for (const r of out) {
+        const a = Math.max(prev, snap(r.cutA)), b = r.cutB === r.cutA ? a : Math.max(a, snap(r.cutB));
+        r.cutA = a; r.cutB = b; prev = b;
+      }
+    }
     return out;
   };
 

@@ -100,7 +100,7 @@ const AudioEditor = (() => {
           <div class="hint">Hover a word to see its place in the waveform; Alt+click plays it. Punctuation and capital letters do not count as changes.</div>
           <div id="ed-et-changes" class="au-changes"></div>
           <div class="row"><label>Voice <select id="ed-et-voice"></select></label><label>Speed <input id="ed-et-speed" type="number" min="0.25" max="4" step="0.05" value="1" style="width:70px"></label>
-            <label class="check"><input type="checkbox" id="ed-et-fit"> match the length of replaced words</label>
+            <label class="check"><input type="checkbox" id="ed-et-fit" checked> match the length of replaced words</label>
             <button id="ed-et-prev" class="primary">Preview</button><span id="ed-et-pbusy" class="muted small"></span></div>
           <div id="ed-et-result" class="hidden"><div class="row"><button id="ed-et-play">▶ Play the edited part</button><button id="ed-et-stop">■</button>
             <button id="ed-et-apply" class="primary">Apply (one undo step)</button><button id="ed-et-discard" class="ghost">Discard</button></div></div>
@@ -736,12 +736,19 @@ const AudioEditor = (() => {
     busyText('ed-rep-busy', 'synthesizing…');
     try {
       const r = await AudioIO.speak({input: text, model: ttsModelId(), voice: voiceOf('ed-rep-voice'), speed: numVal('ed-rep-speed', 1), signal: rep.abort.signal});
-      let piece = E.trimSilence(E.conform(r.clip, S.clip), -45, 0.02);
+      let piece = E.trimToSpeech(E.conform(r.clip, S.clip), 0.02);
       const fitMode = el('ed-rep-fit').value;
       if (fitMode !== 'none' && hasSel()) {
-        const want = S.sel.b - S.sel.a, ratio = E.length(piece) / want;
+        // fit the speech to the spoken part of the selection and keep the selection's own lead-in and tail pauses,
+        // so the replaced part has exactly the length of the selection
+        const total = S.sel.b - S.sel.a;
+        let [sa, sb] = E.speechRange(E.slice(S.clip, S.sel.a, S.sel.b));
+        if (sb - sa < sr() * 0.1) { sa = 0; sb = total; }
+        const ratio = E.length(piece) / (sb - sa);
         const clamped = Math.min(2, Math.max(0.5, ratio));
         piece = fitMode === 'stretch' ? E.timeStretch(piece, 0, E.length(piece), clamped) : E.changeSpeed(piece, 0, E.length(piece), clamped);
+        const nch = S.clip.channels.length;
+        piece = E.concat([E.silent(sr(), nch, sa), piece, E.silent(sr(), nch, Math.max(0, total - sa - E.length(piece)))]);
         if (clamped !== ratio) toast('The speech is much longer/shorter than the selection; it was only fitted as far as sounds natural (0.5×–2×).', 'info', 6000);
       }
       rep.piece = piece;
@@ -835,7 +842,7 @@ const AudioEditor = (() => {
     edit.busy = true; el('ed-et-prev').disabled = true;
     const ed = edit;
     const maxPause = Math.round(0.25 * sr());
-    const plan = E.planTextEdit(edit.words, ops, nw, maxPause);
+    const plan = E.planTextEdit(edit.words, ops, nw, maxPause, f => E.snapToValley(S.clip, f, Math.round(0.15 * sr())));
     const model = ttsModelId(), voice = voiceOf('ed-et-voice'), speed = numVal('ed-et-speed', 1);
     const abort = aiAbort = new AbortController();
     el('ed-et-cancel').classList.remove('hidden');
@@ -849,10 +856,10 @@ const AudioEditor = (() => {
         const key = [model, voice, speed, r.text].join('\u0001');
         let clip = synthCache.get(key);
         if (!clip) { clip = (await AudioIO.speak({input: r.text, model, voice, speed, signal: abort.signal})).clip; synthCache.set(key, clip); }
-        let piece = E.trimSilence(E.conform(clip, S.clip), -45, 0.012);
+        let piece = E.trimToSpeech(E.conform(clip, S.clip), 0.012);
         if (r.type === 'replace' && el('ed-et-fit').checked) {
           const want = r.cutB - r.cutA, ratio = E.length(piece) / want;
-          piece = E.timeStretch(piece, 0, E.length(piece), Math.min(1.5, Math.max(0.67, ratio)));
+          piece = E.timeStretch(piece, 0, E.length(piece), Math.min(1.6, Math.max(0.6, ratio)));
         }
         if (r.type === 'insert') piece = E.concat([piece, E.silent(sr(), S.clip.channels.length, Math.round(0.05 * sr()))]);
         pieces.push(piece);
