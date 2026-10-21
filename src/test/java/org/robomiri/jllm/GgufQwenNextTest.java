@@ -397,6 +397,8 @@ public final class GgufQwenNextTest {
      */
     /** Adds a vocabulary (byte-level BPE, no merges) so that llama.cpp can load the tiny file too: ids are fed directly. */
     static boolean withVocab;
+    /** Scale the output rows of four tokens up (a file for comparing the multi-token-prediction head with llama.cpp). */
+    static boolean focus;
     /** Experts in every layer of the Qwen3-Next model (llama.cpp's loader wants that); default: layer 0 is dense. */
     static boolean allMoe;
     /** Name fragment of the tensors written as zeros (for bisecting against llama.cpp), or null. */
@@ -444,6 +446,14 @@ public final class GgufQwenNextTest {
             String name = e.getKey();
             long[] shape = (long[]) e.getValue()[0];
             float[] data = useEffective ? effective.get(name) : (float[]) e.getValue()[1];
+            if (focus && name.equals("output.weight")) { // four tokens dominate every distribution: drafts are often right
+                data = data.clone();
+                for (int tkn : new int[]{10, 20, 30, 40}) {
+                    for (int j = 0; j < DIM; j++) {
+                        data[tkn * DIM + j] *= 6f;
+                    }
+                }
+            }
             if (zero != null && java.util.Arrays.stream(zero.split(",")).anyMatch(name::contains)) { // bisecting against llama.cpp: this tensor contributes nothing
                 data = new float[data.length];
             }

@@ -37,6 +37,7 @@ public final class GgufGreedy {
         int batch = 512;
         KvDtype kvd = KvDtype.F16;
         boolean int8 = false;
+        boolean mtp = false;
         List<String> prompts = new ArrayList<>();
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -44,6 +45,7 @@ public final class GgufGreedy {
                 case "--ctx" -> ctx = Integer.parseInt(args[++i]);
                 case "--batch" -> batch = Integer.parseInt(args[++i]);
                 case "--kv" -> kvd = KvDtype.parse(args[++i]);
+                case "--mtp" -> mtp = true; // feed the multi-token-prediction head and count how often its guess is the next token
                 case "--int8" -> int8 = true; // CPU: int8 activations (Q8_0 x Q8_0 dot products, as ggml does)
                 default -> prompts.add(args[i]);
             }
@@ -65,15 +67,19 @@ public final class GgufGreedy {
                         ? new Qwen3NextMetalBackend(w, ctx, batch, System.getProperty("jllm.metal.lib"), kvd)
                         : new Qwen3NextCpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), kvd, int8)) {
                     System.out.println("backend: " + b.name());
+                    if (mtp) {
+                        b.enableMtp(true);
+                    }
                     for (String spec : prompts) {
-                        run(b, tok, arch, spec, n, batch);
+                        run(b, tok, arch, spec, n, batch, mtp);
                     }
                 }
             }
         }
     }
 
-    private static void run(Backend b, Tokenizer tok, Qwen3NextArch arch, String spec, int n, int batch) throws Exception {
+    private static void run(Backend b, Tokenizer tok, Qwen3NextArch arch, String spec, int n, int batch, boolean mtp)
+            throws Exception {
         int colon = spec.indexOf(':');
         String mode = spec.substring(0, colon);
         int[] ids;
@@ -103,12 +109,29 @@ public final class GgufGreedy {
         List<Integer> out = new ArrayList<>();
         int pos = ids.length;
         long d0 = System.nanoTime();
+        int drafted = 0;
+        int accepted = 0;
+        int guess = -1;
+        StringBuilder bits = new StringBuilder();
+        float[] head = mtp ? new float[vocab] : null;
         for (int i = 0; i < n; i++) {
             int next = argmax(logits);
+            if (guess >= 0) {
+                drafted++;
+                accepted += guess == next ? 1 : 0;
+                bits.append(guess == next ? '1' : '0');
+            }
             out.add(next);
             if (i + 1 < n) {
+                if (mtp) { // the head's guess for the token after next
+                    b.mtpDraft(next, head);
+                    guess = argmax(head);
+                }
                 b.forward(new int[]{next}, 0, 1, pos++, logits);
             }
+        }
+        if (mtp) {
+            System.out.println("mtp: " + accepted + " of " + drafted + " guesses were the next token: " + bits);
         }
         double decode = (System.nanoTime() - d0) / 1e9;
         System.out.printf("decode %d tokens in %.2fs = %.2f tok/s%n", n - 1, decode, (n - 1) / decode);
