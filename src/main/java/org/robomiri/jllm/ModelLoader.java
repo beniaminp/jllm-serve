@@ -190,20 +190,43 @@ public final class ModelLoader {
         }
     }
 
-    /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
+    /** Prefill chunk of {@code backend.batch=auto} for mixture-of-experts models. */
     static final int MOE_BATCH = 256;
+    /** Prefill chunk of {@code backend.batch=auto} for dense decoders on Metal (measured, docs/11 §11.1). */
+    static final int METAL_DENSE_BATCH = Integer.getInteger("jllm.metal.autoBatch", 256);
+    /** Prefill chunk of {@code backend.batch=auto} everywhere else (the CPU backends, Mamba, dense Qwen3-Next). */
+    static final int DEFAULT_BATCH = 64;
+
+    /** True if {@code backend.batch} holds a number (not {@code auto}). */
+    public static boolean explicitBatch(Settings s) {
+        return !"auto".equalsIgnoreCase(s.get("backend.batch").trim());
+    }
 
     /**
-     * Tokens per prefill chunk: {@code backend.batch}, except that a mixture-of-experts model takes {@link #MOE_BATCH}
-     * unless the setting was given. A chunk reads each chosen expert's weights once for all its tokens (the grouped
-     * kernels on Metal, the dequantized row groups on the CPU), and with 128 experts and top-8 a 64-token chunk gives
-     * an expert only ~4 tokens: 256 tokens measured 1.6x faster per token for the CPU experts (docs/11).
+     * Tokens per prefill chunk: {@code backend.batch} when it is a number; with {@code auto} (the default) a
+     * mixture-of-experts model takes {@link #MOE_BATCH}, a dense decoder on Metal {@link #METAL_DENSE_BATCH}, anything
+     * else {@link #DEFAULT_BATCH}. A MoE chunk reads each chosen expert's weights once for all its tokens (the
+     * grouped kernels on Metal, the dequantized row groups on the CPU), and with 128 experts and top-8 a 64-token
+     * chunk gives an expert only ~4 tokens: 256 tokens measured 1.6x faster per token for the CPU experts (docs/11).
+     * A dense chunk of 64 tokens leaves the GPU under-filled (a 1024-row projection is 16 x 2 MMA threadgroups).
      */
     static int batch(Settings s, Architecture arch) {
-        int batch = s.getInt("backend.batch");
+        if (explicitBatch(s)) {
+            return s.getInt("backend.batch");
+        }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe();
-        return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
+        if (moe) {
+            return MOE_BATCH;
+        }
+        return arch instanceof org.robomiri.jllm.model.Decoder && resolveBackend(s).equals("metal")
+                ? METAL_DENSE_BATCH : DEFAULT_BATCH;
+    }
+
+    /** {@code backend}: cpu or metal, where auto means metal when the Metal library is available. */
+    static String resolveBackend(Settings s) {
+        String name = s.get("backend");
+        return name.equals("auto") ? (Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu") : name;
     }
 
     /**
@@ -390,10 +413,7 @@ public final class ModelLoader {
             throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
-        String backendName = s.get("backend");
-        if (backendName.equals("auto")) {
-            backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
-        }
+        String backendName = resolveBackend(s);
         int threads = s.getInt("backend.threads");
         // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)
         // (-Djllm.cpu.native, as the Docker image's JLLM_CPU_NATIVE sets it, stands in for an unset backend.cpu.native)
