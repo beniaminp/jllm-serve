@@ -146,26 +146,36 @@ public final class ModelLoader {
         ModelWeights weights = p.weights();
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
+        Speculator.Config spec = speculation(s, arch);
+        // the draft model first, on the same device: it joins DeviceLedger before the target's backend plans its GPU
+        // memory (backend.metal.cpu-moe), so the target's budget leaves room for the draft's weights and caches
+        DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch, weights) : null;
         Backend backend;
         try {
             backend = batched(s, weights, newBackend(s, arch, weights, slots, true));
         } catch (Exception e) {
+            if (draft != null) {
+                draft.close();
+            }
             weights.close();
             throw e;
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
-            Speculator.Config spec = speculation(s, arch);
             if (spec.mode() != Speculator.Mode.OFF) {
-                DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch) : null;
-                if (engine.enableSpeculation(spec, draft)) {
+                DraftModel d = draft;
+                draft = null; // the engine owns (and closes) it from here on
+                if (engine.enableSpeculation(spec, d)) {
                     System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase() + ", up to " + spec.k()
-                            + " tokens per pass" + (draft != null ? ", draft " + s.get("engine.draft-model") : ""));
+                            + " tokens per pass" + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
                 }
             }
             return new Loaded(weights, engine);
         } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
+            if (draft != null) {
+                draft.close();
+            }
             backend.close();
             weights.close();
             throw e;
@@ -397,9 +407,16 @@ public final class ModelLoader {
      * Loads the draft model of {@code engine.draft-model} (a safetensors repository, a GGUF repository with a single
      * file, or a local {@code .gguf}) on the same backend type; it must share the target's tokenizer.
      */
-    private static DraftModel loadDraft(Settings s, HuggingFaceHub hub, Tokenizer targetTok, Architecture targetArch) throws Exception {
+    private static DraftModel loadDraft(Settings s, HuggingFaceHub hub, Tokenizer targetTok, Architecture targetArch,
+                                        ModelWeights targetWeights) throws Exception {
         String repo = s.get("engine.draft-model");
-        Prepared p = prepare(s, hub, repo, null, null);
+        Prepared p;
+        try {
+            p = prepare(s, hub, repo, null, null);
+        } catch (Exception e) {
+            targetWeights.close();
+            throw e;
+        }
         Architecture arch = p.arch();
         ModelWeights weights = p.weights();
         try {
@@ -414,9 +431,16 @@ public final class ModelLoader {
             }
         } catch (RuntimeException e) {
             weights.close();
+            targetWeights.close();
             throw e;
         }
-        Backend backend = createBackend(s, arch, weights); // closes the weights if it fails
+        Backend backend;
+        try {
+            backend = createBackend(s, arch, weights); // closes the draft's weights if it fails
+        } catch (Exception e) {
+            targetWeights.close();
+            throw e;
+        }
         System.err.println("Draft backend: " + backend.name());
         return new DraftModel(backend, arch.core().vocabSize(), weights::close);
     }
