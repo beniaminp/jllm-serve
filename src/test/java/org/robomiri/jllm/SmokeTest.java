@@ -222,7 +222,8 @@ public final class SmokeTest {
     static void tokenizerErrors() {
         expectIae(() -> Tokenizer.fromJson("[]"), "expected a JSON object", "non-object tokenizer.json");
         expectIae(() -> Tokenizer.fromJson("{}"), "no \"model\"", "missing model");
-        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"WordPiece\"}}"), "only BPE", "non-BPE model");
+        expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"WordLevel\",\"vocab\":{}}}"), "unsupported model.type",
+                "WordLevel model");
         expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\"}}"), "no \"vocab\"", "missing vocab");
         expectIae(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":[]}}"), "no \"vocab\"",
                 "vocab not an object");

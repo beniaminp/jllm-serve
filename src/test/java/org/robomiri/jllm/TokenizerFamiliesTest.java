@@ -33,7 +33,14 @@ public final class TokenizerFamiliesTest {
             {"glmedge", "glm"}, {"glm4", "glm4"}, {"dsr1", "qwen2"}, {"mamba", "mamba"}, {"dsv2", "deepseek_v2"},
             {"phi4_14b", "phi3"}};
 
+    /**
+     * Tokenizers of other model types that no supported family uses (Unigram: t5, albert, xlmr; WordPiece: bert,
+     * mbert): encode / decode only, no chat template.
+     */
+    private static final String[] OTHER = {"t5", "albert", "xlmr", "bert", "mbert"};
+
     private static final Map<String, Tokenizer> LOADED = new java.util.HashMap<>();
+    private static final Map<String, Tokenizer> OTHER_LOADED = new java.util.HashMap<>();
     private static final Map<String, String> MODEL_TYPE = new java.util.HashMap<>();
     private static Path ROOT;
     /** The Llama 3.x template's fallback date (what jinja2 renders without {@code strftime_now}). */
@@ -60,7 +67,17 @@ public final class TokenizerFamiliesTest {
             }
             runFamily(f[0], f[1], dir);
         }
+        for (String name : OTHER) {
+            Path dir = ROOT.resolve(name);
+            if (!Files.isRegularFile(dir.resolve("tokenizer.json"))) {
+                System.out.println("SKIP " + name + " (no tokenizer.json in " + dir + ")");
+                skipped++;
+                continue;
+            }
+            runFamily(name, null, dir);
+        }
         misc();
+        otherModels();
         System.out.println();
         System.out.println("tokenizer families: " + passed + " checks passed, " + failed + " failed, " + skipped
                 + " families skipped; " + encodeCases + " encode+decode cases (" + roundTripExact
@@ -73,7 +90,7 @@ public final class TokenizerFamiliesTest {
     private static void runFamily(String name, String modelType, Path dir) throws Exception {
         long t0 = System.nanoTime();
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
-        LOADED.put(name, tok);
+        (modelType == null ? OTHER_LOADED : LOADED).put(name, tok);
         long loadMs = (System.nanoTime() - t0) / 1_000_000;
         Map<String, Object> fx = fixture(name);
         System.out.printf("== %s (model_type %s): load %d ms, vocab %d, byteLevel=%b, bos=%d addBos=%b%n", name,
@@ -152,7 +169,7 @@ public final class TokenizerFamiliesTest {
 
         // ---- chat templates against the Jinja renders
         List<Object> chats = Json.list(fx, "chat");
-        if (chats.isEmpty()) {
+        if (chats.isEmpty() || modelType == null) {
             return;
         }
         // forModelType("llama") prints the date of the render; the fixtures were rendered by jinja2 without
@@ -376,23 +393,32 @@ public final class TokenizerFamiliesTest {
 
         // unsupported constructs fail loudly
         String base = "\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}";
-        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"normalizer\":{\"type\":\"BertNormalizer\"}}"),
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"normalizer\":{\"type\":\"ByteLevel\"}}"),
                 "unsupported normalizer", "unknown normalizer");
-        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"}}"),
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"pre_tokenizer\":{\"type\":\"UnicodeScripts\"}}"),
                 "unsupported pre_tokenizer", "unknown pre-tokenizer");
-        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"Unigram\",\"vocab\":[]}}"),
-                "only BPE", "Unigram model");
+        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"WordLevel\",\"vocab\":{}}}"),
+                "unsupported model.type", "WordLevel model");
         expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
                 + "\"continuing_subword_prefix\":\"##\"}}"), "continuing_subword_prefix", "WordPiece-style prefix");
         expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
                 + "\"end_of_word_suffix\":\"</w>\"}}"), "end_of_word_suffix", "end-of-word suffix");
-        expectThrows(() -> Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],"
-                + "\"dropout\":0.1}}"), "dropout", "BPE dropout");
+        // BPE dropout is a training-time regularization: loaded, ignored, encoding stays deterministic
+        Tokenizer dropout = Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"dropout\":0.5,\"byte_fallback\":true,\"vocab\":{\"a\":0,\"b\":1,"
+                + "\"ab\":2,\"abab\":3},\"merges\":[[\"a\",\"b\"],[\"ab\",\"ab\"]]},\"pre_tokenizer\":{\"type\":"
+                + "\"WhitespaceSplit\"},\"decoder\":{\"type\":\"Fuse\"}}");
+        boolean same = true;
+        for (int i = 0; i < 50; i++) {
+            same &= Arrays.equals(dropout.encode("abab ab"), new int[]{3, 2});
+        }
+        check(same, "BPE dropout is ignored: every encode applies all merges");
         check(Tokenizer.fromJson("{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[],\"dropout\":null,"
                 + "\"byte_fallback\":true,\"continuing_subword_prefix\":\"\",\"end_of_word_suffix\":null}}") != null,
                 "empty / null model options are accepted");
-        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"WordPiece\"}}"),
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"CTC\"}}"),
                 "unsupported decoder", "unknown decoder");
+        expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"Sequence\",\"decoders\":["
+                + "{\"type\":\"WordPiece\"},{\"type\":\"Fuse\"}]}}"), "unsupported decoder", "WordPiece decoder in a chain");
         expectThrows(() -> Tokenizer.fromJson("{" + base + ",\"decoder\":{\"type\":\"Sequence\",\"decoders\":["
                 + "{\"type\":\"Replace\",\"pattern\":{\"String\":\"_\"},\"content\":\" \"}]}}"),
                 "unsupported Replace decoder", "Replace decoder of another character");
@@ -467,6 +493,97 @@ public final class TokenizerFamiliesTest {
         Tokenizer msNever = Tokenizer.fromJson(msVocab + "\"decoder\":{\"type\":\"Metaspace\",\"replacement\":\"▁\","
                 + "\"prepend_scheme\":\"never\",\"split\":false}}");
         check(msNever.decode(new int[]{2, 3}).equals("  a b"), "metaspace decoder without prefix keeps all spaces");
+    }
+
+    /**
+     * Unigram and WordPiece: tiny tokenizers with ids checked against the Python {@code tokenizers} package, BOS
+     * of the real files, and the GGUF {@code t5} path rebuilt from the T5 tokenizer.json.
+     */
+    private static void otherModels() throws Exception {
+        // Viterbi ties go to the path found first ("ab" beats "a"+"b" at equal score), unknown runs are fused,
+        // a fused run is spelled in byte tokens when they all exist, else it is <unk>; no decoder joins with spaces
+        Tokenizer uni = Tokenizer.fromJson("{\"model\":{\"type\":\"Unigram\",\"unk_id\":0,\"byte_fallback\":true,"
+                + "\"vocab\":[[\"<unk>\",0.0],[\"a\",-1.0],[\"b\",-1.0],[\"ab\",-2.0],[\"<0x63>\",-5.0],[\"<0x64>\",-5.0]]}}");
+        checkEq(uni.encode("ab"), new int[]{3}, "unigram tie: the longer piece found first wins");
+        checkEq(uni.encode("abcd"), new int[]{3, 4, 5}, "unigram fused unknown run in byte tokens");
+        checkEq(uni.encode("acda"), new int[]{1, 4, 5, 1}, "unigram unknown run between pieces");
+        checkEq(uni.encode("aéb"), new int[]{1, 0, 2}, "unigram unknown without byte tokens is <unk>");
+        checkEq(uni.encode("cé"), new int[]{0}, "unigram fused run with a missing byte token is one <unk>");
+        check(uni.decode(new int[]{1, 2, 3}).equals("a b ab"), "no decoder: tokens joined with spaces ("
+                + Json.write(uni.decode(new int[]{1, 2, 3})) + ")");
+        // the same tokenizer, scored so that the split wins
+        Tokenizer uni2 = Tokenizer.fromJson("{\"model\":{\"type\":\"Unigram\",\"unk_id\":0,"
+                + "\"vocab\":[[\"<unk>\",0.0],[\"a\",-1.0],[\"b\",-1.0],[\"ab\",-2.5]]}}");
+        checkEq(uni2.encode("abab"), new int[]{1, 2, 1, 2}, "unigram picks the highest total log-probability");
+        // untagged model objects (older files) are recognised by their fields
+        check(Tokenizer.fromJson("{\"model\":{\"unk_id\":0,\"vocab\":[[\"<unk>\",0.0],[\"a\",-1.0]]}}").encode("a")[0] == 1,
+                "untagged model with a vocab list is Unigram");
+
+        String wp = "{\"model\":{\"unk_token\":\"[UNK]\",\"continuing_subword_prefix\":\"##\",\"max_input_chars_per_word\":5,"
+                + "\"vocab\":{\"[UNK]\":0,\"a\":1,\"##b\":2,\"ab\":3,\"##a\":4}},\"pre_tokenizer\":{\"type\":\"BertPreTokenizer\"}";
+        Tokenizer w = Tokenizer.fromJson(wp + "}");
+        checkEq(w.encode("ab aab abab"), new int[]{3, 1, 4, 2, 3, 4, 2}, "wordpiece greedy longest match first");
+        checkEq(w.encode("abaaaa"), new int[]{0}, "wordpiece word longer than max_input_chars_per_word is [UNK]");
+        checkEq(w.encode("ac"), new int[]{0}, "wordpiece word with an unmatched rest is one [UNK]");
+        check(w.decode(new int[]{3, 1, 4, 2}).equals("ab a ##a ##b"), "wordpiece without decoder joins with spaces");
+        Tokenizer wd = Tokenizer.fromJson(wp + ",\"decoder\":{\"type\":\"WordPiece\",\"prefix\":\"##\",\"cleanup\":true}}");
+        check(wd.decode(new int[]{3, 1, 4, 2}).equals("ab aab"), "wordpiece decoder glues ## pieces");
+
+        expectBos2("bert", 101, true);
+        expectBos2("mbert", 101, true);
+        expectBos2("albert", 2, true);
+        expectBos2("xlmr", 0, true);
+        expectBos2("t5", -1, false);
+        if (OTHER_LOADED.containsKey("t5")) {
+            check(OTHER_LOADED.get("t5").unkId() == 2, "t5 unk_id");
+            ggufT5();
+        }
+    }
+
+    /** The GGUF t5 tokenizer, given the T5 tokenizer.json's pieces, scores and charsmap, matches the fixture. */
+    private static void ggufT5() throws Exception {
+        Map<String, Object> json = Json.parseObject(Files.readString(ROOT.resolve("t5").resolve("tokenizer.json")));
+        List<Object> vocab = Json.list(Json.map(json, "model"), "vocab");
+        String[] tokens = new String[vocab.size()];
+        double[] scores = new double[vocab.size()];
+        long[] types = new long[vocab.size()];
+        for (int i = 0; i < tokens.length; i++) {
+            List<?> p = (List<?>) vocab.get(i);
+            tokens[i] = (String) p.get(0);
+            scores[i] = ((Number) p.get(1)).doubleValue();
+            types[i] = org.robomiri.jllm.tokenizer.GgufTokenizer.NORMAL;
+        }
+        for (Object a : Json.list(json, "added_tokens")) {
+            int id = (int) Json.num(a, "id", -1);
+            types[id] = "<unk>".equals(Json.str(a, "content", "")) ? org.robomiri.jllm.tokenizer.GgufTokenizer.UNKNOWN
+                    : org.robomiri.jllm.tokenizer.GgufTokenizer.CONTROL;
+        }
+        byte[] charsmap = java.util.Base64.getDecoder().decode(
+                Json.str(Json.map(json, "normalizer"), "precompiled_charsmap", ""));
+        Tokenizer tok = org.robomiri.jllm.tokenizer.GgufTokenizer.build(new org.robomiri.jllm.tokenizer.GgufTokenizer.Spec(
+                "t5", null, tokens, types, scores, null, -1, 1, 2, false, true, charsmap, true));
+        int ok = 0;
+        List<Object> cases = Json.list(fixture("t5"), "cases");
+        for (Object c : cases) {
+            int[] expect = ints(Json.list(c, "ids"));
+            int[] got = tok.encode(Json.str(c, "text", ""), true);
+            if (Arrays.equals(got, expect) && tok.decode(got).equals(Json.str(c, "decoded", ""))) {
+                ok++;
+            } else {
+                fail("gguf t5 " + Json.write(Json.str(c, "text", "")) + ": got " + Arrays.toString(head(got))
+                        + " expected " + Arrays.toString(head(expect)));
+            }
+        }
+        check(ok == cases.size(), "gguf t5: " + ok + "/" + cases.size() + " cases match the reference");
+        System.out.println("   gguf t5 (unigram from tokenizer.ggml.*): " + ok + "/" + cases.size() + " match the reference");
+    }
+
+    private static void expectBos2(String name, int bos, boolean addByDefault) {
+        Tokenizer tok = OTHER_LOADED.get(name);
+        if (tok != null) {
+            check(tok.bosId() == bos && tok.addBosByDefault() == addByDefault, name + " bosId " + tok.bosId() + "/add="
+                    + tok.addBosByDefault() + " expected " + bos + "/" + addByDefault);
+        }
     }
 
     /** A properly alternating conversation (Mistral / Gemma insist) carrying {@code content} in the given role. */

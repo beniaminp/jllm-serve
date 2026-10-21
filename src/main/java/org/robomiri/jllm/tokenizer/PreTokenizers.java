@@ -12,7 +12,7 @@ import java.util.regex.Pattern;
  * The {@code pre_tokenizer} stage of a tokenizer.json: a chain of stages, each of which splits (and possibly
  * rewrites) the pieces produced by the previous one. Supported: Sequence, Split (all behaviors, regex or literal,
  * invert), ByteLevel (add_prefix_space, use_regex), Metaspace (prepend_scheme / add_prefix_space / split),
- * Digits, WhitespaceSplit and Whitespace.
+ * Digits, WhitespaceSplit, Whitespace, BertPreTokenizer and Punctuation.
  */
 final class PreTokenizers {
 
@@ -21,6 +21,13 @@ final class PreTokenizers {
             "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
     private static final int FLAGS = Pattern.UNICODE_CHARACTER_CLASS;
+
+    /**
+     * One punctuation character as BERT defines it: ASCII punctuation (which includes symbols such as {@code $},
+     * {@code +}, {@code <}, {@code |}) or Unicode General_Category P. Matching one character at a time is what
+     * makes {@code "?!"} two pieces under the Isolated behavior.
+     */
+    private static final String PUNCTUATION = "[!-/:-@\\[-`{-~]|\\p{P}";
 
     private PreTokenizers() {
     }
@@ -134,6 +141,17 @@ final class PreTokenizers {
             case "Whitespace" -> {
                 Pattern p = Pattern.compile("\\w+|[^\\w\\s]+", FLAGS);
                 chain.stages.add((pieces, first) -> splitAll(pieces, p, "Removed", true));
+            }
+            case "BertPreTokenizer" -> { // whitespace removed, then every punctuation character on its own
+                Pattern ws = Pattern.compile("\\s+", FLAGS);
+                Pattern punct = Pattern.compile(PUNCTUATION, FLAGS);
+                chain.stages.add((pieces, first) -> splitAll(splitAll(pieces, ws, "Removed", false), punct,
+                        "Isolated", false));
+            }
+            case "Punctuation" -> {
+                Pattern punct = Pattern.compile(PUNCTUATION, FLAGS);
+                String behavior = Json.str(node, "behavior", "Isolated");
+                chain.stages.add((pieces, first) -> splitAll(pieces, punct, behavior, false));
             }
             default -> throw new IllegalArgumentException("unsupported pre_tokenizer type: " + type);
         }

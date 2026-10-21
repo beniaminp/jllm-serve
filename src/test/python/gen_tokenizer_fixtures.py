@@ -5,6 +5,7 @@ Tokenizer / ChatTemplate support.
 
 Usage:  python3 -m venv /tmp/tokv && /tmp/tokv/bin/pip install tokenizers jinja2
         /tmp/tokv/bin/python3 gen_tokenizer_fixtures.py /tmp/jllm-tokenizers <out dir> [random string count]
+            [all | families | other]
 
 <tokenizer dir>/<name>/ holds tokenizer.json, tokenizer_config.json (downloaded from the Hugging Face repos
 listed in docs/04-tokenizer.md); no model weights are needed.
@@ -21,6 +22,9 @@ from tokenizers import Tokenizer
 
 NAMES = ["qwen3", "qwen2", "llama3", "mistral", "gemma3", "gemma2", "phi3", "phi4", "glmedge", "glm4", "dsr1", "mamba",
          "dsv2", "phi4_14b"]
+# tokenizers of other model types (Unigram, WordPiece) that no supported model family uses; no chat template.
+# They get the EXTRA strings too. Generate only these with: ... <out dir> 60 other
+OTHER_NAMES = ["t5", "albert", "xlmr", "bert", "mbert"]
 
 HAND = [
     "", " ", "  ", "   ", "\n", "\n\n", "\n\n\n", "\t", " \n ", "Hello world", "Hello, world!", " leading space",
@@ -46,6 +50,21 @@ HAND = [
     "<|end|> <|user|> <|assistant|>", "<｜User｜>hi<｜Assistant｜>", "<bos><eos><pad>", "</s><unk>",
     "<think>hi</think> <tool_call>x</tool_call>", "<unused0><mask>[multimodal]", "<|tool_call|>f()<|/tool_call|>",
     "class A:\n        def f(self):\n            return 1\n", "x = [\n    1,\n                2,\n]",
+]
+
+# normalizer-heavy strings for the Unigram / WordPiece tokenizers (accents, case, compatibility forms, controls,
+# CJK, punctuation runs, long words)
+EXTRA = [
+    "ÉCOLE Ærøskøbing Ångström Ça", "ΟΔΟΣ Σίσυφος", "İstanbul ǅemal", "Straße STRASSE ẞ", "ﾊﾝｶｸ ｶﾀｶﾅ ①②③ ㎏ ㍿",
+    "x­y​z⁠w﻿v", "áèö ñ", "ñ vs ñ", "क्षत्रिय हिन्दी", "ภาษาไทย",
+    "𠀀𠀁 㐀 鿿 豈 丽", "don't won't I'm you're we've she's", "(hello) [world] {foo} <bar>", "a.b,c;d:e!f?g",
+    "¿Qué? ¡Sí! «guillemets» „Anführung“", "$100 + 50% = €150 | ~5 ^ 2 `x`", "--- *** ### @@@", "…‥—–",
+    "supercalifragilisticexpialidocious antidisestablishmentarianism", "a" * 120, "word " * 30,
+    "UNAFFABLE unaffable Unaffable", "e-mail co-operate re-enter", "3.14 1e10 0x1F 1,234,567.89",
+    "　full　width　space", "tab\there\r\nnew line para\u0085nel", "\x00\x01\x1f\x7f\x80\x9f",
+    " private \U000f0000 use", "͸ unassigned", "🤗 Transformers 🤯 👩🏽‍💻", "keycap 1️⃣ #️⃣",
+    "ＡＢＣ　ａｂｃ　１２３", "Ⅻ ⅻ ﬃ ﬀ ŉ", "Ｈｅｌｌｏ，世界！", "▁ already ▁▁ metaspace", "##not a prefix",
+    "[CLS] [SEP] [MASK] [UNK] [PAD] <pad> </s> <unk> <mask> <extra_id_0>",
 ]
 
 POOL = list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") * 3 + list(" \n\t\r") * 4 + list(
@@ -162,16 +181,17 @@ def id_sequences(tk, n, seed):
     return out
 
 
-def main(src, dst, n_random=60):
+def main(src, dst, n_random=60, which="all"):
     os.makedirs(dst, exist_ok=True)
     env = make_env()
     rnd_strings = random_strings(n_random, 20240601)
-    for name in NAMES:
+    names = {"all": NAMES + OTHER_NAMES, "families": NAMES, "other": OTHER_NAMES}[which]
+    for name in names:
         d = os.path.join(src, name)
         tk = Tokenizer.from_file(os.path.join(d, "tokenizer.json"))
         cfg = json.load(open(os.path.join(d, "tokenizer_config.json")))
         fixture = {"name": name, "cases": [], "chat": []}
-        for text in HAND + rnd_strings:
+        for text in HAND + rnd_strings + (EXTRA if name in OTHER_NAMES else []):
             tk.encode_special_tokens = False
             ids = tk.encode(text, add_special_tokens=False).ids
             dec = tk.decode(ids, skip_special_tokens=False)
@@ -216,4 +236,5 @@ def main(src, dst, n_random=60):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 60)
+    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 60,
+         sys.argv[4] if len(sys.argv) > 4 else "all")

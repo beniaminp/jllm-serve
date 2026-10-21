@@ -24,6 +24,10 @@ import java.util.Map;
  *       vocabulary tokens becomes a merge, ranked by the score of the merged token (best first). Spaces become
  *       {@code U+2581}, a dummy prefix is added when {@code add_space_prefix} (the default) is set, unknown
  *       characters fall back to the {@code <0xXX>} byte tokens.</li>
+ *   <li>{@code tokenizer.ggml.model = t5}: SentencePiece unigram (T5-style encoders). Tokens and scores become the
+ *       Unigram vocabulary (Viterbi segmentation), {@code tokenizer.ggml.precompiled_charsmap} the
+ *       {@code Precompiled} normalizer, {@code remove_extra_whitespaces} a whitespace split and
+ *       {@code add_space_prefix} the Metaspace prefix, as in the Hugging Face conversion of such models.</li>
  * </ul>
  */
 public final class GgufTokenizer {
@@ -70,9 +74,19 @@ public final class GgufTokenizer {
      * @param unkId    {@code tokenizer.ggml.unknown_token_id}, -1 if absent
      * @param addBos   {@code tokenizer.ggml.add_bos_token}, null if absent (then: whether a BOS exists)
      * @param addSpacePrefix {@code tokenizer.ggml.add_space_prefix} (SentencePiece: the dummy prefix), default true
+     * @param precompiledCharsmap {@code tokenizer.ggml.precompiled_charsmap} (unigram: the SentencePiece
+     *                            normalization table), null if absent
+     * @param removeExtraWhitespaces {@code tokenizer.ggml.remove_extra_whitespaces} (unigram), default false
      */
     public record Spec(String model, String pre, String[] tokens, long[] types, double[] scores, String[] merges,
-                       int bosId, int eosId, int unkId, Boolean addBos, boolean addSpacePrefix) {
+                       int bosId, int eosId, int unkId, Boolean addBos, boolean addSpacePrefix,
+                       byte[] precompiledCharsmap, boolean removeExtraWhitespaces) {
+
+        /** A spec without the unigram-only keys. */
+        public Spec(String model, String pre, String[] tokens, long[] types, double[] scores, String[] merges,
+                    int bosId, int eosId, int unkId, Boolean addBos, boolean addSpacePrefix) {
+            this(model, pre, tokens, types, scores, merges, bosId, eosId, unkId, addBos, addSpacePrefix, null, false);
+        }
     }
 
     private GgufTokenizer() {
@@ -85,8 +99,9 @@ public final class GgufTokenizer {
         return switch (s.model() == null ? "" : s.model()) {
             case "gpt2" -> byteLevel(s);
             case "llama" -> sentencePiece(s);
+            case "t5" -> unigram(s);
             default -> throw new IllegalArgumentException("unsupported tokenizer.ggml.model '" + s.model()
-                    + "' (supported: gpt2, llama)");
+                    + "' (supported: gpt2, llama, t5)");
         };
     }
 
@@ -147,6 +162,53 @@ public final class GgufTokenizer {
                 "decoder", Json.obj("type", "ByteLevel", "add_prefix_space", false, "trim_offsets", false, "use_regex", false));
         if ("qwen2".equals(s.pre())) {
             json.put("normalizer", Json.obj("type", "NFC")); // Qwen's tokenizer.json normalizes to NFC, the GGUF does not say so
+        }
+        return Tokenizer.fromMaps(json, config(s));
+    }
+
+    // ------------------------------------------------------------------ unigram (t5)
+
+    private static Tokenizer unigram(Spec s) {
+        if (s.scores() == null || s.scores().length < s.tokens().length) {
+            throw new IllegalArgumentException("the GGUF file has no tokenizer.ggml.scores for its unigram tokenizer");
+        }
+        int n = s.tokens().length;
+        List<Object> vocab = new ArrayList<>(n);
+        List<Object> added = new ArrayList<>();
+        int unk = s.unkId();
+        boolean bytes = false;
+        for (int id = 0; id < n; id++) {
+            String t = s.tokens()[id];
+            vocab.add(List.of(t, s.scores()[id]));
+            switch (type(s, id)) {
+                case UNKNOWN -> {
+                    added.add(addedToken(id, t, true));
+                    if (unk < 0) {
+                        unk = id;
+                    }
+                }
+                case CONTROL -> added.add(addedToken(id, t, true));
+                case USER_DEFINED -> added.add(addedToken(id, t, false));
+                case BYTE -> bytes = true;
+                default -> {
+                }
+            }
+        }
+        Map<String, Object> model = Json.obj("type", "Unigram", "unk_id", unk < 0 ? null : (long) unk,
+                "byte_fallback", bytes, "vocab", vocab);
+        // what the Hugging Face conversion of a T5-style SentencePiece model writes: the charsmap as a Precompiled
+        // normalizer; extra whitespace removed by splitting on it; Metaspace with the dummy prefix
+        String scheme = s.addSpacePrefix() ? "always" : "never";
+        Map<String, Object> metaspace = Json.obj("type", "Metaspace", "replacement", "▁", "prepend_scheme", scheme,
+                "split", true);
+        Map<String, Object> json = Json.obj("model", model, "added_tokens", added,
+                "pre_tokenizer", s.removeExtraWhitespaces()
+                        ? Json.obj("type", "Sequence", "pretokenizers", List.of(Json.obj("type", "WhitespaceSplit"), metaspace))
+                        : metaspace,
+                "decoder", Json.obj("type", "Metaspace", "replacement", "▁", "prepend_scheme", scheme, "split", true));
+        if (s.precompiledCharsmap() != null && s.precompiledCharsmap().length > 0) {
+            json.put("normalizer", Json.obj("type", "Precompiled", "precompiled_charsmap",
+                    java.util.Base64.getEncoder().encodeToString(s.precompiledCharsmap())));
         }
         return Tokenizer.fromMaps(json, config(s));
     }
