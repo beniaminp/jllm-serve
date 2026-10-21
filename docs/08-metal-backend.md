@@ -1444,6 +1444,18 @@ tokens each gives alone, no step in a shared pass), and a batch whose members di
 (`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false` turns batched
 passes off.
 
+**Together with replay and the rest.** `ArchSmoke` runs the combinations that are easy to break by one feature's change
+in another's state: decode replay x batched passes (three slots alternate recorded single steps and batched passes with
+a slot left out now and then, flash decoding forced on; versus three slots alone with replay off, within 10^-4 of the
+largest logit, the single steps counted as bit-identical), replay x saved caches (a slot with recordings gets another
+conversation's cache by `loadState` and by `copyStateFrom`: bit-identical to a replay-off slot, steps really replayed),
+replay x `rebalanceExperts` (the re-placement that moves the last experts onto the GPU makes the backend replayable;
+the steps after it are recorded, replayed and still the CPU backend's), and replay x draft pipelining (the draft's
+pipelined steps are replayed, and the output, with the draft or without it, is the same with replay on and off). The
+per-row flash attention of a batched pass takes the instance's thresholds (`flashMinLen`, `flashChunk`), as the
+single step does; with the static defaults only, a batched row and a single step chose other kernels once a test lowered
+them, which a q8 cache amplified to 10^-2 of the logits.
+
 ---
 
 ## 8.25 Draft-model speculation on the GPU

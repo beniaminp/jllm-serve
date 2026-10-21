@@ -877,7 +877,7 @@ public final class MetalBackend implements Backend {
                 } else {
                     k.kvPut(kvHalf, rowV, kvOff, vc, cacheOff, kvDim);
                 }
-                if (flashDecode && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
+                if (flashDecode && pos + 1 >= k.flashMinLen) { // the instance's thresholds, as the single step uses
                     k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                             hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
                 } else {
