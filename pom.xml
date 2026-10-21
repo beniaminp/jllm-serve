@@ -393,6 +393,29 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- ConstraintBench in its quick mode: the token masks of constrained sampling on the real Qwen3 vocabulary checked
+                         against a brute-force oracle (a few seconds); the timed run is by hand (see the class comment) -->
+                    <execution>
+                        <id>constraint-bench</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.ConstraintBench</argument>
+                                <argument>${jllm.test.model}</argument>
+                                <argument>--quick</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
             <plugin>
