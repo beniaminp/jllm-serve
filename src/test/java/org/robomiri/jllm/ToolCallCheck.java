@@ -75,9 +75,9 @@ public final class ToolCallCheck {
         }
         // (label, settings for the speculation mode)
         Map<String, List<String>> modes = new LinkedHashMap<>();
-        // a first pass that is not recorded: the CPU's float reductions of the interpreter and the first compiled
-        // code differ in the last bit from the optimized ones, which flips a near-tie at the first token of the
-        // very first generation of a JVM; the recorded runs all see steady-state code
+        // a first pass that is not recorded: the very first generation of a JVM once chose differently at a near-tie
+        // of its first token (cause not isolated; cold code rounding a float reduction differently fits); after a
+        // warm-up pass all recorded runs agree
         modes.put(WARM_UP, List.of("--engine.speculative", "off"));
         modes.put("off", List.of("--engine.speculative", "off"));
         modes.put("ngram", List.of("--engine.speculative", "ngram"));

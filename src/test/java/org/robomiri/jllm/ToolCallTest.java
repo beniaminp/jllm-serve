@@ -479,8 +479,8 @@ public final class ToolCallTest {
              Engine plain = new Engine(new CpuBackend(w, 1024, 32, THREADS, KvDtype.F32, true), tok, cfg, Set.of());
              Engine specE = new Engine(new CpuBackend(w, 1024, 32, THREADS, KvDtype.F32, true), tok, cfg, Set.of())) {
             check(specE.enableSpeculation(new Speculator.Config(Speculator.Mode.NGRAM, 8, 4, 2, 0), null), "speculation on");
-            // a throwaway first generation: the float reductions of the interpreter and of the first compiled code
-            // differ in the last bit from the optimized ones, which could flip a near-tie of the first run
+            // a throwaway first generation: the very first generation of a JVM once chose differently at a near-tie
+            // of its first token (docs/17 section 17.7); the recorded runs start after it
             plain.generate(plain.renderChat(List.of(new ChatTemplate.Message("system", system),
                     new ChatTemplate.Message("user", questions[0])), false), greedy(12), Engine.Decoding.NONE, 1, null,
                     () -> false);
