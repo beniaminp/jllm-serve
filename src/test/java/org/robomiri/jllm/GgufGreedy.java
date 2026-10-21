@@ -24,7 +24,7 @@ import java.util.List;
  * <pre>
  * GgufGreedy model.gguf cpu|metal [-n 32] [--ctx 512] [--batch 512] [--kv f16|f32] MODE:prompt.txt ...
  * </pre>
- * MODE {@code raw}: the file's text as it is; {@code chat}: one user message rendered with the model's chat template with
+ * MODE {@code ids}: the ids after the colon, comma separated; {@code raw}: the file's text as it is; {@code chat}: one user message rendered with the model's chat template with
  * thinking off; {@code think}: the same with thinking on. The model is loaded once; every prompt starts at position 0.
  */
 public final class GgufGreedy {
@@ -36,6 +36,7 @@ public final class GgufGreedy {
         int ctx = 512;
         int batch = 512;
         KvDtype kvd = KvDtype.F16;
+        boolean int8 = false;
         List<String> prompts = new ArrayList<>();
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -43,19 +44,26 @@ public final class GgufGreedy {
                 case "--ctx" -> ctx = Integer.parseInt(args[++i]);
                 case "--batch" -> batch = Integer.parseInt(args[++i]);
                 case "--kv" -> kvd = KvDtype.parse(args[++i]);
+                case "--int8" -> int8 = true; // CPU: int8 activations (Q8_0 x Q8_0 dot products, as ggml does)
                 default -> prompts.add(args[i]);
             }
         }
         long t0 = System.nanoTime();
         try (GgufModel g = GgufModel.open(file)) {
-            Tokenizer tok = GgufModel.tokenizer(g.file());
+            Tokenizer tok;
+            try {
+                tok = GgufModel.tokenizer(g.file());
+            } catch (java.io.IOException e) { // a tiny test file has a vocabulary that is no byte-level BPE: ids only
+                System.out.println("no tokenizer: " + e.getMessage());
+                tok = null;
+            }
             Qwen3NextArch arch = (Qwen3NextArch) g.architecture();
             System.out.println("arch: " + arch);
             try (ModelWeights w = g.weights()) {
                 System.out.printf("loaded in %.1fs%n", (System.nanoTime() - t0) / 1e9);
                 try (Backend b = backend.equals("metal")
                         ? new Qwen3NextMetalBackend(w, ctx, batch, System.getProperty("jllm.metal.lib"), kvd)
-                        : new Qwen3NextCpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), kvd)) {
+                        : new Qwen3NextCpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), kvd, int8)) {
                     System.out.println("backend: " + b.name());
                     for (String spec : prompts) {
                         run(b, tok, arch, spec, n, batch);
@@ -68,11 +76,13 @@ public final class GgufGreedy {
     private static void run(Backend b, Tokenizer tok, Qwen3NextArch arch, String spec, int n, int batch) throws Exception {
         int colon = spec.indexOf(':');
         String mode = spec.substring(0, colon);
-        String text = Files.readString(Path.of(spec.substring(colon + 1)));
         int[] ids;
-        if (mode.equals("raw")) {
-            ids = tok.encode(text);
+        if (mode.equals("ids")) { // the ids as they are: 1,5,17
+            ids = Arrays.stream(spec.substring(colon + 1).split(",")).mapToInt(Integer::parseInt).toArray();
+        } else if (mode.equals("raw")) {
+            ids = tok.encode(Files.readString(Path.of(spec.substring(colon + 1))));
         } else {
+            String text = Files.readString(Path.of(spec.substring(colon + 1)));
             ChatTemplate.Format f = ChatTemplate.forModelType(arch.core().modelType(), tok);
             List<ChatTemplate.Message> msgs = List.of(new ChatTemplate.Message("user", text));
             boolean think = mode.equals("think");
@@ -104,7 +114,7 @@ public final class GgufGreedy {
         System.out.printf("decode %d tokens in %.2fs = %.2f tok/s%n", n - 1, decode, (n - 1) / decode);
         int[] o = out.stream().mapToInt(Integer::intValue).toArray();
         System.out.println("greedy ids: " + Arrays.toString(o));
-        System.out.println("text: " + tok.decode(o).replace("\n", "\\n"));
+        System.out.println("text: " + (tok == null ? "-" : tok.decode(o).replace("\n", "\\n")));
     }
 
     private static int argmax(float[] a) {
@@ -135,8 +145,13 @@ public final class GgufGreedy {
         Arrays.sort(idx, (x, y) -> Float.compare(logits[y], logits[x]));
         StringBuilder sb = new StringBuilder("top-" + k + " (id logit logprob token):");
         for (int i = 0; i < k; i++) {
-            sb.append(String.format("%n  %d  %.4f  %.4f  %s", idx[i], logits[idx[i]], logits[idx[i]] - lse,
-                    tok.decode(new int[]{idx[i]}).replace("\n", "\\n")));
+            String piece;
+            try {
+                piece = tok.decode(new int[]{idx[i]}).replace("\n", "\\n");
+            } catch (RuntimeException e) {
+                piece = "?";
+            }
+            sb.append(String.format("%n  %d  %.4f  %.4f  %s", idx[i], logits[idx[i]], logits[idx[i]] - lse, piece));
         }
         System.out.println(sb);
     }

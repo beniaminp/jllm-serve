@@ -56,8 +56,10 @@ public final class GgufQwenNextTest {
         }
     }
 
-    static final int DIM = 128, HEADS = 4, KV = 2, HD = 64, LAYERS = 4, VOCAB = 96, FF = 192, NK = 2, NV = 4, DK = 32, DV = 32,
-            KC = 4, EXPERTS = 4, TOPK = 2, MOE_DIM = 32, SHARED = 64, ROT = 16, INTERVAL = 2;
+    static final int DIM = 128, HEADS = 4, KV = 2, HD = 64, VOCAB = 96, FF = 192, NK = 2, NV = 4, DK = 32, DV = 32,
+            KC = 4, EXPERTS = 4, TOPK = 2, MOE_DIM = 32, SHARED = 64, ROT = 16;
+    /** Layers and the full-attention interval: fixed for the test, settable by {@link GgufTinyWrite} to bisect against llama.cpp. */
+    static int LAYERS = 4, INTERVAL = 2;
     static final int CONV_DIM = 2 * NK * DK + NV * DV;
 
     /** A tiny Hugging Face Qwen3-Next checkpoint: grouped per-key-head in_proj_qkvz / in_proj_ba, q_proj = [query | gate] per head. */
@@ -93,7 +95,7 @@ public final class GgufQwenNextTest {
             c.put("shared_expert_intermediate_size", (long) SHARED);
             c.put("norm_topk_prob", true);
             c.put("decoder_sparse_step", 1L);
-            c.put("mlp_only_layers", List.of(0L));
+            c.put("mlp_only_layers", allMoe ? List.of() : List.of(0L));
         } else {
             c.put("num_experts", 0L);
         }
@@ -141,7 +143,7 @@ public final class GgufQwenNextTest {
                 vec.accept(a + "norm.weight", new long[]{DV});
                 mat.accept(a + "out_proj.weight", new long[]{DIM, NV * DV});
             }
-            if (moe && l != 0) {
+            if (moe && (allMoe || l != 0)) {
                 mat.accept(p + "mlp.gate.weight", new long[]{EXPERTS, DIM});
                 for (int e = 0; e < EXPERTS; e++) {
                     mlp(mat, p + "mlp.experts." + e + ".", MOE_DIM);
@@ -336,7 +338,7 @@ public final class GgufQwenNextTest {
             put(out, b + "ffn_down.weight", new long[]{DIM, FF}, rnd(mr, DIM * FF, 0.1, 0));
         }
         if (t.moe()) {
-            for (int l = 1; l < LAYERS; l++) {
+            for (int l = allMoe ? 0 : 1; l < LAYERS; l++) {
                 String p0 = "model.layers." + l + ".mlp.experts.";
                 for (String[] part : new String[][]{{"gate_proj", "ffn_gate_exps"}, {"up_proj", "ffn_up_exps"}, {"down_proj", "ffn_down_exps"}}) {
                     boolean down = part[0].equals("down_proj");
@@ -381,15 +383,25 @@ public final class GgufQwenNextTest {
     }
 
     /** Matrices that stay float in a real file: norms, vectors, the conv, the router and the small b / a / gate tensors. */
+    /** Also write beta / alpha as Q8_0 (a real file keeps them f32); for comparing with llama.cpp on equal weights. */
+    static boolean quantizeBa;
+
     static boolean quantizable(String name, long[] shape) {
-        return (shape.length == 2 || shape.length == 3) && !name.contains("ssm_conv1d") && !name.contains("ffn_gate_inp") && !name.contains("ssm_beta")
-                && !name.contains("ssm_alpha") && !name.contains("ssm_ba");
+        return (shape.length == 2 || shape.length == 3) && !name.contains("ssm_conv1d") && !name.contains("ffn_gate_inp")
+                && (quantizeBa || !name.contains("ssm_beta") && !name.contains("ssm_alpha") && !name.contains("ssm_ba"));
     }
 
     /**
      * Writes the GGUF file. {@code q8}: quantizable matrices as Q8_0 blocks, their dequantized values stored in
      * {@code effective} (so an F32 file of {@code effective} holds the same weights).
      */
+    /** Adds a vocabulary (byte-level BPE, no merges) so that llama.cpp can load the tiny file too: ids are fed directly. */
+    static boolean withVocab;
+    /** Experts in every layer of the Qwen3-Next model (llama.cpp's loader wants that); default: layer 0 is dense. */
+    static boolean allMoe;
+    /** Name fragment of the tensors written as zeros (for bisecting against llama.cpp), or null. */
+    static String zero;
+
     static GgufWriter meta(boolean qwen35) {
         String arch = qwen35 ? "qwen35" : "qwen3next";
         String a = arch + ".";
@@ -407,6 +419,16 @@ public final class GgufQwenNextTest {
             w.u32(a + "expert_count", EXPERTS).u32(a + "expert_used_count", TOPK).u32(a + "expert_feed_forward_length", MOE_DIM)
                     .u32(a + "expert_shared_feed_forward_length", SHARED);
         }
+        if (withVocab) {
+            String[] tokens = new String[VOCAB];
+            int[] types = new int[VOCAB];
+            for (int i = 0; i < VOCAB; i++) {
+                tokens[i] = "t" + i;
+                types[i] = 1;
+            }
+            w.str("tokenizer.ggml.model", "gpt2").str("tokenizer.ggml.pre", "qwen35").strings("tokenizer.ggml.tokens", tokens)
+                    .i32s("tokenizer.ggml.token_type", types).strings("tokenizer.ggml.merges");
+        }
         return w;
     }
 
@@ -422,6 +444,9 @@ public final class GgufQwenNextTest {
             String name = e.getKey();
             long[] shape = (long[]) e.getValue()[0];
             float[] data = useEffective ? effective.get(name) : (float[]) e.getValue()[1];
+            if (zero != null && java.util.Arrays.stream(zero.split(",")).anyMatch(name::contains)) { // bisecting against llama.cpp: this tensor contributes nothing
+                data = new float[data.length];
+            }
             long[] dims = new long[shape.length];
             for (int i = 0; i < shape.length; i++) {
                 dims[i] = shape[shape.length - 1 - i];
