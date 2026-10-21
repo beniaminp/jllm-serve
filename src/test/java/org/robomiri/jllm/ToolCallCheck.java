@@ -56,6 +56,8 @@ public final class ToolCallCheck {
                             + "{\"city\": \"Rome\", \"days\": 2, \"unit\": \"celsius\"}}\n</tool_call>",
                     "Show me lines 1 to 5 of src/main/java/Bar.java"));
 
+    static final String WARM_UP = "warm-up";
+
     public static void main(String[] args) throws Exception {
         List<String> rest = new ArrayList<>();
         List<String> drafts = new ArrayList<>();
@@ -73,6 +75,10 @@ public final class ToolCallCheck {
         }
         // (label, settings for the speculation mode)
         Map<String, List<String>> modes = new LinkedHashMap<>();
+        // a first pass that is not recorded: the CPU's float reductions of the interpreter and the first compiled
+        // code differ in the last bit from the optimized ones, which flips a near-tie at the first token of the
+        // very first generation of a JVM; the recorded runs all see steady-state code
+        modes.put(WARM_UP, List.of("--engine.speculative", "off"));
         modes.put("off", List.of("--engine.speculative", "off"));
         modes.put("ngram", List.of("--engine.speculative", "ngram"));
         for (String d : drafts) {
@@ -103,15 +109,20 @@ public final class ToolCallCheck {
                             engine.setJumpForward(jump);
                             Engine.Result r = null;
                             double[] ms = new double[rounds];
+                            if (rounds > 1) { // one more, not timed: the first run of a prompt has cold caches and code
+                                engine.generate(prompt, ToolCallTest.greedy(max), d, 1, null, () -> false);
+                            }
                             for (int k = 0; k < rounds; k++) {
-                                r = engine.generate(prompt, ToolCallTest.greedy(max), d, 1, null, () -> false).getFirst();
+                                r =engine.generate(prompt, ToolCallTest.greedy(max), d, 1, null, () -> false).getFirst();
                                 ms[k] = r.stats().decodeMs();
                             }
                             Arrays.sort(ms);
                             double median = ms[rounds / 2];
                             String key = sc.name() + "/required=" + required + "/jump=" + jump;
                             String verdict;
-                            if (mode.getKey().equals("off")) {
+                            if (mode.getKey().equals(WARM_UP)) {
+                                continue;
+                            } else if (mode.getKey().equals("off")) {
                                 reference.put(key, r.tokens());
                                 verdict = "reference";
                             } else if (Arrays.equals(reference.get(key), r.tokens())) {
