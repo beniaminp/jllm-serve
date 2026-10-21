@@ -537,7 +537,7 @@ public final class GgufQwenNextTest {
                 System.out.printf("%-9s Q8_0 gguf vs safetensors Q8_0: max logit diff %.2e (quantization noise)%n", label, vs);
             }
             if (qwen35) {
-                mtp(q8, prompt);
+                mtp(q8, prompt, metal ? gpu : null);
             }
             if (metal) {
                 try (GgufModel g = GgufModel.open(q8); ModelWeights w = g.weights()) {
@@ -695,7 +695,7 @@ public final class GgufQwenNextTest {
      * the history was fed (one pass, chunks, single tokens); (2) greedy decoding through the speculator equals plain
      * decoding, with an oracle head (accept and reject paths both taken) and with the real head.
      */
-    private static void mtp(Path file, int[] prompt) throws Exception {
+    private static void mtp(Path file, int[] prompt, Factory gpu) throws Exception {
         int n = 40;
         float[][] guess = new float[3][VOCAB];
         int[][] feeds = {{prompt.length}, {5, 4, 3}, {1}};
@@ -730,6 +730,26 @@ public final class GgufQwenNextTest {
         check(GgufModelTest.maxDiff(new float[][]{guess[0]}, new float[][]{other}) > 1e-3,
                 "qwen35: the head's guess depends on the token it is given");
 
+        if (gpu != null) { // the GPU head: the same guess as the CPU's, chunked or not
+            float[][] g2 = new float[2][VOCAB];
+            for (int mode = 0; mode < 2; mode++) {
+                try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights(); Backend b = gpu.open(w)) {
+                    b.enableMtp(true);
+                    int pos = 0;
+                    while (pos < prompt.length) {
+                        int step = Math.min(mode == 0 ? prompt.length : 4, prompt.length - pos);
+                        b.forward(prompt, pos, step, pos, new float[VOCAB]);
+                        pos += step;
+                    }
+                    check(b.mtpReady(), "qwen35 metal: the head follows the state after the prompt");
+                    b.mtpDraft(17, g2[mode]);
+                }
+            }
+            double dc = GgufModelTest.maxDiff(new float[][]{guess[0]}, new float[][]{g2[0]});
+            double dk = GgufModelTest.maxDiff(new float[][]{g2[0]}, new float[][]{g2[1]});
+            check(dc < 2e-3 && dk < 2e-3, "qwen35 metal: head logits vs cpu " + dc + ", chunked vs whole " + dk);
+            System.out.printf("qwen35    mtp head logits, metal vs cpu: %.2e, metal chunked vs whole: %.2e%n", dc, dk);
+        }
         int[] truth;
         try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
              Qwen3NextCpuBackend b = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
@@ -757,6 +777,31 @@ public final class GgufQwenNextTest {
                         + java.util.Arrays.toString(got) + " vs " + java.util.Arrays.toString(truth));
                 System.out.printf("qwen35    mtp speculation with the real head: %d of %d drafts accepted, output == plain%n",
                         sp.accepted(), sp.drafted());
+            }
+        }
+        if (gpu != null) {
+            try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights(); Backend b = gpu.open(w)) {
+                int[] gtruth = plain(b, prompt, n);
+                try (GgufModel g2 = GgufModel.open(file); ModelWeights w2 = g2.weights(); Backend inner = gpu.open(w2)) {
+                    Oracle o = new Oracle(inner, gtruth, prompt.length);
+                    try (Speculator sp = new Speculator(cfg, o, null, VOCAB, VOCAB, Set.of())) {
+                        int[] got = speculative(o, sp, prompt, n);
+                        check(java.util.Arrays.equals(got, gtruth), "qwen35 metal: speculative output with an oracle head equals plain output: "
+                                + java.util.Arrays.toString(got) + " vs " + java.util.Arrays.toString(gtruth));
+                        check(sp.accepted() > 0 && sp.accepted() < sp.drafted(), "qwen35 metal: accepted and rejected drafts: "
+                                + sp.accepted() + " / " + sp.drafted());
+                        System.out.printf("qwen35    metal mtp speculation with an oracle head: %d of %d drafts accepted, output == plain%n",
+                                sp.accepted(), sp.drafted());
+                    }
+                }
+                b.enableMtp(true);
+                try (GgufModel g3 = GgufModel.open(file); ModelWeights w3 = g3.weights(); Backend real = gpu.open(w3);
+                     Speculator sp = new Speculator(cfg, real, null, VOCAB, VOCAB, Set.of())) {
+                    int[] got = speculative(real, sp, prompt, n);
+                    check(java.util.Arrays.equals(got, gtruth), "qwen35 metal: speculative output with the real head equals plain output");
+                    System.out.printf("qwen35    metal mtp speculation with the real head: %d of %d drafts accepted, output == plain%n",
+                            sp.accepted(), sp.drafted());
+                }
             }
         }
     }
