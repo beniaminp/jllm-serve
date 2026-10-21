@@ -15,6 +15,9 @@ public record AudioSettings(String backend, String metalDecoder, int threads, lo
         String backend = s.get("audio.backend").trim().toLowerCase(java.util.Locale.ROOT);
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), s, "audio.backend",
                 "must be cpu, metal or auto");
+        if (backend.equals("auto") && s.get("backend").trim().equalsIgnoreCase("cpu")) {
+            backend = "cpu";          // a server started with --backend cpu keeps the audio models off the GPU too
+        }
         String metalDecoder = s.get("audio.metal.decoder").trim().toLowerCase(java.util.Locale.ROOT);
         require(metalDecoder.equals("auto") || metalDecoder.equals("on") || metalDecoder.equals("off"), s, "audio.metal.decoder",
                 "must be auto, on or off");
