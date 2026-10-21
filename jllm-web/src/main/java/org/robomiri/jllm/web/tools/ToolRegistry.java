@@ -31,10 +31,12 @@ public class ToolRegistry {
     private final List<Tool> builtins;
     private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
 
-    public ToolRegistry(ToolsConfig config, McpManager mcp) {
+    public ToolRegistry(ToolsConfig config, McpManager mcp, org.robomiri.jllm.web.images.ImageService images) {
         this.config = config;
         this.mcp = mcp;
-        this.builtins = BuiltinTools.all(config::general);
+        List<Tool> all = new ArrayList<>(BuiltinTools.all(config::general));
+        all.addAll(ImageToolSupport.all(images)); // generate_image, edit_image
+        this.builtins = all;
     }
 
     /** All tools, the switched-off built-ins included (marked). */

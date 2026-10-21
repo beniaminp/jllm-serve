@@ -6,7 +6,11 @@ import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.QuantFile;
+import org.robomiri.jllm.diffusion.DiffusersRepo;
+import org.robomiri.jllm.diffusion.ImageModels;
+import org.robomiri.jllm.diffusion.ImagePipeline;
 import org.robomiri.jllm.web.WebProperties;
+import org.robomiri.jllm.web.images.ImageService;
 import org.robomiri.jllm.web.settings.SettingsService;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -71,7 +75,8 @@ public class ModelManager implements DisposableBean {
 
     /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
     public record RepoInfo(String repo, String revision, String file, String quant, String defaultId, boolean gguf,
-                           List<HuggingFaceHub.RepoFile> files, List<HuggingFaceHub.RepoFile> ggufFiles) {
+                           List<HuggingFaceHub.RepoFile> files, List<HuggingFaceHub.RepoFile> ggufFiles,
+                           boolean diffusers, List<HuggingFaceHub.RepoFile> imageFiles) {
     }
 
     /** Where a request points, after the link and the explicit fields are combined. */
@@ -83,16 +88,18 @@ public class ModelManager implements DisposableBean {
     private final SettingsService settings;
     private final WebProperties props;
     private final KvStore kvStore;
+    private final ImageService images;
     private final Map<String, LoadedModel> loaded = new LinkedHashMap<>();
     private final Map<String, Job> jobs = new LinkedHashMap<>();
     private final ExecutorService downloads = Executors.newFixedThreadPool(2, Thread.ofPlatform().name("jllm-download-", 1).daemon().factory());
     private final ExecutorService loads = Executors.newSingleThreadExecutor(Thread.ofPlatform().name("jllm-load").daemon().factory());
     private final AtomicLong jobCounter = new AtomicLong();
 
-    public ModelManager(SettingsService settings, WebProperties props, KvStore kvStore) {
+    public ModelManager(SettingsService settings, WebProperties props, KvStore kvStore, ImageService images) {
         this.settings = settings;
         this.props = props;
         this.kvStore = kvStore;
+        this.images = images;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -144,6 +151,10 @@ public class ModelManager implements DisposableBean {
 
     /** Unloads a model: running requests on it are cancelled first. */
     public void unload(String id) throws InterruptedException {
+        if (images.has(id)) {
+            images.unload(id);
+            return;
+        }
         LoadedModel m;
         synchronized (this) {
             m = loaded.get(id);
@@ -198,6 +209,14 @@ public class ModelManager implements DisposableBean {
         Map<String, String> extra = settingsFor(t, r.settings());
         locate(t, extra);
         Settings s = settings.with(extra); // validates before the job is queued
+        if (isImageModel(t, s)) {
+            Job imageJob = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
+            submit(downloads, imageJob, () -> {
+                imageJob.phase = "downloading";
+                downloadImageModel(imageJob, s, t);
+            });
+            return imageJob.view();
+        }
         Job job = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
         submit(downloads, job, () -> {
             HuggingFaceHub hub = ModelLoader.hub(s);
@@ -215,12 +234,15 @@ public class ModelManager implements DisposableBean {
         Map<String, String> extra = settingsFor(t, r.settings());
         locate(t, extra);
         Settings s = settings.with(extra);
+        if (isImageModel(t, s)) {
+            return loadImageModel(t, s, extra);
+        }
         int slots = r.slots() == null ? 1 : r.slots();
         if (slots < 1 || slots > 8) {
             throw new IllegalArgumentException("slots must be 1 to 8");
         }
         synchronized (this) {
-            if (loaded.containsKey(t.id())) {
+            if (loaded.containsKey(t.id()) || images.has(t.id())) {
                 throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
             }
             for (Job j : jobs.values()) {
@@ -277,6 +299,81 @@ public class ModelManager implements DisposableBean {
             }
             System.err.println("Loaded " + t.id() + ": " + l.engine().backend().name() + ", ctx="
                     + l.engine().backend().contextLength() + (slots > 1 ? ", " + slots + " slots" : ""));
+        });
+        return job.view();
+    }
+
+    // ------------------------------------------------------------------ image models (Stable Diffusion family, diffusers layout)
+
+    /** A diffusers pipeline: a local folder with a model_index.json, or a Hub repository that has one. */
+    private boolean isImageModel(Target t, Settings s) {
+        if (t.local()) {
+            return false;
+        }
+        if (DiffusersRepo.isDiffusersDir(repoDir(s, t.model()))) {
+            return true;
+        }
+        if (Files.isDirectory(repoDir(s, t.model()))) {
+            return false; // a text model already on disk
+        }
+        try {
+            return DiffusersRepo.isDiffusers(ModelLoader.hub(s).listFiles(t.model(), s.get("model.revision")));
+        } catch (Exception e) {
+            return false; // the Hub is unreachable: the normal path reports it
+        }
+    }
+
+    private void downloadImageModel(Job job, Settings s, Target t) throws Exception {
+        HuggingFaceHub hub = ModelLoader.hub(s);
+        Path dir = repoDir(s, t.model());
+        if (DiffusersRepo.isDiffusersDir(dir) && DiffusersRepo.missingWeights(dir).isEmpty()) {
+            return;
+        }
+        List<HuggingFaceHub.RepoFile> listing = hub.listFiles(t.model(), s.get("model.revision"));
+        hub.ensure(t.model(), s.get("model.revision"), dir, "model_index.json");
+        Map<String, Object> index = Json.parseObject(Files.readString(dir.resolve("model_index.json")));
+        Map<String, Long> sizes = new LinkedHashMap<>();
+        DiffusersRepo.select(listing, index).forEach((n, f) -> sizes.put(n, f.size()));
+        job.expect(dir, sizes);
+        DiffusersRepo.download(hub, t.model(), s.get("model.revision"), dir);
+        writeMarker(s, t);
+    }
+
+    private Job.View loadImageModel(Target t, Settings s, Map<String, String> extra) {
+        synchronized (this) {
+            if (loaded.containsKey(t.id()) || images.has(t.id())) {
+                throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
+            }
+            for (Job j : jobs.values()) {
+                if (j.kind == Job.Kind.LOAD && !j.finished() && j.model.equals(t.id())) {
+                    throw new IllegalStateException("'" + t.id() + "' is already being loaded (job " + j.id + ")");
+                }
+            }
+        }
+        Job job = newJob(Job.Kind.LOAD, t.id(), t.model());
+        submit(loads, job, () -> {
+            long t0 = System.nanoTime();
+            Path dir = repoDir(s, t.model());
+            if (!DiffusersRepo.isDiffusersDir(dir) || !DiffusersRepo.missingWeights(dir).isEmpty()) {
+                job.phase = "downloading";
+                downloadImageModel(job, s, t);
+            }
+            checkInterrupted();
+            job.phase = "loading";
+            System.err.println("Loading image model " + t.id() + " (" + t.model() + ")");
+            ImagePipeline p = ImageModels.load(s, ModelLoader.hub(s), t.model());
+            if (Thread.currentThread().isInterrupted()) {
+                p.close();
+                throw new CancellationException();
+            }
+            Map<String, String> snapshot = new LinkedHashMap<>();
+            for (String k : s.keys()) {
+                if (k.startsWith("image.") && !s.get(k).isEmpty() && SettingsService.scope(k) == SettingsService.Scope.LOAD) {
+                    snapshot.put(k, s.get(k));
+                }
+            }
+            images.register(t.id(), t.model(), p, snapshot, (System.nanoTime() - t0) / 1e9);
+            System.err.println("Loaded image model " + t.id() + ": " + p.description());
         });
         return job.view();
     }
@@ -393,7 +490,8 @@ public class ModelManager implements DisposableBean {
         for (Path root : modelRoots()) {
             Path dir = root.resolve(name);
             try {
-                if (Files.isRegularFile(dir.resolve("config.json")) || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
+                if (Files.isRegularFile(dir.resolve("config.json")) || Files.isRegularFile(dir.resolve("model_index.json"))
+                        || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
                     extra.put("model.dir", root.toString());
                     return;
                 }
@@ -511,18 +609,41 @@ public class ModelManager implements DisposableBean {
         Settings s = settings.current();
         String rev = t.revision() == null ? "main" : t.revision();
         List<HuggingFaceHub.RepoFile> files = ModelLoader.hub(s).listFiles(t.model(), rev);
-        boolean gguf = link.file() != null || link.quant() != null || HuggingFaceHub.isGgufRepo(files);
+        boolean diffusers = DiffusersRepo.isDiffusers(files);
+        List<HuggingFaceHub.RepoFile> imageFiles = List.of();
+        if (diffusers) {
+            try {
+                Path tmp = Files.createTempDirectory("jllm-index");
+                try {
+                    ModelLoader.hub(s).ensure(t.model(), rev, tmp, "model_index.json");
+                    imageFiles = new ArrayList<>(DiffusersRepo.select(files,
+                            Json.parseObject(Files.readString(tmp.resolve("model_index.json")))).values());
+                } finally {
+                    try (Stream<Path> st = Files.walk(tmp)) {
+                        for (Path x : st.sorted(Comparator.reverseOrder()).toList()) {
+                            Files.deleteIfExists(x);
+                        }
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                imageFiles = List.of();
+            }
+        }
+        boolean gguf = !diffusers && (link.file() != null || link.quant() != null || HuggingFaceHub.isGgufRepo(files));
         List<HuggingFaceHub.RepoFile> ggufFiles = files.stream()
                 .filter(f -> HuggingFaceHub.isGgufModelFile(f.name()))
                 .filter(f -> !f.name().matches(".*-0000[2-9]-of-.*|.*-000[1-9][0-9]-of-.*")) // split parts after the first
                 .toList();
-        return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles);
+        return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles, diffusers, imageFiles);
     }
 
     /** The models in {@code model.dir} and {@code jllm.web.model-dirs}: safetensors checkpoints and GGUF files. */
     public List<LocalModel> localModels() throws IOException {
         Map<String, List<String>> users = new LinkedHashMap<>();
         for (LoadedModel m : loaded()) {
+            users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+        }
+        for (ImageService.Loaded m : images.loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
         }
         List<LocalModel> out = new ArrayList<>();
@@ -552,6 +673,10 @@ public class ModelManager implements DisposableBean {
             String[] repoRev = repoOf(p);
             String repo = repoRev[0];
             List<String> loadedAs = users.getOrDefault(repo, List.of());
+            if (DiffusersRepo.isDiffusersDir(p)) {
+                out.add(new LocalModel(repo, "diffusers", repo, repoRev[1], null, p.toString(), dirSize(p), List.of(), loadedAs, rootName));
+                continue;
+            }
             if (Files.isRegularFile(p.resolve("config.json"))) {
                 List<String> caches = new ArrayList<>();
                 try (Stream<Path> st = Files.list(p)) {
