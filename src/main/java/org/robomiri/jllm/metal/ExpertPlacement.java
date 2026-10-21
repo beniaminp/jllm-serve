@@ -29,7 +29,7 @@ import java.util.List;
  * skewed counts move the cold experts of a few layers. The two constants are estimates (Apple Silicon CPU bandwidth, a command-buffer round
  * trip), not measurements; only their ratio matters.
  *
- * <p>The counts come from the GPU ({@code moe_remap} adds up every layer's choices while experts are split) and are
+ * <p>The counts come from the GPU (the router kernels add up every layer's choices while experts are split) and are
  * kept in {@code ~/.cache/jllm/expert-usage/<model key>.txt}, one line per MoE layer, summed over runs (halved when a
  * layer passes {@link #MAX_COUNT} picks, so recent use weighs more).
  */
@@ -184,6 +184,26 @@ final class ExpertPlacement {
             }
         }
         return cold;
+    }
+
+    /** The planner's cost per token, in microseconds, of the placement {@code cold} under the usage {@code counts}. */
+    static double cost(boolean[][] cold, long[] expertBytes, int[] experts, int[] topK, long[][] counts) {
+        double us = 0;
+        for (int l = 0; l < cold.length; l++) {
+            if (cold[l] == null || expertBytes[l] <= 0) {
+                continue;
+            }
+            double[] p = shares(counts != null ? counts[l] : null, experts[l]);
+            boolean any = false;
+            for (int e = 0; e < experts[l]; e++) {
+                if (cold[l][e]) {
+                    any = true;
+                    us += p[e] * topK[l] * expertBytes[l] / CPU_BYTES_PER_US;
+                }
+            }
+            us += any ? SYNC_US : 0;
+        }
+        return us;
     }
 
     /** Every expert of the last {@code n} MoE layers on the CPU. */

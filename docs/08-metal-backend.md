@@ -635,7 +635,7 @@ reading the whole prefix) dominates instead.
 
 1. **Wider threadgroups / more rows per threadgroup for small matrices** so `Wo`-sized matmuls fill the GPU,
    and splitting the LM head over the token dimension in prefill.
-2. **Fusing `moe_remap` into the router kernels**, one dispatch fewer per split layer when experts run on the CPU
+2. *Done:* the remap and the usage counts of the experts on the CPU are part of the router kernels
    ([8.18](#818-experts-on-the-cpu-backendmetalcpu-moe)).
 
 ---
@@ -919,8 +919,7 @@ CPU reads them like any file data.
 **How much must move.** The working set is the device's, so the budget covers everything on it: with `W` this
 model's weights, `B` one backend's buffers (KV cache, activations), `s` the number of backends that will run on
 these weights (a server's slots: `jllm-web` passes it at load; the later slots reuse the first one's placement), `O`
-what the other open attention-model Metal backends hold (another model, a draft model; a loaded Mamba model is not
-counted), and `b_l` the bytes of one expert of layer `l`,
+what the other open Metal backends hold (another model, a draft model, a Mamba model: `DeviceLedger`), and `b_l` the bytes of one expert of layer `l`,
 leaving the set `C` of (layer, expert) pairs on the CPU keeps
 
 ```
@@ -959,11 +958,12 @@ Metal: 2.3 GB of experts run on the CPU (10 threads): 0 of 48 MoE layers entirel
 (placed by the usage of earlier runs); expected share of expert picks on the CPU 4 %; GPU share …
 ```
 
-**Where the usage comes from.** While any expert is on the CPU, every MoE layer's picks are counted. In a split
-layer, `moe_remap` (which runs after the router anyway) counts them, one thread per expert over the step's slots,
-so the counts are exact and need no atomics. A layer entirely on the CPU is counted by the CPU from the router's
-choices it reads anyway. A layer entirely on the GPU gets a `moe_remap` dispatch on one forward pass in 8
-(`-Djllm.metal.expertCountEvery`), because a dispatch per layer per token would cost more than it tells. A sample
+**Where the usage comes from.** While any expert is on the CPU, every MoE layer's picks are counted. The router
+kernel counts them itself (`remap_slot`): its thread 0, which picks each token's experts, adds one to `counts[e]`
+per pick with a relaxed atomic add, so there is no extra dispatch and the counts are exact. A layer entirely on
+the CPU is counted by the CPU from the router's choices it reads anyway. A layer entirely on the GPU is counted on
+one forward pass in 8 (`-Djllm.metal.expertCountEvery`), because atomics in every router on every token would cost
+more than they tell. A sample
 is enough because the planner turns each layer's counts into shares of that layer's picks (`p(l,e)` sums to `topK`
 in every layer), so how many passes a layer was counted on does not matter. The backend adds the counts to
 `~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, headed by the model's description, size and a
@@ -973,17 +973,24 @@ the same time; a damaged line loses only that layer's history. The first run of 
 moves whole layers; later runs place the experts from how you actually use it (code, chat, another language),
 improving as the counts grow. `-Djllm.metal.hotExperts=false` ignores the statistics.
 
+**Re-placement while running.** A server runs for days, and the usage it sees can change. Every 30 minutes of use
+(or when `MetalBackend.rebalanceExperts()` is called), the backend saves its counts and plans again from them. If
+the new plan's cost (the formula above) is at least 20 % lower, it moves the experts of the layers that change,
+one layer at a time, between two forward passes: it packs the layer's new hot experts, switches the GPU to them and
+frees the old copy, so at most one extra layer's copy exists at any moment. Only a placement used by one backend
+is re-planned; slots sharing a placement keep the plan made at load.
+
 **A layer whose experts are split.** Its hot experts are copied once, at load, into memory of their own (`QTensor.
 gatherExperts`, in the tensor's own layout, in parallel) and only that copy is given to the GPU. The copy and
 the CPU threads belong to the placement, which every backend on the same weights shares (a server's slots), so
 they exist once per model, not once per slot. The mapped file stays untouched
-for the CPU's cold ones. `moe_remap` also writes, for every slot, the expert's index in that copy, or −1 for a
-cold expert. `moe_up`, `moe_down`, `moe_sort` and `moe_combine` skip −1 slots, so the GPU kernels are the same ones
+for the CPU's cold ones. The router also writes, for every slot, the expert's index in that copy, or −1 for a
+cold expert (`gassign[s] = map[e]`). `moe_up`, `moe_down`, `moe_sort` and `moe_combine` skip −1 slots, so the GPU kernels are the same ones
 running on the packed tensors. Then the CPU and GPU work **at the same time**:
 
 ```
-GPU:  … attention, norm, router, remap ┃ hot experts (+ shared experts) ┃              ┃ next layer …
-CPU:                                   ┃ cold slots: Σ_k w_k·expert_k   ┃ wait, add    ┃
+GPU:  … attention, norm, router (+remap) ┃ hot experts (+ shared experts) ┃              ┃ next layer …
+CPU:                                     ┃ cold slots: Σ_k w_k·expert_k   ┃ wait, add    ┃
                            commit #1    commit #2, wait for #1 only
 ```
 
@@ -1013,3 +1020,29 @@ kernels, batched CPU path). The saved usage holds exactly `topK` picks per proce
 `ExpertPlacementCheck` (run by `mvn test`) checks the planner: uniform usage fills whole layers, skewed usage
 moves the coldest experts, at least the bytes asked for are freed, and within a layer a moved expert is never
 more used than a kept one.
+
+---
+
+## 8.19 Thermal state
+
+🧸 A runner who gets too hot slows down. A Mac does the same: when it is hot, macOS lowers the GPU's clock, and
+tokens come out slower without any other sign of trouble.
+
+📐 `jm_thermal_state` reads `NSProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical. The Metal
+backends report it (`Backend.thermalState()`, -1 where nothing can tell, e.g. the CPU backend). At most every 10 s
+during generation they log a warning when it reaches serious or critical, and a note when it cools down. The web
+console's status panel shows it. Benchmarks taken while the state is serious measure the cooling, not the code;
+`scripts/mac-validate.sh` notes it in its table.
+
+## 8.20 Validating on a Mac
+
+The emulator ([18](18-metal-emulator.md)) proves that the kernels compute the right numbers, not how fast they
+are. `scripts/mac-validate.sh` does both on a real Mac:
+- it runs `scripts/arch-smoke.sh` on the GPU;
+- it benchmarks a dense model with each newer feature on (the default) and off: flash prefill, flash decode,
+  pipelined decoding, simdgroup-matrix prefill and the f16 cache;
+- optionally (`--moe <repo>`) it benchmarks an MoE model with 256- vs 64-token chunks, grouped prefill on and off,
+  experts on the CPU with int8 on and off, and all experts on the GPU.
+
+It prints a markdown table of prefill and decode tokens per second (median of the rounds) for the docs.
+

@@ -27,7 +27,8 @@ import java.util.Map;
 public class ManagementController {
 
     public record Status(long uptimeMs, String java, int processors, long heapUsed, long heapMax, long weightBytes,
-                         int loadedModels, int runningJobs, boolean apiKeyRequired, String settingsFile) {
+                         int loadedModels, int runningJobs, boolean apiKeyRequired, String settingsFile,
+                         int thermalState) {
     }
 
     public record SettingsUpdate(Map<String, String> changes, List<String> reset) {
@@ -54,13 +55,15 @@ public class ManagementController {
     public Status status() {
         Runtime rt = Runtime.getRuntime();
         long weights = 0;
+        int thermal = -1; // the hottest any loaded model's backend reports (-1: none can tell, e.g. CPU only)
         for (LoadedModel m : models.loaded()) {
             weights += m.view().weightBytes();
+            thermal = Math.max(thermal, m.engine().backend().thermalState());
         }
         int running = (int) models.jobs().stream().filter(j -> j.state() == Job.State.RUNNING).count();
         return new Status(ManagementFactory.getRuntimeMXBean().getUptime(), Runtime.version().toString(),
                 rt.availableProcessors(), rt.totalMemory() - rt.freeMemory(), rt.maxMemory(), weights,
-                models.loaded().size(), running, props.apiKeyRequired(), settings.file().toString());
+                models.loaded().size(), running, props.apiKeyRequired(), settings.file().toString(), thermal);
     }
 
     // ------------------------------------------------------------------ models

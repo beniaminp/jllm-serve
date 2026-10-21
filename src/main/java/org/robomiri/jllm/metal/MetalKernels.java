@@ -195,6 +195,15 @@ final class MetalKernels implements AutoCloseable {
         return upBuffers.computeIfAbsent(t, x -> wrap(x.second.data));
     }
 
+    /** Releases {@code buf} (a wrap of {@code t}) and the wrap of t's second view, if any: t is no longer used. */
+    void release(QTensor t, Metal.Buffer buf) {
+        metal.release(buf);
+        Metal.Buffer up = upBuffers.remove(t);
+        if (up != null) {
+            metal.release(up);
+        }
+    }
+
     /** Offset of the f32 scale region to bind as buffer(1); Q2_K / Q6_K keep their scales inside the blocks (unused binding). */
     private static long scaleOff(QTensor t) {
         return t.type.scaleBytes == 0 ? 0 : t.scalesOffset;
@@ -528,29 +537,39 @@ final class MetalKernels implements AutoCloseable {
 
     // ---------------------------------------------------------------- mixture of experts
 
-    /** Softmax top-k routing of n rows of x: assign[t * topK + k] and the (optionally renormalised) weights. */
+    /**
+     * Softmax top-k routing of n rows of x: assign[t * topK + k] and the (optionally renormalised) weights. With
+     * {@code counts} (experts on the CPU): also gassign[slot] = map[expert] and counts[expert] += 1 per pick.
+     */
     void router(Metal.Buffer x, Metal.Buffer w, Metal.Buffer assign, Metal.Buffer rw, int nExperts, int dim, int topK,
-                boolean normalize, int n) {
+                boolean normalize, Metal.Buffer map, Metal.Buffer gassign, Metal.Buffer counts, int n) {
         bind(0, x, 0);
         bind(1, w, 0);
         bind(2, assign, 0);
         bind(3, rw, 0);
-        p.reset(KernelParams.ROUTER).i(nExperts).i(dim).i(topK).i(normalize);
-        dispatch("router", 4, 0, n, 1, 1, ROW_THREADS, 1, 1);
+        bindOrDummy(4, map);
+        bindOrDummy(5, gassign);
+        bindOrDummy(6, counts);
+        p.reset(KernelParams.ROUTER).i(nExperts).i(dim).i(topK).i(normalize).i(counts != null);
+        dispatch("router", 7, 0, n, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** DeepSeek routing (see router_ds in kernels.metal and DeepSeekRouter.java); {@code bias} only for noaux_tc. */
     void routerDs(Metal.Buffer x, Metal.Buffer w, Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer bias, int nExperts,
                   int dim, int topK, boolean normalize, int nGroup, int topkGroup, boolean sigmoid, int method,
-                  boolean scaleAlways, float routedScale, int n) {
+                  boolean scaleAlways, float routedScale, Metal.Buffer map, Metal.Buffer gassign, Metal.Buffer counts,
+                  int n) {
         bind(0, x, 0);
         bind(1, w, 0);
         bind(2, assign, 0);
         bind(3, rw, 0);
         bindOrDummy(4, bias);
+        bindOrDummy(5, map);
+        bindOrDummy(6, gassign);
+        bindOrDummy(7, counts);
         p.reset(KernelParams.ROUTER_DS).i(nExperts).i(dim).i(topK).i(normalize).i(nGroup).i(topkGroup).i(sigmoid)
-                .i(method).i(scaleAlways).f(routedScale);
-        dispatch("router_ds", 5, 0, n, 1, 1, ROW_THREADS, 1, 1);
+                .i(method).i(scaleAlways).f(routedScale).i(counts != null);
+        dispatch("router_ds", 8, 0, n, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** Per-slot gate/up projections with SwiGLU: out[slot, :] for the n * topK slots of assign (moe_up). */
@@ -626,20 +645,6 @@ final class MetalKernels implements AutoCloseable {
         bind(2, x, 0);
         p.reset(KernelParams.MOE).i(dim).i(moeDim).i(topK);
         dispatch("moe_combine", 3, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
-    }
-
-    /**
-     * gassign[s] = map[assign[s]] (the expert's index among the layer's GPU experts, or -1 for one on the CPU) for the
-     * n * topK slots, and counts[e] += the slots that chose expert e (moe_remap).
-     */
-    void moeRemap(Metal.Buffer assign, Metal.Buffer map, Metal.Buffer gassign, Metal.Buffer counts, int experts, int topK,
-                  int n) {
-        bind(0, assign, 0);
-        bind(1, map, 0);
-        bind(2, gassign, 0);
-        bind(3, counts, 0);
-        p.reset(KernelParams.MOE_REMAP).i(n * topK).i(experts);
-        dispatch("moe_remap", 4, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */

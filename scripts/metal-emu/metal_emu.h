@@ -161,6 +161,18 @@ void emu_barrier();
 // all = 32 slots of `size` bytes in lane order; returns the mask of the lanes that took part
 uint32_t emu_simd_exchange(const void *mine, void *all, int size);
 static inline void threadgroup_barrier(mem_flags) { emu_barrier(); }
+
+// ---- atomics: the GPU threads of the emulator are fibers of one OS thread that only switch at collectives, so a
+// plain read-modify-write is atomic
+typedef uint atomic_uint;
+typedef int atomic_int;
+enum memory_order { memory_order_relaxed };
+template <typename P, typename T>
+static inline T atomic_fetch_add_explicit(P p, T v, memory_order) {
+    T old = *p;
+    *p = old + v;
+    return old;
+}
 static inline void simdgroup_barrier(mem_flags) { // every live lane of the simdgroup arrives
     char none = 0, all[32];
     emu_simd_exchange(&none, all, 1);

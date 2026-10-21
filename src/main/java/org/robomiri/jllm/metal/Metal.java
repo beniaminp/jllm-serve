@@ -46,6 +46,7 @@ public final class Metal implements AutoCloseable {
 
     private final MethodHandle create;
     private final MethodHandle waitPending; // null with a library built before jm_wait_pending existed
+    private final MethodHandle thermal;     // null with a library built before jm_thermal_state existed
     private final MethodHandle destroy;
     private final MethodHandle deviceName;
     private final MethodHandle workingSet;
@@ -91,6 +92,8 @@ public final class Metal implements AutoCloseable {
         abort = handle(l, "jm_abort", FunctionDescriptor.ofVoid(ADDRESS));
         commit = handle(l, "jm_commit", FunctionDescriptor.ofVoid(ADDRESS));
         commitWait =handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
+        thermal = l.find("jm_thermal_state").map(a -> LINKER.downcallHandle(a, FunctionDescriptor.of(JAVA_INT, ADDRESS)))
+                .orElse(null);
         waitPending = l.find("jm_wait_pending").map(a -> LINKER.downcallHandle(a,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT))).orElse(null);
         try {
@@ -209,6 +212,18 @@ public final class Metal implements AutoCloseable {
         }
     }
 
+    /** The system's thermal state: 0 nominal, 1 fair, 2 serious, 3 critical; -1 when the library cannot tell. */
+    public int thermalState() {
+        if (thermal == null) {
+            return -1;
+        }
+        try {
+            return (int) thermal.invokeExact(ctx);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
     /** Threadgroup memory limit in bytes (static arrays and the dynamic [[threadgroup(0)]] argument combined). */
     public long maxThreadgroupMemory() {
         try {
@@ -308,6 +323,17 @@ public final class Metal implements AutoCloseable {
         }
         Buffer b = wrap(MemorySegment.ofAddress(base).reinterpret(end - base));
         return new Buffer(b.handle(), b.contents(), b.size(), addr - base);
+    }
+
+    /** Releases one buffer before {@link #close} (a no-copy wrap no longer refers to its memory afterwards). */
+    public void release(Buffer b) {
+        if (buffers.remove(b)) {
+            try {
+                bufferRelease.invokeExact(b.handle());
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+        }
     }
 
     private Buffer track(MemorySegment h, long size) throws Throwable {

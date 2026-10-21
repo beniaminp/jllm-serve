@@ -48,7 +48,8 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
 The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
-not been measured on Apple hardware yet. Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
+not been measured on Apple hardware yet: `scripts/mac-validate.sh` does both on a Mac and prints a table
+([08 §8.20](docs/08-metal-backend.md#820-validating-on-a-mac)). Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
 `-Djllm.metal.pipeline=false` (passed through `JAVA_OPTS`) and `./jllm bench`.
 
 ## Requirements

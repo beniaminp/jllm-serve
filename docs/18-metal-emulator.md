@@ -120,7 +120,7 @@ What it verified during this work:
   - KV caches written by the CPU backend load into the Metal backend;
   - the MoE models also run with experts on the CPU in four placements (80 checks), with exact usage counts and
     two slots sharing a placement;
-  - this end-to-end run is what exercises `moe_sort` and the grouped MoE kernels, `moe_remap`, `embed_token`,
+  - this end-to-end run is what exercises `moe_sort` and the grouped MoE kernels, the router's remap and counting (with emulated atomics), `embed_token`,
     `argmax` and the Q6_K matrix path;
 - attention (`attention_t` variants), the Q4_0 prefill matmuls and `attention_fa` (windows, soft-cap, half cache)
   against float64 numpy references (`kernel_tests.py`, 18 tests).

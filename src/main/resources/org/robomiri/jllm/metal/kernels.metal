@@ -1487,13 +1487,26 @@ struct RouterParams {
     int dim;
     int topK;
     int normalize;
+    int remap;       // also write gassign and count the picks (experts on the CPU, see remap_slot)
 };
+
+// When some of a layer's experts run on the CPU (backend.metal.cpu-moe), the router also writes, for each slot, the
+// expert's index among the layer's packed GPU experts (map[e], -1 for an expert on the CPU: the MoE kernels skip
+// those slots) and counts the pick in counts[e], the usage the next placement is planned from. One relaxed atomic add
+// per pick (thread 0 of each token's threadgroup), so the counts are exact.
+static inline void remap_slot(device const int *map, device int *gassign, device atomic_uint *counts, int slot, int e) {
+    gassign[slot] = map[e];
+    atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+}
 
 kernel void router(device const float *x [[buffer(0)]],
                    device const float *w [[buffer(1)]],
                    device int *assign [[buffer(2)]],
                    device float *rw [[buffer(3)]],
-                   constant RouterParams &p [[buffer(4)]],
+                   device const int *map [[buffer(4)]],
+                   device int *gassign [[buffer(5)]],
+                   device atomic_uint *counts [[buffer(6)]],
+                   constant RouterParams &p [[buffer(7)]],
                    uint tg [[threadgroup_position_in_grid]],
                    ushort tid [[thread_position_in_threadgroup]],
                    ushort tpg [[threads_per_threadgroup]],
@@ -1534,6 +1547,7 @@ kernel void router(device const float *x [[buffer(0)]],
                 if (logits[e] > bv) { bv = logits[e]; best = e; }
             }
             assign[tg * p.topK + k] = best;
+            if (p.remap) remap_slot(map, gassign, counts, tg * p.topK + k, best);
             rw[tg * p.topK + k] = bv / sum;
             selected += bv / sum;
             logits[best] = -INFINITY;
@@ -1573,7 +1587,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
     const int row = int(tgp.x) * nsg + sg;
     if (row >= m) return;
     const int s = int(tgp.y);
-    if (assign[s] < 0) return; // an expert left on the CPU (moe_remap)
+    if (assign[s] < 0) return; // an expert left on the CPU (remap_slot)
     const int t = s / p.topK;
     // GGUF types: gate and up experts are two [experts * m, cols] views (wq, and buffer(1) = ws), same row in both
     const ulong growG = QT >= GG_FIRST ? (ulong)assign[s] * m + row : (ulong)assign[s] * p.rowsPerExpert + row;
@@ -1593,7 +1607,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
 }
 
 // moe_down: x[t, row] += sum_k rw[t,k] * (W_{assign[t,k]}[row] . h[t*topK + k]). rowsPerExpert = dim.
-// A slot whose assign is -1 (moe_remap: its expert runs on the CPU) is skipped here and in moe_up / moe_combine.
+// A slot whose assign is -1 (its expert runs on the CPU, see remap_slot) is skipped here and in moe_up / moe_combine.
 // Grid: (ceil(dim / simdgroups), ntok). Looping over k inside keeps a single writer per (t, row).
 
 template <int QT>
@@ -1784,32 +1798,6 @@ kernel void moe_combine(device const float *ys [[buffer(0)]],
     x[(ulong)t * p.rowsPerExpert + row] += total;
 }
 
-// ---- hot experts on the GPU, cold ones on the CPU (backend.metal.cpu-moe)
-// moe_remap: gassign[s] = map[assign[s]], the slot's expert in the layer's packed GPU copy of its hot experts, or -1
-// when the expert stays on the CPU (the MoE kernels above skip those slots); and counts[e] += how many of the slots
-// chose expert e, the usage the placement of the next load is planned from. One threadgroup; each thread counts its
-// own experts over all slots, so no atomics are needed and the counts are exact.
-
-struct MoeRemapParams {
-    int slots;       // ntok * topK
-    int experts;
-};
-
-kernel void moe_remap(device const int *assign [[buffer(0)]],
-                      device const int *map [[buffer(1)]],
-                      device int *gassign [[buffer(2)]],
-                      device uint *counts [[buffer(3)]],
-                      constant MoeRemapParams &p [[buffer(4)]],
-                      ushort tid [[thread_index_in_threadgroup]],
-                      ushort tpg [[threads_per_threadgroup]]) {
-    for (int s = tid; s < p.slots; s += tpg) gassign[s] = map[assign[s]];
-    for (int e = tid; e < p.experts; e += tpg) {
-        uint c = 0;
-        for (int s = 0; s < p.slots; s++) c += assign[s] == e ? 1u : 0u;
-        counts[e] += c;
-    }
-}
-
 typedef decltype(moe_up_mma<4>) moe_up_mma_t;
 typedef decltype(moe_down_mma<4>) moe_down_mma_t;
 template [[host_name("moe_up_mma_q4")]] kernel moe_up_mma_t moe_up_mma<4>;
@@ -1839,6 +1827,7 @@ struct RouterDsParams {
     int method;
     int scaleAlways;
     float routedScale;
+    int remap;       // see remap_slot
 };
 
 kernel void router_ds(device const float *x [[buffer(0)]],
@@ -1846,7 +1835,10 @@ kernel void router_ds(device const float *x [[buffer(0)]],
                       device int *assign [[buffer(2)]],
                       device float *rw [[buffer(3)]],
                       device const float *bias [[buffer(4)]],
-                      constant RouterDsParams &p [[buffer(5)]],
+                      device const int *map [[buffer(5)]],
+                      device int *gassign [[buffer(6)]],
+                      device atomic_uint *counts [[buffer(7)]],
+                      constant RouterDsParams &p [[buffer(8)]],
                       uint tg [[threadgroup_position_in_grid]],
                       ushort tid [[thread_position_in_threadgroup]],
                       ushort tpg [[threads_per_threadgroup]],
@@ -1925,6 +1917,7 @@ kernel void router_ds(device const float *x [[buffer(0)]],
             if (choice[e] > bv) { bv = choice[e]; best = e; }
         }
         assign[tg * p.topK + k] = best;
+        if (p.remap) remap_slot(map, gassign, counts, tg * p.topK + k, best);
         rw[tg * p.topK + k] = scores[best];
         selected += scores[best];
         choice[best] = -INFINITY;

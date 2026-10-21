@@ -4,7 +4,7 @@ Code: `model/Mlp.Moe` + `model/Router` (the typed spec, built by `model/Families
 `model/ModelConverter.moeRules`, `cpu/CpuBackend.MoeFfn` (routing: `routeSoftmax`, `routeDeepseek`) and
 `cpu/MoeExperts` (the experts: `token`, `batched`, `expertMatmul`; shared with the Metal backend's CPU experts),
 `metal/MetalBackend.MoeStep`, `metal/ExpertPlacement`, `kernels.metal` section 5 (`router`, `moe_up`, `moe_down`,
-the grouped `moe_sort` / `moe_up_mma` / `moe_down_mma` / `moe_combine`, `moe_remap`)
+the grouped `moe_sort` / `moe_up_mma` / `moe_down_mma` / `moe_combine`)
 
 ## 12.1 The idea
 
@@ -232,6 +232,6 @@ cost = 100 µs · (layers with a CPU expert)  +  Σ_{CPU experts} p(l,e) · expe
 where `p(l,e)` is how often a token picks that expert, learned from earlier runs and saved in
 `~/.cache/jllm/expert-usage`. A first run, with no statistics, moves whole layers. Later runs move the rarely
 picked experts, so the CPU is called for a few percent of the picks instead of a whole layer's share. The hot
-experts of a split layer are packed into their own GPU memory; the GPU skips the cold slots (`moe_remap` marks them
+experts of a split layer are packed into their own GPU memory; the GPU skips the cold slots (the router marks them
 −1) while the CPU computes them with the same `MoeExperts` code as the CPU backend. Every detail, the timeline
 and the tests are in [08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe).

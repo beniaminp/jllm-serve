@@ -87,6 +87,13 @@ uint64_t jm_recommended_working_set(void *ctx) {
     return c.device.recommendedMaxWorkingSetSize;
 }
 
+// The system's thermal state (NSProcessInfoThermalState): 0 nominal, 1 fair, 2 serious, 3 critical. A hot Apple GPU
+// runs at lower clocks, which shows up as slower tokens without any other sign.
+int jm_thermal_state(void *ctx) {
+    (void) ctx;
+    return (int) [[NSProcessInfo processInfo] thermalState];
+}
+
 // Bytes of threadgroup memory one threadgroup may use (static arrays plus the dynamic [[threadgroup(0)]]
 // argument together); 32 KB on every Apple GPU so far.
 uint64_t jm_device_max_tg_mem(void *ctx) {

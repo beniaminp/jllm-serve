@@ -119,16 +119,43 @@ public final class MambaMetalBackend implements Backend {
         dbc = k.scratch((long) maxBatch * (m.dtRank() + 2 * m.dState()) * 4);
         y = k.scratch((long) maxBatch * di * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
+        long others = DeviceLedger.others(ledger);
+        DeviceLedger.add(ledger);
         long ws = k.metal.recommendedWorkingSet();
-        if (w.byteSize() > ws) {
-            System.err.printf("warning: weights (%.1f GB) exceed Metal's recommended working set (%.1f GB); expect paging%n",
-                    w.byteSize() / 1e9, ws / 1e9);
+        long gpu = w.byteSize() + k.metal.allocatedBytes();
+        if (gpu + others > ws) {
+            System.err.printf("warning: the GPU holds %.1f GB (this model %.1f GB, other backends %.1f GB), more than "
+                    + "Metal's recommended working set (%.1f GB); expect paging%n", (gpu + others) / 1e9, gpu / 1e9,
+                    others / 1e9, ws / 1e9);
         }
     }
+
+    /** This backend in the {@link DeviceLedger}, so the other models' GPU budgets count it. */
+    private final DeviceLedger.Resident ledger = new DeviceLedger.Resident() {
+        @Override
+        public ModelWeights weights() {
+            return w;
+        }
+
+        @Override
+        public long gpuWeightBytes() {
+            return w.byteSize();
+        }
+
+        @Override
+        public long ownBytes() {
+            return k.metal.allocatedBytes();
+        }
+    };
 
     @Override
     public String name() {
         return "metal mamba (" + k.metal.deviceName() + ")";
+    }
+
+    @Override
+    public int thermalState() {
+        return k.metal.thermalState();
     }
 
     @Override
@@ -204,6 +231,7 @@ public final class MambaMetalBackend implements Backend {
 
     @Override
     public void close() {
+        DeviceLedger.remove(ledger);
         k.close();
     }
 }

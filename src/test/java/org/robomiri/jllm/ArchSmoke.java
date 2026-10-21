@@ -291,6 +291,7 @@ public final class ArchSmoke {
             System.out.println("  first slot after the second closed: " + (ok ? "ok" : "BROKEN"));
             bad += ok ? 0 : 1;
         }
+        bad += rebalanceCheck(w, lib, cfg, cpu, cpuLogits);
         long expect = -1;
         boolean statsOk = true;
         for (int l = 0; l < layers; l++) {
@@ -301,6 +302,53 @@ public final class ArchSmoke {
         }
         System.out.println("  expert usage saved: " + expect + " picks per MoE layer -> " + (statsOk ? "ok" : "STATS WRONG"));
         return bad + (statsOk ? 0 : 1);
+    }
+
+    /**
+     * Re-placement while running: under backend.metal.cpu-moe=auto with a GPU budget about half the experts short and
+     * no statistics, the first plan moves whole layers; after some tokens have been counted, rebalanceExperts re-plans
+     * from them (arch-smoke.sh sets the round-trip estimate to 0, so splitting layers is preferred) and moves experts,
+     * and the generation is still the CPU backend's.
+     */
+    private static int rebalanceCheck(ModelWeights w, String lib, Architecture cfg, int[] cpu, float[] cpuLogits)
+            throws Exception {
+        Decoder d = (Decoder) cfg;
+        long experts = 0;
+        for (int l = 0; l < d.core().layers(); l++) {
+            if (d.layers().get(l).mlp() instanceof Mlp.Moe) {
+                experts += w.decoderLayer(l).moe().expGateUp().data.byteSize() + w.decoderLayer(l).moe().expDown().data.byteSize();
+            }
+        }
+        long full;
+        try (MetalBackend b = new MetalBackend(w, 64, 32, lib, KvDtype.F32, MoeSplit.OFF)) {
+            full = b.gpuResidentBytes();
+        }
+        java.nio.file.Path stats = java.nio.file.Files.createTempDirectory("jllm-expert-stats");
+        System.setProperty("jllm.metal.expertStatsDir", stats.toString());
+        System.setProperty("jllm.metal.workingSetGb", Double.toString((full - experts / 2) / 1e9));
+        int bad = 0;
+        try (MetalBackend b = new MetalBackend(w, 64, 32, lib, KvDtype.F32, new MoeSplit(MoeSplit.AUTO, 4, false))) {
+            float[] logits = new float[cfg.core().vocabSize()];
+            generate(b, logits);
+            generate(b, logits);
+            int moved = b.rebalanceExperts();
+            int[] got = generate(b, logits);
+            float diff = maxDiff(cpuLogits, logits);
+            boolean ok = moved > 0 && Arrays.equals(cpu, got) && diff <= 1e-3f * maxAbs(cpuLogits) + 1e-4f;
+            System.out.printf("  experts re-placed while running: %d layers moved, %s max|cpu-split| = %.2e -> %s%n", moved,
+                    Arrays.toString(got), diff, ok ? "ok" : "REBALANCE FAILED");
+            bad += ok ? 0 : 1;
+        } finally {
+            System.clearProperty("jllm.metal.workingSetGb");
+            System.clearProperty("jllm.metal.expertStatsDir");
+            try (var files = java.nio.file.Files.list(stats)) {
+                for (java.nio.file.Path f : files.toList()) {
+                    java.nio.file.Files.delete(f);
+                }
+            }
+            java.nio.file.Files.delete(stats);
+        }
+        return bad;
     }
 
     private static float maxDiff(float[] a, float[] b) {

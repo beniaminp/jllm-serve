@@ -52,6 +52,14 @@ public interface Backend extends AutoCloseable {
      * past {@code pos} are simply overwritten); a recurrent state (Mamba) cannot, so the engine then reuses the
      * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.
      */
+    /**
+     * The machine's thermal state as the GPU driver reports it: 0 nominal, 1 fair, 2 serious (the GPU is being slowed
+     * down), 3 critical; -1 when the backend cannot tell (the CPU backend, an old native library).
+     */
+    default int thermalState() {
+        return -1;
+    }
+
     default boolean supportsPrefixReuse() {
         return true;
     }

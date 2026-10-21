@@ -247,7 +247,8 @@ Mac yet. Decode is unchanged (one token per step).
 Experts on the CPU are chosen by a setting (`jllm.properties` key, or `--backend.metal.cpu-moe` on the command
 line), not a system property: `backend.metal.cpu-moe` = `auto` (default: only when the device's GPU memory budget is
 exceeded; the rarely used experts by saved usage, whole layers until statistics exist), `off`, `all` or a number of
-whole layers ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)).
+whole layers ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)). A backend that holds
+its placement alone also re-plans it every 30 minutes of use from the counts so far (`MetalBackend.rebalanceExperts`).
 
 JIT warm-up matters: the first ~50 tokens run before C2 has compiled the kernels; `bench` discards a warm-up
 round for that reason.
@@ -364,7 +365,10 @@ an 80-line file from the prompt went from 19.9 to 81.2 tok/s (98 % of drafts acc
 explicitly, for the reason above. Enable `ngram` for editing, extraction
 and quoting workloads on dense models; `draft` needs a draft model that agrees with the target on 80 % or more of the tokens and
 a backend whose multi-token pass is much cheaper than K single steps, which the Metal kernels of this repository are not yet.
-`engine.draft-tokens=4`, `engine.ngram-max=3`, `engine.ngram-min=2` were the best of the grid above.
+`engine.draft-tokens=4`, `engine.ngram-max=3`, `engine.ngram-min=2` were the best of the grid above, measured with the
+earlier search that looked at the last 4 096 tokens only. The defaults now are `16`, `8` and `3`: the n-gram index and
+the adaptive draft length of [17 §17.1](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) make long drafts
+cheap when they fail, and 3-token minimum matches cost less on free text than 2.
 
 ---
 

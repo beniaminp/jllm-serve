@@ -187,6 +187,11 @@ int jm_device_name(void *ctx, char *out, int len) {
 }
 
 uint64_t jm_recommended_working_set(void *ctx) { return 64ull << 30; }
+// no thermal sensor to read: nominal, or JLLM_EMU_THERMAL=0..3 to test the warning path
+int jm_thermal_state(void *ctx) {
+    const char *v = getenv("JLLM_EMU_THERMAL");
+    return v ? atoi(v) : 0;
+}
 
 uint64_t jm_device_max_tg_mem(void *ctx) { return 32768; }
 

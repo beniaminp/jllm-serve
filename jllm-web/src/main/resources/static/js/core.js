@@ -97,6 +97,8 @@ async function refreshStatus() {
     const s = serverStatus = await api('/api/status');
     $('#status').innerHTML = `<b>${s.loadedModels}</b> model${s.loadedModels === 1 ? '' : 's'} loaded<br>weights ${fmtBytes(s.weightBytes)}<br>`
       + `heap ${fmtBytes(s.heapUsed)} / ${fmtBytes(s.heapMax)}<br>${s.processors} cpus · up ${fmtDur(s.uptimeMs)}`
+      + (s.thermalState >= 0 ? `<br>thermal: ${['nominal', 'fair', '<b class="error">serious (GPU slowed)</b>',
+        '<b class="error">critical (GPU slowed)</b>'][s.thermalState] || s.thermalState}` : '')
       + (s.runningJobs ? `<br><b>${s.runningJobs}</b> job${s.runningJobs === 1 ? '' : 's'} running` : '');
     $('#settings-file').textContent = s.settingsFile;
     $('#api-key-note').innerHTML = s.apiKeyRequired ? 'This server requires <code>Authorization: Bearer &lt;key&gt;</code> (<code>jllm.web.api-key</code>).'
