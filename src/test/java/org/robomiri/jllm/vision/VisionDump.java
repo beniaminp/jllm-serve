@@ -1,0 +1,51 @@
+package org.robomiri.jllm.vision;
+
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+/**
+ * Manual check against llama.cpp: preprocesses and encodes an image and writes each chunk's embeddings as little-endian
+ * f32 ({@code <out>.<i>.f32}, tiles first, the overview last, like mtmd's chunk order) for comparison with the files
+ * the {@code mtmd} dump tool writes. Usage: {@code VisionDump <mmproj.gguf> <image> <out-prefix> [threads]}.
+ */
+public final class VisionDump {
+
+    private VisionDump() {
+    }
+
+    public static void main(String[] a) throws Exception {
+        Path mm = Path.of(a[0]);
+        Rgb img = ImageDecoder.decode(Files.readAllBytes(Path.of(a[1])));
+        int threads = a.length > 3 ? Integer.parseInt(a[3]) : Runtime.getRuntime().availableProcessors();
+        try (ClipModel m = ClipModel.open(mm); ClipCpu enc = new ClipCpu(m, threads)) {
+            System.out.println(m.projector + " layers=" + m.nLayer + " embd=" + m.nEmbd + " image " + img.width() + "x" + img.height());
+            long t0 = System.nanoTime();
+            Preprocess.Prepared pp = Preprocess.preprocess(m, img, Preprocess.Limits.NONE);
+            System.out.printf("preprocess %.1f ms: %d tiles, grid %dx%d, overview %s%n", (System.nanoTime() - t0) / 1e6,
+                    pp.tiles().size(), pp.gridX(), pp.gridY(), pp.overview() != null);
+            int i = 0;
+            java.util.List<Preprocess.Pixels> all = new java.util.ArrayList<>(pp.tiles());
+            if (pp.overview() != null) {
+                all.add(pp.overview());
+            }
+            for (Preprocess.Pixels px : all) {
+                long t1 = System.nanoTime();
+                VisionEncoder.Encoded e = enc.encode(px);
+                System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d) in %.0f ms%n", i, px.width(), px.height(), e.tokens(),
+                        e.nx(), e.ny(), (System.nanoTime() - t1) / 1e6);
+                ByteBuffer bb = ByteBuffer.allocate(e.embd().length * 4).order(ByteOrder.LITTLE_ENDIAN);
+                bb.asFloatBuffer().put(e.embd());
+                Files.write(Path.of(a[2] + "." + i + ".f32"), bb.array());
+                // also the preprocessed pixels, for comparison with other implementations
+                ByteBuffer pb = ByteBuffer.allocate(px.hwc().length * 4).order(ByteOrder.LITTLE_ENDIAN);
+                pb.asFloatBuffer().put(px.hwc());
+                Files.write(Path.of(a[2] + "." + i + ".pix.f32"), pb.array());
+                i++;
+            }
+        }
+    }
+}

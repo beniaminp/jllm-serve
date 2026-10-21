@@ -13,7 +13,7 @@ import java.nio.ByteOrder;
  * only dequantize it row by row so the loader can requantize it to Q8_0. Everything else (the IQ and ternary
  * types, MXFP4, integers) is rejected with the type's name.
  */
-final class GgmlCodec {
+public final class GgmlCodec {
 
     private static final ValueLayout.OfFloat LE_F32 = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
@@ -34,7 +34,7 @@ final class GgmlCodec {
     }
 
     /** True if {@link #dequantizeRow} handles the type. */
-    static boolean canDequantize(GgmlType t) {
+    public static boolean canDequantize(GgmlType t) {
         return switch (t) {
             case F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K -> true;
             default -> false;
@@ -47,7 +47,7 @@ final class GgmlCodec {
     }
 
     /** Dequantizes the row of {@code cols} elements at byte {@code off} of {@code seg} into {@code dst[o ..)}. */
-    static void dequantizeRow(GgmlType t, MemorySegment seg, long off, int cols, float[] dst, int o) {
+    public static void dequantizeRow(GgmlType t, MemorySegment seg, long off, int cols, float[] dst, int o) {
         switch (t) {
             case F32 -> {
                 for (int i = 0; i < cols; i++) {
