@@ -714,10 +714,12 @@ The cost is one extra dispatch per layer (`kv_store_q8`, `2·kvHeads·n` simdgro
 through `vStage`; the reads in attention shrink from 2 to ~1 byte per value. CPU and Metal quantize the same f32
 numbers with the same formula, but their f32 k / v differ in the last bits, so a value on a rounding edge can land one
 step apart: `ArchSmoke` runs every family with q8 on both backends and requires the usual 10⁻³ relative agreement of
-the logits (observed: at most 1.0 × 10⁻⁴ of the largest logit, on Gemma-2 with head dim 256; ~10⁻⁶ for most
-families), and prints the distance from the f32 cache (0.04 % to 1.2 % of the largest logit, up to 15 % on the tiny
-DeepSeeks, whose routing amplifies any perturbation); `kernel_tests.py` checks `kv_store_q8` bit for bit against
-numpy and the q8 attention, split and flash kernels against a float64 reference.
+the logits (observed: at most 2.5 × 10⁻⁴ of the largest logit, on Gemma-2; ~10⁻⁶ for most families). It also
+prints the distance from the f32 cache — 0.04 % to 1.2 % of the largest logit, up to 25 % on the tiny DeepSeeks,
+whose routing amplifies any perturbation (their f16 caches already move the logits by 0.2–0.4 %) — and bounds it by
+200 times the f16 cache's distance (observed 20–45× for the dense families, up to 115× for the DeepSeeks);
+`kernel_tests.py` checks `kv_store_q8` bit for bit against numpy and the q8 attention, split and flash kernels
+against a float64 reference.
 
 ---
 
