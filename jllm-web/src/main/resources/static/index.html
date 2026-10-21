@@ -266,7 +266,7 @@
       <label class="st-only">Weights <select name="model.quant"><option value="">(default)</option><option value="q4">q4 (Q4_0)</option><option value="q8">q8 (Q8_0)</option><option value="q6k">q6k (Q6_K)</option><option value="q2k">q2k (Q2_K)</option></select></label>
       <label>Batch <input name="backend.batch" type="number" min="1" placeholder="(default)"></label>
       <label>Threads <input name="backend.threads" type="number" min="0" placeholder="(default)"></label>
-      <label>Speculative <select name="engine.speculative"><option value="">(default)</option><option>off</option><option>ngram</option><option>draft</option></select></label>
+      <label>Speculative <select name="engine.speculative"><option value="">(default)</option><option>off</option><option>ngram</option><option>draft</option><option>mtp</option></select></label>
       <label>Draft model <input name="engine.draft-model" placeholder="owner/name"></label>
       <label title="each slot keeps one conversation's prefix in its own KV cache; requests go to the slot that already holds most of their prompt">Slots <input name="slots" type="number" min="1" max="8" placeholder="1"></label>
       <label class="check st-only"><input type="checkbox" name="model.low-disk"> low disk</label>

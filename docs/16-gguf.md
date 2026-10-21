@@ -1,7 +1,7 @@
 # 16. GGUF: running llama.cpp's quantized files without converting them
 
 Code: `gguf/GgufFile.java`, `gguf/GgmlType.java`, `gguf/GgufArchitecture.java`, `gguf/GgufWeights.java`,
-`gguf/GgmlCodec.java`, `gguf/GgufModel.java`, `model/Ggml.java`, `model/QType.java`, `model/QTensor.java`,
+`gguf/GgmlCodec.java`, `gguf/GgufModel.java`, `gguf/GgufQwenNext.java`, `model/Ggml.java`, `model/QType.java`, `model/QTensor.java`,
 `model/TensorSource.java`, `tokenizer/GgufTokenizer.java`, `cpu/GgufKernels.java`, the *GGUF block types* section
 of `metal/kernels.metal`, `hub/HuggingFaceHub.java` (file selection), `Main.java`
 
@@ -121,6 +121,8 @@ Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 heads=16/8 headDim=128 vocab=151936
 | `qwen3moe` | `qwen3_moe` | routed experts (`num_experts`, `num_experts_per_tok`, `moe_intermediate_size`; `norm_topk_prob` is always true, as in llama.cpp) |
 | `qwen2` | `qwen2` | q/k/v biases |
 | `llama` | `llama` (`mistral` when the file has a sliding window or "mistral" in its name) | the q/k row permutation, 16.5 |
+| `qwen35` | `qwen3_next` (reported as `qwen3_5`: it has a chat template of its own) | Qwen3.5: Gated DeltaNet layers + gated attention, a dense MLP everywhere, value heads in tiled order, a multi-token-prediction block, 16.12 |
+| `qwen3next` | `qwen3_next` | Qwen3-Next-80B-A3B: the same hybrid with experts and a gated shared expert, value heads grouped, 16.12 |
 
 | GGUF key (prefix `<arch>.`) | config.json key |
 |---|---|
@@ -137,6 +139,10 @@ Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 heads=16/8 headDim=128 vocab=151936
 | tensor `rope_freqs.weight` (Llama 3.x) | `rope_scaling` llama3 when the table is the Llama 3 one, else a longrope table |
 | `context_length` | `max_position_embeddings` |
 | `expert_count`, `expert_used_count`, `expert_feed_forward_length` | `num_experts`, `num_experts_per_tok`, `moe_intermediate_size` |
+| `expert_shared_feed_forward_length` (`qwen3next`) | `shared_expert_intermediate_size` |
+| `ssm.conv_kernel`, `ssm.state_size`, `ssm.group_count`, `ssm.time_step_rank` (`qwen35`, `qwen3next`) | `linear_conv_kernel_dim`, `linear_key_head_dim` = `linear_value_head_dim`, `linear_num_key_heads`, `linear_num_value_heads` (`ssm.inner_size` must be `state_size × time_step_rank`) |
+| `full_attention_interval` (or the per-layer `attention.recurrent_layers`) | `full_attention_interval` (or `layer_types`) |
+| `nextn_predict_layers` | `block_count - nextn_predict_layers` layers; the rest is the multi-token-prediction block (16.13) |
 | rows of `token_embd.weight` | `vocab_size` |
 | absence of `output.weight` | `tie_word_embeddings = true` |
 | `tokenizer.ggml.bos_token_id`, `eos_token_id`, `eot_token_id` | `bos_token_id`, `eos_token_id` |
@@ -355,7 +361,8 @@ existing encoder ([04](04-tokenizer.md)), so there is one BPE implementation:
 * **`tokenizer.ggml.model = gpt2`**: byte-level BPE. `tokens` are the vocabulary and `merges` the merge list.
   `token_type` separates `CONTROL` tokens (added tokens flagged `special`: `<|im_start|>`, `<|endoftext|>`) and
   `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary. `tokenizer.ggml.pre` picks
-  the pre-tokenizer regex: `qwen2` (Qwen's, with an NFC normalizer as in its tokenizer.json), `llama-bpe` / `llama3`
+  the pre-tokenizer regex: `qwen2` (Qwen's, with an NFC normalizer as in its tokenizer.json), `qwen35` (Qwen3.5's: the same with combining
+  marks counted as letters, `[\p{L}\p{M}]+`; llama.cpp's `LLAMA_VOCAB_PRE_TYPE_QWEN35`), `llama-bpe` / `llama3`
   (Llama 3's, with `ignore_merges`), `gpt-2`. Any other value is refused with its name; the loader then fetches the
   original model's `tokenizer.json` from the repository named in `general.base_model.0.repo_url` /
   `general.source.url`, and fails clearly if the file names none.
@@ -463,8 +470,9 @@ the load is dominated by the tokenizer.
 
 ## 16.10 Limits and what is next
 
-* **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe` only. Gemma 2/3, Phi-3, GLM-4, DeepSeek-2 and Mamba are
-  supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are not mapped yet.
+* **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen3next` (16.12). Gemma 2/3, Phi-3, GLM-4,
+  DeepSeek-2 and Mamba are supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are
+  not mapped yet (unless a later section says so). `qwen35moe` (Qwen3.5-35B-A3B) is not mapped.
 * **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.
 * **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
   variant and `dynamic` scaling are not.
@@ -480,7 +488,7 @@ the load is dominated by the tokenizer.
 `mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
 Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
-permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
+permutation, metadata mapping), `GgufQwenNextTest` (tiny Qwen3.5 and Qwen3-Next hybrids, 16.12), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
 selection, settings) and `GgufTokenizerTest` on the `llama-spm` vocabulary. With the Qwen3-0.6B files downloaded by
 `./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:
 

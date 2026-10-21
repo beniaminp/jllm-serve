@@ -137,6 +137,11 @@ done
   -cp target/classes:target/test-classes org.robomiri.jllm.Qwen3NextChecks "$METAL_LIB" \
   "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
 
+# Qwen3.5 / Qwen3-Next as GGUF (tiny hybrids written the way llama.cpp's converter writes them): GGUF vs the converted
+# checkpoint, CPU == Metal, the multi-token-prediction head and its speculation (output == plain decoding)
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+  -Djllm.metal.lib="$METAL_LIB" -cp target/classes:target/test-classes org.robomiri.jllm.GgufQwenNextTest
+
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false -Djllm.metal.hmma=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 \
   -Djllm.smoke.draftPair="${P}-LlamaPlainForCausalLM=$M/${P}-LlamaDraftForCausalLM" ${JAVA_OPTS:-} \

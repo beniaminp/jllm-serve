@@ -259,6 +259,42 @@ public final class BatchGroup {
             return inner.supportsPrefixReuse();
         }
 
+        // multi-token prediction (a Qwen3.5 GGUF): the head runs on the device like any pass, so under its lock
+        @Override
+        public boolean hasMtp() {
+            return inner.hasMtp();
+        }
+
+        @Override
+        public void enableMtp(boolean on) {
+            locked(() -> inner.enableMtp(on));
+        }
+
+        @Override
+        public boolean mtpReady() {
+            return inner.mtpReady();
+        }
+
+        @Override
+        public void mtpDraft(int token, float[] logits) {
+            locked(() -> inner.mtpDraft(token, logits));
+        }
+
+        @Override
+        public boolean supportsRollback() {
+            return inner.supportsRollback();
+        }
+
+        @Override
+        public void checkpointState() {
+            locked(inner::checkpointState);
+        }
+
+        @Override
+        public void rollbackState(int keep) {
+            locked(() -> inner.rollbackState(keep));
+        }
+
         @Override
         public int thermalState() {
             return inner.thermalState();
