@@ -283,4 +283,24 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
             }
 }
 
+// jm_run: the commands of a recorded decode step (layout of JMCmd in jllm_metal.m / DecodeProgram.java), run in order
+struct JMCmd {
+    int32_t pipe, nbuf, plen, tgmem;
+    int32_t grid[3], threads[3];
+    int32_t pad[2];
+    void *bufs[16];
+    uint64_t offs[16];
+    uint8_t params[64];
+    uint8_t pad2[16];
+};
+static_assert(sizeof(JMCmd) == 384, "JMCmd layout is shared with DecodeProgram.java");
+
+void jm_run(void *ctx, const JMCmd *cmds, int n) {
+    for (int k = 0; k < n; k++) {
+        const JMCmd &d = cmds[k];
+        jm_dispatch(ctx, d.pipe, (void **) d.bufs, d.offs, d.nbuf, d.plen > 0 ? d.params : nullptr, d.plen, d.tgmem,
+                    d.grid[0], d.grid[1], d.grid[2], d.threads[0], d.threads[1], d.threads[2]);
+    }
+}
+
 } // extern "C"

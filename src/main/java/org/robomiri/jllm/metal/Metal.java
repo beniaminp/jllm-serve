@@ -47,6 +47,7 @@ public final class Metal implements AutoCloseable {
     private final MethodHandle create;
     private final MethodHandle waitPending; // null with a library built before jm_wait_pending existed
     private final MethodHandle thermal;     // null with a library built before jm_thermal_state existed
+    private final MethodHandle run;         // null with a library built before jm_run existed
     private final MethodHandle destroy;
     private final MethodHandle deviceName;
     private final MethodHandle workingSet;
@@ -93,6 +94,8 @@ public final class Metal implements AutoCloseable {
         commit = handle(l, "jm_commit", FunctionDescriptor.ofVoid(ADDRESS));
         commitWait =handle(l, "jm_commit_wait", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT));
         thermal = l.find("jm_thermal_state").map(a -> LINKER.downcallHandle(a, FunctionDescriptor.of(JAVA_INT, ADDRESS)))
+                .orElse(null);
+        run = l.find("jm_run").map(a -> LINKER.downcallHandle(a, FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, JAVA_INT)))
                 .orElse(null);
         waitPending = l.find("jm_wait_pending").map(a -> LINKER.downcallHandle(a,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT))).orElse(null);
@@ -343,7 +346,46 @@ public final class Metal implements AutoCloseable {
         return b;
     }
 
+    // ------------------------------------------------------------------ hot path (counted)
+
+    private long downcalls;
+    private long dispatches;
+
+    /**
+     * Java -> native calls made on the forward-pass path so far (begin, dispatch, run, commit, waits, abort): what a
+     * recorded decode step saves. Calls made at start-up (buffers, pipelines) are not counted.
+     */
+    public long downcalls() {
+        return downcalls;
+    }
+
+    /** Kernel dispatches encoded so far, one by one ({@link #dispatch}) or inside recorded steps ({@link #run}). */
+    public long dispatches() {
+        return dispatches;
+    }
+
+    /** Whether {@link #run} is available (the native library is recent enough). */
+    public boolean canRun() {
+        return run != null;
+    }
+
+    /**
+     * Encodes {@code n} recorded commands ({@link DecodeProgram}: 384 bytes each, the arguments of one
+     * {@link #dispatch}) into the command buffer being recorded, in one call. The native side copies everything it
+     * needs, so the caller may change {@code cmds} as soon as this returns.
+     */
+    public void run(MemorySegment cmds, int n) {
+        downcalls++;
+        dispatches += n;
+        try {
+            run.invokeExact(ctx, cmds, n);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
     public void begin() {
+        downcalls++;
         try {
             begin.invokeExact(ctx);
         } catch (Throwable t) {
@@ -363,6 +405,8 @@ public final class Metal implements AutoCloseable {
     /** As above, with {@code tgmem} bytes of dynamic threadgroup memory for the kernel's [[threadgroup(0)]]. */
     public void dispatch(int pipe, MemorySegment bufs, MemorySegment offsets, int nbuf, MemorySegment params, int plen,
                          int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
+        downcalls++;
+        dispatches++;
         try {
             dispatch.invokeExact(ctx, pipe, bufs, offsets, nbuf, params, plen, tgmem, gx, gy, gz, tx, ty, tz);
         } catch (Throwable t) {
@@ -375,6 +419,7 @@ public final class Metal implements AutoCloseable {
      * insists on). Safe to call when nothing is being recorded.
      */
     public void abort() {
+        downcalls++;
         try {
             abort.invokeExact(ctx);
         } catch (Throwable t) {
@@ -388,6 +433,7 @@ public final class Metal implements AutoCloseable {
      * in-order queue); {@link #commitAndWait()} waits for everything and reports a failure of any part.
      */
     public void commit() {
+        downcalls++;
         try {
             commit.invokeExact(ctx);
         } catch (Throwable t) {
@@ -402,6 +448,7 @@ public final class Metal implements AutoCloseable {
 
     /** Waits until at most {@code keep} buffers submitted with {@link #commit} are unfinished (oldest first). */
     public void waitPending(int keep) {
+        downcalls++;
         try {
             int rc = (int) waitPending.invokeExact(ctx, keep, err, ERR_LEN);
             if (rc != 0) {
@@ -413,6 +460,7 @@ public final class Metal implements AutoCloseable {
     }
 
     public void commitAndWait() {
+        downcalls++;
         try {
             int rc = (int) commitWait.invokeExact(ctx, err, ERR_LEN);
             if (rc != 0) {

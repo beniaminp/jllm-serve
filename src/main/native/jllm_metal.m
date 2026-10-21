@@ -215,6 +215,61 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
     }
 }
 
+// One command of a recorded decode step (DecodeProgram.java writes them; 384 bytes each, natural alignment):
+// what jm_dispatch takes as arguments, packed, so a whole step crosses from Java in one call.
+typedef struct {
+    int32_t pipe, nbuf, plen, tgmem;
+    int32_t grid[3], threads[3];
+    int32_t pad[2];
+    void *bufs[16];
+    uint64_t offs[16];
+    uint8_t params[64];
+    uint8_t pad2[16];
+} JMCmd;
+_Static_assert(sizeof(JMCmd) == 384, "JMCmd layout is shared with DecodeProgram.java");
+
+// Replays n recorded commands into the current encoder, exactly as n jm_dispatch calls would (the serial encoder
+// orders them; params are copied with setBytes, so the caller may patch the array for the next step at once). State the
+// previous command already set (pipeline, a buffer at an index, its offset) is not set again.
+void jm_run(void *ctx, const JMCmd *cmds, int n) {
+    @autoreleasepool {
+        JMContext *c = (__bridge JMContext *) ctx;
+        id<MTLComputeCommandEncoder> enc = c.enc;
+        int lastPipe = -1;
+        void *bound[16] = {0};
+        uint64_t boundOff[16] = {0};
+        for (int k = 0; k < n; k++) {
+            const JMCmd *d = &cmds[k];
+            if (d->pipe != lastPipe) {
+                [enc setComputePipelineState:c.pipelines[(NSUInteger) d->pipe]];
+                lastPipe = d->pipe;
+            }
+            for (int i = 0; i < d->nbuf; i++) {
+                if (bound[i] != d->bufs[i]) {
+                    [enc setBuffer:(__bridge id<MTLBuffer>) d->bufs[i] offset:(NSUInteger) d->offs[i] atIndex:(NSUInteger) i];
+                    bound[i] = d->bufs[i];
+                    boundOff[i] = d->offs[i];
+                } else if (boundOff[i] != d->offs[i]) {
+                    [enc setBufferOffset:(NSUInteger) d->offs[i] atIndex:(NSUInteger) i];
+                    boundOff[i] = d->offs[i];
+                }
+            }
+            if (d->plen > 0) {
+                [enc setBytes:d->params length:(NSUInteger) d->plen atIndex:(NSUInteger) d->nbuf];
+                if (d->nbuf < 16) {
+                    bound[d->nbuf] = NULL; // setBytes replaced whatever buffer was bound there
+                }
+            }
+            if (d->tgmem > 0) {
+                [enc setThreadgroupMemoryLength:(NSUInteger) d->tgmem atIndex:0];
+            }
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger) d->grid[0], (NSUInteger) d->grid[1], (NSUInteger) d->grid[2])
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger) d->threads[0], (NSUInteger) d->threads[1],
+                                                  (NSUInteger) d->threads[2])];
+        }
+    }
+}
+
 // Submits what has been recorded so far without waiting and opens a fresh command buffer for the dispatches
 // that follow, so the GPU runs the first part of a forward pass while the CPU is still encoding the rest.
 // Command buffers of one queue execute in submission order, so the serial-dependency guarantee of jm_begin
