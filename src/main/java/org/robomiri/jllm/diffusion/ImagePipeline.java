@@ -206,6 +206,8 @@ public final class ImagePipeline implements AutoCloseable {
             ops.free(emb.encoder());
         }
         totalNs = System.nanoTime() - t0;
+        devices.main().trim(1L << 30); // keep up to 1 GB of scratch buffers for the next image
+        devices.vae().trim(1L << 30);
         return out;
     }
 

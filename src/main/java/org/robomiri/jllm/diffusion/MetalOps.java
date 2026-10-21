@@ -59,7 +59,8 @@ final class MetalOps implements Ops {
         long peakBytes;
 
         Gpu() {
-            this.metal = Metal.create(null, "", "diffusion.metal");
+            // -Djllm.diffusion.defines="#define DF_PAD_BYTES 16\n": shader variants for experiments (see the macros at the top of diffusion.metal)
+            this.metal = Metal.create(null, System.getProperty("jllm.diffusion.defines", "").replace("\\n", "\n"), "diffusion.metal");
         }
 
         @Override
@@ -136,9 +137,16 @@ final class MetalOps implements Ops {
         long size = Math.max(16, bytes);
         ArrayDeque<Metal.Buffer> q = gpu.pool.get(size);
         if (q != null && !q.isEmpty()) {
+            gpu.poolBytes -= size;
             return q.pop();
         }
-        Metal.Buffer b = gpu.metal.newBuffer(size, false);
+        Metal.Buffer b;
+        try {
+            b = gpu.metal.newBuffer(size, false);
+        } catch (OutOfMemoryError e) { // give the pooled scratch memory back and try once more
+            trim(0);
+            b = gpu.metal.newBuffer(size, false);
+        }
         gpu.liveBytes += size;
         gpu.peakBytes = Math.max(gpu.peakBytes, gpu.liveBytes);
         return b;
@@ -203,7 +211,24 @@ final class MetalOps implements Ops {
             gpu.liveBytes -= m.bytes;
         } else {
             gpu.pool.computeIfAbsent(m.bytes, k -> new ArrayDeque<>()).push(m.buf);
+            gpu.poolBytes += m.bytes;
         }
+    }
+
+    @Override
+    public void trim(long keepBytes) {
+        if (gpu.poolBytes <= keepBytes) {
+            return;
+        }
+        sync();
+        for (ArrayDeque<Metal.Buffer> q : gpu.pool.values()) {
+            for (Metal.Buffer b : q) {
+                gpu.metal.release(b);
+                gpu.liveBytes -= b.size();
+            }
+        }
+        gpu.pool.clear();
+        gpu.poolBytes = 0;
     }
 
     void releaseAll() {
@@ -432,7 +457,7 @@ final class MetalOps implements Ops {
 
     private void gemm(Tn x, Tn w, Tn out, Tn bias, Tn residual, Act act, int m, int n, int k) {
         int plen = p(DiffusionParams.GEMM).i(m).i(n).i(k).i(k).i(k).i(n).i(1).i(0).i(0).i(0).i(0).i(0).i(0).f(1f)
-                .i(bias != null ? 1 : 0).i(residual != null ? 1 : 0).i(act.ordinal()).i(k % 4 == 0 && n % 4 == 0 ? 1 : 0).done();
+                .i(bias != null ? 1 : 0).i(residual != null ? 1 : 0).i(act.ordinal()).i(k % 8 == 0 && n % 8 == 0 ? 1 : 0).done();
         Metal.Buffer o = buf(out);
         run("df_gemm_nt" + sfx, cdiv(n, 64), cdiv(m, 64), 1, 128, plen, buf(x), buf(w), o,
                 bias != null ? buf(bias) : o, residual != null ? buf(residual) : o);
@@ -559,7 +584,7 @@ final class MetalOps implements Ops {
         long maxScores = 64L << 20; // floats per chunk: 256 MB
         int perHead = (int) Math.max(1, Math.min(heads, maxScores / ((long) lq * ld)));
         MT scores = (MT) createFloats((long) perHead * lq * ld);
-        boolean vec = dm % 4 == 0 && hd % 4 == 0;
+        boolean vec = dm % 8 == 0 && hd % 8 == 0 && ld % 8 == 0;
         MT qm = (MT) q;
         MT km = (MT) k;
         MT vm = (MT) v;

@@ -119,6 +119,21 @@ static inline vec<TD, 4> df_cvt4(vec<TS, 4> v) {
     return vec<TD, 4>{TD(v.x), TD(v.y), TD(v.z), TD(v.w)};
 }
 
+// 8 contiguous elements (16-byte aligned for half) to threadgroup memory, converted when the types differ
+template <typename TS, typename TM>
+static inline void df_load8(device const TS *src, threadgroup TM *dst) {
+    device const vec<TS, 4> *s4 = (device const vec<TS, 4> *)src;
+    threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)dst;
+    d4[0] = df_cvt4<TM, TS>(s4[0]);
+    d4[1] = df_cvt4<TM, TS>(s4[1]);
+}
+
+#if DF_LOAD16B
+static inline void df_load8(device const half *src, threadgroup half *dst) {
+    *(threadgroup float4 *)dst = *(device const float4 *)src;
+}
+#endif
+
 template <typename TS, typename TM>
 static inline void df_load16(device const TS *src, threadgroup TM *dst, int avail, bool useVec) {
     if (useVec && avail >= 16) {
@@ -134,10 +149,31 @@ static inline void df_load16(device const TS *src, threadgroup TM *dst, int avai
 // threadgroup-memory banks (a row of 32 halves is 64 bytes: rows i and i + 2 would share a bank).
 //   LDK: row stride (in TM elements) of a slice that is 32 wide in k     LDN: of a slice that is 64 wide in n
 //   LDS: row stride (floats) of the float32 tile the accumulators are stored in before the epilogue
-#define DF_LDK(TM) (DF_BK + 16 / int(sizeof(TM)))
-#define DF_LDN(TM) (DF_BN + 16 / int(sizeof(TM)))
-#define DF_LDS (DF_BN + 4)
+#ifndef DF_PAD_BYTES
+#define DF_PAD_BYTES 0
+#endif
+#define DF_LDK(TM) (DF_BK + DF_PAD_BYTES / int(sizeof(TM)))
+#define DF_LDN(TM) (DF_BN + DF_PAD_BYTES / int(sizeof(TM)))
+#define DF_LDS (DF_BN + DF_PAD_BYTES / 4)
 #define DF_SMEM_FLOATS 5120     // 20 KB: both slices (float: 2 x 64 x 36 x 4 B = 18 KB) or the 64 x 68 float tile (17 KB)
+
+// same element type on both sides (half, half): 16-byte vectors, two per 16 elements (vec = 1 guarantees 16-byte alignment:
+// the strides and offsets are multiples of 8 halves)
+#ifndef DF_LOAD16B
+#define DF_LOAD16B 1
+#endif
+#if DF_LOAD16B
+static inline void df_load16(device const half *src, threadgroup half *dst, int avail, bool useVec) {
+    if (useVec && avail >= 16) {
+        device const float4 *s4 = (device const float4 *)src;
+        threadgroup float4 *d4 = (threadgroup float4 *)dst;
+        d4[0] = s4[0];
+        d4[1] = s4[1];
+    } else {
+        for (int i = 0; i < 16; i++) dst[i] = i < avail ? src[i] : half(0);
+    }
+}
+#endif
 
 // the 4 x 4 accumulators of one simdgroup over the staged 64 x 32 A and B slices
 template <typename TM, bool BT>
@@ -307,11 +343,8 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                 const int iy = oy * p.stride - p.padT + ky;
                 const int ix = ox * p.stride - p.padL + kx;
                 if (iy >= 0 && iy < p.h && ix >= 0 && ix < p.w) {
-                    device const vec<T, 4> *s4 = (device const vec<T, 4> *)(x + ((long)(bi * (p.h >> p.ups) + (iy >> p.ups))
-                                                                                  * (p.w >> p.ups) + (ix >> p.ups)) * p.cin + ci);
-                    threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)(da + g * 8);
-                    d4[0] = df_cvt4<TM, T>(s4[0]);
-                    d4[1] = df_cvt4<TM, T>(s4[1]);
+                    df_load8(x + ((long)(bi * (p.h >> p.ups) + (iy >> p.ups)) * (p.w >> p.ups) + (ix >> p.ups)) * p.cin + ci,
+                             da + g * 8);
                 } else {
                     for (int i = 0; i < 8; i++) da[g * 8 + i] = TM(0);
                 }
@@ -324,9 +357,8 @@ kernel void df_conv(device const T *x [[buffer(0)]],
             device const T *wr = w + (long)n * K + k0 + ak;
             const int avail = K - k0 - ak;
             if (avail >= 16) {
-                device const vec<T, 4> *s4 = (device const vec<T, 4> *)wr;
-                threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)db;
-                for (int i = 0; i < 4; i++) d4[i] = df_cvt4<TM, T>(s4[i]);
+                df_load8(wr, db);
+                df_load8(wr + 8, db + 8);
             } else {
                 for (int i = 0; i < 16; i++) db[i] = i < avail ? TM(wr[i]) : TM(0);
             }

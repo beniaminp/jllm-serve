@@ -50,6 +50,10 @@ public interface Ops extends AutoCloseable {
     /** Waits until everything submitted has finished. */
     void sync();
 
+    /** Releases pooled scratch memory beyond {@code keepBytes} (the GPU pool grows with the largest image made so far). */
+    default void trim(long keepBytes) {
+    }
+
     /** Loads a checkpoint tensor as a weight of the given kind (converted to this device's format). */
     Tn weight(SafeTensors.Tensor t, Kind kind);
 
