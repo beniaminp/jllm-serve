@@ -124,5 +124,10 @@ BUILDX_CREATE_OPTS="--buildkitd-config buildkitd.toml" …   # registry CA for t
 - **amd64:** the image was built and run on a 4-core x86 Linux machine. It became healthy, printed and kept its
   generated key across a restart, and rejected requests without the key (401). It loaded Qwen3-0.6B from the
   volume (CPU backend, AVX-512) and answered a chat completion through `/v1/chat/completions`.
+- **native kernels (amd64):** the `native` stage alone (`docker buildx build --target native`) compiled
+  `libjllm_cpu.so` in 4.4 s, and `NativeCpuCheck` run inside that image against it passed (678 checks, levels
+  scalar / avx2 / avx512-vnni). The full image with this stage has not been rebuilt here. For arm64 the same C code
+  was cross-compiled and run under qemu-aarch64 (`src/test/native/jllm_cpu_levels.c`, NEON and dotprod against
+  scalar), but not as a Docker build.
 - **arm64:** the image was built (650 MB amd64, 673 MB arm64) but could not be run on that machine. Run it on an
   ARM machine or a Mac before publishing.

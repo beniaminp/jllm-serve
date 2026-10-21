@@ -34,6 +34,7 @@ mkdir -p "$(dirname "$OUT")"
 # shellcheck disable=SC2086
 if ! $CC -std=c11 -O2 -fvisibility=hidden -ffp-contract=off -fno-fast-math -Wall -Wextra -Wno-unused-function \
     $FLAGS -o "$OUT" src/main/native/jllm_cpu.c -lm; then
+  rm -f "$OUT"
   if $optional; then
     echo "build-native-cpu: compiling failed, libjllm_cpu not built (the Java kernels are used)"
     exit 0
