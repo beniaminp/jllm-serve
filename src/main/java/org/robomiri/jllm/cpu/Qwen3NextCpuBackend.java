@@ -66,6 +66,9 @@ public final class Qwen3NextCpuBackend implements Backend {
     private float[][] ckConv;
     private float[][] ckState;
     private int ckPos;
+    private boolean armed;          // checkpointState() was called: the next pass is remembered to be replayed
+    private int[] armedTokens;
+    private int armedPos;
 
     private final float[][] convState;
     private final float[][] state;
@@ -207,6 +210,11 @@ public final class Qwen3NextCpuBackend implements Backend {
     private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (armed) { // a verification pass: its tokens are kept so that rollbackState can replay the first ones
+            armed = false;
+            armedTokens = Arrays.copyOfRange(tokens, off, off + n);
+            armedPos = pos;
         }
         if (pos == 0) {
             for (float[] s : convState) {
@@ -361,10 +369,11 @@ public final class Qwen3NextCpuBackend implements Backend {
         if (feeder != null) {
             feeder.snapshot();
         }
+        armed = true;
     }
 
     @Override
-    public void rollbackState() {
+    public void rollbackState(int keep) {
         for (int l = 0; l < convState.length; l++) {
             System.arraycopy(ckConv[l], 0, convState[l], 0, convState[l].length);
             System.arraycopy(ckState[l], 0, state[l], 0, state[l].length);
@@ -373,6 +382,7 @@ public final class Qwen3NextCpuBackend implements Backend {
         if (feeder != null) {
             feeder.restore();
         }
+        run(armedTokens, 0, keep, armedPos, null, 0); // the first tokens again: the state after them, and the head's rows
     }
 
     // ------------------------------------------------------------------ Gated DeltaNet

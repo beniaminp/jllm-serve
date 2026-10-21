@@ -8,6 +8,8 @@
 #   scripts/mac-validate.sh                                  Qwen/Qwen3-0.6B, ~25 minutes
 #   scripts/mac-validate.sh --moe Qwen/Qwen3-30B-A3B         plus the MoE rows (needs ~20 GB free memory)
 #   scripts/mac-validate.sh --skip-smoke                     speed only
+#   scripts/mac-validate.sh --qwen35 /path/to/Qwen3.5-27B-Q4_0.gguf   plus multi-token-prediction speculation on/off
+#                                                                     (a qwen35 GGUF with its nextn layer; ~19 GB of memory)
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
 #   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
@@ -23,6 +25,7 @@ cd "$(dirname "$0")/.."
 [ "$(uname)" = "Darwin" ] || { echo "run this on a Mac (Apple Silicon): it measures the Metal backend" >&2; exit 2; }
 DENSE=Qwen/Qwen3-0.6B
 MOE=""
+QWEN35=""
 SMOKE=1
 ROUNDS=3
 VS_LLAMA=""
@@ -34,6 +37,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --model) DENSE="$2"; shift 2 ;;
     --moe) MOE="$2"; shift 2 ;;
+    --qwen35) QWEN35="$2"; shift 2 ;;
     --skip-smoke) SMOKE=""; shift ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
     --vs-llama) VS_LLAMA=1; shift ;;
@@ -133,6 +137,13 @@ if [ -n "$MOE" ]; then
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
+fi
+# multi-token prediction (engine.speculative=mtp, docs/10 section 10.9, docs/16 section 16.13): the model's own nextn
+# head drafts one token per step, the target verifies it with the next position. The bench prompt repeats itself,
+# which flatters every speculation mode a little.
+if [ -n "$QWEN35" ]; then
+  bench "$QWEN35: speculation off" "$QWEN35" "" --engine.speculative off
+  bench "$QWEN35: multi-token prediction (mtp)" "$QWEN35" "" --engine.speculative mtp
 fi
 echo
 echo "(median of $ROUNDS rounds; logs in $OUT)"

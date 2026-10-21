@@ -681,9 +681,9 @@ public final class GgufQwenNextTest {
             ckPos = pos;
         }
 
-        public void rollbackState() {
-            inner.rollbackState();
-            pos = ckPos;
+        public void rollbackState(int keep) {
+            inner.rollbackState(keep);
+            pos = ckPos + keep;
         }
 
         public void close() {
@@ -794,7 +794,6 @@ public final class GgufQwenNextTest {
                                 sp.accepted(), sp.drafted());
                     }
                 }
-                b.enableMtp(true);
                 try (GgufModel g3 = GgufModel.open(file); ModelWeights w3 = g3.weights(); Backend real = gpu.open(w3);
                      Speculator sp = new Speculator(cfg, real, null, VOCAB, VOCAB, Set.of())) {
                     int[] got = speculative(real, sp, prompt, n);

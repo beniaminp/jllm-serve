@@ -3075,6 +3075,7 @@ struct GdnConvParams {
     int ntok;
     int inStride;   // floats per token of the input (the fused projection row)
     int outStride;  // floats per token of the output
+    int snapTok;    // >= 0: also write the conv state as it is after token snapTok to snap (a verification pass keeps it); -1: no
 };
 
 // y[t, c] = silu(sum_k w[c, k] * window[k]) with window = (the conv state of channel c, x[t, c]): Qwen3-Next's
@@ -3084,7 +3085,8 @@ kernel void gdn_conv(device const float *x [[buffer(0)]],
                      device const float *w [[buffer(1)]],
                      device float *state [[buffer(2)]],
                      device float *y [[buffer(3)]],
-                     constant GdnConvParams &p [[buffer(4)]],
+                     device float *snap [[buffer(4)]],
+                     constant GdnConvParams &p [[buffer(5)]],
                      uint gid [[thread_position_in_grid]]) {
     const int c = int(gid);
     if (c >= p.channels) return;
@@ -3103,6 +3105,9 @@ kernel void gdn_conv(device const float *x [[buffer(0)]],
         for (int k = 0; k + 1 < kc - 1; k++) win[k] = win[k + 1];
         if (kc > 1) win[kc - 2] = u;
         y[(ulong)t * p.outStride + c] = sum / (1.0f + precise::exp(-sum));
+        if (t == p.snapTok) {
+            for (int k = 0; k < kc - 1; k++) snap[(ulong)c * (kc - 1) + k] = win[k];
+        }
     }
     for (int k = 0; k < kc - 1; k++) st[k] = win[k];
 }
@@ -3118,6 +3123,7 @@ struct GdnRuleParams {
     int bOff;       // offset of b in a projection row; a follows after valueHeads
     float eps;      // of the q / k L2 norm
     int tiled;      // 1: value head h reads key head h % keyHeads (Qwen3.5 GGUF order); 0: h / (valueHeads / keyHeads)
+    int snapTok;    // >= 0: also write the state as it is after token snapTok to snapState; -1: no
 };
 
 // The gated delta rule of value head h = tgp.y, state column j (value dim) = tgp.x * GDN_COLS + simdgroup:
@@ -3132,7 +3138,8 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
                      device const float *dtBias [[buffer(3)]],
                      device float *state [[buffer(4)]],
                      device float *out [[buffer(5)]],
-                     constant GdnRuleParams &p [[buffer(6)]],
+                     device float *snapState [[buffer(6)]],
+                     constant GdnRuleParams &p [[buffer(7)]],
                      uint2 tgp [[threadgroup_position_in_grid]],
                      ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]]) {
@@ -3184,6 +3191,10 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
         }
         o = simd_sum(o);
         if (lane == 0) out[(ulong)t * p.valueHeads * p.valueDim + h * p.valueDim + j] = o;
+        if (t == p.snapTok) {
+            device float *sc = snapState + ((ulong)h * p.valueDim + j) * dk;
+            for (int r = 0; r < per; r++) sc[lane + 32 * r] = s[r];
+        }
     }
     for (int r = 0; r < per; r++) col[lane + 32 * r] = s[r];
 }

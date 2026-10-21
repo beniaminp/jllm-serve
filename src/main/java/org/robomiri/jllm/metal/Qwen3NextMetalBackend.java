@@ -102,6 +102,9 @@ public final class Qwen3NextMetalBackend implements Backend {
     private Metal.Buffer[] ckConv;
     private Metal.Buffer[] ckState;
     private int ckPos;
+    private boolean armed;          // checkpointState(): the next pass of two tokens saves the state after its first token
+    private boolean captured;       // ... and did (ckConv / ckState hold it)
+    private int capturedPos;
 
     private static final class LayerBufs {
         Metal.Buffer attnNorm;
@@ -358,11 +361,18 @@ public final class Qwen3NextMetalBackend implements Backend {
 
     private static final int MAX_ALL_ROWS = 16;
 
+    /** This pass saves the DeltaNet states after its first token into {@link #ckConv} / {@link #ckState}. */
+    private boolean capture;
+
     /** {@code stride == 0}: the logits of the last row into {@code logits}; else row i to {@code logits[i * stride ..)}. */
     private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
+        capture = armed && n == 2 && stride > 0;
+        armed = false;
+        captured = capture;
+        capturedPos = pos;
         if (pos == 0) {
             for (int i = 0; i < state.length; i++) {
                 convState[i].contents().fill((byte) 0);
@@ -533,6 +543,11 @@ public final class Qwen3NextMetalBackend implements Backend {
         return true;
     }
 
+    /**
+     * The next {@link #forwardAll} of two tokens writes the conv and recurrent states as they are after its first token
+     * to a second set of buffers while it computes the second ({@code gdn_conv} / {@code gdn_rule} snapshot parameter),
+     * so a rejected draft costs a swap of the two sets, not a replay.
+     */
     @Override
     public void checkpointState() {
         if (ckConv == null) {
@@ -543,25 +558,27 @@ public final class Qwen3NextMetalBackend implements Backend {
                 ckState[l] = k.scratch((long) dn.stateSize() * 4);
             }
         }
-        for (int l = 0; l < state.length; l++) {
-            MemorySegment.copy(convState[l].contents(), 0, ckConv[l].contents(), 0, (long) dn.convStateSize() * 4);
-            MemorySegment.copy(state[l].contents(), 0, ckState[l].contents(), 0, (long) dn.stateSize() * 4);
-        }
-        ckPos = statePos;
-        if (feeder != null) {
-            feeder.snapshot();
-        }
+        armed = true;
+        captured = false;
     }
 
     @Override
-    public void rollbackState() {
-        for (int l = 0; l < state.length; l++) {
-            MemorySegment.copy(ckConv[l].contents(), 0, convState[l].contents(), 0, (long) dn.convStateSize() * 4);
-            MemorySegment.copy(ckState[l].contents(), 0, state[l].contents(), 0, (long) dn.stateSize() * 4);
+    public void rollbackState(int keep) {
+        if (!captured || keep != 1) {
+            throw new IllegalStateException("no state was saved after " + keep + " tokens of the last pass");
         }
-        statePos = ckPos;
+        for (int l = 0; l < state.length; l++) {
+            Metal.Buffer c = convState[l];
+            convState[l] = ckConv[l];
+            ckConv[l] = c;
+            Metal.Buffer s = state[l];
+            state[l] = ckState[l];
+            ckState[l] = s;
+        }
+        captured = false;
+        statePos = capturedPos + keep;
         if (feeder != null) {
-            feeder.restore();
+            feeder.truncate(capturedPos, keep, hid);
         }
     }
 
@@ -572,14 +589,14 @@ public final class Qwen3NextMetalBackend implements Backend {
         if (d.split()) { // q k v | z | b a are three products in three buffers
             k.matmul(d.z(), b.inProjZ, xb, 0, projZ, 0, n, false, null, 0f);
             k.matmul(d.ba(), b.inProjBa, xb, 0, projBa, 0, n, false, null, 0f);
-            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), cd, cd, n);
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), cd, cd, n, capture ? ckConv[li] : null, 0);
             k.gdnRule(qkv, projBa, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
-                    cd, 2 * dn.valueHeads(), 0, 1e-6f, dn.tiled(), n);
+                    cd, 2 * dn.valueHeads(), 0, 1e-6f, dn.tiled(), n, capture ? ckState[li] : null, 0);
             k.gdnNormGate(o, projZ, b.gdnNorm, dn.valueDim(), dn.valueHeads(), dn.valueWidth(), 0, n);
         } else {
-            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n);
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n, capture ? ckConv[li] : null, 0);
             k.gdnRule(qkv, proj, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
-                    cd, pd, cd + dn.valueWidth(), 1e-6f, dn.tiled(), n);
+                    cd, pd, cd + dn.valueWidth(), 1e-6f, dn.tiled(), n, capture ? ckState[li] : null, 0);
             k.gdnNormGate(o, proj, b.gdnNorm, dn.valueDim(), dn.valueHeads(), pd, cd, n);
         }
         k.matmul(d.outProj(), b.outProj, o, 0, x, 0, n, true, null, 0f);

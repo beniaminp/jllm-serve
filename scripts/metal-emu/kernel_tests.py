@@ -229,9 +229,13 @@ def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
     ref = ref / (1 + np.exp(-ref))
     want_state = seq[-(kc - 1):].T
     s = state.copy()
-    E.dispatch('gdn_conv', [x, w, s, y], pack('iiiii', channels, kc, ntok, in_stride, channels),
+    snap = np.zeros_like(state)
+    snap_tok = ntok // 2
+    E.dispatch('gdn_conv', [x, w, s, y, snap], pack('iiiiii', channels, kc, ntok, in_stride, channels, snap_tok),
                ((channels + 63) // 64,), (64,))
-    err = max(np.abs(y - ref).max(), np.abs(s - want_state).max())
+    # the snapshot is the conv state after token snap_tok: the last kc - 1 inputs up to and including it
+    want_snap = seq[snap_tok + 1:snap_tok + kc].T
+    err = max(np.abs(y - ref).max(), np.abs(s - want_state).max(), np.abs(snap - want_snap).max())
     check(err < 1e-5, 'gdn_conv channels=%d kernel=%d ntok=%d: max err %.2e' % (channels, kc, ntok, err))
 
 
@@ -267,10 +271,16 @@ def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5, tiled=0):
             d = (v - S[h].T @ k) * beta
             S[h] += np.outer(k, d)
             ref[t, h] = S[h].T @ q
+        if t == ntok // 2:
+            S_snap = S.copy()
     st = S0.copy()
-    E.dispatch('gdn_rule', [qkv, proj, A, dtb, st, out],
-               pack('iiiiiiiifi', nk, nv, dk, dv, ntok, conv, proj_stride, b_off, 1e-6, tiled), ((dv + 3) // 4, nv), (128,))
-    err = max(np.abs(out - ref.reshape(ntok, -1)).max(), np.abs(st - S.transpose(0, 2, 1)).max())
+    snap = np.zeros_like(S0)
+    snap_tok = ntok // 2
+    E.dispatch('gdn_rule', [qkv, proj, A, dtb, st, out, snap],
+               pack('iiiiiiiifii', nk, nv, dk, dv, ntok, conv, proj_stride, b_off, 1e-6, tiled, snap_tok),
+               ((dv + 3) // 4, nv), (128,))
+    err = max(np.abs(out - ref.reshape(ntok, -1)).max(), np.abs(st - S.transpose(0, 2, 1)).max(),
+              np.abs(snap - S_snap.transpose(0, 2, 1)).max())
     check(err < 1e-5, 'gdn_rule nk=%d nv=%d dk=%d dv=%d ntok=%d tiled=%d: max err %.2e' % (nk, nv, dk, dv, ntok, tiled, err))
 
 

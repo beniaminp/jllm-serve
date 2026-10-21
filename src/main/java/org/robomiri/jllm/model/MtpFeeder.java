@@ -123,6 +123,17 @@ public final class MtpFeeder {
         doneToken = token;
     }
 
+    /**
+     * After a pass of which only the first {@code kept} tokens count (the rest was a rejected draft): the last kept
+     * position's hidden state is the pending one again, as if the pass had been that short. The head's rows computed for
+     * positions past it are overwritten by the next pass.
+     */
+    public void truncate(int pos, int kept, float[] hidden) {
+        System.arraycopy(hidden, (kept - 1) * dim, pending, 0, dim);
+        pendingPos = pos + kept - 1;
+        doneToken = -1;
+    }
+
     /** Remembers the pending hidden state (before a verification pass that may be rolled back). */
     public void snapshot() {
         System.arraycopy(pending, 0, savedPending, 0, dim);

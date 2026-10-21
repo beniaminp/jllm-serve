@@ -106,20 +106,28 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
-     * Whether {@link #checkpointState} / {@link #rollbackState} work: a recurrent state is saved before a verification
-     * pass and put back when drafts are rejected (the KV cache needs nothing: later positions are overwritten).
+     * Whether {@link #checkpointState} / {@link #rollbackState} work: before a verification pass of two tokens the
+     * recurrent state is armed to be kept after the first of them, and when the draft (the second) is rejected the state
+     * is put back to that point (the KV cache needs nothing: later positions are overwritten).
      */
     default boolean supportsRollback() {
         return false;
     }
 
-    /** Saves the whole state (recurrent states, head bookkeeping) as it is now; one checkpoint is kept. */
+    /**
+     * Arms the next pass ({@link #forwardAll} of two tokens): the recurrent state and the head's bookkeeping as they are
+     * after its <em>first</em> token can be restored by {@link #rollbackState}. One checkpoint is kept. A backend may
+     * save the state as it is now and replay, or have the pass save it on the way.
+     */
     default void checkpointState() {
         throw new UnsupportedOperationException(name() + " cannot checkpoint its state");
     }
 
-    /** Puts the state back to the last {@link #checkpointState}. */
-    default void rollbackState() {
+    /**
+     * Puts the state to what it was after the first {@code keep} (= 1) tokens of the pass armed by
+     * {@link #checkpointState}, as if only they had been fed.
+     */
+    default void rollbackState(int keep) {
         throw new UnsupportedOperationException(name() + " cannot roll back its state");
     }
 

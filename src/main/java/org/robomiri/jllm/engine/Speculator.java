@@ -256,7 +256,7 @@ public final class Speculator implements AutoCloseable {
         long t1 = System.nanoTime();
         boolean mtp = cfg.mode() == Mode.MTP;
         if (mtp) {
-            target.checkpointState(); // the recurrent state goes through every fed token: kept to undo the rejected ones
+            target.checkpointState(); // the recurrent state goes through every fed token: kept to undo the rejected one
         }
         target.forwardAll(feed, 0, m + 1, pos, rows, stride);
         cost.verify(m + 1, System.nanoTime() - t1);
@@ -287,9 +287,8 @@ public final class Speculator implements AutoCloseable {
             }
             break;
         }
-        if (mtp && acc < m) { // the state ran through rejected tokens: back to before the pass, then only the accepted ones
-            target.rollbackState();
-            target.forward(feed, 0, acc + 1, pos, null);
+        if (mtp && acc < m) { // the state ran through the rejected draft: back to after the accepted tokens
+            target.rollbackState(acc + 1);
         }
         cost.acceptance(acc, examined);
         // whole draft accepted: try longer ones next time; else as many as this text supported

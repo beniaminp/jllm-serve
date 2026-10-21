@@ -1086,12 +1086,19 @@ final class MetalKernels implements AutoCloseable {
     /** y[t, c] = silu(causal conv of channel c) over n tokens with the carried conv state (gdn_conv). */
     void gdnConv(Metal.Buffer x, Metal.Buffer w, Metal.Buffer state, Metal.Buffer y, int channels, int kernel,
                  int inStride, int outStride, int n) {
+        gdnConv(x, w, state, y, channels, kernel, inStride, outStride, n, null, -1);
+    }
+
+    /** As above; with {@code snapTok >= 0} the state after that token also goes to {@code snap} (same layout as {@code state}). */
+    void gdnConv(Metal.Buffer x, Metal.Buffer w, Metal.Buffer state, Metal.Buffer y, int channels, int kernel,
+                 int inStride, int outStride, int n, Metal.Buffer snap, int snapTok) {
         bind(0, x, 0);
         bind(1, w, 0);
         bind(2, state, 0);
         bind(3, y, 0);
-        p.reset(KernelParams.GDN_CONV).i(channels).i(kernel).i(n).i(inStride).i(outStride);
-        dispatch("gdn_conv", 4, 0, channelGrid(channels), 1, 1, CHANNEL_THREADS, 1, 1);
+        bind(4, snap != null ? snap : state, 0);
+        p.reset(KernelParams.GDN_CONV).i(channels).i(kernel).i(n).i(inStride).i(outStride).i(snap != null ? snapTok : -1);
+        dispatch("gdn_conv", 5, 0, channelGrid(channels), 1, 1, CHANNEL_THREADS, 1, 1);
     }
 
     /** The gated delta rule over n tokens for every (value head, state column) (gdn_rule). */
@@ -1099,22 +1106,31 @@ final class MetalKernels implements AutoCloseable {
                  Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
                  int bOff, float l2Eps, int n) {
         gdnRule(qkv, proj, a, dtBias, state, out, keyHeads, valueHeads, keyDim, valueDim, qkvStride, projStride, bOff, l2Eps,
-                false, n);
+                false, n, null, -1);
     }
 
     /** As above; {@code tiled}: value head h reads key head h % keyHeads (Qwen3.5 GGUF order) instead of h / group. */
     void gdnRule(Metal.Buffer qkv, Metal.Buffer proj, Metal.Buffer a, Metal.Buffer dtBias, Metal.Buffer state,
                  Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
                  int bOff, float l2Eps, boolean tiled, int n) {
+        gdnRule(qkv, proj, a, dtBias, state, out, keyHeads, valueHeads, keyDim, valueDim, qkvStride, projStride, bOff, l2Eps,
+                tiled, n, null, -1);
+    }
+
+    /** As above; with {@code snapTok >= 0} the state after that token also goes to {@code snap} (same layout as {@code state}). */
+    void gdnRule(Metal.Buffer qkv, Metal.Buffer proj, Metal.Buffer a, Metal.Buffer dtBias, Metal.Buffer state,
+                 Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
+                 int bOff, float l2Eps, boolean tiled, int n, Metal.Buffer snap, int snapTok) {
         bind(0, qkv, 0);
         bind(1, proj, 0);
         bind(2, a, 0);
         bind(3, dtBias, 0);
         bind(4, state, 0);
         bind(5, out, 0);
+        bind(6, snap != null ? snap : state, 0);
         p.reset(KernelParams.GDN_RULE).i(keyHeads).i(valueHeads).i(keyDim).i(valueDim).i(n).i(qkvStride).i(projStride)
-                .i(bOff).f(l2Eps).i(tiled ? 1 : 0);
-        dispatch("gdn_rule", 6, 0, (valueDim + GDN_COLS - 1) / GDN_COLS, valueHeads, 1, GDN_COLS * 32, 1, 1);
+                .i(bOff).f(l2Eps).i(tiled ? 1 : 0).i(snap != null ? snapTok : -1);
+        dispatch("gdn_rule", 7, 0, (valueDim + GDN_COLS - 1) / GDN_COLS, valueHeads, 1, GDN_COLS * 32, 1, 1);
     }
 
     /** o[row] = rmsnorm(o[row]) * w * silu(z[row]) for the n * valueHeads rows of valueDim (gdn_norm_gate). */
