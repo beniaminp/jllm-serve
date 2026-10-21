@@ -4,7 +4,15 @@ import org.robomiri.jllm.model.Attention;
 
 import java.util.Arrays;
 
-/** TEMPORARY accuracy-study simulation of q4 KV variants (not for commit). */
+/**
+ * Accuracy-study simulation of q4 KV variants (docs/07 §7.13, "where the error comes from"; never used unless
+ * {@code -Dq4.sim=true}): K and V are rounded through the chosen quantizer and stored dequantized in an f32 cache, so
+ * one run can vary what the shipped {@link Q4} fixes. Switches: {@code q4.rotk} / {@code q4.rotv} (normalized
+ * Hadamard rotation of K / V), {@code q4.qk} / {@code q4.qv} (quantize K / V at all), {@code q4.bits},
+ * {@code q4.group}, {@code q4.symh} (the shipped symmetric mid-rise levels; off: ggml Q4_0's {@code d = m / -8}),
+ * {@code q4.asymk} / {@code q4.asymv} (min/max scale and offset), {@code q4.sink} (keep the first positions exact),
+ * {@code q4.recent} (a window of exact positions).
+ */
 public final class KvQ4Sim extends KvCache {
     static final boolean ROT_K = Boolean.parseBoolean(System.getProperty("q4.rotk", "true"));
     static final boolean ROT_V = Boolean.parseBoolean(System.getProperty("q4.rotv", "false"));
