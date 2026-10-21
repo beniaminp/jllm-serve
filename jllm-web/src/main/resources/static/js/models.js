@@ -174,6 +174,9 @@ const Models = (() => {
     try {
       const [loaded, jobs] = await Promise.all([refreshLoaded(), api('/api/jobs')]);
       renderLoaded(loaded); renderJobs(jobs);
+      // audio:begin
+      window.AudioUI?.renderModelsRows();
+      // audio:end
       const busy = jobs.some(j => j.state === 'RUNNING');
       // the disk listing is redrawn when asked or while jobs change it, never under an open load form
       if ((full || busy || Date.now() - lastLocal > 15000) && !$('#local-list .inline-form')) {

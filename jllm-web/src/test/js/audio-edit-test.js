@@ -263,6 +263,48 @@ test('subtitles and clock', () => {
   assert.equal(E.clock(5, 0), '0:05');
 });
 
+test('planTextEdit + applyTextEdit: delete, replace, insert', () => {
+  const rate = 1000;
+  // five words of 200 frames each with 100 frame pauses: "one two three four five"
+  const texts = ['one', 'two', 'three', 'four', 'five'];
+  const words = texts.map((t, i) => ({text: t, s: i * 300, e: i * 300 + 200}));
+  const total = 5 * 300;
+  const c = E.clip(rate, [Float32Array.from({length: total}, (_, i) => (i % 300 < 200 ? 0.5 : 0))]);
+  const edit = (newText, pieces) => {
+    const nw = E.tokenize(newText);
+    const ops = E.diffWords(texts, nw);
+    const plan = E.planTextEdit(words, ops, nw, 250);
+    const ps = plan.map(r => (r.text ? pieces(r) : null));
+    return {plan, res: E.applyTextEdit(c, plan, ps, 0)};
+  };
+  const tone = n => E.clip(rate, [new Float32Array(n).fill(0.9)]);
+  // delete "three": cuts the word and the pause after it
+  let r = edit('one two four five', () => null);
+  assert.deepEqual(r.plan.map(x => [x.type, x.cutA, x.cutB]), [['delete', 600, 900]]);
+  assert.equal(E.length(r.res.clip), total - 300);
+  // replace "two" by a 150 frame piece
+  r = edit('one deux three four five', () => tone(150));
+  assert.deepEqual(r.plan.map(x => [x.type, x.cutA, x.cutB, x.text]), [['replace', 300, 500, 'deux']]);
+  assert.equal(E.length(r.res.clip), total - 200 + 150);
+  assert.deepEqual(r.res.spans, [[300, 450]]);
+  near(r.res.clip.channels[0][320], 0.9, 1e-6); near(r.res.clip.channels[0][460], 0, 1e-6);
+  // insert "very" before "three": into the middle of the pause (frame 550)
+  r = edit('one two very three four five', () => tone(100));
+  assert.deepEqual(r.plan.map(x => [x.type, x.cutA, x.cutB]), [['insert', 550, 550]]);
+  assert.equal(E.length(r.res.clip), total + 100);
+  // two regions, with cross-fades of 10 frames
+  const nw = E.tokenize('uno two three quatro five'), ops = E.diffWords(texts, nw);
+  const plan = E.planTextEdit(words, ops, nw, 250);
+  assert.equal(plan.length, 2);
+  const res = E.applyTextEdit(c, plan, [tone(100), tone(100)], 10);
+  // kept 700 + 400 and two pieces of 100 = 1300, minus three cross-fades of 10 (the first join follows an empty part)
+  assert.equal(E.length(res.clip), 1270);
+  assert.equal(res.spans.length, 2);
+  // delete at the end takes the pause before the removed words, not beyond the clip
+  r = edit('one two three four', () => null);
+  assert.deepEqual(r.plan.map(x => [x.type, x.cutA, x.cutB]), [['delete', 1100, 1400]]);
+});
+
 test('limit keeps values within +-1', () => {
   const c = E.clip(8000, [Float32Array.from([0.5, 1.5, -3, 0.95])]);
   const l = E.limit(c);

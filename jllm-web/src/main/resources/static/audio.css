@@ -1,0 +1,101 @@
+/* jllm console: the Audio tab and the audio controls in the chat. Uses the variables of app.css (light and dark). */
+
+/* ---------------------------------------------------------------- the tab */
+#tab-audio .au-models { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+#tab-audio .au-models .hint { flex-basis: 100%; margin: 2px 0 0; }
+.au-pane { display: flex; flex-direction: column; gap: 16px; }
+.au-pane > .card { width: 100%; }
+#tab-audio textarea { width: 100%; resize: vertical; }
+#tab-audio button:focus-visible, .au-wave:focus-visible, .au-drop:focus-visible, .au-menu button:focus-visible, .au-composer button:focus-visible,
+.au-mic:focus-visible, .au-attach:focus-visible, .au-speak:focus-visible, .au-ts:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#tab-audio .au-actions { margin: 8px 0 4px; }
+.au-sep { width: 1px; align-self: stretch; background: var(--border); margin: 2px 4px; }
+.au-range { flex-direction: row; align-items: center; gap: 8px; }
+.au-range input[type=range] { flex: 1; min-width: 90px; accent-color: var(--accent); padding: 0; }
+.au-range output { min-width: 52px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* recording */
+button.recording { background: var(--danger); border-color: var(--danger); color: #fff; animation: au-rec 1.4s ease-in-out infinite; }
+@keyframes au-rec { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 30%, transparent); } }
+.au-meter { width: 120px; height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; border: 1px solid var(--border); flex-shrink: 0; }
+.au-meter div { height: 100%; width: 0; background: linear-gradient(90deg, var(--ok), var(--warn) 75%, var(--danger)); background-size: 120px 100%; transition: width .05s linear; }
+.au-time { font-variant-numeric: tabular-nums; color: var(--text); font-size: 13px; min-width: 52px; }
+
+/* speech to text */
+.au-drop { border: 1.5px dashed var(--border); border-radius: 10px; padding: 8px 12px; transition: border-color .15s, background .15s; }
+.au-drop.over, .au-wave.over { border-color: var(--accent); background: var(--accent-2); }
+.au-clipbox { margin-top: 12px; }
+.au-clipbox audio, #tts-audio, #ed-rep-audio { width: 100%; max-width: 560px; height: 40px; }
+.au-segs { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; max-height: 460px; overflow: auto; }
+.au-seg { display: flex; gap: 10px; align-items: baseline; padding: 4px 8px; border-radius: 8px; cursor: pointer; }
+.au-seg:hover { background: var(--panel-2); }
+.au-seg.on { background: var(--accent-2); }
+.au-ts { border: none; background: transparent; color: var(--accent); font: 12px var(--mono); padding: 0 2px; flex-shrink: 0; min-width: 56px; text-align: left; }
+.au-seg-text { overflow-wrap: anywhere; }
+.au-w { border-radius: 4px; padding: 0 1px; }
+.au-segs .au-w { cursor: pointer; }
+.au-segs .au-w:hover, .au-segs .au-w.on { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+
+/* editor */
+.au-ed { padding-bottom: 10px; }
+.au-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+.au-toolbar select { padding: 4px 6px; }
+.au-wave { position: relative; height: 230px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--panel-2); outline-offset: 2px; }
+.au-wave canvas { display: block; width: 100%; height: 100%; touch-action: pan-y; }
+.au-wave-empty { position: absolute; inset: 24px 0 0; display: grid; place-items: center; text-align: center; padding: 0 24px; color: var(--muted); font-style: italic; pointer-events: none; }
+.au-scroll { position: relative; height: 12px; margin-top: 6px; background: var(--panel-2); border-radius: 6px; border: 1px solid var(--border); }
+.au-scroll.full { opacity: .5; }
+.au-scroll div { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 45%, var(--panel)); border-radius: 5px; min-width: 14px; cursor: grab; touch-action: none; }
+.au-status { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+.au-status #ed-pos { color: var(--text); font-family: var(--mono); }
+.au-ops { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; align-items: start; }
+.au-op { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.au-op.au-wide { grid-column: 1 / -1; }
+.au-op h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.au-op .row { margin: 6px 0; }
+.au-op .row > input { flex: none; min-width: 0; }
+.au-op textarea { margin-top: 4px; }
+.au-words { min-height: 70px; max-height: 260px; overflow: auto; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+            font-size: 15px; line-height: 1.9; white-space: pre-wrap; outline-offset: 1px; }
+.au-words:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.au-words .au-w:hover { background: color-mix(in srgb, var(--warn) 30%, transparent); }
+.au-changes { margin: 6px 0; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.au-chg del { color: var(--danger); } .au-chg ins { color: var(--ok); text-decoration: none; font-weight: 600; }
+.au-chg { padding: 2px 8px; border-left: 3px solid var(--border); }
+.au-chg.delete { border-left-color: var(--danger); } .au-chg.insert { border-left-color: var(--ok); } .au-chg.replace { border-left-color: var(--warn); }
+
+/* ---------------------------------------------------------------- chat */
+.au-comp { display: inline-flex; align-items: center; gap: 2px; margin-right: auto; position: relative; }
+.composer-row .au-comp + .hint { margin-left: 6px; }
+.au-mic, .au-attach { display: none; width: 30px; height: 30px; padding: 0; align-items: center; justify-content: center; border-radius: 50%; }
+body.au-has-stt .au-mic { display: inline-flex; }
+body.au-avail .au-attach { display: inline-flex; }
+.au-mic svg, .au-attach svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.au-mic.recording, .au-attach.recording { background: var(--danger); color: #fff; animation: au-rec 1.4s ease-in-out infinite; }
+.au-mic.busy, .au-attach.busy { opacity: .6; position: relative; }
+.au-mic.busy::after, .au-attach.busy::after { content: ""; position: absolute; inset: 4px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+.au-comp-time { font-size: 12px; color: var(--danger); font-variant-numeric: tabular-nums; margin: 0 4px; }
+.au-attach-wrap { position: relative; display: inline-flex; }
+.au-menu { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 30; min-width: 190px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+           box-shadow: 0 10px 30px rgba(0, 0, 0, .15); padding: 4px; display: flex; flex-direction: column; }
+.au-menu button { border: none; background: none; text-align: left; padding: 7px 10px; border-radius: 6px; }
+.au-menu button:hover { background: var(--panel-2); }
+.actions .au-speak { display: none; }
+body.au-has-tts .actions .au-speak { display: inline-block; }
+.actions .au-speak.on { color: var(--accent); }
+.turn .actions:has(.au-speak.on) { opacity: 1; }
+.au-clip { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; max-width: 100%; margin: 2px 0; }
+.au-clip audio { height: 36px; max-width: 320px; width: 100%; }
+.au-clip .au-dl { color: var(--muted); text-decoration: none; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+.au-clip .au-dl:hover { background: var(--panel-2); color: var(--text); }
+.au-clip.gone { color: var(--muted); font-style: italic; font-size: 12px; }
+.au-clips { margin: 0 0 10px; display: flex; flex-direction: column; gap: 4px; }
+
+@media (max-width: 900px) {
+  .au-wave { height: 190px; }
+  .au-ops { grid-template-columns: 1fr; }
+  .au-meter { width: 80px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  button.recording, .au-mic.recording, .au-attach.recording { animation: none; }
+}

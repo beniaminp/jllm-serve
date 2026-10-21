@@ -553,6 +553,68 @@
     });
   };
 
+  /**
+   * Turns a word diff into regions of the audio to change. `words` are [{text, s, e}] with s/e in frames of the clip,
+   * `ops` come from diffWords(old words, new words), `newWords` are the new tokens. Returns regions sorted by position:
+   * {type, cutA, cutB, text, a0, a1}; text is the new words joined by spaces ('' for a deletion). A deletion also takes
+   * the pause that follows the removed words (at most `maxPauseFrames` of it), so no double pause is left behind; an
+   * insertion goes into the middle of the pause between its neighbours.
+   */
+  AudioEdit.planTextEdit = (words, ops, newWords, maxPauseFrames) => {
+    const out = [];
+    for (const op of ops) {
+      const text = newWords.slice(op.b0, op.b1).join(' ');
+      if (op.type === 'replace') {
+        out.push({type: 'replace', cutA: words[op.a0].s, cutB: words[op.a1 - 1].e, text, a0: op.a0, a1: op.a1});
+      } else if (op.type === 'delete') {
+        const last = words[op.a1 - 1];
+        let cutA = words[op.a0].s, cutB = last.e;
+        if (op.a1 < words.length) cutB = Math.max(cutB, Math.min(words[op.a1].s, last.e + maxPauseFrames));
+        else if (op.a0 > 0) cutA = Math.min(cutA, Math.max(words[op.a0 - 1].e, cutA - maxPauseFrames));
+        out.push({type: 'delete', cutA, cutB, text: '', a0: op.a0, a1: op.a1});
+      } else {
+        let at;
+        if (!words.length) at = 0;
+        else if (op.a0 === 0) at = words[0].s;
+        else if (op.a0 >= words.length) at = words[words.length - 1].e;
+        else at = Math.round((words[op.a0 - 1].e + words[op.a0].s) / 2);
+        out.push({type: 'insert', cutA: at, cutB: at, text, a0: op.a0, a1: op.a0});
+      }
+    }
+    out.sort((x, y) => x.cutA - y.cutA || x.cutB - y.cutB);
+    return out;
+  };
+
+  /**
+   * Applies a plan: every region's [cutA, cutB) is removed and replaced by its piece (a clip, or null for a pure
+   * deletion); the kept audio between regions is untouched. All joins are cross-faded by `xfadeFrames`. Returns
+   * {clip, spans: [[start, end)] of every region in the new clip (a deletion has an empty span at its join)}.
+   */
+  AudioEdit.applyTextEdit = (c, regions, pieces, xfadeFrames) => {
+    const parts = [], joins = [], spans = [];
+    let pos = 0, L = 0;
+    // mirrors concatCrossfade: appending a part overlaps the previous end by the (capped) cross-fade
+    const push = part => {
+      let x = 0;
+      if (parts.length) { x = Math.min(xfadeFrames, L >> 1, length(part) >> 1); joins.push(xfadeFrames); }
+      const at = L - x;
+      parts.push(part);
+      L = L + length(part) - x;
+      return at;
+    };
+    for (let i = 0; i < regions.length; i++) {
+      const r = regions[i];
+      push(AudioEdit.slice(c, pos, Math.max(pos, r.cutA)));
+      const piece = pieces[i] && length(pieces[i]) ? AudioEdit.conform(pieces[i], c) : null;
+      if (piece) { const at = push(piece); spans.push([at, at + length(piece)]); }
+      else spans.push([L, L]);
+      pos = Math.max(pos, r.cutB);
+    }
+    push(AudioEdit.slice(c, pos, length(c)));
+    const out = AudioEdit.concatCrossfade(parts, joins);
+    return {clip: out, spans};
+  };
+
   const pad = (n, w) => String(n).padStart(w, '0');
   const stamp = (sec, comma) => {
     const ms = Math.max(0, Math.round(sec * 1000));
