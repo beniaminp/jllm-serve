@@ -139,7 +139,9 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"s
 - `response_format` `json_object` or `json_schema`: constrained decoding, where tokens that would make the output an
   invalid JSON prefix are masked before sampling (a byte-level automaton checks the most likely candidates first),
   enforcing `type`, `properties`, `required`, `additionalProperties`, `items`, `enum`/`const`, `anyOf` of different
-  types, local `$ref`, min/max items and length; other schema keywords are a 400;
+  types, local `$ref`, min/max items and length; other schema keywords are a 400. Text the schema leaves no choice
+  about is appended without sampling (jump-forward), and speculative decoding stays on (drafts are checked against
+  the constraint);
 - completions only: `echo` (with prompt logprobs), `suffix` (fill-in-the-middle for tokenizers with
   `<|fim_prefix|>`/`<|fim_suffix|>`/`<|fim_middle|>`, a 400 otherwise) and `best_of` (the n most likely of best_of
   candidates; not with `stream`).
@@ -203,7 +205,10 @@ repository by its launcher).
   behaviour as `jllm serve`, including `n`, `logprobs`, `logit_bias`, `response_format`, `echo`, `suffix` and
   `best_of`). Chat completions also accept OpenAI **function calling**: `tools` and `tool_choice`
   (`auto`, `none`, `required` or a named function); the model's calls come back as `tool_calls` with finish reason
-  `tool_calls`, and `tool` messages carry the results back. `POST /api/chat` is the console's chat with server-side
+  `tool_calls`, and `tool` messages carry the results back. Calls are **constrained**: inside `<tool_call>` the model
+  can only write a known function name and arguments matching its `parameters` schema, `required` / a named function
+  force the call, the fixed parts (`{"name": "`, `", "arguments": `, `}</tool_call>`, …) are appended in one pass
+  without sampling, and `response_format` may be combined with `tools` (calls or that JSON). `POST /api/chat` is the console's chat with server-side
   tools (an event stream). The management API: `/api/models/load|download|loaded|local`, `/api/hub/inspect`,
   `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`,
   `/api/kv-cache` (`GET`, `POST /save`, `DELETE`).

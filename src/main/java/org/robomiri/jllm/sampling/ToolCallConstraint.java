@@ -367,6 +367,11 @@ public final class ToolCallConstraint extends ByteConstraint {
         }
 
         @Override
+        public boolean wide() {
+            return phase == CALL && seg == S_ARGS ? args.wide() : phase == ANSWER && answer.wide();
+        }
+
+        @Override
         public boolean allowsSpecial() {
             return phase == FREE || phase == THINKING;
         }

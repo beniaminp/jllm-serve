@@ -468,6 +468,16 @@ public final class JsonConstraint extends ByteConstraint {
             return depth == 0;
         }
 
+        /** Inside a string value, or a key of an object that takes any key. */
+        @Override
+        public boolean wide() {
+            if (depth == 0) {
+                return false;
+            }
+            Frame f = stack[depth - 1];
+            return f.kind == F_STRING && (f.owner == null || f.owner.schema.additional);
+        }
+
         /**
          * The whole stack: kinds, schemas (by identity), phases, keys seen, partial key bytes, counters. Literal
          * frames (enum matching in progress) are not memoized.
@@ -489,7 +499,11 @@ public final class JsonConstraint extends ByteConstraint {
                 k.add(f.phase);
                 k.add(List.of(f.seen));
                 k.add(f.key == null ? "" : f.key);
-                k.add(f.count);
+                Schema fs = f.schema;
+                boolean counted = fs != null && (f.kind == F_STRING && f.owner == null
+                        ? fs.minLength > 0 || fs.maxLength < Integer.MAX_VALUE
+                        : f.kind == F_ARRAY && (fs.minItems > 0 || fs.maxItems < Integer.MAX_VALUE));
+                k.add(counted ? f.count : 0); // (a count without limits does not change what is allowed)
                 k.add(f.esc * 8 + f.cont);
                 k.add(f.buf == null ? "" : new String(f.buf, 0, f.len, StandardCharsets.ISO_8859_1));
                 k.add(f.num * 2 + (f.integer ? 1 : 0));

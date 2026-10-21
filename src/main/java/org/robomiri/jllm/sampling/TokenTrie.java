@@ -148,12 +148,27 @@ final class TokenTrie {
      * @return the number of trie nodes visited
      */
     int allowed(ByteState start, long[] mask) {
-        return walk(start, 0, mask);
+        return allowed(start, mask, Integer.MAX_VALUE);
     }
 
-    private int walk(ByteState s, int node, long[] mask) {
+    /**
+     * {@link #allowed(ByteState, long[])} that gives up after visiting {@code budget} nodes (a state that allows
+     * most of the vocabulary, such as the inside of a string).
+     *
+     * @return the number of nodes visited, or -1 when the budget ran out ({@code mask} is then incomplete)
+     */
+    int allowed(ByteState start, long[] mask, int budget) {
+        int[] left = {budget};
+        int v = walk(start, 0, mask, left);
+        return left[0] < 0 ? -1 : v;
+    }
+
+    private int walk(ByteState s, int node, long[] mask, int[] left) {
         int visited = 0;
         for (int c = first[node]; c >= 0; c = next[c]) {
+            if (--left[0] < 0) {
+                return visited;
+            }
             ByteState t = next[c] < 0 ? s : s.copy(); // the last child may use up the parent's state
             visited++;
             if (!t.feed(edge[c] & 0xff)) {
@@ -164,7 +179,10 @@ final class TokenTrie {
                 mask[id >>> 6] |= 1L << id;
             }
             if (first[c] >= 0) {
-                visited += walk(t, c, mask);
+                visited += walk(t, c, mask, left);
+                if (left[0] < 0) {
+                    return visited;
+                }
             }
         }
         return visited;

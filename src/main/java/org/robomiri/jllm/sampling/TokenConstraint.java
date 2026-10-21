@@ -32,6 +32,18 @@ public interface TokenConstraint {
     }
 
     /**
+     * Every token allowed now (end-of-sequence tokens aside), in id order, when that set is small and known or cheap
+     * to find; else null. The sampler then picks among these instead of scanning the vocabulary for allowed
+     * candidates.
+     *
+     * @param compute whether to work it out now if it is not known (the sampler found no allowed token among the
+     *                most likely ones); else only a known set is returned
+     */
+    default int[] allowedTokens(boolean compute) {
+        return null;
+    }
+
+    /**
      * An independent copy in the same state (speculative decoding checks drafted tokens on a copy), or null when the
      * constraint cannot be copied (the engine then does not speculate under it).
      */

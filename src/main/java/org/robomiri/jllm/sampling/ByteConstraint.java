@@ -41,6 +41,14 @@ abstract class ByteConstraint implements TokenConstraint {
             return false;
         }
 
+        /**
+         * Whether a large part of the vocabulary is allowed here (inside a JSON string): not worth computing the
+         * allowed set ({@link ByteConstraint#allowedTokens}).
+         */
+        default boolean wide() {
+            return false;
+        }
+
         /** Whether nearly everything is allowed here ({@link TokenConstraint#relaxed}). */
         default boolean relaxed() {
             return false;
@@ -57,20 +65,20 @@ abstract class ByteConstraint implements TokenConstraint {
 
     /** Memoized allowed-token masks by state key, bounded; shared by the constraints of one schema / tool set. */
     static final class MaskCache {
-        private static final int MAX = 512;
-        private final java.util.LinkedHashMap<Object, long[]> map = new java.util.LinkedHashMap<>(64, 0.75f, true) {
+        private static final int MAX = 256;
+        private final java.util.LinkedHashMap<Object, Masks> map = new java.util.LinkedHashMap<>(64, 0.75f, true) {
             @Override
-            protected boolean removeEldestEntry(java.util.Map.Entry<Object, long[]> e) {
+            protected boolean removeEldestEntry(java.util.Map.Entry<Object, Masks> e) {
                 return size() > MAX;
             }
         };
 
-        synchronized long[] get(Object key) {
+        synchronized Masks get(Object key) {
             return map.get(key);
         }
 
-        synchronized void put(Object key, long[] mask) {
-            map.put(key, mask);
+        synchronized void put(Object key, Masks m) {
+            map.put(key, m);
         }
     }
 
@@ -83,6 +91,7 @@ abstract class ByteConstraint implements TokenConstraint {
     final MaskCache cache;
     State state;
     private long[] mask; // the allowed set of the current state, once computed
+    private int[] list; // the same as token ids, when small
     private int checks;
 
     /** Statistics for benchmarks: masks computed by a trie walk, and trie nodes visited by them. */
@@ -92,7 +101,7 @@ abstract class ByteConstraint implements TokenConstraint {
     ByteConstraint(byte[][] tokens, State start, MaskCache cache) {
         this.tokens = tokens;
         this.state = start;
-        this.cache = cache;
+        this.cache = cache != null ? cache : new MaskCache(); // (at least the states of this sequence)
     }
 
     /** Copy constructor. */
@@ -101,6 +110,8 @@ abstract class ByteConstraint implements TokenConstraint {
         this.state = o.state.copy();
         this.cache = o.cache;
         this.mask = o.mask; // immutable once built
+        this.list = o.list;
+        this.tooBig = o.tooBig;
     }
 
     @Override
@@ -111,12 +122,9 @@ abstract class ByteConstraint implements TokenConstraint {
         }
         if (mask == null) {
             if (++checks == MASK_AFTER) {
-                mask = computeMask();
-            } else if (checks == 1 && cache != null) {
-                Object key = state.key();
-                if (key != null) {
-                    mask = cache.get(key);
-                }
+                masks(Integer.MAX_VALUE);
+            } else if (checks == 1) {
+                cached();
             }
         }
         if (mask != null) {
@@ -131,21 +139,104 @@ abstract class ByteConstraint implements TokenConstraint {
         return true;
     }
 
-    /** The allowed set of the current state (special tokens excluded), via the vocabulary trie. */
-    private long[] computeMask() {
-        long[] m = new long[(tokens.length + 63) >>> 6];
-        int visited = TokenTrie.of(tokens).allowed(state.copy(), m);
-        synchronized (ByteConstraint.class) {
-            masksComputed++;
-            nodesVisited += visited;
+    /**
+     * The tokens this state allows, in id order, when there are at most {@value #LIST_MAX} and finding them takes a
+     * trie walk of at most {@value #LIST_BUDGET} nodes (a structural JSON position, a key of a closed object, an enum
+     * value, the envelope of a tool call); else null (inside a string most of the vocabulary is allowed). The walk
+     * is done when {@code compute} is set or when the state was seen before (the memo then marks it), so one-off
+     * states do not pay for it; its result (or the fact that there is none) is memoized by state.
+     */
+    @Override
+    public int[] allowedTokens(boolean compute) {
+        if (state.relaxed() || (mask == null && state.wide())) {
+            return null;
         }
-        if (cache != null) {
-            Object key = state.key();
-            if (key != null) {
-                cache.put(key, m);
+        if (mask == null && !tooBig) {
+            boolean seen = cached();
+            if (mask == null && !tooBig) {
+                if (compute || seen) {
+                    masks(LIST_BUDGET);
+                } else {
+                    Object key = state.key();
+                    if (key != null) {
+                        cache.put(key, SEEN);
+                    }
+                }
             }
         }
-        return m;
+        return list;
+    }
+
+    /** Most tokens {@link #allowedTokens} lists. */
+    static final int LIST_MAX = 2048;
+    /** Most trie nodes {@link #allowedTokens} visits. */
+    static final int LIST_BUDGET = 6000;
+    /** Cached for a state whose allowed set is too large to compute within {@link #LIST_BUDGET}. */
+    private static final Masks TOO_BIG = new Masks(null, null);
+    /** Cached for a state that was met once without computing its allowed set. */
+    private static final Masks SEEN = new Masks(null, null);
+
+    /** A state's allowed set as a bit mask, and as a list when small. */
+    record Masks(long[] mask, int[] list) {
+    }
+
+    private boolean tooBig;
+
+    /**
+     * Takes the memoized masks of the current state, if any.
+     *
+     * @return whether the state was met before without its masks being computed
+     */
+    private boolean cached() {
+        Object key = state.key();
+        Masks m = key == null ? null : cache.get(key);
+        if (m == TOO_BIG) {
+            tooBig = true;
+        } else if (m != null && m != SEEN) {
+            mask = m.mask;
+            list = m.list;
+        }
+        return m == SEEN;
+    }
+
+    /**
+     * Computes the allowed set of the current state (special tokens excluded) with the vocabulary trie, giving up
+     * after {@code budget} nodes; memoizes the outcome.
+     */
+    private void masks(int budget) {
+        long[] m = new long[(tokens.length + 63) >>> 6];
+        int visited = TokenTrie.of(tokens).allowed(state.copy(), m, budget);
+        synchronized (ByteConstraint.class) {
+            masksComputed++;
+            nodesVisited += Math.max(visited, 0);
+        }
+        Masks result;
+        if (visited < 0) {
+            tooBig = true;
+            result = TOO_BIG;
+        } else {
+            int n = 0;
+            for (long w : m) {
+                n += Long.bitCount(w);
+            }
+            int[] l = null;
+            if (n <= LIST_MAX) {
+                l = new int[n];
+                int k = 0;
+                for (int i = 0; i < m.length; i++) {
+                    for (long w = m[i]; w != 0; w &= w - 1) {
+                        l[k++] = i * 64 + Long.numberOfTrailingZeros(w);
+                    }
+                }
+            }
+            mask = m;
+            list = l;
+            result = new Masks(m, l);
+        }
+        Object key = state.key();
+        if (key != null) {
+            cache.put(key, result);
+        }
     }
 
     @Override
@@ -165,6 +256,8 @@ abstract class ByteConstraint implements TokenConstraint {
         }
         state = s;
         mask = null;
+        list = null;
+        tooBig = false;
         checks = 0;
     }
 
@@ -220,6 +313,8 @@ abstract class ByteConstraint implements TokenConstraint {
         }
         state = s;
         mask = null;
+        list = null;
+        tooBig = false;
         checks = 0;
     }
 

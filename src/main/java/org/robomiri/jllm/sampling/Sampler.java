@@ -96,7 +96,7 @@ public final class Sampler {
             return sample(logits);
         }
         applyPenalties(logits);
-        return masked(logits, allowed, -1);
+        return masked(logits, allowed, -1, null);
     }
 
     /**
@@ -109,7 +109,7 @@ public final class Sampler {
             return verify(logits, draft);
         }
         applyPenalties(logits);
-        return masked(logits, allowed, draft);
+        return masked(logits, allowed, draft, null);
     }
 
     /**
@@ -122,7 +122,7 @@ public final class Sampler {
     public int sampleRelaxed(float[] logits, IntPredicate allowed) {
         applyPenalties(logits);
         int t = build(logits) ? draw(logits) : argmax(logits);
-        return allowed.test(t) ? t : masked(logits, allowed, -1);
+        return allowed.test(t) ? t : masked(logits, allowed, -1, null);
     }
 
     /** {@link #verify(float[], int)} where nearly everything is allowed; the fallback as in {@link #sampleRelaxed}. */
@@ -148,7 +148,7 @@ public final class Sampler {
                 t = draw(logits);
             }
         }
-        return allowed.test(t) ? t : masked(logits, allowed, -1);
+        return allowed.test(t) ? t : masked(logits, allowed, -1, null);
     }
 
     /**
@@ -162,7 +162,11 @@ public final class Sampler {
             return sample(logits);
         }
         IntPredicate allowed = id -> isStop.test(id) ? c.canEnd() : c.allows(id);
-        return c.relaxed() ? sampleRelaxed(logits, allowed) : sample(logits, allowed);
+        if (c.relaxed()) {
+            return sampleRelaxed(logits, allowed);
+        }
+        applyPenalties(logits);
+        return masked(logits, allowed, -1, c);
     }
 
     /** {@link #verify(float[], int)} under {@code c} (null = unconstrained), like {@link #sample(float[], TokenConstraint, IntPredicate)}. */
@@ -171,14 +175,21 @@ public final class Sampler {
             return verify(logits, draft);
         }
         IntPredicate allowed = id -> isStop.test(id) ? c.canEnd() : c.allows(id);
-        return c.relaxed() ? verifyRelaxed(logits, draft, allowed) : verify(logits, draft, allowed);
+        if (c.relaxed()) {
+            return verifyRelaxed(logits, draft, allowed);
+        }
+        applyPenalties(logits);
+        return masked(logits, allowed, draft, c);
     }
 
     /**
      * The masked choice (penalties already applied): candidates, then greedy pick or a draw; with {@code draft >= 0}
      * the speculative accept / resample rule over the masked distribution.
+     *
+     * @param c when not null and the output may not end here, its {@link TokenConstraint#allowedTokens} (if any)
+     *          are the candidates, instead of the allowed tokens among the most likely of the whole vocabulary
      */
-    private int masked(float[] logits, IntPredicate allowed, int draft) {
+    private int masked(float[] logits, IntPredicate allowed, int draft, TokenConstraint c) {
         boolean greedy = p.temperature() == 0f || p.topK() == 1;
         if (greedy) {
             int a = argmax(logits);
@@ -192,17 +203,25 @@ public final class Sampler {
             cIdx = new int[pool];
             cVal = new float[pool];
         }
-        int m = topK(logits, pool, cIdx, cVal, null);
-        int n = 0;
-        for (int i = 0; i < m && n < want; i++) {
-            if (allowed.test(cIdx[i])) {
-                cIdx[n] = cIdx[i];
-                cVal[n] = cVal[i];
-                n++;
+        boolean listed = c != null && !c.canEnd(); // (the list leaves out end-of-sequence tokens)
+        int[] list = listed ? c.allowedTokens(false) : null;
+        int n;
+        if (list != null) { // the whole allowed set is known and small: no pass over the vocabulary
+            n = topOf(list, logits, want);
+        } else {
+            n = 0;
+            int m = topK(logits, pool, cIdx, cVal, null);
+            for (int i = 0; i < m && n < want; i++) {
+                if (allowed.test(cIdx[i])) {
+                    cIdx[n] = cIdx[i];
+                    cVal[n] = cVal[i];
+                    n++;
+                }
             }
-        }
-        if (n == 0 && m < vocab) { // nothing likely is allowed: search everything
-            n = topK(logits, want, cIdx, cVal, allowed);
+            if (n == 0 && m < vocab) { // nothing likely is allowed: the allowed set, or else a search of everything
+                list = listed ? c.allowedTokens(true) : null;
+                n = list != null ? topOf(list, logits, want) : topK(logits, want, cIdx, cVal, allowed);
+            }
         }
         if (n == 0) {
             return -1;
@@ -261,6 +280,31 @@ public final class Sampler {
             }
         }
         return cIdx[0];
+    }
+
+    /** The {@code want} most likely of {@code list} into cIdx/cVal, sorted descending; returns how many. */
+    private int topOf(int[] list, float[] logits, int want) {
+        int n = 0;
+        for (int id : list) {
+            if (id >= vocab) {
+                continue;
+            }
+            float x = logits[id];
+            if (n < want) {
+                cVal[n] = x;
+                cIdx[n] = id;
+                siftUp(cIdx, cVal, n++);
+            } else if (x > cVal[0]) {
+                cVal[0] = x;
+                cIdx[0] = id;
+                siftDown(cIdx, cVal, 0, n);
+            }
+        }
+        for (int end = n - 1; end > 0; end--) {
+            swap(cIdx, cVal, 0, end);
+            siftDown(cIdx, cVal, 0, end);
+        }
+        return n;
     }
 
     /**

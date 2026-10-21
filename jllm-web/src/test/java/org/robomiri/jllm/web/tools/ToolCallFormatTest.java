@@ -71,6 +71,12 @@ class ToolCallFormatTest {
     }
 
     @Test
+    void canonicalJson() {
+        assertEquals("{\"a\": [1, 2.5, \"x\\n\"], \"b\": {\"c\": null, \"d\": true}, \"e\": {}, \"f\": []}",
+                ToolCallFormat.canonical(Json.parseObject("{\"a\":[1,2.5,\"x\\n\"],\"b\":{\"c\":null,\"d\":true},\"e\":{},\"f\":[]}")));
+    }
+
+    @Test
     void templateMessages() {
         List<Object> msgs = List.of(
                 Json.obj("role", "user", "content", "weather?"),
@@ -81,7 +87,8 @@ class ToolCallFormatTest {
         List<ChatTemplate.Message> qwen = ToolCallFormat.toTemplate(msgs, "TOOLS", "chatml-qwen3");
         assertEquals("system", qwen.get(0).role());
         assertEquals("TOOLS", qwen.get(0).content());
-        assertEquals("<tool_call>\n{\"name\":\"w\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>", qwen.get(2).content());
+        // earlier calls in the layout the constraint makes the model write (json.dumps spacing)
+        assertEquals("<tool_call>\n{\"name\": \"w\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>", qwen.get(2).content());
         assertEquals("tool", qwen.get(3).role());
 
         List<ChatTemplate.Message> llama = ToolCallFormat.toTemplate(msgs, null, "llama3");
