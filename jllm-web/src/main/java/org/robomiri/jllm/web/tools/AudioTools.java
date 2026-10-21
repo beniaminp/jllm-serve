@@ -97,6 +97,20 @@ public final class AudioTools {
         }
     }
 
+    /** " Voices: a, b, c." when a speech model is loaded. */
+    private static String voicesNote() {
+        AudioService svc = AudioService.current();
+        if (svc == null) {
+            return "";
+        }
+        for (AudioModels.Entry e : svc.loaded()) {
+            if (e.tts() != null) {
+                return " Voices: " + String.join(", ", e.tts().voices()) + " (omit voice for the default).";
+            }
+        }
+        return "";
+    }
+
     /** Text to speech. */
     public static final class Speak implements Tool {
         @Override
@@ -107,7 +121,8 @@ public final class AudioTools {
         @Override
         public String description() {
             return "Say text aloud with the loaded text-to-speech model. Returns an audio clip id; the chat shows a player"
-                    + " for it, so just mention that you spoke it. Use for short passages (a few sentences).";
+                    + " for it, so just mention that you spoke it. Use for short passages (a few sentences)."
+                    + voicesNote();
         }
 
         @Override
@@ -133,6 +148,9 @@ public final class AudioTools {
             }
             AudioModels.Entry m = svc.models().resolve(AudioModels.Kind.TEXT_TO_SPEECH, null);
             String voice = Json.str(args, "voice", "").strip();
+            if (voice.equalsIgnoreCase("default")) {
+                voice = "";
+            }
             double speed = Json.dbl(args, "speed", 1.0);
             if (!(speed >= 0.25 && speed <= 4.0)) {
                 throw new IllegalArgumentException("speed must be between 0.25 and 4");
