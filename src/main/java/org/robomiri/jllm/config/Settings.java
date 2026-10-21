@@ -239,6 +239,7 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        org.robomiri.jllm.audio.AudioSettings.of(this); // audio.*: the messages name their keys
         return this;
     }
 
