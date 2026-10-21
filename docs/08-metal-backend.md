@@ -1438,9 +1438,11 @@ within 10⁻⁴ of the largest, then runs the same slots in a three-thread `Batc
 alone. From 8 rows on the tiled prefill kernels (still bit-identical) and from 32 the simdgroup-matrix ones (rounding
 level, §8.10) take over.
 
-**What stays one at a time.** Mamba backends (a recurrent state per slot), and a batch whose members differ in weights
-or cache type (`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false`
-turns batched passes off.
+**What stays one at a time.** Mamba and Qwen3-Next backends (a recurrent state per slot; neither implements
+`forwardBatch`, so their slots in a group take turns on the device lock, which `ArchSmoke` checks: three threads, the
+tokens each gives alone, no step in a shared pass), and a batch whose members differ in weights or cache type
+(`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false` turns batched
+passes off.
 
 ---
 
