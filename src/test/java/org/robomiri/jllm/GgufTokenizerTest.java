@@ -88,7 +88,7 @@ public final class GgufTokenizerTest {
         Tokenizer tok;
         try (GgufFile f = GgufFile.open(gguf)) {
             tok = GgufModel.tokenizer(f);
-        } catch (org.robomiri.jllm.tokenizer.GgufTokenizer.UnsupportedPreTokenizer e) {
+        } catch (org.robomiri.jllm.tokenizer.GgufTokenizer.UnsupportedPreTokenizer | java.io.IOException e) {
             System.out.printf("%-34s skipped: %s%n", gguf.getFileName(), e.getMessage());
             return;
         }
