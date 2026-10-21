@@ -36,6 +36,7 @@ public final class OuteTts implements SpeechModel {
 
     private static final int AUDIO_CODES = 4100;     // <|0|> .. <|4099|> (the codebook has 4096 entries)
     private static final String DEFAULT_VOICE = "en_male_1";
+    private static final int MAX_ATTEMPTS = 3;
     private static final boolean TRACE = Boolean.getBoolean("jllm.audio.trace");
 
     private record SWord(String word, double duration, int[] codes) {
@@ -232,29 +233,55 @@ public final class OuteTts implements SpeechModel {
                     + " tokens (audio.tts.ctx)");
         }
         double temp = o.temperature();
-        SamplingParams sp = new SamplingParams((float) temp, cfg.ttsTopK(), (float) cfg.ttsTopP(), 0f,
-                (float) cfg.ttsRepetitionPenalty(), 0f, 0f, o.seed(), maxNew, List.of());
-        Engine.Result r = lm.engine().generate(ids, sp, t -> { }, o.cancelled());
-        if (r.finishReason().equals("cancelled")) {
-            throw new WhisperTranscriber.Cancelled();
-        }
+        int words = OuteText.process(text).size();
+        // a sampled run sometimes ends after a few frames, writes silence, or never ends (the model is not infallible at
+        // temperature > 0): the speech of a word lasts between ~0.08 s and 2 s, so a result outside that is generated again with
+        // another seed, up to 3 times
+        double minSeconds = 0.08 * words;
+        double maxSeconds = 2.0 * words + 3.0;
+        Engine.Result r = null;
         int n = 0;
-        int[] codes = new int[r.tokens().length];
-        for (int t : r.tokens()) {
-            int c = t - audioBase;
-            if (c >= 0 && c < AUDIO_CODES) {
-                codes[n++] = c;
+        float[] pcm = null;
+        long c0 = 0;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            long seed = o.seed() < 0 ? -1 : o.seed() + 7919L * attempt;
+            SamplingParams sp = new SamplingParams((float) temp, cfg.ttsTopK(), (float) cfg.ttsTopP(), 0f,
+                    (float) cfg.ttsRepetitionPenalty(), 0f, 0f, seed, maxNew, List.of());
+            r = lm.engine().generate(ids, sp, t -> { }, o.cancelled());
+            if (r.finishReason().equals("cancelled")) {
+                throw new WhisperTranscriber.Cancelled();
+            }
+            n = 0;
+            int[] codes = new int[r.tokens().length];
+            for (int t : r.tokens()) {
+                int c = t - audioBase;
+                if (c >= 0 && c < AUDIO_CODES) {
+                    codes[n++] = c;
+                }
+            }
+            if (n == 0) {
+                if (attempt == MAX_ATTEMPTS - 1) {
+                    throw new IllegalStateException("the model produced no audio for this text");
+                }
+                continue;
+            }
+            c0 = System.nanoTime();
+            pcm = codec.decode(java.util.Arrays.copyOf(codes, n));
+            float[] trimmed = Speech.trimSilence(pcm, sampleRate());
+            double spoken = (double) trimmed.length / sampleRate() - 0.32;       // minus the margins trimSilence keeps
+            boolean plausible = spoken >= minSeconds && n / 75.0 <= maxSeconds;
+            if (cfg.ttsTrim()) {
+                pcm = trimmed;
+            }
+            if (plausible || temp == 0 || attempt == MAX_ATTEMPTS - 1) {
+                break;
+            }
+            if (TRACE) {
+                System.err.printf("tts: %d words came out as %.2f s of speech in %.2f s of audio, trying again%n", words, spoken,
+                        n / 75.0);
             }
         }
-        if (n == 0) {
-            throw new IllegalStateException("the model produced no audio for this text");
-        }
         o.progress().accept(n);
-        long c0 = System.nanoTime();
-        float[] pcm = codec.decode(java.util.Arrays.copyOf(codes, n));
-        if (cfg.ttsTrim()) {
-            pcm = Speech.trimSilence(pcm, sampleRate());
-        }
         if (TRACE) {
             Engine.Stats st = r.stats();
             System.err.printf("tts: prompt %d tokens (%d cached), prefill %.0f ms; %d tokens in %.0f ms (%.1f tok/s), %d frames = %.2f s;"
