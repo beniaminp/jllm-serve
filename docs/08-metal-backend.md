@@ -1087,3 +1087,22 @@ are. `scripts/mac-validate.sh` does both on a real Mac:
 
 It prints a markdown table of prefill and decode tokens per second (median of the rounds) for the docs.
 
+Apple M1 Pro (32 GB, macOS 27.2), Qwen3-0.6B, 413-token prompt, median of 3 rounds, 2026-10-21; the correctness part
+passed (115 CPU == Metal checks, 80 expert-split checks):
+
+| configuration | prefill tok/s | decode tok/s |
+|---|---|---|
+| defaults | 1429.8 | 117.5 |
+| flash prefill off | 1353.4 | 116.6 |
+| flash decode off | 1431.5 | 117.3 |
+| pipelined decoding off | 1433.0 | 119.7 |
+| simdgroup-matrix prefill off | 535.9 | 116.9 |
+| f16 KV cache | 1413.5 | 118.9 |
+| q8 KV cache | 1405.8 | 263.2 (see below) |
+
+The simdgroup-matrix prefill is worth 2.7× and flash prefill ~6 %. Flash decode was already off: the kernel
+self-check (8.14) found it no faster on this GPU, so the "off" row measures the same kernels. Pipelined decoding shows
+no gain here. The q8 row is not a q8 speedup: the bench keeps the default n-gram speculation, the q8 cache changes
+the greedy text so that all 128 tokens come out in a repetitive pattern the drafter predicts well (the f32 cache
+stops at 91 tokens). With `--engine.speculative off` f32, f16 and q8 all decode at ~112–114 tok/s.
+
