@@ -50,6 +50,9 @@ public final class MetalBackend implements Backend {
     private final KvDtype kvDtype;
     private final boolean kvHalf;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
+    private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
+    private int[] windows;             // the distinct attention windows of the GQA layers (0 = none), for stepKey
+    private int keyedVocab = -1;       // the pipe's vocabulary the recorded pipe steps were made with
     private Metal.Buffer kStage;
     private Metal.Buffer vStage;
 
@@ -318,6 +321,8 @@ public final class MetalBackend implements Backend {
             for (int l = 0; l < c.layers(); l++) {
                 keyCache[l] = k.scratch(kvBytes);
                 valCache[l] = k.scratch(kvBytes);
+                k.rowIndexed(keyCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads())); // for decode replay
+                k.rowIndexed(valCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads()));
             }
             // f32 k rows before RoPE (f16, q8) and v rows before the quantization (q8)
             kStage = kvDtype != KvDtype.F32 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
@@ -359,6 +364,14 @@ public final class MetalBackend implements Backend {
         }
         k.decodeThreads = MetalTuner.decodeThreads(k, plans[0].wo(), plans[0].woBuf());
         MetalTuner.prefillMatmuls(k, w); // f32 or half-weight MMA prefill kernels, per matrix shape
+        java.util.TreeSet<Integer> wins = new java.util.TreeSet<>();
+        for (LayerSpec s : arch.layers()) {
+            if (s.attn() instanceof Attention.Gqa g) {
+                wins.add(g.window());
+            }
+        }
+        windows = wins.stream().mapToInt(Integer::intValue).toArray();
+        replay = MetalKernels.REPLAY && k.metal.canRun() && windows.length <= 8;
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
@@ -691,8 +704,12 @@ public final class MetalBackend implements Backend {
         AttnStep attention = switch (spec.attn()) {
             case Attention.Gqa g -> new GqaStep(g, L.gqa(), attnNorm);
             case Attention.Mla m -> (layer, n, pos, fuseNorm) -> {
-                k.rmsnorm(x, 0, attnNorm, xb, n, c.dim());
-                mla.run(layer, n, pos);
+                if (fuseNorm && MetalKernels.FUSE) { // the projections normalize x themselves (*_norm matmuls)
+                    mla.run(layer, n, pos, x, attnNorm);
+                } else {
+                    k.rmsnorm(x, 0, attnNorm, xb, n, c.dim());
+                    mla.run(layer, n, pos, xb, null);
+                }
             };
         };
         FfnStep ffn = switch (spec.mlp()) {
@@ -775,14 +792,21 @@ public final class MetalBackend implements Backend {
             // into the staging rows, which kv_store_q8 then quantizes together with v)
             boolean useNorm = !partial && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
-            k.rope(table.pairing() == RopeTable.Pairing.INTERLEAVED, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer],
-                    q8 ? 0 : cacheOff, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
-                    g.headDim(), g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
+            boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             int hd = g.headDim();
-            if (q8) {
-                k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
+            if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch
+                k.ropeStoreQ8(adjacent, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
+                        useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), g.heads(), g.kvHeads(), pos,
+                        0, rotHalf, n);
+            } else {
+                k.rope(adjacent, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer], q8 ? 0 : cacheOff,
+                        useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
+                        hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
+                if (q8) {
+                    k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
+                }
             }
-            if (flashDecode && n == 1 && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
+            if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
                         hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
                 return;
@@ -878,9 +902,19 @@ public final class MetalBackend implements Backend {
             Metal.Buffer router = k.upload(w.router());
             int dim = c.dim();
             int topK = spec.topK();
+            // the layer's norm (x -> xb) runs inside the router kernel (router_norm / router_ds_norm), unless
+            // -Djllm.metal.fuse=false, which brings back rmsnorm + router
             route = switch (spec.router()) {
-                case Router.Softmax s -> (n, counted) -> k.router(xb, router, assign, routeWeight, e, dim, topK,
-                        spec.normTopK(), counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                case Router.Softmax s -> (n, counted) -> {
+                    if (MetalKernels.FUSE) {
+                        k.routerNorm(x, ffnNorm, xb, router, assign, routeWeight, e, dim, topK, spec.normTopK(),
+                                counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                    } else {
+                        k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
+                        k.router(xb, router, assign, routeWeight, e, dim, topK, spec.normTopK(), counted ? map : null,
+                                counted ? gassign : null, counted ? counts : null, n);
+                    }
+                };
                 case Router.DeepSeek r -> {
                     Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
                     int method = switch (r.topK()) {
@@ -888,9 +922,19 @@ public final class MetalBackend implements Backend {
                         case GROUP_LIMITED_GREEDY -> 1;
                         case NOAUX_TC -> 2;
                     };
-                    yield (n, counted) -> k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, spec.normTopK(),
-                            r.nGroup(), r.topkGroup(), r.sigmoid(), method, r.scaleAlways(), (float) r.routedScale(),
-                            counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                    yield (n, counted) -> {
+                        if (MetalKernels.FUSE) {
+                            k.routerDsNorm(x, ffnNorm, xb, router, assign, routeWeight, bias, e, dim, topK,
+                                    spec.normTopK(), r.nGroup(), r.topkGroup(), r.sigmoid(), method, r.scaleAlways(),
+                                    (float) r.routedScale(), counted ? map : null, counted ? gassign : null,
+                                    counted ? counts : null, n);
+                        } else {
+                            k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
+                            k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, spec.normTopK(), r.nGroup(),
+                                    r.topkGroup(), r.sigmoid(), method, r.scaleAlways(), (float) r.routedScale(),
+                                    counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                        }
+                    };
                 }
             };
             if (w.shared() != null) {
@@ -948,8 +992,7 @@ public final class MetalBackend implements Backend {
 
         @Override
         public void run(int layer, int n, boolean fuseNorm) {
-            k.rmsnorm(x, 0, ffnNorm, xb, n, c.dim());
-            // the GPU router counts a split layer on every step (it needs gassign anyway) and a GPU-only layer on sampled
+            // the router normalizes x into xb (the experts' input) itself; the GPU router counts a split layer on every step (it needs gassign anyway) and a GPU-only layer on sampled
             // steps; a layer entirely on the CPU is counted by the CPU (runOnCpu), from the choices it reads anyway
             route.run(n, counts != null && (cold != null ? !allCold : countStep));
             if (allCold) {
@@ -1113,6 +1156,82 @@ public final class MetalBackend implements Backend {
         }
     }
 
+    // ------------------------------------------------------------------ decode replay
+
+    /**
+     * Whether single-token decode steps are recorded and replayed ({@link MetalKernels#step}): on by default, off with
+     * {@code -Djllm.metal.replay=false}, with a native library that has no {@code jm_run}, and while any expert runs on
+     * the CPU (such a step waits for the CPU halfway, so it is not one program).
+     */
+    private boolean replayable() {
+        return replay && cpuLayers == 0;
+    }
+
+    /**
+     * What a recorded decode step depends on besides its position and ring slots: pipelined or not, whether this pass
+     * counts the experts' picks (the router binds the counters), and flash decoding: on or off at this position and,
+     * when on, the number of splits for each attention window (the grid of attention_split; the keys per split follow
+     * the position inside the kernel). Everything else (weights, buffers, kernel choices) is fixed for the backend's
+     * life or invalidates the recordings when it changes (rebalanceExperts, a new pipe vocabulary).
+     */
+    private long stepKey(boolean pipelined, int pos) {
+        long key = (pipelined ? 1 : 0) | (countStep ? 2 : 0);
+        if (flashDecode && pos + 1 >= k.flashMinLen) {
+            key |= 4;
+            for (int i = 0; i < windows.length; i++) {
+                key |= (long) k.flashSplits(pos, windows[i]) << (3 + 7 * i);
+            }
+        }
+        return key;
+    }
+
+    /** Turns decode replay on or off for this backend (on only where it can work: see {@link #replayable}). */
+    public void replay(boolean on) {
+        replay = on && k.metal.canRun() && windows.length <= 8;
+        k.invalidatePrograms();
+    }
+
+    /** Whether decode replay is on for this backend now. */
+    public boolean replaying() {
+        return replayable();
+    }
+
+    /** Java → native calls of the forward passes so far (see {@link Metal#downcalls}). */
+    public long downcalls() {
+        return k.metal.downcalls();
+    }
+
+    /** Kernel dispatches encoded so far. */
+    public long dispatches() {
+        return k.metal.dispatches();
+    }
+
+    /** Decode steps run from a recording / recorded so far. */
+    public long replayedSteps() {
+        return k.replayedSteps();
+    }
+
+    public long recordedSteps() {
+        return k.recordedSteps();
+    }
+
+    /**
+     * Forces flash decoding on for steps over at least {@code minLen} positions, with {@code chunk} keys per split, so a
+     * test can cross the kernel-variant thresholds of a long context within a few tokens. Dense attention only.
+     */
+    public void flashDecodeThresholds(int minLen, int chunk) {
+        if (!(arch.attention() instanceof Attention.Gqa)) {
+            return;
+        }
+        if (flashPart == null) {
+            flashPart = k.scratch((long) arch.attention().heads() * MetalKernels.FLASH_SPLITS * (arch.attention().headDim() + 2) * 4);
+        }
+        flashDecode = true;
+        k.flashMinLen = minLen;
+        k.flashChunk = chunk;
+        k.invalidatePrograms();
+    }
+
     // ------------------------------------------------------------------ pipelined greedy decoding
 
     private Pipe pipe; // the one pipe of this backend, created on first use
@@ -1163,11 +1282,23 @@ public final class MetalBackend implements Backend {
             }
             boolean ok = false;
             try {
-                k.embedToken(w.embed, embedQ, ring, slot, x, c.dim(), c.embedScale());
-                encodeLayers(1, pos, false);
-                k.rmsnorm(x, 0, finalNorm, xb, 1, c.dim());
-                k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
-                k.argmax(logitsBuf, vocab, ring, (slot + 1) % R);
+                int out = (slot + 1) % R;
+                Runnable body = () -> {
+                    k.embedToken(w.embed, embedQ, ring, slot, x, c.dim(), c.embedScale());
+                    encodeLayers(1, pos, false);
+                    k.rmsnorm(x, 0, finalNorm, xb, 1, c.dim());
+                    k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
+                    k.argmax(logitsBuf, vocab, ring, out);
+                };
+                if (replayable()) {
+                    if (keyedVocab != vocab) { // the argmax range is part of every recorded pipe step
+                        k.invalidatePrograms();
+                        keyedVocab = vocab;
+                    }
+                    k.step(stepKey(true, pos), pos, slot, out, body);
+                } else {
+                    body.run();
+                }
                 k.commit(); // runs now; a fresh command buffer is open for the next step
                 ok = true;
             } finally {
@@ -1228,11 +1359,23 @@ public final class MetalBackend implements Backend {
 
         countStep = counts != null && steps++ % COUNT_EVERY == 0;
         watchThermal();
+        // a decode step: recorded once per shape, then replayed with its position patched in (one native call)
+        boolean decodeReplay = n == 1 && logits != null && stride == 0 && replayable();
         k.begin();
         boolean committed = false;
         try {
-            encodeLayers(n, pos, true);
-            if (logits != null && stride > 0) {
+            if (decodeReplay) {
+                k.step(stepKey(false, pos), pos, 0, 0, () -> {
+                    encodeLayers(1, pos, false);
+                    k.rmsnorm(x, 0, finalNorm, xb, 1, dim);
+                    k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
+                });
+            } else {
+                encodeLayers(n, pos, true);
+            }
+            if (decodeReplay) {
+                // the final norm and the LM head are part of the step
+            } else if (logits != null && stride > 0) {
                 // every row (speculative verification): rmsnorm and LM head over the n tokens
                 if (logitsAllBuf == null || logitsAllRows < n) {
                     logitsAllRows = Math.min(maxBatch, Math.max(n, 16)); // buffers live until the backend closes: size once
@@ -1336,6 +1479,7 @@ public final class MetalBackend implements Backend {
             }
             changed++;
         }
+        k.invalidatePrograms(); // recorded steps bind the experts' old buffers (place released them, too)
         cpuLayers = 0;
         for (boolean[] row : placement.cold) {
             boolean any = false;

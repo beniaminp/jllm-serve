@@ -46,6 +46,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
+| Decode replay | a decode step's ~170 GPU dispatches are recorded once and replayed with one native call per token instead of one call per dispatch | [08 §8.22](docs/08-metal-backend.md#822-decode-replay-one-native-call-per-token) |
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
@@ -61,7 +62,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
 not been measured on Apple hardware yet: `scripts/mac-validate.sh` does both on a Mac and prints a table
 ([08 §8.20](docs/08-metal-backend.md#820-validating-on-a-mac)). Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
-`-Djllm.metal.pipeline=false` (passed through `JAVA_OPTS`) and `./jllm bench`. `scripts/mac-validate.sh --vs-llama` also runs
+`-Djllm.metal.pipeline=false`, `-Djllm.metal.replay=false` (passed through `JAVA_OPTS`) and `./jllm bench`. `scripts/mac-validate.sh --vs-llama` also runs
 llama.cpp's `llama-bench` on the same GGUF file with the same prompt and output lengths and prints both side by side
 ([11 §11.1](docs/11-performance.md#against-llamacpp-scriptsmac-validatesh---vs-llama)).
 

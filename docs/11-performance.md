@@ -165,9 +165,22 @@ decode closer; see 11.2).
 
 ### Metal decode (~9 ms per token at 413-token context)
 
-1. **Dispatch count.** 6 kernels per layer × 28 + 2 = 170 dispatches per token (386 for the 30B MoE model; the
-   first version had 338). Each costs a few microseconds of GPU front-end time even when its work is tiny, and a
-   kernel cannot start before the previous one has finished (serial encoder).
+1. **Dispatch count.** 6 kernels per layer × 28 + 2 = 170 dispatches per token (338 for the 30B MoE model since
+   its norm moved into the router, 386 before; the first version had 338). Each costs a few microseconds of GPU
+   front-end time even when its work is tiny, and a kernel cannot start before the previous one has finished (serial
+   encoder). Encoding them cost one Java → native call each until decode replay
+   ([08 §8.22](08-metal-backend.md#822-decode-replay-one-native-call-per-token)) recorded the step once and made it
+   3 calls per token:
+
+   | per decode token | dispatches | Java → native calls, encoded one by one | with decode replay |
+   |---|---|---|---|
+   | Qwen3-0.6B, `forward` of one token | 170 | 175 | 3 |
+   | Qwen3-0.6B, pipelined greedy step | 172 | 174 | 3 |
+   | Qwen3-0.6B, q8 KV cache | 198 → 170 ([08 §8.23](08-metal-backend.md#823-decode-fusions)) | 203 | 3 |
+   | Qwen3-30B-A3B | 386 → 338 | 391 | 3 |
+
+   Not yet measured on a Mac (the emulator's wall time means nothing); `scripts/mac-validate.sh` compares replay on
+   and off.
 2. **Under-filled GPU.** `o_proj` / `down_proj` have 1024 output rows → 256 threadgroups of 4
    simdgroups; the 16-core GPU wants thousands in flight to hide memory latency. Latency, not bandwidth, bounds
    these matmuls.
@@ -178,7 +191,8 @@ decode closer; see 11.2).
    [08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) spreads long contexts over more threadgroups.
 5. **CPU-side work per token**: sampling over 151 936 logits (~0.3 ms), the embedding row copy, and the
    `commitAndWait` round trip. The command buffers are committed every 8 layers, so encoding overlaps GPU work and
-   only the last part is exposed.
+   only the last part is exposed; pipelined greedy decoding takes sampling off the CPU, and decode replay replaces
+   the encoding of 170 dispatches from Java by one native call.
 
 ### CPU decode (~77 ms per token with float activations, ~20 ms with int8)
 
@@ -271,6 +285,9 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.moeMma` | true | expert-grouped simdgroup-matrix MoE prefill ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)); `false` = per-slot kernels |
 | `jllm.metal.moeMmaMin` | 16 | smallest chunk that uses the expert-grouped MoE kernels |
 | `jllm.metal.pipeline` | true | pipelined greedy decoding: the GPU picks the token and runs ahead ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) |
+| `jllm.metal.replay` | true | decode replay: a decode step is recorded once per shape and replayed with its position patched in, one native call per token ([08 §8.22](08-metal-backend.md#822-decode-replay-one-native-call-per-token)); `false` = every dispatch from Java |
+| `jllm.metal.replayVerify` | first | `all`: compare every replayed step with a fresh recording (tests); by default only each recording's first replay is compared |
+| `jllm.metal.fuse` | true | decode fusions (q8 cache store in `rope_store_q8`, the MoE norm in the router, MLA's norm in its projections; bit-identical, [08 §8.23](08-metal-backend.md#823-decode-fusions)); `false` = the separate dispatches |
 | `jllm.metal.workingSetGb` | Metal's | the GPU memory budget `backend.metal.cpu-moe=auto` aims for |
 | `jllm.metal.hotExperts` | true | place CPU experts by the saved usage statistics (hot ones stay on the GPU); `false` = whole layers |
 | `jllm.metal.cpuMoeSyncUs` | 100 | the planner's estimate of one GPU → CPU → GPU round trip, µs (lower = more layers split) |

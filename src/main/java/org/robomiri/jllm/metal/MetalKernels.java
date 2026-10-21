@@ -90,6 +90,19 @@ final class MetalKernels implements AutoCloseable {
     static final int FLASH_MIN_LEN = Integer.getInteger("jllm.metal.flashMinLen", 512);
     static final int FLASH_CHUNK = Integer.getInteger("jllm.metal.flashChunk", 128); // 64-128 measured best, 256+ slower
     static final int FLASH_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.flashSplits", 32));
+    /**
+     * Decode replay: a single-token decode step is recorded once per shape and later steps re-run the recording with
+     * their position (and token ring slots) patched in, one native call per step instead of one per dispatch (see
+     * {@link #step}). {@code -Djllm.metal.replay=false} encodes every step dispatch by dispatch.
+     */
+    static final boolean REPLAY = !"false".equals(System.getProperty("jllm.metal.replay"));
+    /** {@code -Djllm.metal.replayVerify=all}: compare every replayed step with a fresh recording (tests; slow). */
+    static final boolean REPLAY_VERIFY_ALL = "all".equals(System.getProperty("jllm.metal.replayVerify"));
+    /**
+     * Decode-path fusions: q8 cache store in the rope kernel, the MoE norm in the router, DeepSeek MLA's attention norm
+     * in its projections. Bit-identical; {@code -Djllm.metal.fuse=false} brings the separate dispatches back (A/B).
+     */
+    static final boolean FUSE = !"false".equals(System.getProperty("jllm.metal.fuse"));
 
     final Metal metal;
     private final float eps;
@@ -100,6 +113,9 @@ final class MetalKernels implements AutoCloseable {
     private final Params p;
     /** Bound wherever a kernel declares a buffer the dispatch does not use (norm weights, biases, ...). */
     private final Metal.Buffer dummy;
+    /** Flash decoding thresholds (see FLASH_MIN_LEN, FLASH_CHUNK); per instance so a test can cross them early. */
+    int flashMinLen = FLASH_MIN_LEN;
+    int flashChunk = FLASH_CHUNK;
 
     /** Owns {@code metal} from here on. */
     MetalKernels(Metal metal, float normEps) {
@@ -148,14 +164,17 @@ final class MetalKernels implements AutoCloseable {
     }
 
     void begin() {
+        notRecording();
         metal.begin();
     }
 
     void commit() {
+        notRecording();
         metal.commit();
     }
 
     void commitAndWait() {
+        notRecording();
         metal.commitAndWait();
     }
 
@@ -163,11 +182,155 @@ final class MetalKernels implements AutoCloseable {
         metal.abort();
     }
 
+    // ---------------------------------------------------------------- decode replay
+
+    /** Thrown while recording a step that cannot be replayed (as it is, or at this position: {@code retry}). */
+    static final class NotReplayable extends RuntimeException {
+        final boolean retry;
+
+        NotReplayable(String why, boolean retry) {
+            super(why, null, false, false);
+            this.retry = retry;
+        }
+    }
+
+    private void notRecording() {
+        if (rec != null) { // a step that synchronizes with the CPU midway (experts on the CPU) is not one program
+            throw new NotReplayable("the step submits or waits for command buffers", false);
+        }
+    }
+
+    private DecodeProgram rec;                       // the program being recorded, or null
+    private final int[] recVars = new int[DecodeProgram.VARS];
+    // per binding slot: the step variable its offset follows (-1: none), and how
+    private final int[] bindVar = new int[MAX_BUFS];
+    private final long[] bindBase = new long[MAX_BUFS];
+    private final long[] bindCoeff = new long[MAX_BUFS];
+    /** Buffers with one row per position (KV caches): a binding at the step position's row follows the position. */
+    private final java.util.Map<Metal.Buffer, Long> rowBytes = new java.util.IdentityHashMap<>();
+    private final java.util.LinkedHashMap<Long, DecodeProgram> programs = new java.util.LinkedHashMap<>(16, 0.75f, true);
+    private final java.util.Set<Long> unreplayable = new java.util.HashSet<>();
+    private static final int MAX_PROGRAMS = 8;
+    private long replayed;
+    private long recorded;
+
+    /** Declares {@code b} a per-position cache: position p's row starts at byte {@code p * bytesPerRow}. */
+    void rowIndexed(Metal.Buffer b, long bytesPerRow) {
+        rowBytes.put(b, bytesPerRow);
+    }
+
+    /** Drops every recorded step (a buffer they bind was released or replaced, a kernel choice changed). */
+    void invalidatePrograms() {
+        programs.clear();
+        unreplayable.clear();
+    }
+
+    /** Decode steps run from a recording made at an earlier step. */
+    long replayedSteps() {
+        return replayed;
+    }
+
+    /** Decode steps recorded (each then ran from its fresh recording). */
+    long recordedSteps() {
+        return recorded;
+    }
+
+    /**
+     * Encodes one single-token decode step: {@code body} issues its dispatches through the writers of this class. A
+     * step with the same {@code key} (everything that changes which dispatches run, their grids or their buffers, except
+     * the variables) recorded before is replayed instead: its position and ring-slot fields are patched to {@code pos},
+     * {@code slotIn}, {@code slotOut} and the whole step goes to the native side in one {@link Metal#run} call. A new key
+     * is recorded (the body runs in recording mode, nothing crosses to the native side) and run the same way. The first
+     * replay of every recording is checked against a fresh recording of that step, field by field; a mismatch (a
+     * per-step value the writers did not declare) disables replay for the key with a warning, and the fresh recording
+     * runs instead.
+     */
+    void step(long key, int pos, int slotIn, int slotOut, Runnable body) {
+        int[] vars = {pos, slotIn, slotOut};
+        if (unreplayable.contains(key)) {
+            body.run();
+            return;
+        }
+        DecodeProgram prog = programs.get(key);
+        if (prog == null) {
+            DecodeProgram fresh = record(key, vars, body);
+            if (fresh == null) {
+                body.run();
+                return;
+            }
+            if (programs.size() >= MAX_PROGRAMS) {
+                programs.pollFirstEntry(); // least recently used: positions only grow within a conversation
+            }
+            programs.put(key, fresh);
+            recorded++;
+            metal.run(fresh.commands(), fresh.size());
+            return;
+        }
+        prog.apply(vars);
+        if (!prog.verified || REPLAY_VERIFY_ALL) {
+            DecodeProgram fresh = record(key, vars, body);
+            int bad = fresh == null ? 0 : prog.firstDifference(fresh);
+            if (fresh == null || bad >= 0) {
+                programs.remove(key);
+                unreplayable.add(key);
+                System.err.println("warning: Metal decode replay disabled for a step shape: "
+                        + (fresh == null ? "it could not be recorded again" : "command " + bad + " ("
+                        + (bad < prog.size() ? prog.kernel(bad) : "end") + ") differs from a fresh recording")
+                        + "; those steps are encoded dispatch by dispatch");
+                if (fresh != null) {
+                    metal.run(fresh.commands(), fresh.size());
+                } else {
+                    body.run();
+                }
+                return;
+            }
+            prog.verified = true;
+        }
+        replayed++;
+        metal.run(prog.commands(), prog.size());
+    }
+
+    /** Runs {@code body} in recording mode; null if the step cannot be replayed (nothing was encoded then). */
+    private DecodeProgram record(long key, int[] vars, Runnable body) {
+        DecodeProgram prog = new DecodeProgram();
+        System.arraycopy(vars, 0, recVars, 0, vars.length);
+        java.util.Arrays.fill(bindVar, -1);
+        rec = prog;
+        try {
+            body.run();
+            return prog;
+        } catch (NotReplayable e) {
+            if (!e.retry) {
+                unreplayable.add(key);
+                System.err.println("note: Metal decode replay off for a step shape: " + e.getMessage());
+            }
+            return null;
+        } finally {
+            rec = null;
+        }
+    }
+
     // ---------------------------------------------------------------- dispatch plumbing
 
     private void bind(int i, Metal.Buffer b, long offset) {
         bufArgs.setAtIndex(ValueLayout.ADDRESS, i, b.handle());
         offArgs.setAtIndex(ValueLayout.JAVA_LONG, i, offset + b.offset());
+        if (rec != null) {
+            bindVar[i] = -1;
+            Long row = rowBytes.get(b);
+            int pos = recVars[DecodeProgram.VAR_POS];
+            if (row != null && (offset != 0 || pos == 0)) { // offset 0 at pos > 0: the whole cache (attention)
+                if (pos == 0) {
+                    throw new NotReplayable("position 0: a cache row and the whole cache look the same", true);
+                }
+                if (offset != pos * row) {
+                    throw new NotReplayable("a cache bound at " + offset + ", not at the step's row " + pos, false);
+                }
+                bindVar[i] = DecodeProgram.VAR_POS;
+                bindBase[i] = b.offset();
+                bindCoeff[i] = row;
+            }
+        }
     }
 
     private void bindOrDummy(int i, Metal.Buffer b) {
@@ -177,6 +340,21 @@ final class MetalKernels implements AutoCloseable {
     /** Records {@code kernel} with the buffers bound so far and the params written since the last reset. */
     private void dispatch(String kernel, int nbuf, int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
         int plen = p.done();
+        if (rec != null) {
+            int cmd = rec.add(metal.pipeline(kernel), kernel, bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz,
+                    tx, ty, tz);
+            for (int i = 0; i < nbuf; i++) {
+                if (bindVar[i] >= 0) {
+                    rec.patch(cmd, DecodeProgram.KIND_OFFSET, i, bindVar[i], bindBase[i], bindCoeff[i]);
+                }
+            }
+            for (int j = 0; j < p.vars(); j++) {
+                int f = p.varField(j);
+                int var = p.varOf(j);
+                rec.patch(cmd, DecodeProgram.KIND_PARAM, f, var, (long) p.intAt(f) - recVars[var], 1);
+            }
+            return;
+        }
         metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
@@ -204,6 +382,7 @@ final class MetalKernels implements AutoCloseable {
 
     /** Releases {@code buf} (a wrap of {@code t}) and the wrap of t's second view, if any: t is no longer used. */
     void release(QTensor t, Metal.Buffer buf) {
+        invalidatePrograms(); // recorded steps may bind it
         metal.release(buf);
         Metal.Buffer up = upBuffers.remove(t);
         if (up != null) {
@@ -496,9 +675,33 @@ final class MetalKernels implements AutoCloseable {
         bind(4, cos, 0);
         bind(5, sin, 0);
         bind(6, kOut, kOutOff);
-        p.reset(KernelParams.ROPE).i(headDim).i(qStride).i(kvStride).i(nHeads).i(pos).f(eps).i(qw != null).i(rotOff).i(rotHalf);
+        p.reset(KernelParams.ROPE).i(headDim).i(qStride).i(kvStride).i(nHeads).iv(DecodeProgram.VAR_POS, pos).f(eps).i(qw != null)
+                .i(rotOff).i(rotHalf);
         dispatch((adjacent ? "rope_il" : "rope") + (kHalf && nKHeads > 0 ? "_h" : ""), 7, 0,
                 nHeads + nKHeads, n, 1, rotHalf, 1, 1);
+    }
+
+    /**
+     * The q8 cache's rope: {@link #rope} for the q heads and the k heads of the f32 staging rows {@code kStage}, and
+     * {@link #kvStoreQ8} of the rotated k and of {@code vStage} into the cache rows at byte offset {@code cacheOff} of
+     * kc / vc, in one dispatch ({@code rope_store_q8}; the same cache bytes).
+     */
+    void ropeStoreQ8(boolean adjacent, Metal.Buffer q, Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc,
+                     Metal.Buffer vc, long cacheOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin,
+                     int headDim, int qStride, int nHeads, int nKvHeads, int pos, int rotOff, int rotHalf, int n) {
+        int kvDim = headDim * nKvHeads;
+        bind(0, q, 0);
+        bind(1, kStage, 0);
+        bindOrDummy(2, qw);
+        bindOrDummy(3, kw);
+        bind(4, cos, 0);
+        bind(5, sin, 0);
+        bind(6, kc, cacheOff);
+        bind(7, vStage, 0);
+        bind(8, vc, cacheOff);
+        p.reset(KernelParams.ROPE_Q8).i(headDim).i(qStride).i(kvDim).i(nHeads).iv(DecodeProgram.VAR_POS, pos).f(eps)
+                .i(qw != null).i(rotOff).i(rotHalf).i(nKvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, nKvHeads));
+        dispatch(adjacent ? "rope_il_store_q8" : "rope_store_q8", 9, 0, nHeads + 2 * nKvHeads, n, 1, rotHalf, 1, 1);
     }
 
     // ---------------------------------------------------------------- attention
@@ -517,7 +720,8 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, 0);
         bind(4, scores, 0);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
-            p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
+            p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).iv(DecodeProgram.VAR_POS, pos).i(ctx)
+                    .f(scale)
                     .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap);
             dispatch(kernel, 5, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
@@ -530,7 +734,7 @@ final class MetalKernels implements AutoCloseable {
         bind(1, embedBuf, scaleOff(embed));
         bind(2, tokens, 0);
         bind(3, x, 0);
-        p.reset(KernelParams.EMBED).i(dim).i(slot).f(scale);
+        p.reset(KernelParams.EMBED).i(dim).iv(DecodeProgram.VAR_SLOT_IN, slot).f(scale);
         dispatch(kernel("embed_token", embed.type, ""), 4, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
@@ -538,7 +742,7 @@ final class MetalKernels implements AutoCloseable {
     void argmax(Metal.Buffer v, int n, Metal.Buffer tokens, int slot) {
         bind(0, v, 0);
         bind(1, tokens, 0);
-        p.reset(KernelParams.ARGMAX).i(n).i(slot);
+        p.reset(KernelParams.ARGMAX).i(n).iv(DecodeProgram.VAR_SLOT_OUT, slot);
         dispatch("argmax", 2, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
@@ -595,25 +799,31 @@ final class MetalKernels implements AutoCloseable {
                 (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
     }
 
+    /** Threadgroups per head of flash decoding for the token at pos: one per flashChunk keys it sees, at most FLASH_SPLITS. */
+    int flashSplits(int pos, int window) {
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int keys = len - first;
+        return Math.min(FLASH_SPLITS, (keys + flashChunk - 1) / flashChunk);
+    }
+
     /**
-     * Flash decoding for the single token at pos: {@code attention_split} over (heads, nSplit) into the partials
+     * Flash decoding for the single token at pos:{@code attention_split} over (heads, nSplit) into the partials
      * buffer {@code part} (heads * FLASH_SPLITS * (headDim + 2) floats), then {@code attention_combine} into out.
      */
     void flashAttention(KvDtype kv, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
                         Metal.Buffer scores, Metal.Buffer out, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
                         float scale, int qStride, int kvStride, int window, float softcap) {
-        int len = pos + 1;
-        int first = window > 0 ? Math.max(0, len - window) : 0;
-        int keys = len - first;
-        int nSplit = Math.min(FLASH_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
-        int chunk = (keys + nSplit - 1) / nSplit;
+        int nSplit = flashSplits(pos, window);
         bind(0, q, 0);
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, scores, 0);
-        p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
-                .i(window).f(softcap).i(nSplit).i(chunk);
+        // chunk 0: the kernel derives the keys per split from the position, ceil(keys / nSplit), so a recorded decode
+        // step stays valid while nSplit does (MetalBackend's step key)
+        p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
+                .i(qStride).i(kvStride).i(window).f(softcap).i(nSplit).i(0);
         dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
@@ -656,6 +866,46 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.ROUTER_DS).i(nExperts).i(dim).i(topK).i(normalize).i(nGroup).i(topkGroup).i(sigmoid)
                 .i(method).i(scaleAlways).f(routedScale).i(counts != null);
         dispatch("router_ds", 8, 0, n, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * {@link #rmsnorm} of the n rows of x with {@code normW} into xn, and {@link #router} on xn, in one dispatch
+     * ({@code router_norm}, bit-identical): the norm before a MoE layer's experts.
+     */
+    void routerNorm(Metal.Buffer x, Metal.Buffer normW, Metal.Buffer xn, Metal.Buffer w, Metal.Buffer assign,
+                    Metal.Buffer rw, int nExperts, int dim, int topK, boolean normalize, Metal.Buffer map,
+                    Metal.Buffer gassign, Metal.Buffer counts, int n) {
+        bind(0, x, 0);
+        bind(1, w, 0);
+        bind(2, assign, 0);
+        bind(3, rw, 0);
+        bindOrDummy(4, map);
+        bindOrDummy(5, gassign);
+        bindOrDummy(6, counts);
+        bind(7, normW, 0);
+        bind(8, xn, 0);
+        p.reset(KernelParams.ROUTER_NORM).i(nExperts).i(dim).i(topK).i(normalize).i(counts != null).f(eps);
+        dispatch("router_norm", 9, 0, n, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** {@link #rmsnorm} into xn and {@link #routerDs} on it in one dispatch ({@code router_ds_norm}, bit-identical). */
+    void routerDsNorm(Metal.Buffer x, Metal.Buffer normW, Metal.Buffer xn, Metal.Buffer w, Metal.Buffer assign,
+                      Metal.Buffer rw, Metal.Buffer bias, int nExperts, int dim, int topK, boolean normalize, int nGroup,
+                      int topkGroup, boolean sigmoid, int method, boolean scaleAlways, float routedScale,
+                      Metal.Buffer map, Metal.Buffer gassign, Metal.Buffer counts, int n) {
+        bind(0, x, 0);
+        bind(1, w, 0);
+        bind(2, assign, 0);
+        bind(3, rw, 0);
+        bindOrDummy(4, bias);
+        bindOrDummy(5, map);
+        bindOrDummy(6, gassign);
+        bindOrDummy(7, counts);
+        bind(8, normW, 0);
+        bind(9, xn, 0);
+        p.reset(KernelParams.ROUTER_DS_NORM).i(nExperts).i(dim).i(topK).i(normalize).i(nGroup).i(topkGroup).i(sigmoid)
+                .i(method).i(scaleAlways).f(routedScale).i(counts != null).f(eps);
+        dispatch("router_ds_norm", 10, 0, n, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** Per-slot gate/up projections with SwiGLU: out[slot, :] for the n * topK slots of assign (moe_up). */

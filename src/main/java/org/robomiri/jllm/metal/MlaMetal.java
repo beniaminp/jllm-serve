@@ -92,6 +92,7 @@ final class MlaMetal {
         cache = new Metal.Buffer[layers];
         for (int l = 0; l < layers; l++) {
             cache[l] = k.scratch((long) ctx * kvDtype.rowBytes(aw, 1));
+            k.rowIndexed(cache[l], kvDtype.rowBytes(aw, 1)); // for decode replay
         }
         qa = k.scratch((long) maxBatch * Math.max(m.qLoraRank(), 1) * 4);
         qaNorm = k.scratch((long) maxBatch * Math.max(m.qLoraRank(), 1) * 4);
@@ -123,8 +124,11 @@ final class MlaMetal {
         return cache.length;
     }
 
-    /** Reads {@code xb}, writes the attention output {@code [n, heads*v]} to {@code att} (o_proj is the caller's). */
-    void run(int l, int n, int pos) {
+    /**
+     * Reads {@code in} (normalized with {@code norm} on the fly when non-null: a single token, the *_norm matmuls; else
+     * already normalized), writes the attention output {@code [n, heads*v]} to {@code att} (o_proj is the caller's).
+     */
+    void run(int l, int n, int pos, Metal.Buffer in, Metal.Buffer norm) {
         Bufs b = bufs[l];
         AttnWeights.Mla mw = b.w;
         int heads = m.heads();
@@ -134,15 +138,15 @@ final class MlaMetal {
         int kvl = m.kvLoraRank();
         int aw = m.latentDim();
         switch (mw.query()) {
-            case AttnWeights.Mla.Proj p -> k.matmul(p.w(), b.qProj, mb.xb, 0, mb.q, 0, n, false, null, 0f);
+            case AttnWeights.Mla.Proj p -> k.matmul(p.w(), b.qProj, in, 0, mb.q, 0, n, false, norm, 0f);
             case AttnWeights.Mla.Lora q -> {
-                k.matmul(q.a(), b.qA, mb.xb, 0, qa, 0, n, false, null, 0f);
+                k.matmul(q.a(), b.qA, in, 0, qa, 0, n, false, norm, 0f);
                 k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
                 k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
             }
         }
-        k.matmul(mw.kvA(), b.kvA, mb.xb, 0, lat, 0, n, false, null, 0f);
-        k.matmul(mw.kPe(), b.kPe, mb.xb, 0, kpe, 0, n, false, null, 0f);
+        k.matmul(mw.kvA(), b.kvA, in, 0, lat, 0, n, false, norm, 0f);
+        k.matmul(mw.kPe(), b.kPe, in, 0, kpe, 0, n, false, norm, 0f);
         k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
 
         // interleaved rotation of the rd-wide slice after the nope part of every q head, and of the shared

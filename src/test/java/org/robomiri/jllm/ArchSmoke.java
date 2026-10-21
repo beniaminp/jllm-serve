@@ -190,6 +190,13 @@ public final class ArchSmoke {
             }
             if (!mamba && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += q8Check(w, lib, cfg, cpu);
+                // f32 and q8 caches for every family; the f16 cache (its own mix of staging and cache rows) on the
+                // first dense and the first MoE family, to keep the emulator run's time in bounds
+                failures += replayCheck(w, lib, cfg, KvDtype.F32);
+                failures += replayCheck(w, lib, cfg, KvDtype.Q8);
+                if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
+                    failures += replayCheck(w, lib, cfg, KvDtype.F16);
+                }
             }
             if (!mamba && cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
                 boolean latent = dec.attention() instanceof Attention.Mla;
@@ -522,6 +529,98 @@ public final class ArchSmoke {
         System.out.printf("  kv q8: max|cpu-metal| = %.2e%s, max|q8-f32| = %.2e%s (f16: %.2e, max|logit| = %.2f)%n", diff,
                 agree ? "" : " MISMATCH", drift, close ? "" : " TOO FAR", drift16, scale);
         return (agree ? 0 : 1) + (close ? 0 : 1);
+    }
+
+    private static final int REPLAY_STEPS = 40;
+    private static final java.util.Set<String> replayF16 = new java.util.HashSet<>();
+
+    /**
+     * Decode replay (a single-token step recorded once per shape, then re-run with its position patched in) against
+     * encoding every step dispatch by dispatch, on two backends fed the same tokens: the logits of all
+     * {@code REPLAY_STEPS} decode steps after the prompt must be bit-identical, and so must the token ids of as many
+     * pipelined greedy steps (Backend.GreedyPipe, where the token ring slots are patched too). Flash decoding is forced
+     * on from 8 positions after the prompt with 4 keys per split, so the steps cross from the single-pass attention to
+     * the split kernels and through a new split count every 4 positions (each a new recording) within the run. Also
+     * prints the dispatches and the Java -> native calls per decode token with and without replay.
+     */
+    private static int replayCheck(ModelWeights w, String lib, Architecture cfg, KvDtype dt) {
+        int vocab = cfg.core().vocabSize();
+        int[] tokens = new int[REPLAY_STEPS];
+        boolean same = true;
+        long[] calls = new long[2];
+        long[] disp = new long[2];
+        long recorded;
+        long replayed;
+        try (MetalBackend on = new MetalBackend(w, 64, 16, lib, dt); MetalBackend off = new MetalBackend(w, 64, 16, lib, dt)) {
+            on.replay(true);
+            off.replay(false);
+            if (!on.replaying()) {
+                System.out.println("  replay " + dt + ": not available (native library without jm_run)");
+                return 1;
+            }
+            for (MetalBackend b : new MetalBackend[]{on, off}) {
+                b.flashDecodeThresholds(PROMPT.length + 8, 4);
+            }
+            float[] lOn = new float[vocab];
+            float[] lOff = new float[vocab];
+            on.forward(PROMPT, 0, PROMPT.length, 0, lOn);
+            off.forward(PROMPT, 0, PROMPT.length, 0, lOff);
+            same &= Arrays.equals(lOn, lOff);
+            long[] c0 = {on.downcalls(), off.downcalls()};
+            long[] d0 = {on.dispatches(), off.dispatches()};
+            int firstBad = -1;
+            for (int i = 0; i < REPLAY_STEPS; i++) {
+                int best = argmax(lOn);
+                tokens[i] = best;
+                on.forward(new int[]{best}, 0, 1, PROMPT.length + i, lOn);
+                off.forward(new int[]{best}, 0, 1, PROMPT.length + i, lOff);
+                if (!Arrays.equals(lOn, lOff) && firstBad < 0) {
+                    firstBad = i;
+                }
+            }
+            same &= firstBad < 0;
+            calls[0] = on.downcalls() - c0[0];
+            calls[1] = off.downcalls() - c0[1];
+            disp[0] = on.dispatches() - d0[0];
+            disp[1] = off.dispatches() - d0[1];
+            recorded = on.recordedSteps();
+            replayed = on.replayedSteps();
+            // pipelined greedy decoding with replay, from the same prompt (the GPU feeds its own argmax forward): step i's
+            // token must be the argmax the decode loop above saw after step i (the same on both backends)
+            int[] ids = null;
+            Backend.GreedyPipe pipe = on.greedyPipe(vocab);
+            if (pipe != null) {
+                on.forward(PROMPT, 0, PROMPT.length, 0, lOn);
+                ids = new int[REPLAY_STEPS];
+                pipe.submit(argmax(lOn), PROMPT.length);
+                for (int i = 0; i < REPLAY_STEPS; i++) {
+                    if (i + 1 < REPLAY_STEPS) {
+                        pipe.submit(-1, PROMPT.length + i + 1);
+                    }
+                    ids[i] = pipe.next();
+                }
+                pipe.drain();
+            }
+            boolean pipeSame = ids == null || Arrays.equals(ids, 0, REPLAY_STEPS - 1, tokens, 1, REPLAY_STEPS);
+            String msg = String.format("  replay %s: %d decode steps %s (%d recorded, %d replayed), pipelined %s; per token "
+                            + "%.1f dispatches, %.1f native calls with replay vs %.1f / %.1f without", dt, REPLAY_STEPS,
+                    same ? "bit-identical" : "DIFFER from step " + firstBad, recorded, replayed,
+                    ids == null ? "n/a" : pipeSame ? "the same tokens" : "DIFFERENT tokens", disp[0] / (double) REPLAY_STEPS,
+                    calls[0] / (double) REPLAY_STEPS, disp[1] / (double) REPLAY_STEPS, calls[1] / (double) REPLAY_STEPS);
+            boolean ok = same && pipeSame && replayed > 0 && calls[0] < calls[1];
+            System.out.println(msg + (ok ? "" : "  REPLAY MISMATCH"));
+            return ok ? 0 : 1;
+        }
+    }
+
+    private static int argmax(float[] l) {
+        int best = 0;
+        for (int t = 1; t < l.length; t++) {
+            if (l[t] > l[best]) {
+                best = t;
+            }
+        }
+        return best;
     }
 
     /** The logits of {@code seq}'s last token as one chunk, then those of every token after the prompt fed one at a time. */

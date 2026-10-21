@@ -75,6 +75,9 @@ bench "$DENSE: defaults" "$DENSE" ""
 bench "flash prefill off" "$DENSE" "-Djllm.metal.flashPrefill=false"
 bench "flash decode off" "$DENSE" "-Djllm.metal.flashDecode=false"
 bench "pipelined decoding off" "$DENSE" "-Djllm.metal.pipeline=false"
+bench "decode replay off" "$DENSE" "-Djllm.metal.replay=false"
+bench "decode replay off, pipelined decoding off" "$DENSE" "-Djllm.metal.replay=false -Djllm.metal.pipeline=false"
+bench "q8 KV cache, decode fusions off" "$DENSE" "-Djllm.metal.fuse=false" --backend.kv-dtype q8
 bench "simdgroup-matrix prefill off" "$DENSE" "-Djllm.metal.mmaPrefill=false"
 # the prefill kernels' two forms: f32 *_mma vs half-weight *_hmma (default: per shape, as the start-up check timed them),
 # and attention_fa vs attention_fb; the 2000-token rows weigh attention more
@@ -93,6 +96,7 @@ if [ -n "$MOE" ]; then
   bench "grouped MoE prefill off" "$MOE" "-Djllm.metal.moeMma=false"
   bench "half-weight MMA prefill forced on" "$MOE" "-Djllm.metal.hmma=true"
   bench "half-weight MMA prefill off (f32 MMA)" "$MOE" "-Djllm.metal.hmma=false"
+  bench "decode replay off" "$MOE" "-Djllm.metal.replay=false"
   bench "experts of 4 layers on the CPU" "$MOE" "" --backend.metal.cpu-moe 4
   bench "experts of 4 layers on the CPU, int8 off" "$MOE" "" --backend.metal.cpu-moe 4 --backend.cpu.int8-activations false
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off

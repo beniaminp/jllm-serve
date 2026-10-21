@@ -565,4 +565,147 @@ mm_test('q4', 'hmma', 96, 256, 40, softcap=3.0)
 mm_test('q4', 'hmma', 64, 128, 7)                              # one 8-token block of the tile only
 swiglu_test('q8', 'hmma', 32, 128, 64, use_gelu=True)
 moe_test('q4', 'hmma', 96, 128, counts=(32, 32, 3), experts=(1, 3, 1))
+def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0):
+    """attention_split with chunk = 0 (the keys per split derived in the kernel, as a recorded decode step passes it)
+    gives the bytes of the explicit ceil(keys / nSplit)."""
+    rng = np.random.default_rng(6)
+    q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
+    kc = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    vc = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    ln = pos0 + 1
+    keys = ln - (max(0, ln - window) if window > 0 else 0)
+    outs = []
+    for chunk in ((keys + n_split - 1) // n_split, 0):
+        part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
+        scores = np.zeros(n_heads * ctx, np.float32)
+        out = np.zeros((1, n_heads * hd), np.float32)
+        p = pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, 1 / np.sqrt(hd), n_heads * hd, n_kv * hd, window, 0.0,
+                 n_split, chunk)
+        E.dispatch('attention_split', [q, kc, vc, part, scores], p, (n_heads, n_split), (256,))
+        E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+        outs.append(out)
+    ref = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, 1, 1 / np.sqrt(hd), window)
+    err = np.abs(outs[1] - ref).max()
+    check(np.array_equal(outs[0], outs[1]) and err < 1e-4,
+          'attention_split chunk derived in the kernel (window %d): %s the explicit chunk, max err %.2e'
+          % (window, 'same bytes as' if np.array_equal(outs[0], outs[1]) else 'DIFFERENT from', err))
+
+
+split_chunk()
+split_chunk(window=50)
+
+
+def rope_ref(h, cos, sin, pos, rot_off, rot_half, adjacent, w=None, eps=1e-6):
+    """One head h (float32 [headDim]) normalised (w) and rotated at pos, in float32 like the kernel."""
+    h = h.astype(np.float32).copy()
+    hd = h.shape[0]
+    i = np.arange(rot_half)
+    i0 = rot_off + (2 * i if adjacent else i)
+    i1 = rot_off + (2 * i + 1 if adjacent else i + rot_half)
+    a, b = h[i0], h[i1]
+    if w is not None:
+        ss = np.float32((a.astype(np.float64) ** 2 + b.astype(np.float64) ** 2).sum())
+        sc = np.float32(1) / np.sqrt(ss / np.float32(hd) + np.float32(eps))
+        a, b = a * sc * w[i0], b * sc * w[i1]
+    c, s = cos[pos * rot_half + i], sin[pos * rot_half + i]
+    h[i0], h[i1] = a * c - b * s, b * c + a * s
+    return h
+
+
+def rope_store_q8(hd, n_heads=4, n_kv=2, ntok=3, pos0=5, ctx=16, rot_half=None, adjacent=False, norm=True):
+    """rope_store_q8 writes the q rows and the q8 cache rows of k and v that rope (in place on the f32 staging rows)
+    followed by kv_store_q8 write, byte for byte; the cache rows also match numpy's rope + quantization."""
+    rot_half = rot_half or hd // 2
+    rng = np.random.default_rng(7)
+    q0 = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    k0 = (rng.standard_normal((ntok, n_kv * hd)) * 3).astype(np.float32)
+    v = rng.standard_normal((ntok, n_kv * hd)).astype(np.float32)
+    v[1, hd:2 * hd] = 0  # an all-zero v row: scale 0
+    qw = (rng.random(hd) + 0.5).astype(np.float32)
+    kw = (rng.random(hd) + 0.5).astype(np.float32)
+    ang = rng.random((ctx, rot_half)).astype(np.float32) * 3
+    cos, sin = np.cos(ang).astype(np.float32).reshape(-1), np.sin(ang).astype(np.float32).reshape(-1)
+    kv_dim = n_kv * hd
+    stride = kv_dim + 4 * n_kv
+    eps = 1e-6
+    # reference: rope<float> in place, then kv_store_q8
+    q_a, k_a = q0.copy(), k0.copy()
+    E.dispatch('rope_il' if adjacent else 'rope', [q_a, k_a, qw, kw, cos, sin, k_a],
+               pack('iiiiifiii', hd, n_heads * hd, kv_dim, n_heads, pos0, eps, int(norm), 0, rot_half),
+               (n_heads + n_kv, ntok), (rot_half,))
+    kc_a = np.full((ntok, stride), 0x5A, np.uint8)
+    vc_a = np.full((ntok, stride), 0x5A, np.uint8)
+    E.dispatch('kv_store_q8', [k_a, v, kc_a, vc_a], pack('iiii', hd, kv_dim, n_kv, stride), (2 * n_kv, ntok), (32,))
+    # fused
+    q_b, k_b = q0.copy(), k0.copy()
+    kc_b = np.full((ntok, stride), 0x5A, np.uint8)
+    vc_b = np.full((ntok, stride), 0x5A, np.uint8)
+    E.dispatch('rope_il_store_q8' if adjacent else 'rope_store_q8', [q_b, k_b, qw, kw, cos, sin, kc_b, v, vc_b],
+               pack('iiiiifiiiii', hd, n_heads * hd, kv_dim, n_heads, pos0, eps, int(norm), 0, rot_half, n_kv, stride),
+               (n_heads + 2 * n_kv, ntok), (rot_half,))
+    same = np.array_equal(q_a, q_b) and np.array_equal(kc_a, kc_b) and np.array_equal(vc_a, vc_b)
+    # numpy: rotate every k head, quantize
+    kr = np.stack([np.concatenate([rope_ref(k0[t, h * hd:(h + 1) * hd], cos, sin, pos0 + t, 0, rot_half, adjacent,
+                                            kw if norm else None, eps) for h in range(n_kv)]) for t in range(ntok)])
+    want_k, _ = q8_rows(kr, n_kv, hd)
+    want_v, _ = q8_rows(v, n_kv, hd)
+    # the float32 rotation may round differently from numpy's in the last bit: at most one quantization step apart
+    kq = kc_b[:, :kv_dim].view(np.int8).astype(int)
+    close_k = np.abs(kq - want_k[:, :kv_dim].view(np.int8).astype(int)).max() <= 1
+    check(same and close_k and np.array_equal(vc_b, want_v),
+          'rope_%sstore_q8 hd=%d rotHalf=%d norm=%s: %s rope + kv_store_q8, k within a step of numpy, v as numpy'
+          % ('il_' if adjacent else '', hd, rot_half, norm, 'same bytes as' if same else 'DIFFERENT from'))
+
+
+rope_store_q8(128)
+rope_store_q8(64, n_kv=1, n_heads=3)
+rope_store_q8(64, rot_half=16, adjacent=True, norm=False)
+rope_store_q8(96, rot_half=24, norm=False)
+
+
+def router_norm(ds=False, n_exp=16, dim=128, top_k=4, ntok=3, remap=False, method=2, sigmoid=1):
+    """router_norm / router_ds_norm: the norm before the experts and the router in one kernel give the bytes of rmsnorm
+    followed by router / router_ds (xb, assign, weights, and with remap the GPU slots and the pick counts)."""
+    rng = np.random.default_rng(8)
+    x = rng.standard_normal((ntok, dim)).astype(np.float32)
+    nw = (rng.random(dim) + 0.5).astype(np.float32)
+    w = (rng.standard_normal((n_exp, dim)) * 0.2).astype(np.float32)
+    bias = (rng.standard_normal(n_exp) * 0.1).astype(np.float32)
+    emap = np.array([-1 if e % 3 == 0 else e for e in range(n_exp)], np.int32)
+    eps = 1e-6
+    res = []
+    for fused in (False, True):
+        xb = np.zeros((ntok, dim), np.float32)
+        assign = np.zeros(ntok * top_k, np.int32)
+        rw = np.zeros(ntok * top_k, np.float32)
+        gassign = np.zeros(ntok * top_k, np.int32)
+        counts = np.zeros(n_exp, np.uint32)
+        if ds:
+            fields = (n_exp, dim, top_k, 1, 4, 2, sigmoid, method, 1, 2.5, int(remap))
+            bufs = [w, assign, rw, bias, emap, gassign, counts]
+            if fused:
+                E.dispatch('router_ds_norm', [x] + bufs + [nw, xb], pack('iiiiiiiiifif', *fields, eps), (ntok,), (256,))
+            else:
+                E.dispatch('rmsnorm', [x, nw, xb], pack('if', dim, eps), (ntok,), (256,))
+                E.dispatch('router_ds', [xb] + bufs, pack('iiiiiiiiifi', *fields), (ntok,), (256,))
+        else:
+            fields = (n_exp, dim, top_k, 1, int(remap))
+            bufs = [w, assign, rw, emap, gassign, counts]
+            if fused:
+                E.dispatch('router_norm', [x] + bufs + [nw, xb], pack('iiiiif', *fields, eps), (ntok,), (256,))
+            else:
+                E.dispatch('rmsnorm', [x, nw, xb], pack('if', dim, eps), (ntok,), (256,))
+                E.dispatch('router', [xb] + bufs, pack('iiiii', *fields), (ntok,), (256,))
+        res.append((xb, assign, rw, gassign, counts))
+    same = all(np.array_equal(a, b) for a, b in zip(res[0], res[1]))
+    picks_ok = res[1][4].sum() == (ntok * top_k if remap else 0)
+    check(same and picks_ok, '%s ntok=%d remap=%s: %s rmsnorm + %s' % ('router_ds_norm' if ds else 'router_norm', ntok,
+                                                                      remap, 'same bytes as' if same else 'DIFFERENT from',
+                                                                      'router_ds' if ds else 'router'))
+
+
+router_norm()
+router_norm(remap=True, ntok=5)
+router_norm(ds=True)
+router_norm(ds=True, method=1, sigmoid=0, remap=True)
 sys.exit(1 if failures else 0)

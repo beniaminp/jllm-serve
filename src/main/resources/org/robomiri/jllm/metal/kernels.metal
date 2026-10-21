@@ -1372,7 +1372,7 @@ struct AttnSplitParams {
     int window;
     float softcap;
     int nSplit;
-    int chunk;       // keys per split
+    int chunk;       // keys per split; <= 0: ceil(keys / nSplit), computed by the kernel
 };
 
 template <typename KV>
@@ -1398,8 +1398,10 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     const int kvh = h / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + 1;
     const int first = p.window > 0 ? max(0, len - p.window) : 0;
-    const int s0 = first + split * p.chunk;
-    const int s1 = min(len, s0 + p.chunk);
+    // chunk <= 0: ceil(keys / nSplit), derived here so that a recorded decode step only patches the position
+    const int chunk = p.chunk > 0 ? p.chunk : (len - first + p.nSplit - 1) / p.nSplit;
+    const int s0 = first + split * chunk;
+    const int s1 = min(len, s0 + chunk);
     const int per = p.headDim / 32;
     device const float *qv = q + h * p.headDim;
     device float *sc = scores + (ulong)h * p.ctx;
@@ -1540,6 +1542,108 @@ kernel void kv_store_q8(device const float *k [[buffer(0)]],
     if (lane == 0) ((device float *)(row + p.kvDim))[h] = s;
 }
 
+// rope_store_q8<ADJACENT>: rope<float, ADJACENT> and kv_store_q8 in one dispatch (the decode path of the q8 cache).
+// Grid: (nHeads + 2 * nKvHeads, ntok), rotHalf threads per threadgroup. Threadgroups x < nHeads are rope's q heads,
+// unchanged; x < nHeads + nKvHeads takes k head x - nHeads from the f32 staging rows `k`, applies rope's qk-norm and
+// rotation, keeps the head's values in threadgroup memory and quantizes them straight into the cache rows `kc`; the
+// remaining nKvHeads threadgroups quantize v head x - nHeads - nKvHeads of the staging rows `v` into `vc`. The
+// quantization is kv_store_q8's (scale = max|x| / 127 over the head, q = rint(x / scale)); the maximum is taken by a
+// threadgroup reduction instead of one simdgroup's, which gives the same number, so the cache bytes are the ones
+// rope + kv_store_q8 write. kc / vc are bound at the row of the chunk's first position, like kv_store_q8's.
+
+struct RopeQ8Params {
+    int headDim;
+    int qStride;
+    int kvStride;    // floats per staging row (kvDim)
+    int nHeads;
+    int pos0;
+    float eps;
+    int useNorm;
+    int rotOff;
+    int rotHalf;
+    int nKvHeads;
+    int stride;      // bytes per cache position row: kvDim + 4 * nKvHeads
+};
+
+static inline char q8_value(float x, float s) {
+    return s > 0.0f ? char(clamp(rint(x / s), -127.0f, 127.0f)) : char(0);
+}
+
+template <bool ADJACENT>
+kernel void rope_store_q8(device float *q [[buffer(0)]],
+                          device const float *k [[buffer(1)]],
+                          device const float *qw [[buffer(2)]],
+                          device const float *kw [[buffer(3)]],
+                          device const float *cosT [[buffer(4)]],
+                          device const float *sinT [[buffer(5)]],
+                          device char *kc [[buffer(6)]],
+                          device const float *v [[buffer(7)]],
+                          device char *vc [[buffer(8)]],
+                          constant RopeQ8Params &p [[buffer(9)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort2 tid2 [[thread_position_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]],
+                          ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    threadgroup float hv[MAX_PER * 32];   // the k head after norm and rotation
+    const ushort tid = tid2.x;
+    const int kvDim = p.nKvHeads * p.headDim;
+    if (int(tgp.x) >= p.nHeads + p.nKvHeads) { // a v head: quantized as it is
+        const int h = int(tgp.x) - p.nHeads - p.nKvHeads;
+        device const float *x = v + (ulong)tgp.y * p.kvStride + h * p.headDim;
+        float mx = 0.0f;
+        for (int i = tid; i < p.headDim; i += p.rotHalf) mx = max(mx, fabs(x[i]));
+        const float s = tg_max(mx, buf, sg, lane, nsg) / 127.0f;
+        device char *row = vc + (ulong)tgp.y * p.stride;
+        for (int i = tid; i < p.headDim; i += p.rotHalf) row[h * p.headDim + i] = q8_value(x[i], s);
+        if (tid == 0) ((device float *)(row + kvDim))[h] = s;
+        return;
+    }
+    const bool isQ = int(tgp.x) < p.nHeads;
+    const int head = isQ ? int(tgp.x) : int(tgp.x) - p.nHeads;
+    const ulong off = isQ ? (ulong)tgp.y * p.qStride + (ulong)head * p.headDim
+                          : (ulong)tgp.y * p.kvStride + (ulong)head * p.headDim;
+    device const float *h = (isQ ? q : k) + off;
+    device const float *w = isQ ? qw : kw;
+    const int i0 = p.rotOff + (ADJACENT ? 2 * tid : tid);
+    const int i1 = p.rotOff + (ADJACENT ? 2 * tid + 1 : tid + p.rotHalf);
+    float a = h[i0];
+    float b = h[i1];
+    if (p.useNorm) {
+        float ss = tg_sum(a * a + b * b, buf, sg, lane, nsg);
+        float scale = rsqrt(ss / p.headDim + p.eps);
+        a *= scale * w[i0];
+        b *= scale * w[i1];
+    }
+    const int pos = p.pos0 + int(tgp.y);
+    const float c = cosT[pos * p.rotHalf + tid];
+    const float s = sinT[pos * p.rotHalf + tid];
+    const float ra = a * c - b * s;
+    const float rb = b * c + a * s;
+    if (isQ) {
+        q[off + i0] = ra;
+        q[off + i1] = rb;
+        return;
+    }
+    hv[i0] = ra;
+    hv[i1] = rb;
+    float mx = max(fabs(ra), fabs(rb));
+    for (int i = tid; i < p.headDim; i += p.rotHalf) {
+        if (i < p.rotOff || i >= p.rotOff + 2 * p.rotHalf) {
+            hv[i] = h[i];
+            mx = max(mx, fabs(h[i]));
+        }
+    }
+    const float sc = tg_max(mx, buf, sg, lane, nsg) / 127.0f; // its barriers also publish hv
+    device char *row = kc + (ulong)tgp.y * p.stride;
+    for (int i = tid; i < p.headDim; i += p.rotHalf) row[head * p.headDim + i] = q8_value(hv[i], sc);
+    if (tid == 0) ((device float *)(row + kvDim))[head] = sc;
+}
+
+template [[host_name("rope_store_q8")]] kernel decltype(rope_store_q8<false>) rope_store_q8<false>;
+template [[host_name("rope_il_store_q8")]] kernel decltype(rope_store_q8<true>) rope_store_q8<true>;
+
 // ---------------------------------------------------------------------------------------------- 5. mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
 // sg, sg + 8, ...: the 32 lanes stride over dim in float4 steps (each iteration reads 512 contiguous bytes of
@@ -1563,23 +1667,27 @@ static inline void remap_slot(device const int *map, device int *gassign, device
     atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
 }
 
-kernel void router(device const float *x [[buffer(0)]],
-                   device const float *w [[buffer(1)]],
-                   device int *assign [[buffer(2)]],
-                   device float *rw [[buffer(3)]],
-                   device const int *map [[buffer(4)]],
-                   device int *gassign [[buffer(5)]],
-                   device atomic_uint *counts [[buffer(6)]],
-                   constant RouterParams &p [[buffer(7)]],
-                   uint tg [[threadgroup_position_in_grid]],
-                   ushort tid [[thread_position_in_threadgroup]],
-                   ushort tpg [[threads_per_threadgroup]],
-                   ushort sg [[simdgroup_index_in_threadgroup]],
-                   ushort lane [[thread_index_in_simdgroup]],
-                   ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float logits[MAX_EXPERTS];
-    threadgroup float buf[32];
-    device const float *xv = x + (ulong)tg * p.dim;
+// the norm the MoE layer applies before its router, fused into the *_norm routers: xn row = rmsnorm(x row) * nw, the
+// arithmetic of the rmsnorm kernel (the same threads, reduction and expression), then published to the threadgroup
+static inline void norm_row_into(device const float *xv, device const float *nw, device float *ov, int n, float eps,
+                                 ushort tid, ushort tpg, threadgroup float *buf, ushort sg, ushort lane, ushort nsg) {
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += tpg) {
+        float v = xv[i];
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float scale = rsqrt(ss / n + eps);
+    for (int i = tid; i < n; i += tpg) ov[i] = xv[i] * scale * nw[i];
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
+// The router's work for token tg, whose (normalised) row is xv. P: RouterParams or RouterNormParams.
+template <typename P>
+static inline void router_row(device const float *xv, device const float *w, device int *assign, device float *rw,
+                              device const int *map, device int *gassign, device atomic_uint *counts, constant P &p,
+                              uint tg, ushort tid, ushort tpg, ushort sg, ushort lane, ushort nsg,
+                              threadgroup float *logits, threadgroup float *buf) {
     device const float4 *x4 = (device const float4 *)xv;
     const int n4 = p.dim / 4;
     for (int e = sg; e < p.nExperts; e += nsg) {
@@ -1620,6 +1728,59 @@ kernel void router(device const float *x [[buffer(0)]],
             for (int k = 0; k < p.topK; k++) rw[tg * p.topK + k] /= selected;
         }
     }
+}
+
+kernel void router(device const float *x [[buffer(0)]],
+                   device const float *w [[buffer(1)]],
+                   device int *assign [[buffer(2)]],
+                   device float *rw [[buffer(3)]],
+                   device const int *map [[buffer(4)]],
+                   device int *gassign [[buffer(5)]],
+                   device atomic_uint *counts [[buffer(6)]],
+                   constant RouterParams &p [[buffer(7)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   ushort tid [[thread_position_in_threadgroup]],
+                   ushort tpg [[threads_per_threadgroup]],
+                   ushort sg [[simdgroup_index_in_threadgroup]],
+                   ushort lane [[thread_index_in_simdgroup]],
+                   ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float logits[MAX_EXPERTS];
+    threadgroup float buf[32];
+    router_row(x + (ulong)tg * p.dim, w, assign, rw, map, gassign, counts, p, tg, tid, tpg, sg, lane, nsg, logits, buf);
+}
+
+// router_norm: the MoE layer's rmsnorm and its router in one dispatch (one threadgroup per token owns the token's row):
+// xn = rmsnorm(x) * nw, written for the experts that follow, then the router on it. Bit-identical to rmsnorm + router.
+struct RouterNormParams {
+    int nExperts;
+    int dim;
+    int topK;
+    int normalize;
+    int remap;
+    float eps;
+};
+
+kernel void router_norm(device const float *x [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device int *assign [[buffer(2)]],
+                        device float *rw [[buffer(3)]],
+                        device const int *map [[buffer(4)]],
+                        device int *gassign [[buffer(5)]],
+                        device atomic_uint *counts [[buffer(6)]],
+                        device const float *nw [[buffer(7)]],
+                        device float *xn [[buffer(8)]],
+                        constant RouterNormParams &p [[buffer(9)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_position_in_threadgroup]],
+                        ushort tpg [[threads_per_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float logits[MAX_EXPERTS];
+    threadgroup float buf[32];
+    device float *row = xn + (ulong)tg * p.dim;
+    norm_row_into(x + (ulong)tg * p.dim, nw, row, p.dim, p.eps, tid, tpg, buf, sg, lane, nsg);
+    router_row(row, w, assign, rw, map, gassign, counts, p, tg, tid, tpg, sg, lane, nsg, logits, buf);
 }
 
 // moe_up: h[s, row] = silu(Wgate_e[row] . x[t]) * (Wup_e[row] . x[t])   for slot s = token*topK + k,
@@ -1894,26 +2055,14 @@ struct RouterDsParams {
     int remap;       // see remap_slot
 };
 
-kernel void router_ds(device const float *x [[buffer(0)]],
-                      device const float *w [[buffer(1)]],
-                      device int *assign [[buffer(2)]],
-                      device float *rw [[buffer(3)]],
-                      device const float *bias [[buffer(4)]],
-                      device const int *map [[buffer(5)]],
-                      device int *gassign [[buffer(6)]],
-                      device atomic_uint *counts [[buffer(7)]],
-                      constant RouterDsParams &p [[buffer(8)]],
-                      uint tg [[threadgroup_position_in_grid]],
-                      ushort tid [[thread_position_in_threadgroup]],
-                      ushort tpg [[threads_per_threadgroup]],
-                      ushort sg [[simdgroup_index_in_threadgroup]],
-                      ushort lane [[thread_index_in_simdgroup]],
-                      ushort nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float scores[MAX_EXPERTS];
-    threadgroup float choice[MAX_EXPERTS];
-    threadgroup float buf[32];
+// router_ds's work for token tg, whose (normalised) row is xv. P: RouterDsParams or RouterDsNormParams.
+template <typename P>
+static inline void router_ds_row(device const float *xv, device const float *w, device int *assign, device float *rw,
+                                 device const float *bias, device const int *map, device int *gassign,
+                                 device atomic_uint *counts, constant P &p, uint tg, ushort tid, ushort tpg, ushort sg,
+                                 ushort lane, ushort nsg, threadgroup float *scores, threadgroup float *choice,
+                                 threadgroup float *buf) {
     const int ne = p.nExperts;
-    device const float *xv = x + (ulong)tg * p.dim;
     device const float4 *x4 = (device const float4 *)xv;
     const int n4 = p.dim / 4;
     for (int e = sg; e < ne; e += nsg) {
@@ -1995,6 +2144,69 @@ kernel void router_ds(device const float *x [[buffer(0)]],
         if (scale) v *= p.routedScale;
         rw[tg * p.topK + k] = v;
     }
+}
+
+kernel void router_ds(device const float *x [[buffer(0)]],
+                      device const float *w [[buffer(1)]],
+                      device int *assign [[buffer(2)]],
+                      device float *rw [[buffer(3)]],
+                      device const float *bias [[buffer(4)]],
+                      device const int *map [[buffer(5)]],
+                      device int *gassign [[buffer(6)]],
+                      device atomic_uint *counts [[buffer(7)]],
+                      constant RouterDsParams &p [[buffer(8)]],
+                      uint tg [[threadgroup_position_in_grid]],
+                      ushort tid [[thread_position_in_threadgroup]],
+                      ushort tpg [[threads_per_threadgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float scores[MAX_EXPERTS];
+    threadgroup float choice[MAX_EXPERTS];
+    threadgroup float buf[32];
+    router_ds_row(x + (ulong)tg * p.dim, w, assign, rw, bias, map, gassign, counts, p, tg, tid, tpg, sg, lane, nsg, scores,
+                  choice, buf);
+}
+
+// router_ds_norm: the MoE layer's rmsnorm and router_ds in one dispatch, as router_norm.
+struct RouterDsNormParams {
+    int nExperts;
+    int dim;
+    int topK;
+    int normalize;
+    int nGroup;
+    int topkGroup;
+    int sigmoidScore;
+    int method;
+    int scaleAlways;
+    float routedScale;
+    int remap;
+    float eps;
+};
+
+kernel void router_ds_norm(device const float *x [[buffer(0)]],
+                           device const float *w [[buffer(1)]],
+                           device int *assign [[buffer(2)]],
+                           device float *rw [[buffer(3)]],
+                           device const float *bias [[buffer(4)]],
+                           device const int *map [[buffer(5)]],
+                           device int *gassign [[buffer(6)]],
+                           device atomic_uint *counts [[buffer(7)]],
+                           device const float *nw [[buffer(8)]],
+                           device float *xn [[buffer(9)]],
+                           constant RouterDsNormParams &p [[buffer(10)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_position_in_threadgroup]],
+                           ushort tpg [[threads_per_threadgroup]],
+                           ushort sg [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float scores[MAX_EXPERTS];
+    threadgroup float choice[MAX_EXPERTS];
+    threadgroup float buf[32];
+    device float *row = xn + (ulong)tg * p.dim;
+    norm_row_into(x + (ulong)tg * p.dim, nw, row, p.dim, p.eps, tid, tpg, buf, sg, lane, nsg);
+    router_ds_row(row, w, assign, rw, bias, map, gassign, counts, p, tg, tid, tpg, sg, lane, nsg, scores, choice, buf);
 }
 
 // ---------------------------------------------------------------------------------------------- 6. state space (Mamba)

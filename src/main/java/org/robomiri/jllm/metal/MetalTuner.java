@@ -329,6 +329,8 @@ final class MetalTuner {
                     matmul(m, ml.xProj());
                     matmul(m, ml.outProj());
                 }
+                case org.robomiri.jllm.model.Qwen3NextLayer q -> { // its own backend (Qwen3NextMetalBackend) does not use the tuned prefill matmuls
+                }
             }
         }
         return new ArrayList<>(m.values());

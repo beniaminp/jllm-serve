@@ -121,7 +121,7 @@ MLX would otherwise do for us.
 │ Metal.java          knows NOTHING about models: compile shader source, make/wrap     │  Java (FFM)
 │                     buffers, memoized pipelines, begin / dispatch / commit / wait    │
 ├───────────────────────────── C function calls (jm_*) ───────────────────────────────┤
-│ jllm_metal.m        Objective-C: talks to the Metal framework; 16 C functions        │  native
+│ jllm_metal.m        Objective-C: talks to the Metal framework; 19 C functions        │  native
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │ kernels.metal       Metal Shading Language (C++ dialect): the code the GPU runs;     │  GPU
 │                     compiled at start-up from source, in eight sections (0-7)             │
@@ -150,7 +150,7 @@ Just enough Objective-C to read the file:
 | `MTLComputeCommandEncoder` | the object you record dispatches into |
 | `MTLComputePipelineState` | a compiled kernel ready to run (like a `MethodHandle` for GPU code) |
 
-The 16 exported functions:
+The exported functions (the rest: `jm_thermal_state` [8.19](#819-thermal-state), `jm_wait_pending` [8.16](#816-pipelined-greedy-decoding)):
 
 | C function | does | called from |
 |---|---|---|
@@ -167,6 +167,7 @@ The 16 exported functions:
 | `jm_buffer_release(buf)` | drop the reference | `Metal.close` |
 | `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels | start of `forward` |
 | `jm_dispatch(ctx, pipe, bufs[], offsets[], nbuf, params, plen, tgmem, gx,gy,gz, tx,ty,tz)` | `setComputePipelineState`, `setBuffer:offset:atIndex:` for `i < nbuf`, `setBytes:` for the params at index `nbuf`, `setThreadgroupMemoryLength:` for the kernel's dynamic `[[threadgroup(0)]]` argument when `tgmem > 0`, then `dispatchThreadgroups:threadsPerThreadgroup:` | once per kernel launch |
+| `jm_run(ctx, cmds, n)` | encodes `n` recorded dispatches (384-byte `JMCmd` records: pipeline, buffers, offsets, params, grid) exactly as `n` `jm_dispatch` calls would, skipping a pipeline / buffer / offset the previous command already set — a whole decode step in one call ([8.22](#822-decode-replay-one-native-call-per-token)) | every decode step |
 | `jm_commit(ctx)` | `endEncoding`, `commit` **without waiting**, then opens a fresh command buffer and encoder: the GPU starts on the layers recorded so far while Java encodes the next ones. The queue runs command buffers in submission order, so the serial guarantee of `jm_begin` carries across the split | every 8 layers (`-Djllm.metal.commitLayers`) |
 | `jm_abort(ctx)` | ends and drops the command buffer being recorded without running it (Metal aborts the process if an encoder is released un-ended), after waiting for the parts `jm_commit` already submitted | `forward` when recording throws |
 | `jm_commit_wait(ctx, err, len)` | `endEncoding`, `commit`, `waitUntilCompleted`; returns −1 with the error text if any command buffer of the pass has status `MTLCommandBufferStatusError` (a GPU fault) | end of `forward` |
@@ -281,9 +282,11 @@ the projection that follows it (the `*_norm` kernel variants normalise the input
 
 28 layers × 6 = 168, plus the final `rmsnorm` and the LM head `matmul_q8` (151 936 rows, grid (37 984, 1),
 Gemma's logit soft-cap in its epilogue): **170 dispatches per decode step**, in 4 command buffers
-(`-Djllm.metal.commitLayers=8`). With `backend.kv-dtype=f16` the kernel names gain `_h` and k goes through
-a staging row — [8.9](#89-the-f16-kv-cache); with `q8` they gain `_q8`, k and v go through staging rows and one
-`kv_store_q8` per layer quantizes them. With `-Djllm.metal.flashDecode=true` step 4 of a decode step
+(`-Djllm.metal.commitLayers=8`) when a prefill chunk or a step is encoded dispatch by dispatch; a decode step is
+recorded once and then replayed in one native call per token ([8.22](#822-decode-replay-one-native-call-per-token)).
+With `backend.kv-dtype=f16` the kernel names gain `_h` and k goes through
+a staging row — [8.9](#89-the-f16-kv-cache); with `q8` they gain `_q8`, k and v go through staging rows and step 3
+becomes `rope_store_q8`, which also quantizes them into the cache ([8.23](#823-decode-fusions)). With `-Djllm.metal.flashDecode=true` step 4 of a decode step
 over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11](#811-flash-decoding-chosen-at-start-up).
 
 ### Dispatch list per MoE layer (Qwen3-30B-A3B: dim 2048, qDim 4096, kvDim 512, 128 experts, top-8, moeDim 768)
@@ -291,12 +294,11 @@ over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11
 | # | kernel | grid, decode `n=1` | grid, prefill `n=64` | threads |
 |---|---|---|---|---|
 | 1–5 | as above with the 30B shapes | | | |
-| 6 | `rmsnorm` | 1 | 64 | 256 |
-| 7 | `router` (DeepSeek: `router_ds`) | 1 | 64 | 256 |
-| 8 | `moe_up_q4` (1536 rows per expert, SwiGLU in the epilogue) | (192, 8) | (192, 512) | 128 |
-| 9 | `moe_down_q4` (2048 rows per expert) | (512, 1) | (512, 64) | 128 |
+| 6 | `router_norm` (DeepSeek: `router_ds_norm`): the layer's rmsnorm into `xb`, then the routing ([8.23](#823-decode-fusions)) | 1 | 64 | 256 |
+| 7 | `moe_up_q4` (1536 rows per expert, SwiGLU in the epilogue) | (192, 8) | (192, 512) | 128 |
+| 8 | `moe_down_q4` (2048 rows per expert) | (512, 1) | (512, 64) | 128 |
 
-48 layers × 8 + 2 = **386 dispatches per decode step**.
+48 layers × 7 + 2 = **338 dispatches per decode step** (386 before the norm moved into the router).
 
 ### Parameter structs: `Params`, `KernelParams` and `MetalParamsTest`
 
@@ -616,7 +618,7 @@ Where a decode step of the 0.6B model (~9 ms) goes:
 
 | cost | evidence |
 |---|---|
-| **170 dispatches per token** | each costs a few µs of GPU front-end time plus the serial dependency between consecutive kernels; the fusions ([8.4](#84-recording-a-forward-pass-metalbackendforward)) brought the count down from 338 |
+| **170 dispatches per token** | each costs a few µs of GPU front-end time plus the serial dependency between consecutive kernels; the fusions ([8.4](#84-recording-a-forward-pass-metalbackendforward)) brought the count down from 338. Encoding them used to cost one Java → native call each (~175 per token); decode replay ([8.22](#822-decode-replay-one-native-call-per-token)) makes that 3 |
 | **under-filled grids** | `Wo`, `Wdown` have 1024 rows → 256 threadgroups of 128 threads = 32 768 threads on a GPU that wants hundreds of thousands in flight; the M1 Pro's 16 cores are mostly idle during these kernels |
 | **the LM head** | `151 936 × 1024` Q8 = 165 MB, a third of all bytes read per token, in one 37 984-threadgroup dispatch |
 | **attention reads the whole prefix** | per layer, per head: `len × 128 × 4 B` of keys and the same of values; at 4 096 tokens that is 4 MB per head per layer — the `half` cache halves it, flash decoding ([8.11](#811-flash-decoding-chosen-at-start-up)) spreads it over more threadgroups |
@@ -648,7 +650,7 @@ reading the whole prefix) dominates instead.
 - Dot products end with `simd_sum`; threadgroup-wide sums use a two-level reduction through threadgroup memory
   and barriers.
 - Unified memory lets the memory-mapped quantized cache be used by the GPU in place (`jm_buffer_wrap`).
-- A ~270-line Objective-C shim exposes 16 C functions; `Metal.java` binds them with the FFM API (`Linker`,
+- A ~330-line Objective-C shim exposes 19 C functions; `Metal.java` binds them with the FFM API (`Linker`,
   `FunctionDescriptor`, `MethodHandle.invokeExact`, `MemorySegment`), no JNI, no generated code.
 - `MetalBackend.forward` records the whole forward pass (170 dispatches for 0.6B, 386 for 30B-A3B) through
   the writers of `MetalKernels` (per-layer strategy objects picked once from the `LayerSpec`), submitting every 8 layers so the GPU runs them while the rest is encoded, and
@@ -697,8 +699,8 @@ k and v take the f32 path and a new kernel quantizes them:
 | step | q8 |
 |---|---|
 | 2 `matmul3` | the plain (`float`) variant: k rows into `kStage`, v rows into a second staging buffer `vStage` |
-| 3 `rope` | the `float` variant, k rotated in place in `kStage` |
-| 3b `kv_store_q8` | new, grid `(2·kvHeads, n)`, one simdgroup per (token, kv head) row of k or v: `simd_max` of `|x|`, `scale = max / 127`, `q = rint(x / scale)` clamped to ±127 as `char`, the scale after the row's values |
+| 3 `rope_store_q8` | the rotation of `rope` and the quantization below in one dispatch ([8.23](#823-decode-fusions)); with `-Djllm.metal.fuse=false` the two separate kernels: `rope` (`float` variant, k rotated in place in `kStage`) and |
+| 3b `kv_store_q8` | grid `(2·kvHeads, n)`, one simdgroup per (token, kv head) row of k or v: `simd_max` of `|x|`, `scale = max / 127`, `q = rint(x / scale)` clamped to ±127 as `char`, the scale after the row's values |
 | 4 attention | `attention_g1_d128_q8` (`KV = char`); flash decoding `attention_split_q8`, flash prefill `attention_fa_d128_q8` |
 
 The attention kernels read `char` and multiply once per row: `kv_scale(row, stride, nKvHeads, h)` returns the scale of
@@ -710,8 +712,7 @@ exists for q8 (`attention[_q8]`, `attention_g{1,2,4,8}_d{64,128,256}_q8`), and `
 against `attention_t` on a q8 cache too (its own cache key `|q8`). DeepSeek's latent rows are stored by
 `mla_lat_store_q8` (one scale per `[c | k_pe]` row, `aw + 4` bytes) and read by `attention_mla_q8`.
 
-The cost is one extra dispatch per layer (`kv_store_q8`, `2·kvHeads·n` simdgroups) and the f32 round trip of v
-through `vStage`; the reads in attention shrink from 2 to ~1 byte per value. CPU and Metal quantize the same f32
+The cost is the f32 round trip of v through `vStage` (and, before `rope_store_q8`, one extra dispatch per layer); the reads in attention shrink from 2 to ~1 byte per value. CPU and Metal quantize the same f32
 numbers with the same formula, but their f32 k / v differ in the last bits, so a value on a rounding edge can land one
 step apart: `ArchSmoke` runs every family with q8 on both backends and requires the usual 10⁻³ relative agreement of
 the logits (observed: at most 2.5 × 10⁻⁴ of the largest logit, on Gemma-2; ~10⁻⁶ for most families). It also
@@ -1211,3 +1212,136 @@ shift into whole rounding steps, exceed theirs. `arch-smoke.sh` therefore runs t
 runs one GPU thread per CPU fiber, so its timings say nothing about a GPU. `scripts/mac-validate.sh` has the rows
 that measure it on a Mac (half-weight MMA forced on / off, `fa` / `fb`, a ~2 000-token prompt); the expected gains
 and their arithmetic are in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design).
+---
+
+## 8.22 Decode replay: one native call per token
+
+🧸 Every morning a cook makes the same soup. The old way: the head chef walks over to the kitchen hand 170 times and
+reads out one instruction each time ("now the onions", "now stir"). The new way: on the first morning he writes the
+whole recipe on a card; every morning after that he only corrects the date on the card and hands it over once. When
+the recipe really changes (a bigger pot from tomorrow on), he writes a new card. And the first time he hands over a
+card, he quickly reads the recipe out once more and checks it against the card, to be sure he copied it right.
+
+📐 **What it saves.** A decode step of Qwen3-0.6B is 170 dispatches ([8.4](#84-recording-a-forward-pass-metalbackendforward)).
+Encoded one by one, each costs the Java writer (kernel name, pipeline lookup, parameter struct), one FFM downcall and,
+on the native side, the Objective-C calls `jm_dispatch` makes (pipeline, a `setBuffer` per binding, `setBytes`,
+`dispatchThreadgroups`). For a model whose weights the GPU reads in ~2.3 ms per token, the ~9 ms decode step leaves
+plenty of room for that per-dispatch overhead to matter. With replay a step is **one** downcall (`jm_run`) that encodes
+the whole recorded step natively:
+
+| per decode token, Qwen3-0.6B | dispatches | Java → native calls before | with replay |
+|---|---|---|---|
+| `forward` of one token (the plain decode loop) | 170 | 175: `begin`, 170 × `jm_dispatch`, 3 × `jm_commit` (every 8 layers), `jm_commit_wait` | 3: `begin`, `jm_run`, `jm_commit_wait` |
+| pipelined greedy step ([8.16](#816-pipelined-greedy-decoding)) | 172 (+ `embed_token`, `argmax`) | 174: 172 × `jm_dispatch`, `jm_commit`, `jm_wait_pending` | 3: `jm_run`, `jm_commit`, `jm_wait_pending` |
+| q8 KV cache | 198 → 170 ([8.23](#823-decode-fusions)) | 203 | 3 |
+| Qwen3-30B-A3B (MoE, all experts on the GPU) | 386 → 338 | 391 | 3 |
+
+`Metal` counts both (`downcalls()`, `dispatches()`); `ArchSmoke` prints them per token with and without replay for
+every family on the tiny models (e.g. LlamaPlain, 2 layers: 15.7 dispatches, 17.7 calls → 3.0). The dispatch count on
+the GPU is what it was; what disappears is the CPU's share: the Java writers and the crossings. Wall time on the
+emulator says nothing about this (every GPU thread is a fiber there); `scripts/mac-validate.sh` has the rows to measure
+it on a Mac (`-Djllm.metal.replay=false`, with and without pipelined decoding).
+
+**Recording** (`MetalKernels.step(key, pos, slotIn, slotOut, body)`, `DecodeProgram`). `body` is the step as the backend
+always encodes it: `encodeLayers(1, pos)`, the final norm, the LM head (and `embed_token` / `argmax` in a pipelined
+step). The first time a step of a given *shape* runs, the writers run in recording mode: `dispatch` appends a 384-byte
+record instead of crossing to the native side,
+
+| bytes | field |
+|---|---|
+| 0–15 | pipeline index, buffer count, params length, threadgroup memory |
+| 16–39 | grid and threadgroup size |
+| 48–175 | 16 buffer handles |
+| 176–303 | 16 binding offsets |
+| 304–367 | the parameter struct (≤ 64 bytes) |
+
+and the step runs from the fresh recording (`jm_run`), so even the recording step costs one call. While recording,
+the writers declare which fields belong to *this* step:
+
+- parameter fields written with `Params.iv(var, value)`: the position of `rope` / `rope_store_q8` / `attention_t` /
+  `attention_split` (`VAR_POS`), the token ring slot `embed_token` reads and the one `argmax` writes (`VAR_SLOT_IN`,
+  `VAR_SLOT_OUT`);
+- binding offsets of the buffers declared per-position (`MetalKernels.rowIndexed`: the KV caches, DeepSeek's latent
+  cache): bound at the step's row they are `base + pos · rowBytes`; bound at 0 (attention reads the whole cache) they
+  are constants.
+
+Each becomes a patch `value = base + coeff · var`. A later step of the same shape skips the writers altogether:
+`DecodeProgram.apply` rewrites the patched fields (≈ 6 per layer for an f32 cache: the k and v rows `matmul3` writes,
+rope's position and k rows, attention's position) and `jm_run` encodes the commands. The native loop sets a pipeline,
+a buffer or an offset only when it differs from the previous command's. Encoding copies everything (`setBytes`
+copies the parameters, bindings are captured when set), so the program can be patched for step `j + 1` while step `j`
+is still running on the GPU, which is what pipelined decoding does.
+
+**The shape** (`MetalBackend.stepKey`) is what the variables cannot express: plain or pipelined, whether this pass
+counts the experts' picks (the router binds the counters then), and flash decoding — off below `flashMinLen` positions,
+on above, and then the number of splits for each distinct attention window (the grid of `attention_split`). The keys
+per split used to be another per-step parameter that is not linear in the position; `attention_split` now derives it
+itself (`chunk = 0` means `ceil(keys / nSplit)`), the same number Java computed, so a recording stays valid while
+`nSplit` does. Up to 8 shapes are kept (least recently used dropped): a 4 096-token conversation with flash decoding
+records about 30 of them, one every 128 positions while the split count grows. Everything else is fixed for the
+backend's lifetime or drops the recordings when it changes: `MetalKernels.release` (a buffer they bind is gone),
+`rebalanceExperts` (the experts' buffers moved), a new vocabulary for the pipe's `argmax`.
+
+**Checked against a fresh recording.** The first replay of every recording also runs the writers in recording mode
+for that step and compares the two programs byte for byte (`DecodeProgram.firstDifference`). A field a writer forgot
+to declare shows up here as a difference; the shape is then encoded dispatch by dispatch from then on, with a warning
+naming the kernel. `-Djllm.metal.replayVerify=all` compares every step (slow; for tests). `ArchSmoke.replayCheck`
+runs every family with f32 and q8 caches (f16 on one dense and one MoE family): two backends, replay on and off, fed
+the same tokens for 40 decode steps after the prompt, with flash decoding forced on 8 positions after the prompt with
+4 keys per split, so the steps cross from `attention_t` to the split kernels and through a new split count every 4
+positions. The logits of every step must be bit-identical, and the 40 tokens of a pipelined run with replay must be
+the ones the decode loop chose.
+
+**What is not replayed**, and why:
+
+| | |
+|---|---|
+| prefill chunks, `forwardAll` (draft verification) | `n > 1`: different kernels per chunk size; they are long enough that encoding is not the bottleneck |
+| decode steps while experts run on the CPU (`backend.metal.cpu-moe`) | the step submits and waits halfway for the CPU's experts; a recording that meets `commit` / `commitAndWait` gives up (`NotReplayable`). The pipe is off there anyway |
+| a step at position 0 | a cache bound at its row 0 and at offset 0 for attention look the same; the next step records |
+| the Mamba backend | its own forward pass (`MambaMetalBackend`), not changed here |
+
+MoE layers whose experts are on the GPU **are** replayed: routing is already GPU-side (the router writes `assign`,
+`moe_up` / `moe_down` read it, their grids are `n · topK` slots whatever the choice), so nothing in the recording
+depends on which experts a token picks. Saved and copied caches (`loadState`, `copyStateFrom`) write the caches'
+contents, not their bindings, so recordings stay valid; the thermal watcher only reads a value.
+
+**Why not a Metal indirect command buffer.** An ICB holds encoded compute commands the GPU executes without the CPU
+encoding them again, which would remove even the native loop. It was not used, for now, because: its pipelines must
+be created with `supportIndirectCommandBuffers` (a second pipeline per kernel); indirect compute commands cannot take
+`setBytes`, so every parameter struct would move into a buffer; the GPU reads an ICB's commands when it executes them,
+not when they are encoded, so with up to four pipelined steps in flight each needs its own patched copy (a ring of
+ICBs); and none of it can be run without an Apple GPU — the emulator would test only the bookkeeping. The recording
+format is laid out with that next step in mind: a program's commands, parameters and patch list map one to one onto
+an ICB per ring slot, with only the ~6 patched commands per layer re-encoded per step.
+
+---
+
+## 8.23 Decode fusions
+
+🧸 Two cooks pass a bowl back and forth: one chops, the other weighs and labels. If the first cook also weighs and
+labels while the bowl is still in his hands, the bowl never travels.
+
+📐 What a decode step of a dense layer already does in fused kernels: the rmsnorm before a projection inside the
+projection (`*_norm` variants), q, k and v in one `matmul3` writing k and v straight into the cache (bias in the
+epilogue), q/k-norm (Qwen3, Gemma 3) + RoPE + the k cache store (f32, rounded to f16) in one `rope`, SwiGLU / GeGLU in
+the gate·up epilogue, the residual adds in the `o_proj` / `down_proj` epilogues (`accumulate`). Three places still had
+a separate dispatch:
+
+| where | before | now | saved per token |
+|---|---|---|---|
+| q8 KV cache | `rope` (k rotated in its f32 staging row) + `kv_store_q8` | `rope_store_q8`: the k heads are normalized and rotated, kept in threadgroup memory and quantized straight into the cache rows; extra threadgroups quantize the v heads | 1 per layer (198 → 170 for Qwen3-0.6B) |
+| MoE layers | `rmsnorm` (x → xb) + `router` / `router_ds` | `router_norm` / `router_ds_norm`: the router has one threadgroup per token, which owns the token's row, so it normalizes the row, writes `xb` for the experts, and routes it | 1 per MoE layer (386 → 338 for Qwen3-30B-A3B), in prefill too |
+| DeepSeek MLA attention | `rmsnorm` (x → xb) + three or four projections of `xb` | the projections are `matmul_*_norm` with the attention norm (as the dense layers' `matmul3` already was) | 1 per MLA layer |
+
+All three are **bit-identical** to the kernels they replace: the q8 quantization takes the head's maximum with a
+threadgroup reduction instead of one simdgroup's — the same number, maxima do not depend on order — and then the
+same `rint(x / scale)`; the routers' norm is the `rmsnorm` kernel's code on the same 256 threads (`norm_row_into`); the
+`*_norm` matmuls reproduce `rmsnorm` lane for lane ([8.5](#85-the-kernels-one-by-one)). `kernel_tests.py` checks the
+new kernels byte for byte against the pairs they replace (and against numpy), `-Djllm.metal.fuse=false` brings the
+separate dispatches back for an A/B on a Mac.
+
+What stays separate, on purpose: RoPE cannot move into `matmul3`, because the q/k-norm needs a whole head and a head's
+rows are computed by different simdgroups and threadgroups; Gemma's and GLM-4's post-norms (`rmsnorm_add` after `o_proj`
+/ `down_proj`) need a whole output row, which no threadgroup of the matmul has; the final norm stays out of the LM
+head (folding it in measured ~5 % slower, [8.4](#84-recording-a-forward-pass-metalbackendforward)).

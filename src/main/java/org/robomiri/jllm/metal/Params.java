@@ -14,6 +14,10 @@ final class Params {
     private final MemorySegment seg;
     private KernelParams layout;
     private int count;
+    // fields written with iv: their index and the step variable (DecodeProgram.VAR_*) they are
+    private final int[] varField = new int[16];
+    private final int[] varOf = new int[16];
+    private int vars;
 
     Params(MemorySegment seg) {
         this.seg = seg;
@@ -26,7 +30,35 @@ final class Params {
     Params reset(KernelParams layout) {
         this.layout = layout;
         this.count = 0;
+        this.vars = 0;
         return this;
+    }
+
+    /**
+     * An int field holding a per-step value of a decode step ({@link DecodeProgram#VAR_POS} or a token ring slot):
+     * a recorded step patches it for the next step (see {@link MetalKernels#step}).
+     */
+    Params iv(int var, int v) {
+        varField[vars] = count;
+        varOf[vars++] = var;
+        return i(v);
+    }
+
+    /** Fields written with {@link #iv} since the last reset. */
+    int vars() {
+        return vars;
+    }
+
+    int varField(int i) {
+        return varField[i];
+    }
+
+    int varOf(int i) {
+        return varOf[i];
+    }
+
+    int intAt(int field) {
+        return seg.getAtIndex(ValueLayout.JAVA_INT, field);
     }
 
     Params i(int v) {
