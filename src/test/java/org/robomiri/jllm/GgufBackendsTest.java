@@ -193,7 +193,11 @@ public final class GgufBackendsTest {
                         }
                     }
                     check(!Double.isNaN(diff) && mag > 0 && mag < 1e6, family + "/" + mode + ": logits are finite (max |logit| " + mag + ")");
-                    check(diff < 1e-3, family + "/" + mode + ": CPU vs Metal max logit diff " + diff);
+                    // 1e-3, plus 2e-4 of the logit scale: where MetalTuner finds the half-weight matrix-unit prefill kernels (docs/08
+                    // 8.21) faster and in agreement, they round each dequantized weight to half (relative 2^-11), which the
+                    // non-linear IQ4 formats (d * ls * table value: 18 significant bits) feel at ~1e-4 of the logits;
+                    // -Djllm.metal.hmma=false brings every type to ~1e-6
+                    check(diff < 1e-3 + 2e-4 * mag, family + "/" + mode + ": CPU vs Metal max logit diff " + diff);
                     check(sameTokens, family + "/" + mode + ": same greedy tokens");
                     System.out.printf("%-9s %-6s CPU vs Metal: max logit diff %.2e (max |logit| %.2f)%n", family, mode, diff, mag);
                 }

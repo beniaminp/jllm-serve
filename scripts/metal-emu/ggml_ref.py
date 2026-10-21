@@ -57,7 +57,7 @@ def random_blocks(fmt, rows, cols, rng):
     elif fmt == 'q3k':
         _put_f16(blk, 108, d)
     elif fmt == 'mxfp4':
-        blk[:, :, 0] = rng.integers(100, 140, (rows, nb))
+        blk[:, :, 0] = rng.integers(112, 124, (rows, nb))   # 2^-16 .. 2^-5 (times the doubled values: weights up to 0.4)
     return blk
 
 
