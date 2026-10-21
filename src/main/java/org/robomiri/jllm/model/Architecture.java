@@ -12,14 +12,14 @@ import java.util.Map;
  * What a checkpoint computes, resolved once from its Hugging Face {@code config.json}: the model-wide
  * {@link Core} plus a typed description of every layer. {@link Decoder} is every attention model (Llama, Mistral,
  * Qwen2, Qwen3 dense and MoE, GLM / GLM-4, Phi-3, Gemma 2 / 3, DeepSeek-V2 / V3), {@link MambaArch} the Mamba
- * state-space model.
+ * state-space model, {@link Qwen3NextArch} the Qwen3-Next hybrid of Gated DeltaNet and gated full attention.
  *
  * <p>A family's switches (q/k/v bias, QK-norm, sliding window, a second RoPE base, post-norms, which layers route
  * to experts, latent attention, the routing rule, ...) are read by that family's parser in {@link Families} and
  * written into the per-layer {@link LayerSpec}s, so the loader, the converter and the backends only ever look
  * at the typed vocabulary below and never at the {@code model_type}.
  */
-public sealed interface Architecture permits Decoder, MambaArch {
+public sealed interface Architecture permits Decoder, MambaArch, Qwen3NextArch {
 
     /**
      * Config key written by the GGUF loader and never found in a Hugging Face config: the file's q/k rows were

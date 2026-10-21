@@ -309,6 +309,7 @@ public final class ModelConverter {
         return switch (arch) {
             case MambaArch m -> planMamba(m);
             case Decoder d -> planDecoder(d);
+            case Qwen3NextArch q -> planQwen3Next(q);
         };
     }
 
@@ -513,6 +514,119 @@ public final class ModelConverter {
             units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
         units.add(new Unit("final", finalRules(f32(M_FINAL_NORM, M_FINAL_NORM))));
+        return units;
+    }
+
+    // ------------------------------------------------------------------ Qwen3-Next
+
+    /**
+     * Quantizes rows gathered from several 2-D {@code [rowsOf[i], cols]} sources as one tensor: output row {@code r} is
+     * row {@code map[r][1]} of source {@code map[r][0]}. A pure row permutation, so it quantizes exactly like the rows in
+     * place (quantization blocks run along a row).
+     */
+    private static Rule gather(String cacheName, List<String> sources, QType type, int[][] map, int[] rowsOf, int cols) {
+        return new Rule(cacheName, List.copyOf(sources), (a, s) -> {
+            for (int i = 0; i < s.size(); i++) {
+                SafeTensors.Tensor t = matrix(s.get(i));
+                if (t.dim(0) != rowsOf[i] || t.dim(1) != cols) {
+                    throw new IOException(t + " does not match [" + rowsOf[i] + ", " + cols + "]");
+                }
+            }
+            SafeTensors.Tensor[] arr = s.toArray(new SafeTensors.Tensor[0]);
+            return QTensor.quantize(a, type, map.length, cols,
+                    (r, dst) -> arr[map[r][0]].toFloat((long) map[r][1] * cols, dst, 0, cols));
+        });
+    }
+
+    /**
+     * Embedding, one unit per layer, final norm + head. The zero-centred norms (input / post-attention / q / k / final)
+     * get their {@code 1 + w} folded in; the DeltaNet's gated norm is stored as is. {@code in_proj_qkvz} and
+     * {@code in_proj_ba} (rows grouped per key head: [q k v z] and [b a] of each group) become one
+     * {@code linear_attn.in_proj} with the rows [q | k | v | z | b | a], each part in head order; {@code q_proj} (per
+     * head: headDim query rows then headDim gate rows) becomes {@code q_proj} and {@code q_gate}. The shared expert is
+     * stored like DeepSeek's ({@code mlp.shared.gate_up} / {@code mlp.shared.down}) plus its gate vector. The
+     * multi-token-prediction tensors ({@code mtp.*}) are never read.
+     */
+    private List<Unit> planQwen3Next(Qwen3NextArch q) {
+        int dim = q.core().dim();
+        List<Unit> units = new ArrayList<>();
+        units.add(new Unit("embed", List.of(quantize(EMBED, head))));
+        for (int l = 0; l < q.core().layers(); l++) {
+            String p = "model.layers." + l + ".";
+            List<Rule> rules = new ArrayList<>();
+            rules.add(f32PlusOne(p + "input_layernorm.weight", p + "input_layernorm.weight"));
+            rules.add(f32PlusOne(p + "post_attention_layernorm.weight", p + "post_attention_layernorm.weight"));
+            if (q.isFull(l)) {
+                String a = p + "self_attn.";
+                Attention.Gqa g = q.attention();
+                int hd = g.headDim();
+                int[][] qRows = new int[g.qDim()][];
+                int[][] gateRows = new int[g.qDim()][];
+                for (int h = 0; h < g.heads(); h++) {
+                    for (int i = 0; i < hd; i++) {
+                        qRows[h * hd + i] = new int[]{0, h * 2 * hd + i};
+                        gateRows[h * hd + i] = new int[]{0, h * 2 * hd + hd + i};
+                    }
+                }
+                int[] qShape = {2 * g.qDim()};
+                rules.add(gather(a + "q_proj.weight", List.of(a + "q_proj.weight"), quant, qRows, qShape, dim));
+                rules.add(gather(a + "q_gate", List.of(a + "q_proj.weight"), quant, gateRows, qShape, dim));
+                rules.add(quantize(a + "k_proj.weight", quant));
+                rules.add(quantize(a + "v_proj.weight", quant));
+                rules.add(quantize(a + "o_proj.weight", quant));
+                rules.add(f32PlusOne(a + "q_norm.weight", a + "q_norm.weight"));
+                rules.add(f32PlusOne(a + "k_norm.weight", a + "k_norm.weight"));
+            } else {
+                String a = p + "linear_attn.";
+                Qwen3NextArch.DeltaNet d = q.deltaNet();
+                int nk = d.keyHeads();
+                int dk = d.keyDim();
+                int rv = d.group() * d.valueDim(); // v (and z) rows per key-head group
+                int r = d.group();
+                int group = 2 * dk + 2 * rv;
+                int[][] rows = new int[d.projDim()][];
+                int o = 0;
+                for (int part = 0; part < 4; part++) { // q, k, v, z
+                    int start = part == 0 ? 0 : part == 1 ? dk : part == 2 ? 2 * dk : 2 * dk + rv;
+                    int len = part < 2 ? dk : rv;
+                    for (int g = 0; g < nk; g++) {
+                        for (int i = 0; i < len; i++) {
+                            rows[o++] = new int[]{0, g * group + start + i};
+                        }
+                    }
+                }
+                for (int part = 0; part < 2; part++) { // b, a
+                    for (int g = 0; g < nk; g++) {
+                        for (int j = 0; j < r; j++) {
+                            rows[o++] = new int[]{1, g * 2 * r + part * r + j};
+                        }
+                    }
+                }
+                rules.add(gather(a + "in_proj", List.of(a + "in_proj_qkvz.weight", a + "in_proj_ba.weight"), quant, rows,
+                        new int[]{nk * group, nk * 2 * r}, dim));
+                rules.add(f32(a + "conv1d.weight", a + "conv1d.weight"));
+                rules.add(negExp(a + "A", a + "A_log"));
+                rules.add(f32(a + "dt_bias", a + "dt_bias"));
+                rules.add(f32(a + "norm.weight", a + "norm.weight"));
+                rules.add(quantize(a + "out_proj.weight", quant));
+            }
+            switch (q.mlps().get(l)) {
+                case Mlp.Moe m -> {
+                    rules.addAll(moeRules(p, new Mlp.Moe(m.experts(), m.topK(), m.moeDim(), m.normTopK(), m.router(), null), dim));
+                    String sp = p + "mlp.shared_expert.";
+                    int sh = m.shared().hidden();
+                    rules.add(stack(p + "mlp.shared.gate_up", List.of(sp + "gate_proj.weight", sp + "up_proj.weight"), quant, sh, 0));
+                    rules.add(quantize(p + "mlp.shared.down", sp + "down_proj.weight", quant, 0, sh));
+                    rules.add(f32(p + "mlp.shared_gate", p + "mlp.shared_expert_gate.weight"));
+                }
+                case Mlp.Dense dense -> {
+                    rules.add(stack(p + "mlp.gate_up", List.of(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"), quant, 0, 0));
+                    rules.add(quantize(p + "mlp.down_proj.weight", quant));
+                }
+            }
+            units.add(new Unit("layer." + l, List.copyOf(rules)));
+        }
+        units.add(new Unit("final", finalRules(f32PlusOne(FINAL_NORM, FINAL_NORM))));
         return units;
     }
 

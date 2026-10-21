@@ -1,6 +1,6 @@
-# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills, DeepSeek-V2/V3)
+# 14. Model families (Llama, Mistral, Qwen2, Phi-3/4, Gemma 2/3, DeepSeek-R1 distills, DeepSeek-V2/V3, Qwen3-Next)
 
-Code: `model/Architecture` (`Decoder`, `MambaArch`), `model/Families` (one parser per `model_type`),
+Code: `model/Architecture` (`Decoder`, `MambaArch`, `Qwen3NextArch`), `model/Families` (one parser per `model_type`),
 `model/LayerSpec`, `model/Attention`, `model/Mlp`, `model/Router`, `model/RopeTable`, `model/Scaling`, `model/Rope`,
 `model/ModelConverter`, `cpu/CpuBackend`, `cpu/MlaCpu`, `metal/MetalBackend`, `metal/MlaMetal`, `kernels.metal`,
 `Main.eosIds`, `tokenizer/Tokenizer.promptBos`, `engine/Engine.preparePrompt`
@@ -12,6 +12,7 @@ switches, all read from `config.json` by the family's parser in `Families` and s
 families at a glance, 14.2 – 14.6 what the Llama-like families have in common (and what they lack), 14.7 how it is
 tested, 14.8 GLM, 14.9 Phi-3/4, 14.10 Gemma, 14.11 DeepSeek-V2/V3, 14.12 the typed model and how to add a family,
 14.13 the comparison with transformers on real published weights.
+14.14 Qwen3-Next (Gated DeltaNet linear attention + gated attention + sparse MoE).
 Qwen3-MoE is [chapter 12](12-mixture-of-experts.md), Mamba [chapter 15](15-mamba.md).
 
 ## 14.1 Supported families
@@ -35,6 +36,7 @@ means the value comes from `config.json`; defaults are those of the family's tra
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | rejected | no | none | MLA rotary slice `INTERLEAVED`, `yarn` | `PRE` | dense for the first `first_k_dense_replace` layers, then MoE + shared experts; `Router.DeepSeek` softmax, `greedy` / `group_limited_greedy` | yes | config (false) | MLA latent KV cache; 14.11 |
 | `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints dequantized by the converter (14.11.7) |
 | `mamba` | `MambaForCausalLM` | n/a | n/a | n/a (no attention) | none (no positions) | one RMSNorm per block | no MLP: conv + selective scan mixer | no | default true | `MambaArch`; chapter 15 |
+| `qwen3_next` | `Qwen3NextForCausalLM` | rejected | yes (`1 + w`) | none | `HALF` on `partial_rotary_factor` (0.25) of `head_dim` (256) | `PRE`, gains `1 + w` | MoE + gated shared expert (Qwen3-MoE layer rule) | no | config (false) | `Qwen3NextArch`: 3 of 4 layers Gated DeltaNet (no KV cache), the rest attention with an output gate; 14.14 |
 
 Reading the table: *Norms* are the `LayerSpec.Norms` value of 14.12 (`PRE` = `input_layernorm` + `post_attention_layernorm`
 before the MLP). *RoPE* `HALF` pairs element `i` with `i + rotaryDim/2`, `INTERLEAVED` pairs `2i` with `2i + 1` (14.8); every
@@ -58,6 +60,7 @@ The checkpoints each row was verified against:
 | `deepseek_v2` | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct (14.11) | config, safetensors header and `modeling_deepseek.py` on the Hub; tiny random models |
 | `deepseek_v3` | DeepSeek-V3 / R1 (FP8 or bf16; too large to run here, 14.11.7) | config and header only; tiny random models |
 | `mamba` | `state-spaces/mamba-130m-hf` … `mamba-2.8b-hf` | chapter 15 |
+| `qwen3_next` | Qwen3-Next-80B-A3B Instruct / Thinking (14.13) | config, tensor index and safetensors headers of `Qwen/Qwen3-Next-80B-A3B-Instruct`; tiny random models against transformers 5.20 |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
 `gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` for `mistral`, `phi3` or DeepSeek (transformers ignores
@@ -997,3 +1000,277 @@ Results at Q8_0 (head Q8_0), transformers 5.20.2, five prompts × 16 steps unles
   its 52-token chat) on 4 cores shared with other jobs. The script deletes the checkpoint and the cache afterwards
   unless `KEEP=1`; `LOW_DISK=1` deletes the safetensors as soon as they are converted, and
   `JAVA_OPTS=-Dreal.prompts=raw_text,raw_code` runs a subset of the prompts.
+## 14.14 Qwen3-Next (hybrid: Gated DeltaNet + gated attention + sparse MoE)
+
+Code: `model/Qwen3NextArch` (an `Architecture` of its own, with its parser), `model/Qwen3NextLayer`,
+`ModelConverter.planQwen3Next`, `cpu/Qwen3NextCpuBackend`, `metal/Qwen3NextMetalBackend`, `kernels.metal` section 11
+(`gdn_conv`, `gdn_rule`, `gdn_norm_gate`, `sigmoid_mul`, `shared_gate_add`), `scripts/qwen3next-ref.py`,
+`scripts/qwen3next-hf-compare.py`, `src/test/.../Qwen3NextChecks`
+
+`Qwen3NextForCausalLM` (`model_type: qwen3_next`; `Qwen/Qwen3-Next-80B-A3B-Instruct` / `-Thinking`) mixes two kinds of
+token mixer. Three layers out of four are a **Gated DeltaNet**, a linear attention with a fixed-size memory per head
+(like Mamba's state, [chapter 15](15-mamba.md)); every fourth layer is ordinary attention with a KV cache, plus an
+output gate. Every layer's MLP is a mixture of 512 experts (10 per token) plus one always-on shared expert. The KV
+cache exists only in the attention layers, so it is a quarter of a same-shape transformer's.
+
+### 14.14.0 🧸 The simple story
+
+A transformer remembers a conversation like a **diary**: every word gets a page (the KV cache) and, to write the
+next word, the model flips through all the pages. The diary gets thicker with every word.
+
+A DeltaNet layer remembers like a **whiteboard of fixed size**. For each word it writes a note under a label (the
+*key*): "under *colour*, write *blue*". If something is already written under that label, it does not just scribble
+on top: it first reads what is there, and writes only the **difference** ("it said *red*, it should say *blue*:
+change it by *blue minus red*"). That correction is the *delta*. Before each word the whole board also fades a
+little (the *gate*), so old, unimportant notes disappear by themselves. To answer, the layer reads the board with a
+question (the *query*). The board never grows, however long the conversation.
+
+Fading boards forget details, so every fourth layer still keeps a real diary (full attention). The model gets the
+long memory of attention where it matters and the fixed cost of a whiteboard everywhere else.
+
+### 14.14.1 One layer
+
+Every layer is `x += mixer(rmsnorm(x)); x += mlp(rmsnorm(x))`. Which mixer a layer has comes from `layer_types`
+(`linear_attention` / `full_attention`), or, when absent, from `full_attention_interval` (default 4): layer `l` is
+full attention when `(l + 1) % interval == 0`, i.e. layers 3, 7, …, 47 of 48. Which MLP it has follows the Qwen3-MoE
+rule (12.1): experts unless `l` is in `mlp_only_layers` or `(l + 1) % decoder_sparse_step != 0`, given `num_experts > 0`.
+
+**Zero-centred norms.** `input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm` and the final `norm` are
+`Qwen3NextRMSNorm`, which computes `x / sqrt(mean(x²) + eps) · (1 + w)` with `w` initialised to 0 (like Gemma, 14.10).
+The converter adds the 1 once (`f32PlusOne`), so the backends multiply by a plain gain. The DeltaNet's own output
+norm (`Qwen3NextRMSNormGated`) is **not** zero-centred (`w` starts at 1) and is stored as is.
+
+**Gated full attention** (`Qwen3NextAttention`):
+
+```
+[q | gate] = q_proj · h          per head: head_dim query rows, then head_dim gate rows (q_proj is [heads·2·hd, dim])
+q, k       = rmsnorm(q) · (1+w_q), rmsnorm(k_proj · h) · (1+w_k)        per head, over the whole head
+q, k       = RoPE on the first rotaryDim = partial_rotary_factor · head_dim dims (rotate-half: i with i + rotaryDim/2)
+o          = softmax(q kᵀ / √head_dim) v                 GQA, causal, KV cache
+x         += o_proj · (o · sigmoid(gate))                  the output gate, element-wise
+```
+
+The converter splits `q_proj` into `q_proj` (the query rows) and `q_gate` (the gate rows), so the attention itself is
+the Qwen3 one with `partial_rotary_factor` 0.25 (64 of 256 dims rotate in the 80B).
+
+**Sparse MoE with a gated shared expert** (`Qwen3NextSparseMoeBlock`): softmax router over the experts, top-k, the
+weights renormalized when `norm_topk_prob` (true), each chosen expert a SwiGLU of `moe_intermediate_size`; plus a
+SwiGLU `shared_expert` of `shared_expert_intermediate_size` on every token, scaled by a learned scalar gate:
+
+```
+y = Σ_k w_k · expert_k(h)  +  sigmoid(shared_expert_gate · h) · shared_expert(h)       shared_expert_gate is [1, dim]
+```
+
+**Gated DeltaNet** (`Qwen3NextGatedDeltaNet`), with `nk` key heads of `dk`, `nv` value heads of `dv` (`nv` a multiple
+of `nk`; each q/k head serves `r = nv / nk` value heads):
+
+```
+[q k v z] = in_proj_qkvz · h,  [b a] = in_proj_ba · h        q, k: nk·dk;  v, z: nv·dv;  b, a: nv
+[q k v]   = silu(causal_conv1d([q k v]))                     depthwise, conv kernel 4, no bias; conv state = last 3 inputs
+q, k      = l2norm(q) / √dk,  l2norm(k)                      per head: x / sqrt(Σx² + 1e-6)
+β         = sigmoid(b)                                       per value head: how much of the correction is written
+g         = −exp(A_log) · softplus(a + dt_bias)              per value head, ≤ 0: the log of the decay
+S, o      = gated delta rule (14.14.2), per value head with the q / k of its key head
+o         = rmsnorm(o) · w · silu(z)                         per value head (the gated norm)
+x        += out_proj · o
+```
+
+### 14.14.2 📐 The gated delta rule
+
+Each value head keeps a state `S` of `dk × dv` numbers (transformers' `[num_v_heads, k_head_dim, v_head_dim]`).
+`Sᵀ k` is what the state "says" for key `k`: a vector of `dv` values. One token with key `k` (unit length after the
+L2 norm), value `v`, query `q`, decay `γ = exp(g)` ∈ (0, 1] and write strength `β` ∈ (0, 1):
+
+```
+S  ← γ S                              forget a little (the gate α_t of the papers)
+d  = β (v − Sᵀ k)                     the correction: what should be there minus what is there
+S  ← S + k dᵀ                         write the correction under the key
+o  = Sᵀ q                             read with the query
+```
+
+Written as one formula, `S_t = γ_t (I − β_t k_t k_tᵀ) S_{t−1} + β_t k_t v_tᵀ`. With the state transposed (`[dv, dk]`,
+as in the Gated DeltaNet paper) that is `S_t = S_{t−1} (α_t (I − β_t k_t k_tᵀ)) + β_t v_t k_tᵀ` with `α_t = γ_t`: the
+form in the task statement, checked term by term against `torch_recurrent_gated_delta_rule` (decay first, then
+`kv_mem = Sᵀ k`, `delta = (v − kv_mem) β`, `S += k deltaᵀ`, `o = Sᵀ q`).
+
+Why "delta": `d` is a gradient step of the regression loss `½ ‖Sᵀ k − v‖²` with learning rate `β` (the Widrow–Hoff
+delta rule). A plain linear attention only ever adds `k vᵀ`, so two values written under similar keys pile up; the
+delta rule replaces. The gate `γ` (as in Mamba-2) lets the model clear the whole state quickly when the context changes.
+
+**Worked example** (checked by `Qwen3NextChecks.workedExample`): `dk = 2`, `dv = 1`, so the state is one column
+`s = (1, 0)`; `γ = 0.5`, `k = q = (0.6, 0.8)`, `v = 2`.
+
+```
+s ← 0.5 s                = (0.5, 0)
+s · k                    = 0.3                    what the key reads now
+β = 1:   d = 2 − 0.3      = 1.7;   s = (0.5 + 1.7·0.6, 1.7·0.8) = (1.52, 1.36);   o = s · q = 0.912 + 1.088 = 2
+β = 0.5: d = 0.85;  s = (1.01, 0.68);   o = 0.606 + 0.544 = 1.15 = 0.3 + 0.5 · (2 − 0.3)
+```
+
+With `β = 1` the key now reads exactly `v` (the old content under that key was overwritten, not added to); with
+`β = 0.5` it reads half way between the old value and the new one.
+
+The cost per token and head is a few passes over the `dk × dv` state (scale, one product for `Sᵀk`, the rank-1
+update, one product for `Sᵀq`), the same at token 10 and token 100 000.
+
+### 14.14.3 📐 The chunked form (prefill)
+
+Token by token, every token reads and writes the whole state. For a prompt the same result can be computed a chunk
+of `L` tokens (64) at a time, touching the state only at the chunk boundaries. Inside a chunk let `c_t = Σ_{u≤t} g_u`
+(the cumulative log decay, so `γ` from token `u` to token `t` is `e^{c_t − c_u}` ≤ 1) and `S₀` the state before the
+chunk. Unrolling the recurrence, the decayed state that token `t` reads is
+`e^{c_t} S₀ + Σ_{u<t} e^{c_t−c_u} k_u d_uᵀ`, so the corrections satisfy
+
+```
+d_t = β_t ( v_t − e^{c_t} S₀ᵀ k_t − Σ_{u<t} e^{c_t−c_u} (k_t·k_u) d_u )      a unit lower-triangular system
+o_t = e^{c_t} S₀ᵀ q_t + Σ_{u≤t} e^{c_t−c_u} (q_t·k_u) d_u
+S   = e^{c_L} S₀ + Σ_u e^{c_L−c_u} k_u d_uᵀ
+```
+
+In matrix form `(I + A) D = β ⊙ (V − Γ K S₀)` with `A_{tu} = β_t e^{c_t−c_u} k_t·k_u` for `u < t`: transformers'
+`torch_chunk_gated_delta_rule` builds `T = (I + A)⁻¹` (the "UT transform"; `T` applied to `β K` is the WY form of the
+product of the `I − β k kᵀ` factors) with a triangular solve, and gets `D = T(βV) − T(βΓK) S₀`. `Qwen3NextCpuBackend.chunked`
+solves the same system by forward substitution, row by row, which needs no explicit inverse:
+
+1. `S₀ᵀ k_t` and `S₀ᵀ q_t` for every token (`2 L dk dv`), the Gram matrices `k_t·k_u` and `q_t·k_u` (`L² dk`);
+2. `d_t` in token order from the earlier `d_u` (`L² dv / 2`), then `o_t`;
+3. the new state from `S₀` and the chunk's `k_u d_uᵀ` (`L dk dv`).
+
+Everything is a rearrangement of the token recurrence, so the two agree to float rounding: on the tiny models the
+150-token prompt in chunks of 64 differs from the token loop by 1.2e-6 of the logit range (chunks of 7: 3.4e-7),
+and `qwen3next-ref.py` gives 3e-14 between its two float64 forms. Only differences `c_t − c_u ≤ 0` are exponentiated
+(`e^{c_t}` itself may underflow to 0 for a fast-decaying head, which is the right limit), so nothing overflows.
+
+What the chunked form buys: the state (64 KB per head in the 80B) is read and written once per 64 tokens instead of
+per token, and the work becomes small dense products that vectorize (and, on a GPU, map to matrix units). On the CPU
+the arithmetic is about the same as the token loop; the Metal backend uses the token loop for prefill too (14.14.6).
+
+### 14.14.4 Shapes of the 80B (verified on the Hub) and how they are stored
+
+`config.json` of `Qwen/Qwen3-Next-80B-A3B-Instruct`: `hidden_size` 2048, 48 layers, `full_attention_interval` 4,
+attention 16 heads / 2 KV heads × `head_dim` 256, `partial_rotary_factor` 0.25, `rope_theta` 1e7, DeltaNet 16 key heads ×
+128, 32 value heads × 128, conv kernel 4, 512 experts of 512 (10 per token), shared expert 512, `intermediate_size`
+5120 (unused: no `mlp_only_layers`), vocabulary 151936, untied head, `max_position_embeddings` 262144. 75 944 tensors,
+41 shards; shapes read from the safetensors headers:
+
+| Tensor (layer 0: DeltaNet, layer 3: attention) | Shape | Stored in jllm as |
+|---|---|---|
+| `linear_attn.in_proj_qkvz.weight` | `[12288, 2048]` = per key head `[q 128 \| k 128 \| v 256 \| z 256]` rows | with `in_proj_ba` one `linear_attn.in_proj` `[12352, 2048]`, rows reordered to `[q all heads \| k \| v \| z \| b \| a]` (`gather` rule) |
+| `linear_attn.in_proj_ba.weight` | `[64, 2048]` = per key head `[b 2 \| a 2]` | (in `in_proj`) |
+| `linear_attn.conv1d.weight` | `[8192, 1, 4]` | f32 |
+| `linear_attn.A_log`, `dt_bias` | `[32]` each | f32, `A = −exp(A_log)` |
+| `linear_attn.norm.weight` | `[128]` (gated norm, shared by the heads) | f32, as is |
+| `linear_attn.out_proj.weight` | `[2048, 4096]` | quantized |
+| `self_attn.q_proj.weight` | `[8192, 2048]` = per head `[query 256 \| gate 256]` | `q_proj` `[4096, 2048]` + `q_gate` `[4096, 2048]` |
+| `self_attn.k_proj` / `v_proj` / `o_proj` | `[512, 2048]` / `[512, 2048]` / `[2048, 4096]` | quantized |
+| `self_attn.q_norm` / `k_norm`, `input_layernorm`, `post_attention_layernorm`, `model.norm` | `[256]` / `[2048]` | f32, `1 + w` folded |
+| `mlp.gate.weight` (router), `mlp.shared_expert_gate.weight` | `[512, 2048]`, `[1, 2048]` | f32 |
+| `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_expert.*` | `[512, 2048]`, `[2048, 512]` | stacked like Qwen3-MoE (12.3); the shared expert as `mlp.shared.gate_up` / `.down` |
+| `mtp.*` (one multi-token-prediction layer) | | never read |
+
+The reorder makes the first `convDim = 2·nk·dk + nv·dv` outputs of `in_proj` the conv channels in the order of
+transformers' `mixed_qkv` (all q heads, all k heads, all v heads), so the conv reads one contiguous slice per token.
+Transformers ≥ 5 can also save the experts fused (`experts.gate_up_proj` 3-D); the converter reads both layouts.
+
+### 14.14.5 State instead of most of the KV cache
+
+Per DeltaNet layer the backends keep (f32)
+
+```
+conv state       convDim × (kernel − 1) = 8192 × 3 × 4 B            =    96 KB
+recurrent state  nv × dv × dk          = 32 × 128 × 128 × 4 B      = 2 048 KB
+```
+
+so 36 layers hold **79 MB, whatever the context**. Only the 12 attention layers have a KV cache:
+
+| per token of context | Qwen3-Next-80B-A3B | same attention shape in all 48 layers (= Qwen3-30B-A3B: 48 layers × 4 × 128) |
+|---|---|---|
+| KV cache f32 | 12 × 2 × 512 × 4 B = **48 KB** | 48 × 2 × 512 × 4 B = 192 KB |
+| KV cache f16 | **24 KB** | 96 KB |
+| at `--ctx 4096`, f32 | 201 MB + 79 MB of state = 280 MB | 805 MB |
+| at the full 262 144 tokens, f16 | 6.4 GB + 79 MB | 25.8 GB |
+
+The KV cache is 4× smaller per token; the fixed state equals the KV of ~1 600 tokens (f32), so the hybrid is
+smaller as soon as the context exceeds ~550 tokens. (`docs/11` §11.3 lists the same numbers.)
+
+The state follows Mamba's contract (15.5, 15.6): `pos == 0` resets it, any other `pos` must equal the number of tokens
+fed, it cannot be rewound (`supportsPrefixReuse()` is false, so the engine resumes only when the new prompt extends
+everything cached and otherwise prefills from 0, and speculative decoding is off). Unlike Mamba it can be **saved,
+loaded and copied** (`stateFormat`, `saveState`, `loadState`, `copyStateFrom`: the prompt cache files and the
+server's slot-to-slot prefix copies of chapter 10): the bytes are the KV rows of the attention layers in `KvCache.write`
+order followed by each DeltaNet layer's conv and recurrent state, identical on both backends. Because a recurrent
+state cannot be cut, saving `n` tokens is refused unless the state holds exactly `n` (the engine only ever asks for
+that). `backend.kv-dtype=f16` applies to the attention layers; the recurrent state stays f32.
+
+### 14.14.6 The implementations
+
+**CPU (`Qwen3NextCpuBackend`).** The projections are `CpuMatmul` (int8 activations for single tokens when enabled),
+the attention layers reuse `KvCache` (allocated for the attention layers only: `KvCache.create(dtype,
+fullLayers, ...)`, layer index = rank among the attention layers), the experts reuse `MoeExperts`. The conv is
+`MambaCpuBackend.convStep` per channel (parallel over channels). The recurrent state of a head is stored transposed,
+`S[h][j][i]` (value dim major), so each of the `dv` columns that the token loop updates is a contiguous `dk`-vector:
+decode runs `scale, dot, axpy, dot` on it with the Vector API, parallel over (head, column). Chunks of several tokens
+use the chunked form, parallel over heads (`-Djllm.gdn.chunked=false` forces the token loop, `-Djllm.gdn.chunk=N`
+sets the chunk length).
+
+**Metal (`Qwen3NextMetalBackend`).** One command buffer per call. The projections, norms, RoPE, attention and experts
+are the existing kernels (`matmul`, `matmul3`, `rmsnorm`, `rope`, `attention_t`, `router`, `moe_up` / `moe_down` or the
+expert-grouped MMA kernels, `matmul_swiglu`); new kernels in section 11:
+
+- `gdn_conv`: one thread per channel, the conv window and taps in registers for the chunk (as `mamba_conv`, but no bias
+  and the input read from the fused projection row);
+- `gdn_rule`: one **simdgroup per state column**: lane `l` holds rows `l, l + 32, …` of column `j` of head `h` in
+  registers (`dk / 32` floats; `dk ≤ 256`), `Sᵀk` and `Sᵀq` are `simd_sum`s, and the simdgroup recomputes the q / k L2
+  norms of its token with two more `simd_sum`s (cheaper than a separate pass). Grid `dv / 4 × nv` threadgroups of
+  4 simdgroups: 4 096 simdgroups for the 80B, independent, each running the chunk's tokens in order. Prefill is
+  therefore the token loop, not the chunked form (documented trade-off as for Mamba's scan, 15.7): simple and exactly
+  the decode arithmetic; a chunked GPU kernel (matrix units for the Gram and state products) is the next step for long
+  prompts;
+- `gdn_norm_gate`: one threadgroup per (token, value head) row;
+- `sigmoid_mul` (the attention output gate) and `shared_gate_add` (`x += sigmoid(w · xb) · shared`).
+
+The per-head q / k norms of the attention layers run through the plain `rmsnorm` kernel on rows of `head_dim` (the
+`rope` kernel's fused norm only supports a full rotation), then `rope` rotates the 64-dim slice and stores k into the
+cache. No existing kernel or buffer index changed.
+
+### 14.14.7 Verification
+
+| check | result |
+|---|---|
+| `qwen3next-ref.py` (float64 numpy, written from `modeling_qwen3_next.py`) vs transformers 5.20 `Qwen3NextForCausalLM` in float64 (`qwen3next-hf-compare.py`): last-token logits of the 12-token prompt, then 8 greedy tokens with the cache (single-token decode: recurrent rule, conv update, KV cache) | max difference 3.3e-5 (`qwen3next`, logits up to 20) and 3.2e-6 (`qwen3next2`); identical tokens. The residue is transformers computing the delta rule in float32 even in a float64 model |
+| reference recurrent form vs chunked form (chunks of 5 and 64) | 3e-14 |
+| CPU backend (Q8_0) vs the reference on Q8_0-rounded weights (`REF_Q8=1`) | 3.7e-6 / 1.1e-6 of the logit range; the 8 greedy tokens identical |
+| CPU, 150 tokens: chunks of 64, chunks of 7, one call per token vs the token loop | ≤ 1.4e-6 |
+| CPU state saved + loaded / copied, f32 and f16 KV | bit-identical continuation; saving another length refused |
+| Metal backend (on the emulator, doc 18) vs the reference | 2.2e-6 / 7.8e-7; the 8 greedy tokens identical |
+| Metal, 150 tokens: one call, chunks of 16, token by token; vs CPU | ≤ 1.5e-6 between them, ≤ 1.8e-6 from the CPU |
+| Metal state saved + loaded / copied (f32, f16 KV); the CPU's file loaded into Metal | bit-identical; CPU file: same format and size, continuation within 1e-5 |
+| kernel tests (`kernel_tests.py`): `gdn_conv`, `gdn_rule` (dk 32 / 64 / 128, 1–3 value heads per key head), `gdn_norm_gate` vs numpy | ≤ 7.6e-7 |
+
+The tiny models (`make-tiny-model.py qwen3next`: 4 layers, interval 2, head_dim 64 with 16 rotary dims, 2 × 32 keys /
+4 × 32 values, 8 experts + shared, one dense layer; `qwen3next2`: explicit `layer_types` L L F L L, one value head per
+key head with dk 64 ≠ dv 32, conv 3, head_dim 32, MoE every other layer with `norm_topk_prob` false, tied head) cover
+the variants of the config. The real 80B config parses to the sizes above (`Qwen3NextChecks.realConfig`).
+
+```
+METAL_EMU=1 scripts/arch-smoke.sh          # includes both tiny models: CPU == Metal in every format, chunking, state
+REF_Q8=1 python3 scripts/qwen3next-ref.py <dir>; java ... Qwen3NextChecks <metal-lib|-> <dir>...
+python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
+```
+
+### 14.14.8 Not supported
+
+- **Multi-token prediction** (`mtp.*`, one extra layer that predicts the token after next from the last hidden state and
+  the next token's embedding): ignored, as transformers does for inference. It could serve as a built-in draft model
+  for speculative decoding, but speculation needs a rewindable state (the DeltaNet's is not, 14.14.5), so it would
+  also need state snapshots per drafted token.
+- **GGUF** (llama.cpp's `qwen3next` architecture): not mapped. The `gguf` package (0.19.0) lists for it both the
+  fused DeltaNet input `ssm_in` + `ssm_ba` and a split `attn_qkv` + `attn_gate`, besides `ssm_conv1d`, `ssm_a`, `ssm_dt`,
+  `ssm_norm` and `ssm_out`: the layout (which rows go where, which norms carry the `+ 1`, whether `A` is stored as
+  `−exp(A_log)`) is decided by llama.cpp's converter, has changed between versions, and could not be checked against a
+  real file here (the smallest is tens of GB), so it is not implemented rather than guessed.
+- The chunked delta rule on Metal (prefill uses the token loop); a state snapshot to rewind to a shared prefix;
+  `backend.metal.cpu-moe` (experts in CPU memory, 12.x) and flash-attention / flash decoding for the attention layers
+  (they use `attention_t`); measured speed on real weights (an 80B checkpoint does not fit this machine).
+- `attention_bias: true`; `rope_scaling` types other than those of 14.1 (the released models use none); a
+  `linear_key_head_dim` that is not a multiple of 32 or above 256, or a conv kernel above 8, on Metal.

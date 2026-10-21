@@ -8,7 +8,9 @@ module; the engine itself does not depend on it.
 Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`, `qwen3_moe`), **Qwen2 / 2.5**
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
-**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting) and **Mamba** (`mamba`).
+**DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting), **Mamba** (`mamba`) and
+**Qwen3-Next** (`qwen3_next`: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
+[docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
@@ -126,7 +128,8 @@ Llama-3.2-1B-Instruct, GLM-Edge-1.5B-Chat, Gemma-2-2B-it, Gemma-3-1B-it, mamba-1
 TinyMistral-248M: prompt ids and chat templates are identical, and the logits agree to a correlation ≥ 0.99998 with
 the same model run on Q8_0-rounded weights (greedy differences come from the quantization, mostly at near ties), see
 [docs/14.13](docs/14-model-families.md#1413-verified-on-real-weights) and `scripts/real-weights-check.sh`.
-Phi-3/4, `glm4`, Mistral-7B, Qwen3-MoE and DeepSeek are still verified on synthetic checkpoints and configs only.
+Phi-3/4, `glm4`, Mistral-7B, Qwen3-MoE, DeepSeek and Qwen3-Next are still verified on synthetic checkpoints and
+configs only (Qwen3-Next against an independent float64 reference, `scripts/qwen3next-ref.py`).
 
 The `./jllm` launcher compiles the Java code and the native Metal library on first use. Equivalent manual steps:
 

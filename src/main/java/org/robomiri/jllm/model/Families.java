@@ -38,7 +38,8 @@ final class Families {
             Map.entry("gemma3_text", "Gemma3ForCausalLM"),
             Map.entry("mamba", "MambaForCausalLM"),
             Map.entry("deepseek_v2", "DeepseekV2ForCausalLM"),
-            Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"));
+            Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"),
+            Map.entry("qwen3_next", "Qwen3NextForCausalLM"));
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
     private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration");
@@ -78,6 +79,7 @@ final class Families {
         String arch = declaredArch != null ? declaredArch : SUPPORTED.get(modelType);
         return switch (modelType) {
             case "mamba" -> mamba(c, arch);
+            case "qwen3_next" -> Qwen3NextArch.parse(c, arch);
             case "llama" -> llama(new Draft(c, modelType, arch));
             case "mistral" -> mistral(new Draft(c, modelType, arch));
             case "qwen2" -> qwen2(new Draft(c, modelType, arch));
@@ -613,7 +615,7 @@ final class Families {
      * @param rs the scaling map ({@code rope_scaling}, or the {@code rope_parameters} entry), null for plain RoPE
      * @param c  the config, for the position limits longrope derives its factor from
      */
-    private static Scaling parseRopeScaling(Map<String, Object> rs, Map<String, Object> c, int rotaryDim) {
+    static Scaling parseRopeScaling(Map<String, Object> rs, Map<String, Object> c, int rotaryDim) {
         if (rs == null) {
             return Scaling.NONE;
         }
@@ -713,7 +715,7 @@ final class Families {
      * {@code key} as a list of ints: absent or null gives the empty list, a single int a one-entry list; a list
      * with anything but integral numbers (or any other value) is rejected with a clear message.
      */
-    private static List<Integer> intList(Map<String, Object> c, String key) {
+    static List<Integer> intList(Map<String, Object> c, String key) {
         Object v = c.get(key);
         if (v == null) {
             return List.of();
@@ -740,7 +742,7 @@ final class Families {
         return (bits + 0x7FFF + lsb) & 0xFFFF0000;
     }
 
-    private static int requirePositive(Map<String, Object> c, String key) {
+    static int requirePositive(Map<String, Object> c, String key) {
         long v = Json.num(c, key, 0);
         if (v <= 0 || v > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("config.json: " + key + " must be a positive integer, got "

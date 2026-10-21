@@ -768,4 +768,66 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.MAMBA_SCAN).i(dInner).i(dState).i(dtRank).i(n);
         dispatch("mamba_scan", 9, 0, channelGrid(dInner), 1, 1, CHANNEL_THREADS, 1, 1);
     }
+
+    // ---------------------------------------------------------------- Qwen3-Next
+
+    /** Gated DeltaNet conv state width per gdn_rule threadgroup (GDN_COLS) and the widest key head (32 * GDN_MAX_PER). */
+    static final int GDN_COLS = 4;
+    static final int GDN_MAX_KEY_DIM = 32 * 8;
+    static final int GDN_MAX_CONV = 8;
+
+    /** y[t, c] = silu(causal conv of channel c) over n tokens with the carried conv state (gdn_conv). */
+    void gdnConv(Metal.Buffer x, Metal.Buffer w, Metal.Buffer state, Metal.Buffer y, int channels, int kernel,
+                 int inStride, int outStride, int n) {
+        bind(0, x, 0);
+        bind(1, w, 0);
+        bind(2, state, 0);
+        bind(3, y, 0);
+        p.reset(KernelParams.GDN_CONV).i(channels).i(kernel).i(n).i(inStride).i(outStride);
+        dispatch("gdn_conv", 4, 0, channelGrid(channels), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** The gated delta rule over n tokens for every (value head, state column) (gdn_rule). */
+    void gdnRule(Metal.Buffer qkv, Metal.Buffer proj, Metal.Buffer a, Metal.Buffer dtBias, Metal.Buffer state,
+                 Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
+                 int bOff, float l2Eps, int n) {
+        bind(0, qkv, 0);
+        bind(1, proj, 0);
+        bind(2, a, 0);
+        bind(3, dtBias, 0);
+        bind(4, state, 0);
+        bind(5, out, 0);
+        p.reset(KernelParams.GDN_RULE).i(keyHeads).i(valueHeads).i(keyDim).i(valueDim).i(n).i(qkvStride).i(projStride)
+                .i(bOff).f(l2Eps);
+        dispatch("gdn_rule", 6, 0, (valueDim + GDN_COLS - 1) / GDN_COLS, valueHeads, 1, GDN_COLS * 32, 1, 1);
+    }
+
+    /** o[row] = rmsnorm(o[row]) * w * silu(z[row]) for the n * valueHeads rows of valueDim (gdn_norm_gate). */
+    void gdnNormGate(Metal.Buffer o, Metal.Buffer proj, Metal.Buffer w, int valueDim, int valueHeads, int projStride,
+                     int zOff, int n) {
+        bind(0, o, 0);
+        bind(1, proj, 0);
+        bind(2, w, 0);
+        p.reset(KernelParams.GDN_NORM).i(valueDim).i(valueHeads).i(projStride).i(zOff).f(eps);
+        int threads = Math.max(32, Math.min(ROW_THREADS, (valueDim + 31) / 32 * 32));
+        dispatch("gdn_norm_gate", 3, 0, n * valueHeads, 1, 1, threads, 1, 1);
+    }
+
+    /** a[i] *= sigmoid(g[i]) for i < count (sigmoid_mul). */
+    void sigmoidMul(Metal.Buffer a, Metal.Buffer g, int count) {
+        bind(0, a, 0);
+        bind(1, g, 0);
+        p.reset(KernelParams.GATE).i(count);
+        dispatch("sigmoid_mul", 2, 0, (count + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** x[t] += sigmoid(w . xb[t]) * y[t] for n rows of dim (shared_gate_add). */
+    void sharedGateAdd(Metal.Buffer xb, Metal.Buffer w, Metal.Buffer y, Metal.Buffer x, int dim, int n) {
+        bind(0, xb, 0);
+        bind(1, w, 0);
+        bind(2, y, 0);
+        bind(3, x, 0);
+        p.reset(KernelParams.GATE).i(dim);
+        dispatch("shared_gate_add", 4, 0, n, 1, 1, ROW_THREADS, 1, 1);
+    }
 }

@@ -89,7 +89,7 @@ public final class ChatTemplate {
         String t = modelType == null ? "" : modelType.toLowerCase(Locale.ROOT).replace('-', '_');
         boolean deepseekVocab = tok != null && tok.tokenId("<｜User｜>") >= 0 && tok.tokenId("<｜Assistant｜>") >= 0;
         switch (t) {
-            case "qwen3", "qwen3_moe":
+            case "qwen3", "qwen3_moe", "qwen3_next":
                 return QWEN3;
             case "qwen2", "qwen2_5", "qwen2_moe":
                 return deepseekVocab ? DEEPSEEK : QWEN2;

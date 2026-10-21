@@ -3,6 +3,7 @@ package org.robomiri.jllm;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.cpu.CpuBackend;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
+import org.robomiri.jllm.cpu.Qwen3NextCpuBackend;
 import org.robomiri.jllm.engine.DraftModel;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.Speculator;
@@ -13,12 +14,14 @@ import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.metal.MoeSplit;
+import org.robomiri.jllm.metal.Qwen3NextMetalBackend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
+import org.robomiri.jllm.model.Qwen3NextArch;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.tokenizer.GgufTokenizer;
 import org.robomiri.jllm.tokenizer.Tokenizer;
@@ -187,7 +190,8 @@ public final class ModelLoader {
      */
     static int batch(Settings s, Architecture arch) {
         int batch = s.getInt("backend.batch");
-        boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
+        boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
+                || arch instanceof Qwen3NextArch q && q.anyMoe();
         return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
     }
 
@@ -382,6 +386,15 @@ public final class ModelLoader {
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
         }
+        if (arch instanceof Qwen3NextArch) { // hybrid: DeltaNet states plus a KV cache for the full-attention layers
+            return switch (backendName) {
+                case "cpu" -> new Qwen3NextCpuBackend(weights, ctx, batch,
+                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
+                        s.getBool("backend.cpu.int8-activations"));
+                case "metal" -> new Qwen3NextMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
+            };
+        }
         return switch (backendName) {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,
@@ -414,7 +427,8 @@ public final class ModelLoader {
         Architecture arch = p.arch();
         ModelWeights weights = p.weights();
         try {
-            if (arch instanceof MambaArch || targetArch instanceof MambaArch) {
+            if (arch instanceof MambaArch || targetArch instanceof MambaArch
+                    || arch instanceof Qwen3NextArch || targetArch instanceof Qwen3NextArch) {
                 throw new IllegalArgumentException("engine.draft-model: speculation needs attention (KV cache) models");
             }
             System.err.println("Draft model: " + arch);

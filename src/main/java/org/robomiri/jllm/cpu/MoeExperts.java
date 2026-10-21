@@ -34,17 +34,22 @@ public final class MoeExperts {
     private final int[] slotOrder;
 
     MoeExperts(ThreadPool pool, CpuMatmul mm, Decoder arch, int maxBatch) {
+        this(pool, mm, arch.core().dim(), arch.maxExperts(), arch.maxTopK(), arch.maxMoeDim(), maxBatch);
+    }
+
+    /** Sized for layers of up to {@code maxExperts} experts of width {@code maxMoeDim}, {@code maxTopK} per token. */
+    MoeExperts(ThreadPool pool, CpuMatmul mm, int dim, int maxExperts, int maxTopK, int maxMoeDim, int maxBatch) {
         this.pool = pool;
         this.mm = mm;
         this.scratch = mm.scratch;
-        this.dim = arch.core().dim();
-        int slots = maxBatch * arch.maxTopK();
-        gateUp = new float[slots * 2 * arch.maxMoeDim()];
-        hidden = new float[slots * arch.maxMoeDim()];
+        this.dim = dim;
+        int slots = maxBatch * maxTopK;
+        gateUp = new float[slots * 2 * maxMoeDim];
+        hidden = new float[slots * maxMoeDim];
         down = new float[slots * dim];
-        expertStart = new int[arch.maxExperts() + 1];
-        expertFill = new int[arch.maxExperts()];
-        usedExperts = new int[arch.maxExperts()];
+        expertStart = new int[maxExperts + 1];
+        expertFill = new int[maxExperts];
+        usedExperts = new int[maxExperts];
         slotOrder = new int[slots];
     }
 

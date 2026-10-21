@@ -7,6 +7,7 @@
 //   8. Q6_K (block format, row / tile walks and the _q6k instantiations of every matmul / moe kernel)
 //   9. flash-attention prefill (attention_fa: simdgroup-matrix QK^T and PV, online softmax)
 //  10. pipelined greedy decoding (embed_token: the embedding of a token id the GPU chose; argmax)
+//  11. Qwen3-Next (Gated DeltaNet conv / delta rule / gated norm, the attention output gate, the shared-expert gate)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -2817,3 +2818,208 @@ template [[host_name("embed_token_q4g")]] kernel embed_token_t embed_token<GG_Q4
 template [[host_name("embed_token_q8g")]] kernel embed_token_t embed_token<GG_Q8_0>;
 template [[host_name("embed_token_q4k")]] kernel embed_token_t embed_token<GG_Q4_K>;
 template [[host_name("embed_token_q5k")]] kernel embed_token_t embed_token<GG_Q5_K>;
+
+// ---------------------------------------------------------------------------------------------- 11. Qwen3-Next
+// The pieces of Qwen3NextMetalBackend that the generic kernels lack (docs/14.14). The projections, norms, RoPE,
+// attention and experts reuse the kernels above; these add the Gated DeltaNet (gdn_conv, gdn_rule, gdn_norm_gate) and
+// the two gates (sigmoid_mul: attention output * sigmoid(gate); shared_gate_add: x += sigmoid(w . xb) * shared expert).
+// Like Mamba's scan, the delta rule runs the tokens of a chunk sequentially inside each thread: prefill is the token
+// loop of decode, not the chunked (UT / WY) form of the CPU backend (the two agree to float rounding).
+
+#define GDN_MAX_PER 8           // key head width held per lane, in units of 32 (linear_key_head_dim <= 256)
+#define GDN_COLS 4              // state columns (value dims) per gdn_rule threadgroup: one simdgroup each
+#define GDN_MAX_CONV 8          // conv taps held in registers
+
+struct GdnConvParams {
+    int channels;   // conv channels: q, k and v of all heads
+    int taps;       // <= GDN_MAX_CONV
+    int ntok;
+    int inStride;   // floats per token of the input (the fused projection row)
+    int outStride;  // floats per token of the output
+};
+
+// y[t, c] = silu(sum_k w[c, k] * window[k]) with window = (the conv state of channel c, x[t, c]): Qwen3-Next's
+// depthwise causal conv (no bias). One thread per channel; the state (kernel - 1 previous inputs, oldest first) is
+// read once, carried in registers over the chunk and written back.
+kernel void gdn_conv(device const float *x [[buffer(0)]],
+                     device const float *w [[buffer(1)]],
+                     device float *state [[buffer(2)]],
+                     device float *y [[buffer(3)]],
+                     constant GdnConvParams &p [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]]) {
+    const int c = int(gid);
+    if (c >= p.channels) return;
+    const int kc = p.taps;
+    device float *st = state + (ulong)c * (kc - 1);
+    device const float *wc = w + (ulong)c * kc;
+    float win[GDN_MAX_CONV - 1];
+    float wr[GDN_MAX_CONV];
+    for (int k = 0; k < kc - 1; k++) win[k] = st[k];
+    for (int k = 0; k < kc; k++) wr[k] = wc[k];
+    for (int t = 0; t < p.ntok; t++) {
+        const float u = x[(ulong)t * p.inStride + c];
+        float sum = 0.0f;
+        for (int k = 0; k < kc - 1; k++) sum += wr[k] * win[k];
+        sum += wr[kc - 1] * u;
+        for (int k = 0; k + 1 < kc - 1; k++) win[k] = win[k + 1];
+        if (kc > 1) win[kc - 2] = u;
+        y[(ulong)t * p.outStride + c] = sum / (1.0f + precise::exp(-sum));
+    }
+    for (int k = 0; k < kc - 1; k++) st[k] = win[k];
+}
+
+struct GdnRuleParams {
+    int keyHeads;
+    int valueHeads;
+    int keyDim;     // multiple of 32, <= 32 * GDN_MAX_PER
+    int valueDim;
+    int ntok;
+    int qkvStride;  // floats per token of the conv output [q | k | v]
+    int projStride; // floats per token of the projection (b and a of the token are read from it)
+    int bOff;       // offset of b in a projection row; a follows after valueHeads
+    float eps;      // of the q / k L2 norm
+};
+
+// The gated delta rule of value head h = tgp.y, state column j (value dim) = tgp.x * GDN_COLS + simdgroup:
+//   q, k = l2norm(q), l2norm(k) of the head's key head, q *= keyDim^-0.5;  beta = sigmoid(b);  g = A * softplus(a + dt_bias)
+//   s *= exp(g);   d = (v_j - s . k) * beta;   s += d k;   o_j = s . q
+// where s is column j of the head's [keyDim, valueDim] state, kept transposed in memory ([head][j][keyDim]) and in
+// registers: lane l holds rows l, l + 32, ... (keyDim / 32 of them). The dot products are simd_sums; every simdgroup
+// recomputes the two L2 norms of its token (two more simd_sums), which saves a pass over q and k. Tokens run in order.
+kernel void gdn_rule(device const float *qkv [[buffer(0)]],
+                     device const float *proj [[buffer(1)]],
+                     device const float *A [[buffer(2)]],
+                     device const float *dtBias [[buffer(3)]],
+                     device float *state [[buffer(4)]],
+                     device float *out [[buffer(5)]],
+                     constant GdnRuleParams &p [[buffer(6)]],
+                     uint2 tgp [[threadgroup_position_in_grid]],
+                     ushort sg [[simdgroup_index_in_threadgroup]],
+                     ushort lane [[thread_index_in_simdgroup]]) {
+    const int h = int(tgp.y);
+    const int j = int(tgp.x) * GDN_COLS + sg;
+    if (j >= p.valueDim) return;   // the whole simdgroup leaves together: no barrier below
+    const int dk = p.keyDim;
+    const int per = dk / 32;
+    const int kh = h / (p.valueHeads / p.keyHeads);
+    const int kw = p.keyHeads * dk;
+    const float scale = rsqrt(float(dk));
+    device float *col = state + ((ulong)h * p.valueDim + j) * dk;
+    float s[GDN_MAX_PER];
+    for (int r = 0; r < per; r++) s[r] = col[lane + 32 * r];
+    const float a0 = A[h];
+    const float db = dtBias[h];
+    for (int t = 0; t < p.ntok; t++) {
+        device const float *row = qkv + (ulong)t * p.qkvStride;
+        device const float *pr = proj + (ulong)t * p.projStride;
+        float q[GDN_MAX_PER];
+        float k[GDN_MAX_PER];
+        float qq = 0.0f;
+        float kk = 0.0f;
+        for (int r = 0; r < per; r++) {
+            q[r] = row[kh * dk + lane + 32 * r];
+            k[r] = row[kw + kh * dk + lane + 32 * r];
+            qq += q[r] * q[r];
+            kk += k[r] * k[r];
+        }
+        const float qn = scale * rsqrt(simd_sum(qq) + p.eps);
+        const float kn = rsqrt(simd_sum(kk) + p.eps);
+        const float b = pr[p.bOff + h];
+        const float araw = pr[p.bOff + p.valueHeads + h] + db;
+        const float beta = 1.0f / (1.0f + precise::exp(-b));
+        const float sp = araw > SOFTPLUS_LINEAR ? araw : precise::log(1.0f + precise::exp(araw));
+        const float gamma = precise::exp(a0 * sp);
+        float kv = 0.0f;
+        for (int r = 0; r < per; r++) {
+            k[r] *= kn;
+            s[r] *= gamma;
+            kv += s[r] * k[r];
+        }
+        kv = simd_sum(kv);
+        const float d = (row[2 * kw + h * p.valueDim + j] - kv) * beta;
+        float o = 0.0f;
+        for (int r = 0; r < per; r++) {
+            s[r] += d * k[r];
+            o += s[r] * (q[r] * qn);
+        }
+        o = simd_sum(o);
+        if (lane == 0) out[(ulong)t * p.valueHeads * p.valueDim + h * p.valueDim + j] = o;
+    }
+    for (int r = 0; r < per; r++) col[lane + 32 * r] = s[r];
+}
+
+struct GdnNormParams {
+    int valueDim;
+    int valueHeads;
+    int projStride;
+    int zOff;       // offset of z in a projection row
+    float eps;
+};
+
+// o[row] = rmsnorm(o[row]) * w * silu(z[row]) in place for the rows (token, value head) of valueDim floats: the
+// DeltaNet's gated RMSNorm (its gain is applied as is, not 1 + w). One threadgroup per row.
+kernel void gdn_norm_gate(device float *o [[buffer(0)]],
+                          device const float *proj [[buffer(1)]],
+                          device const float *w [[buffer(2)]],
+                          constant GdnNormParams &p [[buffer(3)]],
+                          uint tg [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_position_in_threadgroup]],
+                          ushort tpg [[threads_per_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]],
+                          ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const int t = int(tg) / p.valueHeads;
+    const int h = int(tg) - t * p.valueHeads;
+    device float *ov = o + (ulong)tg * p.valueDim;
+    device const float *z = proj + (ulong)t * p.projStride + p.zOff + h * p.valueDim;
+    float ss = 0.0f;
+    for (int i = tid; i < p.valueDim; i += tpg) {
+        const float v = ov[i];
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float scale = rsqrt(ss / p.valueDim + p.eps);
+    for (int i = tid; i < p.valueDim; i += tpg) {
+        const float zi = z[i];
+        ov[i] = ov[i] * scale * w[i] * (zi / (1.0f + precise::exp(-zi)));
+    }
+}
+
+struct GateParams {
+    int n;          // elements (sigmoid_mul) or the row width (shared_gate_add)
+};
+
+// a[i] *= sigmoid(g[i]) for i < n: the output gate of Qwen3-Next's full attention (before o_proj).
+kernel void sigmoid_mul(device float *a [[buffer(0)]],
+                        device const float *g [[buffer(1)]],
+                        constant GateParams &p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+    const int i = int(gid);
+    if (i >= p.n) return;
+    a[i] = a[i] * (1.0f / (1.0f + precise::exp(-g[i])));
+}
+
+// x[t] += sigmoid(dot(w, xb[t])) * y[t] for the token t = threadgroup: the shared expert's output y scaled by its gate
+// (shared_expert_gate, one row of n = dim floats). One threadgroup per token.
+kernel void shared_gate_add(device const float *xb [[buffer(0)]],
+                            device const float *w [[buffer(1)]],
+                            device const float *y [[buffer(2)]],
+                            device float *x [[buffer(3)]],
+                            constant GateParams &p [[buffer(4)]],
+                            uint tg [[threadgroup_position_in_grid]],
+                            ushort tid [[thread_position_in_threadgroup]],
+                            ushort tpg [[threads_per_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]],
+                            ushort lane [[thread_index_in_simdgroup]],
+                            ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    device const float *xr = xb + (ulong)tg * p.n;
+    float d = 0.0f;
+    for (int i = tid; i < p.n; i += tpg) d += w[i] * xr[i];
+    d = tg_sum(d, buf, sg, lane, nsg);
+    const float s = 1.0f / (1.0f + precise::exp(-d));
+    device const float *yr = y + (ulong)tg * p.n;
+    device float *out = x + (ulong)tg * p.n;
+    for (int i = tid; i < p.n; i += tpg) out[i] += s * yr[i];
+}
