@@ -221,7 +221,10 @@ repository by its launcher).
   low-disk conversion. Downloads and loads run as background jobs with progress and cancel. Several models can be
   loaded at once; the `model` field of an API request picks one (with a single model loaded any name works). Loaded
   models show their settings, requests and speed and can be unloaded (running requests are cancelled first). Models
-  on disk can be loaded again or deleted.
+  on disk can be loaded again or deleted: *On disk* lists `model.dir` and the folders of `jllm.web.model-dirs`
+  (default `../models`, so a console started from `jllm-web/` also shows the repository's `models/` folder that
+  `./jllm` uses), grouped by folder. A model is loaded from the folder it is in, and a checkpoint whose quantized
+  cache is there loads from the cache without contacting the Hub, even after its shards were deleted (`model.low-disk`).
 - **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
   from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
   `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and

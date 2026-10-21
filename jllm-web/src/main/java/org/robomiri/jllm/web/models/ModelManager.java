@@ -4,6 +4,8 @@ import org.robomiri.jllm.ModelLoader;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.hub.HuggingFaceHub;
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.model.QType;
+import org.robomiri.jllm.model.QuantFile;
 import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.settings.SettingsService;
 import org.springframework.beans.factory.DisposableBean;
@@ -16,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -59,9 +62,11 @@ public class ModelManager implements DisposableBean {
      * @param ggufFile  the GGUF file within the repository directory, or null for a safetensors checkpoint
      * @param caches    the quantized caches converted from a safetensors checkpoint
      * @param loadedAs  ids of the loaded models that use it
+     * @param modelDir  the models folder it was found in: loading it passes this as {@code model.dir}, so the model
+     *                  is read where it is instead of being downloaded into the default folder
      */
     public record LocalModel(String name, String format, String source, String revision, String ggufFile,
-                             String path, long bytes, List<String> caches, List<String> loadedAs) {
+                             String path, long bytes, List<String> caches, List<String> loadedAs, String modelDir) {
     }
 
     /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
@@ -226,7 +231,9 @@ public class ModelManager implements DisposableBean {
         submit(loads, job, () -> {
             HuggingFaceHub hub = ModelLoader.hub(s);
             long t0 = System.nanoTime();
-            if (!t.local() && !s.getBool("model.low-disk")) { // low-disk downloads shard by shard while converting
+            // low-disk downloads shard by shard while converting; a checkpoint whose quantized cache is here needs
+            // nothing from the Hub (its shards may have been deleted after the conversion)
+            if (!t.local() && !s.getBool("model.low-disk") && !cacheReady(s, t)) {
                 planProgress(job, s, hub, t);
                 job.phase = "downloading";
                 ModelLoader.download(s, hub, t.model());
@@ -370,6 +377,49 @@ public class ModelManager implements DisposableBean {
         return Path.of(s.get("model.dir")).resolve(repo.replace('/', '_'));
     }
 
+    /** A safetensors checkpoint whose quantized cache for the requested format is already converted. */
+    private static boolean cacheReady(Settings s, Target t) {
+        if (t.file() != null || t.quant() != null) {
+            return false;
+        }
+        Path dir = repoDir(s, t.model());
+        try {
+            return Files.isRegularFile(dir.resolve("config.json")) && Files.isRegularFile(dir.resolve("tokenizer.json"))
+                    && QuantFile.exists(dir, QType.parse(s.get("model.quant")), QType.parseHead(s.get("model.head-quant")));
+        } catch (RuntimeException e) {
+            return false; // an unknown format: let the loader report it
+        }
+    }
+
+    /**
+     * The folders models are listed from: {@code model.dir} first, then {@code jllm.web.model-dirs}; only existing
+     * ones, each once (by real path).
+     */
+    public List<Path> modelRoots() {
+        List<String> names = new ArrayList<>();
+        names.add(settings.current().get("model.dir"));
+        names.addAll(props.modelDirs());
+        LinkedHashSet<Path> seen = new LinkedHashSet<>();
+        List<Path> out = new ArrayList<>();
+        for (String n : names) {
+            if (n == null || n.isBlank()) {
+                continue;
+            }
+            Path p = Path.of(n.trim()).toAbsolutePath().normalize();
+            if (!Files.isDirectory(p)) {
+                continue;
+            }
+            try {
+                if (seen.add(p.toRealPath())) {
+                    out.add(p);
+                }
+            } catch (IOException e) {
+                // unreadable: skip
+            }
+        }
+        return out;
+    }
+
     /** Works out which files the job will fetch, the same way {@link ModelLoader#resolve} decides, for the progress bar. */
     private static void planProgress(Job job, Settings s, HuggingFaceHub hub, Target t) {
         try {
@@ -443,18 +493,21 @@ public class ModelManager implements DisposableBean {
         return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles);
     }
 
-    /** The models in {@code model.dir}: safetensors checkpoints and GGUF files. */
+    /** The models in {@code model.dir} and {@code jllm.web.model-dirs}: safetensors checkpoints and GGUF files. */
     public List<LocalModel> localModels() throws IOException {
-        Settings s = settings.current();
-        Path root = Path.of(s.get("model.dir")).toAbsolutePath();
-        List<LocalModel> out = new ArrayList<>();
-        if (!Files.isDirectory(root)) {
-            return out;
-        }
         Map<String, List<String>> users = new LinkedHashMap<>();
         for (LoadedModel m : loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
         }
+        List<LocalModel> out = new ArrayList<>();
+        for (Path root : modelRoots()) {
+            listModels(root, users, out);
+        }
+        return out;
+    }
+
+    private void listModels(Path root, Map<String, List<String>> users, List<LocalModel> out) throws IOException {
+        String rootName = root.toString();
         List<Path> entries;
         try (Stream<Path> st = Files.list(root)) {
             entries = st.sorted().toList();
@@ -464,7 +517,7 @@ public class ModelManager implements DisposableBean {
             if (Files.isRegularFile(p) && isFirstGguf(name)) {
                 String abs = p.toString();
                 out.add(new LocalModel(name, "gguf", abs, null, null, abs, Files.size(p), List.of(),
-                        users.getOrDefault(abs, List.of())));
+                        users.getOrDefault(abs, List.of()), rootName));
                 continue;
             }
             if (!Files.isDirectory(p) || name.equals("tokenizers") || name.startsWith(".")) {
@@ -479,7 +532,8 @@ public class ModelManager implements DisposableBean {
                     st.map(x -> x.getFileName().toString()).filter(n -> n.startsWith("jllm-") && n.endsWith(".bin"))
                             .sorted().forEach(caches::add);
                 }
-                out.add(new LocalModel(repo, "safetensors", repo, repoRev[1], null, p.toString(), dirSize(p), caches, loadedAs));
+                out.add(new LocalModel(repo, "safetensors", repo, repoRev[1], null, p.toString(), dirSize(p), caches, loadedAs,
+                        rootName));
             }
             for (String g : HuggingFaceHub.localGgufNames(p)) {
                 if (!isFirstGguf(Path.of(g).getFileName().toString())) {
@@ -490,10 +544,9 @@ public class ModelManager implements DisposableBean {
                     bytes += Files.size(part);
                 }
                 out.add(new LocalModel(repo + " / " + g, "gguf", repo, repoRev[1], g, p.resolve(g).toString(), bytes,
-                        List.of(), loadedAs));
+                        List.of(), loadedAs, rootName));
             }
         }
-        return out;
     }
 
     /**
@@ -501,10 +554,10 @@ public class ModelManager implements DisposableBean {
      * split parts).
      */
     public void deleteLocal(String path) throws IOException {
-        Path root = Path.of(settings.current().get("model.dir")).toAbsolutePath().normalize();
         Path p = Path.of(path).toAbsolutePath().normalize();
-        if (!p.startsWith(root) || p.equals(root)) {
-            throw new IllegalArgumentException("only models inside " + root + " can be deleted");
+        List<Path> roots = modelRoots();
+        if (roots.stream().noneMatch(root -> p.startsWith(root) && !p.equals(root))) {
+            throw new IllegalArgumentException("only models inside " + roots + " can be deleted");
         }
         for (LocalModel m : localModels()) {
             if (Path.of(m.path()).toAbsolutePath().normalize().equals(p) && !m.loadedAs().isEmpty()) {

@@ -12,7 +12,7 @@ const Models = (() => {
   let lastLocal = 0;
 
   function loadForm(opts) {
-    // opts: {source, revision, gguf, ggufFiles, ggufFile, quant, defaultId, local, download}
+    // opts: {source, revision, gguf, ggufFiles, ggufFile, quant, defaultId, local, download, modelDir}
     const frag = $('#load-form-tpl').content.cloneNode(true);
     const form = frag.querySelector('form');
     form.querySelectorAll('.gguf-only').forEach(e => e.classList.toggle('hidden', !opts.gguf || !opts.ggufFiles?.length));
@@ -43,6 +43,8 @@ const Models = (() => {
         if (!el.name || !el.name.includes('.') || el.closest('.hidden')) continue;
         if (el.type === 'checkbox') { if (el.checked) settings[el.name] = 'true'; } else if (el.value !== '') settings[el.name] = el.value;
       }
+      // a model listed from a models folder is read from that folder (not downloaded into the default one)
+      if (opts.modelDir && !settings['model.dir']) settings['model.dir'] = opts.modelDir;
       const req = {source: opts.source, revision: form.revision.value || null,
         ggufFile: opts.gguf && opts.ggufFiles?.length ? form.ggufFile.value : (opts.ggufFile || null), ggufQuant: null, settings};
       try {
@@ -123,9 +125,13 @@ const Models = (() => {
 
   function renderLocal(list) {
     const box = $('#local-list');
-    if (!list.length) { box.innerHTML = '<p class="empty">No models downloaded yet.</p>'; return; }
+    if (!list.length) { box.innerHTML = '<p class="empty">No models in the models folders yet.</p>'; return; }
+    const folders = [...new Set(list.map(m => m.modelDir))];
+    $('#model-dir').textContent = folders.join(' · ');
     box.innerHTML = `<table class="table"><tr><th>model</th><th>format</th><th>size</th><th></th></tr>
-      ${list.map((m, i) => `<tr><td><strong>${esc(m.name)}</strong><div class="hint">${esc(m.path)}</div>
+      ${list.map((m, i) => `${folders.length > 1 && (i === 0 || list[i - 1].modelDir !== m.modelDir)
+          ? `<tr class="folder-row"><td colspan="4"><span class="muted small">folder</span> <code>${esc(m.modelDir)}</code></td></tr>` : ''}
+        <tr><td><strong>${esc(m.name)}</strong><div class="hint">${esc(m.path)}</div>
           ${m.caches.length ? `<div class="hint">quantized: ${m.caches.map(esc).join(', ')}</div>` : ''}</td>
         <td><span class="badge">${esc(m.format)}</span></td><td>${fmtBytes(m.bytes)}</td>
         <td style="white-space:nowrap">${m.loadedAs.length ? '<span class="badge ok">loaded</span> ' : ''}<button class="small" data-load="${i}">load…</button>
@@ -140,6 +146,7 @@ const Models = (() => {
       td.colSpan = 4;
       const gguf = m.format === 'gguf';
       td.appendChild(loadForm({source: m.source, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
+        modelDir: gguf && !m.ggufFile ? null : m.modelDir,
         defaultId: gguf && m.ggufFile ? m.source + ':' + m.ggufFile.replace(/\.gguf$/i, '').split('/').pop() : m.source}));
       tr.appendChild(td);
       row.after(tr);
