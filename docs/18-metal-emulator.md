@@ -106,7 +106,10 @@ attention kernel rescales rows with a diagonal matrix product for exactly this r
 Buffers are plain host memory (on Apple Silicon they are too — unified memory), so `newBufferWithBytesNoCopy`
 becomes "remember this pointer". A dispatch runs at once; `jm_commit` and `jm_commit_wait` are no-ops, and `jm_wait_pending`
 returns immediately, so pipelined decoding ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) runs
-with its full logic.
+with its full logic. `jm_run` (a recorded decode step, [08 §8.21](08-metal-backend.md#821-decode-replay-one-native-call-per-token))
+reads the same 384-byte command records as the Objective-C shim and runs them one after the other through
+`jm_dispatch`, so the recording, the patching and the verification of replayed steps are exercised here exactly as on a
+Mac; only the native encoding loop itself is the shim's own.
 
 ---
 
