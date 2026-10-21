@@ -64,6 +64,14 @@ public final class WhisperWeights implements AutoCloseable {
     }
 
     public static WhisperWeights load(Path dir, long residentLimitBytes) throws IOException {
+        return load(dir, residentLimitBytes, false);
+    }
+
+    /**
+     * @param gpuEncoder the encoder runs on the GPU, which reads the checkpoint's tensors itself: its matrices are not
+     *                   copied into heap floats. The decoder's (used for every token) and the embedding always are when they fit.
+     */
+    public static WhisperWeights load(Path dir, long residentLimitBytes, boolean gpuEncoder) throws IOException {
         WhisperConfig cfg = WhisperConfig.parse(Json.parseObject(Files.readString(dir.resolve("config.json"))));
         Path file = dir.resolve("model.safetensors");
         if (!Files.isRegularFile(file)) {
@@ -71,8 +79,8 @@ public final class WhisperWeights implements AutoCloseable {
         }
         SafeTensors st = SafeTensors.open(file);
         WhisperWeights w = new WhisperWeights(cfg, st, dir);
-        boolean resident = totalBytes(cfg) <= residentLimitBytes;
-        w.fill(resident);
+        boolean all = totalBytes(cfg) <= residentLimitBytes;
+        w.fill(all && !gpuEncoder, all || decoderBytes(cfg) <= residentLimitBytes);
         return w;
     }
 
@@ -82,6 +90,12 @@ public final class WhisperWeights implements AutoCloseable {
         long enc = c.encLayers() * (4 * d * d + 2 * d * c.encFfn());
         long dec = c.decLayers() * (8 * d * d + 2 * d * c.decFfn());
         return 4 * (enc + dec + (long) c.vocab() * d + 3 * d * (c.nMels() + d));
+    }
+
+    /** The bytes of the decoder's layers and the embedding as floats. */
+    static long decoderBytes(WhisperConfig c) {
+        long d = c.dModel();
+        return 4 * (c.decLayers() * (8 * d * d + 2 * d * c.decFfn()) + (long) c.vocab() * d);
     }
 
     private String prefix;
@@ -120,7 +134,7 @@ public final class WhisperWeights implements AutoCloseable {
         return a;
     }
 
-    private void fill(boolean resident) {
+    private void fill(boolean encResident, boolean resident) {
         prefix = st.tensors().containsKey("model.encoder.conv1.weight") ? "model." : "";
         int d = cfg.dModel();
         conv1 = Mat.of(t("encoder.conv1.weight"), d, cfg.nMels() * 3, vec("encoder.conv1.bias"), true);
@@ -131,11 +145,11 @@ public final class WhisperWeights implements AutoCloseable {
         for (int i = 0; i < cfg.encLayers(); i++) {
             String b = "encoder.layers." + i;
             Layer l = new Layer();
-            l.self = attn(b + ".self_attn", resident);
+            l.self = attn(b + ".self_attn", encResident);
             l.self.lnGamma = vec(b + ".self_attn_layer_norm.weight");
             l.self.lnBeta = vec(b + ".self_attn_layer_norm.bias");
-            l.fc1 = mat(b + ".fc1", cfg.encFfn(), d, true, resident);
-            l.fc2 = mat(b + ".fc2", d, cfg.encFfn(), true, resident);
+            l.fc1 = mat(b + ".fc1", cfg.encFfn(), d, true, encResident);
+            l.fc2 = mat(b + ".fc2", d, cfg.encFfn(), true, encResident);
             l.ffnLnGamma = vec(b + ".final_layer_norm.weight");
             l.ffnLnBeta = vec(b + ".final_layer_norm.bias");
             el.add(l);

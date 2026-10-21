@@ -34,7 +34,8 @@ public final class WhisperModel implements AutoCloseable {
     /** @param metalDecoder "auto", "on" or "off": whether the decoder runs on the GPU too (the Metal backend) */
     public static WhisperModel load(Path dir, String backend, int threads, long residentMb, String metalDecoder)
             throws IOException {
-        WhisperWeights w = WhisperWeights.load(dir, residentMb << 20);
+        boolean gpu = !"cpu".equals(backend) && org.robomiri.jllm.metal.Metal.available(System.getProperty("jllm.metal.lib"));
+        WhisperWeights w = WhisperWeights.load(dir, residentMb << 20, gpu);
         try {
             Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
             WhisperNet net = null;
