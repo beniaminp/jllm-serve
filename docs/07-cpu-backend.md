@@ -586,16 +586,26 @@ near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 🧸 Two roads lead to the same town. On some machines the short road (int8) is faster, on others the wide road
 (float) is. Instead of guessing, the program drives both once when a model loads and takes the faster one from then on.
 
-📐 `backend.cpu.int8-activations=auto` (the default) times one representative single-token matmul of the loaded
-model, the first layer's `o_proj` (else the LM head), 24 times each way, alternating, and compares the best of the
-last 20. The int8 path wins where the CPU has cheap byte dot products (NEON `sdot`: ~3.9× faster decode on Apple
-silicon, the table above). On x86 with AVX-512 but no VNNI, the 16-bit widening multiplies cost more than streaming
-the float-dequantized weights; on a 4-core AVX-512 machine the probe measured int8 1619 µs vs float 402 µs for
-Q4_0 1024×2048 and chose float. The result is printed (`int8 activations: auto -> off (...)`) and cached per model,
-so the slots of a server share one measurement. `true` / `false` force a path. When the native int8 kernels of
-[7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu) are loaded, the probe times them instead of the Java int8
-kernels, which turns the decision around on that machine (native int8 on AVX512-VNNI is several times faster than
-float; numbers in 7.16).
+📐 `backend.cpu.int8-activations=auto` (the default) times one token's single-token matmuls both ways: every
+quantized tensor of the first decoder layer (weighted by the number of layers) plus the LM head, 16 alternating
+runs each, keeping the best of the last 12. The int8 path wins where the CPU has cheap byte dot products (NEON
+`sdot`: ~3.9× faster decode on Apple silicon, the table above). On x86 with AVX-512 but no VNNI, the 16-bit
+widening multiplies cost more than streaming the float-dequantized weights. On a 4-core AVX-512 machine, Qwen3-0.6B
+Q4_0 measured 292 ms (int8) vs 183 ms (float) per token of matmuls, so float was chosen, and decode ran at
+2.6 tok/s against 0.5 tok/s with int8 forced (a heavily loaded machine: compare the ratio, not the numbers). The
+result is printed (`int8 activations: auto -> off (...)`) and cached per model, so the slots of a server share one
+measurement. `true` / `false` force a path. When the native int8 kernels of
+[7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu) are loaded, the int8 side of the probe runs them (the log
+line says `int8 ... ms [native avx512-vnni]` or `[java]`), which turns the decision around on that machine: see the
+measurements in 7.16.
+
+**A JIT pitfall found on the way.** The first version timed only `o_proj` (Q4_0) and chose float, which made decode
+far *slower*: the Q8_0 LM head (151936 × 1024) took 9–10 s per token in float instead of ~0.1 s. Inside the full
+engine, C2 compiled `dotQ8`'s byte-to-float `castShape` as a non-intrinsic call (`VectorSupport::convert … failed to
+inline (intrinsic)`, then `made not entrant: uncommon trap` in a loop), so every lane went through the generic
+Java fallback; the same code in a small benchmark compiled fine. Single-token Q8_0 rows on the float path now
+dequantize into the thread-local scratch and run a float dot (`CpuMatmul.mulOne`), which compiles reliably and
+takes 107 ms for that head, and the probe times the whole token so one slow tensor can no longer mislead it.
 
 ## 7.11 What to optimize next
 

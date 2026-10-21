@@ -124,6 +124,29 @@ CPU the expert-grouped prefill reuses each dequantized expert row for all tokens
 
 ---
 
+### Against llama.cpp (`scripts/mac-validate.sh --vs-llama`)
+
+🧸 To know who runs faster, both runners must run the same race: the same model file, the same length of question,
+the same number of words to say back. The script makes jllm and llama.cpp do exactly that on a Mac and writes down
+both times side by side.
+
+📐 `scripts/mac-validate.sh --vs-llama` (add `--llama-only` to skip the rest, `--llama-moe unsloth/Qwen3-30B-A3B-GGUF`
+for a mixture-of-experts row, `--llama-quant Q4_K_M` for another file of the repository) does, per GGUF repository:
+
+1. `jllm bench` on the `.gguf` file as it is (default `unsloth/Qwen3-0.6B-GGUF`, `Q4_0`), with
+   `--engine.speculative off`: llama-bench has no speculation, and the bench prompt repeats one sentence, which
+   would flatter prompt-lookup drafting. Its output gives the prompt length P (≈ 413 tokens) and the generated
+   count N (128).
+2. `llama-bench -m <same file> -p P -n N -d P -r <rounds>` with flash attention off and on (the faster of each column
+   is kept). `-d P` makes llama.cpp decode after P tokens of context, as jllm does after its prompt; a llama-bench
+   without `-d` decodes from an empty context, which favours it slightly, and the table says so.
+3. The ratio row `jllm / llama.cpp` (above 1 = jllm faster), and one more jllm row with its default speculation,
+   labelled as favoured by the repetitive prompt.
+
+It needs `llama-bench` (`brew install llama.cpp`, or `LLAMA_BENCH=/path`) and `python3` (to read llama-bench's
+JSON). No comparison has been run yet; until one is, the gap to llama.cpp is an estimate (prefill well behind,
+decode closer; see 11.2).
+
 ## 11.2 Where the time goes
 
 ### Metal decode (~9 ms per token at 413-token context)
