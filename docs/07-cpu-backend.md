@@ -584,8 +584,8 @@ near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 
 In order of expected payoff on this CPU:
 
-1. **Vectorized exp** — done for attention and the soft-caps, opt-in: `-Djllm.cpu.fastmath`
-   ([7.15](#715-fast-math-jllmcpufastmath)). SiLU still uses the scalar `Math.exp`.
+1. **Vectorized exp** — done for attention, the soft-caps and the MLP's SiLU (`-Djllm.cpu.fastmath`, on by
+   default; [7.15](#715-fast-math-jllmcpufastmath)).
 2. **f16 KV cache** — done: `backend.kv-dtype=f16` ([7.13](#713-the-f16-kv-cache-kvcache)). What remains is
    a fused f16 dot product that converts inside the SIMD loop instead of expanding each row to scratch first.
 3. **Fuse RMSNorm into the following matmul** and SiLU into the gate/up matmul to cut passes over the
@@ -705,7 +705,8 @@ near-tie; the `run` gates in [11](11-performance.md) have been stable across hun
 Fast math is **on by default** (the backend name reports `fastmath`); `-Djllm.cpu.fastmath=false` turns it off.
 It replaces the scalar `Math.exp` of the attention softmax and the `Math.tanh` of the attention and final-logit
 soft-caps with polynomial kernels on float lanes (`VectorKernels.expFast` / `tanhFast`, used through `softmaxExp`
-and `softcapFast`). Everything else, including SiLU, keeps `Math.exp`. The results are *not* bit-identical to the
+and `softcapFast`), and the SwiGLU's `silu(g) · u = g / (1 + e^(−g)) · u` of the gated MLPs and the MoE experts
+(`VectorKernels.siluMul`). Mamba's SiLU keeps `Math.exp`. The results are *not* bit-identical to the
 scalar functions, so bit-exact comparisons with the Metal backend (`scripts/arch-smoke.sh`) pass
 `-Djllm.cpu.fastmath=false`, but they are close:
 

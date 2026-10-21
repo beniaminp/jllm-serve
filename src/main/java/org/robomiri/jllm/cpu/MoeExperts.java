@@ -88,12 +88,7 @@ public final class MoeExperts {
             });
         }
         for (int k = 0; k < topK; k++) {
-            int gi = k * gu;
-            int hi = k * m;
-            for (int i = 0; i < m; i++) {
-                float g = gateUp[gi + i];
-                hidden[hi + i] = VectorKernels.silu(g) * gateUp[gi + m + i];
-            }
+            VectorKernels.siluMul(gateUp, k * gu, gateUp, k * gu + m, hidden, k * m, m);
         }
         if (mm.useInt8(expDown)) {
             short[] xq = mm.quantizeInt8(hidden, 0, topK * m);   // slot k starts at block offset k * m
@@ -160,13 +155,9 @@ public final class MoeExperts {
 
         expertMatmul(w.expGateUp(), gu, used, topK, xb, dim, false, gateUp, gu);
 
-        pool.forRange(slots * m, 256, (i0, i1) -> {
-            for (int i = i0; i < i1; i++) {
-                int s = i / m;
-                int j = i - s * m;
-                int gi = s * gu;
-                float g = gateUp[gi + j];
-                hidden[s * m + j] = VectorKernels.silu(g) * gateUp[gi + m + j];
+        pool.forRange(slots, 1, (s0, s1) -> {
+            for (int s = s0; s < s1; s++) {
+                VectorKernels.siluMul(gateUp, s * gu, gateUp, s * gu + m, hidden, s * m, m);
             }
         });
 

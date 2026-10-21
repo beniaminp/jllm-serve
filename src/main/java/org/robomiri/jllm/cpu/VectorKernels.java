@@ -431,6 +431,26 @@ public final class VectorKernels {
         return x / (1f + (float) Math.exp(-x));
     }
 
+    /**
+     * {@code out[oo + i] = silu(g[go + i]) · u[uo + i]} for {@code i in [0, n)}: the SwiGLU of a gated MLP. With
+     * {@link #FASTMATH} the lanes use {@link #expFast} (relative error ~2e-7 per exp); otherwise the scalar
+     * {@link #silu}, bit-exact with the reference.
+     */
+    static void siluMul(float[] g, int go, float[] u, int uo, float[] out, int oo, int n) {
+        int i = 0;
+        if (FASTMATH) {
+            FloatVector one = FloatVector.broadcast(F, 1f);
+            for (int ub = F.loopBound(n); i < ub; i += FL) {
+                FloatVector x = FloatVector.fromArray(F, g, go + i);
+                FloatVector e = expFast(x.neg());
+                x.div(one.add(e)).mul(FloatVector.fromArray(F, u, uo + i)).intoArray(out, oo + i);
+            }
+        }
+        for (; i < n; i++) {
+            out[oo + i] = silu(g[go + i]) * u[uo + i];
+        }
+    }
+
     /** {@code x[i] *= s} for {@code i in [o, o + n)} (one multiply per element, lanes or tail alike). */
     static void scale(float[] x, int o, int n, float s) {
         FloatVector sv = FloatVector.broadcast(F, s);

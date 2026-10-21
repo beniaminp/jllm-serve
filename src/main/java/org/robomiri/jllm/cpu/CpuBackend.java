@@ -693,12 +693,14 @@ public final class CpuBackend implements Backend {
      * {@code Math.exp} stays scalar: the Vector API's EXP is not bit-identical to it.
      */
     private void siluMul(int n, int hdim) {
-        pool.forRange(n * hdim, 512, (i0, i1) -> {
+        // parallel over (token, 512-wide piece) so a single token still spreads over the threads
+        int pieces = (hdim + 511) / 512;
+        pool.forRange(n * pieces, 1, (i0, i1) -> {
             for (int i = i0; i < i1; i++) {
-                int t = i / hdim;
-                int j = i - t * hdim;
+                int t = i / pieces;
+                int j = (i - t * pieces) * 512;
                 int gi = t * 2 * hdim;
-                hidden[t * hdim + j] = VectorKernels.silu(gateUp[gi + j]) * gateUp[gi + hdim + j];
+                VectorKernels.siluMul(gateUp, gi + j, gateUp, gi + hdim + j, hidden, t * hdim + j, Math.min(512, hdim - j));
             }
         });
     }
