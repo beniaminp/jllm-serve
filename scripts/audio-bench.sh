@@ -30,6 +30,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
+OUT=$(mktemp -d)
 mvn -q -o test-compile
 CP="target/classes:target/test-classes"
 JAVA="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx8g"
@@ -45,13 +46,15 @@ for m in $STT; do
   $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" metal off "$REPS" 2>&1 | grep -v WARNING
   $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" metal on "$REPS" 2>&1 | grep -v WARNING
   if [ -n "$GGML" ] && command -v whisper-cli >/dev/null && [ -f "$GGML/ggml-$m.bin" ]; then
+    dur=$(python3 -c "import wave,sys; w=wave.open(sys.argv[1]); print(w.getnframes()/w.getframerate())" "$AUDIO")
     for mode in "" "-ng"; do
-      s=$(date +%s.%N)
-      whisper-cli -m "$GGML/ggml-$m.bin" -f "$AUDIO" -l auto $mode -nt > /tmp/whisper-cpp.out 2> /tmp/whisper-cpp.err || true
-      e=$(date +%s.%N)
-      dur=$(python3 -c "import wave,sys; w=wave.open(sys.argv[1]); print(w.getnframes()/w.getframerate())" "$AUDIO")
-      echo "  whisper.cpp ${mode:-(Metal)}${mode:+(CPU)}: $(echo "$e $s" | awk '{printf "%.2f", $1-$2}') s wall for $dur s of audio (includes loading the model);" \
-           "$(grep -o 'total time = *[0-9.]* ms' /tmp/whisper-cpp.err | tail -1)"
+      for rep in $(seq 1 "$REPS"); do   # whisper.cpp prints its own timings (model load is part of "total")
+        whisper-cli -m "$GGML/ggml-$m.bin" -f "$AUDIO" -l auto $mode -nt > "$OUT/cpp.out" 2> "$OUT/cpp.err" || true
+        t=$(grep -o 'total time = *[0-9.]* ms' "$OUT/cpp.err" | tail -1 | grep -o '[0-9.]* ms' | grep -o '[0-9.]*' || true)
+        l=$(grep -o 'load time = *[0-9.]* ms' "$OUT/cpp.err" | tail -1 | grep -o '[0-9.]* ms' | grep -o '[0-9.]*' || true)
+        echo "  whisper.cpp ${mode:-(GPU)}${mode:+(CPU)} run $rep: total ${t:-?} ms, of it loading ${l:-?} ms, for $dur s of audio: real-time factor" \
+             "$(echo "${t:-0} ${l:-0} $dur" | awk '{printf "%.3f", ($1-$2)/1000/$3}')"
+      done
     done
   fi
 done
