@@ -94,9 +94,6 @@ public interface Ops extends AutoCloseable {
     /** Concatenation along the channel dimension of two {@code [B, H, W, *]} tensors. */
     Tn concat(Tn a, Tn b);
 
-    /** Copy of {@code x [rows, C]} into a tensor with {@code newC ≥ C} channels, the rest zero. */
-    Tn padChannels(Tn x, int newC);
-
     @Override
     void close();
 }

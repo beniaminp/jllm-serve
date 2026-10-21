@@ -637,18 +637,4 @@ public final class CpuOps implements Ops {
         }
         return out;
     }
-
-    @Override
-    public Tn padChannels(Tn xt, int newC) {
-        T x = (T) xt;
-        int c = x.last();
-        int rows = x.rows();
-        int[] shape = x.shape.clone();
-        shape[shape.length - 1] = newC;
-        T out = (T) create(shape);
-        for (int r = 0; r < rows; r++) {
-            System.arraycopy(x.a, r * c, out.a, r * newC, c);
-        }
-        return out;
-    }
 }

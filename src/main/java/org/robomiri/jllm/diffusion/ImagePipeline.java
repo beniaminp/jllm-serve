@@ -172,7 +172,12 @@ public final class ImagePipeline implements AutoCloseable {
         validate(r);
         Ops ops = devices.main();
         boolean cfg = r.guidance() > 1.0 + 1e-9;
+        long t0 = System.nanoTime();
+        unetNs = 0;
+        vaeNs = 0;
         Embeds emb = embed(r.prompt(), r.negativePrompt(), cfg, r.width(), r.height(), r.clipSkip());
+        devices.main().sync();
+        textNs = System.nanoTime() - t0;
         List<Image> out = new ArrayList<>();
         try {
             for (int k = 0; k < n; k++) {
@@ -184,6 +189,7 @@ public final class ImagePipeline implements AutoCloseable {
         } finally {
             ops.free(emb.encoder());
         }
+        totalNs = System.nanoTime() - t0;
         return out;
     }
 
@@ -249,7 +255,18 @@ public final class ImagePipeline implements AutoCloseable {
                         : Imaging.resize(r.mask(), r.maskWidth(), r.maskHeight(), 1, w, h);
                 latentMask = Imaging.areaResize(pixelMask, w, h, lw, lh);
             }
-            initLatents = sampleLatents(vae.encode(px, 1, h, w), rng, lc, lh, lw);
+            // the random numbers are drawn in the order of diffusers' pipelines: the encoded image's sample (when its
+            // latents are needed), the noise, then the masked image's sample (inpainting)
+            boolean needImage = !inpaint || !nine || r.strength() < 1.0;
+            if (needImage) {
+                long e0 = System.nanoTime();
+                Vae.Posterior post0 = vae.encode(px, 1, h, w);
+                vaeNs += System.nanoTime() - e0;
+                initLatents = sampleLatents(post0, rng, lc, lh, lw);
+            }
+            int initSteps = Math.min((int) (r.steps() * r.strength()), r.steps());
+            start = Math.max(r.steps() - initSteps, 0);
+            noiseForBlend = toNhwc(rng.normal(lc * lp), lc, lh, lw);
             if (nine) {
                 float[] masked = px.clone();
                 if (inpaint) {
@@ -263,11 +280,13 @@ public final class ImagePipeline implements AutoCloseable {
                     latentMask = new float[lp];
                     java.util.Arrays.fill(latentMask, 1f);
                 }
-                maskedLatents = sampleLatents(vae.encode(masked, 1, h, w), rng, lc, lh, lw);
+                long e1 = System.nanoTime();
+                Vae.Posterior mp = vae.encode(masked, 1, h, w);
+                vaeNs += System.nanoTime() - e1;
+                maskedLatents = sampleLatents(mp, rng, lc, lh, lw);
+            } else if (inpaint) {
+                rng.normal(lc * lp); // the reference pipeline also samples the (unused) masked image here
             }
-            int initSteps = Math.min((int) (r.steps() * r.strength()), r.steps());
-            start = Math.max(r.steps() - initSteps, 0);
-            noiseForBlend = toNhwc(rng.normal(lc * lp), lc, lh, lw);
             if (initSteps == 0) {
                 return finish(initLatents, lh, lw, initImage, pixelMask, w, h);
             }
@@ -320,11 +339,13 @@ public final class ImagePipeline implements AutoCloseable {
             for (int b = 0; b < bs; b++) {
                 System.arraycopy(unetIn, 0, batch, b * unetIn.length, unetIn.length);
             }
+            long u0 = System.nanoTime();
             Tn sample = ops.upload(batch, bs, lh, lw, inC);
             Tn eps = unet.forward(sample, sched.timestep(i), new UNet.Cond(emb.encoder(), emb.pooled(), emb.timeIds()));
             ops.free(sample);
             float[] e = ops.download(eps);
             ops.free(eps);
+            unetNs += System.nanoTime() - u0;
             int oc = unet.outChannels;
             float[] guided = new float[lp * lc];
             int per = lp * oc;
@@ -384,6 +405,9 @@ public final class ImagePipeline implements AutoCloseable {
         return defaults.distilled() ? "trailing" : null;
     }
 
+    /** Time spent in the last {@link #generate} call: text encoders, UNet evaluations, VAE (encode and decode), everything. */
+    public volatile long textNs, unetNs, vaeNs, totalNs;
+
     /** Diagnostics of the last image: the final latents (NHWC) and the decoded pixels before clamping (-1..1). */
     public volatile float[] lastLatents;
     public volatile float[] lastPixels;
@@ -395,7 +419,9 @@ public final class ImagePipeline implements AutoCloseable {
         for (int i = 0; i < z.length; i++) {
             z[i] = x[i] * inv;
         }
+        long v0 = System.nanoTime();
         float[] px = vae.decode(z, 1, lh, lw);
+        vaeNs += System.nanoTime() - v0;
         lastPixels = px;
         Image img = Imaging.fromUnit(px, w, h);
         if (initImage != null && pixelMask != null) {

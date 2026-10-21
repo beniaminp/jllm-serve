@@ -114,8 +114,8 @@ struct GemmParams {
 };
 
 template <typename TS, typename TM>
-static inline void df_load16(device const TS *src, threadgroup TM *dst, int avail, bool vec) {
-    if (vec && avail >= 16) {
+static inline void df_load16(device const TS *src, threadgroup TM *dst, int avail, bool useVec) {
+    if (useVec && avail >= 16) {
         device const vec<TS, 4> *s4 = (device const vec<TS, 4> *)src;
         threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)dst;
         for (int i = 0; i < 4; i++) d4[i] = vec<TM, 4>(s4[i]);
@@ -163,7 +163,7 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
     device TC *cb = c + (long)zb * p.cSB + (long)zh * p.cSH;
     const ushort sr = sg & 1;
     const ushort sc = sg >> 1;
-    const bool vec = p.vec != 0;
+    const bool useVec = p.vec != 0;
 
     simdgroup_float8x8 acc[16];
     for (int i = 0; i < 16; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -176,18 +176,18 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
         {
             const int m = m0 + ar;
             threadgroup TM *dst = sa + ar * DF_BK + ak;
-            if (m < p.m) df_load16<TA, TM>(ab + (long)m * p.lda + k0 + ak, dst, p.k - k0 - ak, vec);
+            if (m < p.m) df_load16<TA, TM>(ab + (long)m * p.lda + k0 + ak, dst, p.k - k0 - ak, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         }
         if (BT) {
             const int n = n0 + ar;
             threadgroup TM *dst = sb + ar * DF_BK + ak;
-            if (n < p.n) df_load16<TB, TM>(bb + (long)n * p.ldb + k0 + ak, dst, p.k - k0 - ak, vec);
+            if (n < p.n) df_load16<TB, TM>(bb + (long)n * p.ldb + k0 + ak, dst, p.k - k0 - ak, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         } else {
             const int kr = k0 + bk;
             threadgroup TM *dst = sb + bk * DF_BN + bn;
-            if (kr < p.k) df_load16<TB, TM>(bb + (long)kr * p.ldb + n0 + bn, dst, p.n - n0 - bn, vec);
+            if (kr < p.k) df_load16<TB, TM>(bb + (long)kr * p.ldb + n0 + bn, dst, p.n - n0 - bn, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -341,7 +341,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
 DF_INST_GEMM("df_gemm_nt_f", float, float, float, float, true)
 DF_INST_GEMM("df_gemm_nt_h", half, half, half, half, true)
 // attention scores Q K^T (float scores out) and P V (float probabilities in, values T)
-DF_INST_GEMM("df_scores_f", float, float, float, float, true)
+// (in float32 the scores product is df_gemm_nt_f itself)
 DF_INST_GEMM("df_scores_h", half, half, float, half, true)
 DF_INST_GEMM("df_pv_f", float, float, float, float, false)
 DF_INST_GEMM("df_pv_h", float, half, half, half, false)

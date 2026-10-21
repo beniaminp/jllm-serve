@@ -183,7 +183,20 @@ public final class DiffusionCompare {
                 int b = cfg ? 2 : 1;
                 float[] uin = nchwToNhwc(floats(ref.resolve("unet_in.f32")), b, 4, lh, lw);
                 float[] wantOut = nchwToNhwc(floats(ref.resolve("unet_out.f32")), b, 4, lh, lw);
-                Tn x = ops.upload(uin, b, lh, lw, 4);
+                int inCh = 4;
+                if (Files.exists(ref.resolve("unet_extra.f32"))) { // an inpainting UNet: mask + masked-image latents follow
+                    float[] extra = nchwToNhwc(floats(ref.resolve("unet_extra.f32")), 1, 5, lh, lw);
+                    float[] full = new float[b * lh * lw * 9];
+                    for (int n = 0; n < b; n++) {
+                        for (int px = 0; px < lh * lw; px++) {
+                            System.arraycopy(uin, (n * lh * lw + px) * 4, full, (n * lh * lw + px) * 9, 4);
+                            System.arraycopy(extra, px * 5, full, (n * lh * lw + px) * 9 + 4, 5);
+                        }
+                    }
+                    uin = full;
+                    inCh = 9;
+                }
+                Tn x = ops.upload(uin, b, lh, lw, inCh);
                 float[] pooled = null;
                 float[] timeIds = null;
                 if (xl) {
@@ -224,8 +237,19 @@ public final class DiffusionCompare {
             if (Files.exists(ref.resolve("latents.f32"))) {
                 try (ImagePipeline pipe = new ImagePipeline(model, new Devices(dev.main(), dev.vae(), dev.description(), null))) {
                     long p0 = System.nanoTime();
+                    String mode = Json.str(meta, "mode", "txt2img");
+                    double strength = mode.equals("txt2img") ? 1.0 : Json.dbl(meta, "strength", 0.6);
+                    Imaging.Image init = null;
+                    float[] mask = null;
+                    if (!mode.equals("txt2img")) {
+                        init = Imaging.decode(Files.readAllBytes(ref.resolve("init.png")));
+                    }
+                    if (mode.equals("inpaint")) {
+                        int[] sz = new int[2];
+                        mask = Imaging.decodeMask(Files.readAllBytes(ref.resolve("mask.png")), sz);
+                    }
                     ImagePipeline.Request r = new ImagePipeline.Request(prompt, negative, w, h, steps, guidance, seed, scheduler,
-                            0, null, null, 0, 0, 1.0);
+                            0, init, mask, w, h, strength);
                     pipe.generate(r, 1, null);
                     System.out.printf("pipeline       %.2f s%n", (System.nanoTime() - p0) / 1e9);
                     report("latents", pipe.lastLatents, nchwToNhwc(floats(ref.resolve("latents.f32")), 1, 4, lh, lw));

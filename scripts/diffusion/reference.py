@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Reference outputs of Hugging Face diffusers for the diffusion stack of jllm, stage by stage, with the random numbers
-of jllm (org.robomiri.jllm.diffusion.Rng) so both sides see the same noise.
+of jllm (org.robomiri.jllm.diffusion.Rng) so both sides see the same noise: every randn_tensor call of diffusers (the
+initial noise, the posterior sample of the VAE encoder, the noise of the ancestral sampler) takes its numbers from the
+next numbers of one Rng stream, in the order the calls happen.
 
     python -I scripts/diffusion/reference.py MODEL_DIR OUT_DIR [options]
+        --mode txt2img|img2img|inpaint    (img2img / inpaint use a synthetic 64x64 test picture and mask, written to OUT_DIR)
 
 Writes raw little-endian float32 / int32 files and ref.json into OUT_DIR:
     ids.i32        token ids [2, 77]            (negative prompt, prompt) -- [1, 77] without guidance
     text.f32       text embeddings [B, 77, C]   (what the UNet is conditioned on; B = 2 with guidance)
     pooled.f32     pooled text embeddings (SDXL)
-    noise.f32      the initial noise [4, h, w] (NCHW) of Rng(seed)
+    noise.f32      the first numbers of Rng(seed), as the initial noise [4, h, w] (NCHW)
     unet_in.f32    one UNet input [B, 4, h, w] (scaled noise duplicated) ; unet_out.f32 its output [B, 4, h, w]
     latents.f32    final latents [4, h, w] ; image.f32 the decoded image [H, W, 3] (-1..1 range, not clamped)
     vae_z.f32 / vae_dec.f32  a fixed latent [4, h, w] and its decoding [H, W, 3]
     vae_img.f32 / vae_mean.f32 / vae_std.f32  a fixed image [H, W, 3] and its posterior [4, h, w]
+    init.png, mask.png (img2img / inpaint)
 """
 import argparse
 import json
@@ -76,6 +80,19 @@ def save(d, name, a):
     a.tofile(os.path.join(d, name))
 
 
+def test_picture(w, h):
+    """A synthetic photo-like picture: colour gradients, a disc and a stripe pattern (deterministic)."""
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    r = 0.5 + 0.5 * np.sin(x / w * 6.0)
+    g = 0.5 + 0.5 * np.cos(y / h * 5.0)
+    b = (x + y) / (w + h)
+    disc = ((x - w * 0.6) ** 2 + (y - h * 0.4) ** 2) < (min(w, h) * 0.22) ** 2
+    img = np.stack([r, g, b], -1)
+    img[disc] = [0.9, 0.2, 0.1]
+    img[(x.astype(int) // 4 + y.astype(int) // 4) % 2 == 0, :] *= 0.9
+    return (np.clip(img, 0, 1) * 255).round().astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('model')
@@ -93,6 +110,8 @@ def main():
     ap.add_argument('--dtype', default='float32')
     ap.add_argument('--skip-pipeline', action='store_true')
     ap.add_argument('--clip-skip', type=int, default=None)
+    ap.add_argument('--mode', default='txt2img')
+    ap.add_argument('--strength', type=float, default=0.6)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dtype = getattr(torch, a.dtype)
@@ -100,6 +119,11 @@ def main():
     from diffusers import (DiffusionPipeline, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                            DPMSolverMultistepScheduler)
     import diffusers.schedulers.scheduling_euler_ancestral_discrete as eam
+    import diffusers.models.autoencoders.vae as vaem
+    import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion as p_t2i
+    import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as p_i2i
+    import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint as p_inp
+    import diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl as p_xl
 
     pipe = DiffusionPipeline.from_pretrained(a.model, torch_dtype=dtype, variant=a.variant, safety_checker=None,
                                              requires_safety_checker=False)
@@ -118,7 +142,8 @@ def main():
     lh, lw = a.height // 8, a.width // 8
     cfg = a.guidance > 1.0
     meta = dict(prompt=a.prompt, negative=a.negative, width=a.width, height=a.height, steps=a.steps,
-                guidance=a.guidance, seed=a.seed, scheduler=a.scheduler, xl=xl, cfg=cfg)
+                guidance=a.guidance, seed=a.seed, scheduler=a.scheduler, xl=xl, cfg=cfg, mode=a.mode,
+                strength=a.strength)
 
     # tokens
     tok = pipe.tokenizer
@@ -126,7 +151,6 @@ def main():
         return tok(p, padding='max_length', max_length=tok.model_max_length, truncation=True, return_tensors='pt').input_ids[0].numpy()
     rows = [ids(a.negative), ids(a.prompt)] if cfg else [ids(a.prompt)]
     save(a.out, 'ids.i32', np.stack(rows))
-    # extra tokenizer cases
     cases = ['', 'A  Photo\tOF a Café — 日本語 😀 it\'s don\'t 123', 'x' * 400, '<|startoftext|>hello<|endoftext|> world!!']
     meta['tok_cases'] = [dict(text=c, ids=[int(v) for v in ids(c)]) for c in cases]
 
@@ -146,18 +170,20 @@ def main():
             emb = torch.cat([npe, pe]) if cfg else pe
     save(a.out, 'text.f32', emb.float().cpu().numpy())
 
-    # noise (the same stream jllm draws: [4, h, w] first)
-    rng = Rng(a.seed)
-    noise = rng.normal(4 * lh * lw).reshape(1, 4, lh, lw)
-    save(a.out, 'noise.f32', noise)
-
     # one UNet evaluation at the first timestep
+    noise = Rng(a.seed).normal(4 * lh * lw).reshape(1, 4, lh, lw)
+    save(a.out, 'noise.f32', noise)
     sched = pipe.scheduler
     sched.set_timesteps(a.steps, device=a.device)
     t0 = sched.timesteps[0]
+    unet_in_ch = pipe.unet.config.in_channels
     x = torch.from_numpy(noise).to(a.device, dtype) * sched.init_noise_sigma
     xin = sched.scale_model_input(x, t0)
     xin2 = torch.cat([xin, xin]) if cfg else xin
+    if unet_in_ch == 9:  # the extra channels of an inpainting UNet: a mask and the masked image's latents
+        extra = torch.from_numpy(Rng(5).normal(5 * lh * lw).reshape(1, 5, lh, lw)).to(a.device, dtype)
+        xin2 = torch.cat([xin2, extra.repeat(xin2.shape[0], 1, 1, 1)], dim=1)
+        save(a.out, 'unet_extra.f32', extra.float().cpu().numpy())
     with torch.no_grad():
         if xl:
             tid = torch.tensor([[a.height, a.width, 0, 0, a.height, a.width]], dtype=dtype, device=a.device)
@@ -167,7 +193,7 @@ def main():
         else:
             out = pipe.unet(xin2, t0, encoder_hidden_states=emb.to(dtype)).sample
     meta['t0'] = float(t0)
-    save(a.out, 'unet_in.f32', xin2.float().cpu().numpy())
+    save(a.out, 'unet_in.f32', xin2[:, :4].float().cpu().numpy())
     save(a.out, 'unet_out.f32', out.float().cpu().numpy())
 
     # VAE on fixed inputs
@@ -186,23 +212,37 @@ def main():
     save(a.out, 'vae_std.f32', post.std.float().cpu().numpy())
 
     if not a.skip_pipeline:
-        # the whole pipeline with our noise; ancestral noise comes from the stream after the initial noise
-        extra = []
-        if a.scheduler == 'euler_a':
-            for _ in range(a.steps):
-                extra.append(rng.normal(4 * lh * lw).reshape(1, 4, lh, lw))
-        it = iter(extra)
-        orig = eam.randn_tensor
-        eam.randn_tensor = lambda shape, generator=None, device=None, dtype=None, layout=None: \
-            torch.from_numpy(next(it)).to(device=device, dtype=dtype)
-        try:
-            kws = dict(prompt=a.prompt, negative_prompt=a.negative, num_inference_steps=a.steps, guidance_scale=a.guidance,
-                       height=a.height, width=a.width, latents=torch.from_numpy(noise).to(a.device, dtype), output_type='latent')
-            if a.clip_skip is not None:
-                kws['clip_skip'] = a.clip_skip
-            res = pipe(**kws).images
-        finally:
-            eam.randn_tensor = orig
+        rng = Rng(a.seed)
+
+        def fake_randn(shape, generator=None, device=None, dtype=None, layout=None):
+            n = int(np.prod(shape))
+            return torch.from_numpy(rng.normal(n).reshape(tuple(shape))).to(device=device, dtype=dtype)
+
+        for m in (eam, vaem, p_t2i, p_i2i, p_inp, p_xl):
+            if hasattr(m, 'randn_tensor'):
+                m.randn_tensor = fake_randn
+        common = dict(prompt=a.prompt, negative_prompt=a.negative, num_inference_steps=a.steps, guidance_scale=a.guidance,
+                      output_type='latent')
+        if a.clip_skip is not None:
+            common['clip_skip'] = a.clip_skip
+        from PIL import Image
+        if a.mode == 'txt2img':
+            res = pipe(height=a.height, width=a.width, **common).images
+        else:
+            init = test_picture(a.width, a.height)
+            Image.fromarray(init).save(os.path.join(a.out, 'init.png'))
+            if a.mode == 'img2img':
+                from diffusers import StableDiffusionImg2ImgPipeline
+                p2 = StableDiffusionImg2ImgPipeline(**pipe.components)
+                res = p2(image=Image.fromarray(init), strength=a.strength, **common).images
+            else:
+                from diffusers import StableDiffusionInpaintPipeline
+                mask = np.zeros((a.height, a.width), np.uint8)
+                mask[a.height // 4: 3 * a.height // 4, a.width // 4: 3 * a.width // 4] = 255
+                Image.fromarray(mask).save(os.path.join(a.out, 'mask.png'))
+                p2 = StableDiffusionInpaintPipeline(**pipe.components)
+                res = p2(image=Image.fromarray(init), mask_image=Image.fromarray(mask), height=a.height, width=a.width,
+                         strength=a.strength, **common).images
         lat = res.float().cpu().numpy()
         save(a.out, 'latents.f32', lat)
         with torch.no_grad():
