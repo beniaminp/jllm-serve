@@ -19,8 +19,10 @@ import java.util.List;
  * @param kvCache            save conversation KV caches to disk and restore them ({@code KvStore})
  * @param kvCacheDir         where the saved caches live
  * @param kvCacheMaxGb       disk budget; the least recently used caches are deleted beyond it
- * @param kvCacheMinTokens   shorter caches are not saved
- * @param kvCacheSaveAfterMs a request whose prefill took at least this long saves its slot's cache
+ * @param kvCacheMinTokens   shorter caches are not saved (default 512; also the least growth that saves a conversation
+ *                           again)
+ * @param kvCacheSaveAfterMs a request whose prefill took at least this long saves its slot's cache (default 2000: the
+ *                           save only holds the slot to copy the token list, the rows are written in the background)
  */
 @ConfigurationProperties("jllm.web")
 public record WebProperties(
@@ -33,8 +35,20 @@ public record WebProperties(
         @DefaultValue("true") boolean kvCache,
         @DefaultValue("kv-cache") String kvCacheDir,
         @DefaultValue("10") double kvCacheMaxGb,
-        @DefaultValue("1024") int kvCacheMinTokens,
-        @DefaultValue("10000") long kvCacheSaveAfterMs) {
+        @DefaultValue("512") int kvCacheMinTokens,
+        @DefaultValue("2000") long kvCacheSaveAfterMs) {
+
+    public WebProperties {
+        if (!(kvCacheMaxGb >= 0)) {
+            throw new IllegalArgumentException("jllm.web.kv-cache-max-gb must be 0 or more, got " + kvCacheMaxGb);
+        }
+        if (kvCacheMinTokens < 1) {
+            throw new IllegalArgumentException("jllm.web.kv-cache-min-tokens must be at least 1, got " + kvCacheMinTokens);
+        }
+        if (kvCacheSaveAfterMs < 0) {
+            throw new IllegalArgumentException("jllm.web.kv-cache-save-after-ms must be 0 or more, got " + kvCacheSaveAfterMs);
+        }
+    }
 
     public boolean apiKeyRequired() {
         return apiKey != null && !apiKey.isBlank();

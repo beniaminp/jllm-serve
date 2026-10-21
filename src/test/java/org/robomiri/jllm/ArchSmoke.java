@@ -168,7 +168,7 @@ public final class ArchSmoke {
             if (cfg instanceof Decoder d && d.anyMoe()) {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
             }
-            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
+            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
                 for (KvDtype dt : KvDtype.values()) {
                     failures += kvStateChecks(w, lib, cfg, dt);
                 }

@@ -101,6 +101,24 @@ final class MlaMetal {
         oLat = k.scratch((long) maxBatch * heads * kvl * 4);
     }
 
+    /** The latent cache of layer {@code l}: ctx rows of {@link #rowBytes} (saved caches read and write it directly). */
+    java.lang.foreign.MemorySegment cache(int l) {
+        return cache[l].contents();
+    }
+
+    /** Layout of the saved rows, the same as {@code MlaCpu.format} (IEEE half and little-endian f32 on both). */
+    String format() {
+        return (kvHalf ? "f16" : "f32") + " layers=" + cache.length + " width=" + m.latentDim();
+    }
+
+    long rowBytes() {
+        return (long) m.latentDim() * (kvHalf ? 2 : 4);
+    }
+
+    int layers() {
+        return cache.length;
+    }
+
     /** Reads {@code xb}, writes the attention output {@code [n, heads*v]} to {@code att} (o_proj is the caller's). */
     void run(int l, int n, int pos) {
         Bufs b = bufs[l];

@@ -75,6 +75,54 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
+     * Replaces the state of positions {@code [0, n)} with the first {@code n} positions of what {@link #saveState}
+     * wrote for {@code stored >= n} positions, and consumes all of it. Lets a saved conversation that shares only a
+     * prefix with a prompt be loaded without reading the rest. The default handles {@code n == stored} only.
+     */
+    default void loadState(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        if (n != stored) {
+            throw new UnsupportedOperationException(name() + " cannot load part of a saved cache");
+        }
+        loadState(n, in);
+    }
+
+    /**
+     * Whether {@link #saveStateWhileServing} works: the rows of positions {@code [0, n)} can be written out by another
+     * thread while this backend serves requests that leave them alone (they only write positions {@code >= n}).
+     */
+    default boolean canSaveWhileServing() {
+        return false;
+    }
+
+    /**
+     * {@link #saveState} from a thread other than the one using the backend. The caller guarantees that positions
+     * {@code [0, n)} are not written meanwhile; this method only reads them.
+     */
+    default void saveStateWhileServing(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        throw new UnsupportedOperationException(name() + " cannot save its cache while serving");
+    }
+
+    /** Skips {@code bytes} of a saved state: a seek when {@code in} is seekable (a file), else reads them. */
+    static void skipState(java.nio.channels.ReadableByteChannel in, long bytes) throws java.io.IOException {
+        if (bytes <= 0) {
+            return;
+        }
+        if (in instanceof java.nio.channels.SeekableByteChannel s) {
+            s.position(s.position() + bytes);
+            return;
+        }
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate((int) Math.min(bytes, 1 << 16));
+        while (bytes > 0) {
+            buf.clear().limit((int) Math.min(bytes, buf.capacity()));
+            int r = in.read(buf);
+            if (r < 0) {
+                throw new java.io.EOFException("the saved cache file is truncated");
+            }
+            bytes -= r;
+        }
+    }
+
+    /**
      * Replaces the state of positions {@code [0, n)} with that of {@code other}, a backend of the same model with the
      * same {@link #stateFormat}: copying a finished prefix costs a memory copy instead of a prefill. Both backends
      * must be idle (the engines hold their locks).
