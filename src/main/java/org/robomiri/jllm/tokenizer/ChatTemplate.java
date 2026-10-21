@@ -38,6 +38,15 @@ public final class ChatTemplate {
         /** The prompt as token ids (content tokenized with special tokens disabled). */
         int[] renderTokens(Tokenizer tok, List<Message> messages, boolean addGenerationPrompt, boolean enableThinking);
 
+        /**
+         * {@link #renderTokens(Tokenizer, List, boolean, boolean)} that reuses the ids of an earlier prompt this one
+         * extends; the ids are the same. {@code cache} may be null, and is ignored when it is for another tokenizer.
+         */
+        default int[] renderTokens(Tokenizer tok, List<Message> messages, boolean addGenerationPrompt,
+                                   boolean enableThinking, PromptCache cache) {
+            return renderTokens(tok, messages, addGenerationPrompt, enableThinking);
+        }
+
         /** Ids of the tokens that end an assistant turn (end-of-turn and end-of-text), those the vocabulary has. */
         int[] stopIds(Tokenizer tok);
 
@@ -493,6 +502,17 @@ public final class ChatTemplate {
                 }
             }
             return enc.toArray();
+        }
+
+        @Override
+        public int[] renderTokens(Tokenizer tok, List<Message> messages, boolean addGenerationPrompt,
+                                  boolean enableThinking, PromptCache cache) {
+            if (cache == null || cache.tokenizer() != tok) {
+                return renderTokens(tok, messages, addGenerationPrompt, enableThinking);
+            }
+            Out o = new Out();
+            script.build(messages, addGenerationPrompt, enableThinking, o);
+            return cache.encode(name, o.texts, o.control, protectedTokens);
         }
 
         @Override

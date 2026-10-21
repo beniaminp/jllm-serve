@@ -196,6 +196,8 @@ public final class Settings {
                 "engine.max-prompt-bytes"}) {
             require(getLong(k) >= 0, k, "must be 0 or positive");
         }
+        require(getLong("engine.prompt-cache-mb") >= 0 && getLong("engine.prompt-cache-mb") <= 1 << 20,
+                "engine.prompt-cache-mb", "must be 0 (off) .. 1048576");
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "backend.cpu.int8-activations", "chat.thinking", "raw"}) {

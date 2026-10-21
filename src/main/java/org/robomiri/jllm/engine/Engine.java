@@ -6,6 +6,7 @@ import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.sampling.TokenConstraint;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
+import org.robomiri.jllm.tokenizer.PromptCache;
 import org.robomiri.jllm.tokenizer.StreamDecoder;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 
@@ -132,6 +133,7 @@ public final class Engine implements AutoCloseable {
     private volatile int[] cached = new int[0]; // tokens currently in the KV cache
     private volatile int cachedLen;
     private final ChatTemplate.Format template;
+    private volatile PromptCache promptCache; // null = every prompt is tokenized in full
     private Speculator spec; // null = no speculative decoding
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
@@ -213,7 +215,23 @@ public final class Engine implements AutoCloseable {
 
     /** Renders a conversation to prompt ids with the family template (content cannot inject control tokens). */
     public int[] renderChat(java.util.List<ChatTemplate.Message> messages, boolean enableThinking) {
-        return template.renderTokens(tokenizer, messages, true, enableThinking);
+        return template.renderTokens(tokenizer, messages, true, enableThinking, promptCache);
+    }
+
+    /**
+     * Keeps the ids of recently rendered prompts, so that a conversation's next request tokenizes only what is new
+     * ({@code engine.prompt-cache-mb}); null turns it off. The ids are the same either way.
+     */
+    public void setPromptCache(PromptCache cache) {
+        if (cache != null && cache.tokenizer() != tokenizer) {
+            throw new IllegalArgumentException("the prompt cache is for another tokenizer");
+        }
+        this.promptCache = cache;
+    }
+
+    /** The prompt cache, or null. */
+    public PromptCache promptCache() {
+        return promptCache;
     }
 
     public Backend backend() {
