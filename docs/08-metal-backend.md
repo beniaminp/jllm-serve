@@ -1539,7 +1539,7 @@ IQ4_XS) address unit `u` as sub-block `u & 7` of super-block `u >> 3`, like Q4_K
 `embed_token`, and the matrix-unit and half-weight families (`mma`, `hmma`: matmul, matmul3, swiglu, MoE up and down)
 on the emulator against a float64 reference (`python3 scripts/metal-emu/kernel_tests.py q41 q3k ...` runs chosen formats
 only); `GgufMetalCheck` does the same on the GPU through `MetalKernels` on weights at an odd offset of a mapped file.
-Compile cost: the Metal source grows by about 190 instantiations; `newLibraryWithSource` goes from 1.5 s to 2.8 s the
+Compile cost: the Metal source grows by 9 x 27 = 243 kernel instantiations (from 310 to 553); `newLibraryWithSource` goes from 1.5 s to 2.8 s the
 first time a changed source is compiled (it is cached by the system afterwards, 0.1 s).
 
 The half-weight kernels round each dequantized weight to half. A weight of the non-linear formats is
