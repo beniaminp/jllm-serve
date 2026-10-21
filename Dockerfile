@@ -37,6 +37,18 @@ RUN --mount=type=cache,target=/root/.m2 \
     && cd jllm-web && mvn -q -B $(maven-proxy) package -DskipTests \
     && cp target/jllm-web.jar /jllm-web.jar
 
+# ---------------------------------------------------------------- native int8 CPU kernels (libjllm_cpu.so): C, so
+# compiled for each TARGET platform (a stage without --platform runs on the target platform: under emulation in a
+# cross-platform build, like the runtime stage's apt-get; it is a few seconds of gcc). On the runtime image's base, so
+# it links against the same C library. One binary covers all SIMD levels of its architecture (x86-64: AVX2 / AVX-VNNI
+# / AVX512-VNNI, arm64: NEON / dotprod). If it does not build, /out stays empty and the engine uses its Java kernels.
+FROM eclipse-temurin:26-jdk AS native
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY scripts/build-native-cpu.sh scripts/build-native-cpu.sh
+COPY src/main/native src/main/native
+RUN mkdir -p /out && CC=gcc OUT=/out/libjllm_cpu.so sh scripts/build-native-cpu.sh --optional
+
 # ---------------------------------------------------------------- runtime
 FROM eclipse-temurin:26-jdk
 # the JDK image (not the JRE) because the engine needs the jdk.incubator.vector module; curl for the health check
@@ -44,6 +56,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
     && useradd --create-home --uid 10001 jllm \
     && mkdir -p /data /opt/jllm && chown jllm:jllm /data
 COPY --from=build /jllm-web.jar /opt/jllm/jllm-web.jar
+# the native kernels, when they were built (entrypoint.sh passes their path; without them the Java kernels run)
+COPY --from=native /out/ /opt/jllm/native/
 COPY docker/entrypoint.sh /opt/jllm/entrypoint.sh
 USER jllm
 WORKDIR /data
