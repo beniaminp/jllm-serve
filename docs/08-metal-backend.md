@@ -1529,9 +1529,10 @@ Everything else is shared: `mm_row_gguf` (decode: lane `l` walks units `l, l + 3
 `GG_BLOCK_DOT` (the MoE kernels), `dequant_block` (the embedding lookup), `mma_core` / `hm_core` (matrix-unit prefill),
 so a format costs one branch of `gg_new` plus a row in `GG_INSTANTIATE`, `HM_INSTANTIATE` and `embed_token`. Block
 sizes of 22, 110, 18 and 17 bytes are not multiples of 4: those formats read their quants as `ushort`s (2-byte aligned) or
-byte by byte (MXFP4), as Q4_0 / Q8_0 already did; the 4-bit lookup tables (IQ4_NL, MXFP4: 16 `int8` each) are packed
-four to a `uint4` and indexed with a shift (`gg_tab`), which needs no constant memory. The 256-weight formats (Q3_K,
-IQ4_XS) address unit `u` as sub-block `u & 7` of super-block `u >> 3`, like Q4_K.
+byte by byte (MXFP4), as Q4_0 / Q8_0 already did; the 4-bit lookup tables (IQ4_NL, MXFP4: 16 values each) are
+program-scope `constexpr constant` arrays indexed per nibble (`gg_tab_iq4nl`, `gg_tab_mxfp4`; a first version packed the
+int8 values four to a `uint4` and extracted them with shifts, 15-20% slower on the decode matvec). The 256-weight
+formats (Q3_K, IQ4_XS) address unit `u` as sub-block `u & 7` of super-block `u >> 3`, like Q4_K.
 
 **What is compared and how.** `scripts/metal-emu/ggml_ref.py` holds numpy decoders of the new formats written from
 `ggml-quants.c` (and checked against it bit for bit by compiling that file and calling `dequantize_row_*` through
