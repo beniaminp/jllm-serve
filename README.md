@@ -304,7 +304,8 @@ Settings are validated strictly, before any weights are loaded: an unknown key, 
 number, a malformed boolean (booleans are `true|false|yes|no|on|off|1|0`; a stray `--think flase` is an error, not
 `false`) or an unknown `model.quant` / `backend.kv-dtype` / `backend` value stops the program with a message and
 exit status 2. `prompt`, `raw` and `config` are command line flags only and are rejected in a properties file.
-Notable keys besides the usual ones: `backend.kv-dtype` (`f32` or `f16`), `backend.cpu.int8-activations`
+Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, or `q8`: int8 with a scale per row of a
+kv head, about a quarter of the f32 cache), `backend.cpu.int8-activations`
 (default `true`; the CPU quantizes activations to int8 for integer dot products, several times faster decode but
 ~1 % different numerics; `false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
@@ -321,7 +322,7 @@ Short flags:
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
---backend.kv-dtype f32|f16   KV cache element type (no short alias)
+--backend.kv-dtype f32|f16|q8   KV cache element type (no short alias)
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)

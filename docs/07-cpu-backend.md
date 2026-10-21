@@ -95,7 +95,7 @@ once; a forward pass allocates nothing (important for the thread pool and for av
 
 The KV cache lives on the Java heap, which is why the launcher passes `-Xmx4g`. Weights are off-heap
 (`MemorySegment`) and do not count against it. With `backend.kv-dtype=f16` the cache is `short[]` and half the
-size ([7.13](#713-the-f16-kv-cache-kvcache)).
+size, with `q8` int8 plus a scale per row, a little over a quarter ([7.13](#713-the-f16-kv-cache-kvcache)).
 
 ---
 
@@ -241,7 +241,7 @@ is skipped and the tokens go one by one through the decode path ([7.14](#714-pre
 
 ## 7.5 Attention (`KvCache.attention`)
 
-The attention loop lives with the cache (`KvCache.F32` / `KvCache.F16`, [7.13](#713-the-f16-kv-cache-kvcache));
+The attention loop lives with the cache (`KvCache.F32` / `KvCache.F16` / `KvCache.Q8`, [7.13](#713-the-f16-kv-cache-kvcache));
 `CpuBackend` only passes the layer's window, scale and soft-cap. For one query head with `len = pos + t + 1`
 cached positions the math is:
 
@@ -615,8 +615,9 @@ In order of expected payoff on this CPU:
 
 ## 7.13 The f16 KV cache (`KvCache`)
 
-`backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation. The storage lives in `cpu/KvCache.java`
-with two implementations; `CpuBackend` only knows `kv.store(...)` and `kv.attention(...)`:
+`backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation, `q8` (below) nearly quarters it. The
+storage lives in `cpu/KvCache.java` with three implementations; `CpuBackend` only knows `kv.store(...)` and
+`kv.attention(...)`:
 
 | | `KvCache.F32` (default) | `KvCache.F16` |
 |---|---|---|
@@ -650,6 +651,82 @@ and a 623-token reading-comprehension prompt were identical to f32 on both backe
 
 **Measured** (M1 Pro, 10 threads, Qwen3-0.6B Q4_0, ctx 4096, machine shared with other jobs so absolute
 numbers are below [7.9](#79-measured-numbers-and-the-bottleneck)): see [11 §11.3](11-performance.md#113-memory-footprint).
+
+### q8: int8 values and a scale per row (`KvCache.Q8`)
+
+`backend.kv-dtype=q8` goes one step further and stores every value as one signed byte. **The simple picture:** take
+the `headDim` numbers that one kv head produced for one position (a *row*), find the largest magnitude, and map
+`[-max, +max]` evenly onto the integers `-127 … 127`; keep the integers and the one float that undoes the mapping. A
+value then comes back as `integer × scale`, a little off, but never by more than half a step.
+
+**The math.** For a row `x[0 .. headDim)`:
+
+```
+scale = max_i |x_i| / 127                    (0 for an all-zero row)
+q_i   = rint(x_i / scale)  ∈ [-127, 127]     (KvDtype.q8: round half to even, clamped)
+x̂_i   = q_i · scale
+```
+
+Because `|x_i / scale| ≤ 127`, rounding to the nearest integer is the only error, so
+
+```
+|x_i - x̂_i| ≤ scale / 2 = max_i |x_i| / 254          (0.39 % of the row's largest value)
+```
+
+The error is relative to the *row's* maximum, not to the value itself as with f16 (2⁻¹¹ ≈ 0.05 % of each value):
+small values in a row with one large outlier lose the most. Symmetric quantization needs no zero point, so a dot
+product with a row factors as `q · x̂ = scale · (q · x_int)` and a softmax weight times a value row as
+`(p · scale) · v_int`. Memory per token, `L` layers, both K and V, one 4-byte scale per `headDim` values:
+
+```
+bytes per token = 2 · L · kvDim · (1 + 4 / headDim)
+Qwen3-0.6B (L = 28, kvDim = 1024, headDim = 128):  2 · 28 · 1024 · 1.03125 = 59 136 B ≈ 59 KB
+                                                   f16: 2 · 28 · 1024 · 2 = 114 688 B ≈ 115 KB;  f32: 229 KB
+at --ctx 4096:                                     242 MB (q8)  vs  470 MB (f16)  vs  940 MB (f32)
+```
+
+**Layout.** K keeps the transposed 32-key chunks of `F32`, as bytes (`byte[layers][kvHeads · chunks · hd · 32]`), with
+the scales of a chunk's 32 keys next to each other (`float[layers][kvHeads · chunks · 32]`); V rows are bytes
+`[ctx][kvDim]` with scales `[ctx][kvHeads]`. `store` quantizes each (position, kv head) row of the f32 staging rows
+(k after QK-norm and RoPE, as for f16), so a value is rounded exactly once.
+
+**The attention loop.** The tiled kernel is unchanged; like `F16`, `Q8` expands a block of K chunks (then V rows) into
+f32 scratch once per tile. The widening is vector code: a 16-byte `ByteVector` load, `castShape` to the float species
+(`B2F`, lanes 0 … FL−1), multiplied by the scales. In a K chunk each lane is a different key, so the multiplier is a
+*vector* of their 32 scales (loaded once per FL keys, reused for all `headDim` elements); in a V row it is one
+broadcast scale. The expanded block holds exactly `q_i · scale` (the scalar fallback and save/load compute the same
+float product), so prefill and decode stay bit-identical and `SmokeTest.kvCacheAttention` checks q8 against a
+double-precision reference on the dequantized rows, as for f32 and f16.
+
+**Saved caches** (`kv q8 layers=… kvDim=… headDim=…`): per position the K row as `kvDim` int8 values followed by
+`kvHeads` f32 scales, then the V row the same way — the stored integers and scales themselves, so a cache saved and
+loaded is bit-identical, and the layout is the Metal backend's row layout ([08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)),
+so a file saved by one backend loads into the other (`ArchSmoke.kvStateChecks`).
+
+**DeepSeek** (`MlaCpu`): the latent row `[c | k_pe]` (576 values) gets one scale for the whole row: 0.6 KB instead of
+1.2 KB (f16) per layer and token. `c` (RMS-normalized) and `k_pe` can differ in magnitude, and one shared scale costs
+the smaller part precision: on the tiny random DeepSeek of `ArchSmoke` separate scales for the two parts halved the
+logit drift. As the latent cache is already small, f16 is the safer choice for DeepSeek.
+
+**Measured** on Qwen3-0.6B Q4_0, CPU backend (4-core VM shared with other jobs, int8 activations, 4 threads; the
+speeds are indicative):
+
+| | f32 | f16 | q8 |
+|---|---|---|---|
+| cache per token (28 layers) | 229 KB | 115 KB | **59 KB** |
+| 300-token greedy answer (chat prompt, ctx 1024) vs f16 | 82 / 300 tokens equal, first difference at token 76 | — | 8 / 300 equal, first difference at token 1 (a near-tie: "A steam engine" vs "A **steam engine**"; the text stays fluent and on topic) |
+| the f16 answer teacher-forced, max \|logit − logit_f16\| over the 300 steps (max \|logit\| 35.6) | 0.82 (mean of the per-step maxima 0.40), argmax equal 292 / 300 | — | 4.41 (mean 1.43), argmax equal 282 / 300 |
+| prefill of a 2 000-token prompt, tok/s (two runs) | 17 / 38 | 25 / 38 | 32 / 40 |
+| decode after it (64 tokens), tok/s (two runs) | 2.7 / 5.1 | 2.8 / 4.5 | 3.9 / 3.8 |
+
+The speeds were taken with a load average of 15–20 on the 4 cores (other jobs), so they only say that q8 is not
+slower to a degree that shows through that noise (the first runs include the JIT warming up). The accuracy numbers
+are deterministic. q8 is clearly
+less exact than f16: Qwen3's K rows have outlier channels (after QK-norm a row's largest value is on average 7.3×
+its RMS, at worst 11×; V rows 3.6×), so the step `max / 127` is coarse for the typical entries — the RMS rounding
+error is 1.6 % of a K row's RMS and 0.8 % of a V row's, against ~0.02 % for f16. Greedy text diverges early (as it
+does for any change at a near-tie; f32 vs f16 diverges at token 76) but remains coherent. Use q8 when the cache
+size is what limits the context or the number of slots, f16 otherwise.
 
 ---
 
