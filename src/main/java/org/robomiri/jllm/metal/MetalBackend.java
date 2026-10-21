@@ -338,8 +338,8 @@ public final class MetalBackend implements Backend {
 
     /** Metal's recommendedMaxWorkingSetSize, or {@code -Djllm.metal.workingSetGb} (to leave memory to other programs). */
     private long workingSet() {
-        String gb = System.getProperty("jllm.metal.workingSetGb");
-        return gb != null ? (long) (Double.parseDouble(gb) * 1e9) : k.metal.recommendedWorkingSet();
+        double gb = ExpertPlacement.positiveProperty("jllm.metal.workingSetGb", -1);
+        return gb > 0 ? (long) (gb * 1e9) : k.metal.recommendedWorkingSet();
     }
 
     private static long bytes(QTensor t) {
@@ -393,7 +393,7 @@ public final class MetalBackend implements Backend {
                 topK[l] = m.topK();
             }
         }
-        modelKey = arch + " | " + w.byteSize() + " bytes";
+        modelKey = modelKey();
         statsFile = ExpertPlacement.statsFile(modelKey);
         String config = split.config();
         // planning and packing (seconds, gigabytes) hold only this model's lock, not the other models' loads
@@ -415,6 +415,10 @@ public final class MetalBackend implements Backend {
                         PLACEMENTS.put(w, placement);
                         placementShared = true;
                     }
+                }
+                if (!placementShared && placement.cold != null) {
+                    System.err.println("note: this backend's backend.metal.cpu-moe differs from the other backends on the "
+                            + "same weights, so it keeps its own expert placement (and copies, and CPU threads)");
                 }
             }
         }
@@ -547,8 +551,23 @@ public final class MetalBackend implements Backend {
         return b;
     }
 
+    /**
+     * Names the model for its usage statistics: the architecture, the size, and a hash of the first MoE layer's router
+     * weights, so two fine-tunes of one base model (same shapes and size) keep their own statistics.
+     */
+    private String modelKey() {
+        int router = 0;
+        for (int l = 0; l < c.layers(); l++) {
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe) {
+                router = java.util.Arrays.hashCode(w.decoderLayer(l).moe().router());
+                break;
+            }
+        }
+        return arch + " | " + w.byteSize() + " bytes | router " + Integer.toHexString(router);
+    }
+
     /** Adds the expert picks counted since the last save to the statistics file and resets the counters. */
-    private void saveExpertStats() {
+    private void saveExpertStats(boolean background) {
         if (counts == null) {
             return;
         }
@@ -571,7 +590,13 @@ public final class MetalBackend implements Backend {
             }
         }
         if (any) {
-            ExpertPlacement.add(statsFile, modelKey, delta);
+            // the counters are read and reset here (the GPU is idle); the file, with its cross-process lock, is
+            // written off the decode thread except at close
+            if (background) {
+                ExpertPlacement.addLater(statsFile, modelKey, delta);
+            } else {
+                ExpertPlacement.add(statsFile, modelKey, delta);
+            }
         }
         lastStatsSave = System.nanoTime();
     }
@@ -1156,7 +1181,7 @@ public final class MetalBackend implements Backend {
             }
         }
         if (counts != null && System.nanoTime() - lastStatsSave > STATS_SAVE_NANOS) {
-            saveExpertStats(); // a long-running server keeps its statistics current, not only at shutdown
+            saveExpertStats(true); // a long-running server keeps its statistics current, not only at shutdown
         }
         if (logits != null && stride > 0) {
             int rows = Math.min(w.lmHead.rows, stride);
@@ -1305,7 +1330,7 @@ public final class MetalBackend implements Backend {
             }
         }
         try {
-            saveExpertStats();
+            saveExpertStats(false);
         } catch (RuntimeException e) {
             System.err.println("warning: expert statistics not saved: " + e);
         }

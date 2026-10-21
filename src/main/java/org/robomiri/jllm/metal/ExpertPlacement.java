@@ -36,12 +36,51 @@ import java.util.List;
 final class ExpertPlacement {
 
     /** Estimated cost of one GPU → CPU → GPU round trip, microseconds ({@code -Djllm.metal.cpuMoeSyncUs} to tune). */
-    static final double SYNC_US = Double.parseDouble(System.getProperty("jllm.metal.cpuMoeSyncUs", "100"));
+    static final double SYNC_US = nonNegativeProperty("jllm.metal.cpuMoeSyncUs", 100);
     /** Estimated CPU memory bandwidth, bytes per microsecond (60 GB/s). */
     static final double CPU_BYTES_PER_US = 60e3;
     static final long MAX_COUNT = 1L << 30;
 
     private static final Object FILE_LOCK = new Object();
+
+    /** One daemon thread for the periodic saves, so the decode thread never waits for the file or its lock. */
+    private static final java.util.concurrent.ExecutorService SAVER = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "jllm-expert-stats");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** A numeric system property, or {@code def} (with a warning) when it is missing, malformed or not positive. */
+    static double positiveProperty(String name, double def) {
+        double v = numberProperty(name, def);
+        if (v != def && !(v > 0)) {
+            System.err.println("warning: -D" + name + " must be positive; ignored");
+            return def;
+        }
+        return v;
+    }
+
+    private static double nonNegativeProperty(String name, double def) {
+        double v = numberProperty(name, def);
+        if (!(v >= 0)) {
+            System.err.println("warning: -D" + name + " must not be negative; using " + def);
+            return def;
+        }
+        return v;
+    }
+
+    private static double numberProperty(String name, double def) {
+        String s = System.getProperty(name);
+        if (s == null) {
+            return def;
+        }
+        try {
+            return Double.parseDouble(s.trim());
+        } catch (NumberFormatException e) {
+            System.err.println("warning: -D" + name + "=" + s + " is not a number; using " + def);
+            return def;
+        }
+    }
 
     private ExpertPlacement() {
     }
@@ -211,6 +250,11 @@ final class ExpertPlacement {
                 return null;
             }
         }
+    }
+
+    /** {@link #add} on the background saver thread. */
+    static void addLater(Path file, String modelKey, long[][] delta) {
+        SAVER.execute(() -> add(file, modelKey, delta));
     }
 
     /** Adds {@code delta} to the saved counts (halving a layer's that pass MAX_COUNT) and writes the file atomically. */

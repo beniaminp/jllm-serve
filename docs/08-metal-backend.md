@@ -920,7 +920,8 @@ CPU reads them like any file data.
 **How much must move.** The working set is the device's, so the budget covers everything on it: with `W` this
 model's weights, `B` one backend's buffers (KV cache, activations), `s` the number of backends that will run on
 these weights (a server's slots: `jllm-web` passes it at load; the later slots reuse the first one's placement), `O`
-what the other open backends hold (another model, a draft model), and `b_l` the bytes of one expert of layer `l`,
+what the other open attention-model Metal backends hold (another model, a draft model; a loaded Mamba model is not
+counted), and `b_l` the bytes of one expert of layer `l`,
 leaving the set `C` of (layer, expert) pairs on the CPU keeps
 
 ```
@@ -963,10 +964,12 @@ Metal: 2.3 GB of experts run on the CPU (10 threads): 0 of 48 MoE layers entirel
 layer, `moe_remap` (which runs after the router anyway) counts them, one thread per expert over the step's slots,
 so the counts are exact and need no atomics. A layer entirely on the CPU is counted by the CPU from the router's
 choices it reads anyway. A layer entirely on the GPU gets a `moe_remap` dispatch on one forward pass in 8
-(`-Djllm.metal.expertCountEvery`), because a dispatch per layer per token would cost more than it tells, and the
-planner only compares experts within a layer, so a sample is enough. The backend adds the counts to
-`~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, headed by the model's description, halved
-once a layer passes 2³⁰ picks) every ten minutes and when it closes. A lock file orders processes that save at
+(`-Djllm.metal.expertCountEvery`), because a dispatch per layer per token would cost more than it tells. A sample
+is enough because the planner turns each layer's counts into shares of that layer's picks (`p(l,e)` sums to `topK`
+in every layer), so how many passes a layer was counted on does not matter. The backend adds the counts to
+`~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, headed by the model's description, size and a
+hash of its first router, so fine-tunes of one base model keep separate files; halved once a layer passes 2³⁰
+picks) every ten minutes, from a background thread, and when it closes. A lock file orders processes that save at
 the same time; a damaged line loses only that layer's history. The first run of a model that does not fit therefore
 moves whole layers; later runs place the experts from how you actually use it (code, chat, another language),
 improving as the counts grow. `-Djllm.metal.hotExperts=false` ignores the statistics.
