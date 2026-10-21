@@ -46,7 +46,8 @@ import java.util.Set;
  *       That reference has the engine's weights exactly, so only float rounding of the activations remains: this
  *       separates quantization noise (first comparison) from a wrong computation (this one).</li>
  * </ul>
- * Prints a table and writes {@code <ref-dir>/result-<quant>.json}. Run with {@code -Djllm.cpu.fastmath=false}; the
+ * Prints a table and writes {@code <ref-dir>/result-<quant>.json}; {@code -Dreal.prompts=raw_text,raw_code} runs only
+ * those prompts (and adds them to the file name), to split a slow model over several runs. Run with {@code -Djllm.cpu.fastmath=false}; the
  * int8-activation kernels are off, so the matmuls see float activations.
  */
 public final class RealWeightsCheck {
@@ -55,6 +56,8 @@ public final class RealWeightsCheck {
         Path dir = Path.of(args[0]);
         Path refDir = Path.of(args[1]);
         QType quant = QType.parse(args.length > 2 ? args[2] : "q8");
+        String sel = System.getProperty("real.prompts");
+        List<String> only = sel == null || sel.isBlank() ? null : List.of(sel.split(","));
         Map<String, Object> ref = Json.parseObject(Files.readString(refDir.resolve("ref.json")));
         Architecture arch = Architecture.load(dir);
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
@@ -91,6 +94,9 @@ public final class RealWeightsCheck {
             for (Object o : Json.list(ref, "prompts")) {
                 long t0 = System.nanoTime();
                 String name = Json.str(o, "name", "?");
+                if (only != null && !only.contains(name)) {
+                    continue;
+                }
                 String kind = Json.str(o, "kind", "?");
                 if (Json.str(o, "error", null) != null) {
                     System.out.printf("%-12s reference template refused it: %s%n", name, Json.str(o, "error", ""));
@@ -232,7 +238,8 @@ public final class RealWeightsCheck {
         out.put("probes_match", probeOk);
         out.put("probes", probes.size());
         out.put("prompts", results);
-        Files.writeString(refDir.resolve("result-" + quant.name().toLowerCase() + ".json"), Json.write(out));
+        String suffix = only == null ? "" : "-" + String.join("+", only);
+        Files.writeString(refDir.resolve("result-" + quant.name().toLowerCase() + suffix + ".json"), Json.write(out));
     }
 
     /**
