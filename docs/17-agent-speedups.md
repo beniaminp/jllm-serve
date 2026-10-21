@@ -3,15 +3,18 @@
 A coding agent (opencode, Continue, aider, Cline) is a very particular customer. Its first request carries ~10 000
 tokens of instructions and tool definitions; every later request repeats all of them plus the growing conversation;
 it runs side requests (titles, summaries) next to the main one; and much of what it writes back is text that is
-already in its context — lines of a file it read, the shape of earlier tool calls. This chapter covers the four
-things jllm-serve does about that, each explained simply first and then exactly:
+already in its context — lines of a file it read, the shape of earlier tool calls. It also gives up often: a user
+presses Escape, a step times out and is retried. This chapter covers what jllm-serve does about that, each explained
+simply first and then exactly:
 
 | | what | where |
 |---|---|---|
 | [17.1](#171-prompt-lookup-tuned-for-agents) | guess the next tokens from the context and check them all at once | `engine/Speculator`, `engine/NgramIndex` |
 | [17.2](#172-slots-that-share-a-prefix) | several conversations share an expensive prefix by copying it, not recomputing it | `web/models/LoadedModel`, `Engine.adoptPrefix`, `Backend.copyStateFrom` |
-| [17.3](#173-saved-conversations) | conversations survive restarts on disk | `web/models/KvStore`, `engine/CacheFile`, `Backend.saveState` |
+| [17.3](#173-saved-conversations) | conversations survive restarts on disk, saved in the background, restored in part | `web/models/KvStore`, `engine/CacheFile`, `Engine.beginSave`, `Backend.saveState` |
 | [17.4](#174-pipelined-decoding-on-the-gpu) | the GPU runs the next step before the CPU has looked at the last one | `Backend.GreedyPipe`, `MetalBackend.Pipe` |
+| [17.5](#175-tokenizing-only-what-is-new) | a resent conversation is tokenized only from where it is new | `tokenizer/PromptCache`, `Tokenizer.SequenceEncoder` |
+| [17.6](#176-noticing-a-client-that-left) | a request nobody waits for stops within one prefill chunk or one token | `web/chat/ClientGone` |
 
 ---
 
@@ -104,22 +107,87 @@ morning, when a child asks about that book again, she takes the notes out instea
 ```
 
 The **fingerprint** names the model and every load setting that changes its keys and values (source, quantization,
-backend, cache type, int8 activations — not context size, batch or threads); the **state format** names the layout
-(`kv f16 layers=28 kvDim=1024 headDim=128`). A file is loaded only under the same fingerprint and format. Both the CPU
-and the Metal backend write the same rows (per layer, per position, the K row then the V row, little-endian f32 or IEEE
-half — Metal's `half` has the same bits), so the layout is shared between backends (ArchSmoke loads a CPU-written cache
-into the Metal backend). `jllm-web`'s `KvStore`:
+backend, cache type, int8 activations — not context size, batch or threads); the **state format** names the layout.
+A file is loaded only under the same fingerprint and format. Both the CPU and the Metal backend write the same rows,
+little-endian f32 or IEEE half (Metal's `half` has the same bits), so the layout is shared between backends:
 
-- **saves** a slot after a request whose prefill took ≥ 10 s, before a restore overwrites it, and on unload/shutdown,
-  when it holds ≥ 1 024 tokens; a cache extending a saved one replaces it, one already covered is not written;
+| attention | state format | per layer, per position | bytes per token |
+|---|---|---|---|
+| standard (GQA / MHA) | `kv f16 layers=28 kvDim=1024 headDim=128` | the K row, then the V row | `2 × layers × kvDim × b` |
+| DeepSeek latent (MLA) | `mla f16 layers=27 width=576` | the latent row `[c, k_pe]` (latent, rotary key) | `layers × (kv_lora_rank + rope) × b` |
+
+(`b` = 2 for f16, 4 for f32.) The MLA row is exactly what the backends cache (`MlaCpu`, `MlaMetal`, see
+[12](12-mixture-of-experts.md)): 62 kB per token for DeepSeek-V2-Lite in f32 (31 kB in f16) instead of the 553 kB of expanded keys
+and values, so a saved DeepSeek conversation is small. Saved MLA caches, prefix copies between slots (17.2) and
+partial loads work like the standard ones; `KvStateTest` checks on tiny standard and MLA checkpoints, f32 and f16,
+that a saved + loaded or copied state continues with bit-identical logits, that a partial load holds the first rows
+bit for bit, and (with `--metal`) that a CPU-written file loads into the Metal backend.
+
+`jllm-web`'s `KvStore`:
+
+- **saves** a slot after a request whose prefill took ≥ `jllm.web.kv-cache-save-after-ms` (2 000), before a restore
+  overwrites it, and on unload/shutdown, when it holds ≥ `jllm.web.kv-cache-min-tokens` (512) tokens; a cache extending
+  a saved one replaces it, one already covered is not written, and after a request a cache that a saved file covers
+  up to `c` tokens is saved again only once it holds `≥ max(min-tokens, c / 4)` new ones;
 - **restores** before a request the saved cache with the longest common prefix with the prompt, if that beats what the
-  slot holds by ≥ 256 tokens;
+  slot holds by ≥ 256 tokens, loading only that prefix;
 - keeps the files under `jllm.web.kv-cache-max-gb` (10), deleting the least recently used.
+
+### Saving in the background
+
+🧸 The teacher no longer copies her notes into the drawer while the class waits. She writes on a sticky note "pages 1
+to 40 are being copied, don't erase them" and goes on teaching: as long as the lesson only adds pages, nobody waits.
+Only if she has to erase one of those pages does she wait for the copy to finish.
+
+📐 A save used to hold the engine for the whole write (a GB at disk speed). Now `Engine.beginSave(file, fingerprint)`
+holds the engine only to copy the cached token ids, sets a **pin** `[0, n)` and returns a `PendingSave` whose
+`write()` (a virtual thread of `KvStore`) writes the header and the rows with `Backend.saveStateWhileServing` and then
+drops the pin. Meanwhile requests run; the engine checks the pin where a request starts overwriting the cache:
+
+```
+reuse = common prefix of the cached ids and the prompt       (17.2, 10.2)
+if pin > reuse: wait until the save has written its rows     (only then are rows < pin rewritten)
+```
+
+The next turn of an agent's conversation extends the cached tokens (`reuse ≥ n`) and never waits; a request that
+diverges inside the saved part, a restore and a prefix copy into that slot wait (as every request waited before).
+The rows of `[0, n)` are not written while pinned, so the file holds exactly the state of the moment the save began,
+whatever ran in between (`KvStateTest` serves a request between `beginSave` and `write` and compares the file with
+the rows taken before). Reading rows `< n` while a request writes rows `≥ n` is safe on both backends: the CPU cache
+is Java arrays (a writer of an f16 pair rewrites the other half with the value it holds, a reader only reads), the
+Metal cache is shared memory the GPU writes elsewhere; `saveStateWhileServing` touches neither the command queue nor
+the greedy pipe. One save per engine at a time; `Engine.close` waits for a running one.
+
+Because a save now costs the next request nothing, the thresholds were lowered: 2 s of prefill (10 s before) and 512
+tokens (1 024): a 2 s prefill is ~250 tokens of Qwen3-0.6B on a 4-core CPU (2 707 tokens took 21 s, below);
+anything that took that long is worth a file. The growth rule keeps a long conversation from being rewritten every
+turn: with 20 000 tokens saved, the next file is written at 25 000.
+
+### Restoring part of a file
+
+🧸 If today's lesson starts like yesterday's but changes after page 30, she takes only the first 30 pages of
+yesterday's notes out of the drawer.
+
+📐 The best file is the one whose token list shares the longest prefix with the prompt. `KvStore` keeps each model's
+lists in a `TreeMap` ordered lexicographically: for any sorted list `s_1 < ... < s_m` and a query `q` inserted between
+`s_i` and `s_{i+1}`, the common prefix `lcp(q, s_j)` only shrinks as `j` moves away from the insertion point (two lists
+that both agree with `q` on `k` tokens bracket everything in between, which then agrees on `k` too), so the best match is
+`floor(q)` or `higher(q)`: two comparisons instead of one per file (`KvStoreTest` checks it against a linear scan).
+
+It then loads only the shared prefix `p = min(lcp, prompt − 1)`: `Engine.loadCache(file, fp, p)` calls
+`Backend.loadState(p, stored, channel)`, which reads `p` rows per layer and skips the other `stored − p` (a seek on a
+file, since the rows are stored layer by layer). Rows beyond `p` would be overwritten by the prefill anyway; now they
+are not read, and a file longer than the context can still serve a prompt that shares less than the context with it.
 
 Size: `n × 2 × layers × kvDim × bytes` — 115 kB per token for Qwen3-0.6B f16, ~1.2 GB for opencode's 10k-token prompt.
 **Measured:** a 2 707-token prompt prefilled in 21.3 s; after a restart the cache was restored in 0.9 s and the same
 prompt was served with 2 706 tokens cached. On the Metal backend the file is read straight into the cache buffers
 (unified memory: they are the GPU's memory), with no intermediate copy.
+
+**Measured** (Qwen3-0.6B Q4_0, f16 cache, CPU, a 2 003-token conversation = 230 MB, on a 4-core machine shared with
+other jobs): a blocking save held the engine 3.1 s; `beginSave` held it 0.3 ms, the rows were written in 7.3 s while
+the next turn (20 new tokens, 2 003 reused) ran in 4.6 s and finished first; both files were byte-identical.
+Restoring all 2 003 positions took 1.1 s, the first 500 (a prompt sharing a quarter) 0.22 s.
 
 ---
 
@@ -159,3 +227,90 @@ simply runs unpipelined.
 FFM — is on the order of a millisecond, out of ~9 ms per token for Qwen3-0.6B on an M1 Pro ([08 §8.7](08-metal-backend.md));
 hiding it is worth roughly 10 %, more for small models and fast GPUs. Not measured on Apple hardware yet: run `bench`
 with `-Djllm.metal.pipeline=false` and without to see it on yours.
+
+---
+
+## 17.5 Tokenizing only what is new
+
+🧸 Every time the agent asks something, it hands over the whole notebook again, with one new page at the end. Reading
+the notebook from the first page each time is silly: the teacher remembers where she stopped reading last time,
+checks that the pages before it are the same ones, and reads only the new page.
+
+📐 Every request re-renders the chat template over the whole conversation and turns ~100 000 characters into ids:
+BPE on a CPU, tens of milliseconds per request, all of it work done the turn before. `PromptCache` (one per model,
+`engine.prompt-cache-mb`, 64 MB, 0 = off) keeps the ids of recently rendered prompts and gives exactly the ids of a
+full render.
+
+**Where encoding can be resumed.** The template renders a prompt as a list of *pieces*: control strings (`<|im_start|>user\n`)
+and message texts. The pieces are not tokenized one by one: the `SequenceEncoder` joins the ordinary text between two
+added tokens into one run, so that pre-tokenization and BPE merges see the text as one string (a word split between a
+control string and a message would otherwise tokenize differently). The places where the encoding of the rest does not
+depend on the past are right **after an added token**: the run before it has been flushed, nothing is pending, and
+what follows starts a new run. The encoder reports these *boundaries* `(offset in the piece, ids so far)`, except
+after a token that swallows the whitespace after it (`rstrip`, Phi's `<|end|>`): its effect reaches into the next
+piece. An `lstrip` token only trims the run before it, which starts after the boundary, so it is no exception.
+
+**The key.** For a piece boundary `k` (after pieces `0..k−1`), the cache stores under a hash of those pieces the last
+encoder boundary inside them:
+
+```
+key_k = H(scope, kind_0, len_0, text_0, ..., kind_{k−1}, len_{k−1}, text_{k−1})    two 64-bit multiply-rotate lanes
+value = (entry, piece j < k, offset e in piece j, t = ids before it)
+```
+
+The scope is the template family and its protected tokens; a different tokenizer is a different cache. Hashing all of
+pieces `0..k−1` is enough although the scan inside a piece looks ahead for the longest added token: a boundary inside
+piece `j < k` was found by a scan that never left piece `j`, and piece `j` is hashed whole. Two different prompts
+collide with probability about `2⁻¹²⁸` (two lanes, MurmurHash3's finalizer on each).
+
+**A request** renders its pieces, computes `key_1..key_n` (one pass over the characters) and looks them up from `k = n`
+down. On a hit it copies the entry's first `t` ids, resumes the encoder (`Tokenizer.resumeSequence`) and encodes
+piece `j` from offset `e`, then the remaining pieces. The new prompt's own boundaries are registered for the next
+request. With an agent, request `r + 1` repeats request `r` up to its generation prompt, so the hit is the end of the
+last message of request `r`, and only the new assistant answer, tool results and user message are encoded.
+
+**Memory.** An entry costs `4 bytes × ids + ~96 bytes × keys`; entries are evicted least recently used first; one
+larger than a quarter of the budget is not kept. A key that a newer prompt takes over (same prefix) moves to it, and
+an entry left without keys is dropped. Lookups and updates hold the cache's lock for a hash-map probe per piece;
+the encoding runs outside it.
+
+`PromptCacheTest` renders ~2 900 requests of growing, edited and interleaved conversations through the cache, for
+every template family, with a cache small enough to evict and with `lstrip` / `rstrip` added tokens, and requires the
+ids of a full render each time. **Measured** (Qwen3 tokenizer, a 50-turn conversation of 100 258 characters, 31 308
+ids, the 50th request after the 49th; best of 15 on a shared 4-core machine): render + tokenize 15.6 ms in full,
+0.50 ms with the 49th request cached (31×); under heavier load on the same machine, 60–90 ms against about 2 ms. The
+render itself (string building) is ~0.3 ms; what is left is hashing the 100k characters and encoding the ~1 800
+new ones.
+
+---
+
+## 17.6 Noticing a client that left
+
+🧸 If the child who asked a question walks out of the room, the teacher stops answering — she doesn't finish a
+ten-minute explanation to an empty chair while the next child waits.
+
+📐 The engine polls a `cancelled` supplier between prefill chunks and before every token
+([10 §10.4](10-engine-and-server.md#104-cancellation-the-lock-statistics)). The engine's own HTTP server knows when a
+connection closes (a probe thread blocks reading the socket). In the web console (Spring on Tomcat) a servlet has no
+such signal: a non-streaming request was only cancelled by an unload or the request timeout, so an agent that gave up
+kept its slot for the whole answer, and a stream noticed only when a write failed, every 10–15 s during a prefill
+(the keep-alive comments).
+
+`ClientGone.of(request)` returns a check that asks Tomcat's connection for available input without blocking
+(`ActionCode.AVAILABLE` with a read: the non-blocking read `ServletInputStream.isReady` does under a read listener).
+After the request body has been read, the client sends nothing until its next request; a closed connection makes the
+read hit the end of the stream, which Tomcat reports as available input (so that the next read throws). The
+controllers OR the check into `cancelled` for `/v1/chat/completions`, `/v1/completions` (streaming or not) and the
+console's `/api/chat`; it costs one system call and is made at most every 50 ms. After a disconnect nothing more is
+written, the slot is released and the log line ends with `cancelled: the client went away`. A prefill stopped half-way
+stays cached, so a retry of the same prompt continues where it stopped. Limits: a pipelined next request on the same
+connection would look the same (no HTTP client pipelines POSTs); under another servlet container, HTTP/2 or MockMvc
+the check is never true and only failed writes stop a stream.
+
+`CancellationTest` runs Tomcat on a random port with a fake backend that sleeps per forward call, sends a request over
+a raw socket, closes it during the prefill or during decoding, streaming or not, and requires the slot to be free
+within about one forward call and no token to be fed afterwards. **Measured** (one forward call = 20 ms in decoding,
+150 ms per 64-token prefill chunk): non-streaming, the slot was free 27 ms after the client left during
+decoding (19 of 2 000 tokens generated) and 156 ms after it left half-way through a 3 001-token prefill; streaming,
+25 ms and 166 ms. Before, the non-streaming request would have run to its 2 000 tokens (40 s) and the stream until
+the next keep-alive comment failed.
