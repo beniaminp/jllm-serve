@@ -29,6 +29,46 @@ same steps with real sizes are in [05](05-transformer-math.md).
 
 ---
 
+## The big picture first
+
+A language model is one function: it takes the list of tokens so far and returns, for every token of its
+vocabulary, how likely that token is to come next. Generating an answer is calling that function in a loop:
+
+```
+tokens so far ──► model ──► a probability for each of the 20 tokens ──► pick one ──► append it ──► repeat
+```
+
+Inside, every token becomes a short list of numbers (a **vector**), and the vectors pass through the same few
+operations again and again:
+
+| step | what it does, in one line | section |
+|---|---|---|
+| embedding | look up the token's vector in a table | 5.1 |
+| RMSNorm | rescale a vector so that its size is always about the same | 5.2 |
+| q, k, v | three views of each token: what it looks for, what it offers, what it hands over | 5.3 |
+| q-norm, k-norm | rescale each head's query and key the same way | 5.4 |
+| RoPE | turn query and key by an angle that depends on the token's position | 5.5 |
+| attention | each token takes a weighted mix of the earlier tokens' values | 5.6 |
+| residual add | add the result to the vector instead of replacing it | 5.6, 5.7 |
+| feed-forward (SwiGLU) | a small calculation on each token alone | 5.7 |
+| logits, softmax | score every vocabulary token and turn the scores into probabilities | 5.10, 5.11 |
+
+The model's "knowledge" is nothing but the numbers in its weight matrices. Training sets them; here they are
+picked by hand.
+
+## Notation
+
+| symbol | meaning | example |
+|---|---|---|
+| `x = [x0, x1, x2, x3]` | a row vector of 4 numbers; `x0` is its first number | `[1, 0, 0, −1]` |
+| `x·W` | row vector times matrix (section 0) | `[1, 2]·[[1, 1], [0, 1]] = [1·1 + 2·0, 1·1 + 2·1] = [1, 3]` |
+| `a·b` (two vectors) | dot product: multiply number by number, add up | `(1, 2)·(3, 4) = 3 + 8 = 11` |
+| `a ⊙ b` | multiply number by number, keep the vector | `(1, 2) ⊙ (3, 4) = (3, 8)` |
+| `Σ` | sum | `Σ_j w_j` = add all the w's |
+| `eˣ` | the exponential, `e ≈ 2.718` | `e¹ = 2.718`, `e⁰ = 1`, `e⁻¹ = 0.368` |
+| `p` (position) | where a token stands in the sequence, from 0 | `sky` is at p = 1 |
+| `d`, `d_h` | width of a token vector (4), width of one head (2) | |
+
 ## 0. Rules for doing it by hand
 
 - **Vectors are rows.** Multiplying a row vector `x` (length n) by a matrix `W` (n rows, m columns) gives a row of
@@ -98,6 +138,11 @@ front of punctuation:
 **Step 3b, BPE on each word.** Byte-pair encoding starts from single letters and applies a fixed, ordered list of
 merges. Each merge glues two neighbouring pieces into one, as long as the result is a vocabulary token.
 
+Why pieces and not whole words? A vocabulary of whole words could never hold every word, name and typo; a
+vocabulary of single letters would make every text very long (and every extra token costs a full pass through
+the model). BPE sits in between: frequent words become one token, rare ones are spelled with a few pieces, and
+nothing is ever "unknown". The merge list is learned once, by counting which pairs occur most often in a big text.
+
 This toy's merge list, in order:
 
 ```
@@ -133,6 +178,9 @@ So the prompt is the id list **[0, 5, 11, 3, 1]** at positions **0, 1, 2, 3, 4**
 ---
 
 
+
+
+
 ## 4. The weights (everything the model "knows")
 
 ### 4a. The embedding table `E` (one row of 4 numbers per token)
@@ -149,6 +197,10 @@ Only six rows are used in this chapter:
 | `color` | 11 | [1, 1, 0, 0] |
 
 The other 14 rows exist but are never looked up here.
+
+A row is the token's starting point in a 4-dimensional space. In a trained model, tokens that are used alike end
+up with similar rows (the rows of `sky` and `blue` share a 1 in place 1 here). The model never sees the token's
+spelling, only this row.
 
 ### 4b. Layer 1
 
@@ -171,6 +223,10 @@ q = n·Wq = [n0,  n1,  n1 + n2,  n3]
 k = n·Wk = [n0,  n1 + n2,  n2,  n3]
 v = n·Wv = [n0,  n1,  n2 + n3,  n3]
 ```
+
+Each output number is a dot product of the input with one column of the matrix, so each column is a pattern
+the input is compared with. In the real Qwen3-0.6B, `Wq` is 1 024 × 2 048 (16 heads of 128), `Wk` and `Wv` are
+1 024 × 1 024 (8 heads of 128), and `Wo` is 2 048 × 1 024.
 
 **Feed-forward matrices** (SwiGLU):
 
@@ -315,6 +371,24 @@ All five:
 | 3 `?` | [0, −1, 0, 1] | 0.5 | 0.707 | 1.414 | [0, −2.828, 0, 0.707] |
 | 4 `<\|assistant\|>` | [−1, 0, 1, 1] | 0.75 | 0.866 | 1.155 | [−1.155, 0, 1.155, 0.578] |
 
+**The exact formula**, for a vector of `d` numbers (here d = 4):
+
+```
+RMSNorm(x)_i = g_i · x_i / √( (x_0² + x_1² + … + x_(d−1)²) / d  +  ε )
+```
+
+"RMS" is the *root mean square*: the square root of the mean of the squares, a measure of how big the numbers
+are on average.
+
+**Check that it works.** Before the weights `g`, position 4 becomes `x · 1.155 = [−1.155, 0, 1.155, 1.155]`. Its mean of
+squares is `(1.334 + 0 + 1.334 + 1.334) / 4 = 1.001`, i.e. 1 up to rounding, whatever `x` was.
+
+**Why the model needs it.** Every layer *adds* its result to the vector (the residual adds of 5.6 and 5.7), so
+vectors tend to grow from layer to layer: layer 1's outputs below reach 5.073, while the embeddings only hold
+−1, 0 and 1. Normalizing before each block gives every block inputs of the same size, so its weights work the same
+in layer 1 and layer 28. Unlike the older LayerNorm, RMSNorm does not subtract the mean first; it is cheaper and
+works as well.
+
 ### 5.3 Queries, keys and values for every position
 
 Use the formulas of 4b. Position 1 (`sky`), `n = [0, 2.828, 1.414, 0]`:
@@ -332,6 +406,12 @@ v = [0, 2.828, 1.414, 0]
 | 2 | [1.414, 2.828, 2.828, 0] | [1.414, 2.828, 0, 0] | [1.414, 2.828, 0, 0] |
 | 3 | [0, −2.828, −2.828, 0.707] | [0, −2.828, 0, 0.707] | [0, −2.828, 0.707, 0.707] |
 | 4 | [−1.155, 0, 1.155, 0.578] | [−1.155, 1.155, 1.155, 0.578] | [−1.155, 0, 1.733, 0.578] |
+
+**What the three are for.** Think of a library: the **query** is the question a token asks ("which earlier words
+tell me what is being asked?"), each token's **key** is the label on its spine, and its **value** is what is
+written inside. A query that matches a key well (a large dot product) gets much of that token's value. All three
+come from the same normalized vector, through three different matrices, because asking, labelling and content are
+different jobs.
 
 ### 5.4 q-norm and k-norm (Qwen3)
 
@@ -367,6 +447,20 @@ A head piece that is (0, 0) stays (0, 0): there is nothing to scale (the ε keep
 | 2 | [0.632, 0.632, 1.414, 0] | [0.316, 1.264, 0, 0] |
 | 3 | [0, −0.707, −1.372, 0.171] | [0, −1.414, 0, 1.414] |
 | 4 | [−1.414, 0, 1.265, 0.316] | [−0.5, 1, 0.632, 0.633] |
+
+**What this guarantees.** Before the weights, a normalized head piece `(a, b)` has `(a² + b²) / 2 = 1`, so its
+length `√(a² + b²)` is always `√2 = 1.414`. After the weights it is at most `√2 · (largest weight)`. A dot product is
+never larger than the two lengths multiplied (the Cauchy–Schwarz inequality, `|q·k| ≤ |q|·|k|`), so:
+
+| | longest query piece | longest key piece | largest possible dot | largest dot in this chapter |
+|---|---|---|---|---|
+| layer 1 (`g_q = [1, 0.5]`, `g_k = [0.5, 1]`) | 1.414 | 1.414 | 2 | 1.817 |
+| layer 2 (`g_q = [1, 1]`, `g_k = [1, 2]`) | 1.414 | 2.828 | 4 | 3.994 |
+
+Without q-norm and k-norm nothing would stop a query and a key from growing during training until their scores
+were in the hundreds. Softmax (5.6) would then put all the weight on a single token and none on the others, and
+the attention could no longer blend information. The norm keeps the scores in a fixed range, and the weights
+`g_q`, `g_k` decide how sharp the attention may get.
 
 ### 5.5 RoPE: tell each query and key where it stands
 
@@ -404,6 +498,20 @@ RoPE k head 1: (0.707, 0) → (0.707·0.54 − 0·0.841,  0.707·0.841 + 0·0.54
 | 3 | [0.1, 0.7, 1.334, −0.363] | [0.199, 1.4, −0.199, −1.4] |
 | 4 | [0.925, 1.07, −0.588, −1.164] | [1.084, −0.276, 0.066, −0.892] |
 
+**Why a rotation encodes position.** Turning a pair never changes its length:
+`(a·cos p − b·sin p)² + (a·sin p + b·cos p)² = a² + b²` (the cross terms cancel and `cos² + sin² = 1`). What it
+changes is the angle. A query turned by `p` and a key turned by `m` have a dot product that depends only on the
+difference `p − m`, because turning both by the same extra angle leaves their dot product unchanged. So attention
+sees *how far back* a token is, not where it is in absolute terms.
+
+Check it with the table: take the pair (1, 0) as both query and key.
+- Query at p = 4, key at m = 1 (3 apart): `cos 4·cos 1 + sin 4·sin 1 = (−0.654)·0.54 + (−0.757)·0.841 = −0.99`.
+- Query at p = 5, key at m = 2 (also 3 apart): `cos 5·cos 2 + sin 5·sin 2 = 0.284·(−0.416) + (−0.959)·0.909 = −0.99`.
+- Both equal `cos 3 = −0.99`.
+
+The real model turns each of a head's 64 pairs at its own speed (`θ_i = base^(−2i/headDim)`, base 1 000 000 for
+Qwen3), from fast turns that tell neighbours apart to very slow ones that still differ after 100 000 tokens.
+
 The rotated keys and the values of every position are the layer's **KV cache**. They are stored, and reused for
 every token generated later.
 
@@ -421,6 +529,28 @@ For each position and each head:
    multiplied by its weight.
 4. **Residual.** Add the result to the position's own input `x` (with a real `Wo`, the result would first be
    multiplied by `Wo`; ours is the identity).
+
+**The same thing for all positions at once, as matrices.** Stack the 5 rotated queries of one head as the rows
+of `Q` (5 × 2) and the keys as the rows of `K`, and the values as `V` (5 × 2):
+
+```
+S = Q·Kᵀ / √d_h              5 × 5: row i, column j = score of query i against key j
+S_ij = −∞ for j > i           the causal mask: no looking ahead (e^−∞ = 0, so those weights are 0)
+A = softmax of each row of S  5 × 5, each row adds up to 1
+out = A·V                     5 × 2: row i is position i's mix of values
+```
+
+**Why divide by √d_h.** A dot product adds `d_h` products. If the numbers are of size about 1 and have random
+signs, the sum grows like `√d_h` (as a random walk does). Dividing by `√d_h` keeps the scores of size about 1 for
+any head width: here `√2 = 1.414`, in Qwen3 `√128 = 11.3`.
+
+**Why softmax.** It turns any scores into positive weights that add up to 1, it keeps their order, and because of
+`eˣ` a lead of 1 in score means 2.7 times the weight. Subtracting the maximum first gives the same weights, since
+`e^(s_j − c) / Σ e^(s_i − c) = e^(−c)·e^(s_j) / (e^(−c)·Σ e^(s_i))` and the `e^(−c)` cancel; it only keeps `eˣ` from
+overflowing when scores are large.
+
+**Why the residual add.** The layer *adds* what it found to the token's vector instead of replacing it. What the
+token was stays available to every later layer, and each layer only has to learn a correction.
 
 Position 4 in full:
 
@@ -460,6 +590,8 @@ out_3 = 0.314·(−0.707) + 0.051·0 + 0.098·0 + 0.337·0.707 + 0.199·0.578 = 
 attention output = [0.111, −0.769, 0.433, 0.131]
 h = x + attention = [−0.889, −0.769, 1.433, 1.131]
 ```
+
+Check: the weights of each head add up to 1 (head 0: 1, head 1: 0.999; the last digit is rounding).
 
 Positions 0 to 3 the same way. Position 0 can only look at itself, so both its weights are 1:
 
@@ -505,7 +637,33 @@ Output: head 0 (0.748, 2.46), head 1 (0.684, −0.071), so attention = [0.748, 2
 
 Output: head 0 (0.503, 0.065), head 1 (0.322, −0.036), so attention = [0.503, 0.065, 0.322, −0.036] and h = x + attention = [0.503, −0.935, 0.322, 0.964].
 
+All the weights of head 0 in layer 1 as the matrix `A` (row = the position that looks, column = the position looked at; the zeros above the diagonal are the causal mask):
+
+```
+                         key 0    key 1    key 2    key 3    key 4
+query 0 <|user|>             1        0        0        0        0
+query 1 sky              0.268    0.732        0        0        0
+query 2 color             0.13    0.471    0.399        0        0
+query 3 ?                0.201    0.256    0.155    0.388        0
+query 4 <|assistant|>    0.206    0.107    0.047    0.426    0.214
+```
+
 ### 5.7 Feed-forward (SwiGLU) for every position
+
+Attention moved information *between* tokens. The feed-forward step then works on each token *alone*, with the
+same weights for every position:
+
+```
+m   = RMSNorm(h) · g_ffn
+FFN = ( silu(m·Wgate) ⊙ (m·Wup) ) · Wdown        silu(z) = z · σ(z),   σ(z) = 1 / (1 + e^(−z))
+out = h + FFN                                      the second residual add
+```
+
+`σ(z)` is a smooth switch between 0 and 1, so `silu(z)` lets a positive `z` through almost unchanged and squeezes
+a negative one towards 0. The "GLU" (gated linear unit) part: `silu(m·Wgate)` decides how much of each number of
+`m·Wup` gets through. At position 4 the gates are `σ(−0.159) = 0.46` and `σ(−1.229) = 0.226`: a bit under half of
+the first hidden number and about a quarter of the second get through. In Qwen3-0.6B the feed-forward matrices hold about 60 % of a layer's weights
+(3 × 1 024 × 3 072 against 6.3 million for attention).
 
 Position 4 in full:
 
@@ -670,7 +828,8 @@ f = y · 0.728 · g = [−0.656·0.728·2,  −1.926·0.728·1,  1.653·0.728·1
                  = [−0.955, −1.402, 1.203, 0.301]
 ```
 
-Each token's **logit** is the dot product of its `Wout` row with `f`. For example:
+Each token's **logit** is the dot product of its `Wout` row with `f`: `logit_t = f · Wout[t]`. It is large when
+`f` points the same way as the token's row. All 20 at once are `f · Woutᵀ`. For example:
 
 ```
 blue      [−1, −1, 1, 0]   → (−1)·(−0.955) + (−1)·(−1.402) + 1·1.203 = 3.56
@@ -706,9 +865,20 @@ Same softmax as in attention, over all 20 tokens:
 | 19 | `red` | 2.459 | −1.101 | 0.333 | 0.127 |
 | | | | | sum = 2.616 | |
 
+The probabilities add up to 1 (up to rounding), and `blue` gets 0.382.
+
+**What training would do with this.** If the training text said the answer is `blue`, the model's error on this
+example, its *loss*, would be `−ln p(blue) = −ln 0.382 = 0.962`. A perfect model gives probability 1 and
+loss 0. Training nudges every weight a little in the direction that lowers this number, over billions of examples;
+that is how the hand-picked numbers here would be found in a real model.
+
 ### 5.12 Choosing the token
 
 **Greedy** (temperature 0) takes the largest probability: **`blue`** (0.382).
+
+**Temperature** `T` divides the logits before the softmax: `p_t = e^(logit_t / T) / Σ_u e^(logit_u / T)`. With
+`T = 1` nothing changes. Below 1 the gaps grow and the favourite takes more of the probability; as `T` goes to 0
+it takes all of it, which is greedy. Above 1 the probabilities flatten towards "every token equally likely".
 
 **Sampling** draws at random, following the probabilities. A typical setting is temperature 0.7 with top-k = 3:
 1. Keep the 3 largest logits: `blue` 3.56, `red` 2.459, `or` 2.357.
@@ -733,6 +903,11 @@ The sequence is now `<|user|> sky color ? <|assistant|> blue`, and `blue` sits a
 would redo everything from section 5 for six tokens. With the KV cache, the keys and values of positions 0 to 4 are
 already stored, one set per layer (5.5 for layer 1, 5.8 for layer 2), so we run **only `blue`** through the two
 layers.
+
+Counting (query, key) pairs per head and layer shows the saving. The prefill compared every position with itself
+and the ones before it: `1 + 2 + 3 + 4 + 5 = 15` pairs. Without a cache, the second token would redo all of it plus
+6 new pairs, 21 in total; with the cache it is just the 6 new pairs. For a prompt of `n` tokens the prefill costs
+`n·(n + 1)/2` pairs, which grows with the square of the length, and each generated token afterwards costs about `n`.
 
 ### 6.1 Layer 1
 
@@ -999,8 +1174,9 @@ layer (6 rows per layer here). That is why long contexts get slower, and why the
 
 **What the real model multiplies.** Qwen3-0.6B does each step above with 1 024 numbers instead of 4, 16 heads of
 128 instead of 2 of 2, an FFN hidden width of 3 072 instead of 2, 151 936 logits instead of 20, and 28 layers instead
-of 2. One token then costs about 1.2 billion multiply-adds, roughly 2 per weight ([11](11-performance.md)), and the
-recipe stays the same.
+of 2. Every weight is used once per token in one multiply and one add, so a token costs about
+`2 × 596 million ≈ 1.2 billion` operations, plus the attention's dot products, which grow with the context
+([11](11-performance.md)). The recipe stays the same.
 
 ---
 
