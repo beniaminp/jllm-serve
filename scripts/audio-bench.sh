@@ -3,8 +3,8 @@
 # Metal (decoder on the CPU, and on the GPU), against whisper.cpp when whisper-cli and its ggml models are there, and
 # OuteTTS text-to-speech with the WavTokenizer codec. Run it idle (the repository's agents do it under the heavy lock).
 #
-#   scripts/audio-bench.sh <speech.wav> [--stt "tiny base small large-v3-turbo"] [--tts "OuteAI/OuteTTS-0.3-500M"]
-#                          [--ggml-dir DIR] [--text "sentence to speak"] [--reps 3]
+#   scripts/audio-bench.sh <speech.wav> [--stt "tiny base small large-v3-turbo"] [--cpu-models "tiny base small"]
+#                          [--tts "OuteAI/OuteTTS-0.3-500M"] [--ggml-dir DIR] [--text "sentence to speak"] [--reps 3]
 #
 # <speech.wav> should be several seconds to a minute or two of speech (`say -o x.aiff "..."; afconvert -f WAVE -d LEI16@16000
 # x.aiff x.wav` makes one). The ggml models are ggml-<size>.bin of https://huggingface.co/ggerganov/whisper.cpp.
@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 AUDIO="${1:?usage: audio-bench.sh <speech.wav> [options]}"
 shift
 STT="tiny base small"
+CPU_MODELS="tiny base small"      # the CPU runs of bigger models take minutes: add them with --cpu-models
 TTS="OuteAI/OuteTTS-0.3-500M"
 GGML=""
 TEXT="Speech synthesis is the artificial production of human speech. A computer system used for this purpose is called a speech synthesizer."
@@ -21,6 +22,7 @@ REPS=3
 while [ $# -gt 0 ]; do
   case "$1" in
     --stt) STT="$2"; shift 2 ;;
+    --cpu-models) CPU_MODELS="$2"; shift 2 ;;
     --tts) TTS="$2"; shift 2 ;;
     --ggml-dir) GGML="$2"; shift 2 ;;
     --text) TEXT="$2"; shift 2 ;;
@@ -39,7 +41,7 @@ for m in $STT; do
   dir="models/openai_whisper-$m"
   [ -d "$dir" ] || { echo "(no $dir, skipped)"; continue; }
   echo; echo "== whisper-$m"
-  $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" cpu auto "$REPS" 2>&1 | grep -v WARNING
+  case " $CPU_MODELS " in *" $m "*) $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" cpu auto "$REPS" 2>&1 | grep -v WARNING ;; esac
   $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" metal off "$REPS" 2>&1 | grep -v WARNING
   $JAVA -cp $CP org.robomiri.jllm.AudioBench stt "$dir" "$AUDIO" metal on "$REPS" 2>&1 | grep -v WARNING
   if [ -n "$GGML" ] && command -v whisper-cli >/dev/null && [ -f "$GGML/ggml-$m.bin" ]; then
