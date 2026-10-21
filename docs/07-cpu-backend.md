@@ -1,7 +1,8 @@
 # 7. The CPU backend: SIMD with the Vector API — in detail
 
 Code: `cpu/VectorKernels.java`, `cpu/ThreadPool.java`, `cpu/CpuMatmul.java`, `cpu/CpuBackend.java`, `cpu/KvCache.java`,
-`cpu/Int8Kernels.java`, `cpu/MlaCpu.java`, `cpu/MambaCpuBackend.java`
+`cpu/Int8Kernels.java`, `cpu/MlaCpu.java`, `cpu/MambaCpuBackend.java`, `cpu/NativeCpu.java` and its C library
+`src/main/native/jllm_cpu.c` ([7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu))
 
 This chapter explains how the 25 lines of math from [05](05-transformer-math.md#513-the-whole-thing-in-25-lines)
 run fast on a CPU, using nothing but the JDK: the Vector API for SIMD arithmetic, the FFM API to read
@@ -591,7 +592,10 @@ last 20. The int8 path wins where the CPU has cheap byte dot products (NEON `sdo
 silicon, the table above). On x86 with AVX-512 but no VNNI, the 16-bit widening multiplies cost more than streaming
 the float-dequantized weights; on a 4-core AVX-512 machine the probe measured int8 1619 µs vs float 402 µs for
 Q4_0 1024×2048 and chose float. The result is printed (`int8 activations: auto -> off (...)`) and cached per model,
-so the slots of a server share one measurement. `true` / `false` force a path.
+so the slots of a server share one measurement. `true` / `false` force a path. When the native int8 kernels of
+[7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu) are loaded, the probe times them instead of the Java int8
+kernels, which turns the decision around on that machine (native int8 on AVX512-VNNI is several times faster than
+float; numbers in 7.16).
 
 ## 7.11 What to optimize next
 
@@ -623,6 +627,9 @@ In order of expected payoff on this CPU:
   closed by a volatile re-check.
 - On 128-bit NEON the float kernel is instruction-bound (byte→float conversions), not memory-bound; integer dot
   products (int8 activations, the default) are the fix: ~4× the decode speed.
+- The byte dot-product instructions (VNNI, `sdot`) are out of the Vector API's reach; a small C library called through
+  the FFM API, one call per chunk of rows, uses them for the int8 decode matmuls
+  ([7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu)).
 
 ---
 
@@ -820,3 +827,143 @@ on the M1 Pro (10 threads, Qwen3-0.6B Q4_0, int8 on, machine shared with other j
 prefill is dominated by the attention dot products, [7.5](#75-attention-kvcacheattention)). Greedy text was
 identical with the switch on and off in these runs. Soft-capped models (Gemma) additionally save the per-score
 `Math.tanh`, which costs about as much as the exp.
+
+---
+
+## 7.16 Native int8 kernels (`libjllm_cpu`, `NativeCpu`)
+
+Code: `src/main/native/jllm_cpu.c` (+ `jllm_cpu_x86.inc`, `jllm_cpu_arm.inc`), `cpu/NativeCpu.java`, `cpu/CpuMatmul.java`;
+build: `scripts/build-native-cpu.sh`; settings: `backend.cpu.native` (`auto` default, `true`, `false`) and
+`backend.cpu.native-lib`.
+
+🧸 The int8 path of [7.10](#710-int8-activations-integer-dot-products-int8kernels) multiplies small whole numbers
+(bytes) and adds up the products. Modern CPUs have one instruction for exactly that: "multiply four pairs of bytes
+and add the four products to a running total", 8 or 16 of them at once. Java's Vector API has no word for that
+instruction, so the Java kernels take the long way: they stretch every byte to 16 bits, multiply, add neighbours, and
+stretch again. The fix is a small C library that uses the instruction. Java hands it a whole stack of rows at a time,
+like giving a fast clerk a pile of forms instead of walking over with each sheet.
+
+### 📐 What the instructions do
+
+| level | instruction | per instruction |
+|---|---|---|
+| `avx512-vnni` (x86 with AVX-512 VNNI, used on 256-bit registers) | `vpdpbusd ymm` | 8 lanes × (4 unsigned bytes · 4 signed bytes) added to an int32 |
+| `avx-vnni` (x86, Alder Lake and later) | `vpdpbusd` (VEX) | the same |
+| `avx2` | `vpmaddubsw` + `vpmaddwd` | the same in two instructions (pairs to int16, then pairs to int32) |
+| `neon-dotprod` (ARMv8.2 `FEAT_DotProd`: Apple M1 and later, Graviton 2 and later) | `sdot` | 4 lanes × (4 signed · 4 signed bytes) added to an int32 |
+| `neon` | `smull` + `sadalp` | 8 products to int16, pairwise added into int32 |
+| `scalar` | C loops | fallback for other CPUs |
+
+All levels of one architecture are in one binary. Every SIMD function carries a `__attribute__((target(...)))`, and
+the file itself is compiled for the baseline (`-O2`, no `-march`). `jllm_cpu_level()` picks the best level from
+`cpuid` / `xgetbv` (x86: AVX2 + FMA + F16C with OS-enabled YMM state; AVX512-VNNI also needs AVX512 F/BW/VL and ZMM
+state) or from `getauxval(AT_HWCAP) & HWCAP_ASIMDDP` / `sysctl hw.optional.arm.FEAT_DotProd`. The backend name says
+which one runs: `int8 activations (native avx512-vnni)`.
+
+### 📐 The arithmetic, per format
+
+The activation is the same int8 vector as in 7.10 (`d_b = max|x|/127`, `q = rint(x/d_b)`, ties to even), stored in
+natural order with its 32-block scales `d_b` and block sums `s_b = Σ q_i`. `jllm_cpu_quantize` produces it, and
+`-ffp-contract=off` keeps its float operations the ones the Java quantizer does, so both give the same bytes (this is
+checked). Per 32 weights (a block or a K-quant sub-block) the kernels compute an exact int32, then do exactly what the
+Java kernels do with it: multiply by the combined scale, rounded to float the same way, and add into float lanes.
+
+- **Q4_0 / Q4_0G.** Byte `j` of a block holds weight `j` (low nibble) and weight `j+16` (high nibble). So
+  `[low nibbles | high nibbles]` in one 256-bit register are the 32 weights in natural order, unsigned `n ∈ [0,15]`.
+  `vpdpbusd` wants unsigned × signed, so instead of subtracting 8 from every weight it uses
+  `Σ (n_i − 8) q_i = Σ n_i q_i − 8 s_b`. The correction `−8 s_b` is the start value of int32 lane 0 of the
+  accumulator. The lane total is exact. The 8 lanes are converted to float and FMA-ed with `scale_b · d_b`: an f32
+  scale for the engine's Q4_0, an f16 one (converted with `vcvtph2ps`) for ggml's.
+- **Q8_0 / Q8_0G.** These are signed × signed, handled as `|w| · (q with w's sign)` (`vpsignb` twice), the standard
+  trick. It is exact for `w = −128` too, since `|−128|` is 128 as an unsigned byte. With AVX2 the pair sums go through
+  int16: `2 · 128 · 127 = 32512 < 32767`, so nothing saturates. The activations never reach −128.
+- **Q4_K / Q5_K.** As in `KQuantKernels`: `dot = Σ_j (d·sc_j·d_j) · Σ_i n_i q_i − Σ_j (dmin·m_j·d_j) · s_j`. The low
+  nibbles of a 32-byte group are sub-block `2g` and its high nibbles are `2g+1`, each multiplied (unsigned × signed)
+  with its own contiguous activation block. Q5_K adds bit `2g` / `2g+1` of `qh[l]` as bit 4. The 16-bit shifts move
+  bits across the two bytes of a lane, but only into bits the mask removes. The scalar prologue per super-block
+  (`k4_prologue`: decode the 6-bit scales and mins, the 8 scales `d·sc_j·d_j`, the min term) is the same sequence of
+  float operations as Java's.
+- **Q6_K.** The codes `(nibble | 2 high bits << 4) − 32 ∈ [−32, 31]` are signed, so the sign trick is used again.
+  Each 16-weight half of a 32-weight group has its own scale: int32 lanes 0–3 and 4–7 of the product are multiplied
+  by `[s_k ×4 | s_{k+1} ×4]`.
+
+Two float accumulators per row hide the FMA latency, and there is one horizontal sum per row. The only difference
+from the Java kernels is the order of the float additions (8 lanes and two accumulators instead of 4 lanes). So the
+results agree to float rounding. They agree **bit for bit** whenever all partial sums are integers below 2²⁴ (unit
+scales), which the tests use to check the integer parts.
+
+### 📐 Calling it: one downcall per chunk of rows
+
+```java
+nat.quantize(in, inOff, cols, act);                                     // calling thread, once per matmul
+pool.forRange(rows, 16, (r0, r1) -> nat.dotRows(wt, r0, r1, act, 0, out, outOff + r0, acc));
+```
+
+```c
+void jllm_cpu_dot_rows(int type, const uint8_t *w, int64_t scales_off, int r0, int r1, int cols,
+                       const int8_t *xq, const float *xd, const int32_t *xs, float *out, int accumulate);
+```
+
+- **Granularity.** `forRange` makes about 4 tasks per thread, at least 16 rows each, and each task is one downcall.
+  For Qwen3-0.6B's `o_proj` (1024 × 2048) on 4 threads that is 16 calls of 64 rows each, a few µs of C work per call.
+  A critical downcall costs tens of nanoseconds.
+- **Zero copy.** `w` is the tensor's own `MemorySegment`: the memory-mapped model file or the converted cache.
+  `scales_off` locates the f32 scale region of the engine's layout. Split tensors (fused gate | up, per-expert
+  interleave) are called part by part, with each run of consecutive rows of one part as one call.
+- **Output.** The caller's `float[]` is passed as a heap segment. The downcall handles use
+  `Linker.Option.critical(true)`, which allows heap segments and skips the thread-state transition. The library never
+  calls back into Java. It returns in micro- to milliseconds (the longest call is one thread's share of the
+  151 936-row LM head), so blocking the GC for that long is acceptable.
+- **Activation.** Each `CpuMatmul` has one `NativeCpu.Activation`: a native allocation from `Arena.ofAuto()` (so any
+  thread may read it), grown when needed. The calling thread writes it before the row loop is published, the same
+  happens-before as for the Java path's arrays.
+- **MoE** (`MoeExperts.token`): the gate/up rows are one call per run of rows of one slot inside a chunk. For the down
+  projection, each chunk of output rows makes one call per slot into `down[k·dim + r]` (activation offset `k·m/32`
+  blocks), then adds `Σ_k w_k · down` in slot order, the same order as the Java loop.
+
+Prefill (`n > 1`) is unchanged: the float `dot4x4` path, with each row dequantized once for all tokens.
+
+### 📐 Finding, checking and choosing the library
+
+`NativeCpu.configure(backend.cpu.native, backend.cpu.native-lib)` runs at each backend creation
+(`ModelLoader.newBackend`, before the int8 `auto` probe). The library is looked up the same way as the Metal library:
+the setting, `-Djllm.cpu.nativeLib`, `$JLLM_CPU_NATIVE_LIB`, `target/native/`, the working directory, and `native/`
+next to the jar or classes directory. It must report interface version 1 and pass a **self-check** before it is used.
+The self-check compares against `Int8Kernels` / `KQuantKernels`: the quantizer bit for bit on 320 values that include
+an all-zero block, and for every type 3 random rows with unit scales (exact equality) and with random scales (within
+`3e-5 · Σ|w_i x_i|`).
+
+- `auto`: a missing library or a failed check prints one line (`native CPU kernels: ... using the Java kernels`) and
+  the Java kernels run.
+- `true`: the backend refuses to start without the library.
+- `false`: the library is never loaded.
+
+Without a `configure` call (tests, or code that builds backends itself), `-Djllm.cpu.native` applies (default `auto`).
+
+The int8 `auto` probe ([7.10.1](#7101-auto-measure-dont-guess)) builds its int8 `CpuMatmul` the normal way, so it
+times the native kernels when they are active, and its log line says which kernels it timed (`int8 ... us [native
+avx512-vnni]` or `[java]`).
+
+### 📐 Tests
+
+- **`NativeCpuCheck`** runs in `mvn test`, after `build-native-cpu.sh --optional` (without a C compiler it passes with
+  a note). It runs at **every level the CPU can run** (here scalar, avx2 and avx512-vnni) and covers:
+  - the quantizer, at 5 lengths;
+  - every type with unit scales at 1/3/7 rows × 32/96/160/256 columns, bit for bit: once with full-range activations,
+    once with small activations and random sub-block scales;
+  - random scales at 1/5/13 rows × up to 3 072 columns (the 32-block formats also at 96, 1 056 and 3 072 columns,
+    which are not multiples of 256);
+  - activation offsets, accumulation, and split tensors across their part boundaries;
+  - `CpuMatmul` on 3 threads, with and without the library.
+
+  Output: `native cpu kernels (..., levels scalar, avx2, avx512-vnni; detected avx512-vnni): 678 checks passed, 0
+  failed`. With two deliberate bugs planted (one wrong Q6_K scale index, one extra rounding in the K-quant min term),
+  77 checks failed.
+- **`src/test/native/jllm_cpu_levels.c`** checks every SIMD level against the scalar one in plain C, for
+  architectures where a JVM would be too slow under emulation. Cross-compiled with `aarch64-linux-gnu-gcc` and run
+  under `qemu-aarch64`, `neon` and `neon-dotprod` pass its 2 688 checks; with `-cpu cortex-a53` the library detects
+  plain `neon`. The `avx-vnni` level is compiled but has not run, because the test machine has AVX512-VNNI without
+  AVX-VNNI. Its code is the same as the AVX512-VNNI level's, with the VEX encoding of the same instruction.
+- **`NativeGreedyCheck <model-dir>`** is run by hand. It loads the model twice (int8 on, native vs Java),
+  teacher-forces the same tokens through both one step at a time (the single-token steps are where the kernels
+  differ) and compares the logits. Then it runs free greedy generation with both.

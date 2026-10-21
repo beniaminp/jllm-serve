@@ -310,7 +310,11 @@ Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, or `q8`: 
 kv head, about a quarter of the f32 cache), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
-`false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
+run in the small C library `libjllm_cpu` when it is found and passes its self-check, using AVX512-VNNI / AVX-VNNI /
+AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
+`scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
+path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 
