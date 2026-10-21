@@ -22,9 +22,15 @@ import org.robomiri.jllm.model.QuantFile;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Pipeline test for the model families on tiny random checkpoints: for each model directory and quantization
@@ -165,6 +171,10 @@ public final class ArchSmoke {
             System.out.println("  metal " + Arrays.toString(gpu));
             if (!mamba) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
+            }
+            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                failures += batchCheck(w, lib, cfg);
+                failures += draftCheck(w, dir, lib, cfg);
             }
             if (cfg instanceof Decoder d && d.anyMoe()) {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
@@ -546,6 +556,254 @@ public final class ArchSmoke {
             System.out.println("  pipe  " + Arrays.toString(got) + (ok ? "" : "  PIPELINE MISMATCH"));
             return ok ? 0 : 1;
         }
+    }
+
+    /**
+     * Batched decoding across slots ({@link MetalBackend#forwardBatch}): three backends on the same weights, each with its
+     * own prompt (other lengths, so other positions), decode greedily alone and then together in shared passes, the
+     * leader rotating so every backend lends its buffers in turn, with one step where a slot decodes on its own between
+     * batched ones. Every row must give the slot's own tokens, and its logits must match the slot's own decode step to
+     * rounding; for the f32, f16 and q8 caches, and for MoE models also with experts on the CPU. The f32 case (and the
+     * CPU-experts one) also runs through a {@link org.robomiri.jllm.engine.BatchGroup} with three threads (the engine's
+     * path): same tokens, steps in shared passes.
+     */
+    private static int batchCheck(ModelWeights w, String lib, Architecture cfg) throws Exception {
+        int vocab = cfg.core().vocabSize();
+        int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
+        List<Object[]> cases = new ArrayList<>();
+        for (KvDtype dt : KvDtype.values()) {
+            cases.add(new Object[]{dt.toString(), dt, MoeSplit.OFF});
+        }
+        if (((Decoder) cfg).anyMoe()) {
+            cases.add(new Object[]{"F32, experts of 1 layer on the cpu", KvDtype.F32, new MoeSplit(1, 4, false)});
+        }
+        Path stats = Files.createTempDirectory("jllm-expert-stats");
+        System.setProperty("jllm.metal.expertStatsDir", stats.toString());
+        int bad = 0;
+        try {
+            for (Object[] c : cases) {
+                KvDtype dt = (KvDtype) c[1];
+                MoeSplit split = (MoeSplit) c[2];
+                MetalBackend[] b = new MetalBackend[3];
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        b[i] = new MetalBackend(w, 64, 16, lib, dt, split);
+                    }
+                    float[][][] alone = new float[3][NEW_TOKENS][vocab];
+                    int[][] aloneTok = new int[3][];
+                    for (int i = 0; i < 3; i++) {
+                        aloneTok[i] = decode(b[i], prompts[i], alone[i], vocab);
+                    }
+                    float[][][] tog = new float[3][NEW_TOKENS][vocab];
+                    int[][] togTok = new int[3][NEW_TOKENS];
+                    for (int i = 0; i < 3; i++) {
+                        b[i].forward(prompts[i], 0, prompts[i].length, 0, tog[i][0]);
+                        togTok[i][0] = argmax(tog[i][0]);
+                    }
+                    boolean batchedAll = true;
+                    for (int s = 1; s < NEW_TOKENS; s++) {
+                        int lead = s % 3;
+                        int solo = s == 3 ? (lead + 1) % 3 : -1; // decodes on its own this step
+                        List<Integer> rows = new ArrayList<>();
+                        for (int r = 0; r < 3; r++) {
+                            int i = (lead + r) % 3;
+                            if (i != solo) {
+                                rows.add(i);
+                            }
+                        }
+                        Backend[] members = new Backend[rows.size()];
+                        int[] tokens = new int[rows.size()];
+                        int[] positions = new int[rows.size()];
+                        float[][] out = new float[rows.size()][];
+                        for (int r = 0; r < rows.size(); r++) {
+                            int i = rows.get(r);
+                            members[r] = b[i];
+                            tokens[r] = togTok[i][s - 1];
+                            positions[r] = prompts[i].length + s - 1;
+                            out[r] = tog[i][s];
+                        }
+                        if (solo >= 0) {
+                            b[solo].forward(new int[]{togTok[solo][s - 1]}, 0, 1, prompts[solo].length + s - 1, tog[solo][s]);
+                        }
+                        batchedAll &= b[lead].forwardBatch(members, tokens, positions, out);
+                        for (int i = 0; i < 3; i++) {
+                            togTok[i][s] = argmax(tog[i][s]);
+                        }
+                    }
+                    float diff = 0;
+                    float scale = 0;
+                    boolean exact = true;
+                    boolean same = batchedAll;
+                    for (int i = 0; i < 3; i++) {
+                        same &= Arrays.equals(aloneTok[i], togTok[i]);
+                        for (int s = 0; s < NEW_TOKENS; s++) {
+                            diff = Math.max(diff, maxDiff(alone[i][s], tog[i][s]));
+                            scale = Math.max(scale, maxAbs(alone[i][s]));
+                            exact &= Arrays.equals(alone[i][s], tog[i][s]);
+                        }
+                    }
+                    boolean ok = same && diff <= 1e-4f * scale + 1e-5f;
+                    System.out.printf("  batched decode, 3 slots, kv %s: tokens %s, max|alone-batched| = %.1e%s -> %s%n",
+                            c[0], same ? "same" : "DIFFERENT", diff, exact ? " (bit-identical)" : "",
+                            ok ? "ok" : "BATCH MISMATCH");
+                    bad += ok ? 0 : 1;
+                    if (dt == KvDtype.F32) {
+                        bad += groupCheck(b, prompts, aloneTok, vocab);
+                    }
+                } finally {
+                    for (MetalBackend x : b) {
+                        if (x != null) {
+                            x.close();
+                        }
+                    }
+                }
+            }
+        } finally {
+            try (var files = Files.list(stats)) {
+                for (Path f : files.toList()) {
+                    Files.delete(f);
+                }
+            }
+            Files.delete(stats);
+            System.clearProperty("jllm.metal.expertStatsDir");
+        }
+        return bad;
+    }
+
+    /** The slots of {@code b} in a batch group, three threads decoding at once: each gets its own tokens of alone. */
+    private static int groupCheck(MetalBackend[] b, int[][] prompts, int[][] alone, int vocab) throws Exception {
+        org.robomiri.jllm.engine.BatchGroup g = new org.robomiri.jllm.engine.BatchGroup();
+        Backend[] m = new Backend[b.length];
+        for (int i = 0; i < b.length; i++) {
+            m[i] = g.join(b[i]);
+        }
+        ExecutorService ex = Executors.newFixedThreadPool(b.length);
+        try {
+            List<Future<int[]>> fs = new ArrayList<>();
+            for (int i = 0; i < b.length; i++) {
+                int k = i;
+                fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab)));
+            }
+            boolean same = true;
+            for (int i = 0; i < b.length; i++) {
+                same &= Arrays.equals(fs.get(i).get(), alone[i]);
+            }
+            long[] st = g.stats();
+            boolean ok = same && st[1] > 0;
+            System.out.printf("  batch group, 3 threads: tokens %s, %d decode steps in shared passes (%d passes) -> %s%n",
+                    same ? "same" : "DIFFERENT", st[1], st[0], ok ? "ok" : "GROUP MISMATCH");
+            return ok ? 0 : 1;
+        } finally {
+            ex.shutdown();
+        }
+    }
+
+    /** Greedy: prefill {@code prompt}, then NEW_TOKENS - 1 decode steps; step s's logits to stepLogits[s] if not null. */
+    private static int[] decode(Backend b, int[] prompt, float[][] stepLogits, int vocab) {
+        float[] logits = stepLogits != null ? stepLogits[0] : new float[vocab];
+        b.forward(prompt, 0, prompt.length, 0, logits);
+        int[] out = new int[NEW_TOKENS];
+        int pos = prompt.length;
+        for (int s = 0; s < NEW_TOKENS; s++) {
+            if (s > 0) {
+                if (stepLogits != null) {
+                    logits = stepLogits[s];
+                }
+                b.forward(new int[]{out[s - 1]}, 0, 1, pos++, logits);
+            }
+            out[s] = argmax(logits);
+        }
+        return out;
+    }
+
+    private static int argmax(float[] v) {
+        int best = 0;
+        for (int t = 1; t < v.length; t++) {
+            if (v[t] > v[best]) {
+                best = t;
+            }
+        }
+        return best;
+    }
+
+    /** {@code -Djllm.smoke.tokenizer} (default: Qwen3-0.6B's, as the tests use): the engine needs one to stream text. */
+    private static org.robomiri.jllm.tokenizer.Tokenizer tokenizer() throws Exception {
+        Path p = Path.of(System.getProperty("jllm.smoke.tokenizer", "models/Qwen_Qwen3-0.6B/tokenizer.json"));
+        return Files.isRegularFile(p) ? org.robomiri.jllm.tokenizer.Tokenizer.load(p) : null;
+    }
+
+    /**
+     * Draft-model speculation on the Metal backend, through the engine (pipelined greedy target, pipelined draft, one
+     * multi-token verification pass, both caches rolled back by position): the greedy output with a draft equals the
+     * output without speculation, for f32, f16 and q8 caches, with three drafts: the same weights (every draft is
+     * accepted), the same checkpoint at Q2_K (some are rejected) and, with {@code -Djllm.smoke.draftPair=<target dir
+     * name>=<draft dir>}, another random model of the same shapes (most are rejected).
+     */
+    private static int draftCheck(ModelWeights w, Path dir, String lib, Architecture cfg) throws Exception {
+        org.robomiri.jllm.tokenizer.Tokenizer tok = tokenizer();
+        if (tok == null) {
+            System.out.println("  draft speculation skipped: no tokenizer (-Djllm.smoke.tokenizer)");
+            return 0;
+        }
+        int vocab = cfg.core().vocabSize();
+        int max = 32; // within ctx 64 with the prompt and a full draft
+        var greedy = new org.robomiri.jllm.sampling.SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, max, List.of());
+        var fmt = org.robomiri.jllm.tokenizer.ChatTemplate.forModelType("qwen3", tok);
+        List<Object[]> drafts = new ArrayList<>();
+        drafts.add(new Object[]{"self", w});
+        ModelWeights q2 = ModelWeights.load(dir, cfg, QType.Q2_K, QuantFile.DEFAULT_HEAD, ShardProvider.local(dir), null);
+        drafts.add(new Object[]{"Q2_K", q2});
+        ModelWeights other = null;
+        String pair = System.getProperty("jllm.smoke.draftPair", "");
+        if (pair.startsWith(dir.getFileName() + "=")) {
+            Path od = Path.of(pair.substring(pair.indexOf('=') + 1));
+            other = ModelWeights.load(od, Architecture.load(od), QType.Q4_0, QuantFile.DEFAULT_HEAD, ShardProvider.local(od), null);
+            drafts.add(new Object[]{od.getFileName().toString(), other});
+        }
+        int bad = 0;
+        try {
+            for (KvDtype dt : KvDtype.values()) {
+                int[] plain;
+                try (org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(new MetalBackend(w, 64, 16, lib, dt),
+                        tok, cfg, Set.of(), 0, fmt)) {
+                    plain = e.generate(PROMPT, greedy, null, () -> false).tokens();
+                }
+                StringBuilder line = new StringBuilder();
+                boolean ok = true;
+                for (Object[] d : drafts) {
+                    if (dt != KvDtype.F32 && d[1] == w) {
+                        continue; // the f16 / q8 caches: the drafts that get rejected, which is what rolls back
+                    }
+                    var dm = new org.robomiri.jllm.engine.DraftModel(new MetalBackend((ModelWeights) d[1], 64, 16, lib, dt), vocab,
+                            null);
+                    try (org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(new MetalBackend(w, 64, 16, lib, dt),
+                            tok, cfg, Set.of(), 0, fmt)) {
+                        // a pass on every step (the emulator's timings would make the cost model pause speculation)
+                        System.setProperty("jllm.engine.adaptiveDraft", "false");
+                        try {
+                            e.enableSpeculation(new org.robomiri.jllm.engine.Speculator.Config(
+                                    org.robomiri.jllm.engine.Speculator.Mode.DRAFT, 4, 8, 3, 0), dm);
+                        } finally {
+                            System.clearProperty("jllm.engine.adaptiveDraft");
+                        }
+                        var r = e.generate(PROMPT, greedy, null, () -> false);
+                        boolean same = Arrays.equals(plain, r.tokens());
+                        ok &= same && r.stats().draftedTokens() > 0;
+                        line.append(String.format(", %s draft %d/%d accepted%s", d[0], r.stats().acceptedTokens(),
+                                r.stats().draftedTokens(), same ? "" : " OUTPUT DIFFERS"));
+                    }
+                }
+                System.out.printf("  draft speculation, kv %s: %d tokens%s -> %s%n", dt, plain.length, line,
+                        ok ? "ok" : "SPECULATION MISMATCH");
+                bad += ok ? 0 : 1;
+            }
+        } finally {
+            q2.close();
+            if (other != null) {
+                other.close();
+            }
+        }
+        return bad;
     }
 
     private static int[] generate(Backend b, float[] logits) {

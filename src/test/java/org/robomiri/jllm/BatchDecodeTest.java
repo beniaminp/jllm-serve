@@ -19,7 +19,9 @@ import java.util.concurrent.Future;
  * time give the same greedy answers as when each runs alone, their steps really are computed together, and the total
  * throughput is printed for one slot alone and three at once.
  *
- * <p>usage: BatchDecodeTest &lt;model dir&gt; [bench] (models/Qwen_Qwen3-0.6B; {@code bench} adds the throughput run)
+ * <p>usage: BatchDecodeTest &lt;model dir&gt; [bench] [--setting value ...] (models/Qwen_Qwen3-0.6B; {@code bench} adds
+ * the throughput run; settings override the test's, e.g. {@code --backend metal} on a Mac, as scripts/mac-validate.sh
+ * runs it)
  */
 public final class BatchDecodeTest {
 
@@ -34,7 +36,8 @@ public final class BatchDecodeTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
-        run(dir, args.length > 1 && args[1].equals("bench"));
+        boolean bench = args.length > 1 && args[1].equals("bench");
+        run(dir, bench, java.util.Arrays.copyOfRange(args, bench ? 2 : 1, args.length));
         if (failures > 0) {
             System.out.println(failures + " FAILED");
             System.exit(1);
@@ -42,11 +45,14 @@ public final class BatchDecodeTest {
         System.out.println("batch decode test passed");
     }
 
-    private static void run(Path dir, boolean bench) throws Exception {
+    private static void run(Path dir, boolean bench, String[] extra) throws Exception {
         // float activations: a batched step runs the multi-token kernels, which add in another order than the int8
         // single-token ones; with float activations both are the same arithmetic up to summation order
-        Settings st = Settings.load(new String[]{"--backend", "cpu", "--model.dir", dir.toAbsolutePath().getParent().toString(),
-                "--backend.ctx", "512", "--engine.speculative", "off", "--backend.cpu.int8-activations", "false"});
+        String[] base = {"--backend", "cpu", "--model.dir", dir.toAbsolutePath().getParent().toString(),
+                "--backend.ctx", "512", "--engine.speculative", "off", "--backend.cpu.int8-activations", "false"};
+        String[] all = java.util.Arrays.copyOf(base, base.length + extra.length);
+        System.arraycopy(extra, 0, all, base.length, extra.length);
+        Settings st = Settings.load(all);
         String[] prompts = {"The capital of France is", "Write a haiku about autumn leaves.", "def fibonacci(n):"};
         SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 24, List.of());
         try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), dir.getFileName().toString());

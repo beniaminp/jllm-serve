@@ -41,6 +41,13 @@
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
 #   hf-internal-testing_tiny-random-Glm4ForCausalLM       generated: glm4, four norms per layer, partial interleaved rope
+#   hf-internal-testing_tiny-random-LlamaDraftForCausalLM generated: the plain Llama's shapes with other random weights
+#                                                         (another seed), the draft model of its speculation check
+#
+# With Metal, every attention model (Q4_0) also checks batched decoding across slots (three backends in shared passes vs.
+# alone, f32 / f16 / q8 caches, a three-thread batch group) and draft-model speculation through the engine (greedy output
+# with a draft equals the output without; drafts: the model itself, its Q2_K quantization, and for the plain Llama the
+# other-seed model). The engine needs a tokenizer: models/Qwen_Qwen3-0.6B/tokenizer.json (-Djllm.smoke.tokenizer).
 #
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 #        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
@@ -97,6 +104,7 @@ gen qwen3moe Qwen3MoeForCausalLM
 gen deepseek_v2 DeepseekV2ForCausalLM
 gen deepseek_v2q DeepseekV2QLoraForCausalLM
 gen deepseek_v3 DeepseekV3ForCausalLM
+gen llama LlamaDraftForCausalLM --seed 4321
 
 # DeepSeek: engine vs. the independent float64 reference (scripts/deepseek-ref.py) on Q8_0-rounded weights
 for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
@@ -107,7 +115,8 @@ done
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
-  -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
+  -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 \
+  -Djllm.smoke.draftPair="${P}-LlamaPlainForCausalLM=$M/${P}-LlamaDraftForCausalLM" ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-MistralForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Llama3RopeForCausalLM" \
   "$M/${P}-LlamaBiasForCausalLM" "$M/${P}-Gemma2BiasForCausalLM" \
