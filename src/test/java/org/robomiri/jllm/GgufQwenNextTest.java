@@ -397,6 +397,8 @@ public final class GgufQwenNextTest {
      */
     /** Adds a vocabulary (byte-level BPE, no merges) so that llama.cpp can load the tiny file too: ids are fed directly. */
     static boolean withVocab;
+    /** A Jinja chat template to store in the tiny file (to ask llama.cpp to render conversations with it). */
+    static String chatTemplate;
     /** Scale the output rows of four tokens up (a file for comparing the multi-token-prediction head with llama.cpp). */
     static boolean focus;
     /** Experts in every layer of the Qwen3-Next model (llama.cpp's loader wants that); default: layer 0 is dense. */
@@ -434,6 +436,9 @@ public final class GgufQwenNextTest {
             }
             w.str("tokenizer.ggml.model", "gpt2").str("tokenizer.ggml.pre", "qwen35").strings("tokenizer.ggml.tokens", tokens)
                     .i32s("tokenizer.ggml.token_type", types).strings("tokenizer.ggml.merges");
+            if (chatTemplate != null) {
+                w.str("tokenizer.chat_template", chatTemplate);
+            }
         }
         return w;
     }
@@ -516,6 +521,7 @@ public final class GgufQwenNextTest {
             variant(dir, true, false, metal, lib);  // qwen35: tiled value heads, separate beta / alpha, dense FFN, an MTP block
             variant(dir, true, true, metal, lib);   // qwen35moe: the same with Qwen3-Next's experts and gated shared expert
             malformed(dir);
+            chatTemplate();
         } finally {
             try (var s = Files.walk(dir)) {
                 s.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
@@ -843,6 +849,37 @@ public final class GgufQwenNextTest {
                 }
             }
         }
+    }
+
+    /**
+     * The Qwen3.5 chat template against the prompts llama.cpp's server renders from the Jinja template stored in the
+     * unsloth Qwen3.8-27B file ({@code /apply-template}, the nine conversations of
+     * {@code src/test/resources/gguf/qwen35-chat-cases.json}; {@code scripts/qwen35-llamacpp-check.sh} regenerates them).
+     */
+    private static void chatTemplate() throws Exception {
+        var f = org.robomiri.jllm.tokenizer.ChatTemplate.forModelType("qwen3_5");
+        List<Object> cases;
+        List<Object> want;
+        try (var c = GgufQwenNextTest.class.getResourceAsStream("/gguf/qwen35-chat-cases.json");
+             var e = GgufQwenNextTest.class.getResourceAsStream("/gguf/qwen35-chat-expected.json")) {
+            cases = Json.list(Map.of("c", Json.parse(new String(c.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8))), "c");
+            want = Json.list(Map.of("c", Json.parse(new String(e.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8))), "c");
+        }
+        int ok = 0;
+        for (int i = 0; i < cases.size(); i++) {
+            List<org.robomiri.jllm.tokenizer.ChatTemplate.Message> msgs = new ArrayList<>();
+            for (Object m : Json.list(cases.get(i), "messages")) {
+                String content = Json.str(m, "content", "");
+                String reasoning = Json.str(m, "reasoning_content", null);
+                msgs.add(new org.robomiri.jllm.tokenizer.ChatTemplate.Message(Json.str(m, "role", ""),
+                        reasoning == null ? content : "<think>" + reasoning + "</think>" + content));
+            }
+            String got = f.render(msgs, true, Json.bool(cases.get(i), "think", true));
+            boolean same = got.equals(want.get(i));
+            ok += same ? 1 : 0;
+            check(same, "qwen35 chat template, case " + i + ": " + got.replace("\n", "\\n") + " vs " + want.get(i));
+        }
+        System.out.println("qwen35    chat template == llama.cpp's Jinja render: " + ok + " of " + cases.size() + " conversations");
     }
 
     private static void malformed(Path root) throws Exception {

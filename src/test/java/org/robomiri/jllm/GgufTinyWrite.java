@@ -14,6 +14,8 @@ public final class GgufTinyWrite {
         for (String a : args) {
             if (a.startsWith("layers=")) {
                 GgufQwenNextTest.LAYERS = Integer.parseInt(a.substring(7));
+            } else if (a.startsWith("template=")) {
+                GgufQwenNextTest.chatTemplate = java.nio.file.Files.readString(Path.of(a.substring(9)));
             } else if (a.equals("focus")) {
                 GgufQwenNextTest.focus = true;
             } else if (a.equals("allmoe")) {

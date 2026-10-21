@@ -106,4 +106,27 @@ echo "== multi-token prediction: does the head's draft equal the next token, at 
 echo "   llama.cpp $(cat "$OUT/mtp-ll.txt")"
 echo "   jllm      $(cat "$OUT/mtp-jl.txt")"
 cmp -s "$OUT/mtp-ll.txt" "$OUT/mtp-jl.txt" && echo "   identical ($(tr -cd 1 < "$OUT/mtp-ll.txt" | wc -c | tr -d ' ') hits)" || { echo "   DIFFERENT"; fail=1; }
+
+# the chat template: llama.cpp renders conversations with the Jinja template of the unsloth Qwen3.8-27B file; the built-in
+# one must give the same prompts (src/test/resources/gguf/qwen35-chat-cases.json)
+R=src/test/resources/gguf
+$J org.robomiri.jllm.GgufTinyWrite qwen35 "$OUT/tpl.gguf" q8 ba template=$R/qwen35-chat-template.jinja | tail -1 > /dev/null
+serve "$OUT/tpl.gguf" "$P1"
+python3 - $R/qwen35-chat-cases.json "$P1" > "$OUT/tpl-ll.json" <<'EOF'
+import json, sys, urllib.request
+out = []
+for c in json.load(open(sys.argv[1])):
+    body = {"messages": c["messages"]}
+    if not c["think"]:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    req = urllib.request.Request('http://127.0.0.1:%s/apply-template' % sys.argv[2], data=json.dumps(body).encode(),
+                                 headers={'Content-Type': 'application/json'})
+    out.append(json.loads(urllib.request.urlopen(req, timeout=60).read().decode())["prompt"])
+print(json.dumps(out))
+EOF
+kill "$SERVER"; wait "$SERVER" 2>/dev/null || true
+$J org.robomiri.jllm.ChatRender qwen3_5 $R/qwen35-chat-cases.json | grep -v WARNING > "$OUT/tpl-jl.json"
+echo "== chat template: llama.cpp's Jinja render vs the built-in template"
+python3 -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1])) == json.load(open(sys.argv[2])) else 1)' \
+  "$OUT/tpl-ll.json" "$OUT/tpl-jl.json" && echo "   identical for all conversations" || { echo "   DIFFERENT"; fail=1; }
 exit $fail
