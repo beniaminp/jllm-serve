@@ -4,7 +4,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.Arrays;
 
 /**
  * Audio files in pure Java: reads RIFF/WAVE (PCM 8/16/24/32-bit, IEEE float 32/64, A-law and mu-law, WAVE_FORMAT_EXTENSIBLE
@@ -364,9 +363,5 @@ public final class Wav {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         in.transferTo(bos);
         return bos.toByteArray();
-    }
-
-    static float[] copy(float[] a) {
-        return Arrays.copyOf(a, a.length);
     }
 }

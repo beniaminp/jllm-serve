@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerates src/test/resources/audio/ (the fixtures of org.robomiri.jllm.AudioTest) with the reference implementations.
 
-usage: python3 -I scripts/audio-fixtures.py [--text-ref TEXTPROC.json --numbers-ref NUMVEC.json --codec-ref CODEC.npy --codes CODES.json]
+usage: python3 -I scripts/audio-fixtures.py [--text-ref TEXTPROC.json] [--numbers-ref NUMVEC.json]
 
 Needs torch, transformers, tokenizers, numpy (a venv with `pip install torch transformers`). Always written:
 
@@ -13,8 +13,11 @@ Needs torch, transformers, tokenizers, numpy (a venv with `pip install torch tra
   mel-ref.f32              WhisperFeatureExtractor's log-mel (80 x 100, little-endian float32) of a 1.1 s synthetic signal
                            (formula in AudioTest.signal), the numbers the Java log-mel must reproduce
 
-The optional files (text front end, number names, the WavTokenizer codec) are produced by the scratch scripts described in
-docs/21-audio.md section "Checks" and copied by hand; see there.
+The optional files are the OuteTTS text front end's references (`outetext-ref.json`, from the Python `TextProcessor` of the outetts
+package run over a list of sentences; the script keeps the input and the prompt text) and the number names
+(`numbers-ref.json`, from `inflect`): pass the JSON the reference scripts wrote. `codec-codes.json` and `codec-ref.wav` (75 WavTokenizer
+codes and the original PyTorch decoder's output for them, with the GGUF's f16 weights) are made from the `outetts` package's
+`WavDecoder` by hand and only used when the codec's GGUF is on disk.
 """
 import json
 import os

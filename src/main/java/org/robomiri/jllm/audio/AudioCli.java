@@ -4,7 +4,6 @@ import org.robomiri.jllm.ModelLoader;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.hub.HuggingFaceHub;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -75,9 +74,5 @@ public final class AudioCli {
             System.err.printf("[%s: %.1f s of audio in %.2f s, real-time factor %.2f, wrote %s]%n", e.tts().describe(), audio,
                     sec, sec / Math.max(1e-9, audio), file);
         }
-    }
-
-    static IOException unreachable() {
-        return new IOException("unreachable");
     }
 }
