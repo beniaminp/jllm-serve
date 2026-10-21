@@ -2,7 +2,6 @@ package org.robomiri.jllm.cpu;
 
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
@@ -29,6 +28,7 @@ final class GgufKernels {
     private static final ByteOrder LE = ByteOrder.LITTLE_ENDIAN;
     private static final ValueLayout.OfInt LE32 = ValueLayout.JAVA_INT_UNALIGNED.withOrder(LE);
     private static final ValueLayout.OfShort LE16 = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(LE);
+    private static final ValueLayout.OfLong LE64 = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(LE);
 
     private GgufKernels() {
     }
@@ -36,8 +36,6 @@ final class GgufKernels {
     // lanes 0..7 take byte 0 (or 2) of a 4-byte group, lanes 8..15 byte 1 (or 3): the bit j of a 16-bit run is lane j
     private static final VectorShuffle<Byte> SH_LO = VectorShuffle.fromValues(B16, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
     private static final VectorShuffle<Byte> SH_HI = VectorShuffle.fromValues(B16, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
-    private static final ByteVector BIT_OF_LANE = ByteVector.fromArray(B16, new byte[]{1, 2, 4, 8, 16, 32, 64, (byte) 128,
-            1, 2, 4, 8, 16, 32, 64, (byte) 128}, 0);
     private static final ByteVector TAB_IQ4 = ByteVector.fromArray(B16, Ggml.KVALUES_IQ4NL, 0);
     private static final ByteVector TAB_FP4 = ByteVector.fromArray(B16, Ggml.KVALUES_MXFP4, 0);
 
@@ -299,31 +297,45 @@ final class GgufKernels {
 
     // ------------------------------------------------------------------ Q4_1 / Q5_0 / Q5_1 (32-weight blocks, 5th bit in qh)
 
-    /** Lanes whose bit is clear: lane j of the half {@code hi ? 1 : 0} tests bit {@code 16 hi + j} of the block's 32 high bits. */
-    private static VectorMask<Byte> bitClear(ByteVector qhBytes, boolean hi) {
-        return qhBytes.rearrange(hi ? SH_HI : SH_LO).and(BIT_OF_LANE).eq((byte) 0);
+    private static final ByteVector SHIFT_OF_LANE = ByteVector.fromArray(B16, new byte[]{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7}, 0);
+
+    /**
+     * 16 in the lanes whose fifth bit is set, else 0: lane j of the half {@code hi ? 1 : 0} takes bit {@code 16 hi + j} of the
+     * block's 32 high bits. (No masked byte arithmetic: C2 has no intrinsic for it on all CPUs and falls back to boxed code.)
+     */
+    private static ByteVector bit16(ByteVector qhBytes, boolean hi) {
+        return qhBytes.rearrange(hi ? SH_HI : SH_LO).lanewise(VectorOperators.LSHR, SHIFT_OF_LANE).and((byte) 1)
+                .lanewise(VectorOperators.LSHL, 4);
     }
 
-    /** Q4_1 (20 B: d, m, 16 nibble bytes) and Q5_1 (24 B: d, m, qh[4], 16 nibble bytes): {@code Σ (d q + m) x = d Σ q x + m Σ x}. */
+    /** {@code acc += (q d + m) x} for the 16 byte lanes of {@code q} against {@code x[xb .. xb+16)}: the weights as the dequantizer makes them. */
+    private static FloatVector affineDot(ByteVector q, FloatVector d, FloatVector m, float[] x, int xb, FloatVector acc) {
+        for (int p = 0; p < 16 / FL; p++) {
+            acc = ((FloatVector) q.castShape(F, p)).fma(d, m).fma(FloatVector.fromArray(F, x, xb + p * FL), acc);
+        }
+        return acc;
+    }
+
+    /** Q4_1 (20 B: d, m, 16 nibble bytes) and Q5_1 (24 B: d, m, qh[4], 16 nibble bytes): {@code w = q d + m}. */
     private static float dotQ41(MemorySegment seg, long q, int nb, float[] x, int xo, boolean q5) {
         int bytes = q5 ? Ggml.Q5_1_BYTES : Ggml.Q4_1_BYTES;
         FloatVector acc = FloatVector.zero(F);
-        FloatVector accM = FloatVector.zero(F);
         for (int b = 0; b < nb; b++, q += bytes) {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + (q5 ? 8 : 4), LE);
             ByteVector lo = v.and((byte) 0x0F);
             ByteVector hi = v.lanewise(VectorOperators.LSHR, 4);
             if (q5) {
                 ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 4, LE);
-                lo = lo.add((byte) 16, bitClear(qh, false).not());
-                hi = hi.add((byte) 16, bitClear(qh, true).not());
+                lo = lo.add(bit16(qh, false));
+                hi = hi.add(bit16(qh, true));
             }
             int xb = xo + b * 32;
-            acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
-                    .fma(FloatVector.broadcast(F, Ggml.f16(seg, q)), acc);
-            accM = sum32(x, xb).fma(FloatVector.broadcast(F, Ggml.f16(seg, q + 2)), accM);
+            int dm = seg.get(LE32, q); // d and m in one load (two segment reads per block exceed C2's inlining budget)
+            FloatVector dv = FloatVector.broadcast(F, Float.float16ToFloat((short) dm));
+            FloatVector mv = FloatVector.broadcast(F, Float.float16ToFloat((short) (dm >>> 16)));
+            acc = affineDot(hi, dv, mv, x, xb + 16, affineDot(lo, dv, mv, x, xb, acc));
         }
-        return acc.add(accM).reduceLanes(VectorOperators.ADD);
+        return acc.reduceLanes(VectorOperators.ADD);
     }
 
     private static void dequantQ41(MemorySegment seg, long q, int nb, float[] dst, int off, boolean q5) {
@@ -334,11 +346,12 @@ final class GgufKernels {
             ByteVector hi = v.lanewise(VectorOperators.LSHR, 4);
             if (q5) {
                 ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 4, LE);
-                lo = lo.add((byte) 16, bitClear(qh, false).not());
-                hi = hi.add((byte) 16, bitClear(qh, true).not());
+                lo = lo.add(bit16(qh, false));
+                hi = hi.add(bit16(qh, true));
             }
-            float d = Ggml.f16(seg, q);
-            float m = Ggml.f16(seg, q + 2);
+            int dm = seg.get(LE32, q);
+            float d = Float.float16ToFloat((short) dm);
+            float m = Float.float16ToFloat((short) (dm >>> 16));
             storeAffine(lo, d, m, dst, off + b * 32);
             storeAffine(hi, d, m, dst, off + b * 32 + 16);
         }
@@ -350,8 +363,8 @@ final class GgufKernels {
         for (int b = 0; b < nb; b++, q += Ggml.Q5_0_BYTES) {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 6, LE);
             ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 2, LE);
-            ByteVector lo = v.and((byte) 0x0F).sub((byte) 16, bitClear(qh, false));
-            ByteVector hi = v.lanewise(VectorOperators.LSHR, 4).sub((byte) 16, bitClear(qh, true));
+            ByteVector lo = v.and((byte) 0x0F).add(bit16(qh, false)).sub((byte) 16);
+            ByteVector hi = v.lanewise(VectorOperators.LSHR, 4).add(bit16(qh, true)).sub((byte) 16);
             int xb = xo + b * 32;
             acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
                     .fma(FloatVector.broadcast(F, Ggml.f16(seg, q)), acc);
@@ -364,8 +377,8 @@ final class GgufKernels {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 6, LE);
             ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 2, LE);
             FloatVector scale = FloatVector.broadcast(F, Ggml.f16(seg, q));
-            store16(v.and((byte) 0x0F).sub((byte) 16, bitClear(qh, false)), scale, dst, off + b * 32);
-            store16(v.lanewise(VectorOperators.LSHR, 4).sub((byte) 16, bitClear(qh, true)), scale, dst, off + b * 32 + 16);
+            store16(v.and((byte) 0x0F).add(bit16(qh, false)).sub((byte) 16), scale, dst, off + b * 32);
+            store16(v.lanewise(VectorOperators.LSHR, 4).add(bit16(qh, true)).sub((byte) 16), scale, dst, off + b * 32 + 16);
         }
     }
 
@@ -378,8 +391,8 @@ final class GgufKernels {
         FloatVector acc = FloatVector.zero(F);
         for (int b = 0; b < nb; b++, q += bytes) {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + (fp4 ? 1 : 2), LE);
-            ByteVector lo = tab.rearrange(v.and((byte) 0x0F).toShuffle());
-            ByteVector hi = tab.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle());
+            ByteVector lo = v.and((byte) 0x0F).selectFrom(tab);
+            ByteVector hi = v.lanewise(VectorOperators.LSHR, 4).selectFrom(tab);
             float d = fp4 ? Ggml.e8m0Half(seg.get(ValueLayout.JAVA_BYTE, q) & 0xFF) : Ggml.f16(seg, q);
             int xb = xo + b * 32;
             acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
@@ -395,8 +408,8 @@ final class GgufKernels {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + (fp4 ? 1 : 2), LE);
             float d = fp4 ? Ggml.e8m0Half(seg.get(ValueLayout.JAVA_BYTE, q) & 0xFF) : Ggml.f16(seg, q);
             FloatVector scale = FloatVector.broadcast(F, d);
-            store16(tab.rearrange(v.and((byte) 0x0F).toShuffle()), scale, dst, off + b * 32);
-            store16(tab.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle()), scale, dst, off + b * 32 + 16);
+            store16(v.and((byte) 0x0F).selectFrom(tab), scale, dst, off + b * 32);
+            store16(v.lanewise(VectorOperators.LSHR, 4).selectFrom(tab), scale, dst, off + b * 32 + 16);
         }
     }
 
@@ -414,8 +427,8 @@ final class GgufKernels {
             int xb = xo + b * Ggml.QK_K;
             for (int ib = 0; ib < 8; ib++, xb += 32) {
                 ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 8 + 16L * ib, LE);
-                ByteVector lo = TAB_IQ4.rearrange(v.and((byte) 0x0F).toShuffle());
-                ByteVector hi = TAB_IQ4.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle());
+                ByteVector lo = v.and((byte) 0x0F).selectFrom(TAB_IQ4);
+                ByteVector hi = v.lanewise(VectorOperators.LSHR, 4).selectFrom(TAB_IQ4);
                 accQ = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
                         .fma(FloatVector.broadcast(F, (float) iq4xsScale(seg, q, sh, ib)), accQ);
             }
@@ -432,8 +445,8 @@ final class GgufKernels {
             for (int ib = 0; ib < 8; ib++, o += 32) {
                 ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 8 + 16L * ib, LE);
                 FloatVector scale = FloatVector.broadcast(F, d * iq4xsScale(seg, q, sh, ib));
-                store16(TAB_IQ4.rearrange(v.and((byte) 0x0F).toShuffle()), scale, dst, o);
-                store16(TAB_IQ4.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle()), scale, dst, o + 16);
+                store16(v.and((byte) 0x0F).selectFrom(TAB_IQ4), scale, dst, o);
+                store16(v.lanewise(VectorOperators.LSHR, 4).selectFrom(TAB_IQ4), scale, dst, o + 16);
             }
         }
     }
@@ -441,23 +454,17 @@ final class GgufKernels {
     // ------------------------------------------------------------------ Q3_K
 
     /**
-     * The sixteen 6-bit scales of a Q3_K block at {@code q} packed four to an int (scale {@code s} is byte {@code s & 3}
-     * of word {@code s >> 2}, before the "minus 32"): llama.cpp's {@code kmask1 / kmask2} shuffle of the 12 scale bytes.
+     * Word {@code g} of the sixteen 6-bit scales of a Q3_K block, four to an int (scale {@code s} is byte {@code s & 3} of
+     * word {@code s >> 2}, before the "minus 32"): llama.cpp's {@code kmask1 / kmask2} shuffle of the 12 scale bytes, which are
+     * {@code a0, a1} (bytes 0..7 of the scale field) and {@code t} (bytes 8..11).
      */
-    private static void q3kScaleWords(MemorySegment seg, long q, int[] w) {
-        int a0 = seg.get(LE32, q + 96);
-        int a1 = seg.get(LE32, q + 100);
-        int t = seg.get(LE32, q + 104);
-        w[0] = (a0 & 0x0f0f0f0f) | (((t) & 0x03030303) << 4);
-        w[1] = (a1 & 0x0f0f0f0f) | (((t >>> 2) & 0x03030303) << 4);
-        w[2] = ((a0 >>> 4) & 0x0f0f0f0f) | (((t >>> 4) & 0x03030303) << 4);
-        w[3] = ((a1 >>> 4) & 0x0f0f0f0f) | (((t >>> 6) & 0x03030303) << 4);
-    }
-
-    private static final ThreadLocal<int[]> Q3_SCALES = ThreadLocal.withInitial(() -> new int[4]);
-
-    private static int q3kScale(int[] w, int s) {
-        return ((w[s >> 2] >>> (8 * (s & 3))) & 0xFF) - 32;
+    private static int q3kWord(int a0, int a1, int t, int g) {
+        return switch (g) {
+            case 0 -> (a0 & 0x0f0f0f0f) | ((t & 0x03030303) << 4);
+            case 1 -> (a1 & 0x0f0f0f0f) | (((t >>> 2) & 0x03030303) << 4);
+            case 2 -> ((a0 >>> 4) & 0x0f0f0f0f) | (((t >>> 4) & 0x03030303) << 4);
+            default -> ((a1 >>> 4) & 0x0f0f0f0f) | (((t >>> 6) & 0x03030303) << 4);
+        };
     }
 
     /**
@@ -465,45 +472,59 @@ final class GgufKernels {
      * of the 16 bytes {@code qs} minus 4 where the high-mask bit {@code u} of the matching 16 bytes {@code hm} is clear.
      */
     private static ByteVector q3kHalf(ByteVector qs, ByteVector hm, int u) {
-        byte bit = (byte) (1 << u);
-        return qs.lanewise(VectorOperators.LSHR, 2 * (u & 3)).and((byte) 3).sub((byte) 4, hm.and(bit).eq((byte) 0));
+        return qs.lanewise(VectorOperators.LSHR, 2 * (u & 3)).and((byte) 3).sub((byte) 4)
+                .add(hm.lanewise(VectorOperators.LSHR, u).and((byte) 1).lanewise(VectorOperators.LSHL, 2));
     }
 
     private static float dotQ3K(MemorySegment seg, long q, int nb, float[] x, int xo) {
-        int[] w = Q3_SCALES.get();
         FloatVector acc = FloatVector.zero(F);
         for (int b = 0; b < nb; b++, q += Ggml.Q3_K_BYTES) {
-            q3kScaleWords(seg, q, w);
+            long a = seg.get(LE64, q + 96);
+            int a0 = (int) a;
+            int a1 = (int) (a >>> 32);
+            int t = seg.get(LE32, q + 104);
             ByteVector h0 = ByteVector.fromMemorySegment(B16, seg, q, LE);
             ByteVector h1 = ByteVector.fromMemorySegment(B16, seg, q + 16, LE);
             FloatVector accQ = FloatVector.zero(F);
             int xb = xo + b * Ggml.QK_K;
-            for (int u = 0; u < 8; u++, xb += 32) {
-                long qs = q + 32 + 32L * (u >> 2);
-                ByteVector v0 = ByteVector.fromMemorySegment(B16, seg, qs, LE);
-                ByteVector v1 = ByteVector.fromMemorySegment(B16, seg, qs + 16, LE);
-                accQ = VectorKernels.halfDot(q3kHalf(v0, h0, u), x, xb).fma(FloatVector.broadcast(F, (float) q3kScale(w, 2 * u)), accQ);
-                accQ = VectorKernels.halfDot(q3kHalf(v1, h1, u), x, xb + 16).fma(FloatVector.broadcast(F, (float) q3kScale(w, 2 * u + 1)), accQ);
+            for (int g = 0; g < 4; g++) {
+                int word = q3kWord(a0, a1, t, g);
+                for (int h = 0; h < 2; h++, xb += 32) {
+                    int u = 2 * g + h;
+                    long qs = q + 32 + 32L * (u >> 2);
+                    ByteVector v0 = ByteVector.fromMemorySegment(B16, seg, qs, LE);
+                    ByteVector v1 = ByteVector.fromMemorySegment(B16, seg, qs + 16, LE);
+                    float s0 = ((word >>> (16 * h)) & 0xFF) - 32;
+                    float s1 = ((word >>> (16 * h + 8)) & 0xFF) - 32;
+                    accQ = VectorKernels.halfDot(q3kHalf(v0, h0, u), x, xb).fma(FloatVector.broadcast(F, s0), accQ);
+                    accQ = VectorKernels.halfDot(q3kHalf(v1, h1, u), x, xb + 16).fma(FloatVector.broadcast(F, s1), accQ);
+                }
             }
-            acc = accQ.fma(FloatVector.broadcast(F, Ggml.f16(seg, q + 108)), acc);
+            acc = accQ.fma(FloatVector.broadcast(F, Float.float16ToFloat(seg.get(LE16, q + 108))), acc);
         }
         return acc.reduceLanes(VectorOperators.ADD);
     }
 
     private static void dequantQ3K(MemorySegment seg, long q, int nb, float[] dst, int off) {
-        int[] w = Q3_SCALES.get();
         for (int b = 0; b < nb; b++, q += Ggml.Q3_K_BYTES) {
-            q3kScaleWords(seg, q, w);
-            float d = Ggml.f16(seg, q + 108);
+            long a = seg.get(LE64, q + 96);
+            int a0 = (int) a;
+            int a1 = (int) (a >>> 32);
+            int t = seg.get(LE32, q + 104);
+            float d = Float.float16ToFloat(seg.get(LE16, q + 108));
             ByteVector h0 = ByteVector.fromMemorySegment(B16, seg, q, LE);
             ByteVector h1 = ByteVector.fromMemorySegment(B16, seg, q + 16, LE);
             int o = off + b * Ggml.QK_K;
-            for (int u = 0; u < 8; u++, o += 32) {
-                long qs = q + 32 + 32L * (u >> 2);
-                ByteVector v0 = ByteVector.fromMemorySegment(B16, seg, qs, LE);
-                ByteVector v1 = ByteVector.fromMemorySegment(B16, seg, qs + 16, LE);
-                store16(q3kHalf(v0, h0, u), FloatVector.broadcast(F, d * q3kScale(w, 2 * u)), dst, o);
-                store16(q3kHalf(v1, h1, u), FloatVector.broadcast(F, d * q3kScale(w, 2 * u + 1)), dst, o + 16);
+            for (int g = 0; g < 4; g++) {
+                int word = q3kWord(a0, a1, t, g);
+                for (int h = 0; h < 2; h++, o += 32) {
+                    int u = 2 * g + h;
+                    long qs = q + 32 + 32L * (u >> 2);
+                    ByteVector v0 = ByteVector.fromMemorySegment(B16, seg, qs, LE);
+                    ByteVector v1 = ByteVector.fromMemorySegment(B16, seg, qs + 16, LE);
+                    store16(q3kHalf(v0, h0, u), FloatVector.broadcast(F, d * (((word >>> (16 * h)) & 0xFF) - 32)), dst, o);
+                    store16(q3kHalf(v1, h1, u), FloatVector.broadcast(F, d * (((word >>> (16 * h + 8)) & 0xFF) - 32)), dst, o + 16);
+                }
             }
         }
     }

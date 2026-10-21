@@ -5,6 +5,7 @@ import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
 import org.robomiri.jllm.model.Ggml;
 import org.robomiri.jllm.model.QTensor;
@@ -24,7 +25,7 @@ import java.nio.ByteOrder;
  *   <li><b>Q4_1 / Q5_1</b>: {@code Σ (d q + m) x = d Σ q x + m Σ x}; the integer sum of the activation block comes
  *       from {@link KQuantKernels#blockSums} (the same {@code xsum} the K-quants use).</li>
  *   <li><b>Q5_0</b>: {@code (q5 - 16) d}; the fifth bit of weight {@code j} is bit {@code j} of {@code qh}, expanded
- *       into the short lanes with per-lane shifts (the lane order is the permuted one: even / odd weights).</li>
+ *       in the byte domain (a byte shuffle and per-lane shifts) and handled like the table formats' bytes.</li>
  *   <li><b>IQ4_NL, MXFP4, IQ4_XS</b>: the nibbles index a 16-entry int8 table (a byte shuffle); the looked-up bytes
  *       are then multiplied as Q8_0 bytes are in {@link Int8Kernels#dotRowQ8GxQ8}.</li>
  * </ul>
@@ -39,12 +40,10 @@ public final class GgufInt8Kernels {
     private static final VectorSpecies<Float> F4 = FloatVector.SPECIES_128;
     private static final ByteOrder LE = ByteOrder.LITTLE_ENDIAN;
     private static final ValueLayout.OfInt LE32 = ValueLayout.JAVA_INT_UNALIGNED.withOrder(LE);
-    private static final ValueLayout.OfShort LE16 = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(LE);
+    private static final ValueLayout.OfLong LE64 = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(LE);
     private static final float MAGIC = 12582912f; // 1.5 * 2^23
     private static final int MAGIC_BITS = Float.floatToRawIntBits(MAGIC);
 
-    private static final ShortVector SHIFT_EVEN = ShortVector.fromArray(S8, new short[]{0, 2, 4, 6, 8, 10, 12, 14}, 0);
-    private static final ShortVector SHIFT_ODD = ShortVector.fromArray(S8, new short[]{1, 3, 5, 7, 9, 11, 13, 15}, 0);
     private static final ByteVector TAB_IQ4 = ByteVector.fromArray(B16, Ggml.KVALUES_IQ4NL, 0);
     private static final ByteVector TAB_FP4 = ByteVector.fromArray(B16, Ggml.KVALUES_MXFP4, 0);
 
@@ -88,8 +87,8 @@ public final class GgufInt8Kernels {
         int nb = w.blocksPerRow();
         int xb = xo / QType.BLOCK;
         return switch (w.type) {
-            case Q4_1 -> dotQ41(seg, q, nb, xq, xs, xsum, xo, xb, false);
-            case Q5_1 -> dotQ41(seg, q, nb, xq, xs, xsum, xo, xb, true);
+            case Q4_1 -> dotQ41(seg, q, nb, xq, xs, xsum, xo, xb);
+            case Q5_1 -> dotQ51(seg, q, nb, xq, xs, xsum, xo, xb);
             case Q5_0 -> dotQ50(seg, q, nb, xq, xs, xo, xb);
             case IQ4_NL -> dotTab(seg, q, nb, xq, xs, xo, xb, false);
             case MXFP4 -> dotTab(seg, q, nb, xq, xs, xo, xb, true);
@@ -98,34 +97,50 @@ public final class GgufInt8Kernels {
         };
     }
 
-    /** Q4_1 (20 B: d, m, 16 nibble bytes) and Q5_1 (24 B: d, m, qh[4], 16 nibble bytes). */
-    private static float dotQ41(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int[] xsum, int xo, int sb, boolean q5) {
-        int bytes = q5 ? Ggml.Q5_1_BYTES : Ggml.Q4_1_BYTES;
+    /** Q4_1 (20 B: d, m, 16 nibble bytes): {@code Σ (d q + m) x = d Σ q x + m Σ x}. */
+    private static float dotQ41(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int[] xsum, int xo, int sb) {
         FloatVector acc = FloatVector.zero(F4);
         float minus = 0;
-        for (int b = 0; b < nb; b++, q += bytes) {
-            ShortVector v = ShortVector.fromMemorySegment(S8, seg, q + (q5 ? 8 : 4), LE);
+        for (int b = 0; b < nb; b++, q += Ggml.Q4_1_BYTES) {
+            ShortVector v = ShortVector.fromMemorySegment(S8, seg, q + 4, LE);
             int x = xo + b * QType.BLOCK;
-            ShortVector a = v.and((short) 0x0F);
-            ShortVector o = v.lanewise(VectorOperators.LSHR, 8).and((short) 0x0F);
-            ShortVector c = v.lanewise(VectorOperators.LSHR, 4).and((short) 0x0F);
-            ShortVector e = v.lanewise(VectorOperators.LSHR, 12).and((short) 0x0F);
-            if (q5) {
-                int qh = seg.get(LE32, q + 4);
-                ShortVector lo = ShortVector.broadcast(S8, (short) qh);
-                ShortVector hi = ShortVector.broadcast(S8, (short) (qh >>> 16));
-                a = a.or(lo.lanewise(VectorOperators.LSHR, SHIFT_EVEN).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-                o = o.or(lo.lanewise(VectorOperators.LSHR, SHIFT_ODD).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-                c = c.or(hi.lanewise(VectorOperators.LSHR, SHIFT_EVEN).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-                e = e.or(hi.lanewise(VectorOperators.LSHR, SHIFT_ODD).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-            }
-            ShortVector p = a.mul(ShortVector.fromArray(S8, xq, x));
-            p = o.mul(ShortVector.fromArray(S8, xq, x + 8)).add(p);
-            p = c.mul(ShortVector.fromArray(S8, xq, x + 16)).add(p);
-            p = e.mul(ShortVector.fromArray(S8, xq, x + 24)).add(p);
+            ShortVector p = v.and((short) 0x0F).mul(ShortVector.fromArray(S8, xq, x));
+            p = v.lanewise(VectorOperators.LSHR, 8).and((short) 0x0F).mul(ShortVector.fromArray(S8, xq, x + 8)).add(p);
+            p = v.lanewise(VectorOperators.LSHR, 4).and((short) 0x0F).mul(ShortVector.fromArray(S8, xq, x + 16)).add(p);
+            p = v.lanewise(VectorOperators.LSHR, 12).and((short) 0x0F).mul(ShortVector.fromArray(S8, xq, x + 24)).add(p);
             float xd = xs[sb + b];
-            acc = toFloat(widenSum(p)).fma(FloatVector.broadcast(F4, Ggml.f16(seg, q) * xd), acc);
-            minus += Ggml.f16(seg, q + 2) * xd * xsum[sb + b];
+            int dm = seg.get(LE32, q); // d and m in one load: two separate segment reads per block push C2 over its inlining budget
+            acc = toFloat(widenSum(p)).fma(FloatVector.broadcast(F4, Float.float16ToFloat((short) dm) * xd), acc);
+            minus += Float.float16ToFloat((short) (dm >>> 16)) * xd * xsum[sb + b];
+        }
+        return acc.reduceLanes(VectorOperators.ADD) + minus;
+    }
+
+    // the fifth bit of the 5-bit formats, expanded in the byte domain: lane j takes bit (16 hi + j) of qh
+    private static final VectorShuffle<Byte> SH_LO = VectorShuffle.fromValues(B16, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+    private static final VectorShuffle<Byte> SH_HI = VectorShuffle.fromValues(B16, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    private static final ByteVector BIT_OF_LANE = ByteVector.fromArray(B16, new byte[]{1, 2, 4, 8, 16, 32, 64, (byte) 128,
+            1, 2, 4, 8, 16, 32, 64, (byte) 128}, 0);
+    private static final ByteVector ZERO = ByteVector.zero(B16);
+
+    /** 16 in the lanes whose fifth bit is set, else 0. */
+    private static ByteVector bit16(ByteVector qhBytes, boolean hi) {
+        return ZERO.blend((byte) 16, qhBytes.rearrange(hi ? SH_HI : SH_LO).and(BIT_OF_LANE).compare(VectorOperators.NE, (byte) 0));
+    }
+
+    /** Q5_1 (24 B: d, m, qh[4], 16 nibble bytes): Q4_1 with the fifth bit of weight j taken from bit j of qh. */
+    private static float dotQ51(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int[] xsum, int xo, int sb) {
+        FloatVector acc = FloatVector.zero(F4);
+        float minus = 0;
+        for (int b = 0; b < nb; b++, q += Ggml.Q5_1_BYTES) {
+            ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 8, LE);
+            ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 4, LE);
+            IntVector isum = tabDot(v.and((byte) 0x0F).add(bit16(qh, false)), v.lanewise(VectorOperators.LSHR, 4).add(bit16(qh, true)),
+                    xq, xo + b * QType.BLOCK);
+            float xd = xs[sb + b];
+            int dm = seg.get(LE32, q);
+            acc = toFloat(isum).fma(FloatVector.broadcast(F4, Float.float16ToFloat((short) dm) * xd), acc);
+            minus += Float.float16ToFloat((short) (dm >>> 16)) * xd * xsum[sb + b];
         }
         return acc.reduceLanes(VectorOperators.ADD) + minus;
     }
@@ -134,23 +149,11 @@ public final class GgufInt8Kernels {
     private static float dotQ50(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int xo, int sb) {
         FloatVector acc = FloatVector.zero(F4);
         for (int b = 0; b < nb; b++, q += Ggml.Q5_0_BYTES) {
-            ShortVector v = ShortVector.fromMemorySegment(S8, seg, q + 6, LE);
-            int x = xo + b * QType.BLOCK;
-            int qh = seg.get(LE32, q + 2);
-            ShortVector lo = ShortVector.broadcast(S8, (short) qh);
-            ShortVector hi = ShortVector.broadcast(S8, (short) (qh >>> 16));
-            ShortVector a = v.and((short) 0x0F).or(lo.lanewise(VectorOperators.LSHR, SHIFT_EVEN).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-            ShortVector o = v.lanewise(VectorOperators.LSHR, 8).and((short) 0x0F)
-                    .or(lo.lanewise(VectorOperators.LSHR, SHIFT_ODD).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-            ShortVector c = v.lanewise(VectorOperators.LSHR, 4).and((short) 0x0F)
-                    .or(hi.lanewise(VectorOperators.LSHR, SHIFT_EVEN).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-            ShortVector e = v.lanewise(VectorOperators.LSHR, 12).and((short) 0x0F)
-                    .or(hi.lanewise(VectorOperators.LSHR, SHIFT_ODD).and((short) 1).lanewise(VectorOperators.LSHL, 4));
-            ShortVector p = a.sub((short) 16).mul(ShortVector.fromArray(S8, xq, x));
-            p = o.sub((short) 16).mul(ShortVector.fromArray(S8, xq, x + 8)).add(p);
-            p = c.sub((short) 16).mul(ShortVector.fromArray(S8, xq, x + 16)).add(p);
-            p = e.sub((short) 16).mul(ShortVector.fromArray(S8, xq, x + 24)).add(p);
-            acc = toFloat(widenSum(p)).fma(FloatVector.broadcast(F4, Ggml.f16(seg, q) * xs[sb + b]), acc);
+            ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 6, LE);
+            ByteVector qh = ByteVector.fromMemorySegment(B16, seg, q + 2, LE);
+            IntVector isum = tabDot(v.and((byte) 0x0F).add(bit16(qh, false)).sub((byte) 16),
+                    v.lanewise(VectorOperators.LSHR, 4).add(bit16(qh, true)).sub((byte) 16), xq, xo + b * QType.BLOCK);
+            acc = toFloat(isum).fma(FloatVector.broadcast(F4, Ggml.f16(seg, q) * xs[sb + b]), acc);
         }
         return acc.reduceLanes(VectorOperators.ADD);
     }
@@ -176,8 +179,8 @@ public final class GgufInt8Kernels {
         FloatVector acc = FloatVector.zero(F4);
         for (int b = 0; b < nb; b++, q += bytes) {
             ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + (fp4 ? 1 : 2), LE);
-            IntVector isum = tabDot(tab.rearrange(v.and((byte) 0x0F).toShuffle()),
-                    tab.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle()), xq, xo + b * QType.BLOCK);
+            IntVector isum = tabDot(v.and((byte) 0x0F).selectFrom(tab),
+                    v.lanewise(VectorOperators.LSHR, 4).selectFrom(tab), xq, xo + b * QType.BLOCK);
             float d = fp4 ? Ggml.e8m0Half(seg.get(ValueLayout.JAVA_BYTE, q) & 0xFF) : Ggml.f16(seg, q);
             acc = toFloat(isum).fma(FloatVector.broadcast(F4, d * xs[sb + b]), acc);
         }
@@ -188,15 +191,16 @@ public final class GgufInt8Kernels {
     private static float dotIQ4XS(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int xo, int sb) {
         FloatVector acc = FloatVector.zero(F4);
         for (int s = 0; s < nb; s++, q += Ggml.IQ4_XS_BYTES) {
-            float d = Ggml.f16(seg, q);
-            int sh = seg.get(LE16, q + 2) & 0xFFFF;
+            long h = seg.get(LE64, q); // d, scales_h and scales_l in one load
+            float d = Float.float16ToFloat((short) h);
+            int sh = (int) (h >>> 16) & 0xFFFF;
+            int sl = (int) (h >>> 32);
             for (int ib = 0; ib < 8; ib++) {
                 ByteVector v = ByteVector.fromMemorySegment(B16, seg, q + 8 + 16L * ib, LE);
                 int blk = s * 8 + ib;
-                IntVector isum = tabDot(TAB_IQ4.rearrange(v.and((byte) 0x0F).toShuffle()),
-                        TAB_IQ4.rearrange(v.lanewise(VectorOperators.LSHR, 4).toShuffle()), xq, xo + blk * QType.BLOCK);
-                int ls = (((seg.get(ValueLayout.JAVA_BYTE, q + 4 + (ib >> 1)) & 0xFF) >>> (4 * (ib & 1))) & 0xF)
-                        | (((sh >>> (2 * ib)) & 3) << 4);
+                IntVector isum = tabDot(v.and((byte) 0x0F).selectFrom(TAB_IQ4),
+                        v.lanewise(VectorOperators.LSHR, 4).selectFrom(TAB_IQ4), xq, xo + blk * QType.BLOCK);
+                int ls = ((sl >>> (8 * (ib >> 1) + 4 * (ib & 1))) & 0xF) | (((sh >>> (2 * ib)) & 3) << 4);
                 acc = toFloat(isum).fma(FloatVector.broadcast(F4, d * (ls - 32) * xs[sb + blk]), acc);
             }
         }

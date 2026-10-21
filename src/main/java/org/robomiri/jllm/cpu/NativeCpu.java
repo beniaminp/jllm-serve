@@ -565,6 +565,14 @@ public final class NativeCpu {
                     seg.set(f16, blk + 2, dmin);
                 }
                 case Q5_0, IQ4_NL -> seg.set(f16, blk, d);
+                case Q3_K -> seg.set(f16, blk + 108, d);
+                case F16, BF16 -> { // random bits are often NaN / inf: use small random halves
+                    for (int i = 0; i < 32; i++) {
+                        short h = type == QType.F16 ? Float.floatToFloat16((float) rnd.nextGaussian() * 0.1f)
+                                : (short) (Float.floatToRawIntBits((float) rnd.nextGaussian() * 0.1f) >>> 16);
+                        seg.set(f16, blk + 2L * i, h);
+                    }
+                }
                 case MXFP4 -> seg.set(ValueLayout.JAVA_BYTE, blk, (byte) (unit ? 128 : 118 + rnd.nextInt(8))); // 1.0, or 2^-10 .. 2^-3
                 case IQ4_XS -> {
                     seg.set(f16, blk, d);
