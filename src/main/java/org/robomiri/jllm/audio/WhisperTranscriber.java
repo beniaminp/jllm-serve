@@ -54,39 +54,50 @@ public final class WhisperTranscriber {
      */
     public record Options(String language, boolean translate, String prompt, boolean timestamps, double temperature,
                           boolean fallback, boolean conditionOnPrevious, int maxTokens, long seed,
-                          BooleanSupplier cancelled, DoubleConsumer progress, Consumer<Transcript.Segment> onSegment) {
+                          BooleanSupplier cancelled, DoubleConsumer progress, Consumer<Transcript.Segment> onSegment,
+                          boolean wordTimestamps) {
         public static Options defaults() {
-            return new Options(null, false, null, true, 0.0, true, true, 224, 0L, () -> false, f -> { }, s -> { });
+            return new Options(null, false, null, true, 0.0, true, true, 224, 0L, () -> false, f -> { }, s -> { }, false);
         }
 
         public Options withLanguage(String l) {
             return new Options(l, translate, prompt, timestamps, temperature, fallback, conditionOnPrevious, maxTokens, seed,
-                    cancelled, progress, onSegment);
+                    cancelled, progress, onSegment, wordTimestamps);
         }
 
         public Options withTranslate(boolean t) {
             return new Options(language, t, prompt, timestamps, temperature, fallback, conditionOnPrevious, maxTokens, seed,
-                    cancelled, progress, onSegment);
+                    cancelled, progress, onSegment, wordTimestamps);
         }
 
         public Options withPrompt(String p) {
             return new Options(language, translate, p, timestamps, temperature, fallback, conditionOnPrevious, maxTokens, seed,
-                    cancelled, progress, onSegment);
+                    cancelled, progress, onSegment, wordTimestamps);
         }
 
         public Options withTimestamps(boolean t) {
             return new Options(language, translate, prompt, t, temperature, fallback, conditionOnPrevious, maxTokens, seed,
-                    cancelled, progress, onSegment);
+                    cancelled, progress, onSegment, wordTimestamps);
         }
 
         public Options withTemperature(double t) {
             return new Options(language, translate, prompt, timestamps, t, fallback, conditionOnPrevious, maxTokens, seed,
-                    cancelled, progress, onSegment);
+                    cancelled, progress, onSegment, wordTimestamps);
+        }
+
+        public Options withFallback(boolean fb, boolean cond) {
+            return new Options(language, translate, prompt, timestamps, temperature, fb, cond, maxTokens, seed,
+                    cancelled, progress, onSegment, wordTimestamps);
+        }
+
+        public Options withWords(boolean w) {
+            return new Options(language, translate, prompt, timestamps, temperature, fallback, conditionOnPrevious, maxTokens,
+                    seed, cancelled, progress, onSegment, w);
         }
 
         public Options withCallbacks(BooleanSupplier c, DoubleConsumer p, Consumer<Transcript.Segment> s) {
             return new Options(language, translate, prompt, timestamps, temperature, fallback, conditionOnPrevious, maxTokens,
-                    seed, c, p, s);
+                    seed, c, p, s, wordTimestamps);
         }
     }
 
@@ -119,6 +130,7 @@ public final class WhisperTranscriber {
     private final int maxInitialTimestamp;
     private final Map<String, Integer> langIds = new LinkedHashMap<>();
     private final boolean[] suppress;
+    private final int[][] alignmentHeads;
 
     public WhisperTranscriber(WhisperNet net, Tokenizer tok, Path modelDir) throws IOException {
         this.net = net;
@@ -154,6 +166,22 @@ public final class WhisperTranscriber {
                     langIds.put(code, id);
                 }
             }
+        }
+        Object ah = gen.get("alignment_heads");
+        if (ah instanceof List<?> hl && !hl.isEmpty()) {
+            alignmentHeads = new int[hl.size()][];
+            for (int i = 0; i < hl.size(); i++) {
+                List<?> lh = (List<?>) hl.get(i);
+                alignmentHeads[i] = new int[]{((Number) lh.get(0)).intValue(), ((Number) lh.get(1)).intValue()};
+            }
+        } else { // OpenAI's default when a checkpoint names none: every head of the last half of the decoder
+            List<int[]> hs = new ArrayList<>();
+            for (int l = cfg.decLayers() / 2; l < cfg.decLayers(); l++) {
+                for (int h = 0; h < cfg.decHeads(); h++) {
+                    hs.add(new int[]{l, h});
+                }
+            }
+            alignmentHeads = hs.toArray(new int[0][]);
         }
         suppress = new boolean[cfg.vocab()];
         Object st = gen.get("suppress_tokens");
@@ -241,6 +269,7 @@ public final class WhisperTranscriber {
         List<Transcript.Segment> segments = new ArrayList<>();
         List<Integer> all = new ArrayList<>();      // text tokens decoded so far (the next window's prompt)
         int promptResetSince = 0;
+        double lastSpeech = 0.0;
         Map<String, Double> langProbs = Map.of();
         int seek = 0;
         Random rnd = new Random(o.seed());
@@ -339,17 +368,34 @@ public final class WhisperTranscriber {
                 if (seek <= previousSeek) {
                     seek = previousSeek + segSize;        // never stand still
                 }
+                List<int[]> segTokens = new ArrayList<>();
+                List<String> segTexts = new ArrayList<>();
+                List<double[]> segTimes = new ArrayList<>();
                 for (int i = 0; i < pieces.size(); i++) {
                     int[] textTok = Arrays.stream(pieces.get(i)).filter(t -> t < eot).toArray();
                     String text = textTok.length == 0 ? "" : tok.decode(textTok);
                     if (text.isBlank()) {
                         continue;
                     }
-                    double[] tm = times.get(i);
-                    Transcript.Segment seg = new Transcript.Segment(segments.size(), previousSeek, tm[0], tm[1], text,
-                            textTok, r.temperature(), r.avgLogprob(), compressionRatio(text), r.noSpeech());
+                    segTokens.add(textTok);
+                    segTexts.add(text);
+                    segTimes.add(times.get(i).clone());
+                }
+                List<List<Transcript.Word>> segWords = new ArrayList<>();
+                for (int i = 0; i < segTokens.size(); i++) {
+                    segWords.add(List.of());
+                }
+                if (o.wordTimestamps() && !segTokens.isEmpty()) {
+                    lastSpeech = addWordTimestamps(s, language, o.translate(), segTokens, segTimes, segWords, segSize,
+                            previousSeek * (double) LogMel.HOP / LogMel.SAMPLE_RATE, lastSpeech);
+                }
+                for (int i = 0; i < segTokens.size(); i++) {
+                    double[] tm = segTimes.get(i);
+                    Transcript.Segment seg = new Transcript.Segment(segments.size(), previousSeek, tm[0], tm[1], segTexts.get(i),
+                            segTokens.get(i), r.temperature(), r.avgLogprob(), compressionRatio(segTexts.get(i)), r.noSpeech(),
+                            segWords.get(i));
                     segments.add(seg);
-                    for (int t : textTok) {
+                    for (int t : segTokens.get(i)) {
                         all.add(t);
                     }
                     o.onSegment().accept(seg);
@@ -366,6 +412,112 @@ public final class WhisperTranscriber {
         }
         return new Transcript(language, o.translate() ? "translate" : "transcribe", duration, text.toString().strip(),
                 segments, langProbs);
+    }
+
+
+    // ------------------------------------------------------------------ word timestamps
+
+    /**
+     * OpenAI's {@code add_word_timestamps} for the segments of one window: one pass of the decoder over
+     * {@code [sot sequence, <|notimestamps|>, text tokens, <|endoftext|>]} returns the cross-attention of the alignment heads;
+     * {@link WordAligner} turns it into word times, which are cut up per segment. Segment start / end times are adjusted to
+     * the words at their edges like the reference does. Returns the new last speech timestamp.
+     */
+    private double addWordTimestamps(WhisperNet.Session s, String language, boolean translate, List<int[]> segTokens,
+                                     List<double[]> segTimes, List<List<Transcript.Word>> segWords, int numFrames,
+                                     double timeOffset, double lastSpeech) {
+        List<Integer> text = new ArrayList<>();
+        for (int[] t : segTokens) {
+            for (int x : t) {
+                text.add(x);
+            }
+        }
+        int[] textArr = text.stream().mapToInt(Integer::intValue).toArray();
+        List<Integer> seq = new ArrayList<>();
+        seq.add(sot);
+        if (multilingual()) {
+            seq.add(langIds.get(language));
+            seq.add(translate ? translateId : transcribeId);
+        }
+        int skip = seq.size();
+        seq.add(notimestamps);
+        for (int x : textArr) {
+            seq.add(x);
+        }
+        seq.add(eot);
+        int[] tokens = seq.stream().mapToInt(Integer::intValue).toArray();
+        int used = Math.min(cfg.sourcePos(), numFrames / 2);
+        float[][] weights;
+        try {
+            weights = s.crossAttention(tokens, alignmentHeads);
+        } catch (UnsupportedOperationException e) {
+            return lastSpeech;
+        }
+        List<WordAligner.Timing> alignment = WordAligner.align(weights, tokens.length, cfg.sourcePos(), used, skip, textArr,
+                language, tok, eot);
+        if (alignment.isEmpty()) {
+            return lastSpeech;
+        }
+        double[] durations = alignment.stream().mapToDouble(t -> t.end - t.start).filter(d -> d != 0).sorted().toArray();
+        double median = 0;
+        if (durations.length > 0) {
+            median = durations.length % 2 == 1 ? durations[durations.length / 2]
+                    : (durations[durations.length / 2 - 1] + durations[durations.length / 2]) / 2;
+        }
+        median = Math.min(0.7, median);
+        double maxDur = median * 2;
+        WordAligner.tidy(alignment);
+        int wordIndex = 0;
+        for (int si = 0; si < segTokens.size(); si++) {
+            int saved = 0;
+            List<Transcript.Word> words = new ArrayList<>();
+            double[] sw = null;                     // start / end of each kept word, mutable for the clean-up below
+            List<double[]> times = new ArrayList<>();
+            List<String> labels = new ArrayList<>();
+            while (wordIndex < alignment.size() && saved < segTokens.get(si).length) {
+                WordAligner.Timing t = alignment.get(wordIndex);
+                if (!t.word.isEmpty()) {
+                    labels.add(t.word);
+                    times.add(new double[]{round2(timeOffset + t.start), round2(timeOffset + t.end)});
+                }
+                saved += t.tokens.length;
+                wordIndex++;
+            }
+            double[] seg = segTimes.get(si);
+            if (!times.isEmpty()) {
+                double[] first = times.getFirst();
+                double[] lastW = times.getLast();
+                if (first[1] - lastSpeech > median * 4
+                        && (first[1] - first[0] > maxDur || (times.size() > 1 && times.get(1)[1] - first[0] > maxDur * 2))) {
+                    if (times.size() > 1 && times.get(1)[1] - times.get(1)[0] > maxDur) {
+                        double boundary = Math.max(times.get(1)[1] / 2, times.get(1)[1] - maxDur);
+                        first[1] = boundary;
+                        times.get(1)[0] = boundary;
+                    }
+                    first[0] = Math.max(timeOffset, first[1] - maxDur);
+                }
+                if (seg[0] < first[1] && seg[0] - 0.5 > first[0]) {
+                    first[0] = Math.max(0, Math.min(first[1] - median, seg[0]));
+                } else {
+                    seg[0] = first[0];
+                }
+                if (seg[1] > lastW[0] && seg[1] + 0.5 < lastW[1]) {
+                    lastW[1] = Math.max(lastW[0] + median, seg[1]);
+                } else {
+                    seg[1] = lastW[1];
+                }
+                lastSpeech = seg[1];
+            }
+            for (int i = 0; i < labels.size(); i++) {
+                words.add(new Transcript.Word(labels.get(i), times.get(i)[0], times.get(i)[1]));
+            }
+            segWords.set(si, words);
+        }
+        return lastSpeech;
+    }
+
+    private static double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
     }
 
     // ------------------------------------------------------------------ language detection

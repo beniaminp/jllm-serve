@@ -24,7 +24,11 @@ public record Transcript(String language, String task, double duration, String t
      * @param tokens text token ids (without timestamps)
      */
     public record Segment(int id, int seek, double start, double end, String text, int[] tokens, double temperature,
-                          double avgLogprob, double compressionRatio, double noSpeechProb) {
+                          double avgLogprob, double compressionRatio, double noSpeechProb, List<Word> words) {
+    }
+
+    /** A word with its start and end in seconds (from word-level timestamps). */
+    public record Word(String word, double start, double end) {
     }
 
     public static final List<String> FORMATS = List.of("json", "text", "srt", "vtt", "verbose_json");
@@ -55,16 +59,34 @@ public record Transcript(String language, String task, double duration, String t
             for (int t : s.tokens()) {
                 toks.add((long) t);
             }
-            segs.add(Json.obj("id", (long) s.id(), "seek", (long) s.seek(), "start", round(s.start()), "end", round(s.end()),
-                    "text", s.text(), "tokens", toks, "temperature", s.temperature(), "avg_logprob", round(s.avgLogprob()),
-                    "compression_ratio", round(s.compressionRatio()), "no_speech_prob", round(s.noSpeechProb())));
+            Map<String, Object> seg = Json.obj("id", (long) s.id(), "seek", (long) s.seek(), "start", round(s.start()),
+                    "end", round(s.end()), "text", s.text(), "tokens", toks, "temperature", s.temperature(), "avg_logprob",
+                    round(s.avgLogprob()), "compression_ratio", round(s.compressionRatio()), "no_speech_prob",
+                    round(s.noSpeechProb()));
+            if (!s.words().isEmpty()) {
+                seg.put("words", wordList(s.words()));
+            }
+            segs.add(seg);
         }
         Map<String, Object> m = Json.obj("task", task, "language", Languages.NAMES.getOrDefault(language, language),
                 "duration", round(duration), "text", text, "segments", segs);
         if (!languageProbs.isEmpty()) {
             m.put("language_probabilities", new java.util.LinkedHashMap<String, Object>(languageProbs));
         }
+        List<Word> all = new ArrayList<>();
+        segments.forEach(s -> all.addAll(s.words()));
+        if (!all.isEmpty()) {
+            m.put("words", wordList(all));      // OpenAI's timestamp_granularities[]=word puts the words at the top level
+        }
         return m;
+    }
+
+    private static List<Object> wordList(List<Word> words) {
+        List<Object> out = new ArrayList<>();
+        for (Word w : words) {
+            out.add(Json.obj("word", w.word().strip(), "start", round(w.start()), "end", round(w.end())));
+        }
+        return out;
     }
 
     private static double round(double v) {

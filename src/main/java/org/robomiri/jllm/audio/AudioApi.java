@@ -76,6 +76,13 @@ public final class AudioApi {
         WhisperTranscriber.Options o = WhisperTranscriber.Options.defaults()
                 .withLanguage(language).withTranslate(translate).withPrompt(blankToNull(field.apply("prompt")))
                 .withTemperature(temperature).withCallbacks(cancelled, f -> { }, s -> { });
+        String gran = field.apply("timestamp_granularities[]");
+        if (gran == null) {
+            gran = field.apply("timestamp_granularities");
+        }
+        if (gran != null && gran.contains("word")) {
+            o = o.withWords(true);        // "words" in verbose_json (and in every segment)
+        }
         o = defaults.apply(o);
         try {
             Transcript tr = model.transcriber.transcribe(audio, o);
@@ -94,8 +101,7 @@ public final class AudioApi {
         }
 
         WhisperTranscriber.Options apply(WhisperTranscriber.Options o) {
-            return new WhisperTranscriber.Options(o.language(), o.translate(), o.prompt(), o.timestamps(), o.temperature(),
-                    fallback, conditionOnPrevious, o.maxTokens(), o.seed(), o.cancelled(), o.progress(), o.onSegment());
+            return o.withFallback(fallback, conditionOnPrevious);
         }
     }
 

@@ -72,7 +72,13 @@ public class AudioController {
         }
         byte[] bytes = file == null ? null : file.getBytes();
         BooleanSupplier gone = ClientGone.of(req);
-        AudioApi.Reply r = AudioApi.transcribe(m.stt(), audio.decoder(), bytes, fields::get, translate,
+        String[] gran = req.getParameterValues("timestamp_granularities[]");   // repeated: segment and word
+        if (gran != null) {
+            fields = new java.util.HashMap<>(fields);
+            fields.put("timestamp_granularities[]", String.join(",", gran));
+        }
+        Map<String, String> f = fields;
+        AudioApi.Reply r = AudioApi.transcribe(m.stt(), audio.decoder(), bytes, f::get, translate,
                 audio.whisperDefaults(), gone);
         reply(res, r);
     }

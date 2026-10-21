@@ -57,6 +57,16 @@ public final class WhisperCpu implements WhisperNet {
         }
     }
 
+    /** A decoder session on an encoder output computed elsewhere (the Metal net's word-timestamp pass). */
+    public Session sessionOf(float[] encoderOutput) {
+        lock.lock();
+        try {
+            return new CpuSession(encoderOutput);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private float[] encoder(float[][] mel) {
         int d = c.dModel();
         int nm = c.nMels();
@@ -173,6 +183,8 @@ public final class WhisperCpu implements WhisperNet {
     // ------------------------------------------------------------------ attention
 
     private static final int QBLOCK = 32;
+    /** When set (by {@code crossAttention}), the next {@code attend} copies the probabilities of these heads: [head] -> [query][key]. */
+    private float[][] capture;
     private static final ThreadLocal<float[]> SCORES = new ThreadLocal<>();
 
     /**
@@ -217,6 +229,10 @@ public final class WhisperCpu implements WhisperNet {
                     }
                     for (int j = vis; j < len; j++) {
                         sc[o + j] = 0f;
+                    }
+                    float[][] cap = capture;
+                    if (cap != null && cap[h] != null) {
+                        System.arraycopy(sc, o, cap[h], (t0 + t) * len, len);
                     }
                 }
                 // O[t][e] = sum_j P[t][j] V[j][e], with V transposed: rows e, length vRow, first len used
@@ -284,13 +300,31 @@ public final class WhisperCpu implements WhisperNet {
         public void decode(int[] tokens, int off, int n, int pos, float[] logits) {
             lock.lock();
             try {
-                run(tokens, off, n, pos, logits);
+                run(tokens, off, n, pos, logits, null);
             } finally {
                 lock.unlock();
             }
         }
 
-        private void run(int[] tokens, int off, int n, int pos, float[] logits) {
+        @Override
+        public float[][] crossAttention(int[] tokens, int[][] heads) {
+            lock.lock();
+            try {
+                int n = tokens.length;
+                int t2 = c.sourcePos();
+                float[][] out = new float[heads.length][n * t2];
+                float[][][] cap = new float[c.decLayers()][c.decHeads()][];
+                for (int i = 0; i < heads.length; i++) {
+                    cap[heads[i][0]][heads[i][1]] = out[i];
+                }
+                run(tokens, 0, n, 0, new float[c.vocab()], cap);
+                return out;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private void run(int[] tokens, int off, int n, int pos, float[] logits, float[][][] cap) {
             if (pos < 0 || pos + n > maxPos) {
                 throw new IllegalArgumentException("decoder positions " + pos + ".." + (pos + n) + " exceed " + maxPos);
             }
@@ -333,7 +367,9 @@ public final class WhisperCpu implements WhisperNet {
                 Dense.layerNorm(x, 0, n, d, l.cross.lnGamma, l.cross.lnBeta, LN_EPS, xn, 0);
                 Dense.mul(pool, l.cross.q, xn, 0, d, n, q, 0, d, false);
                 scale(q, scale);
+                capture = cap == null ? null : cap[li];
                 attend(q, n, d, crossK[li], t2 * hd, crossVt[li], hd * t2, t2, heads, hd, -1, ctx);
+                capture = null;
                 Dense.mul(pool, l.cross.out, ctx, 0, d, n, x, 0, d, true);
                 Dense.layerNorm(x, 0, n, d, l.ffnLnGamma, l.ffnLnBeta, LN_EPS, xn, 0);
                 Dense.mul(pool, l.fc1, xn, 0, d, n, hid, 0, ffn, false);

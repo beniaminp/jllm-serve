@@ -27,6 +27,15 @@ public interface WhisperNet extends AutoCloseable {
          */
         void decode(int[] tokens, int off, int n, int pos, float[] logits);
 
+        /**
+         * The cross-attention probabilities of some decoder heads over the encoder positions for a run of {@code tokens}
+         * from position 0 (the cache is overwritten): {@code result[i][t * positions + p]} is the weight head
+         * {@code heads[i] = {layer, head}} gives query token t to encoder position p. Word timestamps need it.
+         */
+        default float[][] crossAttention(int[] tokens, int[][] heads) {
+            throw new UnsupportedOperationException("this device cannot return cross-attention weights");
+        }
+
         /** The encoder output {@code [positions][dModel]} (tests and diagnostics; may be expensive). */
         float[] encoderOutput();
 
