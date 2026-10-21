@@ -255,6 +255,28 @@ public final class BatchGroup {
         }
 
         @Override
+        public boolean supportsEmbeds() {
+            return inner.supportsEmbeds();
+        }
+
+        @Override
+        public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
+            locked(() -> inner.forwardEmbeds(embeds, off, n, pos, logits));
+        }
+
+        @Override
+        public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+            boolean[] ok = new boolean[1];
+            locked(() -> ok[0] = inner.setRopePositions(from, p));
+            return ok[0];
+        }
+
+        @Override
+        public boolean ropePositionsCustom() {
+            return inner.ropePositionsCustom();
+        }
+
+        @Override
         public boolean supportsPrefixReuse() {
             return inner.supportsPrefixReuse();
         }

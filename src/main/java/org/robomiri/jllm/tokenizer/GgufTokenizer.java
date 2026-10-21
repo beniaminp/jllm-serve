@@ -40,6 +40,12 @@ public final class GgufTokenizer {
     private static final String LLAMA3 =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     private static final String GPT2 = PreTokenizers.GPT2_REGEX;
+    /**
+     * SmolLM / SmolVLM: every digit alone, then the GPT-2 split of the rest (llama.cpp's two-step
+     * {@code LLAMA_VOCAB_PRE_TYPE_SMOLLM}; the digits first, so a single alternation with {@code \p{N}} in front is the same).
+     */
+    private static final String SMOLLM =
+            "\\p{N}|'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
     /**
      * The {@code tokenizer.ggml.pre} values with a known regex (llama.cpp's {@code LLAMA_VOCAB_PRE_TYPE_*}); the value
@@ -51,6 +57,7 @@ public final class GgufTokenizer {
             "llama3", LLAMA3,
             "llama-v3", LLAMA3,
             "gpt-2", GPT2,
+            "smollm", SMOLLM,
             "default", GPT2);
 
     /** Thrown when the file names a pre-tokenizer this build has no regex for. */

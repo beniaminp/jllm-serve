@@ -377,12 +377,41 @@ public final class CpuBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
+    }
+
+    // ---- images (vision encoders feed embeddings; Qwen-VL needs its own rotary positions)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
+        run(null, embeds, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        for (int i = 0; i < ropes.length; i++) {
+            ropes[i].refill(arch.ropeTables().get(i), ctx, from, p);
+        }
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
     }
 
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
     }
 
     @Override
@@ -393,7 +422,8 @@ public final class CpuBackend implements Backend {
         }
         CpuBackend[] owners = new CpuBackend[n];
         for (int t = 0; t < n; t++) {
-            if (!(members[t] instanceof CpuBackend o) || o.w != w || o.kv == null || positions[t] >= o.ctx) {
+            if (!(members[t] instanceof CpuBackend o) || o.w != w || o.kv == null || positions[t] >= o.ctx
+                    || o.ropeCustomFrom != Integer.MAX_VALUE) { // a row with its own rotary table cannot share the lender's
                 return false;
             }
             owners[t] = o;
@@ -427,16 +457,23 @@ public final class CpuBackend implements Backend {
         return true;
     }
 
-    /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    /**
+     * {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}).
+     * With {@code embeds != null} the input rows are those embeddings (rows {@code off ..}) and {@code tokens} is unused.
+     */
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
         int dim = c.dim();
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+        if (embeds != null) {
+            System.arraycopy(embeds, off * dim, x, 0, n * dim); // image embeddings are used as they are
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+            }
         }
-        if (c.embedScale() != 1f) {
+        if (embeds == null && c.embedScale() != 1f) {
             float es = c.embedScale();
             pool.forRange(n, 1, (t0, t1) -> {
                 for (int i = t0 * dim, m = t1 * dim; i < m; i++) {

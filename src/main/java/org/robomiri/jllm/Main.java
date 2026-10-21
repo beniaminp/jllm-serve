@@ -93,6 +93,10 @@ public final class Main {
     private static void run(ModelLoader.Loaded l, Settings s) {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             String text = s.has("prompt") ? s.get("prompt") : "Hello";
+            if (s.has("image")) {
+                runWithImages(engine, s, text);
+                return;
+            }
             int[] prompt = s.has("raw") && s.getBool("raw")
                     ? engine.tokenizer().encode(text)
                     : engine.renderChat(List.of(new ChatTemplate.Message("user", text)), s.getBool("chat.thinking"));
@@ -103,6 +107,54 @@ public final class Main {
             System.out.println();
             System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason());
         }
+    }
+
+    /** {@code run --image a.png,b.jpg --prompt "..."}: the pictures come first in the message, in the order given. */
+    private static void runWithImages(Engine engine, Settings s, String text) {
+        List<org.robomiri.jllm.vision.Rgb> images = new ArrayList<>();
+        StringBuilder content = new StringBuilder();
+        for (String f : s.get("image").split(",")) {
+            if (f.isBlank()) {
+                continue;
+            }
+            try {
+                images.add(org.robomiri.jllm.vision.ImageDecoder.decode(java.nio.file.Files.readAllBytes(java.nio.file.Path.of(f.trim())),
+                        s.getLong("vision.max-image-pixels")));
+            } catch (java.io.IOException e) {
+                throw new IllegalArgumentException("--image " + f + ": " + e.getMessage(), e);
+            }
+            content.append(org.robomiri.jllm.vision.MediaChat.MARK);
+        }
+        content.append(org.robomiri.jllm.vision.MediaChat.stripMarks(text));
+        long t0 = System.nanoTime();
+        org.robomiri.jllm.engine.MediaPrompt mp = org.robomiri.jllm.vision.MediaChat.render(engine,
+                List.of(new ChatTemplate.Message("user", content.toString())), s.getBool("chat.thinking"), images);
+        if (Boolean.getBoolean("jllm.vision.debug")) { // the prompt ids with each picture as <image n>
+            StringBuilder sb = new StringBuilder();
+            int[] tk = mp.tokens();
+            for (int i = 0; i < tk.length; ) {
+                org.robomiri.jllm.engine.MediaPrompt.Span sp = mp.spanAt(i);
+                if (sp != null && sp.start() == i) {
+                    sb.append(" <image ").append(sp.length()).append(">");
+                    i += sp.length();
+                } else {
+                    sb.append(' ').append(tk[i++]);
+                }
+            }
+            System.err.println("prompt:" + sb);
+        }
+        double encodeMs = engine.vision().lastEncodeMs();
+        System.err.printf("%d image(s) -> %d prompt tokens, %.0f ms to encode (%d new)%n", images.size(), mp.length(), encodeMs,
+                engine.vision().lastEncodedImages());
+        Engine.Result r = engine.generate(mp, s.sampling(), Engine.Decoding.NONE, 1, new Engine.ChoiceSink() {
+            @Override
+            public void text(int index, String t) {
+                System.out.print(t);
+                System.out.flush();
+            }
+        }, () -> false).getFirst();
+        System.out.println();
+        System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason() + ", total " + (System.nanoTime() - t0) / 1_000_000 + " ms");
     }
 
     private static void chat(ModelLoader.Loaded l, Settings s) throws Exception {

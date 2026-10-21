@@ -37,6 +37,7 @@ public final class Settings {
             Map.entry("low-disk", "model.low-disk"),
             Map.entry("gguf-file", "model.gguf-file"),
             Map.entry("gguf-quant", "model.gguf-quant"),
+            Map.entry("mmproj", "model.mmproj"),
             Map.entry("backend", "backend"),
             Map.entry("ctx", "backend.ctx"),
             Map.entry("batch", "backend.batch"),
@@ -58,7 +59,7 @@ public final class Settings {
             Map.entry("port", "server.port"));
 
     /** Flags that are not properties: per-invocation inputs. */
-    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config");
+    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config", "image");
 
     private final Properties props = new Properties();
     private final Map<String, String> sources = new LinkedHashMap<>();
@@ -239,6 +240,16 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
+        for (String k : new String[]{"vision.enabled", "vision.auto-download"}) {
+            getBool(k);
+        }
+        for (String k : new String[]{"vision.image-min-tokens", "vision.image-max-tokens", "vision.cache-mb",
+                "vision.max-image-bytes", "vision.max-image-pixels"}) {
+            require(getLong(k) >= 0, k, "must be 0 or positive");
+        }
+        require(getInt("vision.image-max-tokens") == 0 || getInt("vision.image-min-tokens") <= getInt("vision.image-max-tokens"),
+                "vision.image-min-tokens", "must not exceed vision.image-max-tokens");
         return this;
     }
 

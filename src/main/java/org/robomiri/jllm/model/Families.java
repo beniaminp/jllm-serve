@@ -529,7 +529,8 @@ final class Families {
 
             List<RopeTable> tables = new ArrayList<>(2);
             tables.add(mla != null ? new RopeTable(mla.rope(), ropeTheta, yarn != null ? yarn : Scaling.NONE, Pairing.INTERLEAVED)
-                    : new RopeTable(rotaryDim, ropeTheta, scaling, pairing));
+                    : new RopeTable(rotaryDim, ropeTheta, scaling, pairing, mropeSections(scalingMap),
+                    scalingMap != null && Json.bool(scalingMap, "mrope_interleaved", false)));
             boolean anyLocal = false;
             if (localTheta > 0 && local != null) {
                 for (boolean b : local) {
@@ -611,6 +612,26 @@ final class Families {
         };
     }
 
+    /** {@code mrope_section} of a Qwen-VL rope_scaling (three numbers; a trailing unused 4th section is dropped), else empty. */
+    static List<Integer> mropeSections(Map<String, Object> rs) {
+        if (rs == null || !(rs.get("mrope_section") instanceof List<?> l) || l.size() < 3) {
+            return List.of();
+        }
+        List<Integer> out = new ArrayList<>(3);
+        for (int i = 0; i < 3; i++) {
+            if (!(l.get(i) instanceof Number n)) {
+                throw new IllegalArgumentException("invalid mrope_section " + l);
+            }
+            out.add(n.intValue());
+        }
+        for (int i = 3; i < l.size(); i++) {
+            if (!(l.get(i) instanceof Number n) || n.intValue() != 0) {
+                throw new IllegalArgumentException("mrope_section with a non-zero 4th section is not supported: " + l);
+            }
+        }
+        return out;
+    }
+
     /**
      * @param rs the scaling map ({@code rope_scaling}, or the {@code rope_parameters} entry), null for plain RoPE
      * @param c  the config, for the position limits longrope derives its factor from
@@ -622,7 +643,7 @@ final class Families {
         String type = Json.str(rs, "rope_type", Json.str(rs, "type", "default"));
         double factor = Json.dbl(rs, "factor", 1.0);
         switch (type) {
-            case "default":
+            case "default", "mrope": // Qwen-VL's multimodal RoPE is plain RoPE for text (the sections: mropeSections)
                 return Scaling.NONE;
             case "llama3": {
                 double low = Json.dbl(rs, "low_freq_factor", 1.0);

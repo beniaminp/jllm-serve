@@ -93,9 +93,16 @@ public final class ChatTemplate {
                 return QWEN3;
             case "qwen2", "qwen2_5", "qwen2_moe":
                 return deepseekVocab ? DEEPSEEK : QWEN2;
+            case "smolvlm", "idefics3":
+                return SMOLVLM;
+            case "qwen2vl", "qwen2_vl", "qwen2_5_vl", "qwen25vl":
+                return QWEN2;
             case "llama":
                 if (deepseekVocab) {
                     return DEEPSEEK;
+                }
+                if (tok != null && tok.tokenId("<end_of_utterance>") >= 0 && tok.tokenId("<fake_token_around_image>") >= 0) {
+                    return SMOLVLM; // SmolVLM / Idefics3: a Llama text model with its own turn format
                 }
                 if (tok != null && !tok.isByteLevel() && tok.tokenId("<|start_header_id|>") < 0) {
                     throw new IllegalArgumentException("model_type llama with a SentencePiece tokenizer (Llama 2) has no"
@@ -441,6 +448,38 @@ public final class ChatTemplate {
         }
     }, "<|endoftext|>", "<|user|>", "<|observation|>");
 
+    /**
+     * SmolVLM / Idefics3 (a Llama text model): {@code <|im_start|>} (its BOS, not ChatML), then {@code User: text
+     * <end_of_utterance>} / {@code Assistant: text<end_of_utterance>} lines; a system message is its text and a blank
+     * line. This is llama.cpp's built-in {@code smolvlm} format (the Jinja template of the model differs in leaving
+     * out the space after {@code User:} when the message starts with an image).
+     */
+    private static final Format SMOLVLM = new Family("smolvlm", (m, gen, think, o) -> {
+        o.ctl("<|im_start|>");
+        for (Message msg : m) {
+            String role = role(msg, "system", "user", "assistant");
+            switch (role) {
+                case "system" -> {
+                    o.txt(content(msg));
+                    o.ctl("\n\n");
+                }
+                case "user" -> {
+                    o.ctl("User: ");
+                    o.txt(content(msg));
+                    o.ctl("<end_of_utterance>\n");
+                }
+                default -> {
+                    o.ctl("Assistant: ");
+                    o.txt(content(msg));
+                    o.ctl("<end_of_utterance>\n");
+                }
+            }
+        }
+        if (gen) {
+            o.ctl("Assistant:");
+        }
+    }, "<end_of_utterance>");
+
     /** Mamba / GPT-NeoX base models have no chat format: the message contents as plain text, one per line. */
     private static final Format MAMBA = new Family("plain", (m, gen, think, o) -> {
         for (int i = 0; i < m.size(); i++) {
@@ -464,8 +503,22 @@ public final class ChatTemplate {
         }
 
         void txt(String s) {
-            texts.add(s);
-            control.add(false);
+            // a picture in the message (U+FFFC) is a control piece of its own, so the content around it stays text
+            int i = s.indexOf(Tokenizer.IMAGE_MARK_TEXT);
+            while (i >= 0) {
+                if (i > 0) {
+                    texts.add(s.substring(0, i));
+                    control.add(false);
+                }
+                texts.add(Tokenizer.IMAGE_MARK_TEXT);
+                control.add(true);
+                s = s.substring(i + 1);
+                i = s.indexOf(Tokenizer.IMAGE_MARK_TEXT);
+            }
+            if (!s.isEmpty() || texts.isEmpty() || !texts.get(texts.size() - 1).equals(Tokenizer.IMAGE_MARK_TEXT)) {
+                texts.add(s);
+                control.add(false);
+            }
         }
     }
 

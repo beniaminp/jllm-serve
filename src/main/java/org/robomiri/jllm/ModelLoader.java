@@ -131,7 +131,10 @@ public final class ModelLoader {
     }
 
     /** A model ready to run: architecture, tokenizer and weights, from a safetensors checkpoint or a GGUF file. */
-    public record Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) {
+    public record Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir, Path gguf) {
+        public Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) {
+            this(arch, tok, weights, dir, null);
+        }
     }
 
     public static Loaded load(Settings s, HuggingFaceHub hub, String model) throws Exception {
@@ -178,6 +181,7 @@ public final class ModelLoader {
                             + " tokens per pass" + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
                 }
             }
+            attachVision(s, hub, model, p, engine);
             return new Loaded(weights, engine);
         } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
             if (draft != null) {
@@ -187,6 +191,44 @@ public final class ModelLoader {
             weights.close();
             throw e;
         }
+    }
+
+    /**
+     * Gives {@code engine} eyes when its GGUF model has a multimodal projector next to it ({@code model.mmproj}, or an
+     * {@code mmproj*.gguf} in the same folder / repository; docs/20). A projector that was named explicitly and does not
+     * work is an error; one found automatically that does not fit the model is only reported.
+     */
+    private static void attachVision(Settings s, HuggingFaceHub hub, String model, Prepared p, Engine engine) throws Exception {
+        if (p.gguf() == null || !s.getBool("vision.enabled")) {
+            return;
+        }
+        Path mm = org.robomiri.jllm.vision.Mmproj.locate(s, hub, model, p.gguf());
+        if (mm == null) {
+            return;
+        }
+        try {
+            org.robomiri.jllm.vision.VisionContext vc = org.robomiri.jllm.vision.VisionContext.open(mm, p.tok(), p.arch(),
+                    visionOptions(s));
+            engine.setVision(vc, true);
+            System.err.println("Vision: " + vc.describe());
+        } catch (IOException | RuntimeException e) {
+            if (s.opt("model.mmproj") != null) {
+                throw e;
+            }
+            System.err.println("warning: the projector " + mm.getFileName() + " next to the model cannot be used, loading it as"
+                    + " a text model: " + e.getMessage());
+        }
+    }
+
+    /** The vision encoder options of the settings. */
+    public static org.robomiri.jllm.vision.VisionContext.Options visionOptions(Settings s) {
+        String backend = s.get("vision.backend");
+        if (backend.equals("auto")) {
+            backend = s.get("backend");
+        }
+        return new org.robomiri.jllm.vision.VisionContext.Options(backend, s.getInt("backend.threads"),
+                new org.robomiri.jllm.vision.Preprocess.Limits(s.getInt("vision.image-min-tokens"), s.getInt("vision.image-max-tokens")),
+                s.getInt("vision.cache-mb"));
     }
 
     /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
@@ -250,6 +292,7 @@ public final class ModelLoader {
         if (spec.mode() == Speculator.Mode.NGRAM) {
             e.enableSpeculation(spec, null);
         }
+        e.setVision(first.vision(), false); // the encoder is shared; the first engine closes it
         return e;
     }
 
@@ -303,7 +346,7 @@ public final class ModelLoader {
         }
         System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs (tokenizer %.2fs)%n", arch.core().architecture(),
                 weights.quant, weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9, tokNanos / 1e9);
-        return new Prepared(arch, tok, weights, null);
+        return new Prepared(arch, tok, weights, null, src.gguf());
     }
 
     /** The tokenizer built from the file; when its pre-tokenizer is unknown, the tokenizer.json of the original repository. */

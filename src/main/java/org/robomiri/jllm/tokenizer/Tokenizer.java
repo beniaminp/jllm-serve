@@ -60,6 +60,14 @@ import java.util.function.UnaryOperator;
  */
 public final class Tokenizer {
 
+    /**
+     * A message text can carry pictures: each U+FFFC (the "object replacement character") written as a control piece
+     * by {@link ChatTemplate} becomes the pseudo id {@link #IMAGE_MARK} in the ids a {@link SequenceEncoder} produces,
+     * which the vision layer then replaces by the picture's tokens. Never a vocabulary id.
+     */
+    public static final String IMAGE_MARK_TEXT = "￼";
+    public static final int IMAGE_MARK = -2;
+
     /** Qwen2/3 pre-tokenizer, used only when a byte-level tokenizer.json carries no pre-tokenizer at all. */
     private static final String DEFAULT_SPLIT =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
@@ -492,7 +500,19 @@ public final class Tokenizer {
 
         /** Appends a control string; added tokens in it become their ids. */
         public SequenceEncoder special(String text) {
+            if (IMAGE_MARK_TEXT.equals(text)) {
+                return imageMark();
+            }
             return scan(text, 0, ANY_TOKEN);
+        }
+
+        /** An image goes here: the pseudo id {@link Tokenizer#IMAGE_MARK}, which the vision layer replaces. */
+        private SequenceEncoder imageMark() {
+            flushRun();
+            out.add(IMAGE_MARK);
+            consumed = true;
+            pendingRstrip = false;
+            return this;
         }
 
         /** Appends untrusted text: special (and protected) tokens in it stay text, other added tokens are matched. */
@@ -502,6 +522,9 @@ public final class Tokenizer {
 
         /** {@link #special(String)} of a piece from a {@link Boundary} on (the part before it is encoded already). */
         public SequenceEncoder special(String text, int from) {
+            if (IMAGE_MARK_TEXT.equals(text)) {
+                return imageMark();
+            }
             return scan(text, from, ANY_TOKEN);
         }
 

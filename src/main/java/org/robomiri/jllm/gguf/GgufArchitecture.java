@@ -26,6 +26,8 @@ final class GgufArchitecture {
     enum Family {
         LLAMA("llama", "llama"),
         QWEN2("qwen2", "qwen2"),
+        /** Qwen2-VL / Qwen2.5-VL's text model: Qwen2 with multimodal RoPE sections ({@code rope.dimension_sections}). */
+        QWEN2VL("qwen2vl", "qwen2"),
         QWEN3("qwen3", "qwen3"),
         QWEN3MOE("qwen3moe", "qwen3_moe");
 
@@ -146,6 +148,19 @@ final class GgufArchitecture {
             c.put("norm_topk_prob", true); // llama.cpp always normalizes the selected expert weights for qwen3moe
         }
         Map<String, Object> scaling = ropeScaling(g, p, family, headDim);
+        if (family == Family.QWEN2VL) {
+            long[] sec = g.longs(p + "rope.dimension_sections");
+            if (sec == null || sec.length < 3) {
+                throw new IOException("GGUF metadata has no " + p + "rope.dimension_sections (Qwen-VL's rotary sections)");
+            }
+            scaling = scaling == null ? new LinkedHashMap<>() : scaling;
+            scaling.putIfAbsent("rope_type", "mrope");
+            List<Object> l = new ArrayList<>();
+            for (long s : sec) {
+                l.add(s);
+            }
+            scaling.put("mrope_section", l);
+        }
         if (scaling != null) {
             c.put("rope_scaling", scaling);
         }
