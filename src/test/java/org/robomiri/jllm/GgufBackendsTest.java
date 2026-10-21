@@ -172,10 +172,15 @@ public final class GgufBackendsTest {
                     Path p = dir.resolve(family + "-" + mode + ".gguf");
                     write(p, family, mode, 100 + family.hashCode() + mode.hashCode());
                     float[][] cpu;
+                    float[][] cpu8;
                     float[][] gpu;
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
                          CpuBackend b = new CpuBackend(w, 64, 40, 4, KvDtype.F32, false)) {
                         cpu = run(b, prompt);
+                    }
+                    try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
+                         CpuBackend b = new CpuBackend(w, 64, 40, 4, KvDtype.F32, true)) {
+                        cpu8 = run(b, prompt); // int8 activations: decode (and MoE) matmuls on the integer kernels, Java or native
                     }
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
                          MetalBackend b = new MetalBackend(w, 64, 40, lib, KvDtype.F32)) {
@@ -199,7 +204,19 @@ public final class GgufBackendsTest {
                     // -Djllm.metal.hmma=false brings every type to ~1e-6
                     check(diff < 1e-3 + 2e-4 * mag, family + "/" + mode + ": CPU vs Metal max logit diff " + diff);
                     check(sameTokens, family + "/" + mode + ": same greedy tokens");
-                    System.out.printf("%-9s %-6s CPU vs Metal: max logit diff %.2e (max |logit| %.2f)%n", family, mode, diff, mag);
+                    // the activation rounding of the int8 path (~0.5% of each dot product's terms) against the float path
+                    // (greedy decode feeds each argmax back in: after the first step where the two paths pick different tokens
+                    // they no longer see the same input, so the comparison stops at that step)
+                    double diff8 = 0;
+                    for (int st = 0; st < cpu.length; st++) {
+                        diff8 = Math.max(diff8, GgufModelTest.maxDiff(new float[][]{cpu[st]}, new float[][]{cpu8[st]}));
+                        if (GgufModelTest.argmax(cpu[st]) != GgufModelTest.argmax(cpu8[st])) {
+                            break;
+                        }
+                    }
+                    check(diff8 < 0.05 * Math.max(1.0, mag), family + "/" + mode + ": CPU int8 activations vs float, max logit diff " + diff8);
+                    System.out.printf("%-9s %-6s CPU vs Metal: max logit diff %.2e (max |logit| %.2f); int8 activations vs float %.2e%n",
+                            family, mode, diff, mag, diff8);
                 }
             }
         } finally {
