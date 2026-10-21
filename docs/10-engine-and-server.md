@@ -1,7 +1,8 @@
 # 10. The engine and the server — generation loop, HTTP, OpenAI API, configuration
 
-Code: `engine/Engine.java`, `server/HttpServer.java`, `server/ApiServer.java`, `server/WebUi.java`,
-`config/Settings.java`, `src/main/resources/jllm.properties`, `Main.java`.
+Code: `engine/Engine.java`, `engine/TokenLogprob.java`, `server/HttpServer.java`, `server/ApiServer.java`,
+`server/OpenAiFeatures.java`, `sampling/JsonConstraint.java`, `server/WebUi.java`, `config/Settings.java`,
+`src/main/resources/jllm.properties`, `Main.java`.
 
 Everything before this chapter computes *one* next-token distribution. This chapter is about the loop around
 it, and about getting text in and out over the network with nothing but `java.net`.
@@ -317,6 +318,116 @@ under `stream_options`, no usage at all). Without `stream_options` the legacy in
 
 Streaming uses the same `text_completion` objects with a `text` field per event.
 
+### More than one answer, probabilities and structured output
+
+Beyond the sampling fields the server implements the rest of OpenAI's generation options. They are parsed and
+validated in one place, `OpenAiFeatures`, which the web console's `/v1` endpoints use too, so both servers accept
+the same requests. Each is explained in plain terms first, then exactly.
+
+**`n`: several answers to one prompt.** With `"n": 3` the response has three choices, each an independent sample
+(with `temperature: 0` they are all the same greedy answer, as with OpenAI). They are generated one after the other
+by `Engine.generate(prompt, params, decoding, n, sink, cancelled)` under a single hold of the engine lock: choice 0
+prefills the prompt, and each further choice finds the prompt in the prefix cache (10.2) and recomputes only its
+last token, so a 2,000-token prompt costs one prefill, not three. Choice *i* of a seeded request samples with
+`seed + i` (so choice 0 is exactly the single-answer response); without a seed each choice draws its own. `n` is
+1 to 16. `usage.prompt_tokens` counts the prompt once, `completion_tokens` sums all choices. When streaming, the
+choices are streamed in turn, every chunk carrying its choice's `index`: a role chunk, the deltas, and one
+`finish_reason` chunk per index (the inline legacy `usage` rides on the last choice's, the `stream_options` one
+follows in its own event as before). Because choice 1 onward recompute the last prompt token with a single-token
+step rather than in the prefill batch, its logits can differ from choice 0's in the last bits (the
+prefill-versus-decode caveat of `Backend.forward`).
+
+**`logprobs`: how likely each token was.** The log-probability of a token is the natural log of the probability
+the model gave it, a number at most 0 (−0.01 almost certain, −5 a long shot). For logits *z* over the vocabulary,
+
+```
+logprob(t) = z_t − log Σ_j exp(z_j)          (log-softmax, computed as  z_t − (m + log Σ_j exp(z_j − m)),  m = max z)
+```
+
+jllm reports the log-softmax of the **raw model logits**, before repetition and presence/frequency penalties,
+`logit_bias`, temperature, top-k/top-p/min-p truncation and any `response_format` mask: the model's own
+distribution, the same whatever the sampling settings, so values are comparable across requests and summing them
+scores a text (OpenAI documents its values as the model's distribution too). The cost is one pass over the
+vocabulary per token (`TokenLogprob.of`, a max, a sum of exponentials and a short sorted list for the
+alternatives). A request with logprobs, `echo` scoring or a JSON constraint decodes every step on the CPU from its
+own logits: speculative decoding (10.9) and the pipelined greedy path are off for it.
+
+- Chat: `"logprobs": true` and optionally `"top_logprobs": k` (0 to 20) return per choice
+  `"logprobs": {"content": [{"token", "logprob", "bytes", "top_logprobs": [{"token", "logprob", "bytes"}, …]}, …],
+  "refusal": null}`. `token` is the token's bytes as UTF-8 (a fragment of a multi-byte character shows as U+FFFD,
+  which is why `bytes`, the raw byte values, is there). `top_logprobs` without `"logprobs": true` is a 400.
+- Completions: `"logprobs": k` (0 to 20) returns parallel lists `tokens`, `token_logprobs`, `top_logprobs` (one
+  object per position mapping the k most likely token texts, plus the chosen one as OpenAI does, to their
+  logprobs) and `text_offset` (each token's character offset in the returned `text`).
+- Streaming: each chunk carries the entries of the tokens generated since the previous chunk (a token held back
+  by a possible stop string arrives with the text it belongs to; the tokens of a matched stop string are reported
+  although their text is cut).
+
+**`logit_bias`: nudging or banning tokens.** `{"logit_bias": {"15339": 5, "9906": -100}}` adds the given number
+to those tokens' logits (keys are token ids as strings, values in [−100, 100]) before sampling, after the
+penalties, exactly like OpenAI's: +1…+5 makes a token more likely, −100 removes it in practice (e^−100 next to
+anything else), +100 all but forces it. The bias is a dense array in `Sampler`, so it applies to greedy and sampled
+decoding and to speculative verification alike; only the device-side greedy pipe is skipped, since it computes
+the argmax on the GPU without it. An id outside the vocabulary is a 400.
+
+**`response_format`: answers that are valid JSON.** `{"type": "json_object"}` makes the output a JSON object;
+`{"type": "json_schema", "json_schema": {"schema": {…}}}` makes it a JSON value matching the schema. This is
+*constrained decoding*: at every step tokens that would break the JSON are masked out before sampling, so the
+model can only write a valid prefix, and once the value is complete the generation ends (finish reason
+`stop`). The model is not told about the format: as with OpenAI, put "answer in JSON" (and the fields you want)
+in the prompt, or a model that wanted to write prose will produce `{}` after some whitespace. With Qwen3,
+thinking is switched off for these requests (a `<think>` block is not JSON).
+
+How the mask works (`JsonConstraint`). Every token's bytes are taken from the tokenizer once and cached
+(`tokenTable`; special tokens never qualify, end-of-sequence tokens only when the value is complete). The output
+so far is the state of a byte-level pushdown automaton: a stack of frames (object, array, string, number,
+literal) that knows, for instance, "inside an object of schema S, keys `a` and `b` seen, expecting `,` or `}`".
+A token is allowed when its bytes, fed one by one to a copy of that state, are all accepted. Testing all ~150,000
+tokens at every step would cost more than the forward pass, so `Sampler.sample(logits, allowed)` checks lazily:
+it takes the 256 most likely tokens (after penalties and bias), tests them most likely first, and keeps the
+allowed ones; only if none of them is allowed (typically the first token, when the model wanted to write
+"Sure") does it scan the whole vocabulary, where a table of allowed first bytes, built from the state once more
+than 512 tokens were tested, rejects most tokens without a copy. Greedy takes the first allowed token, i.e. the
+argmax of the masked distribution. Sampling renormalizes over the allowed candidates and applies temperature,
+top-k (the k most likely *allowed* tokens), top-p and min-p to that distribution; allowed tokens outside the 256
+candidates are left out, an approximation that only drops tail mass. Whitespace between JSON tokens is limited to
+one newline and 64 bytes per gap, so a reluctant model cannot fill `max_tokens` with blank lines. If
+`max_tokens` runs out first, the output is a valid but unfinished prefix with finish reason `length`, as with
+OpenAI.
+
+The schema subset that is enforced: `type` (`object`, `array`, `string`, `number`, `integer`, `boolean`, `null`,
+or a list of them; without `type`, `properties` / `required` / `additionalProperties` imply an object and `items`
+an array), `properties`, `required` (`}` is refused until every required key was written),
+`additionalProperties` (`false`: only the listed keys, each at most once; a schema: the type of the other keys'
+values), `items`, `minItems` / `maxItems`, `minLength` / `maxLength` (characters), `enum` and `const` (matched
+against the values' compact serialization, e.g. `"red"` or `1.5`), `anyOf` / `oneOf` whose alternatives start with
+different JSON types (the common `{"anyOf": [{…object…}, {"type": "null"}]}` of optional fields: the first byte of
+the value picks the alternative), local `$ref` (`#`, `#/$defs/…`, `#/definitions/…`, recursion allowed) and
+OpenAPI's `nullable`. Annotations (`title`, `description`, `default`, `examples`, `format`, `$schema`, …) are
+ignored. Any other keyword (`pattern`, `minimum`, `allOf`, tuple `items`, …) is a 400 naming it, rather than a
+schema that is silently enforced only in part. Keys are not reordered: the model writes them in the order it
+likes. Duplicate keys are refused in any object.
+
+**`echo` (completions): the prompt in front.** `"echo": true` returns the prompt followed by the completion in
+`text` (streamed: the prompt is the first chunk of each choice). With `logprobs` the prompt's tokens come first in
+the lists too, the first with `null` (nothing predicts it), the others with their log-probabilities: for this the
+prompt is prefilled through `Backend.forwardAll` in chunks of 16 tokens, which returns every position's logits
+(without the prefix cache, since every position is needed). `"max_tokens": 0` is then allowed and only scores the
+prompt. A BOS token the engine adds in front is not echoed.
+
+**`suffix` (completions): fill in the middle.** With `"prompt": "def area(r):\n    "` and
+`"suffix": "\n    return a"`, a code model writes what goes between. This needs a model trained for it, whose
+tokenizer has `<|fim_prefix|>`, `<|fim_suffix|>` and `<|fim_middle|>` (the Qwen2.5-Coder family): the prompt
+becomes `<|fim_prefix|>` prompt `<|fim_suffix|>` suffix `<|fim_middle|>` (prefix-suffix-middle order) and the
+completion is the middle. For any other tokenizer the request is a 400 that says so. `echo` and `suffix` together
+are a 400.
+
+**`best_of` (completions): pick the most likely.** `"best_of": 5, "n": 2` generates five candidates and returns
+the two whose total log-probability (the sum of their tokens' logprobs, i.e. the log-likelihood of the sequence)
+is highest, most likely first. `best_of` must be at least `n` (default `n`), at most 16, and cannot be combined
+with `stream` (a 400, as with OpenAI): the choice is only known at the end. `usage.completion_tokens` counts all
+candidates' tokens.
+
 ### Errors
 
 Every error, from the HTTP layer or the API, is a JSON body of one shape:
@@ -347,10 +458,11 @@ are refused with the same code *before* tokenizing, so a huge body never reaches
 clamped to the room left in the context.
 
 **Unsupported OpenAI fields.** Rather than silently ignoring what it cannot honour, the server answers 400
-(`"... is not supported"`) for `n` other than 1, non-empty `tools`, `tool_choice` other than `"none"`,
-`response_format` other than text, `logprobs`, non-empty `logit_bias`, `echo`, `suffix`, `best_of` other than 1,
-message content parts that are not `text`, and a completion `prompt` that is not one string (batches and token-id
-arrays).
+(`"... is not supported"`) for non-empty `tools` and `tool_choice` other than `"none"` (function calling is the
+web console's job: its `/v1` endpoints implement it), message content parts that are not `text`, and a completion
+`prompt` that is not one string (batches and token-id arrays). Out-of-range or malformed values of the fields
+above (`n` 17, `top_logprobs` 21, a `logit_bias` of 500, an unsupported schema keyword, `echo` on chat, …) are a
+400 naming the field.
 
 **After the stream has started** the status line is long gone. If an exception happens then, the server sends
 one more event, `data: {"error": {"message": "internal server error", "type": "server_error"}}`, ends the
@@ -560,7 +672,9 @@ backend and weights closed again.
   thread so that a stalled client costs a timeout, not the engine. Limits (body size, header size, read and
   write deadlines, queue wait) turn hostile or broken clients into plain JSON errors.
 - The API mirrors OpenAI's chat and completion endpoints closely enough for the official SDKs and the bundled
-  web page.
+  web page, including `n`, `logprobs` (log-softmax of the raw logits), `logit_bias`, `echo`, `suffix` (fill in the
+  middle), `best_of` and `response_format` (constrained decoding: a byte-level JSON automaton masks the sampler's
+  candidates, most likely first).
 - Speculative decoding (off by default) proposes tokens by prompt lookup or with a small draft model, verifies them
   in one multi-token pass (`Backend.forwardAll`) and keeps what the target would have produced: identical greedy
   output, the target's distribution when sampling; it pays only when a pass of n tokens is much cheaper than n steps.
