@@ -97,7 +97,7 @@ The two settings differ only in decode (prefill keeps the float `dot4x4` tiles):
 | | prefill | decode | decode speedup |
 |---|---|---|---|
 | float activations (`false`) | ~237 tok/s | ~13 tok/s | — |
-| int8 activations (`true`, default) | ~275 tok/s | ~51 tok/s | **~3.9×** |
+| int8 activations (`true`; what `auto` picks on NEON) | ~275 tok/s | ~51 tok/s | **~3.9×** |
 
 An earlier A/B run on a loaded machine (interleaved, best of two, load average 5–17) gave 13.4 and 53.7 tok/s
 (4.0×) with the same prefill, so the ratio is stable. Per kernel, single-threaded and undisturbed, the Q4 row

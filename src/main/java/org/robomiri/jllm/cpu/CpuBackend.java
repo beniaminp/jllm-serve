@@ -72,6 +72,20 @@ public final class CpuBackend implements Backend {
     private final LayerPlan[] plans;
 
     /**
+     * Resolves {@code backend.cpu.int8-activations}: {@code true} / {@code false} as given, {@code auto} by timing both
+     * paths on {@code w} once (see {@link CpuMatmul#int8Faster}).
+     */
+    public static boolean int8Activations(String setting, ModelWeights w, int threads) {
+        return switch (setting.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "true" -> true;
+            case "false" -> false;
+            case "auto" -> CpuMatmul.int8Faster(w, threads);
+            default -> throw new IllegalArgumentException("backend.cpu.int8-activations must be auto, true or false, got '"
+                    + setting + "'");
+        };
+    }
+
+    /**
      * @param int8Activations quantize activations to int8 per 32-block and use integer dot products for the
      *                        single-token (decode / MoE) matmuls instead of dequantizing weights to float
      *                        (Q4_0 and Q8_0 weights; other formats keep the float path)

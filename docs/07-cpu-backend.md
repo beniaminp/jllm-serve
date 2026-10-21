@@ -580,6 +580,19 @@ int8 activations off; with the default `true`, CPU and Metal greedy outputs can 
 near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 `--backend.cpu.int8-activations false` whenever an exact CPU/Metal comparison is wanted.
 
+### 7.10.1 `auto`: measure, don't guess
+
+🧸 Two roads lead to the same town. On some machines the short road (int8) is faster, on others the wide road
+(float) is. Instead of guessing, the program drives both once when a model loads and takes the faster one from then on.
+
+📐 `backend.cpu.int8-activations=auto` (the default) times one representative single-token matmul of the loaded
+model, the first layer's `o_proj` (else the LM head), 24 times each way, alternating, and compares the best of the
+last 20. The int8 path wins where the CPU has cheap byte dot products (NEON `sdot`: ~3.9× faster decode on Apple
+silicon, the table above). On x86 with AVX-512 but no VNNI, the 16-bit widening multiplies cost more than streaming
+the float-dequantized weights; on a 4-core AVX-512 machine the probe measured int8 1619 µs vs float 402 µs for
+Q4_0 1024×2048 and chose float. The result is printed (`int8 activations: auto -> off (...)`) and cached per model,
+so the slots of a server share one measurement. `true` / `false` force a path.
+
 ## 7.11 What to optimize next
 
 In order of expected payoff on this CPU:

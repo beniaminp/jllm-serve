@@ -60,6 +60,63 @@ final class CpuMatmul {
         return int8;
     }
 
+    /** Probe results per weights ({@link #int8Faster}): every slot of a model would measure the same thing. */
+    private static final java.util.Map<ModelWeights, Boolean> PROBED =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /**
+     * Whether single-token matmuls of {@code w} run faster with int8 activations than with float ones on this machine
+     * ({@code backend.cpu.int8-activations=auto}). Integer dot products win where the CPU multiplies bytes cheaply
+     * (ARM NEON's {@code sdot}, AVX-VNNI); on AVX-512 without them the float kernels can be faster, as the weights are
+     * streamed either way and the int8 path adds the activation's quantization. Times one representative tensor (the
+     * first layer's attention output projection, else the LM head) both ways on {@code threads} threads and keeps
+     * the faster; a type the int8 kernels do not cover gives false.
+     */
+    static boolean int8Faster(ModelWeights w, int threads) {
+        Boolean known = PROBED.get(w);
+        if (known != null) {
+            return known;
+        }
+        QTensor t = w.lmHead;
+        for (LayerWeights L : w.layers) {
+            if (L instanceof org.robomiri.jllm.model.DecoderLayer d && d.wo() != null) {
+                t = d.wo();
+                break;
+            }
+        }
+        boolean faster = false;
+        try (ThreadPool pool = new ThreadPool(threads)) {
+            CpuMatmul i8 = new CpuMatmul(pool, true, false, 4 * t.cols);
+            CpuMatmul f32 = new CpuMatmul(pool, false, false, 4 * t.cols);
+            if (i8.useInt8(t)) {
+                float[] in = new float[t.cols];
+                java.util.Random r = new java.util.Random(1);
+                for (int i = 0; i < in.length; i++) {
+                    in[i] = (float) r.nextGaussian();
+                }
+                float[] out = new float[t.rows];
+                long best8 = Long.MAX_VALUE;
+                long bestF = Long.MAX_VALUE;
+                for (int round = 0; round < 24; round++) { // alternating, so both see the same clocks and caches
+                    long a = System.nanoTime();
+                    i8.mul(t, in, out, 0, 1, false);
+                    long b = System.nanoTime();
+                    f32.mul(t, in, out, 0, 1, false);
+                    long c = System.nanoTime();
+                    if (round >= 4) { // the first rounds warm up the JIT
+                        best8 = Math.min(best8, b - a);
+                        bestF = Math.min(bestF, c - b);
+                    }
+                }
+                faster = best8 < bestF;
+                System.err.printf("int8 activations: auto -> %s (%s %dx%d: int8 %.0f us, float %.0f us)%n",
+                        faster ? "on" : "off", t.type, t.rows, t.cols, best8 / 1e3, bestF / 1e3);
+            }
+        }
+        PROBED.put(w, faster);
+        return faster;
+    }
+
     /**
      * The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0 and their ggml layouts
      * Q4_0G, Q8_0G) and the K-quants of {@link KQuantKernels} (Q4_K, Q5_K, Q6_K); Q2_K stays on the float kernels.

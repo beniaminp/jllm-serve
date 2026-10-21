@@ -307,8 +307,9 @@ number, a malformed boolean (booleans are `true|false|yes|no|on|off|1|0`; a stra
 `false`) or an unknown `model.quant` / `backend.kv-dtype` / `backend` value stops the program with a message and
 exit status 2. `prompt`, `raw` and `config` are command line flags only and are rejected in a properties file.
 Notable keys besides the usual ones: `backend.kv-dtype` (`f32` or `f16`), `backend.cpu.int8-activations`
-(default `true`; the CPU quantizes activations to int8 for integer dot products, several times faster decode but
-~1 % different numerics; `false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
+(default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
+activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
+`false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 

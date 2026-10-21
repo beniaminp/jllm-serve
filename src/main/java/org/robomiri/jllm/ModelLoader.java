@@ -375,20 +375,20 @@ public final class ModelLoader {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                            s.getBool("backend.cpu.int8-activations"))
+                            int8(s, weights, threads))
                     : member && group(s, weights) != null // a group's slots share one pool: they never compute at once
                     ? new CpuBackend(weights, ctx, batch, group(s, weights).cpuPool(
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors()), kvDtype,
-                            s.getBool("backend.cpu.int8-activations"))
+                            int8(s, weights, threads))
                     : new CpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                            s.getBool("backend.cpu.int8-activations"));
+                            int8(s, weights, threads));
             case "metal" -> mamba
                     ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                     : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
                             new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
                                     threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                                    s.getBool("backend.cpu.int8-activations"), null, Math.max(1, slots)));
+                                    int8(s, weights, threads), null, Math.max(1, slots)));
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }
@@ -452,5 +452,11 @@ public final class ModelLoader {
         // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
         // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
+    }
+
+    /** {@code backend.cpu.int8-activations} for {@code weights} ({@code auto} measures both paths once per model). */
+    private static boolean int8(Settings s, org.robomiri.jllm.model.ModelWeights weights, int threads) {
+        return org.robomiri.jllm.cpu.CpuBackend.int8Activations(s.get("backend.cpu.int8-activations"), weights,
+                threads > 0 ? threads : Runtime.getRuntime().availableProcessors());
     }
 }
