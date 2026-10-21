@@ -212,6 +212,9 @@ public class SettingsService {
     }
 
     public static Scope scope(String key) {
+        if (key.startsWith("image.")) { // the image model's device and VAE tiling apply at load; the rest belongs to "jllm image" / "jllm serve"
+            return key.equals("image.backend") || key.equals("image.precision") || key.startsWith("image.vae-tile") ? Scope.LOAD : Scope.CLI;
+        }
         if (key.startsWith("sampling.") || key.startsWith("chat.") || key.startsWith("hub.")
                 || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")) {
             return Scope.LIVE;

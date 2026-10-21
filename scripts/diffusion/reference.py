@@ -125,7 +125,7 @@ def main():
     import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint as p_inp
     import diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl as p_xl
 
-    pipe = DiffusionPipeline.from_pretrained(a.model, torch_dtype=dtype, variant=a.variant, safety_checker=None,
+    pipe = DiffusionPipeline.from_pretrained(a.model, torch_dtype=dtype, variant=a.variant, safety_checker=None, feature_extractor=None,
                                              requires_safety_checker=False)
     pipe = pipe.to(a.device)
     cfgd = pipe.scheduler.config

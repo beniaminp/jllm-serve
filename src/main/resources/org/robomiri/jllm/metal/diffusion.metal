@@ -130,16 +130,27 @@ static inline void df_load16(device const TS *src, threadgroup TM *dst, int avai
     }
 }
 
+// The staged slices are padded by 16 bytes per row so that the 8 rows of an 8 x 8 simdgroup_load fall into different
+// threadgroup-memory banks (a row of 32 halves is 64 bytes: rows i and i + 2 would share a bank).
+//   LDK: row stride (in TM elements) of a slice that is 32 wide in k     LDN: of a slice that is 64 wide in n
+//   LDS: row stride (floats) of the float32 tile the accumulators are stored in before the epilogue
+#define DF_LDK(TM) (DF_BK + 16 / int(sizeof(TM)))
+#define DF_LDN(TM) (DF_BN + 16 / int(sizeof(TM)))
+#define DF_LDS (DF_BN + 4)
+#define DF_SMEM_FLOATS 5120     // 20 KB: both slices (float: 2 x 64 x 36 x 4 B = 18 KB) or the 64 x 68 float tile (17 KB)
+
 // the 4 x 4 accumulators of one simdgroup over the staged 64 x 32 A and B slices
 template <typename TM, bool BT>
 static inline void df_mma(threadgroup TM *sa, threadgroup TM *sb, thread simdgroup_float8x8 *acc, ushort sr, ushort sc) {
+    constexpr int LDK = DF_LDK(TM);
+    constexpr int LDN = DF_LDN(TM);
     for (int kk = 0; kk < 4; kk++) {
         simdgroup_matrix<TM, 8, 8> af[4];
         simdgroup_matrix<TM, 8, 8> bf[4];
-        for (int i = 0; i < 4; i++) simdgroup_load(af[i], sa + (sr * 32 + i * 8) * 32 + kk * 8, 32);
+        for (int i = 0; i < 4; i++) simdgroup_load(af[i], sa + (sr * 32 + i * 8) * LDK + kk * 8, LDK);
         for (int j = 0; j < 4; j++) {
-            if (BT) simdgroup_load(bf[j], sb + (sc * 32 + j * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
-            else simdgroup_load(bf[j], sb + (kk * 8) * 64 + sc * 32 + j * 8, 64);
+            if (BT) simdgroup_load(bf[j], sb + (sc * 32 + j * 8) * LDK + kk * 8, LDK, ulong2(0, 0), true);
+            else simdgroup_load(bf[j], sb + (kk * 8) * LDN + sc * 32 + j * 8, LDN);
         }
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i * 4 + j], af[i], bf[j], acc[i * 4 + j]);
@@ -156,9 +167,11 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
                     uint3 tgp [[threadgroup_position_in_grid]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float smem[4096];
+    constexpr int LDK = DF_LDK(TM);
+    constexpr int LDN = DF_LDN(TM);
+    threadgroup float smem[DF_SMEM_FLOATS];
     threadgroup TM *sa = (threadgroup TM *)smem;
-    threadgroup TM *sb = sa + DF_BM * DF_BK;
+    threadgroup TM *sb = sa + DF_BM * LDK;
     const int n0 = int(tgp.x) * DF_BN;
     const int m0 = int(tgp.y) * DF_BM;
     const int z = int(tgp.z);
@@ -181,18 +194,18 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
     for (int k0 = 0; k0 < p.k; k0 += DF_BK) {
         {
             const int m = m0 + ar;
-            threadgroup TM *dst = sa + ar * DF_BK + ak;
+            threadgroup TM *dst = sa + ar * LDK + ak;
             if (m < p.m) df_load16<TA, TM>(ab + (long)m * p.lda + k0 + ak, dst, p.k - k0 - ak, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         }
         if (BT) {
             const int n = n0 + ar;
-            threadgroup TM *dst = sb + ar * DF_BK + ak;
+            threadgroup TM *dst = sb + ar * LDK + ak;
             if (n < p.n) df_load16<TB, TM>(bb + (long)n * p.ldb + k0 + ak, dst, p.k - k0 - ak, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         } else {
             const int kr = k0 + bk;
-            threadgroup TM *dst = sb + bk * DF_BN + bn;
+            threadgroup TM *dst = sb + bk * LDN + bn;
             if (kr < p.k) df_load16<TB, TM>(bb + (long)kr * p.ldb + n0 + bn, dst, p.n - n0 - bn, useVec);
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         }
@@ -203,7 +216,7 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
     // tile -> threadgroup memory (aliasing the slices) -> epilogue
     threadgroup float *stg = smem;
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * 64 + sc * 32 + j * 8, 64);
+        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * DF_LDS + sc * 32 + j * 8, DF_LDS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const TC *rb = res + (long)zb * p.cSB + (long)zh * p.cSH;
     for (int e = tid; e < DF_BM * DF_BN; e += DF_THREADS) {
@@ -212,7 +225,7 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
         const int m = m0 + r;
         const int n = n0 + cc;
         if (m < p.m && n < p.n) {
-            float v = stg[e] * p.alpha;
+            float v = stg[r * DF_LDS + cc] * p.alpha;
             if (p.hasBias != 0) v += bias[n];
             v = df_act(v, p.act);
             if (p.hasRes != 0) v += float(rb[(long)m * p.ldc + n]);
@@ -242,6 +255,7 @@ struct DfConvParams {
     int hasBias;
     int hasChan;    // chan is [batch, cout]
     int hasRes;     // res is [batch, ho, wo, cout]
+    int ups;        // 1: the input is read through a nearest-neighbour 2x upsampling: h and w are the upsampled size
 };
 
 template <typename T, typename TM>
@@ -255,9 +269,10 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                     uint3 tgp [[threadgroup_position_in_grid]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float smem[4096];
+    constexpr int LDK = DF_LDK(TM);
+    threadgroup float smem[DF_SMEM_FLOATS];
     threadgroup TM *sa = (threadgroup TM *)smem;
-    threadgroup TM *sb = sa + DF_BM * DF_BK;
+    threadgroup TM *sb = sa + DF_BM * LDK;
     const int n0 = int(tgp.x) * DF_BN;
     const int m0 = int(tgp.y) * DF_BM;
     const int M = p.batch * p.ho * p.wo;
@@ -281,7 +296,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
     }
     const int n = n0 + ar;
     for (int k0 = 0; k0 < K; k0 += DF_BK) {
-        threadgroup TM *da = sa + ar * DF_BK + ak;
+        threadgroup TM *da = sa + ar * LDK + ak;
         for (int g = 0; g < 2; g++) {
             const int kb = k0 + ak + g * 8;
             if (m < M && kb < K) {
@@ -292,7 +307,8 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                 const int iy = oy * p.stride - p.padT + ky;
                 const int ix = ox * p.stride - p.padL + kx;
                 if (iy >= 0 && iy < p.h && ix >= 0 && ix < p.w) {
-                    device const vec<T, 4> *s4 = (device const vec<T, 4> *)(x + ((long)(bi * p.h + iy) * p.w + ix) * p.cin + ci);
+                    device const vec<T, 4> *s4 = (device const vec<T, 4> *)(x + ((long)(bi * (p.h >> p.ups) + (iy >> p.ups))
+                                                                                  * (p.w >> p.ups) + (ix >> p.ups)) * p.cin + ci);
                     threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)(da + g * 8);
                     d4[0] = df_cvt4<TM, T>(s4[0]);
                     d4[1] = df_cvt4<TM, T>(s4[1]);
@@ -303,7 +319,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                 for (int i = 0; i < 8; i++) da[g * 8 + i] = TM(0);
             }
         }
-        threadgroup TM *db = sb + ar * DF_BK + ak;
+        threadgroup TM *db = sb + ar * LDK + ak;
         if (n < p.cout) {
             device const T *wr = w + (long)n * K + k0 + ak;
             const int avail = K - k0 - ak;
@@ -323,7 +339,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
     }
     threadgroup float *stg = smem;
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * 64 + sc * 32 + j * 8, 64);
+        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * DF_LDS + sc * 32 + j * 8, DF_LDS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int e = tid; e < DF_BM * DF_BN; e += DF_THREADS) {
         const int r = e >> 6;
@@ -331,7 +347,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
         const int mm = m0 + r;
         const int nn = n0 + cc;
         if (mm < M && nn < p.cout) {
-            float v = stg[e];
+            float v = stg[r * DF_LDS + cc];
             if (p.hasBias != 0) v += bias[nn];
             if (p.hasChan != 0) v += float(chan[(long)(mm / (p.ho * p.wo)) * p.cout + nn]);
             if (p.hasRes != 0) v += float(res[(long)mm * p.cout + nn]);
@@ -384,7 +400,7 @@ kernel void df_conv_direct(device const T *x [[buffer(0)]],
         for (int kx = 0; kx < p.kw; kx++) {
             const int ix = ox * p.stride - p.padL + kx;
             if (ix < 0 || ix >= p.w) continue;
-            device const T *xp = x + ((long)(bi * p.h + iy) * p.w + ix) * p.cin;
+            device const T *xp = x + ((long)(bi * (p.h >> p.ups) + (iy >> p.ups)) * (p.w >> p.ups) + (ix >> p.ups)) * p.cin;
             device const T *wp = wr + (ky * p.kw + kx) * p.cin;
             for (int ci = 0; ci < p.cin; ci++) acc += float(xp[ci]) * float(wp[ci]);
         }
@@ -457,30 +473,136 @@ kernel void df_layernorm(device const T *x [[buffer(0)]],
                          device const float *beta [[buffer(2)]],
                          device T *out [[buffer(3)]],
                          constant DfNormParams &p [[buffer(4)]],
-                         uint row [[threadgroup_position_in_grid]],
-                         ushort tid [[thread_index_in_threadgroup]],
+                         uint tg [[threadgroup_position_in_grid]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
                          ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[32];
-    device const T *xr = x + (long)row * p.c;
+    // one simdgroup per row (hw = number of rows), 8 rows per threadgroup: no barriers, reductions with simd_sum
+    const long row = (long)tg * (DF_ROW_THREADS / 32) + sg;
+    if (row >= p.hw) return;
+    device const T *xr = x + row * p.c;
     float s = 0.0f;
-    for (int i = tid; i < p.c; i += DF_ROW_THREADS) s += float(xr[i]);
-    const float mean = df_tg_sum(s, red, sg, lane, DF_ROW_THREADS / 32) / float(p.c);
+    for (int i = lane; i < p.c; i += 32) s += float(xr[i]);
+    const float mean = simd_sum(s) / float(p.c);
     float q = 0.0f;
-    for (int i = tid; i < p.c; i += DF_ROW_THREADS) {
+    for (int i = lane; i < p.c; i += 32) {
         const float d = float(xr[i]) - mean;
         q += d * d;
     }
-    const float rstd = rsqrt(df_tg_sum(q, red, sg, lane, DF_ROW_THREADS / 32) / float(p.c) + p.eps);
-    for (int i = tid; i < p.c; i += DF_ROW_THREADS) {
+    const float rstd = rsqrt(simd_sum(q) / float(p.c) + p.eps);
+    for (int i = lane; i < p.c; i += 32) {
         float v = (float(xr[i]) - mean) * rstd;
         if (p.hasAffine != 0) v = v * gamma[i] + beta[i];
-        out[(long)row * p.c + i] = T(v);
+        out[row * p.c + i] = T(v);
+    }
+}
+
+// Group norm of a large tensor in three steps, so that the whole GPU works on it instead of one threadgroup per group:
+//   df_gn_stats    (chunks, groups, batch): the mean and the sum of squared deviations of one chunk of pixels of one group
+//   df_gn_combine  (groups, batch): the chunks' statistics merged (Chan et al.: M2 = sum(M2_c + n_c (mean_c - mean)^2)) into
+//                  (mean, 1 / sqrt(var + eps))
+//   df_gn_apply    one thread per 4 channels: (x - mean) * rstd * gamma + beta, optionally followed by SiLU
+
+struct DfGnParams {
+    int c;          // channels
+    int hw;         // pixels per batch element
+    int groups;
+    float eps;
+    int silu;
+    int chunkPix;   // pixels per chunk
+    int chunks;
+    int batch;
+};
+
+template <typename T>
+kernel void df_gn_stats(device const T *x [[buffer(0)]],
+                        device float2 *part [[buffer(1)]],
+                        constant DfGnParams &p [[buffer(2)]],
+                        uint3 tgp [[threadgroup_position_in_grid]],
+                        ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    const int ch = int(tgp.x);
+    const int g = int(tgp.y);
+    const int bi = int(tgp.z);
+    const int gs = p.c / p.groups;
+    const int p0 = ch * p.chunkPix;
+    const int p1 = min(p.hw, p0 + p.chunkPix);
+    const int n = (p1 - p0) * gs;
+    const long base = ((long)bi * p.hw + p0) * p.c + (long)g * gs;
+    float s = 0.0f;
+    for (int i = tid; i < n; i += DF_ROW_THREADS) {
+        const int px = i / gs;
+        s += float(x[base + (long)px * p.c + (i - px * gs)]);
+    }
+    const float mean = df_tg_sum(s, red, sg, lane, DF_ROW_THREADS / 32) / float(n);
+    float q = 0.0f;
+    for (int i = tid; i < n; i += DF_ROW_THREADS) {
+        const int px = i / gs;
+        const float d = float(x[base + (long)px * p.c + (i - px * gs)]) - mean;
+        q += d * d;
+    }
+    q = df_tg_sum(q, red, sg, lane, DF_ROW_THREADS / 32);
+    if (tid == 0) part[((long)bi * p.groups + g) * p.chunks + ch] = float2(mean, q);
+}
+
+kernel void df_gn_combine(device const float2 *part [[buffer(0)]],
+                          device float2 *stats [[buffer(1)]],
+                          constant DfGnParams &p [[buffer(2)]],
+                          uint2 tgp [[threadgroup_position_in_grid]]) {
+    const int g = int(tgp.x);
+    const int bi = int(tgp.y);
+    const int gs = p.c / p.groups;
+    device const float2 *pc = part + ((long)bi * p.groups + g) * p.chunks;
+    float total = 0.0f;
+    float mean = 0.0f;
+    for (int ch = 0; ch < p.chunks; ch++) {
+        const int p0 = ch * p.chunkPix;
+        const float n = float((min(p.hw, p0 + p.chunkPix) - p0) * gs);
+        mean += n * pc[ch].x;
+        total += n;
+    }
+    mean /= total;
+    float m2 = 0.0f;
+    for (int ch = 0; ch < p.chunks; ch++) {
+        const int p0 = ch * p.chunkPix;
+        const float n = float((min(p.hw, p0 + p.chunkPix) - p0) * gs);
+        const float d = pc[ch].x - mean;
+        m2 += pc[ch].y + n * d * d;
+    }
+    stats[(long)bi * p.groups + g] = float2(mean, rsqrt(m2 / total + p.eps));
+}
+
+template <typename T>
+kernel void df_gn_apply(device const T *x [[buffer(0)]],
+                        device const float2 *stats [[buffer(1)]],
+                        device const float *gamma [[buffer(2)]],
+                        device const float *beta [[buffer(3)]],
+                        device T *out [[buffer(4)]],
+                        constant DfGnParams &p [[buffer(5)]],
+                        uint gid [[thread_position_in_grid]]) {
+    // c is a multiple of 4: 4 consecutive elements of a thread are the channels c0..c0+3 of one pixel
+    const long e = (long)gid * 4;
+    if (e >= (long)p.batch * p.hw * p.c) return;
+    const long row = e / p.c;                 // pixel index over the whole batch
+    const int c0 = int(e - row * p.c);
+    const long bi = row / p.hw;
+    const int gs = p.c / p.groups;
+    for (int k = 0; k < 4; k++) {
+        const int c = c0 + k;
+        const float2 st = stats[bi * p.groups + c / gs];
+        float v = (float(x[e + k]) - st.x) * st.y * gamma[c] + beta[c];
+        if (p.silu != 0) v = df_silu(v);
+        out[e + k] = T(v);
     }
 }
 
 template [[host_name("df_groupnorm_f")]] kernel decltype(df_groupnorm<float>) df_groupnorm<float>;
 template [[host_name("df_groupnorm_h")]] kernel decltype(df_groupnorm<half>) df_groupnorm<half>;
+template [[host_name("df_gn_stats_f")]] kernel decltype(df_gn_stats<float>) df_gn_stats<float>;
+template [[host_name("df_gn_stats_h")]] kernel decltype(df_gn_stats<half>) df_gn_stats<half>;
+template [[host_name("df_gn_apply_f")]] kernel decltype(df_gn_apply<float>) df_gn_apply<float>;
+template [[host_name("df_gn_apply_h")]] kernel decltype(df_gn_apply<half>) df_gn_apply<half>;
 template [[host_name("df_layernorm_f")]] kernel decltype(df_layernorm<float>) df_layernorm<float>;
 template [[host_name("df_layernorm_h")]] kernel decltype(df_layernorm<half>) df_layernorm<half>;
 

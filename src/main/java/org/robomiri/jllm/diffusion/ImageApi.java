@@ -19,7 +19,8 @@ import java.util.concurrent.ThreadLocalRandom;
  *       ({@code b64_json} or {@code url}); extras {@code negative_prompt}, {@code steps}, {@code guidance} (or
  *       {@code guidance_scale}), {@code seed}, {@code scheduler} ({@code euler}, {@code euler_a}, {@code dpmpp_2m},
  *       {@code dpmpp_2m_karras}), {@code clip_skip}, and for image-to-image {@code image} (base64 or data URL) with
- *       {@code strength};</li>
+ *       {@code strength}; {@code upscale} (1..4) with an {@code image} enlarges the picture by that factor and redraws it at a
+ *       low {@code strength} (default 0.35) to add detail;</li>
  *   <li>{@code POST /v1/images/edits}: {@code image}, optional {@code mask} (white / transparent = repaint), {@code prompt}
  *       and the same options: image-to-image without a mask, inpainting with one;</li>
  *   <li>{@code "stream": true}: server-sent events {@code image_generation.progress} (step n of m),
@@ -109,7 +110,17 @@ public final class ImageApi {
         int w;
         int h;
         String size = Json.str(body, "size", "auto");
-        if (size.equals("auto") || size.isBlank()) {
+        double upscale = num(body, "upscale", 1);
+        if (upscale > 1) { // upscaling: the picture enlarged (bicubic) and redrawn at a low strength adds the detail
+            if (init == null) {
+                throw ApiException.invalid("upscale needs an image");
+            }
+            if (upscale > 4) {
+                throw ApiException.invalid("upscale must be 1 to 4");
+            }
+            w = Math.max(mult, (int) Math.round(init.width() * upscale / mult) * mult);
+            h = Math.max(mult, (int) Math.round(init.height() * upscale / mult) * mult);
+        } else if (size.equals("auto") || size.isBlank()) {
             if (init != null) { // the input picture's size, rounded down to what the network can take, within 1024 on a side
                 double f = Math.min(1.0, 1024.0 / Math.max(init.width(), init.height()));
                 w = Math.max(mult, (int) (init.width() * f) / mult * mult);
@@ -135,7 +146,7 @@ public final class ImageApi {
                 : ThreadLocalRandom.current().nextLong(0, 1L << 31);
         String scheduler = Json.str(body, "scheduler", pipe.defaults.scheduler());
         int clipSkip = (int) num(body, "clip_skip", 0);
-        double strength = dbl(body, "strength", maskPx != null ? 1.0 : 0.8);
+        double strength = dbl(body, "strength", maskPx != null ? 1.0 : upscale > 1 ? 0.35 : 0.8);
         String negative = Json.str(body, "negative_prompt", "");
         try {
             Scheduler.Kind.parse(scheduler);

@@ -159,22 +159,26 @@ def run(E, check):
             out += res.astype(np.float64)
         return out
 
-    def conv(dtype, b, h, wd, ci, co, kh, kw, stride, pad_t, pad_l, pad_b, pad_r, use_bias=True, use_chan=True, use_res=True, direct=False):
+    def conv(dtype, b, h, wd, ci, co, kh, kw, stride, pad_t, pad_l, pad_b, pad_r, use_bias=True, use_chan=True, use_res=True, direct=False, ups=0):
+        """h, wd: the size of the (logical) input; with ups=1 the stored input is half as large and read through a nearest 2x upsampling."""
         ho = (h + pad_t + pad_b - kh) // stride + 1
         wo = (wd + pad_l + pad_r - kw) // stride + 1
-        x, w = rnd(dtype, b, h, wd, ci), rnd(dtype, co, kh, kw, ci, scale=0.2)
+        x, w = rnd(dtype, b, h >> ups, wd >> ups, ci), rnd(dtype, co, kh, kw, ci, scale=0.2)
         bias = rnd(np.float32, co)
         chan = rnd(dtype, b, co)
         res = rnd(dtype, b, ho, wo, co)
         out = np.zeros((b, ho, wo, co), dtype)
-        # ConvParams: batch h w cin ho wo cout kh kw stride padT padL hasBias hasChan hasRes
-        p = pack('iiiiiiiiiiiiiii', b, h, wd, ci, ho, wo, co, kh, kw, stride, pad_t, pad_l, int(use_bias), int(use_chan), int(use_res))
+        # ConvParams: batch h w cin ho wo cout kh kw stride padT padL hasBias hasChan hasRes ups
+        p = pack('iiiiiiiiiiiiiiii', b, h, wd, ci, ho, wo, co, kh, kw, stride, pad_t, pad_l, int(use_bias), int(use_chan), int(use_res), ups)
         m = b * ho * wo
         if direct:
             E.dispatch('df_conv_direct' + sfx[dtype], [x, w, out, bias, chan, res], p, ((m * co + 255) // 256,), (256,))
         else:
             E.dispatch('df_conv' + sfx[dtype], [x, w, out, bias, chan, res], p, ((co + 63) // 64, (m + 63) // 64, 1), (128,))
-        ref = conv_ref(x.astype(np.float64), w, bias if use_bias else None, chan if use_chan else None,
+        xl = x.astype(np.float64)
+        if ups:
+            xl = xl.repeat(2, axis=1).repeat(2, axis=2)
+        ref = conv_ref(xl, w, bias if use_bias else None, chan if use_chan else None,
                        res if use_res else None, stride, pad_t, pad_l, ho, wo)
         err = np.abs(out - ref).max()
         check(err < tol(dtype, ref), 'df_conv%s%s %dx%dx%d ci=%d co=%d k=%dx%d s=%d pad=%d,%d,%d,%d: max err %.2e'
@@ -187,6 +191,8 @@ def run(E, check):
         conv(dt, 1, 5, 6, 24, 40, 1, 1, 1, 0, 0, 0, 0)
         conv(dt, 1, 6, 5, 4, 3, 3, 3, 1, 1, 1, 1, 1, direct=True)           # first / last layers: 4 -> 3 channels
         conv(dt, 2, 7, 7, 9, 8, 3, 3, 1, 1, 1, 1, 1, direct=True)           # an inpainting UNet's 9 input channels
+        conv(dt, 1, 12, 10, 16, 24, 3, 3, 1, 1, 1, 1, 1, use_chan=False, use_res=False, ups=1)    # up-sampling fused into the convolution
+        conv(dt, 1, 8, 6, 4, 5, 3, 3, 1, 1, 1, 1, 1, direct=True, ups=1)
 
     # ---------------------------------------------------------------- normalisation
     def groupnorm(dtype, b, hw, c, groups, silu):
@@ -216,11 +222,40 @@ def run(E, check):
         ref = (xd - xd.mean(1, keepdims=True)) / np.sqrt(xd.var(1, keepdims=True) + 1e-5)
         if affine:
             ref = ref * gamma + beta
-        E.dispatch('df_layernorm' + sfx[dtype], [x, gamma, beta, out], pack('iiifii', c, 1, 1, 1e-5, 0, int(affine)), (rows,), (256,))
+        E.dispatch('df_layernorm' + sfx[dtype], [x, gamma, beta, out], pack('iiifii', c, rows, 1, 1e-5, 0, int(affine)), ((rows + 7) // 8,), (256,))
         err = np.abs(out - ref).max()
         check(err < tol(dtype, ref), 'df_layernorm%s rows=%d c=%d affine=%s: max err %.2e' % (sfx[dtype], rows, c, affine, err))
 
+    def groupnorm_chunked(dtype, b, hw, c, groups, silu, chunk_pix):
+        """df_gn_stats + df_gn_combine + df_gn_apply (the form used for big tensors) against the same reference."""
+        x = rnd(dtype, b, hw, c, scale=2.0) + dtype(1.5)   # a mean away from zero
+        gamma, beta = rnd(np.float32, c), rnd(np.float32, c)
+        out = np.zeros_like(x)
+        eps = 1e-5
+        gs = c // groups
+        chunks = (hw + chunk_pix - 1) // chunk_pix
+        part = np.zeros((b * groups * chunks, 2), np.float32)
+        stats = np.zeros((b * groups, 2), np.float32)
+        # DfGnParams: c hw groups eps silu chunkPix chunks batch
+        p = pack('iiifiiii', c, hw, groups, eps, int(silu), chunk_pix, chunks, b)
+        E.dispatch('df_gn_stats' + sfx[dtype], [x, part], p, (chunks, groups, b), (256,))
+        E.dispatch('df_gn_combine', [part, stats], p, (groups, b), (1,))
+        E.dispatch('df_gn_apply' + sfx[dtype], [x, stats, gamma, beta, out], p, ((b * hw * c // 4 + 255) // 256,), (256,))
+        ref = np.zeros((b, hw, c), np.float64)
+        for bi in range(b):
+            for g in range(groups):
+                sl = x[bi, :, g * gs:(g + 1) * gs].astype(np.float64)
+                ref[bi, :, g * gs:(g + 1) * gs] = (sl - sl.mean()) / np.sqrt(sl.var() + eps)
+        ref = ref * gamma + beta
+        if silu:
+            ref = act_ref(ref, SILU)
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_gn_stats/combine/apply%s b=%d hw=%d c=%d groups=%d chunkPix=%d (%d chunks, last partial) silu=%s: max err %.2e'
+              % (sfx[dtype], b, hw, c, groups, chunk_pix, chunks, silu, err))
+
     for dt in (np.float32, np.float16):
+        groupnorm_chunked(dt, 2, 150, 32, 4, True, 64)
+        groupnorm_chunked(dt, 1, 97, 24, 3, False, 40)
         groupnorm(dt, 2, 50, 64, 8, True)
         groupnorm(dt, 1, 33, 40, 5, False)
         layernorm(dt, 9, 320, True)

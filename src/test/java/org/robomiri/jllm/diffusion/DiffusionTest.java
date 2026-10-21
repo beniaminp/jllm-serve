@@ -59,7 +59,8 @@ public final class DiffusionTest {
             for (String[] c : cases) {
                 compare(c, "metal", "f16", 700.0); // float16 storage: ~1e-3 relative on a UNet stage, ~3e-3 on the image, PSNR ~65-75 dB
             }
-            tilingAndFlash();
+            opsParity("f32", 3e-5);
+            opsParity("f16", 1.5e-2);
         } else {
             System.out.println("skip Metal checks: no GPU library");
         }
@@ -232,9 +233,129 @@ public final class DiffusionTest {
         }
     }
 
-    /** The two attention kernels and the tiny models on the GPU in one piece: flash vs scores + softmax is covered by the cases above. */
-    private static void tilingAndFlash() {
-        // flash attention is the default path of the cases above; the scores path is exercised by -Djllm.diffusion.flash=false runs
-        check(true, "GPU cases above ran the flash attention kernels");
+    private static org.robomiri.jllm.safetensors.SafeTensors.Tensor tensor(float[] data, long... shape) {
+        java.lang.foreign.MemorySegment seg = java.lang.foreign.Arena.ofAuto().allocate(data.length * 4L);
+        java.lang.foreign.MemorySegment.copy(data, 0, seg, java.lang.foreign.ValueLayout.JAVA_FLOAT_UNALIGNED, 0, data.length);
+        return new org.robomiri.jllm.safetensors.SafeTensors.Tensor("t", org.robomiri.jllm.safetensors.SafeTensors.DType.F32, shape, seg);
+    }
+
+    private static float[] noise(long seed, int n, float scale) {
+        float[] f = new Rng(seed).normal(n);
+        for (int i = 0; i < n; i++) {
+            f[i] *= scale;
+        }
+        return f;
+    }
+
+    /** Every {@link Ops} operation on the GPU against the CPU reference, at sizes that exercise the big-tensor kernel variants. */
+    private static void opsParity(String precision, double relTol) {
+        try (Devices cpu = Devices.cpu(); Devices gpu = Devices.open("metal", precision, false)) {
+            Ops c = cpu.main();
+            Ops g = gpu.main();
+            java.util.function.BiConsumer<String, float[][]> cmp = (what, pair) -> {
+                double[] d = DiffusionCompare.diff(pair[0], pair[1]);
+                check(d[0] <= relTol * Math.max(1.0, d[2]), String.format("%s %s vs CPU: max diff %.2e (of %.2f)", what, precision, d[0], d[2]));
+            };
+            // convolutions: plain, strided, asymmetric padding, with channel bias and residual, a first layer with 4 channels
+            for (int[] k : new int[][]{{1, 20, 18, 32, 40, 3, 1, 1, 1}, {2, 16, 16, 24, 70, 3, 2, 1, 1}, {1, 16, 16, 16, 16, 3, 2, 0, 1}, {1, 9, 11, 4, 8, 3, 1, 1, 1}, {1, 12, 12, 16, 3, 3, 1, 1, 1}}) {
+                int b = k[0], h = k[1], w = k[2], ci = k[3], co = k[4], ks = k[5], st = k[6], pt = k[7], pb = k[8];
+                float[] xin = noise(1, b * h * w * ci, 1f);
+                float[] win = noise(2, co * ci * ks * ks, 0.2f);
+                float[] bin = noise(3, co, 0.5f);
+                int ho = (h + pt + pb - ks) / st + 1;
+                int wo = (w + pt + pb - ks) / st + 1;
+                float[] chan = noise(4, b * co, 0.5f);
+                float[] res = noise(5, b * ho * wo * co, 0.5f);
+                float[][] out = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    Tn x = o.upload(xin, b, h, w, ci);
+                    Tn wt = o.weight(tensor(win, co, ci, ks, ks), Ops.Kind.CONV);
+                    Tn bt = o.weight(tensor(bin, co), Ops.Kind.VECTOR);
+                    Tn ct = o.upload(chan, b, co);
+                    Tn rt = o.upload(res, b, ho, wo, co);
+                    out[dev] = o.download(o.conv2d(x, wt, bt, st, pt, pt, pb, pb, ct, rt));
+                }
+                cmp.accept(String.format("conv %dx%dx%d %d->%d k%d s%d", b, h, w, ci, co, ks, st), out);
+            }
+            // linear with GELU and residual; GEGLU
+            {
+                float[] xin = noise(6, 37 * 48, 1f);
+                float[] win = noise(7, 70 * 48, 0.3f);
+                float[] bin = noise(8, 70, 0.3f);
+                float[] res = noise(9, 37 * 70, 1f);
+                float[][] out = new float[2][];
+                float[][] ge = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    Tn y = o.linear(o.upload(xin, 37, 48), o.weight(tensor(win, 70, 48), Ops.Kind.LINEAR), o.weight(tensor(bin, 70), Ops.Kind.VECTOR),
+                            o.upload(res, 37, 70), Ops.Act.GELU);
+                    out[dev] = o.download(y);
+                    ge[dev] = o.download(o.geglu(y));
+                }
+                cmp.accept("linear gelu+residual", out);
+                cmp.accept("geglu", ge);
+            }
+            // normalisation: group norm small (one threadgroup) and large (three kernels), layer norm
+            for (int[] k : new int[][]{{2, 6, 6, 32, 8}, {2, 48, 40, 64, 16}, {1, 128, 100, 32, 32}}) {
+                int b = k[0], h = k[1], w = k[2], ch = k[3], gr = k[4];
+                float[] xin = noise(10, b * h * w * ch, 1.5f);
+                float[] gam = noise(11, ch, 0.5f);
+                float[] bet = noise(12, ch, 0.5f);
+                float[][] out = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    out[dev] = o.download(o.groupNorm(o.upload(xin, b, h, w, ch), o.weight(tensor(gam, ch), Ops.Kind.VECTOR),
+                            o.weight(tensor(bet, ch), Ops.Kind.VECTOR), gr, 1e-5f, true));
+                }
+                cmp.accept(String.format("groupnorm %dx%dx%d c=%d g=%d (%s)", b, h, w, ch, gr, (long) h * w * ch <= 65536 ? "one threadgroup" : "chunked"), out);
+            }
+            {
+                float[] xin = noise(13, 21 * 77, 2f);
+                float[] gam = noise(14, 77, 0.5f);
+                float[] bet = noise(15, 77, 0.5f);
+                float[][] out = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    out[dev] = o.download(o.layerNorm(o.upload(xin, 21, 77), o.weight(tensor(gam, 77), Ops.Kind.VECTOR), o.weight(tensor(bet, 77), Ops.Kind.VECTOR), 1e-5f));
+                }
+                cmp.accept("layernorm", out);
+            }
+            // attention: self (flash widths), cross with 77 keys, causal, and a head width without a flash kernel
+            for (int[] k : new int[][]{{2, 5, 64, 100, 100, 0}, {1, 8, 40, 64, 77, 0}, {2, 4, 32, 77, 77, 1}, {1, 2, 100, 30, 50, 0}}) {
+                int b = k[0], hd = k[2], hs = k[1], lq = k[3], lk = k[4];
+                int dm = hs * hd;
+                float[] qin = noise(16, b * lq * dm, 1f);
+                float[] kin = noise(17, b * lk * dm, 1f);
+                float[] vin = noise(18, b * lk * dm, 1f);
+                float[][] out = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    out[dev] = o.download(o.attention(o.upload(qin, b, lq, dm), o.upload(kin, b, lk, dm), o.upload(vin, b, lk, dm), hs, k[5] == 1));
+                }
+                cmp.accept(String.format("attention b=%d h=%d hd=%d lq=%d lk=%d causal=%d", b, hs, hd, lq, lk, k[5]), out);
+            }
+            // layout: fused upsample + convolution, concat, add, silu
+            {
+                float[] xin = noise(19, 2 * 7 * 9 * 16, 1f);
+                float[] win = noise(20, 24 * 16 * 9, 0.2f);
+                float[] bin = noise(21, 24, 0.5f);
+                float[] other = noise(22, 2 * 7 * 9 * 8, 1f);
+                float[][] up = new float[2][];
+                float[][] cat = new float[2][];
+                float[][] mix = new float[2][];
+                for (int dev = 0; dev < 2; dev++) {
+                    Ops o = dev == 0 ? c : g;
+                    Tn x = o.upload(xin, 2, 7, 9, 16);
+                    up[dev] = o.download(o.upsampleConv(x, o.weight(tensor(win, 24, 16, 3, 3), Ops.Kind.CONV), o.weight(tensor(bin, 24), Ops.Kind.VECTOR)));
+                    Tn ct = o.concat(x, o.upload(other, 2, 7, 9, 8));
+                    cat[dev] = o.download(ct);
+                    mix[dev] = o.download(o.silu(o.add(ct, ct)));
+                }
+                cmp.accept("upsample + conv", up);
+                cmp.accept("concat", cat);
+                cmp.accept("add + silu", mix);
+            }
+        }
     }
 }

@@ -316,10 +316,9 @@ public final class UNet implements AutoCloseable {
                 }
             }
             if (u.up != null) {
-                Tn big = ops.upsample2x(x);
+                Tn up = ops.upsampleConv(x, u.up.w, u.up.b);
                 ops.free(x);
-                x = ops.conv2d(big, u.up.w, u.up.b, 1, 1, 1, 1, 1, null, null);
-                ops.free(big);
+                x = up;
             }
         }
         ops.free(embAct);

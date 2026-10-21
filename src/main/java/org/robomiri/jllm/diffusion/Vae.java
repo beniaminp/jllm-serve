@@ -273,10 +273,9 @@ public final class Vae implements AutoCloseable {
                 x = resnet(r, x);
             }
             if (s.sample != null) {
-                Tn big = ops.upsample2x(x);
+                Tn up = ops.upsampleConv(x, s.sample.w, s.sample.b);
                 ops.free(x);
-                x = ops.conv2d(big, s.sample.w, s.sample.b, 1, 1, 1, 1, 1, null, null);
-                ops.free(big);
+                x = up;
             }
         }
         Tn nrm = ops.groupNorm(x, decNormG, decNormB, groups, eps, true);

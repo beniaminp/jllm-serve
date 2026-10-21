@@ -91,6 +91,17 @@ public interface Ops extends AutoCloseable {
     /** Nearest-neighbour upsampling of {@code [B, H, W, C]} by 2. */
     Tn upsample2x(Tn x);
 
+    /**
+     * Nearest-neighbour 2x upsampling followed by a 3x3 convolution with padding 1 (the up-sampling layer of the UNet and the VAE).
+     * The default does it in two steps; the GPU reads the small input directly in the convolution.
+     */
+    default Tn upsampleConv(Tn x, Tn w, Tn bias) {
+        Tn big = upsample2x(x);
+        Tn out = conv2d(big, w, bias, 1, 1, 1, 1, 1, null, null);
+        free(big);
+        return out;
+    }
+
     /** Concatenation along the channel dimension of two {@code [B, H, W, *]} tensors. */
     Tn concat(Tn a, Tn b);
 

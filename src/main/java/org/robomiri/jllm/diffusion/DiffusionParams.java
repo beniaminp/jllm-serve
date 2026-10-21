@@ -8,8 +8,9 @@ package org.robomiri.jllm.diffusion;
  */
 enum DiffusionParams {
     GEMM("DfGemmParams", "iiiiiiiiiiiiifiiii"),
-    CONV("DfConvParams", "iiiiiiiiiiiiiii"),
+    CONV("DfConvParams", "iiiiiiiiiiiiiiii"),
     NORM("DfNormParams", "iiifii"),
+    GN("DfGnParams", "iiifiiii"),
     FLASH("DfFlashParams", "iiiiiiifi"),
     SOFTMAX("DfSoftmaxParams", "iiii"),
     EW("DfEwParams", "liiii");

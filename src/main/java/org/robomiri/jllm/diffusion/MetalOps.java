@@ -26,6 +26,8 @@ final class MetalOps implements Ops {
     private static final int SLICE = 192;
     private static final boolean FLASH = !"false".equals(System.getProperty("jllm.diffusion.flash"));
     private static final boolean PROFILE = Boolean.getBoolean("jllm.diffusion.profile");
+    /** {@code -Djllm.diffusion.simpleNorm=true}: group norm always in one threadgroup per group (the first, slower form). */
+    private static final boolean SIMPLE_NORM = Boolean.getBoolean("jllm.diffusion.simpleNorm");
 
     /** The per-kernel times collected with {@code -Djllm.diffusion.profile=true}, as text (empty without it). */
     String profileReport() {
@@ -456,8 +458,14 @@ final class MetalOps implements Ops {
             gemm(x, w, out, bias, residual, Act.NONE, b * h * wd, co, ci);
             return out;
         }
+        convKernel(x, w, out, bias, chanBias, residual, b, h, wd, ci, ho, wo, co, kh, kw, stride, padT, padL, 0);
+        return out;
+    }
+
+    private void convKernel(Tn x, Tn w, MT out, Tn bias, Tn chanBias, Tn residual, int b, int h, int wd, int ci, int ho, int wo, int co,
+                            int kh, int kw, int stride, int padT, int padL, int ups) {
         int plen = p(DiffusionParams.CONV).i(b).i(h).i(wd).i(ci).i(ho).i(wo).i(co).i(kh).i(kw).i(stride).i(padT).i(padL)
-                .i(bias != null ? 1 : 0).i(chanBias != null ? 1 : 0).i(residual != null ? 1 : 0).done();
+                .i(bias != null ? 1 : 0).i(chanBias != null ? 1 : 0).i(residual != null ? 1 : 0).i(ups).done();
         Metal.Buffer o = out.buf;
         Metal.Buffer bb = bias != null ? buf(bias) : o;
         Metal.Buffer cb = chanBias != null ? buf(chanBias) : o;
@@ -468,6 +476,17 @@ final class MetalOps implements Ops {
             long total = (long) b * ho * wo * co;
             run("df_conv_direct" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(w), o, bb, cb, rb);
         }
+    }
+
+    @Override
+    public Tn upsampleConv(Tn x, Tn w, Tn bias) {
+        int b = x.dim(0);
+        int h = x.dim(1) * 2;
+        int wd = x.dim(2) * 2;
+        int ci = x.dim(3);
+        int co = w.dim(0);
+        MT out = (MT) create(b, h, wd, co);
+        convKernel(x, w, out, bias, null, null, b, h, wd, ci, h, wd, co, 3, 3, 1, 1, 1, 1);
         return out;
     }
 
@@ -476,8 +495,24 @@ final class MetalOps implements Ops {
         int b = x.dim(0);
         int c = x.last();
         Tn out = create(x.shape);
-        int plen = p(DiffusionParams.NORM).i(c).i(x.rows() / b).i(groups).f(eps).i(silu ? 1 : 0).i(0).done();
-        run("df_groupnorm" + sfx, groups, b, 1, 256, plen, buf(x), buf(gamma), buf(beta), buf(out));
+        int hw = x.rows() / b;
+        int gs = c / groups;
+        if ((long) hw * c <= 65536 || c % 4 != 0 || SIMPLE_NORM) { // small: one threadgroup per group does it all
+            int plen = p(DiffusionParams.NORM).i(c).i(hw).i(groups).f(eps).i(silu ? 1 : 0).i(0).done();
+            run("df_groupnorm" + sfx, groups, b, 1, 256, plen, buf(x), buf(gamma), buf(beta), buf(out));
+            return out;
+        }
+        // large: statistics per chunk of pixels (many threadgroups), merged, then applied elementwise
+        int chunkPix = Math.max(Math.max(1, 16384 / gs), (hw + 127) / 128);
+        int chunks = (hw + chunkPix - 1) / chunkPix;
+        MT part = (MT) createFloats((long) b * groups * chunks * 2);
+        MT stats = (MT) createFloats((long) b * groups * 2);
+        int plen = p(DiffusionParams.GN).i(c).i(hw).i(groups).f(eps).i(silu ? 1 : 0).i(chunkPix).i(chunks).i(b).done();
+        run("df_gn_stats" + sfx, chunks, groups, b, 256, plen, buf(x), part.buf);
+        run("df_gn_combine", groups, b, 1, 1, plen, part.buf, stats.buf);
+        run("df_gn_apply" + sfx, cdiv((long) b * hw * c / 4, 256), 1, 1, 256, plen, buf(x), stats.buf, buf(gamma), buf(beta), buf(out));
+        free(part);
+        free(stats);
         return out;
     }
 
@@ -485,9 +520,9 @@ final class MetalOps implements Ops {
     public Tn layerNorm(Tn x, Tn gamma, Tn beta, float eps) {
         int c = x.last();
         Tn out = create(x.shape);
-        int plen = p(DiffusionParams.NORM).i(c).i(1).i(1).f(eps).i(0).i(gamma != null ? 1 : 0).done();
+        int plen = p(DiffusionParams.NORM).i(c).i(x.rows()).i(1).f(eps).i(0).i(gamma != null ? 1 : 0).done();
         Metal.Buffer o = buf(out);
-        run("df_layernorm" + sfx, x.rows(), 1, 1, 256, plen, buf(x), gamma != null ? buf(gamma) : o,
+        run("df_layernorm" + sfx, cdiv(x.rows(), 8), 1, 1, 256, plen, buf(x), gamma != null ? buf(gamma) : o,
                 beta != null ? buf(beta) : o, o);
         return out;
     }
