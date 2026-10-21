@@ -967,8 +967,8 @@ leaving the set `C` of (layer, expert) pairs on the CPU keeps
 G(C) = W + s · B + O − Σ_{(l,e) ∈ C} b_l          on the GPU, and C is chosen so that G(C) ≤ working set
 ```
 
-`auto` (the default) moves nothing when everything fits. A backend whose load pushes the device past the working set
-(a draft model loaded after its target, say) prints a warning with the totals. `-Djllm.metal.workingSetGb=N` replaces Metal's figure, for
+`auto` (the default) moves nothing when everything fits. A draft model is loaded before its target, so the target's
+plan already counts it. A backend whose load pushes the device past the working set prints a warning with the totals. `-Djllm.metal.workingSetGb=N` replaces Metal's figure, for
 example to leave memory to other programs. A number (`backend.metal.cpu-moe=6`) puts every expert of that many MoE
 layers on the CPU, `all` all of them, `off` none.
 
@@ -1082,8 +1082,142 @@ are. `scripts/mac-validate.sh` does both on a real Mac:
 - it runs `scripts/arch-smoke.sh` on the GPU;
 - it benchmarks a dense model with each newer feature on (the default) and off: flash prefill, flash decode,
   pipelined decoding, simdgroup-matrix prefill and the f16 cache;
+- draft-model speculation (§8.22) with the dense model drafting for itself: off, on, adaptive length off, draft
+  pipelining off;
+- batched decoding (§8.21): three slots generating together in shared passes against taking turns
+  (`BatchDecodeTest bench --backend metal`, which also checks that each slot's answer equals its answer alone);
 - optionally (`--moe <repo>`) it benchmarks an MoE model with 256- vs 64-token chunks, grouped prefill on and off,
-  experts on the CPU with int8 on and off, and all experts on the GPU.
+  experts on the CPU with int8 on and off, all experts on the GPU, and the dense model as its draft.
 
 It prints a markdown table of prefill and decode tokens per second (median of the rounds) for the docs.
 
+
+---
+
+## 8.21 Batched decoding across slots (`MetalBackend.forwardBatch`)
+
+🧸 Three children each ask the teacher a question about the same big book. Reading the page aloud is the slow part;
+writing each child's answer in that child's own notebook is quick. So she reads the page once, and while she reads
+she writes three answers, each in its own notebook, each at the line where that child stopped last time.
+
+📐 A server's slots on one model are `MetalBackend`s on the same weights, each with its own KV cache, command queue
+and activation buffers ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots) for how
+`BatchGroup` gathers their decode steps). `forwardBatch(members, tokens, positions, logits)` runs the steps of `n`
+slots as one pass on the leader's queue (the member whose thread took the group's device lock first), with the
+leader's activation buffers holding the `n` rows:
+
+```
+x[t] = embed(tokens[t])                                  t = 0 .. n-1, one row per slot
+per layer:
+  xb = rmsnorm(x)                                         n rows
+  q, kRow, vRow = matmul3(xb)                             n rows: Wq, Wk, Wv read once
+  for each row t (its slot s = members[t], p = positions[t]):
+      rope_row(q[t], kRow[t] -> s.K[layer][p])            the slot's cache, the slot's position
+      kv_put(vRow[t] -> s.V[layer][p])                    (q8: kv_store_q8 of kRow[t], vRow[t])
+      att[t] = attention(q[t], s.K[layer][0..p], s.V[layer][0..p])
+  x += o_proj(att)                                        n rows
+  x += ffn(rmsnorm(x))                                    n rows: dense, or MoE (router + experts), CPU experts too
+logits[t] = lm_head(rmsnorm(x))[t]                        n rows into an n-row buffer
+```
+
+Decoding is bound by reading the weights (W bytes per pass, [11](11-performance.md)), so with per-row work `r`
+(RoPE, the cache store, attention over the slot's context, tiny next to W / bandwidth at moderate context):
+
+```
+taking turns:   n · (W / BW + r)
+one pass:       W / BW + n · r          speed-up → n while n · r ≪ W / BW
+```
+
+**Same buffers, other caches.** The members' cache buffers are bound in the leader's command buffer. All of them were
+created on the same `MTLDevice`, so any queue may use them; the group's lock guarantees that no member has work in
+flight (`forwardBatch` also drains every member's pipelined steps first, §8.16, which the group only allows while a slot
+is alone). The leader's `kStage` is not enough, since every row goes to another cache: the pass writes the rows' k
+and v to two f32 buffers `rowK`, `rowV` (`[maxBatch, kvDim]`, made on the first batched pass), and each row's RoPE
+reads its k row there and writes the rotated row into its slot's cache at its position (as half for f16; for q8 back
+into `rowK`, then `kv_store_q8` quantizes k and v together, as in a single-sequence step). For the f32 and f16 caches v
+needs a copy, `kv_put<KV>` (the one kernel added for this: one thread per value, rounding once to half for f16 —
+the same `half(v + bias)` that `matmul3<.., half>` writes in a single-sequence step).
+
+**Per-row dispatches, existing kernels.** RoPE, the cache store and attention are the single-sequence kernels,
+dispatched once per row with the row's byte offsets (`MetalKernels.ropeRow`, `attentionRow`, `flashAttentionRow`,
+`kvStoreQ8Row`, `mlaLatStoreRow`): the rope and attention kernels read one position `pos0` per dispatch and one cache
+binding, so a single dispatch cannot cover rows at other positions in other buffers. That is 3 small dispatches per row
+and layer (4 with flash decoding), negligible against the weight reads at a few slots. Sliding windows, soft-capping,
+Gemma's local/global RoPE tables, partial and interleaved rotation (GLM, Phi) come with the layer's own parameters,
+exactly as in a single step. DeepSeek's MLA does the same over its latent cache (`MlaMetal.runRows`: the projections,
+the absorption of q and the value up-projection over the n rows; RoPE of q and k_pe, `mla_lat_store` and the attention
+per row).
+
+**MoE.** The router and the experts take the n rows like a prefill chunk of n tokens: the per-slot kernels below
+`MOE_MMA_MIN` = 16 rows, the expert-grouped ones above. With experts on the CPU (§8.18) the leader's CPU side
+computes the n rows' CPU experts at the layer's GPU → CPU → GPU round trip, so the round trip too is paid once per
+pass instead of once per slot.
+
+**Exactness.** For fewer than 8 rows every projection runs the `tokTiles` kernels, whose per-row arithmetic is the
+single-row kernel's (§8.10), and the per-row kernels are the single-step ones, so a slot's logits in a batched pass are
+normally bit-identical to its own step: `ArchSmoke` checks every attention family with three slots at other positions
+(a rotating leader, one step where a slot runs on its own in between) for the f32, f16 and q8 caches, and found them
+bit-identical on the emulator. With an MoE layer's experts on the CPU they agree to rounding (4e-6 on the tiny Qwen3-MoE):
+the CPU computes several rows with its batched expert kernels, one row with its single-token ones. It requires equal tokens and logits
+within 10⁻⁴ of the largest, then runs the same slots in a three-thread `BatchGroup` and requires the tokens they give
+alone. From 8 rows on the tiled prefill kernels (still bit-identical) and from 32 the simdgroup-matrix ones (rounding
+level, §8.10) take over.
+
+**What stays one at a time.** Mamba backends (a recurrent state per slot), and a batch whose members differ in weights
+or cache type (`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false`
+turns batched passes off.
+
+---
+
+## 8.22 Draft-model speculation on the GPU
+
+🧸 A junior writer drafts the next few words, the senior editor reads the whole draft at once and keeps the words
+she agrees with. The junior writes quickly when nobody makes him stop after every word to show it, and the editor
+decides how long a draft to ask for from how often she agreed lately and how long each of them takes.
+
+📐 `engine.speculative=draft` ([10 §10.9](10-engine-and-server.md#109-speculative-decoding)) loads
+`engine.draft-model` on the same backend: on Metal a second `MetalBackend` on the same device, loaded before the
+target so `DeviceLedger` counts its weights and cache in the target's memory plan (§8.18). Per pass:
+
+```
+draft:   feed the history after the prefix its cache already holds (chunks, no logits), then k pipelined steps:
+         step 0 feeds the last history token, step j feeds the argmax of step j-1 (on the GPU), each step queued
+         before the CPU reads the one before it; only k token ids come back
+target:  one forwardAll([tok, d1..dk]) pass: k+1 rows through the multi-token kernels, k+1 rows of logits
+accept:  the longest prefix the target agrees with, plus the target's own next token
+```
+
+**Pipelined draft.** The draft uses the greedy pipe of §8.16 (`DraftModel.propose`): on the GPU `argmax` writes each
+step's token into the ring and the next step's `embed_token` reads it, so the draft's k steps run back to back without a
+GPU → CPU → GPU round trip and without copying a vocabulary of logits per step (600 KB for a 150k vocabulary). A stop
+token ends the draft early (the pipe is drained). Without a pipe (CPU backend, experts on the CPU) the draft returns
+logits per step as before; `-Djllm.engine.draftPipeline=false` forces that.
+
+**Roll-back costs nothing.** A KV cache is addressed by position: after a pass that accepted `a` of `k` drafts the
+target continues at `pos + 1 + a`, and the rows after that are simply overwritten by the next pass before anything
+attends to them (attention at position `p` reads rows `0..p` only). The draft keeps the list of tokens its cache
+holds and on the next proposal re-feeds only what follows the longest common prefix with the new history (the accepted
+drafts stay, a rejected one is overwritten by the correction). Every cache row is written whole for its position —
+f32, half, or q8's int8 values with their per-row scales — so this holds for all three cache types; `ArchSmoke` checks
+greedy output with and without speculation for each of them.
+
+**Adaptive draft length.** With per-token acceptance probability α, a pass with k drafts yields
+`E(k) = 1 + α + … + α^k` tokens and costs `k·d + V(k+1)`, where d is a draft step and `V(n) ≈ a + b(n−1)` a target pass
+over n positions. `Speculator.CostModel` measures all of them while running (exponentially weighted: α from the
+accepted and examined positions, d from the draft's time per step, a and b by least squares over the verification
+passes, and a plain target step p from the steps the engine takes without a draft) and picks
+
+```
+k* = argmax_k  E(k) / (k·d + a + b·k)         if that beats 1 / p, else pause for 16 plain steps
+```
+
+(one in four pauses runs a pass anyway, so a rise in acceptance is noticed). Until two passes are measured the
+doubling rule of prompt lookup decides; `-Djllm.engine.adaptiveDraft=false` keeps it. Worked example with the costs of
+[11 §11.6](11-performance.md#116-speculative-decoding) for a 30B MoE target on an M1 Pro (a = 39 ms, b = 0.55 a,
+a 0.6B draft step d ≈ 8 ms): at α = 0.6, k = 1 gives 1.6 / (8 + 39.2 + 21.6) ms = 23.3 tok/s against 25.5 tok/s plain
+and longer drafts do worse, so speculation pauses; at α = 0.9, k = 1 gives 1.9 / 68.8 ms = 27.6 tok/s (k = 2: 27.6,
+k = 3: 26.9) and wins by 8 %. The pass cost b is the lever: the multi-token kernels' cost per extra row decides whether
+a draft can pay; at b = 0.1 a, α = 0.9 would choose k = 5 for 1.86x the plain rate.
+
+Emulator timings are not representative of a GPU (the emulator runs every GPU thread of a kernel as a fiber on the
+CPU), so the costs on a real Mac come from `scripts/mac-validate.sh` (§8.20).

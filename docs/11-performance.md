@@ -347,6 +347,23 @@ With a perfectly agreeing draft (the 0.6B drafting for itself, only a correctnes
 throughput still drops (56 vs 95 tok/s) because the verification pass and the draft's own K steps cost more than
 the K tokens saved.
 
+**Since these measurements** the draft path changed on Metal
+([08 §8.22](08-metal-backend.md#822-draft-model-speculation-on-the-gpu)): the draft's steps are pipelined on the GPU
+(each feeds the argmax of the step before; before, every draft step copied a vocabulary of logits to the CPU and
+waited for it), the draft is loaded before the target so the target's memory plan counts it (the k 4 / k 6 rows above
+ran with the two models competing for memory), and the draft length comes from a cost model of measured times and
+acceptance, which pauses speculation while no length beats plain decoding (with the costs of the table above, a
+0.6B draft for the 30B pauses below about 75 % acceptance). `scripts/mac-validate.sh` measures the dense model
+drafting for itself with adaptive length and draft pipelining on and off, and `--moe` the 30B with the 0.6B draft; those
+rows are still to be taken on a quiet Mac. The emulator ([18](18-metal-emulator.md)) runs the same code and checks
+exactness, but its timings say nothing about a GPU.
+
+**Batched decoding across slots on Metal** ([08 §8.21](08-metal-backend.md#821-batched-decoding-across-slots-metalbackendforwardbatch)):
+expected per round of n slots `W/BW + n·r` instead of `n·(W/BW + r)` (W/BW ≈ 8 ms for Qwen3-0.6B on the M1 Pro, r the
+per-row attention and small dispatches), i.e. close to n times the total tokens per second at short contexts.
+`scripts/mac-validate.sh` measures three slots together against taking turns (`-Djllm.metal.batchDecode=false`); not
+measured on a Mac yet.
+
 **Greedy exactness** (5 prompts, 100 to 150 tokens): Metal, `ngram` (min 1, k 4) and `draft` (self-draft, k 6): all
 5 outputs byte-identical to the non-speculative output, accepted 100 % for the self-draft, so `forwardAll` is bit-identical to
 the single-token pass on Metal. CPU, `-Djllm.cpu.deterministic=true --backend.cpu.int8-activations false`: 5 of 5
