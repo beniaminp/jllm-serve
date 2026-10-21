@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -40,6 +40,13 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
                and yarn mscale != mscale_all_dim
   deepseek_v3  MLA with q_lora_rank, sigmoid scores, noaux_tc with e_score_correction_bias, 1 shared expert,
                routed_scaling_factor 2.5, norm_topk_prob, plus a stray layer 4 (V3's MTP layer, must be ignored)
+  qwen3next  Qwen3-Next hybrid: 4 layers, full_attention_interval 2 (layers 1 and 3 gated full attention, head_dim 64,
+             partial_rotary_factor 0.25, GQA 4/2), Gated DeltaNet in layers 0 and 2 (2 key heads x 32, 4 value heads
+             x 32, conv 4), layer 0 dense (mlp_only_layers), the others 8 experts top 2 + a gated shared expert of 64,
+             untied head, zero-centred (1+w) norms, plus an mtp.* tensor that must be ignored
+  qwen3next2 Qwen3-Next with explicit layer_types (L L F L L), one value head per key head with key dim 64 != value
+             dim 32, conv 3, head_dim 32 with partial_rotary_factor 0.5, MoE every other layer (decoder_sparse_step 2,
+             4 experts top 2, norm_topk_prob false), tied embeddings
 MLA head sizes are nope 32 + rope 32 = 64 for q/k and v 32, so the attention kernel's separate q/k and v widths
 are exercised.
 """
@@ -129,6 +136,25 @@ FAMILIES = {
         layer_norm_epsilon=1e-5, use_bias=False, use_conv_bias=True, hidden_act="silu",
         bos_token_id=0, eos_token_id=0, tie_word_embeddings=False),
 }
+FAMILIES["qwen3next"] = dict(
+    architectures=["Qwen3NextForCausalLM"], model_type="qwen3_next", hidden_size=128, intermediate_size=192,
+    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=64, vocab_size=1000,
+    max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=1000000.0, partial_rotary_factor=0.25,
+    hidden_act="silu", attention_bias=False, tie_word_embeddings=False, full_attention_interval=2,
+    linear_conv_kernel_dim=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_num_key_heads=2,
+    linear_num_value_heads=4, num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32,
+    shared_expert_intermediate_size=64, norm_topk_prob=True, decoder_sparse_step=1, mlp_only_layers=[0],
+    bos_token_id=1, eos_token_id=2)
+FAMILIES["qwen3next2"] = dict(
+    architectures=["Qwen3NextForCausalLM"], model_type="qwen3_next", hidden_size=128, intermediate_size=96,
+    num_hidden_layers=5, num_attention_heads=2, num_key_value_heads=1, head_dim=32, vocab_size=1000,
+    max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=10000.0, partial_rotary_factor=0.5,
+    hidden_act="silu", attention_bias=False, tie_word_embeddings=True,
+    layer_types=["linear_attention", "linear_attention", "full_attention", "linear_attention", "linear_attention"],
+    linear_conv_kernel_dim=3, linear_key_head_dim=64, linear_value_head_dim=32, linear_num_key_heads=2,
+    linear_num_value_heads=2, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+    shared_expert_intermediate_size=32, norm_topk_prob=False, decoder_sparse_step=2, mlp_only_layers=[],
+    bos_token_id=1, eos_token_id=[2, 3])
 TEXT_KEYS_EXCLUDED_IN_WRAPPER = ("architectures", "bos_token_id", "eos_token_id")
 
 
@@ -280,6 +306,70 @@ def mamba_tensors(cfg, rnd):
     return tensors
 
 
+def qwen3next_tensors(cfg, rnd):
+    """Random Qwen3-Next weights with the released checkpoints' names and layouts: in_proj_qkvz / in_proj_ba grouped per
+    key head, q_proj holding [query | gate] per head, conv1d [conv_dim, 1, K] without bias, zero-centred norm gains
+    (applied as 1 + w) except the gated DeltaNet norm, per-expert tensors plus shared_expert / shared_expert_gate."""
+    d, vocab, n_layers = cfg["hidden_size"], cfg["vocab_size"], cfg["num_hidden_layers"]
+    heads, kv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
+    nk, nv = cfg["linear_num_key_heads"], cfg["linear_num_value_heads"]
+    dk, dv, kc = cfg["linear_key_head_dim"], cfg["linear_value_head_dim"], cfg["linear_conv_kernel_dim"]
+    conv_dim = 2 * nk * dk + nv * dv
+    types = cfg.get("layer_types") or [
+        "full_attention" if (i + 1) % cfg["full_attention_interval"] == 0 else "linear_attention" for i in range(n_layers)]
+    tensors = {}
+
+    def mat(name, rows, cols, std=0.08):
+        tensors[name] = ([rows, cols], [rnd.gauss(0, std) for _ in range(rows * cols)])
+
+    def vec(name, n, base=0.0, std=0.1):
+        tensors[name] = ([n], [base + rnd.gauss(0, std) for _ in range(n)])
+
+    def mlp(p, inter):
+        mat(p + "gate_proj.weight", inter, d)
+        mat(p + "up_proj.weight", inter, d)
+        mat(p + "down_proj.weight", d, inter)
+
+    # a tied head reads the embedding back: smaller rows keep the last token from dominating its own logits
+    mat("model.embed_tokens.weight", vocab, d, 0.25 if cfg["tie_word_embeddings"] else 1.0)
+    for l in range(n_layers):
+        p = "model.layers.%d." % l
+        vec(p + "input_layernorm.weight", d)
+        vec(p + "post_attention_layernorm.weight", d)
+        if types[l] == "full_attention":
+            a = p + "self_attn."
+            mat(a + "q_proj.weight", heads * hd * 2, d, 0.12)
+            mat(a + "k_proj.weight", kv * hd, d, 0.12)
+            mat(a + "v_proj.weight", kv * hd, d)
+            mat(a + "o_proj.weight", d, heads * hd)
+            vec(a + "q_norm.weight", hd)
+            vec(a + "k_norm.weight", hd)
+        else:
+            a = p + "linear_attn."
+            mat(a + "in_proj_qkvz.weight", 2 * nk * dk + 2 * nv * dv, d, 0.12)
+            mat(a + "in_proj_ba.weight", 2 * nv, d, 0.3)
+            tensors[a + "conv1d.weight"] = ([conv_dim, 1, kc], [rnd.gauss(0, 0.4) for _ in range(conv_dim * kc)])
+            vec(a + "dt_bias", nv, 0.0, 0.8)
+            tensors[a + "A_log"] = ([nv], [math.log(rnd.uniform(0.1, 8.0)) for _ in range(nv)])
+            vec(a + "norm.weight", dv, 1.0, 0.1)
+            mat(a + "out_proj.weight", d, nv * dv, 0.1)
+        moe = cfg["num_experts"] > 0 and l not in cfg["mlp_only_layers"] and (l + 1) % cfg["decoder_sparse_step"] == 0
+        if moe:
+            e, m = cfg["num_experts"], cfg["moe_intermediate_size"]
+            mat(p + "mlp.gate.weight", e, d, 0.3)
+            for i in range(e):
+                mlp(p + "mlp.experts.%d." % i, m)
+            mlp(p + "mlp.shared_expert.", cfg["shared_expert_intermediate_size"])
+            mat(p + "mlp.shared_expert_gate.weight", 1, d, 0.2)
+        else:
+            mlp(p + "mlp.", cfg["intermediate_size"])
+    vec("model.norm.weight", d)
+    if not cfg["tie_word_embeddings"]:
+        mat("lm_head.weight", vocab, d, 0.5)
+    mat("mtp.fc.weight", d, 2 * d)  # the multi-token-prediction head: present in the released checkpoints, unused
+    return tensors
+
+
 def main():
     if len(sys.argv) < 3 or sys.argv[2] not in FAMILIES and sys.argv[2] != "gemma3mm":
         sys.exit(__doc__)
@@ -290,6 +380,9 @@ def main():
     cfg = dict(FAMILIES["gemma3" if wrapper else fam])
     if cfg["model_type"] == "mamba":
         write(out, fam, cfg, mamba_tensors(cfg, rnd))
+        return
+    if cfg["model_type"] == "qwen3_next":
+        write(out, fam, cfg, qwen3next_tensors(cfg, rnd))
         return
     d, heads, kv = cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_key_value_heads"]
     if "--head-dim" in sys.argv:  # e.g. 256 to exercise the largest head size the Metal attention kernel supports

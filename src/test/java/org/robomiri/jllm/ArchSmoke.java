@@ -2,10 +2,12 @@ package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
+import org.robomiri.jllm.cpu.Qwen3NextCpuBackend;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.metal.MoeSplit;
+import org.robomiri.jllm.metal.Qwen3NextMetalBackend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.AttnWeights;
@@ -19,6 +21,7 @@ import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 import org.robomiri.jllm.model.QuantFile;
+import org.robomiri.jllm.model.Qwen3NextArch;
 import org.robomiri.jllm.model.ShardProvider;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
@@ -77,6 +80,16 @@ public final class ArchSmoke {
         }
         return switch (a) {
             case MambaArch m -> m.dInner() % b == 0;
+            case Qwen3NextArch q -> {
+                boolean ok = q.attention().qDim() % b == 0 && q.deltaNet().valueWidth() % b == 0;
+                for (Mlp p : q.mlps()) {
+                    ok &= switch (p) {
+                        case Mlp.Dense dense -> dense.hidden() % b == 0;
+                        case Mlp.Moe moe -> moe.moeDim() % b == 0 && moe.shared().hidden() % b == 0;
+                    };
+                }
+                yield ok;
+            }
             case Decoder d -> {
                 boolean ok = d.attention().qDim() % b == 0;
                 for (LayerSpec s : d.layers()) {
@@ -139,12 +152,16 @@ public final class ArchSmoke {
         String label = dir.getFileName() + " " + quant + (head == QuantFile.DEFAULT_HEAD ? "" : " head " + head);
         int failures = 0;
         boolean mamba = cfg instanceof MambaArch;
+        boolean hybrid = cfg instanceof Qwen3NextArch; // Qwen3-Next: recurrent DeltaNet states plus a KV cache
+        boolean recurrent = mamba || hybrid;
         try (ModelWeights w = ModelWeights.load(dir, cfg, quant, head, ShardProvider.local(dir), null)) {
             int[] cpu;
             float[] cpuLogits = new float[cfg.core().vocabSize()];
-            try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
+            try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4)
+                    : hybrid ? new Qwen3NextCpuBackend(w, 64, 16, 4, KvDtype.F32)
+                    : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                 cpu = generate(b, cpuLogits);
-                failures += mamba ? stateChecks(b, cfg, "cpu") : 0;
+                failures += recurrent ? stateChecks(b, cfg, "cpu") : 0;
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
@@ -157,18 +174,20 @@ public final class ArchSmoke {
             }
             int[] gpu;
             float[] gpuLogits = new float[cfg.core().vocabSize()];
-            try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib) : new MetalBackend(w, 64, 16, lib)) {
+            try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib)
+                    : hybrid ? new Qwen3NextMetalBackend(w, 64, 16, lib, KvDtype.F32)
+                    : new MetalBackend(w, 64, 16, lib)) {
                 gpu = generate(b, gpuLogits);
-                failures += mamba ? stateChecks(b, cfg, "metal") : 0;
+                failures += recurrent ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
-            if (!mamba) {
+            if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
             if (cfg instanceof Decoder d && d.anyMoe()) {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
             }
-            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
+            if (cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && dec.attention() instanceof Attention.Gqa) {
                 for (KvDtype dt : KvDtype.values()) {
                     failures += kvStateChecks(w, lib, cfg, dt);
                 }

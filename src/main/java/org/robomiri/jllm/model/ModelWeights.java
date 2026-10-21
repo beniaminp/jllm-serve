@@ -48,6 +48,12 @@ public final class ModelWeights implements AutoCloseable {
                 }
                 finalNormName = "backbone.norm_f.weight";
             }
+            case Qwen3NextArch q -> {
+                for (int l = 0; l < c.layers(); l++) {
+                    layers[l] = Qwen3NextLayer.load(file, "model.layers." + l + ".", q, l);
+                }
+                finalNormName = "model.norm.weight";
+            }
             case Decoder d -> {
                 for (int l = 0; l < c.layers(); l++) {
                     LayerSpec spec = d.layers().get(l);
@@ -86,6 +92,19 @@ public final class ModelWeights implements AutoCloseable {
     /** Layer {@code l} of a decoder. */
     public DecoderLayer decoderLayer(int l) {
         return (DecoderLayer) layers[l]; // a decoder's layers are DecoderLayers by construction
+    }
+
+    /** The architecture as Qwen3-Next; throws for any other. */
+    public Qwen3NextArch qwen3Next() {
+        if (arch instanceof Qwen3NextArch q) {
+            return q;
+        }
+        throw new IllegalArgumentException("not a Qwen3-Next model: " + arch);
+    }
+
+    /** Layer {@code l} of a Qwen3-Next model. */
+    public Qwen3NextLayer qwen3NextLayer(int l) {
+        return (Qwen3NextLayer) layers[l];
     }
 
     /** Layer {@code l} of a Mamba model. */
