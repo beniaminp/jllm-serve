@@ -228,6 +228,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.moeMma` | true | expert-grouped simdgroup-matrix MoE prefill ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)); `false` = per-slot kernels |
 | `jllm.metal.moeMmaMin` | 16 | smallest chunk that uses the expert-grouped MoE kernels |
 | `jllm.metal.pipeline` | true | pipelined greedy decoding: the GPU picks the token and runs ahead ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) |
+| `backend.metal.cpu-moe` (properties key) | auto | MoE layers whose routed experts run on the CPU: auto (only when the model exceeds Metal's working set), off, all or a number ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)) |
+| `jllm.metal.workingSetGb` | Metal's | the GPU memory budget `auto` above aims for |
 | `jllm.metal.emulator` | false | run the Metal backend on the CPU emulator (with `jllm.metal.lib` = the emulator library; [18](18-metal-emulator.md)) |
 
 JIT warm-up matters: the first ~50 tokens run before C2 has compiled the kernels; `bench` discards a warm-up

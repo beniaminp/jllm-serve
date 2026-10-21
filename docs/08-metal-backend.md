@@ -900,3 +900,62 @@ of [17 §17.2–17.3](17-agent-speedups.md#172-slots-that-share-a-prefix). The f
 `kv f16 layers=L kvDim=K headDim=D` (or `f32`) is the same the CPU backend writes; rows are written as per layer,
 per position, K then V, little-endian. The cache buffers live in unified memory, so loading reads from the file
 straight into them, and a slot copy is a `memcpy` of `n` rows per layer between two engines' buffers.
+
+---
+
+## 8.18 Experts on the CPU (`backend.metal.cpu-moe`)
+
+🧸 The kitchen has one very fast cook (the GPU) with a small worktable, and a slower cook (the CPU) next to a big
+pantry. When the recipe book is too big for the worktable, the fast cook doesn't keep running to the cellar for
+pages; he keeps most of the book on his table and hands a few chapters to the second cook. When the recipe reaches
+one of those chapters, the fast cook waits a moment, the second cook does that step, and the fast cook goes on.
+
+📐 **Why.** On Apple Silicon the CPU and GPU share one memory, but Metal keeps only about
+`recommendedMaxWorkingSetSize` (about two thirds to three quarters of RAM) resident for the GPU. A model whose
+GPU buffers exceed it pages: weights are evicted and read again from the SSD, every token. In an MoE model the
+routed experts are nearly all the bytes (Qwen3-30B-A3B at Q4_0: about 18 of 19.4 GB), so leaving some layers'
+experts out of the GPU's buffers is the cheapest way to fit. Those experts stay in the memory-mapped file and the
+CPU reads them like any file data.
+
+**Which layers.** With `L` the set of layers whose experts go to the CPU, `W` the weights, `B` the GPU's own buffers
+(KV cache, activations) and `E_l` the expert bytes of layer `l`, the GPU keeps
+
+```
+G(L) = W + B − Σ_{l ∈ L} E_l
+```
+
+`auto` (the default) takes the last MoE layers one by one until `G(L) ≤ working set`, so `L` is empty and nothing
+changes for a model that fits. A number takes that many MoE layers (the last ones), `all` every one, `off` none.
+`-Djllm.metal.workingSetGb=N` replaces Metal's figure, for example to leave memory to other programs. The start-up
+log says what was chosen: `Metal: the experts of 6 of 48 MoE layers run on the CPU (2.3 GB, 10 threads); GPU share …`.
+
+**One CPU layer, step by step.** The GPU runs the attention, the FFN norm and the router as usual; then
+
+```
+GPU:  … attention, norm, router ┃                                ┃ next layer …
+CPU:                            ┃ x += Σ_k w_k · expert_k(xb)    ┃
+                         commit + wait                     add, begin
+```
+
+The CPU copies `xb` (n × dim floats), the router's choices and weights out of the shared buffers, runs the
+experts with the CPU backend's own code (`cpu/MoeExperts`, the same code `CpuBackend` uses: the single-token path
+with int8 activations for decode, the expert-grouped path for prefill chunks) and adds the result into `x`. The GPU
+is idle meanwhile, except for one overlap: when the layer has **shared experts** (DeepSeek), they are submitted in
+their own command buffer and run on the GPU while the CPU computes the routed experts.
+
+**Cost.** Per token and CPU layer, the CPU reads `topK · 3 · moeDim · dim` weights:
+
+```
+Qwen3-30B-A3B, Q4_0 (16 B of nibbles + a 4 B scale per 32 weights = 0.625 B):  8 · 3 · 768 · 2048 · 0.625 B ≈ 24 MB
+```
+
+At a CPU memory bandwidth of 60–100 GB/s that is roughly 0.25–0.4 ms, plus one command-buffer round trip
+(≈ 0.1 ms), against ≈ 0.15 ms on the GPU. Each CPU layer therefore costs about 0.2–0.35 ms more per token, under 1 %
+of a 40 ms token. Paging the same 24 MB back from an SSD at ~5 GB/s would cost about 5 ms. Prefill is a different
+story: the GPU's grouped matrix kernels are much faster than the CPU on long chunks, so long prompts slow down
+more. These numbers are estimates, not yet measured on a Mac. Pipelined decoding ([8.16](#816-pipelined-greedy-decoding))
+is off when any layer runs on the CPU, because the GPU cannot run ahead of it.
+
+**Checked by** `scripts/arch-smoke.sh` on the emulator: Qwen3-MoE and the three DeepSeek models generate the same
+tokens with the experts of one layer and of every layer on the CPU as with the CPU backend, and the final logits
+agree within the usual CPU / Metal tolerance.

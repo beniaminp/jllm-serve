@@ -141,8 +141,9 @@ dot products is accumulated in the same order as before, so the results did not 
 variants are explicit template instantiations (`template [[host_name("moe_up_q4")]] …`).
 
 The stacked expert tensors are bound as single buffers (252 MB and 126 MB per layer at Q4_0), wrapped zero-copy from
-the memory-mapped cache file. Metal's `recommendedMaxWorkingSetSize` is checked at start-up and a warning is
-printed when the weights exceed it. DeepSeek's shared experts (always-on, one dense SwiGLU) run after `moe_down`
+the memory-mapped cache file. Metal's `recommendedMaxWorkingSetSize` is checked at start-up: when the GPU's share
+would exceed it, `backend.metal.cpu-moe=auto` leaves the experts of just enough layers on the CPU
+([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)); otherwise a warning is printed. DeepSeek's shared experts (always-on, one dense SwiGLU) run after `moe_down`
 through the ordinary fused SwiGLU and down matmul.
 
 ## 12.6 Memory and disk on a 32 GB laptop

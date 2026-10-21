@@ -5,6 +5,7 @@ import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
+import org.robomiri.jllm.metal.MoeSplit;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.AttnWeights;
@@ -164,6 +165,9 @@ public final class ArchSmoke {
             if (!mamba) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
+            if (cfg instanceof Decoder d && d.anyMoe()) {
+                failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
+            }
             if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
                 for (KvDtype dt : KvDtype.values()) {
                     failures += kvStateChecks(w, lib, cfg, dt);
@@ -188,6 +192,34 @@ public final class ArchSmoke {
             System.out.println("  cpu == metal");
             return failures;
         }
+    }
+
+    /**
+     * Experts on the CPU (backend.metal.cpu-moe): with the routed experts of one MoE layer, and of all of them, run by
+     * the CPU between the GPU's layers, the generation and the final logits match the CPU backend within the usual
+     * CPU / Metal tolerance (prefill takes the batched expert path, decode the single-token one; DeepSeek's shared
+     * experts run on the GPU at the same time).
+     */
+    private static int moeSplitCheck(ModelWeights w, String lib, Architecture cfg, int[] cpu, float[] cpuLogits) throws Exception {
+        int bad = 0;
+        for (int layers : new int[]{1, Integer.MAX_VALUE}) {
+            float[] logits = new float[cfg.core().vocabSize()];
+            int[] got;
+            try (Backend b = new MetalBackend(w, 64, 16, lib, KvDtype.F32, new MoeSplit(layers, 4, false))) {
+                got = generate(b, logits);
+            }
+            float scale = 0;
+            float diff = 0;
+            for (int i = 0; i < logits.length; i++) {
+                scale = Math.max(scale, Math.abs(cpuLogits[i]));
+                diff = Math.max(diff, Math.abs(cpuLogits[i] - logits[i]));
+            }
+            boolean ok = Arrays.equals(cpu, got) && diff <= 1e-3f * scale + 1e-4f;
+            System.out.printf("  experts on cpu (%s layers): %s max|cpu-split| = %.2e -> %s%n",
+                    layers == Integer.MAX_VALUE ? "all" : layers, Arrays.toString(got), diff, ok ? "ok" : "SPLIT MISMATCH");
+            bad += ok ? 0 : 1;
+        }
+        return bad;
     }
 
     /**

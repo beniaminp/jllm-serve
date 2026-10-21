@@ -12,6 +12,7 @@ import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
+import org.robomiri.jllm.metal.MoeSplit;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
@@ -333,7 +334,10 @@ public final class ModelLoader {
                             s.getBool("backend.cpu.int8-activations"));
             case "metal" -> mamba
                     ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
-                    : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+                    : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
+                            new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
+                                    threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
+                                    s.getBool("backend.cpu.int8-activations")));
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }

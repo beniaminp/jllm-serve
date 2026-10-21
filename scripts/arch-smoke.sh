@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture smoke test: Llama / Mistral / Qwen2 / GLM / Phi-3 / Gemma / Mamba / DeepSeek pipeline on tiny random checkpoints.
+# Architecture smoke test: Llama / Mistral / Qwen2 / Qwen3-MoE / GLM / Phi-3 / Gemma / Mamba / DeepSeek pipeline on tiny random checkpoints.
 #
 # For every model it converts to q4, q8, q2k and q6k (plus q4 with a q6k embedding / LM head), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
@@ -28,6 +28,8 @@
 #   hf-internal-testing_tiny-random-Mamba3ForCausalLM     generated: Mamba v1, d_model 128, state 8, conv 3, untied head
 #                                                         (Mamba models additionally check that chunking the prompt
 #                                                         differently gives the same logits)
+#   hf-internal-testing_tiny-random-Qwen3MoeForCausalLM   generated: q/k norm, 8 experts top 2, one dense layer; MoE models
+#                                                         also run with their experts on the CPU (backend.metal.cpu-moe)
 #   ...-DeepseekV2ForCausalLM / -DeepseekV2QLoraForCausalLM / -DeepseekV3ForCausalLM  generated: MLA + shared experts +
 #                                                         yarn, group-limited softmax routing (q_lora null / set) and
 #                                                         sigmoid noaux_tc routing; also checked against deepseek-ref.py
@@ -85,6 +87,7 @@ gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
 gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
 gen mamba MambaForCausalLM
 gen mamba3 Mamba3ForCausalLM
+gen qwen3moe Qwen3MoeForCausalLM
 gen deepseek_v2 DeepseekV2ForCausalLM
 gen deepseek_v2q DeepseekV2QLoraForCausalLM
 gen deepseek_v3 DeepseekV3ForCausalLM
@@ -104,5 +107,5 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
   "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
-  "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" \
+  "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"

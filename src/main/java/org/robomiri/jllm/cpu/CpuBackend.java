@@ -19,7 +19,6 @@ import org.robomiri.jllm.model.Rope;
 import org.robomiri.jllm.model.RopeTable;
 import org.robomiri.jllm.model.Router;
 
-import java.util.Arrays;
 
 /**
  * Decoder forward pass on the CPU (Llama, Mistral, Qwen2, Qwen3, GLM, Phi-3, Gemma, DeepSeek): quantized matmuls
@@ -63,13 +62,7 @@ public final class CpuBackend implements Backend {
     // MoE scratch (null for dense models); per-slot buffers are indexed by slot = t * topK + k
     private final int[] assign;
     private final float[] routeWeight;
-    private final float[] moeGateUp;
-    private final float[] moeHidden;
-    private final float[] moeDown;
-    private final int[] expertStart;
-    private final int[] expertFill;
-    private final int[] usedExperts;
-    private final int[] slotOrder;
+    private final MoeExperts experts;
 
     /** The quantized matmul (float and int8 paths) and the thread-local float scratch, shared with {@link MlaCpu}. */
     final CpuMatmul mm;
@@ -122,28 +115,15 @@ public final class CpuBackend implements Backend {
             int slots = maxBatch * arch.maxTopK();
             assign = new int[slots];
             routeWeight = new float[slots];
-            moeGateUp = new float[slots * 2 * arch.maxMoeDim()];
-            moeHidden = new float[slots * arch.maxMoeDim()];
-            moeDown = new float[slots * c.dim()];
-            expertStart = new int[arch.maxExperts() + 1];
-            expertFill = new int[arch.maxExperts()];
-            usedExperts = new int[arch.maxExperts()];
-            slotOrder = new int[slots];
         } else {
             assign = null;
             routeWeight = null;
-            moeGateUp = null;
-            moeHidden = null;
-            moeDown = null;
-            expertStart = null;
-            expertFill = null;
-            usedExperts = null;
-            slotOrder = null;
         }
         // attention scores (ctx), router logits (experts), or four dequantized rows of the widest tensor
         int scratchLen = Math.max(Math.max(ctx, arch.maxExperts()), 4 * CpuMatmul.maxCols(w));
         mm = new CpuMatmul(pool, int8Activations, DETERMINISTIC, scratchLen);
         scratch = mm.scratch;
+        experts = arch.anyMoe() ? new MoeExperts(pool, mm, arch, maxBatch) : null;
         plans = new LayerPlan[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
             plans[l] = plan(arch.layers().get(l), w.decoderLayer(l));
@@ -473,11 +453,19 @@ public final class CpuBackend implements Backend {
 
         @Override
         public void run(int n) {
+            int topK = spec.topK();
             if (n > 1 && !DETERMINISTIC) {
-                moeBatched(n);
+                // one token per thread; each routes in its own scratch
+                pool.forRange(n, 1, (t0, t1) -> {
+                    for (int t = t0; t < t1; t++) {
+                        route.route(t * c.dim(), t * topK, false);
+                    }
+                });
+                experts.batched(w, spec.experts(), topK, spec.moeDim(), n, xb, assign, routeWeight, x);
             } else {
                 for (int t = 0; t < n; t++) {
-                    moeToken(t);
+                    route.route(t * c.dim(), t * topK, true);
+                    experts.token(w, topK, spec.moeDim(), t, xb, assign, routeWeight, x);
                 }
             }
             if (sharedDim > 0) {
@@ -485,179 +473,6 @@ public final class CpuBackend implements Backend {
                 siluMul(n, sharedDim);
                 matmul(w.shared().down(), hidden, x, 0, n, true);
             }
-        }
-
-        /** The single-token MoE layer for token {@code t}: {@code x[t] += Σ_k w_k · expert_k(xb[t])}. */
-        private void moeToken(int t) {
-            int dim = c.dim();
-            int topK = spec.topK();
-            int m = spec.moeDim();
-            int gu = 2 * m;
-            int xo = t * dim;
-            route.route(xo, 0, true);
-            QTensor expGateUp = w.expGateUp();
-            QTensor expDown = w.expDown();
-            // all selected experts' gate/up rows in one parallel loop
-            if (mm.useInt8(expGateUp)) {
-                short[] xq = mm.quantizeInt8(xb, xo, dim);
-                float[] xs = mm.xs();
-                pool.forRange(topK * gu, 32, (i0, i1) -> {
-                    for (int i = i0; i < i1; i++) {
-                        int k = i / gu;
-                        int r = i - k * gu;
-                        moeGateUp[i] = mm.int8Dot(expGateUp, assign[k] * gu + r, xq, xs, 0);
-                    }
-                });
-            } else {
-                pool.forRange(topK * gu, 32, (i0, i1) -> {
-                    for (int i = i0; i < i1; i++) {
-                        int k = i / gu;
-                        int r = i - k * gu;
-                        moeGateUp[i] = VectorKernels.dotRow(expGateUp, assign[k] * gu + r, xb, xo);
-                    }
-                });
-            }
-            for (int k = 0; k < topK; k++) {
-                int gi = k * gu;
-                int hi = k * m;
-                for (int i = 0; i < m; i++) {
-                    float g = moeGateUp[gi + i];
-                    moeHidden[hi + i] = VectorKernels.silu(g) * moeGateUp[gi + m + i];
-                }
-            }
-            if (mm.useInt8(expDown)) {
-                short[] xq = mm.quantizeInt8(moeHidden, 0, topK * m);   // slot k starts at block offset k * m
-                float[] xs = mm.xs();
-                pool.forRange(dim, 8, (r0, r1) -> {
-                    for (int r = r0; r < r1; r++) {
-                        float sum = 0;
-                        for (int k = 0; k < topK; k++) {
-                            sum += routeWeight[k] * mm.int8Dot(expDown, assign[k] * dim + r, xq, xs, k * m);
-                        }
-                        x[xo + r] += sum;
-                    }
-                });
-            } else {
-                pool.forRange(dim, 8, (r0, r1) -> {
-                    for (int r = r0; r < r1; r++) {
-                        float sum = 0;
-                        for (int k = 0; k < topK; k++) {
-                            sum += routeWeight[k] * VectorKernels.dotRow(expDown, assign[k] * dim + r, moeHidden, k * m);
-                        }
-                        x[xo + r] += sum;
-                    }
-                });
-            }
-        }
-
-        /**
-         * Prefill MoE: route every token, group the {@code n * topK} slots by expert (counting sort), then run each
-         * expert once over all tokens routed to it with the dense prefill kernel (four rows dequantized once, reused
-         * for every token). Down-projection results are kept per slot and combined into x per token in slot order.
-         */
-        private void moeBatched(int n) {
-            int dim = c.dim();
-            int e = spec.experts();
-            int topK = spec.topK();
-            int m = spec.moeDim();
-            int gu = 2 * m;
-            int slots = n * topK;
-
-            // one token per thread; each routes in its own scratch
-            pool.forRange(n, 1, (t0, t1) -> {
-                for (int t = t0; t < t1; t++) {
-                    route.route(t * dim, t * topK, false);
-                }
-            });
-
-            Arrays.fill(expertStart, 0, e + 1, 0);
-            for (int s = 0; s < slots; s++) {
-                expertStart[assign[s] + 1]++;
-            }
-            int used = 0;
-            for (int i = 0; i < e; i++) {
-                if (expertStart[i + 1] > 0) {
-                    usedExperts[used++] = i;
-                }
-                expertStart[i + 1] += expertStart[i];
-                expertFill[i] = expertStart[i];
-            }
-            for (int s = 0; s < slots; s++) {
-                slotOrder[expertFill[assign[s]]++] = s;
-            }
-
-            expertMatmul(w.expGateUp(), gu, used, xb, dim, false, moeGateUp, gu);
-
-            pool.forRange(slots * m, 256, (i0, i1) -> {
-                for (int i = i0; i < i1; i++) {
-                    int s = i / m;
-                    int j = i - s * m;
-                    int gi = s * gu;
-                    float g = moeGateUp[gi + j];
-                    moeHidden[s * m + j] = VectorKernels.silu(g) * moeGateUp[gi + m + j];
-                }
-            });
-
-            expertMatmul(w.expDown(), dim, used, moeHidden, m, true, moeDown, dim);
-
-            pool.forRange(n, 1, (t0, t1) -> {
-                for (int t = t0; t < t1; t++) {
-                    int s0 = t * topK;
-                    VectorKernels.combine(routeWeight, s0, topK, moeDown, s0 * dim, dim, x, t * dim, dim);
-                }
-            });
-        }
-
-        /**
-         * {@code out[slot, r] = dot(W[expert(slot) * rowsPer + r, :], in[src(slot), :])} for every slot of every
-         * used expert, where {@code src(slot)} is the slot itself ({@code inBySlot}) or its token. Parallel over
-         * (expert, 4-row group) pairs; each group is dequantized once and reused for all of the expert's slots.
-         */
-        private void expertMatmul(QTensor wt, int rowsPer, int used, float[] in, int inStride, boolean inBySlot,
-                                  float[] out, int outStride) {
-            int cols = wt.cols;
-            int topK = spec.topK();
-            int groups = (rowsPer + 3) / 4;
-            pool.forRange(used * groups, 1, (g0, g1) -> {
-                float[] tmp = scratch.get();
-                for (int g = g0; g < g1; g++) {
-                    int ex = usedExperts[g / groups];
-                    int r = (g % groups) * 4;
-                    int rowBase = ex * rowsPer;
-                    int sBeg = expertStart[ex];
-                    int sEnd = expertStart[ex + 1];
-                    if (r + 4 <= rowsPer) {
-                        for (int k = 0; k < 4; k++) {
-                            VectorKernels.dequantRow(wt, rowBase + r + k, tmp, k * cols);
-                        }
-                        int s = sBeg;
-                        for (; s + 4 <= sEnd; s += 4) {
-                            int sa = slotOrder[s];
-                            int sb = slotOrder[s + 1];
-                            int sc = slotOrder[s + 2];
-                            int sd = slotOrder[s + 3];
-                            VectorKernels.dot4x4(tmp, 0, cols, in,
-                                    (inBySlot ? sa : sa / topK) * inStride, (inBySlot ? sb : sb / topK) * inStride,
-                                    (inBySlot ? sc : sc / topK) * inStride, (inBySlot ? sd : sd / topK) * inStride,
-                                    out, sa * outStride + r, sb * outStride + r, sc * outStride + r, sd * outStride + r,
-                                    false);
-                        }
-                        for (; s < sEnd; s++) {
-                            int slot = slotOrder[s];
-                            int io = (inBySlot ? slot : slot / topK) * inStride;
-                            VectorKernels.dot4(tmp, 0, cols, in, io, out, slot * outStride + r, false);
-                        }
-                    } else {
-                        for (int rr = r; rr < rowsPer; rr++) {
-                            for (int s = sBeg; s < sEnd; s++) {
-                                int slot = slotOrder[s];
-                                int io = (inBySlot ? slot : slot / topK) * inStride;
-                                out[slot * outStride + rr] = VectorKernels.dotRow(wt, rowBase + rr, in, io);
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         /**

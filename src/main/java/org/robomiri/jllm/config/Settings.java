@@ -224,6 +224,11 @@ public final class Settings {
             throw new IllegalArgumentException("model.head-quant: " + e.getMessage());
         }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
+        try {
+            org.robomiri.jllm.metal.MoeSplit.parseLayers(get("backend.metal.cpu-moe"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("backend.metal.cpu-moe " + e.getMessage());
+        }
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");

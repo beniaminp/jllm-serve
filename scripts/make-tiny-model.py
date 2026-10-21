@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -32,6 +32,8 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
   mamba130m  not tiny: random weights with the exact mamba-130m-hf shapes (24 layers, d_model 768, 515 MB) to
              benchmark the Mamba backends without downloading the real checkpoint (output is gibberish)
   mamba3     Mamba v1: d_model 128, d_inner 256, state 8, conv 3, dt_rank 8 (ceil(128/16)), 2 layers, untied head
+  qwen3moe   Qwen3-MoE: q/k norm, 4 layers of which layer 1 is dense (mlp_only_layers), 8 experts of width 32,
+             top 2 renormalized, per-expert tensors and router mlp.gate (no shared experts), untied head
   deepseek_v2  MLA with a single q_proj (q_lora_rank null, as DeepSeek-V2-Lite), 2 dense + 2 MoE layers, 8 routed
                experts in 2 groups (group_limited_greedy, softmax), 2 shared experts, yarn (mscale == mscale_all_dim)
   deepseek_v2q like deepseek_v2 with q_a_proj/q_a_layernorm/q_b_proj, norm_topk_prob, routed_scaling_factor 2.5
@@ -104,6 +106,13 @@ FAMILIES = {
         attn_logit_softcapping=None, final_logit_softcapping=None, query_pre_attn_scalar=48, sliding_window=6,
         sliding_window_pattern=6, attention_bias=False, tie_word_embeddings=True, bos_token_id=2,
         eos_token_id=106),
+    "qwen3moe": dict(
+        architectures=["Qwen3MoeForCausalLM"], model_type="qwen3_moe", hidden_size=128, intermediate_size=192,
+        num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32, vocab_size=1000,
+        max_position_embeddings=512, rms_norm_eps=1e-6, rope_theta=1000000.0, hidden_act="silu",
+        attention_bias=False, tie_word_embeddings=False, num_experts=8, num_experts_per_tok=2,
+        moe_intermediate_size=32, norm_topk_prob=True, decoder_sparse_step=1, mlp_only_layers=[1],
+        bos_token_id=1, eos_token_id=2),
     "mamba": dict(
         architectures=["MambaForCausalLM"], model_type="mamba", hidden_size=64, state_size=16, conv_kernel=4,
         expand=2, intermediate_size=128, time_step_rank=4, num_hidden_layers=3, vocab_size=1000,
@@ -317,7 +326,7 @@ def main():
         if gemma:
             vec(p + "pre_feedforward_layernorm.weight", d, nb)
             vec(p + "post_feedforward_layernorm.weight", d, nb)
-        if cfg["model_type"] == "gemma3_text":
+        if cfg["model_type"] in ("gemma3_text", "qwen3_moe"):
             vec(p + "self_attn.q_norm.weight", hd, nb)
             vec(p + "self_attn.k_norm.weight", hd, nb)
         if fused:  # rows: q (heads*hd), then k (kv*hd), then v (kv*hd)
@@ -334,6 +343,14 @@ def main():
         if cfg["model_type"] == "glm4":
             vec(p + "post_self_attn_layernorm.weight", d)
             vec(p + "post_mlp_layernorm.weight", d)
+        if cfg.get("num_experts") and l not in cfg["mlp_only_layers"]:
+            e, m = cfg["num_experts"], cfg["moe_intermediate_size"]
+            mat(p + "mlp.gate.weight", e, d, 0.3)
+            for i in range(e):
+                mat(p + "mlp.experts.%d.gate_proj.weight" % i, m, d)
+                mat(p + "mlp.experts.%d.up_proj.weight" % i, m, d)
+                mat(p + "mlp.experts.%d.down_proj.weight" % i, d, m)
+            continue
         if glm or fused:
             mat(p + "mlp.gate_up_proj.weight", 2 * ffn, d)
         else:

@@ -252,6 +252,13 @@ public final class Metal implements AutoCloseable {
         return newBuffer(bytes, true);
     }
 
+    private long allocated; // bytes of the buffers newBuffer created (not the wrapped weights)
+
+    /** Bytes of the buffers {@link #newBuffer} has created: KV caches, activations, uploaded norms and tables. */
+    public long allocatedBytes() {
+        return allocated;
+    }
+
     /**
      * New shared buffer. With {@code zero == false} the contents are left uninitialised, which skips a memset
      * (and the page commit it implies) for scratch buffers that are always written before they are read.
@@ -262,6 +269,7 @@ public final class Metal implements AutoCloseable {
             if (h.equals(MemorySegment.NULL)) {
                 throw new OutOfMemoryError("Metal buffer of " + bytes + " bytes");
             }
+            allocated += Math.max(16L, bytes);
             return track(h, bytes);
         } catch (Throwable t) {
             throw rethrow(t);

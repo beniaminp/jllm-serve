@@ -1,5 +1,7 @@
 package org.robomiri.jllm.metal;
 
+import org.robomiri.jllm.cpu.MoeExperts;
+import org.robomiri.jllm.cpu.ThreadPool;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.AttnWeights;
@@ -74,6 +76,15 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer moeOut;    // grouped MoE: each slot's weighted output row
     /** DeepSeek multi-head latent attention (own caches); null for other families. */
     private MlaMetal mla;
+    // experts left on the CPU (backend.metal.cpu-moe); null when every expert is on the GPU
+    private final MoeSplit split;
+    private ThreadPool cpuPool;
+    private MoeExperts cpuExperts;
+    private float[] cpuXb;
+    private float[] cpuY;
+    private int[] cpuAssign;
+    private float[] cpuWeight;
+    private int cpuLayers;
 
     /**
      * One decoder layer: its norm buffers, {@code o_proj}, and two strategy objects picked once from the layer's
@@ -105,7 +116,12 @@ public final class MetalBackend implements Backend {
     }
 
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype);
+        this(w, ctx, maxBatch, metalLib, kvDtype, MoeSplit.OFF);
+    }
+
+    /** {@code split}: which MoE layers run their routed experts on the CPU (see {@link MoeSplit}). */
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split) {
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split);
     }
 
     private static Metal open(Decoder d, String metalLib) {
@@ -136,8 +152,9 @@ public final class MetalBackend implements Backend {
     }
 
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
-    private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype) {
+    private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype, MoeSplit split) {
         this.w = w;
+        this.split = split;
         this.arch = w.decoder();
         this.c = arch.core();
         this.ctx = ctx;
@@ -148,7 +165,7 @@ public final class MetalBackend implements Backend {
             init(kvDtype);
         } catch (RuntimeException | Error e) {
             try {
-                k.close();
+                close();
             } catch (RuntimeException | Error suppressed) {
                 e.addSuppressed(suppressed);
             }
@@ -225,24 +242,128 @@ public final class MetalBackend implements Backend {
             moeHidden = null;
         }
         mla = a instanceof Attention.Mla m ? new MlaMetal(this, w, m, ctx, maxBatch, kvDtype) : null;
+        boolean[] onCpu = cpuExpertLayers();
         plans = new LayerPlan[c.layers()];
         for (int l = 0; l < c.layers(); l++) {
-            plans[l] = plan(arch.layers().get(l), w.decoderLayer(l));
+            plans[l] = plan(arch.layers().get(l), w.decoderLayer(l), onCpu[l]);
         }
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());
         }
-        long ws = k.metal.recommendedWorkingSet();
-        if (w.byteSize() > ws) {
-            System.err.printf("warning: weights (%.1f GB) exceed Metal's recommended working set (%.1f GB); expect paging%n",
-                    w.byteSize() / 1e9, ws / 1e9);
+        long gpu = gpuBytes(onCpu);
+        long ws = workingSet();
+        if (gpu > ws) {
+            System.err.printf("warning: the GPU's share of the model (%.1f GB with the caches) exceeds Metal's recommended "
+                    + "working set (%.1f GB); expect paging%s%n", gpu / 1e9, ws / 1e9,
+                    arch.anyMoe() ? " (backend.metal.cpu-moe moves experts to the CPU)" : "");
+        }
+    }
+
+    // ------------------------------------------------------------------ experts on the CPU
+
+    /** Metal's recommendedMaxWorkingSetSize, or {@code -Djllm.metal.workingSetGb} (to leave memory to other programs). */
+    private long workingSet() {
+        String gb = System.getProperty("jllm.metal.workingSetGb");
+        return gb != null ? (long) (Double.parseDouble(gb) * 1e9) : k.metal.recommendedWorkingSet();
+    }
+
+    private static long bytes(QTensor t) {
+        return t.data.byteSize() + (t.second != null ? t.second.data.byteSize() : 0);
+    }
+
+    /** Bytes of layer {@code l}'s routed experts (0 for a dense layer). */
+    private long expertBytes(int l) {
+        return arch.layers().get(l).mlp() instanceof Mlp.Moe
+                ? bytes(w.decoderLayer(l).moe().expGateUp()) + bytes(w.decoderLayer(l).moe().expDown()) : 0;
+    }
+
+    /** What the GPU keeps resident: the weights minus the experts left on the CPU, plus its own buffers. */
+    private long gpuBytes(boolean[] onCpu) {
+        long b = w.byteSize() + k.metal.allocatedBytes();
+        for (int l = 0; l < onCpu.length; l++) {
+            b -= onCpu[l] ? expertBytes(l) : 0;
+        }
+        return b;
+    }
+
+    /**
+     * The MoE layers whose experts stay on the CPU: the last {@code split.layers()} MoE layers, or with {@link
+     * MoeSplit#AUTO} as few as make the GPU's share fit the working set (none when the model fits). Sets up the CPU
+     * side when there are any.
+     */
+    private boolean[] cpuExpertLayers() {
+        boolean[] onCpu = new boolean[c.layers()];
+        int want = split.layers();
+        if (want == MoeSplit.AUTO) {
+            long ws = workingSet();
+            want = 0;
+            boolean[] trial = new boolean[c.layers()];
+            for (int l = c.layers() - 1; l >= 0 && gpuBytes(trial) > ws; l--) {
+                if (expertBytes(l) > 0) {
+                    trial[l] = true;
+                    want++;
+                }
+            }
+        }
+        long moved = 0;
+        int moeLayers = 0;
+        for (int l = c.layers() - 1; l >= 0; l--) {
+            if (expertBytes(l) > 0) {
+                moeLayers++;
+                if (cpuLayers < want) {
+                    onCpu[l] = true;
+                    cpuLayers++;
+                    moved += expertBytes(l);
+                }
+            }
+        }
+        if (cpuLayers > 0) {
+            cpuPool = new ThreadPool(split.threads());
+            cpuExperts = MoeExperts.create(cpuPool, w, maxBatch, split.int8Activations());
+            int slots = maxBatch * arch.maxTopK();
+            cpuXb = new float[maxBatch * c.dim()];
+            cpuY = new float[maxBatch * c.dim()];
+            cpuAssign = new int[slots];
+            cpuWeight = new float[slots];
+            System.err.printf("Metal: the experts of %d of %d MoE layers run on the CPU (%.1f GB, %d threads); "
+                            + "GPU share %.1f GB of a %.1f GB working set%n", cpuLayers, moeLayers, moved / 1e9,
+                    split.threads(), gpuBytes(onCpu) / 1e9, workingSet() / 1e9);
+        }
+        return onCpu;
+    }
+
+    /**
+     * {@code x += routed experts(xb)} on the CPU for the n tokens of the current chunk, after the GPU has written xb
+     * and the router's choices; the command buffer recorded so far must be finished. Results go through {@link
+     * #cpuY} so the GPU may add the shared experts into x meanwhile ({@code addToX} later).
+     */
+    private void cpuRouted(MlpWeights.Moe mw, Mlp.Moe spec, int n) {
+        int dim = c.dim();
+        int topK = spec.topK();
+        MemorySegment.copy(xb.contents(), ValueLayout.JAVA_FLOAT, 0, cpuXb, 0, n * dim);
+        MemorySegment.copy(assign.contents(), ValueLayout.JAVA_INT, 0, cpuAssign, 0, n * topK);
+        MemorySegment.copy(routeWeight.contents(), ValueLayout.JAVA_FLOAT, 0, cpuWeight, 0, n * topK);
+        java.util.Arrays.fill(cpuY, 0, n * dim, 0f);
+        if (n > 1) {
+            cpuExperts.batched(mw, spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
+        } else {
+            cpuExperts.token(mw, topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
+        }
+    }
+
+    /** {@code x[0, n·dim) += cpuY}: the CPU's experts joining the residual stream (the GPU is idle here). */
+    private void addToX(int n) {
+        MemorySegment xs = x.contents();
+        for (int i = 0; i < n * c.dim(); i++) {
+            long o = (long) i * 4;
+            xs.set(ValueLayout.JAVA_FLOAT, o, xs.get(ValueLayout.JAVA_FLOAT, o) + cpuY[i]);
         }
     }
 
     // ------------------------------------------------------------------ layer plans
 
-    private LayerPlan plan(LayerSpec spec, DecoderLayer L) {
+    private LayerPlan plan(LayerSpec spec, DecoderLayer L, boolean expertsOnCpu) {
         Metal.Buffer attnNorm = k.upload(L.attnNorm());
         Metal.Buffer ffnNorm = k.upload(L.ffnNorm());
         Metal.Buffer postAttnNorm = L.postAttnNorm() != null ? k.upload(L.postAttnNorm()) : null;
@@ -256,7 +377,7 @@ public final class MetalBackend implements Backend {
         };
         FfnStep ffn = switch (spec.mlp()) {
             case Mlp.Dense d -> new DenseStep(d, L.dense(), ffnNorm, postMlpNorm);
-            case Mlp.Moe m -> new MoeStep(m, L.moe(), ffnNorm);
+            case Mlp.Moe m -> new MoeStep(m, L.moe(), ffnNorm, expertsOnCpu);
         };
         return new LayerPlan(attnNorm, postAttnNorm, L.wo(), k.wrap(L.wo().data), attention, ffn);
     }
@@ -392,6 +513,8 @@ public final class MetalBackend implements Backend {
         }
 
         private final Mlp.Moe spec;
+        private final MlpWeights.Moe weights;
+        private final boolean onCpu;   // routed experts run on the CPU (not wrapped for the GPU)
         private final QTensor expGateUp;
         private final QTensor expDown;
         private final Metal.Buffer bExpGateUp;
@@ -403,13 +526,15 @@ public final class MetalBackend implements Backend {
         private final Metal.Buffer bSharedGateUp;
         private final Metal.Buffer bSharedDown;
 
-        MoeStep(Mlp.Moe spec, MlpWeights.Moe w, Metal.Buffer ffnNorm) {
+        MoeStep(Mlp.Moe spec, MlpWeights.Moe w, Metal.Buffer ffnNorm, boolean onCpu) {
             this.spec = spec;
+            this.weights = w;
+            this.onCpu = onCpu;
             this.ffnNorm = ffnNorm;
             expGateUp = w.expGateUp();
             expDown = w.expDown();
-            bExpGateUp = k.wrap(expGateUp.data);
-            bExpDown = k.wrap(expDown.data);
+            bExpGateUp = onCpu ? null : k.wrap(expGateUp.data);
+            bExpDown = onCpu ? null : k.wrap(expDown.data);
             Metal.Buffer router = k.upload(w.router());
             int e = spec.experts();
             int dim = c.dim();
@@ -444,6 +569,10 @@ public final class MetalBackend implements Backend {
         public void run(int layer, int n, boolean fuseNorm) {
             k.rmsnorm(x, 0, ffnNorm, xb, n, c.dim());
             route.run(n);
+            if (onCpu) {
+                runOnCpu(n);
+                return;
+            }
             if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
                 k.moeGrouped(expGateUp, bExpGateUp, expDown, bExpDown, xb, assign, routeWeight, moeOrder, moeTiles,
                         moeHidden, moeOut, x, spec.experts(), spec.moeDim(), c.dim(), spec.topK(), n);
@@ -451,10 +580,38 @@ public final class MetalBackend implements Backend {
                 k.moeUp(expGateUp, bExpGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
                 k.moeDown(expDown, bExpDown, moeHidden, assign, routeWeight, x, c.dim(), spec.topK(), n);
             }
+            shared(n);
+        }
+
+        /** Shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x. */
+        private void shared(int n) {
             if (sharedGateUp != null) {
-                // shared experts: a dense SwiGLU of width nShared*moeDim on every token, added to x
                 k.swiglu(sharedGateUp, bSharedGateUp, xb, null, hidden, false, n); // writes silu(gate) * up to hidden
                 k.matmul(sharedDown, bSharedDown, hidden, 0, x, 0, n, true, null, 0f);
+            }
+        }
+
+        /**
+         * The GPU stops after the router; the CPU runs the routed experts and adds them to x; the GPU continues.
+         * With shared experts (and a native library with jm_wait_pending) the GPU computes those while the CPU
+         * computes the routed ones: router | shared go in two command buffers, the CPU waits for the first only.
+         */
+        private void runOnCpu(int n) {
+            if (sharedGateUp != null && k.metal.canWaitPending()) {
+                k.commit();               // ... the router
+                shared(n);
+                k.commit();               // the shared experts, running while ...
+                k.metal.waitPending(1);   // ... the CPU, once the router is done,
+                cpuRouted(weights, spec, n);
+                k.commitAndWait();        // (the empty buffer the last commit opened: waits for the shared experts)
+                addToX(n);
+                k.begin();
+            } else {
+                k.commitAndWait();
+                cpuRouted(weights, spec, n);
+                addToX(n);
+                k.begin();
+                shared(n);
             }
         }
     }
@@ -517,8 +674,8 @@ public final class MetalBackend implements Backend {
 
     @Override
     public GreedyPipe greedyPipe(int vocab) {
-        if (!k.metal.canWaitPending() || !PIPELINE) {
-            return null;
+        if (!k.metal.canWaitPending() || !PIPELINE || cpuLayers > 0) {
+            return null; // a step with experts on the CPU cannot run ahead of the CPU
         }
         if (pipe == null) {
             pipe = new Pipe();
@@ -773,6 +930,12 @@ public final class MetalBackend implements Backend {
                 // closing anyway
             }
         }
-        k.close();
+        try {
+            k.close();
+        } finally {
+            if (cpuPool != null) {
+                cpuPool.close();
+            }
+        }
     }
 }
