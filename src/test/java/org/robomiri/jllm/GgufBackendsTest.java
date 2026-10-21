@@ -16,7 +16,7 @@ import java.util.Random;
 
 /**
  * The CPU and Metal backends on tiny random GGUF models whose tensors are random blocks of the ggml formats read in
- * place (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
+ * place (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
  * down, LM head) on every family, with all matrices of one format and with the formats mixed per tensor (which makes
  * the q/k/v dispatch and the gate|up pair mixed too) -- must give the same logits within float rounding. Skipped
  * when Metal is not available.
@@ -36,10 +36,20 @@ public final class GgufBackendsTest {
         }
     }
 
-    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K, GgmlType.Q6_K};
+    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K, GgmlType.Q6_K,
+            GgmlType.Q4_1, GgmlType.Q5_0, GgmlType.Q5_1, GgmlType.Q3_K, GgmlType.IQ4_NL, GgmlType.IQ4_XS, GgmlType.MXFP4,
+            GgmlType.F16, GgmlType.BF16};
 
     /** Random valid blocks: random quant bytes, f16 scales small enough that the weights are about +-0.1. */
     static byte[] blocks(Random r, GgmlType t, long elements) {
+        if (t == GgmlType.F16 || t == GgmlType.BF16) {
+            ByteBuffer fb = ByteBuffer.allocate((int) elements * 2).order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < elements; i++) {
+                float v = (float) (0.1 * r.nextGaussian());
+                fb.putShort(2 * i, t == GgmlType.F16 ? Float.floatToFloat16(v) : (short) (Float.floatToRawIntBits(v) >>> 16));
+            }
+            return fb.array();
+        }
         int nb = (int) (elements / t.blockSize);
         byte[] b = new byte[nb * t.typeSize];
         r.nextBytes(b);
@@ -50,6 +60,10 @@ public final class GgufBackendsTest {
                 case Q4_0 -> bb.putShort(o, Float.floatToFloat16(0.004f + 0.012f * r.nextFloat()));
                 case Q8_0 -> bb.putShort(o, Float.floatToFloat16(0.0004f + 0.0012f * r.nextFloat()));
                 case Q6_K -> bb.putShort(o + 208, Float.floatToFloat16(0.00001f + 0.00004f * r.nextFloat()));
+                case Q5_0 -> bb.putShort(o, Float.floatToFloat16(0.004f + 0.012f * r.nextFloat()));
+                case IQ4_NL -> bb.putShort(o, Float.floatToFloat16(0.0004f + 0.0012f * r.nextFloat()));
+                case Q3_K -> bb.putShort(o + 108, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
+                case MXFP4 -> b[o] = (byte) (116 + r.nextInt(5)); // 2^-12 .. 2^-8 times the doubled e2m1 values
                 default -> {
                     bb.putShort(o, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
                     bb.putShort(o + 2, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
@@ -153,7 +167,8 @@ public final class GgufBackendsTest {
                 prompt[i] = 1 + (i * 37 + 11) % (VOCAB - 1);
             }
             for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe"}) {
-                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "mixed"}) {
+                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q4_1", "Q5_0", "Q5_1", "Q3_K", "IQ4_NL", "IQ4_XS",
+                        "MXFP4", "F16", "BF16", "mixed"}) {
                     Path p = dir.resolve(family + "-" + mode + ".gguf");
                     write(p, family, mode, 100 + family.hashCode() + mode.hashCode());
                     float[][] cpu;

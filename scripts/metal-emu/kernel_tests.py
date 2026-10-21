@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 
 from emu import Emu, pack
+import ggml_ref
 
 E = Emu()
 failures = 0
@@ -308,6 +309,8 @@ def f16(rng, shape, lo, hi):
 def fmt_weights(fmt, rows, cols, rng):
     """(wq bytes, ws f32 scales or a dummy, w [rows, cols] f32 as the kernels dequantize it) of one tensor."""
     dummy = np.zeros(4, np.float32)
+    if fmt in ggml_ref.NEW:   # Q4_1 Q5_0 Q5_1 Q3_K IQ4_NL IQ4_XS MXFP4 F16 BF16: ggml_ref.py (checked against ggml-quants.c)
+        return ggml_ref.weights(fmt, rows, cols, rng)
     if fmt == 'q4':
         wq, ws, w = q4_weights(rows, cols, rng)
         return wq, ws, w
@@ -385,7 +388,8 @@ def fmt_weights(fmt, rows, cols, rng):
     return blk.reshape(-1).copy(), dummy, w.reshape(rows, cols)
 
 
-GGUF = ('q4g', 'q8g', 'q4k', 'q5k')
+GGUF = ('q4g', 'q8g', 'q4k', 'q5k') + ggml_ref.NEW
+KQ256 = ('q2k', 'q6k', 'q4k', 'q5k', 'q3k', 'iq4xs')  # formats of 256-weight super-blocks
 
 
 def rel_errs(out, w, x_ref_fn):
@@ -530,7 +534,7 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     # down: ys[s] = rw[s] * W_e h[s], rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
     h = rng.standard_normal((slots, m)).astype(np.float32)
     rw = rng.random(slots).astype(np.float32)
-    if fmt in GGUF and m % 256 != 0 and fmt in ('q4k', 'q5k'):
+    if fmt in GGUF and m % 256 != 0 and fmt in KQ256:
         return
     dq, ds, dw = fmt_weights(fmt, n_exp * dim, m, rng)
     dw = dw.reshape(n_exp, dim, m)
@@ -549,8 +553,45 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     check(ok, '%s dim=%d m=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), eh, ee))
 
 
-for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k'):
-    kq = fmt in ('q2k', 'q6k', 'q4k', 'q5k')  # 256-weight super-blocks
+def plain_test(fmt, rows=96, cols=None, ntok=3):
+    """matmul_<fmt> (the decode kernel, mm_row_gguf), matmul_pf_<fmt> (the tiled prefill kernel, mm_tile_gguf),
+    matmul_swiglu_<fmt> and the embedding lookup embed_token_<fmt>, which share gg_unit with the mma kernels but walk
+    the units differently."""
+    cols = cols or (256 if fmt in KQ256 else 128)
+    rng = np.random.default_rng(20)
+    wq, ws, w = fmt_weights(fmt, rows, cols, rng)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    ref = x.astype(np.float64) @ w.T.astype(np.float64)
+    for name, grid in (('matmul_' + fmt, (rows // 4, 1)), ('matmul_pf_' + fmt, ((rows + 7) // 8, (ntok + 7) // 8))):
+        out = np.zeros((ntok, rows), np.float32)
+        E.dispatch(name, [wq, ws, x, out, np.ones(cols, np.float32), np.zeros(rows, np.float32)],
+                   pack('iiiiffi', rows, cols, ntok, 0, 1e-6, 0.0, 0), grid, (128,))
+        err = np.abs(out - ref).max() / np.abs(ref).max()
+        check(err < 1e-5, '%s %dx%d, %d tokens: rel err %.2e' % (name, rows, cols, ntok, err))
+    hidden = 48
+    gq, _, gw = fmt_weights(fmt, hidden, cols, rng)
+    uq, _, uw = fmt_weights(fmt, hidden, cols, rng)
+    out = np.full((ntok, hidden), np.nan, np.float32)
+    E.dispatch('matmul_swiglu_' + fmt, [gq, uq, x, out, np.ones(cols, np.float32)], pack('iiifi', hidden, cols, ntok, 1e-6, 0),
+               ((hidden + 3) // 4, 1), (128,))
+    g = x.astype(np.float64) @ gw.T.astype(np.float64)
+    u = x.astype(np.float64) @ uw.T.astype(np.float64)
+    want = silu(g) * u
+    err = np.abs(out - want).max() / np.abs(want).max()
+    check(err < 1e-5, 'matmul_swiglu_%s hidden %d x %d, %d tokens: rel err %.2e' % (fmt, hidden, cols, ntok, err))
+    # the embedding row of token 5, scaled by 1.5: every unit of the row decoded by embed_token
+    tok = np.array([5], np.int32)
+    xo = np.zeros(cols, np.float32)
+    E.dispatch('embed_token_' + fmt, [wq, ws, tok, xo], pack('iif', cols, 0, 1.5), (1,), (128,))
+    err = np.abs(xo - 1.5 * w[5]).max() / np.abs(w[5]).max()
+    check(err < 1e-6, 'embed_token_%s row 5: rel err %.2e' % (fmt, err))
+
+
+for fmt in ggml_ref.NEW:
+    plain_test(fmt)
+
+for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k') + ggml_ref.NEW:
+    kq = fmt in KQ256  # 256-weight super-blocks
     cols = 256 if kq else 128
     for kind in ('mma', 'hmma'):
         mm_test(fmt, kind, 96, cols, 37)                       # partial row and token tiles: staging epilogue

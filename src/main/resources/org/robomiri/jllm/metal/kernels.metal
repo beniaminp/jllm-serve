@@ -2642,10 +2642,156 @@ template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 #define GG_Q4_K 22
 #define GG_Q5_K 23
 
+// ---------------------------------------------------------------------------------------------- GGUF block types, second set
+// Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4 and the plain F16 / BF16 matrices (docs/16-gguf.md, docs/06). Same
+// scheme as the first four: one lane unit is 32 consecutive weights (a block, or a sub-block / 32-weight slice of a
+// 256-weight super-block), gg_unit returns them in natural order as 8 float4, gg_half returns 16 of them (half h =
+// weights 16h .. 16h + 15) for the *_hmma kernels. The decoder is gg_new<QT, NV>, which writes NV float4 of the
+// unit, starting at float4 v0 (unit: NV 8, v0 0; half h: NV 4, v0 4h), so both entry points share one definition.
+//   QT  24 Q4_1  (20 B: half d, m, 16 nibble bytes)                      w = q d + m
+//       25 Q5_0  (22 B: half d, u32 qh, 16 nibble bytes)                 w = (q5 - 16) d
+//       26 Q5_1  (24 B: half d, m, u32 qh, 16 nibble bytes)              w = q5 d + m
+//       27 Q3_K  (110 B: hmask[32], qs[64], scales[12], half d)          w = d (sc - 32) ((qs >> 2j) & 3 - (hm bit ? 0 : 4))
+//       28 IQ4_NL (18 B: half d, 16 nibble bytes)                        w = d kvalues[nibble]
+//       29 IQ4_XS (136 B: half d, u16 scales_h, scales_l[4], qs[128])    w = d (ls - 32) kvalues[nibble]
+//       30 MXFP4 (17 B: e8m0 e, 16 nibble bytes)                         w = kvalues_fp4[nibble] 2^(e - 128)
+//       31 F16, 32 BF16 (64 B per 32 weights)                            w = the half / bfloat16
+// Block sizes 22, 110, 18 and 17 are not multiples of 4: Q5_0 / Q3_K / IQ4_NL read their quants as ushorts (2-byte
+// aligned), MXFP4 byte by byte (17 B blocks are only 1-byte aligned). The 4-bit tables are packed 4 int8 to a uint.
+
+#define GG_NEW 24
+#define GG_Q4_1 24
+#define GG_Q5_0 25
+#define GG_Q5_1 26
+#define GG_Q3_K 27
+#define GG_IQ4_NL 28
+#define GG_IQ4_XS 29
+#define GG_MXFP4 30
+#define GG_F16 31
+#define GG_BF16 32
+
+// ggml's kvalues_iq4nl / kvalues_mxfp4 (int8), four to a little-endian uint
+#define GG_TAB_IQ4NL uint4(0xbfad9881u, 0xf6eaddcfu, 0x26190d01u, 0x71594535u)
+#define GG_TAB_MXFP4 uint4(0x03020100u, 0x0c080604u, 0xfdfeff00u, 0xf4f8fafcu)
+
+// 4 bytes at any 2-byte aligned address as a uchar4
+static inline uchar4 gg_ld4(device const ushort *p, int i) {
+    return as_type<uchar4>(uint(p[i]) | (uint(p[i + 1]) << 16));
+}
+
+// table[n] for four nibbles n
+static inline float4 gg_tab(uchar4 n, uint4 tab) {
+    float4 r;
+    for (int i = 0; i < 4; i++) {
+        const uint s = uint(n[i]) & 3u;
+        r[i] = float(int(tab[uint(n[i]) >> 2] << (24u - 8u * s)) >> 24);
+    }
+    return r;
+}
+
+// The 6-bit scale (minus 32) number s (0..15) of a Q3_K block whose 12 scale bytes start at sc (ggml's kmask shuffle).
+static inline int gg_q3k_scale(device const uchar *sc, int s) {
+    const int g = s >> 2;
+    const int i = s & 3;
+    const uint lowb = sc[4 * (g & 1) + i];
+    const uint lo = g < 2 ? (lowb & 15u) : (lowb >> 4);
+    const uint hi = (uint(sc[8 + i]) >> (2 * g)) & 3u;
+    return int(lo | (hi << 4)) - 32;
+}
+
+template <int QT, int NV>
+static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int v0, thread float4 *w) {
+    if (QT == GG_Q4_1 || QT == GG_Q5_1) {
+        constexpr bool Q5 = QT == GG_Q5_1;
+        device const uchar *blk = wq + (grow * nb + u) * (Q5 ? 24 : 20);
+        const float2 dm = float2(as_type<half2>(*(device const uint *)blk));
+        const uint qh = Q5 ? *(device const uint *)(blk + 4) : 0u;
+        device const uchar4 *q = (device const uchar4 *)(blk + (Q5 ? 8 : 4));
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            uchar4 n = (q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15);
+            if (Q5) {
+                const uint t = qh >> (((v >> 2) << 4) + ((v & 3) << 2));
+                n |= uchar4(t & 1u, (t >> 1) & 1u, (t >> 2) & 1u, (t >> 3) & 1u) << uchar4(4);
+            }
+            w[k] = float4(n) * dm.x + dm.y;
+        }
+    } else if (QT == GG_Q5_0) {
+        device const uchar *blk = wq + (grow * nb + u) * 22;
+        device const ushort *p = (device const ushort *)blk;
+        const float d = float(*(device const half *)blk);
+        const uint qh = uint(p[1]) | (uint(p[2]) << 16);
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            uchar4 n = (gg_ld4(p, 3 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15);
+            const uint t = qh >> (((v >> 2) << 4) + ((v & 3) << 2));
+            n |= uchar4(t & 1u, (t >> 1) & 1u, (t >> 2) & 1u, (t >> 3) & 1u) << uchar4(4);
+            w[k] = (float4(n) - 16.0f) * d;
+        }
+    } else if (QT == GG_Q3_K) {
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * 110;
+        device const ushort *p = (device const ushort *)blk;
+        const int uu = u & 7;                                  // unit inside the super-block = 4 n + j
+        const float d = float(*(device const half *)(blk + 108));
+        const float dl0 = d * float(gg_q3k_scale(blk + 96, 2 * uu));
+        const float dl1 = d * float(gg_q3k_scale(blk + 96, 2 * uu + 1));
+        const uchar sh = uchar(2 * (uu & 3));
+        const int qbase = 16 + 16 * (uu >> 2);                 // ushort index of qs[32 n]
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            const uchar4 qv = gg_ld4(p, qbase + 2 * v);
+            const uchar4 hv = gg_ld4(p, 2 * v);
+            const int4 c = int4((qv >> uchar4(sh)) & uchar4(3));
+            const int4 m = int4((hv >> uchar4(uchar(uu))) & uchar4(1));
+            w[k] = float4(c - 4 + (m << 2)) * (v < 4 ? dl0 : dl1);
+        }
+    } else if (QT == GG_IQ4_NL) {
+        device const uchar *blk = wq + (grow * nb + u) * 18;
+        device const ushort *p = (device const ushort *)blk;
+        const float d = float(*(device const half *)blk);
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            w[k] = gg_tab((gg_ld4(p, 1 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_IQ4NL) * d;
+        }
+    } else if (QT == GG_IQ4_XS) {
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * 136;
+        const int ib = u & 7;
+        const float d = float(*(device const half *)blk);
+        const uint sh16 = uint(*(device const ushort *)(blk + 2));
+        const uint ls = ((uint(blk[4 + (ib >> 1)]) >> (4 * (ib & 1))) & 15u) | (((sh16 >> (2 * ib)) & 3u) << 4);
+        const float dl = d * float(int(ls) - 32);
+        device const uchar4 *q = (device const uchar4 *)(blk + 8 + 16 * ib);
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            w[k] = gg_tab((q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_IQ4NL) * dl;
+        }
+    } else if (QT == GG_MXFP4) {
+        device const uchar *blk = wq + (grow * nb + u) * 17;
+        const uint e = blk[0];
+        const float d = as_type<float>(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            device const uchar *b = blk + 1 + 4 * (v & 3);
+            const uchar4 nib = uchar4(b[0], b[1], b[2], b[3]);
+            w[k] = gg_tab((nib >> uchar4(uchar((v >> 2) << 2))) & uchar4(15), GG_TAB_MXFP4) * d;
+        }
+    } else if (QT == GG_F16) {
+        device const half4 *p = (device const half4 *)(wq + (grow * nb + u) * 64);
+        for (int k = 0; k < NV; k++) w[k] = float4(p[v0 + k]);
+    } else {  // GG_BF16
+        device const ushort4 *p = (device const ushort4 *)(wq + (grow * nb + u) * 64);
+        for (int k = 0; k < NV; k++) w[k] = as_type<float4>(uint4(p[v0 + k]) << 16);
+    }
+}
+
 // 32 weights of unit u of global row `grow` (nb units per row) into w[0..8) as dequantized floats.
 template <int QT>
 static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w) {
-    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+    if (QT >= GG_NEW) {
+        gg_new<QT, 8>(wq, grow, nb, u, 0, w);
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) {
         constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
         device const uchar *blk = wq + (grow * nb + u) * BYTES;
         const float d = float(*(device const half *)blk);
@@ -2751,6 +2897,15 @@ GG_BLOCK_DOT(GG_Q4_0)
 GG_BLOCK_DOT(GG_Q8_0)
 GG_BLOCK_DOT(GG_Q4_K)
 GG_BLOCK_DOT(GG_Q5_K)
+GG_BLOCK_DOT(GG_Q4_1)
+GG_BLOCK_DOT(GG_Q5_0)
+GG_BLOCK_DOT(GG_Q5_1)
+GG_BLOCK_DOT(GG_Q3_K)
+GG_BLOCK_DOT(GG_IQ4_NL)
+GG_BLOCK_DOT(GG_IQ4_XS)
+GG_BLOCK_DOT(GG_MXFP4)
+GG_BLOCK_DOT(GG_F16)
+GG_BLOCK_DOT(GG_BF16)
 
 #define GG_INSTANTIATE(SUF, QTV)                                                                                  \
     template [[host_name("matmul_" SUF)]] kernel matmul_t matmul<QTV, false>;                                     \
@@ -2777,6 +2932,15 @@ GG_INSTANTIATE("q4g", GG_Q4_0)
 GG_INSTANTIATE("q8g", GG_Q8_0)
 GG_INSTANTIATE("q4k", GG_Q4_K)
 GG_INSTANTIATE("q5k", GG_Q5_K)
+GG_INSTANTIATE("q41", GG_Q4_1)
+GG_INSTANTIATE("q50", GG_Q5_0)
+GG_INSTANTIATE("q51", GG_Q5_1)
+GG_INSTANTIATE("q3k", GG_Q3_K)
+GG_INSTANTIATE("iq4nl", GG_IQ4_NL)
+GG_INSTANTIATE("iq4xs", GG_IQ4_XS)
+GG_INSTANTIATE("mxfp4", GG_MXFP4)
+GG_INSTANTIATE("f16w", GG_F16)
+GG_INSTANTIATE("bf16w", GG_BF16)
 
 // ---------------------------------------------------------------------------------------------- 9. flash-attention prefill
 // attention_fa<KV, D>: causal (optionally windowed, soft-capped) attention for a prefill chunk without a scores
@@ -3057,6 +3221,15 @@ template [[host_name("embed_token_q4g")]] kernel embed_token_t embed_token<GG_Q4
 template [[host_name("embed_token_q8g")]] kernel embed_token_t embed_token<GG_Q8_0>;
 template [[host_name("embed_token_q4k")]] kernel embed_token_t embed_token<GG_Q4_K>;
 template [[host_name("embed_token_q5k")]] kernel embed_token_t embed_token<GG_Q5_K>;
+template [[host_name("embed_token_q41")]] kernel embed_token_t embed_token<GG_Q4_1>;
+template [[host_name("embed_token_q50")]] kernel embed_token_t embed_token<GG_Q5_0>;
+template [[host_name("embed_token_q51")]] kernel embed_token_t embed_token<GG_Q5_1>;
+template [[host_name("embed_token_q3k")]] kernel embed_token_t embed_token<GG_Q3_K>;
+template [[host_name("embed_token_iq4nl")]] kernel embed_token_t embed_token<GG_IQ4_NL>;
+template [[host_name("embed_token_iq4xs")]] kernel embed_token_t embed_token<GG_IQ4_XS>;
+template [[host_name("embed_token_mxfp4")]] kernel embed_token_t embed_token<GG_MXFP4>;
+template [[host_name("embed_token_f16w")]] kernel embed_token_t embed_token<GG_F16>;
+template [[host_name("embed_token_bf16w")]] kernel embed_token_t embed_token<GG_BF16>;
 
 // ---------------------------------------------------------------------------------------------- 11. Qwen3-Next
 // The pieces of Qwen3NextMetalBackend that the generic kernels lack (docs/14.14). The projections, norms, RoPE,
@@ -3291,7 +3464,9 @@ kernel void shared_gate_add(device const float *xb [[buffer(0)]],
 // high nibbles of bytes 8h .. 8h + 7 = weights 8h .. 8h + 7 (w[0..1]) and 16 + 8h .. 16 + 8h + 7 (w[2..3]).
 template <int QT>
 static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, int h, thread float4 *w) {
-    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+    if (QT >= GG_NEW) {      // natural order: weights 16 h .. 16 h + 15
+        gg_new<QT, 4>(wq, grow, nb, u, 4 * h, w);
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) {
         constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
         device const uchar *blk = wq + (grow * nb + u) * BYTES;
         const float d = float(*(device const half *)blk);
@@ -3678,6 +3853,15 @@ HM_INSTANTIATE("q4g", GG_Q4_0)
 HM_INSTANTIATE("q8g", GG_Q8_0)
 HM_INSTANTIATE("q4k", GG_Q4_K)
 HM_INSTANTIATE("q5k", GG_Q5_K)
+HM_INSTANTIATE("q41", GG_Q4_1)
+HM_INSTANTIATE("q50", GG_Q5_0)
+HM_INSTANTIATE("q51", GG_Q5_1)
+HM_INSTANTIATE("q3k", GG_Q3_K)
+HM_INSTANTIATE("iq4nl", GG_IQ4_NL)
+HM_INSTANTIATE("iq4xs", GG_IQ4_XS)
+HM_INSTANTIATE("mxfp4", GG_MXFP4)
+HM_INSTANTIATE("f16w", GG_F16)
+HM_INSTANTIATE("bf16w", GG_BF16)
 
 // ---------------------------------------------------------------------------------------------- 13. flash prefill, second form
 // attention_fb<KV, ST, D>: the online-softmax prefill attention of attention_fa (same grid, parameters, masking and
