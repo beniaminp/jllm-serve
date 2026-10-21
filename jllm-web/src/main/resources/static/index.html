@@ -262,7 +262,7 @@
       <label class="gguf-only">GGUF file <select name="ggufFile"></select></label>
       <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
       <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
-      <label>KV cache <select name="backend.kv-dtype"><option value="">(default)</option><option>f32</option><option>f16</option><option>q8</option></select></label>
+      <label>KV cache <select name="backend.kv-dtype"><option value="">(default)</option><option>f32</option><option>f16</option><option>q8</option><option>q4</option></select></label>
       <label class="st-only">Weights <select name="model.quant"><option value="">(default)</option><option value="q4">q4 (Q4_0)</option><option value="q8">q8 (Q8_0)</option><option value="q6k">q6k (Q6_K)</option><option value="q2k">q2k (Q2_K)</option></select></label>
       <label>Batch <input name="backend.batch" type="number" min="1" placeholder="(default)"></label>
       <label>Threads <input name="backend.threads" type="number" min="0" placeholder="(default)"></label>

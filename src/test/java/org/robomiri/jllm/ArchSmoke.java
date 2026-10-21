@@ -204,7 +204,9 @@ public final class ArchSmoke {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
             }
             if (!mamba && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
-                failures += q8Check(w, lib, cfg, cpu);
+                failures += q8Check(w, lib, cfg, cpu, KvDtype.Q8, 0);
+                failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 0);
+                failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 4);
                 // f32 and q8 caches for every family; the f16 cache (its own mix of staging and cache rows) on the
                 // first dense and the first MoE family, to keep the emulator run's time in bounds
                 failures += replayCheck(w, lib, cfg, KvDtype.F32);
@@ -478,6 +480,15 @@ public final class ArchSmoke {
      * tolerance).
      */
     private static int kvStateChecks(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
+        KvDtype.setQ4Recent(3); // q4: the saved window holds the last 3 of the prompt's rows, the others are 4-bit only
+        try {
+            return kvStateChecks0(w, lib, cfg, dt);
+        } finally {
+            KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
+        }
+    }
+
+    private static int kvStateChecks0(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
         int vocab = cfg.core().vocabSize();
         int n = PROMPT.length;
         int[] next = {PROMPT[3]};
@@ -510,7 +521,7 @@ public final class ArchSmoke {
                 diff = Math.max(diff, Math.abs(want[i] - got[i]));
             }
             boolean crossOk = diff <= 1e-3f * scale + 1e-4f;
-            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e)%n", dt,
+            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e)%n", a.stateFormat(),
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
                     sameFormat && crossOk ? "ok" : "MISMATCH", diff);
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
@@ -587,7 +598,8 @@ public final class ArchSmoke {
     }
 
     /**
-     * The q8 KV cache (int8 with a scale per row of a kv head; DeepSeek: per latent row) on both backends, teacher-forced
+     * The q8 KV cache (int8 with a scale per row of a kv head; DeepSeek: per latent row), or the q4 one (Hadamard-rotated
+     * K, 4-bit groups of 32; DeepSeek: q8) with a recent window of {@code recent} positions, on both backends, teacher-forced
      * through the prompt followed by the f32 CPU run's tokens: once as one 20-token chunk (the prefill kernels, flash
      * prefill where the tuner enabled it) and once as the prompt then token by token (decode). CPU q8 and Metal q8 must
      * agree within the usual CPU / Metal tolerance at every step. The distance of the q8 logits from the f32 cache's
@@ -595,9 +607,11 @@ public final class ArchSmoke {
      * tiny DeepSeeks turn the f16 cache's 0.2-0.4% of the largest logit into 13-25% for q8, the dense families stay
      * near 1%), so q8 is bounded relative to f16, by 200 times its distance (observed: 20-45 times for the dense
      * families, up to 115 for the DeepSeeks) plus 10^-3 of the largest logit: a broken dequantization is caught, the
-     * amplification is not.
+     * amplification is not. q4's step is about 16 times q8's (1/8 of a group's largest value against 1/254 of a row's,
+     * for typical values), so its bound is 16 times as wide.
      */
-    private static int q8Check(ModelWeights w, String lib, Architecture cfg, int[] tokens) throws Exception {
+    private static int q8Check(ModelWeights w, String lib, Architecture cfg, int[] tokens, KvDtype dt, int recent)
+            throws Exception {
         int[] seq = Arrays.copyOf(PROMPT, PROMPT.length + tokens.length);
         System.arraycopy(tokens, 0, seq, PROMPT.length, tokens.length);
         float[][] f32;
@@ -610,11 +624,16 @@ public final class ArchSmoke {
         try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.F16, false)) {
             f16 = forced(b, seq, cfg.core().vocabSize());
         }
-        try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.Q8, false)) {
-            cpu = forced(b, seq, cfg.core().vocabSize());
-        }
-        try (Backend b = new MetalBackend(w, 64, 32, lib, KvDtype.Q8)) {
-            gpu = forced(b, seq, cfg.core().vocabSize());
+        KvDtype.setQ4Recent(recent);
+        try {
+            try (Backend b = new CpuBackend(w, 64, 32, 4, dt, false)) {
+                cpu = forced(b, seq, cfg.core().vocabSize());
+            }
+            try (Backend b = new MetalBackend(w, 64, 32, lib, dt)) {
+                gpu = forced(b, seq, cfg.core().vocabSize());
+            }
+        } finally {
+            KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
         }
         float scale = 0;
         float diff = 0;
@@ -629,9 +648,10 @@ public final class ArchSmoke {
             }
         }
         boolean agree = diff <= 1e-3f * scale + 1e-4f;
-        boolean close = drift <= 200 * drift16 + 1e-3f * scale;
-        System.out.printf("  kv q8: max|cpu-metal| = %.2e%s, max|q8-f32| = %.2e%s (f16: %.2e, max|logit| = %.2f)%n", diff,
-                agree ? "" : " MISMATCH", drift, close ? "" : " TOO FAR", drift16, scale);
+        boolean close = drift <= (dt == KvDtype.Q4 ? 3200 : 200) * drift16 + 1e-3f * scale;
+        String what = dt + (dt == KvDtype.Q4 ? " recent=" + recent : "");
+        System.out.printf("  kv %s: max|cpu-metal| = %.2e%s, max|%s-f32| = %.2e%s (f16: %.2e, ratio %.0f, max|logit| = %.2f)%n",
+                what, diff, agree ? "" : " MISMATCH", dt, drift, close ? "" : " TOO FAR", drift16, drift / drift16, scale);
         return (agree ? 0 : 1) + (close ? 0 : 1);
     }
 

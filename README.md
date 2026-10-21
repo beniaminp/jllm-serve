@@ -343,8 +343,10 @@ Settings are validated strictly, before any weights are loaded: an unknown key, 
 number, a malformed boolean (booleans are `true|false|yes|no|on|off|1|0`; a stray `--think flase` is an error, not
 `false`) or an unknown `model.quant` / `backend.kv-dtype` / `backend` value stops the program with a message and
 exit status 2. `prompt`, `raw` and `config` are command line flags only and are rejected in a properties file.
-Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, or `q8`: int8 with a scale per row of a
-kv head, about a quarter of the f32 cache), `backend.cpu.int8-activations`
+Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, `q8`: int8 with a scale per row of a
+kv head, about a quarter of the f32 cache, or `q4`: Hadamard-rotated keys and 4-bit groups of 32 with a half scale,
+about an eighth, for long contexts), `backend.kv-q4-recent` (q4: the latest positions also kept in half precision,
+default 128, 0 = none), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
 `false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
@@ -367,7 +369,7 @@ Short flags:
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
---backend.kv-dtype f32|f16|q8   KV cache element type (no short alias)
+--backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)

@@ -163,7 +163,8 @@ public final class ModelLoader {
             weights.close();
             throw e;
         }
-        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
+        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype"))
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : ""));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
             constraints(s, engine);
@@ -403,6 +404,7 @@ public final class ModelLoader {
         }
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
+        KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         boolean mamba = arch instanceof MambaArch;
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");

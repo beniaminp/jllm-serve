@@ -708,4 +708,219 @@ router_norm()
 router_norm(remap=True, ntok=5)
 router_norm(ds=True)
 router_norm(ds=True, method=1, sigmoid=0, remap=True)
+
+# ---- q4 KV cache (KvQ4): Hadamard-rotated K, 4-bit groups of 32 with a half scale, recent window of half rows
+
+
+def q4_rotate(x):
+    """Unnormalized Walsh-Hadamard transform of each head row (last axis, blocks of the largest power of two dividing
+    it) in float32 with KvQ4.rotate's butterflies: stride 1, 2, 4, ..., (a, b) -> (a + b, a - b)."""
+    x = np.array(x, np.float32, copy=True)
+    hd = x.shape[-1]
+    b = hd & -hd
+    xs = x.reshape(-1, hd // b, b)
+    h = 1
+    while h < b:
+        y = xs.reshape(xs.shape[0], xs.shape[1], b // (2 * h), 2, h)
+        a = y[:, :, :, 0, :].copy()
+        c = y[:, :, :, 1, :].copy()
+        y[:, :, :, 0, :] = a + c
+        y[:, :, :, 1, :] = a - c
+        h *= 2
+    return x
+
+
+def q4_rows(x):
+    """The q4 cache rows of x ([rows, kvDim] f32, heads of whole groups): per group of 32 d = half(max|x| / 7.5),
+    code = clip(rint(x / d + 7.5), 0, 15) (8 when d = 0), value (code - 7.5) * d; a row is kvDim / 2 bytes (byte j of
+    a group: code j | code j + 16 << 4) then kvDim / 32 halves. Returns (bytes, the dequantized values)."""
+    rows = x.shape[0]
+    g = x.reshape(rows, -1, 32)
+    d16 = (np.abs(g).max(axis=2) / np.float32(7.5)).astype(np.float16)
+    d = d16.astype(np.float32)
+    safe = np.where(d != 0, d, np.float32(1))
+    c = np.clip(np.rint(g / safe[:, :, None] + np.float32(7.5)), 0, 15).astype(np.uint8)
+    c[d == 0] = 8
+    packed = (c[:, :, :16] | (c[:, :, 16:] << 4)).astype(np.uint8).reshape(rows, -1)
+    out = np.concatenate([packed, d16.view(np.uint8).reshape(rows, -1)], axis=1)
+    return np.ascontiguousarray(out), ((c.astype(np.float32) - np.float32(7.5)) * d[:, :, None]).reshape(rows, -1)
+
+
+def kv_store_q4(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, ring=8):
+    """kv_store_q4 rotates and quantizes k, quantizes v, rotates the queries in place and fills the ring and its tags,
+    all bit for bit as numpy (and KvQ4 / KvCache.Q4) does."""
+    rng = np.random.default_rng(6)
+    kv_dim = n_kv * hd
+    k = (rng.standard_normal((ntok, kv_dim)) * rng.random((ntok, 1)) * 4).astype(np.float32)
+    k[:, 5] *= 20  # an outlier channel
+    v = rng.standard_normal((ntok, kv_dim)).astype(np.float32)
+    v[1, :32] = 0  # an all-zero group: scale 0, codes 8
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    q0 = q.copy()
+    stride = kv_dim // 2 + kv_dim // 16
+    kc = np.full((ctx, stride), 0x5A, np.uint8)
+    vc = np.full((ctx, stride), 0x5A, np.uint8)
+    kb = np.ascontiguousarray(kc[pos0:])
+    vb = np.ascontiguousarray(vc[pos0:])
+    kr = np.zeros((ring, kv_dim), np.float16)
+    vr = np.zeros((ring, kv_dim), np.float16)
+    tags = np.full(ring, -1, np.int32)
+    # KvStoreQ4Params: headDim kvDim nKvHeads qStride stride pos0 ringCap
+    E.dispatch('kv_store_q4', [k, v, kb, vb, q, kr, vr, tags],
+               pack('iiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, pos0, ring), (2 * n_kv + n_heads, ntok), (32,))
+    krot = q4_rotate(k.reshape(ntok, n_kv, hd)).reshape(ntok, kv_dim)
+    want_k, kd = q4_rows(krot)
+    want_v, vd = q4_rows(v)
+    ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
+    okq = (q == q4_rotate(q0.reshape(ntok, n_heads, hd)).reshape(ntok, -1)).all()
+    slots = [(pos0 + t) % ring for t in range(ntok)]
+    okr = all((kr[s] == krot[t].astype(np.float16)).all() and (vr[s] == v[t].astype(np.float16)).all()
+              and tags[s] == pos0 + t for t, s in enumerate(slots))
+    # error: within half a step max|x| / 15 of each group (plus the half rounding of the scale)
+    gk = np.abs(krot.reshape(ntok, -1, 32)).max(axis=2)
+    err = (np.abs(kd - krot).reshape(ntok, -1, 32).max(axis=2) / np.where(gk > 0, gk / 15, 1)).max()
+    check(ok and okq and okr and err <= 1.002, 'kv_store_q4 hd=%d: rows as numpy %s, queries %s, ring %s, max error '
+          '%.3f of max|x| / 15' % (hd, 'yes' if ok else 'NO', 'yes' if okq else 'NO', 'yes' if okr else 'NO', err))
+
+
+kv_store_q4(128)
+kv_store_q4(64, n_kv=3, n_heads=6)
+kv_store_q4(96)
+kv_store_q4(256, n_kv=1, ntok=3)
+
+
+def ex_from(tags, cap, recent, p):
+    """KvCache.Q4.exactFrom: the first key a query at p reads from the ring."""
+    if recent == 0:
+        return p + 1
+    lim = max(0, p - recent + 1)
+    s = p
+    while s >= lim and tags[s % cap] == s:
+        s -= 1
+    return s + 1
+
+
+def q4_cache(ctx, n_kv, hd, recent, cap, top, lost=(), seed=7):
+    """Random K / V for positions [0, ctx) as the q4 cache holds them: the q4 rows of the rotated K and of V, and a ring
+    of cap slots holding the positions (top - cap, top] as halves, minus the lost ones. Returns the buffers and the
+    float64 views a reference needs."""
+    rng = np.random.default_rng(seed)
+    kv_dim = n_kv * hd
+    k = q4_rotate(rng.standard_normal((ctx, n_kv, hd)).astype(np.float32)).reshape(ctx, kv_dim)
+    v = rng.standard_normal((ctx, kv_dim)).astype(np.float32)
+    (kc, kd), (vc, vd) = q4_rows(k), q4_rows(v)
+    kr = np.zeros((max(cap, 1), kv_dim), np.float16)
+    vr = np.zeros((max(cap, 1), kv_dim), np.float16)
+    tags = np.full(max(cap, 1), -1, np.int32)
+    for s in range(max(0, top - cap + 1), top + 1):
+        if cap > 0 and s not in lost:
+            kr[s % cap], vr[s % cap], tags[s % cap] = k[s], v[s], s
+    return kc, vc, kr, vr, tags, kd, vd, kr.astype(np.float32), vr.astype(np.float32)
+
+
+def attention_ref_q4(q, kd, vd, kr, vr, tags, cap, recent, n_heads, n_kv, hd, pos0, ntok, scale, window=0, softcap=0.0):
+    """attention_ref where each query at p reads the keys [ex_from(p), p] from the ring rows."""
+    out = np.zeros((ntok, n_heads * hd), np.float64)
+    g = n_heads // n_kv
+    for t in range(ntok):
+        ln = pos0 + t + 1
+        first = max(0, ln - window) if window > 0 else 0
+        ex = ex_from(tags, cap, recent, ln - 1)
+        for h in range(n_heads):
+            kvh = h // g
+            sl = slice(kvh * hd, (kvh + 1) * hd)
+            k = np.array([kr[s % cap, sl] if s >= ex else kd[s, sl] for s in range(first, ln)], np.float64)
+            v = np.array([vr[s % cap, sl] if s >= ex else vd[s, sl] for s in range(first, ln)], np.float64)
+            s = k @ q[t, h * hd:(h + 1) * hd].astype(np.float64) * scale
+            if softcap > 0:
+                s = np.tanh(s / softcap) * softcap
+            pr = np.exp(s - s.max())
+            pr /= pr.sum()
+            out[t, h * hd:(h + 1) * hd] = pr @ v
+    return out
+
+
+def attention_q4(name, hd, n_heads=4, n_kv=2, pos0=30, ntok=5, ctx=48, recent=8, lost=(), window=0):
+    """attention_q4_t: q4 rows before exactFrom(p), ring rows from it on (lost: positions the ring no longer holds)."""
+    cap = recent + 8 if recent > 0 else 0
+    kc, vc, kr, vr, tags, kd, vd, krf, vrf = q4_cache(ctx, n_kv, hd, recent, cap, pos0 + ntok - 1, lost)
+    rng = np.random.default_rng(8)
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    out = np.zeros((ntok, n_heads * hd), np.float32)
+    scores = np.zeros((ntok * n_heads * ctx,), np.float32)
+    scale = np.float32(1 / np.sqrt(hd) / (hd & -hd))
+    stride = n_kv * hd // 2 + n_kv * hd // 16
+    # AttnQ4Params: nHeads nKvHeads qkDim pos0 ctx scale qStride stride oStride window tokenOffset softcap recent ringCap
+    p = pack('iiiiifiiiiifii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, n_heads * hd, window, 0, 0.0,
+             recent, cap)
+    E.dispatch(name, [q, kc, vc, out, scores, kr, vr, tags], p, (n_heads, ntok), (256,))
+    ref = attention_ref_q4(q, kd, vd, krf, vrf, tags, cap, recent, n_heads, n_kv, hd, pos0, ntok, scale, window)
+    err = np.abs(out - ref).max()
+    check(err < 1e-4, '%s hd=%d recent=%d lost=%s window=%d: max err %.2e' % (name, hd, recent, list(lost), window, err))
+
+
+attention_q4('attention_g1_d128_q4', 128)
+attention_q4('attention_g1_d128_q4', 128, lost=(29,))
+attention_q4('attention_g1_d128_q4', 128, lost=(31,))
+attention_q4('attention_g1_d128_q4', 128, recent=0)
+attention_q4('attention_g1_d64_q4', 64, n_kv=1, window=6)
+attention_q4('attention_g1_d256_q4', 256)
+attention_q4('attention_q4', 96)
+
+
+def flash_q4(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, recent=16, lost=(), window=0, softcap=0.0):
+    """attention_fa_q4: the band corrections (ring scores, P_band (V_ring - V_q4)) against the same reference."""
+    cap = recent + ntok if recent > 0 else 0
+    kc, vc, kr, vr, tags, kd, vd, krf, vrf = q4_cache(ctx, n_kv, hd, recent, cap, pos0 + ntok - 1, lost, seed=9)
+    rng = np.random.default_rng(10)
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    out = np.full((ntok, n_heads * hd), np.nan, np.float32)
+    scale = np.float32(1 / np.sqrt(hd) / (hd & -hd))
+    stride = n_kv * hd // 2 + n_kv * hd // 16
+    # FlashQ4Params: nHeads nKvHeads pos0 ntok scale qStride stride oStride window softcap recent ringCap
+    p = pack('iiiifiiiifii', n_heads, n_kv, pos0, ntok, scale, n_heads * hd, stride, n_heads * hd, window, softcap,
+             recent, cap)
+    E.dispatch('attention_fa_d%d_q4' % hd, [q, kc, vc, out, kr, vr, tags], p, (n_heads, (ntok + 31) // 32), (128,))
+    ref = attention_ref_q4(q, kd, vd, krf, vrf, tags, cap, recent, n_heads, n_kv, hd, pos0, ntok, scale, window, softcap)
+    err = np.abs(out - ref).max()
+    check(err < 2e-5, 'attention_fa_d%d_q4 pos0=%d ntok=%d recent=%d lost=%s window=%d softcap=%g: max err %.2e'
+          % (hd, pos0, ntok, recent, list(lost), window, softcap, err))
+
+
+flash_q4(128)
+flash_q4(128, recent=0)
+flash_q4(64, lost=(50,), window=20, pos0=60, ntok=40)
+flash_q4(64, softcap=5.0, recent=40)
+flash_q4(256, ntok=33)
+
+
+def split_q4(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, recent=64, lost=()):
+    """Flash decoding (attention_split_q4 + attention_combine) of one token over a q4 cache with a ring."""
+    cap = recent + 8 if recent > 0 else 0
+    kc, vc, kr, vr, tags, kd, vd, krf, vrf = q4_cache(ctx, n_kv, hd, recent, cap, pos0, lost, seed=11)
+    rng = np.random.default_rng(12)
+    q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
+    stride = n_kv * hd // 2 + n_kv * hd // 16
+    keys = pos0 + 1
+    chunk = (keys + n_split - 1) // n_split
+    part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
+    scores = np.zeros(n_heads * ctx, np.float32)
+    out = np.zeros((1, n_heads * hd), np.float32)
+    scale = np.float32(1 / np.sqrt(hd) / (hd & -hd))
+    # AttnSplitQ4Params: nHeads nKvHeads headDim pos0 ctx scale qStride stride window softcap nSplit chunk recent ringCap
+    E.dispatch('attention_split_q4', [q, kc, vc, part, scores, kr, vr, tags],
+               pack('iiiiifiiifiiii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, 0, 0.0, n_split, chunk,
+                    recent, cap), (n_heads, n_split), (256,))
+    E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+    ref = attention_ref_q4(q, kd, vd, krf, vrf, tags, cap, recent, n_heads, n_kv, hd, pos0, 1, scale)
+    err = np.abs(out - ref).max()
+    check(err < 1e-4, 'attention_split_q4 hd=%d, %d splits, recent=%d lost=%s: max err %.2e'
+          % (hd, n_split, recent, list(lost), err))
+
+
+split_q4(128)
+split_q4(128, lost=(290,))
+split_q4(64, recent=0)
+
+
 sys.exit(1 if failures else 0)

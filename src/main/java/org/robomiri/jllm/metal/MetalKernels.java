@@ -752,6 +752,7 @@ final class MetalKernels implements AutoCloseable {
             case F32 -> "";
             case F16 -> "_h";
             case Q8 -> "_q8";
+            case Q4 -> "_q4";
         };
     }
 
@@ -768,6 +769,97 @@ final class MetalKernels implements AutoCloseable {
         bind(3, vc, off);
         p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads));
         dispatch("kv_store_q8", 4, 0, 2 * kvHeads, n, 1, 32, 1, 1);
+    }
+
+    /**
+     * The recent window of one layer of a q4 cache ({@code backend.kv-q4-recent}): {@code cap} half rows of rotated K
+     * and of V ({@code [cap][kvDim]}) and the position each slot holds ({@code int[cap]}, -1 none). Null without one.
+     */
+    record Q4Ring(Metal.Buffer k, Metal.Buffer v, Metal.Buffer tags, int recent, int cap) {
+    }
+
+    private void bindRing(int i, Q4Ring ring) {
+        bindOrDummy(i, ring == null ? null : ring.k());
+        bindOrDummy(i + 1, ring == null ? null : ring.v());
+        bindOrDummy(i + 2, ring == null ? null : ring.tags());
+    }
+
+    /**
+     * {@code kv_store_q4}: the n f32 staging rows of k (Hadamard-rotated here) and v quantized into the q4 cache rows at
+     * byte offset {@code off} of kc / vc, the chunk's query rows ({@code q}, [n, heads * headDim]) rotated in place,
+     * and with a ring the rows and tags of positions {@code [pos, pos + n)}.
+     */
+    void kvStoreQ4(Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc, Metal.Buffer vc, long off, Metal.Buffer q,
+                   Q4Ring ring, int headDim, int kvHeads, int heads, int pos, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, 0);
+        bind(1, vStage, 0);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, 0);
+        bindRing(5, ring);
+        p.reset(KernelParams.KV_STORE_Q4).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q4.rowBytes(kvDim, kvHeads)).i(pos).i(ring == null ? 0 : ring.cap());
+        dispatch("kv_store_q4", 8, 0, 2 * kvHeads + heads, n, 1, 32, 1, 1);
+    }
+
+    /**
+     * {@code attention_q4_t} ({@code attention_q4} / {@code attention_g1_d{64,128,256}_q4}) for the n tokens at pos, in
+     * tiles of ATT_TILE tokens; {@code scale} is the score scale divided by the Hadamard block.
+     */
+    void attentionQ4(String kernel, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out, Metal.Buffer scores,
+                     Q4Ring ring, int nHeads, int nKvHeads, int headDim, int pos, int ctx, float scale, int qStride,
+                     int stride, int oStride, int window, float softcap, int n) {
+        bind(0, q, 0);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, 0);
+        bind(4, scores, 0);
+        bindRing(5, ring);
+        for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
+            p.reset(KernelParams.ATTN_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
+                    .i(oStride).i(window).i(t0).f(softcap).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+            dispatch(kernel, 8, 0, nHeads, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
+        }
+    }
+
+    /** {@link #flashPrefill} over a q4 cache: {@code attention_fa_d{headDim}_q4}. */
+    void flashPrefillQ4(int headDim, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out, Q4Ring ring,
+                        int nHeads, int nKvHeads, int pos, int n, float scale, int qStride, int stride, int oStride,
+                        int window, float softcap) {
+        bind(0, q, 0);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, 0);
+        bindRing(4, ring);
+        p.reset(KernelParams.FLASH_Q4).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(stride).i(oStride)
+                .i(window).f(softcap).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+        dispatch("attention_fa_d" + headDim + "_q4", 7, 0, nHeads,
+                (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
+    }
+
+    /** {@link #flashAttention} over a q4 cache: {@code attention_split_q4}, then {@code attention_combine}. */
+    void flashAttentionQ4(Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part, Metal.Buffer scores,
+                          Metal.Buffer out, Q4Ring ring, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
+                          float scale, int qStride, int stride, int window, float softcap) {
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int keys = len - first;
+        int nSplit = Math.min(FLASH_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
+        int chunk = (keys + nSplit - 1) / nSplit;
+        bind(0, q, 0);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, scores, 0);
+        bindRing(5, ring);
+        p.reset(KernelParams.ATTN_SPLIT_Q4).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(stride)
+                .i(window).f(softcap).i(nSplit).i(chunk).i(ring == null ? 0 : ring.recent()).i(ring == null ? 0 : ring.cap());
+        dispatch("attention_split_q4", 8, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        bind(0, part, 0);
+        bind(1, out, 0);
+        p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+        dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** Whether {@code attention_fa} exists for this head width. */

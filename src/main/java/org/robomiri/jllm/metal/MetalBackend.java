@@ -9,6 +9,7 @@ import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DecoderLayer;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
@@ -46,8 +47,11 @@ public final class MetalBackend implements Backend {
     // reads half; see the "f16 KV cache" section of kernels.metal. q8 (backend.kv-dtype=q8): k and v both go
     // through f32 staging rows (rope rotates k in place) and kv_store_q8 quantizes each (token, kv head) row into
     // the cache, whose position rows are kvDim int8 values followed by one f32 scale per kv head; the *_q8
-    // attention kernels read them
+    // attention kernels read them. q4 (backend.kv-dtype=q4): the same staging rows, kv_store_q4 rotates k (and the
+    // chunk's queries, in place) and quantizes k and v into 4-bit rows; with backend.kv-q4-recent it also keeps the
+    // latest rows as halves in a per-layer ring (q4Rings), which the *_q4 attention kernels read for recent keys
     private final KvDtype kvDtype;
+    private MetalKernels.Q4Ring[] q4Rings;
     private final boolean kvHalf;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
@@ -276,6 +280,11 @@ public final class MetalBackend implements Backend {
         this.c = arch.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
+        if (kvDtype == KvDtype.Q4 && !(arch.attention() instanceof Attention.Gqa g && KvQ4.supports(g.headDim()))) {
+            System.err.println("note: backend.kv-dtype=q4 needs grouped-query attention with a head size that is a "
+                    + "multiple of " + KvQ4.GROUP + " (not DeepSeek's latent cache), using q8");
+            kvDtype = KvDtype.Q8;
+        }
         this.kvDtype = kvDtype;
         this.kvHalf = kvDtype == KvDtype.F16;
         this.k = new MetalKernels(metal, c.normEps());
@@ -294,7 +303,7 @@ public final class MetalBackend implements Backend {
     private void init(KvDtype kvDtype) {
         Attention a = arch.attention();
         // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
-        attnGroup = attnGroupOverride(a);
+        attnGroup = kvDtype == KvDtype.Q4 ? 1 : attnGroupOverride(a); // q4: no grouped instantiations
         int hd = a.headDim();
         String vh = MetalKernels.kvSuffix(kvDtype);
         attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
@@ -331,9 +340,21 @@ public final class MetalBackend implements Backend {
                 k.rowIndexed(keyCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads())); // for decode replay
                 k.rowIndexed(valCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads()));
             }
-            // f32 k rows before RoPE (f16, q8) and v rows before the quantization (q8)
+            // f32 k rows before RoPE (f16, q8, q4) and v rows before the quantization (q8, q4)
             kStage = kvDtype != KvDtype.F32 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
-            vStage = kvDtype == KvDtype.Q8 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            int recent = Math.min(KvDtype.q4Recent(), ctx);
+            if (kvDtype == KvDtype.Q4 && recent > 0) {
+                // recent + batch slots: a chunk never evicts a row one of its own queries reads (as KvCache.Q4)
+                int cap = Math.min(ctx, recent + maxBatch);
+                q4Rings = new MetalKernels.Q4Ring[c.layers()];
+                for (int l = 0; l < c.layers(); l++) {
+                    Metal.Buffer tags = k.scratch((long) cap * 4);
+                    tags.contents().fill((byte) -1); // -1: no position
+                    q4Rings[l] = new MetalKernels.Q4Ring(k.scratch((long) cap * g.kvDim() * 2),
+                            k.scratch((long) cap * g.kvDim() * 2), tags, recent, cap);
+                }
+            }
         }
         x = k.scratch((long) maxBatch * c.dim() * 4);
         xb = k.scratch((long) maxBatch * c.dim() * 4);
@@ -343,7 +364,8 @@ public final class MetalBackend implements Backend {
         scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * a.heads() * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
         if (a instanceof Attention.Gqa g) {
-            MetalTuner.Decision d = MetalTuner.decide(k, g, kvDtype, attnKernel, attnGroup);
+            MetalTuner.Decision d = MetalTuner.decide(k, g, kvDtype, attnKernel, attnGroup,
+                    q4Rings == null ? 0 : q4Rings[0].recent());
             flashPrefill = d.flashPrefill();
             flashDecode = d.flashDecode();
             System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
@@ -792,8 +814,9 @@ public final class MetalBackend implements Backend {
         public void run(int layer, int n, int pos, boolean fuseNorm) {
             int dim = c.dim();
             int kvDim = g.kvDim();
-            boolean q8 = kvDtype == KvDtype.Q8;
-            int stride = kvDtype.rowStride(kvDim, g.kvHeads()); // cache row stride in elements (q8: bytes)
+            boolean q4 = kvDtype == KvDtype.Q4;
+            boolean q8 = kvDtype == KvDtype.Q8 || q4; // k and v through the f32 staging rows
+            int stride = kvDtype.rowStride(kvDim, g.kvHeads()); // cache row stride in elements (q8, q4: bytes)
             long cacheOff = pos * kvDtype.rowBytes(kvDim, g.kvHeads());
             Metal.Buffer kDst = kvDtype != KvDtype.F32 ? kStage : keyCache[layer];
             long kOff = kvDtype != KvDtype.F32 ? 0 : cacheOff;
@@ -814,6 +837,25 @@ public final class MetalBackend implements Backend {
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             int hd = g.headDim();
+            if (q4) {
+                k.rope(adjacent, kvHalf, q, kDst, kOff, kStage, 0, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
+                        hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
+                MetalKernels.Q4Ring ring = q4Rings == null ? null : q4Rings[layer];
+                k.kvStoreQ4(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, ring, hd, g.kvHeads(),
+                        g.heads(), pos, n);
+                float scale = g.scale() / KvQ4.block(hd); // (Hq)·(Hk) = B q·k
+                if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
+                    k.flashAttentionQ4(q, keyCache[layer], valCache[layer], flashPart, scores, att, ring, g.heads(),
+                            g.kvHeads(), hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
+                } else if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
+                    k.flashPrefillQ4(hd, q, keyCache[layer], valCache[layer], att, ring, g.heads(), g.kvHeads(), pos, n,
+                            scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
+                } else {
+                    k.attentionQ4(attnKernel, q, keyCache[layer], valCache[layer], att, scores, ring, g.heads(),
+                            g.kvHeads(), hd, pos, ctx, scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap(), n);
+                }
+                return;
+            }
             if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch
                 k.ropeStoreQ8(adjacent, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), g.heads(), g.kvHeads(), pos,
@@ -1689,17 +1731,75 @@ public final class MetalBackend implements Backend {
 
     /**
      * The cache rows as CpuBackend saves them: for standard attention ({@code KvCache.write}) per layer, per position,
-     * the K row then the V row, little-endian f32 or IEEE half, or q8's kvDim int8 values followed by the kvHeads f32
+     * the K row then the V row, little-endian f32 or IEEE half, or q8 / q4's int8 / 4-bit codes followed by the f32 / half
      * scales; for DeepSeek's latent attention ({@code MlaCpu.write}) per layer, per position, the latent row
-     * {@code [c | k_pe]} in f32 or half. Metal's {@code half} has the same bits and its q8 cache rows are that layout
-     * already, so a cache saved by either backend has the same layout. A q8 latent cache is not saved.
+     * {@code [c | k_pe]} in f32 or half. Metal's {@code half} has the same bits and its q8 / q4 cache rows are that layout
+     * already, so a cache saved by either backend has the same layout; q4 with a recent window then adds the window's
+     * half rows ({@link #saveRecent}). A q8 latent cache is not saved.
      */
     @Override
     public String stateFormat() {
         if (arch.attention() instanceof Attention.Gqa g) {
-            return "kv " + kvDtype + " layers=" + c.layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
+            return "kv " + kvDtype + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
+                    + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
         }
         return mla != null && kvDtype != KvDtype.Q8 ? "mla " + mla.format() : null;
+    }
+
+    /**
+     * q4's recent window as {@code KvCache.Q4.writeRecent} writes it: per layer, for each of the positions
+     * {@code [max(0, n - R), n)} an int (1: the ring holds it, 0: not), then its K and V rows as {@code kvDim} halves
+     * (zeros when absent).
+     */
+    private void saveRecent(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        int kvDim = ((Attention.Gqa) arch.attention()).kvDim();
+        for (MetalKernels.Q4Ring r : q4Rings) {
+            int first = Math.max(0, n - r.recent());
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim))
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            MemorySegment b = MemorySegment.ofBuffer(buf);
+            for (int s = first; s < n; s++) {
+                int slot = s % r.cap();
+                boolean held = r.tags().contents().getAtIndex(ValueLayout.JAVA_INT, slot) == s;
+                long o = (long) (s - first) * (4 + 4 * kvDim);
+                b.set(ValueLayout.JAVA_INT_UNALIGNED, o, held ? 1 : 0);
+                if (held) {
+                    MemorySegment.copy(r.k().contents(), (long) slot * kvDim * 2, b, o + 4, kvDim * 2L);
+                    MemorySegment.copy(r.v().contents(), (long) slot * kvDim * 2, b, o + 4 + 2L * kvDim, kvDim * 2L);
+                }
+            }
+            buf.limit((n - first) * (4 + 4 * kvDim));
+            while (buf.hasRemaining()) {
+                out.write(buf);
+            }
+        }
+    }
+
+    /** Reads what {@link #saveRecent} wrote (the ring forgets every other position). */
+    private void loadRecent(int n, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
+        int kvDim = ((Attention.Gqa) arch.attention()).kvDim();
+        for (MetalKernels.Q4Ring r : q4Rings) {
+            int first = Math.max(0, n - r.recent());
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim))
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            buf.limit((n - first) * (4 + 4 * kvDim));
+            while (buf.hasRemaining()) {
+                if (in.read(buf) < 0) {
+                    throw new java.io.EOFException("the saved cache file is truncated");
+                }
+            }
+            MemorySegment b = MemorySegment.ofBuffer(buf.flip());
+            r.tags().contents().fill((byte) -1);
+            for (int s = first; s < n; s++) {
+                long o = (long) (s - first) * (4 + 4 * kvDim);
+                if (b.get(ValueLayout.JAVA_INT_UNALIGNED, o) != 0) {
+                    int slot = s % r.cap();
+                    MemorySegment.copy(b, o + 4, r.k().contents(), (long) slot * kvDim * 2, kvDim * 2L);
+                    MemorySegment.copy(b, o + 4 + 2L * kvDim, r.v().contents(), (long) slot * kvDim * 2, kvDim * 2L);
+                    r.tags().contents().setAtIndex(ValueLayout.JAVA_INT, slot, s);
+                }
+            }
+        }
     }
 
     /** Bytes of one row of one cache segment. */
@@ -1761,6 +1861,9 @@ public final class MetalBackend implements Backend {
                 }
             }
         }
+        if (q4Rings != null) {
+            saveRecent(n, out);
+        }
     }
 
     @Override
@@ -1806,6 +1909,9 @@ public final class MetalBackend implements Backend {
             }
             Backend.skipState(in, (long) (stored - n) * segs * row);
         }
+        if (q4Rings != null) {
+            loadRecent(n, in);
+        }
     }
 
     @Override
@@ -1826,6 +1932,19 @@ public final class MetalBackend implements Backend {
             MemorySegment[] to = segments(l);
             for (int j = 0; j < to.length; j++) {
                 MemorySegment.copy(from[j], 0, to[j], 0, bytes);
+            }
+        }
+        for (int l = 0; q4Rings != null && l < c.layers(); l++) { // the window's rows the other ring still holds
+            MetalKernels.Q4Ring a = o.q4Rings[l];
+            MetalKernels.Q4Ring r = q4Rings[l];
+            long row = (long) ((Attention.Gqa) arch.attention()).kvDim() * 2;
+            r.tags().contents().fill((byte) -1);
+            for (int s = Math.max(0, n - r.recent()); s < n; s++) {
+                if (a.tags().contents().getAtIndex(ValueLayout.JAVA_INT, s % a.cap()) == s) {
+                    MemorySegment.copy(a.k().contents(), (s % a.cap()) * row, r.k().contents(), (s % r.cap()) * row, row);
+                    MemorySegment.copy(a.v().contents(), (s % a.cap()) * row, r.v().contents(), (s % r.cap()) * row, row);
+                    r.tags().contents().setAtIndex(ValueLayout.JAVA_INT, s % r.cap(), s);
+                }
             }
         }
     }
