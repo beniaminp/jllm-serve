@@ -59,8 +59,14 @@ public final class Devices implements AutoCloseable {
         return MetalOps.open(precision, xl);
     }
 
+    private boolean closed;
+
     @Override
-    public void close() {
+    public synchronized void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
         try {
             if (owner != null) {
                 owner.close();

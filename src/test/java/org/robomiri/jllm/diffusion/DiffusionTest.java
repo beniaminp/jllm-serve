@@ -41,6 +41,8 @@ public final class DiffusionTest {
         rng();
         imaging();
         paramStructs();
+        repoAndHttp();
+        engineServer();
         // {model, reference, per-stage limits (largest difference relative to the largest reference value)}
         String[][] cases = {
                 {"tiny-sd", "ref-txt2img-euler", "text=1e-5,unet=1e-5,vae_decode=1e-5,vae_mean=1e-5,vae_std=1e-5,latents=1e-5,image=1e-5"},
@@ -231,6 +233,121 @@ public final class DiffusionTest {
             }
             check(finite && pt.mean().length == lh * lw * 4 && pt.std().length == lh * lw * 4, "tiled VAE encode: shape and values");
         }
+    }
+
+    /** The engine's own HTTP server with an image model only (`--model none`): generation, streaming, edits (JSON and multipart), files. */
+    private static void engineServer() throws Exception {
+        try (Devices dev = Devices.cpu();
+             ImagePipeline pipe = new ImagePipeline(resource("tiny-sd"), dev);
+             org.robomiri.jllm.server.ApiServer server = new org.robomiri.jllm.server.ApiServer(null, "none", "127.0.0.1", 0,
+                     org.robomiri.jllm.server.ApiServer.Options.defaults())
+                     .withImages(new org.robomiri.jllm.server.ImageHttp(pipe, "tiny-sd"))) {
+            Thread t = Thread.ofVirtual().start(server::serve);
+            String base = "http://127.0.0.1:" + server.port();
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            java.util.function.Function<String, java.net.http.HttpRequest.Builder> req = path -> java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + path));
+            java.net.http.HttpResponse<String> r = http.send(req.apply("/v1/images/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"a cat\",\"size\":\"64x64\",\"steps\":2,\"guidance\":3,\"seed\":7,\"n\":2,\"response_format\":\"url\"}")).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            Map<String, Object> out = org.robomiri.jllm.json.Json.parseObject(r.body());
+            List<Object> data = org.robomiri.jllm.json.Json.list(out, "data");
+            String url = data == null ? "" : org.robomiri.jllm.json.Json.str(data.get(0), "url", "");
+            check(r.statusCode() == 200 && data.size() == 2 && url.contains("/v1/images/files/") && org.robomiri.jllm.json.Json.num(data.get(1), "seed", 0) == 8,
+                    "engine server: POST /v1/images/generations with n=2 and response_format url");
+            java.net.http.HttpResponse<byte[]> f = http.send(req.apply(url.substring(url.indexOf("/v1/"))).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            check(f.statusCode() == 200 && Imaging.decode(f.body()).width() == 64, "engine server: GET /v1/images/files/<id>.png serves the picture");
+            java.net.http.HttpResponse<String> models = http.send(req.apply("/v1/models").GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(models.body().contains("\"kind\":\"image\"") && !models.body().contains("\"kind\":\"text\""), "engine server: /v1/models lists the image model");
+            // streaming
+            java.net.http.HttpResponse<String> s = http.send(req.apply("/v1/images/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"a cat\",\"size\":\"64x64\",\"steps\":3,\"guidance\":3,\"seed\":1,\"stream\":true}")).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(s.body().contains("image_generation.progress") && s.body().contains("image_generation.partial_image")
+                            && s.body().contains("image_generation.completed") && s.body().trim().endsWith("[DONE]"),
+                    "engine server: streaming progress, previews, completion, [DONE]");
+            // edits: multipart (image + mask) and JSON
+            byte[] png = Imaging.png(new Imaging.Image(64, 64, new byte[64 * 64 * 3]));
+            byte[] maskRgb = new byte[64 * 64 * 3];
+            for (int i = 0; i < 64 * 64 / 2; i++) {
+                maskRgb[i * 3] = maskRgb[i * 3 + 1] = maskRgb[i * 3 + 2] = (byte) 255;
+            }
+            byte[] mask = Imaging.png(new Imaging.Image(64, 64, maskRgb));
+            String boundary = "xBOUNDARYx";
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+            java.util.function.BiConsumer<String, String> text = (k, v) -> body.writeBytes(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + k + "\"\r\n\r\n" + v + "\r\n").getBytes());
+            java.util.function.BiConsumer<String, byte[]> file = (k, v) -> {
+                body.writeBytes(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + k + "\"; filename=\"" + k + ".png\"\r\nContent-Type: image/png\r\n\r\n").getBytes());
+                body.writeBytes(v);
+                body.writeBytes("\r\n".getBytes());
+            };
+            text.accept("prompt", "a dog");
+            text.accept("steps", "3");
+            text.accept("guidance", "3");
+            text.accept("seed", "5");
+            file.accept("image", png);
+            file.accept("mask", mask);
+            body.writeBytes(("--" + boundary + "--\r\n").getBytes());
+            java.net.http.HttpResponse<String> e = http.send(req.apply("/v1/images/edits").header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body.toByteArray())).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(e.statusCode() == 200 && e.body().contains("b64_json"), "engine server: POST /v1/images/edits as multipart (inpainting)");
+            java.net.http.HttpResponse<String> bad = http.send(req.apply("/v1/images/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"x\",\"size\":\"50x50\"}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(bad.statusCode() == 400 && bad.body().contains("multiple of"), "engine server: a bad size is a 400 with the reason");
+            java.net.http.HttpResponse<String> chat = http.send(req.apply("/v1/chat/completions").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"messages\":[]}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(chat.statusCode() == 404 && chat.body().contains("no text model"), "engine server: images only, the chat endpoint says there is no text model");
+        }
+    }
+
+    /** Which files of a diffusers repository are downloaded, the multipart reader and the picture store. */
+    private static void repoAndHttp() throws Exception {
+        // a listing like stabilityai/sdxl-turbo's, plus what must be left out
+        String[] names = {"model_index.json", "sd_xl_turbo_1.0_fp16.safetensors", "scheduler/scheduler_config.json",
+                "text_encoder/config.json", "text_encoder/model.safetensors", "text_encoder/model.fp16.safetensors", "text_encoder/model.onnx",
+                "text_encoder_2/config.json", "text_encoder_2/model.fp16.safetensors", "tokenizer/vocab.json", "tokenizer/merges.txt",
+                "tokenizer_2/vocab.json", "unet/config.json", "unet/diffusion_pytorch_model.safetensors",
+                "unet/diffusion_pytorch_model.fp16.safetensors", "unet/diffusion_pytorch_model.fp16.bin", "unet/openvino/model.xml",
+                "vae/config.json", "vae/diffusion_pytorch_model.fp16.safetensors", "safety_checker/model.safetensors",
+                "safety_checker/config.json", "vae_decoder/config.json"};
+        List<org.robomiri.jllm.hub.HuggingFaceHub.RepoFile> listing = new ArrayList<>();
+        for (String n : names) {
+            listing.add(new org.robomiri.jllm.hub.HuggingFaceHub.RepoFile(n, 100, null));
+        }
+        Map<String, Object> index = org.robomiri.jllm.json.Json.parseObject("{\"_class_name\":\"StableDiffusionXLPipeline\","
+                + "\"scheduler\":[\"diffusers\",\"EulerDiscreteScheduler\"],\"text_encoder\":[\"transformers\",\"CLIPTextModel\"],"
+                + "\"text_encoder_2\":[\"transformers\",\"CLIPTextModelWithProjection\"],\"tokenizer\":[\"transformers\",\"CLIPTokenizer\"],"
+                + "\"tokenizer_2\":[\"transformers\",\"CLIPTokenizer\"],\"unet\":[\"diffusers\",\"UNet2DConditionModel\"],"
+                + "\"vae\":[\"diffusers\",\"AutoencoderKL\"],\"safety_checker\":[null,null],\"force_zeros_for_empty_prompt\":true}");
+        java.util.Set<String> chosen = DiffusersRepo.select(listing, index).keySet();
+        check(chosen.contains("unet/diffusion_pytorch_model.fp16.safetensors") && !chosen.contains("unet/diffusion_pytorch_model.safetensors")
+                        && chosen.contains("text_encoder/model.fp16.safetensors") && !chosen.contains("text_encoder/model.safetensors")
+                        && chosen.contains("text_encoder_2/model.fp16.safetensors") && chosen.contains("vae/diffusion_pytorch_model.fp16.safetensors"),
+                "diffusers download: the fp16 weights of unet, vae and both text encoders, not the full-precision ones");
+        check(chosen.contains("model_index.json") && chosen.contains("tokenizer_2/vocab.json") && chosen.contains("scheduler/scheduler_config.json")
+                        && !chosen.contains("sd_xl_turbo_1.0_fp16.safetensors") && !chosen.contains("unet/openvino/model.xml")
+                        && !chosen.contains("unet/diffusion_pytorch_model.fp16.bin") && !chosen.contains("text_encoder/model.onnx")
+                        && !chosen.contains("safety_checker/model.safetensors") && !chosen.contains("vae_decoder/config.json"),
+                "diffusers download: configs and tokenizers yes; the single-file checkpoint, .bin / .onnx / openvino files and the safety checker no");
+        check(DiffusersRepo.isDiffusers(listing) && !DiffusersRepo.isDiffusers(List.of()), "a repository with a model_index.json is a diffusers repository");
+
+        String boundary = "----jllmBoundary";
+        byte[] png = {(byte) 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 1, 2, '\r', '\n', 3};
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+        String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\na cat\r\n"
+                + "--" + boundary + "\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n";
+        body.write(head.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        body.write(png);
+        body.write(("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n2\r\n--" + boundary + "--\r\n")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        Map<String, Multipart.Part> parts = Multipart.parse(body.toByteArray(), Multipart.boundary("multipart/form-data; boundary=\"" + boundary + "\""));
+        check(parts.size() == 3 && parts.get("prompt").text().equals("a cat") && parts.get("n").text().equals("2")
+                        && parts.get("image").filename().equals("a.png") && java.util.Arrays.equals(parts.get("image").data(), png),
+                "multipart/form-data: text fields and a binary file part (with CR LF inside it) are read back exactly");
+        ImageStore store = new ImageStore(2, 1000);
+        String a = store.put(new byte[400]);
+        String b = store.put(new byte[400]);
+        String c = store.put(new byte[400]);
+        check(store.get(a) == null && store.get(b) != null && store.get(c) != null && a.length() == 24, "picture store: oldest evicted beyond its limits, 24-hex ids");
     }
 
     private static org.robomiri.jllm.safetensors.SafeTensors.Tensor tensor(float[] data, long... shape) {

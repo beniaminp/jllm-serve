@@ -56,7 +56,7 @@ public final class Vae implements AutoCloseable {
     private final Tn decNormG, decNormB;
     private final Conv decOut;
     /** Largest latent edge decoded in one piece; bigger images are tiled. */
-    public int tileLatents = 64;
+    public int tileLatents = 128;
     /** Overlap of neighbouring tiles, in latent pixels. */
     public int tileOverlap = 8;
 
