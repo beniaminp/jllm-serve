@@ -16,6 +16,10 @@ import java.util.concurrent.TimeUnit;
  */
 public final class AudioDecoder {
 
+    /** The demuxers an upload may use (ffmpeg's names). */
+    static final String DEMUXERS = "wav,w64,aiff,au,caf,mp3,flac,ogg,aac,ac3,eac3,amr,asf,mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,"
+            + "mpegts,mpeg,avi,wv,ape,tta,s16le,mp2";
+
     private final String ffmpeg;      // resolved executable, or null
     private final long maxSamples;    // samples at 16 kHz
 
@@ -95,8 +99,10 @@ public final class AudioDecoder {
         Path in = Files.createTempFile("jllm-audio-", ".bin");
         try {
             Files.write(in, file);
-            Process p = new ProcessBuilder(ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", in.toString(),
-                    "-vn", "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", String.valueOf(LogMel.SAMPLE_RATE),
+            // an upload is untrusted: only plain files, and only the audio / media containers, never a playlist or a
+            // network-reaching demuxer (concat, hls, sdp ...) that could read other files or addresses
+            Process p = new ProcessBuilder(ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-protocol_whitelist",
+                    "file,pipe", "-format_whitelist", DEMUXERS, "-i", in.toString(), "-vn", "-f", "f32le", "-acodec", "pcm_f32le", "-ac", "1", "-ar", String.valueOf(LogMel.SAMPLE_RATE),
                     "pipe:1").redirectError(ProcessBuilder.Redirect.DISCARD).start();
             byte[] raw;
             try (var s = p.getInputStream()) {

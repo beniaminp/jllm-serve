@@ -191,6 +191,30 @@ public final class AudioTest {
         check(!dec.hasFfmpeg(), "ffmpeg off");
         float[] mono16 = dec.decode16k(Wav.write16(new float[][]{x, x}, 32000));
         check(mono16.length == 500, "decode16k resamples a 32 kHz stereo file to 500 mono samples");
+        AudioDecoder auto = new AudioDecoder("auto", 600);
+        if (auto.hasFfmpeg()) {
+            float[] tone = new float[24000];
+            for (int i = 0; i < tone.length; i++) {
+                tone[i] = (float) (0.4 * Math.sin(2 * Math.PI * 500.0 * i / 24000));
+            }
+            for (String fmt : new String[]{"mp3", "flac", "opus", "aac"}) {
+                float[] back = auto.decode16k(AudioEncoder.encode(fmt, tone, 24000, auto));
+                double dot = 0;
+                double nn = 0;
+                double mm = 0;
+                for (int i = 2000; i < 12000; i++) {
+                    double ref = 0.4 * Math.sin(2 * Math.PI * 500.0 * i / 16000);
+                    dot += ref * back[i];
+                    nn += ref * ref;
+                    mm += back[i] * back[i];
+                }
+                // a lossy codec delays the signal by a few ms; the energy is what must be there
+                check(back.length > 14000 && back.length < 18000 && Math.sqrt(mm / nn) > 0.8 && Math.sqrt(mm / nn) < 1.2,
+                        fmt + " through ffmpeg: encoded from 24 kHz and decoded to " + back.length + " samples at 16 kHz, level " + Math.sqrt(mm / nn));
+            }
+        } else {
+            System.out.println("note: no ffmpeg, the mp3 / flac / opus / aac checks are skipped");
+        }
         boolean tooLong = false;
         try {
             new AudioDecoder("off", 0.01).decode16k(Wav.write16(x, 16000));
