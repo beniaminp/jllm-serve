@@ -108,6 +108,15 @@ public final class Settings {
         return s;
     }
 
+    /** A copy with some values replaced (a model loaded with its own context length, say); the keys must exist. */
+    public Settings with(Map<String, String> overrides) {
+        Settings s = new Settings();
+        s.props.putAll(props);
+        s.sources.putAll(sources);
+        overrides.forEach((k, v) -> s.put(k, v, "override"));
+        return s;
+    }
+
     private static Path findExternal(String fromCli) {
         if (fromCli != null) {
             return Path.of(fromCli);
