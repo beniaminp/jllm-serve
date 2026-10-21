@@ -11,6 +11,9 @@
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
 #   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
+#   scripts/mac-validate.sh --gguf-types DIR                 plus every .gguf in DIR (e.g. made with llama-quantize from one
+#                                                            model: Q4_1, Q5_0, IQ4_NL, MXFP4, ...) used in place against
+#                                                            -Djllm.gguf.requantize=all (requantized to Q8_0 at load)
 #
 # The llama.cpp comparison needs llama-bench (brew install llama.cpp, or LLAMA_BENCH=/path/to/llama-bench) and
 # python3. Both engines read the same .gguf file (default unsloth/Qwen3-0.6B-GGUF, Q4_0; --llama-quant to change),
@@ -30,6 +33,7 @@ LLAMA_ONLY=""
 LLAMA_DENSE=unsloth/Qwen3-0.6B-GGUF
 LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
+GGUF_TYPES=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) DENSE="$2"; shift 2 ;;
@@ -41,6 +45,7 @@ while [ $# -gt 0 ]; do
     --llama-model) LLAMA_DENSE="$2"; shift 2 ;;
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
+    --gguf-types) GGUF_TYPES="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -163,6 +168,15 @@ if [ -n "$MOE" ]; then
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
+fi
+# GGUF block types read in place against the old behaviour (dequantize at load, requantize to Q8_0): the same file, a
+# switch on the loader (-Djllm.gguf.requantize=all; a list of ggml type names limits it to those types)
+if [ -n "$GGUF_TYPES" ]; then
+  for f in "$GGUF_TYPES"/*.gguf; do
+    [ -e "$f" ] || continue
+    bench "$(basename "$f"): in place (default)" "$f" ""
+    bench "$(basename "$f"): requantized to Q8_0 (jllm.gguf.requantize=all)" "$f" "-Djllm.gguf.requantize=all"
+  done
 fi
 echo
 echo "(median of $ROUNDS rounds; logs in $OUT)"

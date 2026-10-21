@@ -26,7 +26,7 @@ dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md
 | Byte-level and SentencePiece-style BPE tokenizers + per-family chat templates | `tokenizer/` | yes |
 | Typed model description (`Architecture`, `LayerSpec`, `RopeTable`, one parser per family) | `model/Architecture.java`, `model/Families.java`, ... | yes |
 | Q4_0 / Q8_0 / Q2_K block quantization + versioned, mmap'd quantized cache file, shard-by-shard resumable conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
-| GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q8_0, Q4_K, Q5_K; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `tokenizer/GgufTokenizer.java` | yes |
+| GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `cpu/GgufInt8Kernels.java`, `tokenizer/GgufTokenizer.java` | yes |
 | Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16/q8 KV cache) | `cpu/` | yes |
 | Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
@@ -119,11 +119,14 @@ Only the shards listed in the model's `model.safetensors.index.json` (or `model.
 A repository with several `.gguf` files needs `--gguf-quant` (a label such as `Q4_K_M`) or `--gguf-file` (exact name);
 without either the error lists the files. Only the chosen file (and the `-0000i-of-0000N` parts of a split model) is
 downloaded, with the usual resume and SHA-256 check. Nothing is converted or cached: the weights are read from the
-mapped file. Q4_0, Q8_0, Q2_K and the K-quants Q4_K / Q5_K / Q6_K (the usual `Q4_K_M` mix) are computed in place; on
-the CPU the K-quants use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11 tok/s on 4 AVX-512
-cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Other formats (Q3_K, Q4_1, Q5_0/1,
-F16/BF16) are requantized to Q8_0 in memory at load. See [docs/16](docs/16-gguf.md) for the file format, the llama q/k permutation, the zero-copy mapping
-and the verification.
+mapped file. Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, the K-quants Q4_K / Q5_K / Q6_K (the usual `Q4_K_M` mix), the
+non-linear 4-bit IQ4_NL / IQ4_XS, MXFP4 (gpt-oss) and F16 / BF16 matrices are computed in place, on both backends (a
+mixed file such as the `Q4_0` of Qwen3.8 with `ffn_down` in Q4_1 stays at its 4.5-5 bits per weight instead of being
+widened to 8.5); on the CPU most of them use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11
+tok/s on 4 AVX-512 cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Only F32 matrices (and
+whatever `-Djllm.gguf.requantize=<types>` lists, to compare with the old behaviour) are requantized to Q8_0 in memory
+at load; IQ1-IQ3 and the ternary types are refused. See [docs/16](docs/16-gguf.md) for the file format, the type table
+(16.4.1), the llama q/k permutation, the zero-copy mapping and the verification.
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
