@@ -55,6 +55,8 @@ class ToolCallApiTest {
     MockMvc mvc;
     @Autowired
     ModelManager models;
+    @Autowired
+    org.robomiri.jllm.web.settings.SettingsService settings;
     ScriptBackend backend;
     Engine engine;
 
@@ -233,5 +235,26 @@ class ToolCallApiTest {
         Map<String, Object> resp = chat(body(fmt));
         Map<String, Object> choice = Json.map(Json.list(resp, "choices").getFirst(), "message");
         assertEquals(Map.of("answer", "sunny"), Json.parseObject((String) choice.get("content")), Json.write(resp));
+    }
+
+    /** {@code engine.constrained-tools=false}: the old path, tool calls are free text and exclude response_format. */
+    @Test
+    void switchedOff() throws Exception {
+        settings.update(Map.of("engine.constrained-tools", "false"), null);
+        try {
+            backend.script = CALL.getBytes(StandardCharsets.UTF_8);
+            Map<String, Object> free = chat(body(""));
+            assertTrue(Json.num(Json.map(free, "usage"), "forced_tokens", -1) == 0, "no jump-forward without a constraint: "
+                    + Json.write(free));
+            String fmt = ", \"response_format\": {\"type\": \"json_object\"}";
+            MvcResult bad = mvc.perform(post("/v1/chat/completions").contentType("application/json").content(body(fmt))).andReturn();
+            assertEquals(400, bad.getResponse().getStatus(), bad.getResponse().getContentAsString());
+            assertTrue(bad.getResponse().getContentAsString().contains("response_format"), bad.getResponse().getContentAsString());
+        } finally {
+            settings.update(null, List.of("engine.constrained-tools"));
+        }
+        // and on again: constrained, forced tokens appear
+        backend.script = CALL.getBytes(StandardCharsets.UTF_8);
+        assertTrue(Json.num(Json.map(chat(body("")), "usage"), "forced_tokens", 0) > 0);
     }
 }

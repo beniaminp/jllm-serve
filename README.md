@@ -42,6 +42,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Feature | What it does | Docs |
 |---|---|---|
 | Prompt lookup for agents | an n-gram index over the whole context drafts up to 16 tokens that the model verifies in one pass; 20 → 81 tok/s when rewriting code from the prompt, −4 % on free text | [17 §17.1](docs/17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) |
+| Constrained tool calls | inside `<tool_call>` the model can only write a known tool and arguments that match its schema, so a call always parses; the fixed parts of a call are appended in one pass without sampling (jump-forward), speculation checks its drafts against the constraint, and the token mask is computed with a byte trie and memoized (a 32-token call: 254 → 149 ms on an M1 Pro with jump-forward; the mask 60–170 µs per token where it was 190–510 µs; `engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks`) | [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward) |
 | Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
@@ -221,7 +222,10 @@ repository by its launcher).
   low-disk conversion. Downloads and loads run as background jobs with progress and cancel. Several models can be
   loaded at once; the `model` field of an API request picks one (with a single model loaded any name works). Loaded
   models show their settings, requests and speed and can be unloaded (running requests are cancelled first). Models
-  on disk can be loaded again or deleted.
+  on disk can be loaded again or deleted: *On disk* lists `model.dir` and the folders of `jllm.web.model-dirs`
+  (default `../models`, so a console started from `jllm-web/` also shows the repository's `models/` folder that
+  `./jllm` uses), grouped by folder. A model is loaded from the folder it is in, and a checkpoint whose quantized
+  cache is there loads from the cache without contacting the Hub, even after its shards were deleted (`model.low-disk`).
 - **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
   from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
   `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and
@@ -348,6 +352,7 @@ run in the small C library `libjllm_cpu` when it is found and passes its self-ch
 AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
 `scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 
@@ -425,7 +430,7 @@ sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   
 REAL_PYTHON=<venv>/bin/python scripts/real-weights-check.sh Qwen/Qwen2.5-0.5B-Instruct   # engine vs transformers on real weights (docs/14.13)
 ```
 
-`mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
+`mvn test` also runs `ToolCallTest` (constrained tool calls, jump-forward and speculation under the constraint, on a scripted model and on Qwen3-0.6B) and `ConstraintBench` in its quick mode (the token masks against a brute-force oracle); `scripts/tool-call-check.sh` checks on the CPU and on Metal that the constrained greedy output is the same with speculation off, prompt lookup and draft models ([docs/17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)). `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
 against a fake backend (settings validation, bad requests, keep-alive, slow, stalled and disconnected clients). Two more checks are run by hand:
 
 ```sh

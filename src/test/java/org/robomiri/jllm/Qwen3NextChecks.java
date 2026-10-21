@@ -239,10 +239,6 @@ public final class Qwen3NextChecks {
         int[] next = {PROMPT[3], PROMPT[5]};
         int bad = 0;
         for (KvDtype dt : KvDtype.values()) {
-            if (cpu != null && dt == KvDtype.Q8) { // the Metal backend (cpu != null marks its run) has no q8 cache
-                System.out.println("  " + label + " state, kv q8: not supported on Metal (the constructor refuses it)");
-                continue;
-            }
             float[] want = new float[vocab];
             float[] got = new float[vocab];
             try (Backend a = f.open(w, 64, 16, dt); Backend b = f.open(w, 64, 16, dt); Backend c = f.open(w, 64, 16, dt)) {
@@ -266,15 +262,21 @@ public final class Qwen3NextChecks {
                 boolean crossOk = true;
                 if (cpu != null) {
                     try (Backend k = cpu.open(w, 64, 16, dt)) {
-                        k.forward(PROMPT, 0, n, 0, null);
-                        var cb = new ByteArrayOutputStream();
-                        k.saveState(n, Channels.newChannel(cb));
-                        boolean same = k.stateFormat().equals(b.stateFormat()) && cb.size() == bytes.size();
-                        b.loadState(n, Channels.newChannel(new ByteArrayInputStream(cb.toByteArray())));
-                        b.forward(next, 0, 2, n, got);
-                        float d = maxDiff(want, got) / maxAbs(want);
-                        crossOk = same && d <= 1e-3f;
-                        cross = String.format(", cpu file in metal %s (%.1e)", crossOk ? "ok" : "MISMATCH", d);
+                        if (!k.stateFormat().equals(b.stateFormat())) {
+                            // Metal keeps a q8 request in f16; the engine loads a file only into the same format
+                            cross = ", cpu file not loaded (format " + k.stateFormat() + " vs " + b.stateFormat() + ")";
+                            crossOk = dt == KvDtype.Q8;
+                        } else {
+                            k.forward(PROMPT, 0, n, 0, null);
+                            var cb = new ByteArrayOutputStream();
+                            k.saveState(n, Channels.newChannel(cb));
+                            boolean same = k.stateFormat().equals(b.stateFormat()) && cb.size() == bytes.size();
+                            b.loadState(n, Channels.newChannel(new ByteArrayInputStream(cb.toByteArray())));
+                            b.forward(next, 0, 2, n, got);
+                            float d = maxDiff(want, got) / maxAbs(want);
+                            crossOk = same && d <= 1e-3f;
+                            cross = String.format(", cpu file in metal %s (%.1e)", crossOk ? "ok" : "MISMATCH", d);
+                        }
                     }
                 }
                 boolean ok = loaded && copied && refused && crossOk;

@@ -177,6 +177,19 @@ public final class ChatSupport {
     }
 
     /**
+     * With {@code engine.constrained-tools} off, {@code response_format} cannot be combined with {@code tools}: the
+     * JSON constraint would keep the model from calling them (the constrained path lets the reply be either).
+     */
+    public static void checkFormatWithoutToolConstraint(Map<String, Object> b) {
+        Map<String, Object> format = Json.map(b, "response_format");
+        if (b.get("tools") instanceof List<?> l && !l.isEmpty() && !"none".equals(b.get("tool_choice")) && format != null
+                && !"text".equals(Json.str(format, "type", "text"))) {
+            throw RequestError.invalid("'response_format' cannot be combined with 'tools': the JSON constraint would"
+                    + " keep the model from calling them (engine.constrained-tools=false)");
+        }
+    }
+
+    /**
      * Rejects request features the engine cannot honour rather than silently ignoring them, and checks the tool
      * fields. The other OpenAI extras ({@code n}, {@code logprobs}, {@code response_format}, ...) are validated by
      * {@code OpenAiFeatures.parse}.
