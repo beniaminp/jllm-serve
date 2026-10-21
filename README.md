@@ -9,7 +9,8 @@ Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
 **DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting) and **Mamba** (`mamba`).
-Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32 or f16.
+Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
+q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
 conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
 place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)). Apple **MLX** quantized checkpoints
@@ -24,7 +25,7 @@ dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md
 | Typed model description (`Architecture`, `LayerSpec`, `RopeTable`, one parser per family) | `model/Architecture.java`, `model/Families.java`, ... | yes |
 | Q4_0 / Q8_0 / Q2_K block quantization + versioned, mmap'd quantized cache file, shard-by-shard resumable conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
 | GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q8_0, Q4_K, Q5_K; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `tokenizer/GgufTokenizer.java` | yes |
-| Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16 KV cache) | `cpu/` | yes |
+| Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16/q8 KV cache) | `cpu/` | yes |
 | Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
 | JSON parser/writer | `json/Json.java` | yes |
@@ -47,6 +48,12 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
 | Hot experts on the GPU, cold on the CPU | an MoE model too big for the GPU's memory budget leaves its rarely used experts (learned from your own usage) on the CPU, which computes them alongside the GPU, instead of paging | [08 §8.18](docs/08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe) |
+| Tokenizing only what is new | a coding agent resends its whole conversation every turn; the rendered prompt's ids are cached, so only the new messages are tokenized (15.6 ms → 0.5 ms for a 100k-character, 50-turn conversation), with exactly the ids of a full tokenization | [17 §17.5](docs/17-agent-speedups.md#175-tokenizing-only-what-is-new) |
+| Stopping for a client that left | an agent that cancels a request frees its slot within one prefill chunk or one token, streaming or not, instead of generating to the end | [17 §17.6](docs/17-agent-speedups.md#176-noticing-a-client-that-left) |
+| Saving in the background, restoring part | a conversation is saved while the next turn already runs (the engine is held 0.3 ms instead of 3 s), and a saved file restores just the prefix a new prompt shares with it | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
+| q8 KV cache | `backend.kv-dtype=q8`: int8 keys and values with one scale per row of a kv head, half of f16 (59 KB vs 115 KB per token for Qwen3-0.6B), on both backends, files interchangeable | [07](docs/07-cpu-backend.md#q8-int8-values-and-a-scale-per-row-kvcacheq8), [08](docs/08-metal-backend.md#q8) |
+| int8 or float, measured | `backend.cpu.int8-activations=auto` times one token's matmuls both ways at load and keeps the faster (int8 on ARM, often float on AVX-512) | [07 §7.10.1](docs/07-cpu-backend.md#7101-auto-measure-dont-guess) |
+| Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
 The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
