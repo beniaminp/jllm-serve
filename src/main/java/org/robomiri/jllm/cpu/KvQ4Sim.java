@@ -15,6 +15,7 @@ public final class KvQ4Sim extends KvCache {
     static final int BITS = Integer.getInteger("q4.bits", 4);
     static final boolean QK = Boolean.parseBoolean(System.getProperty("q4.qk", "true"));
     static final boolean QV = Boolean.parseBoolean(System.getProperty("q4.qv", "true"));
+    static final int SINK = Integer.getInteger("q4.sink", 0);
     static final boolean SYMH = Boolean.getBoolean("q4.symh");
     /** 8 = q8-style per-row (headDim) symmetric int8, for cross-checking. */
 
@@ -157,6 +158,9 @@ public final class KvQ4Sim extends KvCache {
         float[] k0 = kq.clone();
         float[] v0 = vq.clone();
         for (int r = 0; r < n * kvHeads; r++) {
+            if (pos + r / kvHeads < SINK) {
+                continue; // an attention sink position stays exact
+            }
             if (QK) {
                 qdq(kq, r * headDim, headDim, ASYM_K);
             }

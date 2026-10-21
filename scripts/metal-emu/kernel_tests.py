@@ -896,15 +896,16 @@ flash_q4(64, softcap=5.0, recent=40)
 flash_q4(256, ntok=33)
 
 
-def split_q4(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, recent=64, lost=()):
-    """Flash decoding (attention_split_q4 + attention_combine) of one token over a q4 cache with a ring."""
+def split_q4(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, recent=64, lost=(), derive_chunk=False):
+    """Flash decoding (attention_split_q4 + attention_combine) of one token over a q4 cache with a ring. With derive_chunk
+    the chunk parameter is 0 and the kernel derives ceil(keys / nSplit) itself (what decode replay relies on)."""
     cap = recent + 8 if recent > 0 else 0
     kc, vc, kr, vr, tags, kd, vd, krf, vrf = q4_cache(ctx, n_kv, hd, recent, cap, pos0, lost, seed=11)
     rng = np.random.default_rng(12)
     q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
     stride = n_kv * hd // 2 + n_kv * hd // 16
     keys = pos0 + 1
-    chunk = (keys + n_split - 1) // n_split
+    chunk = 0 if derive_chunk else (keys + n_split - 1) // n_split
     part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
     scores = np.zeros(n_heads * ctx, np.float32)
     out = np.zeros((1, n_heads * hd), np.float32)
@@ -916,13 +917,15 @@ def split_q4(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, recent=64, los
     E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
     ref = attention_ref_q4(q, kd, vd, krf, vrf, tags, cap, recent, n_heads, n_kv, hd, pos0, 1, scale)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, 'attention_split_q4 hd=%d, %d splits, recent=%d lost=%s: max err %.2e'
-          % (hd, n_split, recent, list(lost), err))
+    check(err < 1e-4, 'attention_split_q4 hd=%d, %d splits, recent=%d lost=%s derive_chunk=%s: max err %.2e'
+          % (hd, n_split, recent, list(lost), derive_chunk, err))
 
 
 split_q4(128)
 split_q4(128, lost=(290,))
 split_q4(64, recent=0)
+split_q4(128, derive_chunk=True)
+split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
 sys.exit(1 if failures else 0)
