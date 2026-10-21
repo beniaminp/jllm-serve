@@ -17,8 +17,8 @@ import java.util.function.IntPredicate;
 import java.util.function.UnaryOperator;
 
 /**
- * BPE tokenizer that reads a Hugging Face {@code tokenizer.json}. Two flavours of the same model type are
- * supported:
+ * Tokenizer that reads a Hugging Face {@code tokenizer.json}. The model families the engine runs all use BPE, in
+ * two flavours:
  *
  * <ul>
  *   <li><b>byte-level</b> (GPT-2 / Qwen / Llama 3 / Phi-4 / GLM / DeepSeek / GPT-NeoX): split on added tokens,
@@ -28,23 +28,30 @@ import java.util.function.UnaryOperator;
  *       {@code <0xXX>} byte tokens, apply merges by rank.</li>
  * </ul>
  *
+ * <p>Two more model types are read so that other tokenizers load too (encoders, embedding models):
+ * <b>Unigram</b> (SentencePiece unigram: T5, ALBERT, XLM-R; Viterbi segmentation, see {@link Unigram}, usually
+ * with the {@code Precompiled} normalizer) and <b>WordPiece</b> (BERT: greedy longest-match-first with
+ * {@code ##} continuations, {@code BertNormalizer}, {@code BertPreTokenizer}, {@code WordPiece} decoder). A BPE
+ * {@code dropout} is ignored with a note on stderr: the reference applies it at encode time, which makes the ids
+ * random; it is a training-time regularization and inference encodes deterministically (dropout 0).
+ *
  * <p>The normalizer, pre-tokenizer, added-token (lstrip / rstrip) and post-processor (BOS) constructs found in
  * the tokenizers of the common model families are interpreted from the JSON; unknown constructs fail loudly
  * ({@link IllegalArgumentException}) rather than silently tokenizing differently. Not supported:
  *
  * <ul>
- *   <li>models other than {@code BPE} (Unigram, WordPiece, WordLevel);</li>
- *   <li>BPE options {@code continuing_subword_prefix}, {@code end_of_word_suffix} (WordPiece-style affixes) and
- *       {@code dropout};</li>
+ *   <li>the {@code WordLevel} model;</li>
+ *   <li>BPE options {@code continuing_subword_prefix}, {@code end_of_word_suffix} (BPE with WordPiece-style
+ *       affixes);</li>
  *   <li>normalizers other than {@code Sequence}, {@code NFC/NFD/NFKC/NFKD}, {@code Lowercase}, {@code Prepend},
- *       {@code Strip}, {@code Replace} (in particular {@code Precompiled} SentencePiece blobs and
- *       {@code BertNormalizer});</li>
+ *       {@code Strip}, {@code Replace}, {@code StripAccents}, {@code Nmt}, {@code Precompiled},
+ *       {@code BertNormalizer};</li>
  *   <li>pre-tokenizers other than {@code Sequence}, {@code Split}, {@code ByteLevel}, {@code Metaspace},
- *       {@code Digits}, {@code WhitespaceSplit}, {@code Whitespace} ({@code BertPreTokenizer}, {@code Punctuation},
- *       {@code UnicodeScripts}, {@code CharDelimiterSplit});</li>
+ *       {@code Digits}, {@code WhitespaceSplit}, {@code Whitespace}, {@code BertPreTokenizer},
+ *       {@code Punctuation} ({@code UnicodeScripts}, {@code CharDelimiterSplit});</li>
  *   <li>decoders other than {@code ByteLevel}, {@code ByteFallback}, {@code Fuse}, {@code Metaspace},
- *       {@code Replace} of {@code ▁} by a space and {@code Strip} of leading spaces after a {@code Fuse}
- *       ({@code WordPiece}, {@code BPEDecoder}, {@code CTC}, other {@code Replace} / {@code Strip} forms);</li>
+ *       {@code Replace} of {@code ▁} by a space, {@code Strip} of leading spaces after a {@code Fuse} and a lone
+ *       {@code WordPiece} ({@code BPEDecoder}, {@code CTC}, other {@code Replace} / {@code Strip} forms);</li>
  *   <li>post-processors other than {@code TemplateProcessing} and {@code ByteLevel} ({@code RobertaProcessing},
  *       {@code BertProcessing}); of a template only a leading BOS is read, {@code encode} never adds it;</li>
  *   <li>added tokens with {@code single_word}; the {@code normalized} flag (all added tokens are matched on
@@ -102,48 +109,94 @@ public final class Tokenizer {
     private final int[] byteCharIds = new int[256];
     private final Map<String, int[]> cache = new ConcurrentHashMap<>();
 
+    /** The {@code model.type}: the algorithm that turns one pre-tokenized piece into ids. */
+    private enum ModelType { BPE, UNIGRAM, WORDPIECE }
+
+    /**
+     * How the decoder glues tokens when the first token is treated differently from the others: not at all
+     * (byte concatenation), the {@code WordPiece} decoder (a {@code ##} piece is glued to the previous token,
+     * any other token gets a space in front), or no decoder at all for a Unigram / WordPiece model (the
+     * reference then joins the token strings with spaces).
+     */
+    private enum Join { NONE, WORDPIECE, SPACE }
+
+    private final ModelType modelType;
+    /** The unigram lattice, or null for other models. */
+    private final Unigram unigram;
+    /** WordPiece: {@code continuing_subword_prefix} and {@code max_input_chars_per_word}. */
+    private final String wpPrefix;
+    private final int wpMaxChars;
+    private final Join join;
+    /** The WordPiece decoder's {@code prefix} and {@code cleanup}. */
+    private final String decodePrefix;
+    private final boolean decodeCleanup;
+
     private Tokenizer(Map<String, Object> json, Map<String, Object> config) {
         initByteMapping();
         Map<String, Object> model = Json.map(json, "model");
         if (model == null) {
             throw new IllegalArgumentException("tokenizer.json has no \"model\" object");
         }
-        if (!"BPE".equals(Json.str(model, "type", "BPE"))) {
-            throw new IllegalArgumentException("only BPE tokenizers are supported, got model.type="
-                    + Json.str(model, "type", null));
-        }
+        modelType = modelType(model);
         ignoreMerges = Json.bool(model, "ignore_merges", false);
         byteFallback = Json.bool(model, "byte_fallback", false);
         fuseUnk = Json.bool(model, "fuse_unk", false);
-        for (String flag : new String[]{"continuing_subword_prefix", "end_of_word_suffix"}) {
-            String v = Json.str(model, flag, "");
-            if (!v.isEmpty()) {
-                throw new IllegalArgumentException("unsupported BPE model option " + flag + "=" + Json.write(v)
-                        + " (WordPiece-style affixes are not implemented)");
+        if (modelType == ModelType.BPE) {
+            for (String flag : new String[]{"continuing_subword_prefix", "end_of_word_suffix"}) {
+                String v = Json.str(model, flag, "");
+                if (!v.isEmpty()) {
+                    throw new IllegalArgumentException("unsupported BPE model option " + flag + "=" + Json.write(v)
+                            + " (BPE with WordPiece-style affixes is not implemented)");
+                }
+            }
+            // The reference skips each merge with this probability at encode time, which makes the ids random;
+            // that is a training-time regularization, so inference encodes deterministically (dropout 0).
+            if (model.get("dropout") instanceof Number d && d.doubleValue() != 0) {
+                System.err.println("tokenizer: ignoring BPE dropout=" + d + " (encoding is deterministic)");
             }
         }
-        if (model.get("dropout") instanceof Number d && d.doubleValue() != 0) {
-            throw new IllegalArgumentException("unsupported BPE model option dropout=" + d
-                    + " (stochastic merges are not implemented)");
-        }
+        wpPrefix = Json.str(model, "continuing_subword_prefix", "##");
+        wpMaxChars = (int) Json.num(model, "max_input_chars_per_word", 100);
 
-        Map<String, Object> v = Json.map(model, "vocab");
-        if (v == null) {
-            throw new IllegalArgumentException("tokenizer.json model has no \"vocab\" object");
-        }
-        vocab = new HashMap<>(v.size() * 2);
+        vocab = new HashMap<>();
         int maxId = -1;
-        for (Map.Entry<String, Object> e : v.entrySet()) {
-            if (!(e.getValue() instanceof Number n) || n.longValue() < 0 || n.longValue() > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("vocab entry " + Json.write(e.getKey()) + " has invalid id "
-                        + e.getValue());
+        String[] pieces = null;
+        double[] scores = null;
+        if (modelType == ModelType.UNIGRAM) {
+            List<Object> v = Json.list(model, "vocab");
+            if (v == null) {
+                throw new IllegalArgumentException("tokenizer.json Unigram model has no \"vocab\" list");
             }
-            int id = n.intValue();
-            vocab.put(e.getKey(), id);
-            maxId = Math.max(maxId, id);
+            pieces = new String[v.size()];
+            scores = new double[v.size()];
+            for (int id = 0; id < pieces.length; id++) {
+                if (!(v.get(id) instanceof List<?> pair) || pair.size() != 2 || !(pair.get(0) instanceof String p)
+                        || !(pair.get(1) instanceof Number score)) {
+                    throw new IllegalArgumentException("Unigram vocab entry #" + id + " " + Json.write(v.get(id))
+                            + " is not [piece, score]");
+                }
+                pieces[id] = p;
+                scores[id] = score.doubleValue();
+                vocab.put(p, id); // a duplicate piece resolves to its last id, like the reference
+            }
+            maxId = pieces.length - 1;
+        } else {
+            Map<String, Object> v = Json.map(model, "vocab");
+            if (v == null) {
+                throw new IllegalArgumentException("tokenizer.json model has no \"vocab\" object");
+            }
+            for (Map.Entry<String, Object> e : v.entrySet()) {
+                if (!(e.getValue() instanceof Number n) || n.longValue() < 0 || n.longValue() > Integer.MAX_VALUE) {
+                    throw new IllegalArgumentException("vocab entry " + Json.write(e.getKey()) + " has invalid id "
+                            + e.getValue());
+                }
+                int id = n.intValue();
+                vocab.put(e.getKey(), id);
+                maxId = Math.max(maxId, id);
+            }
         }
 
-        List<Object> mergeList = Json.list(model, "merges");
+        List<Object> mergeList = modelType == ModelType.BPE ? Json.list(model, "merges") : null;
         merges = new LongLongMap(mergeList == null ? 16 : mergeList.size());
         if (mergeList != null) {
             int rank = 0;
@@ -209,13 +262,23 @@ public final class Tokenizer {
         boolean spSignal = pre.metaspace || byteFallback || containsType(decoderNode, "Replace")
                 || containsType(decoderNode, "Metaspace") || containsType(decoderNode, "ByteFallback")
                 || containsType(normalizerNode, "Replace") || containsType(normalizerNode, "Prepend");
-        byteLevel = pre.byteLevel || !spSignal; // tokenizers with no hints at all keep the historical byte-level default
+        // tokenizers with no hints at all keep the historical byte-level default; Unigram / WordPiece never are
+        byteLevel = modelType == ModelType.BPE && (pre.byteLevel || !spSignal);
         if (byteLevel && preNode == null) { // no pre-tokenizer at all: the historical default, Qwen's regex
             pre = PreTokenizers.build(Json.obj("type", "Split", "pattern", Json.obj("Regex", DEFAULT_SPLIT),
                     "behavior", "Isolated"));
         }
         preTokenizer = pre;
-        validateDecoder(decoderNode, false);
+        if ("WordPiece".equals(Json.str(decoderNode, "type", null))) {
+            join = Join.WORDPIECE;
+            decodePrefix = Json.str(decoderNode, "prefix", "##");
+            decodeCleanup = Json.bool(decoderNode, "cleanup", true);
+        } else {
+            validateDecoder(decoderNode, false);
+            join = decoderNode == null && modelType != ModelType.BPE ? Join.SPACE : Join.NONE;
+            decodePrefix = "";
+            decodeCleanup = false;
+        }
         validatePostProcessor(Json.map(json, "post_processor"));
         stripOnDecode = decodeStrip(decoderNode);
         metaspaceDecoder = metaspacePrefixDecoder(decoderNode);
@@ -225,12 +288,13 @@ public final class Tokenizer {
         idToString = new String[maxId + 1];
         for (Map.Entry<String, Integer> e : vocab.entrySet()) {
             idToString[e.getValue()] = e.getKey();
-            idToBytes[e.getValue()] = byteLevel ? decodeByteLevel(e.getKey()) : decodeSentencePiece(e.getKey());
+            idToBytes[e.getValue()] = join != Join.NONE ? joinedBytes(e.getKey(), false)
+                    : byteLevel ? decodeByteLevel(e.getKey()) : decodeSentencePiece(e.getKey());
         }
         for (Map.Entry<String, Integer> e : addedTokens.entrySet()) {
             idToString[e.getValue()] = e.getKey();
-            idToBytes[e.getValue()] = byteLevel ? e.getKey().getBytes(StandardCharsets.UTF_8)
-                    : decodeSentencePiece(e.getKey());
+            idToBytes[e.getValue()] = join != Join.NONE ? joinedBytes(e.getKey(), false)
+                    : byteLevel ? e.getKey().getBytes(StandardCharsets.UTF_8) : decodeSentencePiece(e.getKey());
         }
         if (byteLevel) {
             // Some vocabularies (GPT-NeoX) lack the symbols of bytes that never occur in UTF-8 (0xC0, 0xF5..);
@@ -257,12 +321,22 @@ public final class Tokenizer {
 
         // the model's unk_token (Mistral, Gemma, Phi-3) or, when the model names none, the one of
         // tokenizer_config.json (Mamba / GPT-NeoX: <|endoftext|>)
-        String unkToken = Json.str(model, "unk_token", null);
-        if (unkToken == null && config != null) {
-            unkToken = specialName(config.get("unk_token"));
+        if (modelType == ModelType.UNIGRAM) { // Unigram names it by id
+            long u = model.get("unk_id") instanceof Number n ? n.longValue() : -1;
+            if (u >= pieces.length) {
+                throw new IllegalArgumentException("Unigram unk_id " + u + " is outside the vocabulary");
+            }
+            unkId = (int) u;
+            unigram = new Unigram(pieces, scores, vocab, unkId);
+        } else {
+            String unkToken = Json.str(model, "unk_token", null);
+            if (unkToken == null && config != null) {
+                unkToken = specialName(config.get("unk_token"));
+            }
+            Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
+            unkId = unk == null ? -1 : unk;
+            unigram = null;
         }
-        Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
-        unkId = unk == null ? -1 : unk;
 
         // Leftmost-longest matching, so e.g. "<|im_start|>" wins over any shorter overlapping token.
         addedTrie = AddedTokenTrie.build(addedTokens);
@@ -284,7 +358,7 @@ public final class Tokenizer {
         return fromJson(Files.readString(tokenizerJson), Files.isRegularFile(cfg) ? Files.readString(cfg) : null);
     }
 
-    /** @throws IllegalArgumentException if the text is not a well-formed BPE tokenizer.json */
+    /** @throws IllegalArgumentException if the text is not a well-formed, supported tokenizer.json */
     public static Tokenizer fromJson(String tokenizerJson) {
         return fromJson(tokenizerJson, null);
     }
@@ -483,7 +557,13 @@ public final class Tokenizer {
      * {@code decode(["▁▁a", "▁b"])} is {@code "a b"}. Elsewhere identical to {@link #tokenBytes(int)}.
      */
     public byte[] tokenBytes(int id, boolean first) {
-        if (!first || !metaspaceDecoder || id < 0 || id >= idToString.length || idToString[id] == null) {
+        if (!first || id < 0 || id >= idToString.length || idToString[id] == null) {
+            return tokenBytes(id);
+        }
+        if (join != Join.NONE) {
+            return joinedBytes(idToString[id], true);
+        }
+        if (!metaspaceDecoder) {
             return tokenBytes(id);
         }
         return decodeSentencePiece(idToString[id].replace("▁", ""));
@@ -595,14 +675,19 @@ public final class Tokenizer {
             text = normalizer.apply(text);
         }
         for (String piece : preTokenizer.apply(text, first)) {
-            bpe(piece, out);
+            model(piece, out);
         }
     }
 
-    private void bpe(String piece, IntList out) {
+    /** One pre-tokenized piece through the model (BPE merges, unigram Viterbi or WordPiece), memoized. */
+    private void model(String piece, IntList out) {
         int[] cached = cache.get(piece);
         if (cached == null) {
-            cached = byteLevel ? bpeUncached(piece) : bpeCharsUncached(piece);
+            cached = switch (modelType) {
+                case BPE -> byteLevel ? bpeUncached(piece) : bpeCharsUncached(piece);
+                case UNIGRAM -> unigram.encode(piece, vocab, byteFallback, byteTokenIds);
+                case WORDPIECE -> wordPiece(piece);
+            };
             // Only short chunks are worth remembering (words, punctuation, short runs); long runs would let a
             // single request fill the cache with megabytes per entry.
             if (piece.length() <= CACHE_MAX_PIECE_BYTES && cache.size() < CACHE_LIMIT
@@ -678,6 +763,85 @@ public final class Tokenizer {
         }
         int[] sym = syms.toArray();
         return mergeSymbols(sym, sym.length);
+    }
+
+    /**
+     * WordPiece, greedy longest-match-first: from the current position take the longest vocabulary entry that
+     * matches (written with the {@code continuing_subword_prefix} unless it starts the word), continue after it.
+     * A word with more than {@code max_input_chars_per_word} characters, or with a position where nothing
+     * matches, becomes a single unknown token as a whole.
+     */
+    private int[] wordPiece(String word) {
+        int n = word.length();
+        int[] unk = unkId >= 0 ? new int[]{unkId} : new int[0];
+        if (word.codePointCount(0, n) > wpMaxChars) {
+            return unk;
+        }
+        IntList out = new IntList(4);
+        int start = 0;
+        while (start < n) {
+            int end = n;
+            int found = -1;
+            while (start < end) {
+                String sub = word.substring(start, end);
+                Integer id = vocab.get(start > 0 ? wpPrefix + sub : sub);
+                if (id != null) {
+                    found = id;
+                    break;
+                }
+                end -= Character.charCount(word.codePointBefore(end));
+            }
+            if (found < 0) {
+                return unk;
+            }
+            out.add(found);
+            start = end;
+        }
+        return out.toArray();
+    }
+
+    /**
+     * Decoded bytes of a token under a {@link Join} decoder. WordPiece: a token other than the first loses its
+     * {@code ##} prefix, or gets a space in front when it has none; with {@code cleanup} the reference's
+     * per-token clean-up of spaces before punctuation and English contractions follows. No decoder: the tokens
+     * are joined with spaces.
+     */
+    private byte[] joinedBytes(String token, boolean first) {
+        String s = token;
+        if (join == Join.SPACE) {
+            s = first ? s : " " + s;
+        } else if (join == Join.WORDPIECE) {
+            if (!first) {
+                s = !decodePrefix.isEmpty() && s.startsWith(decodePrefix) ? s.substring(decodePrefix.length()) : " " + s;
+            }
+            if (decodeCleanup) {
+                s = s.replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",")
+                        .replace(" ' ", "'").replace(" n't", "n't").replace(" 'm", "'m").replace(" do not", " don't")
+                        .replace(" 's", "'s").replace(" 've", "'ve").replace(" 're", "'re");
+            }
+        }
+        return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static ModelType modelType(Map<String, Object> model) {
+        String type = Json.str(model, "type", null);
+        if (type == null) { // older files omit the tag; the reference then recognizes the model by its fields
+            if (model.get("vocab") instanceof List<?>) {
+                type = "Unigram";
+            } else if (!model.containsKey("merges")
+                    && (model.containsKey("continuing_subword_prefix") || model.containsKey("max_input_chars_per_word"))) {
+                type = "WordPiece";
+            } else {
+                type = "BPE";
+            }
+        }
+        return switch (type) {
+            case "BPE" -> ModelType.BPE;
+            case "Unigram" -> ModelType.UNIGRAM;
+            case "WordPiece" -> ModelType.WORDPIECE;
+            default -> throw new IllegalArgumentException("unsupported model.type=" + type
+                    + " (supported: BPE, Unigram, WordPiece)");
+        };
     }
 
     private int[] mergeSymbols(int[] sym, int n) {

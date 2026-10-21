@@ -93,7 +93,8 @@ public final class GgufModel implements AutoCloseable {
                 (int) file.num("tokenizer.ggml.bos_token_id", -1), (int) file.num("tokenizer.ggml.eos_token_id", -1),
                 (int) file.num("tokenizer.ggml.unknown_token_id", -1),
                 file.get("tokenizer.ggml.add_bos_token") instanceof Boolean b ? b : null,
-                file.bool("tokenizer.ggml.add_space_prefix", true));
+                file.bool("tokenizer.ggml.add_space_prefix", true), bytes(file.longs("tokenizer.ggml.precompiled_charsmap")),
+                file.bool("tokenizer.ggml.remove_extra_whitespaces", false));
         try {
             return GgufTokenizer.build(spec);
         } catch (GgufTokenizer.UnsupportedPreTokenizer e) {
@@ -101,6 +102,18 @@ public final class GgufModel implements AutoCloseable {
         } catch (IllegalArgumentException e) {
             throw new IOException("cannot build the tokenizer of the GGUF file: " + e.getMessage(), e);
         }
+    }
+
+    /** An integer array (u8 or i8 elements) as bytes, or null. */
+    private static byte[] bytes(long[] a) {
+        if (a == null) {
+            return null;
+        }
+        byte[] b = new byte[a.length];
+        for (int i = 0; i < a.length; i++) {
+            b[i] = (byte) a[i];
+        }
+        return b;
     }
 
     /**
