@@ -68,53 +68,98 @@ final class CpuMatmul {
      * Whether single-token matmuls of {@code w} run faster with int8 activations than with float ones on this machine
      * ({@code backend.cpu.int8-activations=auto}). Integer dot products win where the CPU multiplies bytes cheaply
      * (ARM NEON's {@code sdot}, AVX-VNNI); on AVX-512 without them the float kernels can be faster, as the weights are
-     * streamed either way and the int8 path adds the activation's quantization. Times one representative tensor (the
-     * first layer's attention output projection, else the LM head) both ways on {@code threads} threads and keeps
-     * the faster; a type the int8 kernels do not cover gives false.
+     * streamed either way and the int8 path adds the activation's quantization. Times one token's single-token
+     * matmuls both ways on {@code threads} threads (every tensor of the first decoder layer, weighted by the layer
+     * count, plus the LM head) and keeps the faster; a model with no type the int8 kernels cover gives false.
      */
     static boolean int8Faster(ModelWeights w, int threads) {
         Boolean known = PROBED.get(w);
         if (known != null) {
             return known;
         }
-        QTensor t = w.lmHead;
+        // one token's matmuls: the first decoder layer's tensors (times the layer count) and the LM head
+        java.util.List<QTensor> layer = new java.util.ArrayList<>();
         for (LayerWeights L : w.layers) {
-            if (L instanceof org.robomiri.jllm.model.DecoderLayer d && d.wo() != null) {
-                t = d.wo();
+            if (L instanceof org.robomiri.jllm.model.DecoderLayer d) {
+                collect(d, layer, 0);
                 break;
             }
         }
         boolean faster = false;
+        int maxCols = w.lmHead.cols;
+        for (QTensor t : layer) {
+            maxCols = Math.max(maxCols, t.cols);
+        }
         try (ThreadPool pool = new ThreadPool(threads)) {
-            CpuMatmul i8 = new CpuMatmul(pool, true, false, 4 * t.cols);
-            CpuMatmul f32 = new CpuMatmul(pool, false, false, 4 * t.cols);
-            if (i8.useInt8(t)) {
-                float[] in = new float[t.cols];
-                java.util.Random r = new java.util.Random(1);
-                for (int i = 0; i < in.length; i++) {
-                    in[i] = (float) r.nextGaussian();
-                }
-                float[] out = new float[t.rows];
-                long best8 = Long.MAX_VALUE;
-                long bestF = Long.MAX_VALUE;
-                for (int round = 0; round < 24; round++) { // alternating, so both see the same clocks and caches
-                    long a = System.nanoTime();
-                    i8.mul(t, in, out, 0, 1, false);
-                    long b = System.nanoTime();
-                    f32.mul(t, in, out, 0, 1, false);
-                    long c = System.nanoTime();
-                    if (round >= 4) { // the first rounds warm up the JIT
-                        best8 = Math.min(best8, b - a);
-                        bestF = Math.min(bestF, c - b);
-                    }
-                }
-                faster = best8 < bestF;
-                System.err.printf("int8 activations: auto -> %s (%s %dx%d: int8 %.0f us, float %.0f us)%n",
-                        faster ? "on" : "off", t.type, t.rows, t.cols, best8 / 1e3, bestF / 1e3);
+            CpuMatmul i8 = new CpuMatmul(pool, true, false, 4 * maxCols);
+            CpuMatmul f32 = new CpuMatmul(pool, false, false, 4 * maxCols);
+            double t8 = 0;
+            double tf = 0;
+            boolean any = false;
+            int layers = w.layers.length;
+            java.util.List<QTensor> all = new java.util.ArrayList<>(layer);
+            all.add(w.lmHead);
+            for (int k = 0; k < all.size(); k++) {
+                QTensor t = all.get(k);
+                double weight = k < layer.size() ? layers : 1;
+                any |= i8.useInt8(t);
+                long[] best = time(i8, f32, t);
+                t8 += weight * best[0];
+                tf += weight * best[1];
+            }
+            if (any) {
+                faster = t8 < tf;
+                System.err.printf("int8 activations: auto -> %s (one token's matmuls: int8 %.1f ms, float %.1f ms)%n",
+                        faster ? "on" : "off", t8 / 1e6, tf / 1e6);
             }
         }
         PROBED.put(w, faster);
         return faster;
+    }
+
+    /** Best of 12 alternating runs (after 4 warm-up rounds) of a single-token {@code t} matmul each way, in ns. */
+    private static long[] time(CpuMatmul i8, CpuMatmul f32, QTensor t) {
+        float[] in = new float[t.cols];
+        java.util.Random r = new java.util.Random(1);
+        for (int i = 0; i < in.length; i++) {
+            in[i] = (float) r.nextGaussian();
+        }
+        float[] out = new float[t.rows];
+        long best8 = Long.MAX_VALUE;
+        long bestF = Long.MAX_VALUE;
+        for (int round = 0; round < 16; round++) { // alternating, so both see the same clocks and caches
+            long a = System.nanoTime();
+            i8.mul(t, in, out, 0, 1, false);
+            long b = System.nanoTime();
+            f32.mul(t, in, out, 0, 1, false);
+            long c = System.nanoTime();
+            if (round >= 4) { // the first rounds warm up the JIT
+                best8 = Math.min(best8, b - a);
+                bestF = Math.min(bestF, c - b);
+            }
+        }
+        return new long[]{best8, bestF};
+    }
+
+    /** The quantized tensors of a layer's records (attention, MLP or experts), in declaration order. */
+    private static void collect(Object o, java.util.List<QTensor> out, int depth) {
+        if (o == null || depth > 3) {
+            return;
+        }
+        if (o instanceof QTensor q) {
+            out.add(q);
+            return;
+        }
+        if (!o.getClass().isRecord()) {
+            return;
+        }
+        for (var c : o.getClass().getRecordComponents()) {
+            try {
+                collect(c.getAccessor().invoke(o), out, depth + 1);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException(e);
+            }
+        }
     }
 
     /**
@@ -256,6 +301,20 @@ final class CpuMatmul {
             pool.forRange(rows, 16, (r0, r1) -> {
                 for (int r = r0; r < r1; r++) {
                     float v = int8Dot(wt, r, xq, xs, 0);
+                    out[outOff + r] = acc ? out[outOff + r] + v : v;
+                }
+            });
+            return;
+        }
+        if (wt.type == QType.Q8_0 && wt.second == null) {
+            // dequantize, then a float dot: C2 can fail to intrinsify dotRow's byte-to-float conversion for Q8_0 in
+            // the full engine (a 70x slower LM head on AVX-512, docs/07 §7.10.1); the dequantization kernel is unaffected
+            int cols = wt.cols;
+            pool.forRange(rows, 16, (r0, r1) -> {
+                float[] tmp = scratch.get();
+                for (int r = r0; r < r1; r++) {
+                    VectorKernels.dequantRow(wt, r, tmp, 0);
+                    float v = VectorKernels.dot(tmp, 0, in, inOff, cols);
                     out[outOff + r] = acc ? out[outOff + r] + v : v;
                 }
             });
