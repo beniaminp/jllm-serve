@@ -118,8 +118,8 @@ public final class Qwen3NextMetalBackend implements Backend {
         this.dn = arch.deltaNet();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
-        if (kvDtype == KvDtype.Q8) { // no q8 attention path for this family on Metal: its cache rows are f32 or f16
-            System.err.println("note: the Metal Qwen3-Next backend has no q8 KV cache, using f16");
+        if (kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4) { // no q8 / q4 attention path for this family on Metal: its cache rows are f32 or f16
+            System.err.println("note: the Metal Qwen3-Next backend has no " + kvDtype + " KV cache, using f16");
             kvDtype = KvDtype.F16;
         }
         this.kvHalf = kvDtype == KvDtype.F16;
