@@ -339,6 +339,9 @@ cost 60.6 dB (inaudible). The decoder runs on the CPU (21.13: ~0.08 s per second
   (WSOLA). Frames of 20 ms (Hann window) are laid down every 10 ms; frame `k` is cut from the input around `k · 10 ms · speed`, at the
   offset within ±5 ms where its beginning best continues the samples that followed the previous frame in the input (normalised
   cross-correlation), so voiced speech stays in phase. A 440 Hz tone stretched by 0.5, 1.5 and 2 stays at 440 Hz.
+* **Silence.** OuteTTS starts every utterance with about half a second of silence (the model learned to leave a lead-in) and the codec begins
+  with a small transient (an offset of ~0.007 for 40 ms: a click when played from the first sample). `audio.tts.trim-silence` (on) cuts the windows of
+  10 ms quieter than 8 % of the loudest one, keeping 0.12 s before the speech and 0.2 s after, with a 5 ms fade at the ends.
 * **Long text.** `Speech.synthesizeLong` splits at sentence ends (then at commas and spaces) into pieces of at most ~220 characters,
   generates each separately with the same voice (each starts from the speaker prompt, so the voice does not drift), and joins them with 250 ms
   of silence; `audio.tts.max-chars` (4096, OpenAI's limit) bounds the request.
@@ -362,7 +365,10 @@ curl localhost:8090/v1/audio/speech -H 'Content-Type: application/json' \
 
 `model` may be any name when one model of that kind is loaded. Form fields: `file`, `model`, `language` (code or English name; default:
 detect), `prompt` (names and jargon to prime the decoder), `response_format`, `temperature` (0 = greedy with fallback; above 0 that temperature only),
-`timestamp_granularities[]` (`word` adds `words` to the verbose JSON, at the top level and in every segment). Errors are OpenAI's
+`timestamp_granularities[]` (`word` adds `words` to the verbose JSON, at the top level and in every segment), and `stream=true`: the answer is then
+a server-sent-event stream, one `{"type":"transcript.text.segment","id","start","end","text"}` per segment as soon as its 30 s window is decoded, a
+`{"type":"transcript.progress","progress"}` after each window, a last `{"type":"transcript.text.done","text","language","duration","transcript":{…verbose_json…}}`
+and `data: [DONE]` (the console shows long recordings as they are read). Errors are OpenAI's
 `{"error": {"message", "type", "code"}}` (`model_not_found` 404 when nothing of that kind is loaded, 400 for a bad format, voice, speed,
 language, an unreadable file or audio longer than `audio.max-seconds`, 413 above `audio.max-upload-mb`). Additions of the console: `GET /api/audio/models`
 (loaded audio models with their kind, languages / voices), `GET /api/audio/voices`, and a clip store (`POST /api/audio/files`, `GET`, `DELETE
@@ -387,6 +393,7 @@ en_male_1 --out hello.wav [--speed 1.2]` do the same from a terminal and print t
 | `audio.stt-model`, `audio.tts-model` | empty | models `./jllm serve` loads at start |
 | `audio.codec-repo`, `audio.codec-file` | `ggml-org/WavTokenizer`, `WavTokenizer-Large-75-F16.gguf` | the codec |
 | `audio.tts.quant`, `audio.tts.ctx` | `q8`, `8192` | the speech language model's weights and context |
+| `audio.tts.trim-silence` | `true` | cut the silence around the generated speech |
 | `audio.tts.temperature`, `.top-k`, `.top-p`, `.repetition-penalty` | `0.1`, `40`, `0.9`, `1.1` | its sampling |
 | `audio.stt.fallback`, `audio.stt.condition-on-previous` | `true`, `true` | Whisper's decoding behaviour (21.4) |
 
