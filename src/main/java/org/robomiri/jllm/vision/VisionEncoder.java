@@ -13,8 +13,13 @@ public interface VisionEncoder extends AutoCloseable {
      * @param tokens number of image tokens
      * @param nx     tokens per row of the output grid (Qwen-VL: the merged patch grid; 0 when the tokens are not a grid)
      * @param ny     rows of the output grid
+     * @param deepstack Qwen3-VL: features from intermediate layers of the vision transformer, each {@code tokens x dim}
+     *                  like {@code embd}, which the text model adds to its hidden states after its first layers; null otherwise
      */
-    record Encoded(float[] embd, int tokens, int nx, int ny) {
+    record Encoded(float[] embd, int tokens, int nx, int ny, float[][] deepstack) {
+        public Encoded(float[] embd, int tokens, int nx, int ny) {
+            this(embd, tokens, nx, ny, null);
+        }
     }
 
     /** Short description for logs, e.g. {@code cpu} or {@code metal (Apple M1 Pro)}. */

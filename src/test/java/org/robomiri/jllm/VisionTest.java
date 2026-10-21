@@ -81,6 +81,7 @@ public final class VisionTest {
             imageParts();
             ropePositions();
             tinyModel(dir);
+            qwen3Vl(dir);
         } finally {
             try (var s = Files.list(dir)) {
                 for (Path p : s.toList()) {
@@ -433,6 +434,192 @@ public final class VisionTest {
             m = Math.max(m, Math.abs(a[i] - b[i]));
         }
         return m;
+    }
+
+
+    // ------------------------------------------------------------------ Qwen3-VL: interleaved M-RoPE and deepstack
+
+    static final int Q3_SECTIONS_T = 6, Q3_SECTIONS_H = 5, Q3_SECTIONS_W = 5;
+
+    /** A Qwen3-VL text model: qwen3 (q/k norms) with interleaved rotary sections and one deepstack layer. */
+    private static void writeText3(Path p) throws Exception {
+        Random r = new Random(15);
+        GgufWriter w = new GgufWriter().str("general.architecture", "qwen3vl").str("general.name", "tiny-q3vl");
+        String a = "qwen3vl.";
+        w.u32(a + "block_count", LAYERS).u32(a + "embedding_length", DIM).u32(a + "feed_forward_length", FF)
+                .u32(a + "attention.head_count", HEADS).u32(a + "attention.head_count_kv", KV)
+                .u32(a + "context_length", 256).f32(a + "rope.freq_base", 10000f)
+                .f32(a + "attention.layer_norm_rms_epsilon", 1e-6f).u32(a + "attention.key_length", HD)
+                .u32(a + "attention.value_length", HD).u32(a + "n_deepstack_layers", 1)
+                .i32s(a + "rope.dimension_sections", Q3_SECTIONS_T, Q3_SECTIONS_H, Q3_SECTIONS_W, 0)
+                .u32("tokenizer.ggml.bos_token_id", 256).u32("tokenizer.ggml.eos_token_id", 257);
+        mat(w, r, "token_embd.weight", VOCAB, DIM, false);
+        vec(w, r, "output_norm.weight", DIM, 1.0, 0.1);
+        for (int l = 0; l < LAYERS; l++) {
+            String b = "blk." + l + ".";
+            vec(w, r, b + "attn_norm.weight", DIM, 1.0, 0.1);
+            mat(w, r, b + "attn_q.weight", HEADS * HD, DIM, false);
+            mat(w, r, b + "attn_k.weight", KV * HD, DIM, false);
+            mat(w, r, b + "attn_v.weight", KV * HD, DIM, false);
+            vec(w, r, b + "attn_q_norm.weight", HD, 1.0, 0.1);
+            vec(w, r, b + "attn_k_norm.weight", HD, 1.0, 0.1);
+            mat(w, r, b + "attn_output.weight", DIM, HEADS * HD, false);
+            vec(w, r, b + "ffn_norm.weight", DIM, 1.0, 0.1);
+            mat(w, r, b + "ffn_gate.weight", FF, DIM, false);
+            mat(w, r, b + "ffn_up.weight", FF, DIM, false);
+            mat(w, r, b + "ffn_down.weight", DIM, FF, false);
+        }
+        w.write(p);
+    }
+
+    /**
+     * A Qwen3-VL style projector: LayerNorm ViT with fused qkv, a learned 3 x 3 position grid resized to the picture,
+     * GELU, no windows, 2 x 2 merger, and a deepstack merger after block 0; 16 x 16 pixels, 4-pixel patches.
+     */
+    private static void writeProjector3(Path p) throws Exception {
+        Random r = new Random(19);
+        GgufWriter w = new GgufWriter().str("general.architecture", "clip").bool("clip.has_vision_encoder", true)
+                .str("clip.projector_type", "qwen3vl_merger").u32("clip.vision.embedding_length", V_E)
+                .u32("clip.vision.feed_forward_length", V_FF).u32("clip.vision.block_count", V_LAYERS)
+                .u32("clip.vision.attention.head_count", V_HEADS).u32("clip.vision.projection_dim", DIM)
+                .u32("clip.vision.image_size", V_IMAGE).u32("clip.vision.patch_size", V_PATCH)
+                .f32("clip.vision.attention.layer_norm_epsilon", 1e-6f).f32s("clip.vision.image_mean", 0.5f, 0.5f, 0.5f)
+                .f32s("clip.vision.image_std", 0.5f, 0.5f, 0.5f).bool("clip.use_gelu", true)
+                .u32("clip.vision.spatial_merge_size", 2);
+        w.tensor("v.patch_embd.weight", GgmlType.F32, new long[]{V_PATCH, V_PATCH, 3, V_E}, floats(r, V_E * 3 * V_PATCH * V_PATCH, 0.2));
+        w.tensor("v.patch_embd.weight.1", GgmlType.F32, new long[]{V_PATCH, V_PATCH, 3, V_E}, floats(r, V_E * 3 * V_PATCH * V_PATCH, 0.2));
+        vec(w, r, "v.patch_embd.bias", V_E, 0, 0.1);
+        mat(w, r, "v.position_embd.weight", 9, V_E, false);
+        for (int l = 0; l < V_LAYERS; l++) {
+            String b = "v.blk." + l + ".";
+            vec(w, r, b + "ln1.weight", V_E, 1.0, 0.1);
+            vec(w, r, b + "ln1.bias", V_E, 0, 0.1);
+            vec(w, r, b + "ln2.weight", V_E, 1.0, 0.1);
+            vec(w, r, b + "ln2.bias", V_E, 0, 0.1);
+            mat(w, r, b + "attn_qkv.weight", 3 * V_E, V_E, l == 0);
+            vec(w, r, b + "attn_qkv.bias", 3 * V_E, 0, 0.1);
+            mat(w, r, b + "attn_out.weight", V_E, V_E, l == 0);
+            vec(w, r, b + "attn_out.bias", V_E, 0, 0.1);
+            mat(w, r, b + "ffn_up.weight", V_FF, V_E, l == 0);
+            vec(w, r, b + "ffn_up.bias", V_FF, 0, 0.1);
+            mat(w, r, b + "ffn_down.weight", V_E, V_FF, l == 0);
+            vec(w, r, b + "ffn_down.bias", V_E, 0, 0.1);
+        }
+        String ds = "v.deepstack.0.";
+        vec(w, r, ds + "norm.weight", 4 * V_E, 1.0, 0.1);
+        vec(w, r, ds + "norm.bias", 4 * V_E, 0, 0.1);
+        mat(w, r, ds + "fc1.weight", 4 * V_E, 4 * V_E, true);
+        vec(w, r, ds + "fc1.bias", 4 * V_E, 0, 0.1);
+        mat(w, r, ds + "fc2.weight", DIM, 4 * V_E, true);
+        vec(w, r, ds + "fc2.bias", DIM, 0, 0.1);
+        vec(w, r, "v.post_ln.weight", V_E, 1.0, 0.1);
+        vec(w, r, "v.post_ln.bias", V_E, 0, 0.1);
+        mat(w, r, "mm.0.weight", 4 * V_E, 4 * V_E, true);
+        vec(w, r, "mm.0.bias", 4 * V_E, 0, 0.1);
+        mat(w, r, "mm.2.weight", DIM, 4 * V_E, true);
+        vec(w, r, "mm.2.bias", DIM, 0, 0.1);
+        w.write(p);
+    }
+
+    private static void qwen3Vl(Path dir) throws Exception {
+        Path text = dir.resolve("tiny-q3vl.gguf");
+        Path proj = dir.resolve("mmproj-tiny-q3vl.gguf");
+        writeText3(text);
+        writeProjector3(proj);
+        Tokenizer tok = tokenizer();
+        ChatTemplate.Format fmt = ChatTemplate.forModelType("qwen3vl", tok);
+        check(fmt.render(List.of(new ChatTemplate.Message("user", "hi")), true, false)
+                        .equals("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"),
+                "Qwen3-VL's chat format has no default system prompt and no thinking block");
+
+        Rgb img = randomImage(3, 20, 12);
+        Preprocess.Pixels px;
+        VisionEncoder.Encoded cpu;
+        float scale = 0;
+        try (ClipModel m = ClipModel.open(proj); ClipCpu enc = new ClipCpu(m, 2)) {
+            check(m.projector == ClipModel.Projector.QWEN3VL && m.layers.get(0).hasDeepstack() && !m.layers.get(1).hasDeepstack(),
+                    "Qwen3-VL projector: deepstack merger found on block 0 only");
+            px = Preprocess.preprocess(m, img, new Preprocess.Limits(0, 0)).tiles().getFirst();
+            cpu = enc.encode(px);
+            check(cpu.deepstack() != null && cpu.deepstack().length == 1 && cpu.deepstack()[0].length == cpu.embd().length
+                    && cpu.embd().length == cpu.tokens() * DIM, "Qwen3-VL encoder: " + cpu.tokens() + " tokens, one deepstack feature per token");
+            for (float v : cpu.deepstack()[0]) {
+                scale = Math.max(scale, Math.abs(v));
+            }
+            check(scale > 0.01f && Float.isFinite(scale), "the deepstack features are not degenerate (max |x| = " + scale + ")");
+        }
+        boolean metal = Metal.available();
+        if (metal) {
+            try (ClipModel m = ClipModel.open(proj); ClipMetal enc = new ClipMetal(m, null)) {
+                VisionEncoder.Encoded gpu = enc.encode(px);
+                float d = maxDiff(gpu.embd(), cpu.embd());
+                float dd = maxDiff(gpu.deepstack()[0], cpu.deepstack()[0]);
+                check(d < 0.02f * Math.max(scale, 1f) && dd < 0.02f * Math.max(scale, 1f),
+                        "the Metal Qwen3-VL encoder agrees with the CPU one (max diff " + d + ", deepstack " + dd + ")");
+            }
+        }
+
+        try (GgufModel gm = GgufModel.open(text)) {
+            Decoder arch = (Decoder) gm.architecture();
+            RopeTable rt = arch.ropeTables().getFirst();
+            check(rt.mrope().equals(List.of(Q3_SECTIONS_T, Q3_SECTIONS_H, Q3_SECTIONS_W)) && rt.mropeInterleaved(),
+                    "qwen3vl GGUF: interleaved rotary sections " + rt.mrope());
+            ModelWeights weights = gm.weights();
+            try (VisionContext vc = VisionContext.open(proj, tok, arch, new VisionContext.Options("cpu", 2, new Preprocess.Limits(0, 0), 16));
+                 Engine engine = new Engine(new CpuBackend(weights, 256, 16, 2, KvDtype.F32, false), tok, arch, Set.of(257), 0, fmt)) {
+                engine.setVision(vc, false);
+                List<ChatTemplate.Message> msgs = List.of(new ChatTemplate.Message("user", MediaChat.MARK + "ab"));
+                MediaPrompt mp = MediaChat.render(engine, msgs, false, List.of(img));
+                MediaPrompt.Span span = mp.spans().getFirst();
+                check(span.deepstack() != null && span.deepstack().length == 1 && span.deepstack()[0].length == span.embeds().length,
+                        "the picture span carries its deepstack features");
+                RopePositions rp = mp.rope();
+                boolean ext = rp.interleaved() && rp.e() != null;
+                for (int j = 0; ext && j < span.length(); j++) {
+                    ext &= rp.e()[span.start() + j] == 0;
+                }
+                for (int i = 0; ext && i < span.start(); i++) {
+                    ext &= rp.e()[i] == i;
+                }
+                check(ext, "interleaved positions: the extra axis is 0 inside the picture and the position in the text");
+
+                // deepstack is added to the hidden state: the logits differ from the plain embeddings' ones
+                Backend be = engine.backend();
+                int n = Math.min(span.length(), 8);
+                float[] rows = Arrays.copyOf(span.embeds(), n * DIM);
+                float[][] ds = {Arrays.copyOf(span.deepstack()[0], n * DIM)};
+                float[] plain = new float[VOCAB];
+                float[] with = new float[VOCAB];
+                be.forwardEmbeds(rows, 0, n, 0, plain);
+                be.forwardEmbeds(rows, 0, n, 0, ds, with);
+                check(!Arrays.equals(plain, with), "deepstack features change the logits (CPU)");
+
+                SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1L, 8, List.of());
+                Engine.Result r1 = engine.generate(mp, greedy, null, () -> false);
+                Engine.Result r1b = engine.generate(mp, greedy, null, () -> false);
+                check(r1.tokens().length == 8 && Arrays.equals(r1.tokens(), r1b.tokens())
+                        && r1b.stats().cachedTokens() == mp.length() - 1, "Qwen3-VL: deterministic answer, the picture is cached by its hash");
+                if (metal) {
+                    try (Engine me = new Engine(new MetalBackend(weights, 256, 16, (String) null), tok, arch, Set.of(257), 0, fmt)) {
+                        me.setVision(vc, false);
+                        float[] mwith = new float[VOCAB];
+                        me.backend().forwardEmbeds(rows, 0, n, 0, ds, mwith);
+                        float top = 0;
+                        for (float v : with) {
+                            top = Math.max(top, Math.abs(v));
+                        }
+                        check(maxDiff(with, mwith) < 0.01f * Math.max(top, 1f), "Metal: forwardEmbeds with deepstack agrees with the CPU (max diff "
+                                + maxDiff(with, mwith) + " of " + top + ")");
+                        float[] mplain = new float[VOCAB];
+                        me.backend().forwardEmbeds(rows, 0, n, 0, mplain);
+                        check(!Arrays.equals(mplain, mwith), "deepstack features change the logits (Metal)");
+                        Engine.Result g1 = me.generate(mp, greedy, null, () -> false);
+                        check(Arrays.equals(g1.tokens(), r1.tokens()), "Metal text backend: the same Qwen3-VL answer as the CPU backend");
+                    }
+                }
+            }
+            weights.close();
+        }
     }
 
     private static void tinyModel(Path dir) throws Exception {

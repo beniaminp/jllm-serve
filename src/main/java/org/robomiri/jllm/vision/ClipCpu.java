@@ -55,8 +55,7 @@ public final class ClipCpu implements VisionEncoder {
     public Encoded encode(Pixels px) {
         return switch (m.projector) {
             case IDEFICS3, GEMMA3 -> siglip(px);
-            case QWEN2VL, QWEN25VL -> qwen(px);
-            case QWEN3VL -> throw new UnsupportedOperationException("qwen3vl_merger is not implemented yet");
+            case QWEN2VL, QWEN25VL, QWEN3VL -> qwen(px);
         };
     }
 
@@ -96,7 +95,8 @@ public final class ClipCpu implements VisionEncoder {
      * @param posA     with {@code posB}: per-row 2-D rotary positions (null = none)
      * @param winStart row ranges of the windows used by the layers that are not full-attention (null = all full)
      */
-    private void blocks(float[] x, int t, boolean rms, int[] posA, int[] posB, float theta, int[] winStart, int nWin) {
+    private void blocks(float[] x, int t, boolean rms, int[] posA, int[] posB, float theta, int[] winStart, int nWin,
+                        LayerHook hook) {
         int e = m.nEmbd;
         int heads = m.nHead;
         int dh = e / heads;
@@ -153,7 +153,15 @@ public final class ClipCpu implements VisionEncoder {
             }
             VMath.addTo(pool, x, tmp, t * e);
             dump("layer_out-" + il, x, t * e);
+            if (hook != null) {
+                hook.after(il, l, x);
+            }
         }
+    }
+
+    /** Called with the hidden state after each block (Qwen3-VL's deepstack taps some of them). */
+    private interface LayerHook {
+        void after(int il, Layer l, float[] x);
     }
 
     /** The patch embedding weights as a float matrix {@code [nEmbd][kPad]}: the sum of the file's conv tensors. */
@@ -246,7 +254,7 @@ public final class ClipCpu implements VisionEncoder {
         if (preW != null) {
             norm(false, x, t, e, preW, m.vecOpt("v.pre_ln.bias"), x);
         }
-        blocks(x, t, false, null, null, 0, null, 0);
+        blocks(x, t, false, null, null, 0, null, 0, null);
         float[] pw = m.vecOpt("v.post_ln.weight");
         if (pw != null) {
             norm(false, x, t, e, pw, m.vecOpt("v.post_ln.bias"), x);
@@ -397,12 +405,22 @@ public final class ClipCpu implements VisionEncoder {
         int kPad = VMath.pad(3 * p * p);
         float[] x = patchEmbed(unfold(px, oy, ox, kPad), t, kPad,
                 patchWeights(kPad, "v.patch_embd.weight", "v.patch_embd.weight.1"), m.vecOpt("v.patch_embd.bias"));
+        if (m.projector == ClipModel.Projector.QWEN3VL) { // learned positions, interpolated to the grid
+            VMath.addTo(pool, x, interpolatedPositions(m.mat("v.position_embd.weight"), gx, gy, oy, ox), t * e);
+        }
         float[] preW = m.vecOpt("v.pre_ln.weight");
         if (preW != null) {
             norm(rms, x, t, e, preW, m.vecOpt("v.pre_ln.bias"), x);
         }
         dump("inp", x, t * e);
-        blocks(x, t, rms, oy, ox, 10000f, winStart, nWin);
+        List<float[]> deep = new ArrayList<>();
+        int mmTok = mm;
+        LayerHook hook = m.projector != ClipModel.Projector.QWEN3VL ? null : (il, l, hidden) -> {
+            if (l.hasDeepstack()) {
+                deep.add(deepstackFeature(l, hidden, t / mmTok, e * mmTok));
+            }
+        };
+        blocks(x, t, rms, oy, ox, 10000f, winStart, nWin, hook);
         float[] pw = m.vecOpt("v.post_ln.weight");
         if (pw != null) {
             norm(rms, x, t, e, pw, m.vecOpt("v.post_ln.bias"), x);
@@ -425,6 +443,58 @@ public final class ClipCpu implements VisionEncoder {
                 System.arraycopy(merged, d * dim, out, blockOrder[d] * dim, dim);
             }
         }
-        return new Encoded(out, tokens, bw, bh);
+        return new Encoded(out, tokens, bw, bh, deep.isEmpty() ? null : deep.toArray(new float[0][]));
+    }
+
+    /**
+     * Qwen3-VL deepstack: the hidden state of a tapped block, 2 x 2 tokens per row, LayerNorm over the merged row, then
+     * fc1, GELU, fc2 (the same shape as the final merger): {@code tokens x projection_dim}.
+     */
+    private float[] deepstackFeature(Layer l, float[] hidden, int tokens, int feat) {
+        float[] normed = new float[tokens * feat];
+        VMath.layerNorm(pool, hidden, tokens, feat, l.dsNormW, l.dsNormB, m.eps, normed);
+        float[] hid = new float[tokens * VMath.pad(l.dsFc1.rows)];
+        lin(l.dsFc1, l.dsFc1B, normed, tokens, feat, hid, VMath.pad(l.dsFc1.rows));
+        VMath.activate(pool, hid, hid.length, 0);
+        float[] out = new float[tokens * l.dsFc2.rows];
+        lin(l.dsFc2, l.dsFc2B, hid, tokens, VMath.pad(l.dsFc1.rows), out, l.dsFc2.rows);
+        return out;
+    }
+
+    /**
+     * Qwen3-VL's learned position embeddings (a square grid of {@code n x n}), resized to the image's patch grid with
+     * bilinear interpolation, corners aligned (ggml's {@code BILINEAR | ALIGN_CORNERS}), and listed in the order of the
+     * tokens ({@code oy[i], ox[i]} = row and column of token i).
+     */
+    static float[] interpolatedPositions(Mat pos, int gx, int gy, int[] oy, int[] ox) {
+        int n = (int) Math.round(Math.sqrt(pos.rows));
+        if (n * n != pos.rows) {
+            throw new IllegalArgumentException("position embeddings " + pos + " are not a square grid");
+        }
+        int e = pos.cols;
+        float[] tab = pos.toFloats();
+        float[] out = new float[oy.length * e];
+        float sfy = gy > 1 && n > 1 ? (float) (gy - 1) / (n - 1) : (float) gy / n;
+        float sfx = gx > 1 && n > 1 ? (float) (gx - 1) / (n - 1) : (float) gx / n;
+        for (int i = 0; i < oy.length; i++) {
+            float y = oy[i] / sfy;
+            float x = ox[i] / sfx;
+            int y0 = Math.max(0, (int) Math.floor(y));
+            int x0 = Math.max(0, (int) Math.floor(x));
+            int y1 = Math.min(y0 + 1, n - 1);
+            int x1 = Math.min(x0 + 1, n - 1);
+            y0 = Math.min(y0, n - 1);
+            x0 = Math.min(x0, n - 1);
+            float dy = Math.min(Math.max(y - y0, 0f), 1f);
+            float dx = Math.min(Math.max(x - x0, 0f), 1f);
+            for (int c = 0; c < e; c++) {
+                float v00 = tab[(y0 * n + x0) * e + c];
+                float v01 = tab[(y0 * n + x1) * e + c];
+                float v10 = tab[(y1 * n + x0) * e + c];
+                float v11 = tab[(y1 * n + x1) * e + c];
+                out[i * e + c] = (v00 * (1 - dx) + v01 * dx) * (1 - dy) + (v10 * (1 - dx) + v11 * dx) * dy;
+            }
+        }
+        return out;
     }
 }

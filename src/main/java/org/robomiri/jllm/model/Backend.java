@@ -62,6 +62,15 @@ public interface Backend extends AutoCloseable {
      * {@link #supportsEmbeds}.
      */
     default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
+        forwardEmbeds(embeds, off, n, pos, null, logits);
+    }
+
+    /**
+     * {@link #forwardEmbeds(float[], int, int, int, float[])} with Qwen3-VL's deepstack: {@code deepstack[l]} (the same
+     * layout as {@code embeds}, rows {@code off ..}) is added to the hidden state of these positions after layer
+     * {@code l}, for {@code l < deepstack.length}; null = none.
+     */
+    default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
         throw new UnsupportedOperationException(name() + " cannot run from embeddings");
     }
 

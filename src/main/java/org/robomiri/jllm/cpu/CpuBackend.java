@@ -391,9 +391,17 @@ public final class CpuBackend implements Backend {
     }
 
     @Override
-    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
-        run(null, embeds, off, n, pos, logits, 0);
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        this.deepstack = deepstack;
+        try {
+            run(null, embeds, off, n, pos, logits, 0);
+        } finally {
+            this.deepstack = null;
+        }
     }
+
+    /** Qwen3-VL: per-layer features added to the hidden state after the first layers of the current {@link #run}. */
+    private float[][] deepstack;
 
     @Override
     public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
@@ -489,6 +497,15 @@ public final class CpuBackend implements Backend {
             p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
+            if (deepstack != null && l < deepstack.length) { // Qwen3-VL: x += this layer's picture features
+                float[] ds = deepstack[l];
+                int base = off * dim;
+                pool.forRange(n * dim, 4096, (i0, i1) -> {
+                    for (int i = i0; i < i1; i++) {
+                        x[i] += ds[base + i];
+                    }
+                });
+            }
         }
         if (logits != null && stride == 0) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);

@@ -50,6 +50,13 @@ public final class ClipModel implements AutoCloseable {
         public Mat q, k, v, qkv, o, up, gate, down;
         public float[] qB, kB, vB, qkvB, oB, upB, gateB, downB;
         public float[] ln1W, ln1B, ln2W, ln2B;
+        /** Qwen3-VL deepstack merger after this block (null when the block has none): norm, fc1, fc2 over 2 x 2 merged tokens. */
+        public Mat dsFc1, dsFc2;
+        public float[] dsNormW, dsNormB, dsFc1B, dsFc2B;
+
+        public boolean hasDeepstack() {
+            return dsFc1 != null;
+        }
     }
 
     private final GgufFile file;
@@ -172,6 +179,13 @@ public final class ClipModel implements AutoCloseable {
         l.ln1B = vecOpt(b + "ln1.bias");
         l.ln2W = vecOpt(b + "ln2.weight");
         l.ln2B = vecOpt(b + "ln2.bias");
+        String ds = "v.deepstack." + il + ".";
+        l.dsFc1 = matOpt(ds + "fc1.weight");
+        l.dsFc2 = matOpt(ds + "fc2.weight");
+        l.dsNormW = vecOpt(ds + "norm.weight");
+        l.dsNormB = vecOpt(ds + "norm.bias");
+        l.dsFc1B = vecOpt(ds + "fc1.bias");
+        l.dsFc2B = vecOpt(ds + "fc2.bias");
         // some projectors were exported with the feed-forward names swapped (ggml's mul_mat takes the weight's ne[0]
         // as its input width: an "up" matrix whose ne[0] is not the embedding width is really the down projection)
         if (l.up != null && l.down != null && l.down.cols == nEmbd) {

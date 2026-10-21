@@ -29,6 +29,8 @@ final class GgufArchitecture {
         /** Qwen2-VL / Qwen2.5-VL's text model: Qwen2 with multimodal RoPE sections ({@code rope.dimension_sections}). */
         QWEN2VL("qwen2vl", "qwen2"),
         QWEN3("qwen3", "qwen3"),
+        /** Qwen3-VL's text model: Qwen3 with interleaved multimodal RoPE and deepstack features added after the first layers. */
+        QWEN3VL("qwen3vl", "qwen3"),
         QWEN3MOE("qwen3moe", "qwen3_moe");
 
         final String ggufName;
@@ -148,7 +150,7 @@ final class GgufArchitecture {
             c.put("norm_topk_prob", true); // llama.cpp always normalizes the selected expert weights for qwen3moe
         }
         Map<String, Object> scaling = ropeScaling(g, p, family, headDim);
-        if (family == Family.QWEN2VL) {
+        if (family == Family.QWEN2VL || family == Family.QWEN3VL) {
             long[] sec = g.longs(p + "rope.dimension_sections");
             if (sec == null || sec.length < 3) {
                 throw new IOException("GGUF metadata has no " + p + "rope.dimension_sections (Qwen-VL's rotary sections)");
@@ -160,6 +162,9 @@ final class GgufArchitecture {
                 l.add(s);
             }
             scaling.put("mrope_section", l);
+            if (family == Family.QWEN3VL) {
+                scaling.put("mrope_interleaved", true);
+            }
         }
         if (scaling != null) {
             c.put("rope_scaling", scaling);

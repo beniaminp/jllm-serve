@@ -97,6 +97,8 @@ public final class ChatTemplate {
                 return SMOLVLM;
             case "qwen2vl", "qwen2_vl", "qwen2_5_vl", "qwen25vl":
                 return QWEN2;
+            case "qwen3vl", "qwen3_vl":
+                return QWEN3VL;
             case "llama":
                 if (deepseekVocab) {
                     return DEEPSEEK;
@@ -233,6 +235,27 @@ public final class ChatTemplate {
             if (!think) {
                 o.ctl("<think>\n\n</think>\n\n");
             }
+        }
+    }, "<|im_end|>", "<|endoftext|>");
+
+    /**
+     * Qwen3-VL (Instruct) ChatML: no default system prompt, no thinking blocks (the model's own template has none);
+     * pictures are placeholders in the user turn's text.
+     */
+    private static final Format QWEN3VL = new Family("chatml-qwen3vl", (m, gen, think, o) -> {
+        for (int i = 0; i < m.size(); i++) {
+            Message msg = m.get(i);
+            String role = role(msg, "system", "user", "assistant", "tool");
+            if (role.equals("tool")) {
+                toolResponse(m, i, o);
+                continue;
+            }
+            o.ctl("<|im_start|>" + role + "\n");
+            o.txt(content(msg));
+            o.ctl("<|im_end|>\n");
+        }
+        if (gen) {
+            o.ctl("<|im_start|>assistant\n");
         }
     }, "<|im_end|>", "<|endoftext|>");
 

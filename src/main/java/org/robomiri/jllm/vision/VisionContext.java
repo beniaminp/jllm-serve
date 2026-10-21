@@ -52,7 +52,7 @@ public final class VisionContext implements AutoCloseable {
     private record Ids(int[] ids) implements Part {
     }
 
-    private record Chunk(float[] embd, int tokens, int nx, int ny, String hash) implements Part {
+    private record Chunk(float[] embd, int tokens, int nx, int ny, String hash, float[][] deepstack) implements Part {
     }
 
     private record Encoded(String hash, List<Part> parts, long bytes, double ms) {
@@ -213,7 +213,7 @@ public final class VisionContext implements AutoCloseable {
                     }
                     case Chunk c -> {
                         java.util.Arrays.fill(out, n, n + len, placeholder);
-                        spans.add(new MediaPrompt.Span(n, len, c.hash(), c.embd()));
+                        spans.add(new MediaPrompt.Span(n, len, c.hash(), c.embd(), c.deepstack()));
                         grids.add(new int[]{c.nx(), c.ny()});
                     }
                 }
@@ -230,6 +230,7 @@ public final class VisionContext implements AutoCloseable {
         int[] t = new int[n];
         int[] h = new int[n];
         int[] w = new int[n];
+        int[] e = mropeInterleaved ? new int[n] : null; // Qwen3-VL's extra position: the text position, 0 for a picture
         int next = 0;
         int si = 0;
         int i = 0;
@@ -242,7 +243,7 @@ public final class VisionContext implements AutoCloseable {
                     t[i + j] = next;
                     h[i + j] = next + j / nx;
                     w[i + j] = next + j % nx;
-                }
+                } // (e stays 0 inside a picture)
                 next += Math.max(nx, ny);
                 i += s.length();
                 si++;
@@ -250,12 +251,15 @@ public final class VisionContext implements AutoCloseable {
                 t[i] = next;
                 h[i] = next;
                 w[i] = next;
+                if (e != null) {
+                    e[i] = next;
+                }
                 next++;
                 i++;
             }
         }
         int[] sec = mrope.stream().mapToInt(Integer::intValue).toArray();
-        return new RopePositions(t, h, w, sec, mropeInterleaved, n - next);
+        return new RopePositions(t, h, w, e, sec, mropeInterleaved, n - next);
     }
 
     // ------------------------------------------------------------------ encoding
@@ -277,6 +281,11 @@ public final class VisionContext implements AutoCloseable {
         for (Part p : parts) {
             if (p instanceof Chunk c) {
                 bytes += 4L * c.embd().length;
+                if (c.deepstack() != null) {
+                    for (float[] d : c.deepstack()) {
+                        bytes += 4L * d.length;
+                    }
+                }
             }
         }
         double ms = (System.nanoTime() - t0) / 1e6;
@@ -300,7 +309,7 @@ public final class VisionContext implements AutoCloseable {
 
     private Chunk chunk(Preprocess.Pixels px, String hash, int index) {
         VisionEncoder.Encoded e = encoder.encode(px);
-        return new Chunk(e.embd(), e.tokens(), e.nx(), e.ny(), hash + "#" + index);
+        return new Chunk(e.embd(), e.tokens(), e.nx(), e.ny(), hash + "#" + index, e.deepstack());
     }
 
     private List<Part> framed(String begin, String end, Preprocess.Pixels px, String hash) {

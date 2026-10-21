@@ -44,8 +44,20 @@ public final class VisionDump {
                 }
                 System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d) in %.0f ms%n", i, px.width(), px.height(), e.tokens(),
                         e.nx(), e.ny(), (System.nanoTime() - t1) / 1e6);
-                ByteBuffer bb = ByteBuffer.allocate(e.embd().length * 4).order(ByteOrder.LITTLE_ENDIAN);
-                bb.asFloatBuffer().put(e.embd());
+                float[] flat = e.embd();
+                if (e.deepstack() != null) { // like mtmd: per token, the main features then each deepstack layer's
+                    int d = e.embd().length / e.tokens();
+                    int k = e.deepstack().length + 1;
+                    flat = new float[e.tokens() * d * k];
+                    for (int tk = 0; tk < e.tokens(); tk++) {
+                        System.arraycopy(e.embd(), tk * d, flat, tk * d * k, d);
+                        for (int j = 0; j < k - 1; j++) {
+                            System.arraycopy(e.deepstack()[j], tk * d, flat, tk * d * k + (j + 1) * d, d);
+                        }
+                    }
+                }
+                ByteBuffer bb = ByteBuffer.allocate(flat.length * 4).order(ByteOrder.LITTLE_ENDIAN);
+                bb.asFloatBuffer().put(flat);
                 Files.write(Path.of(a[2] + "." + i + ".f32"), bb.array());
                 // also the preprocessed pixels, for comparison with other implementations
                 ByteBuffer pb = ByteBuffer.allocate(px.hwc().length * 4).order(ByteOrder.LITTLE_ENDIAN);

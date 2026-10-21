@@ -17,6 +17,7 @@ using namespace metal;
 #define VG_BN 64                // output columns per threadgroup
 #define VG_BK 32                // k per step
 #define VG_THREADS 128
+#define VG_LDS 40               // row stride of the half tiles in threadgroup memory (32 + 8: avoids bank conflicts)
 #define VA_QPS 4                // query rows per simdgroup of vit_attention
 #define VA_SGS 4                // simdgroups per vit_attention threadgroup (VA_QPS * VA_SGS rows per threadgroup)
 #define VA_MAX_PER 4            // dims per lane: head dims up to 128
@@ -72,8 +73,8 @@ kernel void vit_gemm(device const float *x [[buffer(0)]],
                      ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float smem[VG_BM * VG_BN];   // the half tiles during the k loop, the float result tile after it
-    threadgroup half *sa = (threadgroup half *)smem;            // [64 tokens][32 k]
-    threadgroup half *sb = sa + VG_BM * VG_BK;                  // [64 columns][32 k]
+    threadgroup half *sa = (threadgroup half *)smem;            // [64 tokens][32 k], rows VG_LDS apart
+    threadgroup half *sb = sa + VG_BM * VG_LDS;                 // [64 columns][32 k], rows VG_LDS apart
     const int n0 = int(tgp.x) * VG_BN;
     const int m0 = int(tgp.y) * VG_BM;
     const ushort sr = sg & 1;    // columns 32 sr .. of the tile
@@ -93,15 +94,15 @@ kernel void vit_gemm(device const float *x [[buffer(0)]],
                 if (tokRow < p.m) xv = *(device const float4 *)(x + (ulong)tokRow * p.ldx + kk);
                 if (colRow < p.n) wv = *(device const half4 *)(w + (ulong)colRow * p.k + kk);
             }
-            *(threadgroup half4 *)(sa + lr * VG_BK + lh * 16 + i * 4) = half4(xv);
-            *(threadgroup half4 *)(sb + lr * VG_BK + lh * 16 + i * 4) = wv;
+            *(threadgroup half4 *)(sa + lr * VG_LDS + lh * 16 + i * 4) = half4(xv);
+            *(threadgroup half4 *)(sb + lr * VG_LDS + lh * 16 + i * 4) = wv;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int kk = 0; kk < 4; kk++) {
             simdgroup_half8x8 a[4];
             simdgroup_half8x8 b[4];
-            for (int i = 0; i < 4; i++) simdgroup_load(a[i], sa + (st * 32 + i * 8) * VG_BK + kk * 8, VG_BK);
-            for (int j = 0; j < 4; j++) simdgroup_load(b[j], sb + (sr * 32 + j * 8) * VG_BK + kk * 8, VG_BK, ulong2(0, 0), true);
+            for (int i = 0; i < 4; i++) simdgroup_load(a[i], sa + (st * 32 + i * 8) * VG_LDS + kk * 8, VG_LDS);
+            for (int j = 0; j < 4; j++) simdgroup_load(b[j], sb + (sr * 32 + j * 8) * VG_LDS + kk * 8, VG_LDS, ulong2(0, 0), true);
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i * 4 + j], a[i], b[j], acc[i * 4 + j]);
         }

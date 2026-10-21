@@ -225,8 +225,24 @@ public final class ClipMetal implements VisionEncoder {
         elementwise("vit_add", a, b, n, 0);
     }
 
+    /** The q, k or v part ({@code which} = 0, 1, 2) of a fused attention weight, as its own half matrix (made once). */
+    private W qkvPart(int il, Layer l, int which) {
+        int e = m.nEmbd;
+        return derived("qkv." + il + "." + which, () -> {
+            float[] part = new float[e * l.qkv.cols];
+            l.qkv.rows(which * e, e, part, l.qkv.cols);
+            return weight(part, e, l.qkv.cols);
+        });
+    }
+
+    private Metal.Buffer qkvBias(int il, Layer l, int which) {
+        int e = m.nEmbd;
+        return vec(cached.computeIfAbsent("qkvB." + il + "." + which,
+                k -> l.qkvB == null ? null : java.util.Arrays.copyOfRange(l.qkvB, which * e, (which + 1) * e)));
+    }
+
     private void blocks(Metal.Buffer x, int t, boolean rms, Metal.Buffer ropeCs, Metal.Buffer lo, Metal.Buffer hi,
-                        Metal.Buffer loW, Metal.Buffer hiW) {
+                        Metal.Buffer loW, Metal.Buffer hiW, java.util.function.IntConsumer afterLayer) {
         int e = m.nEmbd;
         int heads = m.nHead;
         int dh = e / heads;
@@ -242,9 +258,15 @@ public final class ClipMetal implements VisionEncoder {
         for (int il = 0; il < m.nLayer; il++) {
             Layer l = m.layers.get(il);
             norm(rms, x, h, l.ln1W, l.ln1B, t, e);
-            gemm(h, weight(l.q), vec(l.qB), q, t, e, e, 0, false);
-            gemm(h, weight(l.k), vec(l.kB), k, t, e, e, 0, false);
-            gemm(h, weight(l.v), vec(l.vB), v, t, e, e, 0, false);
+            if (l.qkv != null) {
+                gemm(h, qkvPart(il, l, 0), qkvBias(il, l, 0), q, t, e, e, 0, false);
+                gemm(h, qkvPart(il, l, 1), qkvBias(il, l, 1), k, t, e, e, 0, false);
+                gemm(h, qkvPart(il, l, 2), qkvBias(il, l, 2), v, t, e, e, 0, false);
+            } else {
+                gemm(h, weight(l.q), vec(l.qB), q, t, e, e, 0, false);
+                gemm(h, weight(l.k), vec(l.kB), k, t, e, e, 0, false);
+                gemm(h, weight(l.v), vec(l.vB), v, t, e, e, 0, false);
+            }
             if (ropeCs != null) {
                 for (Metal.Buffer qk : new Metal.Buffer[]{q, k}) {
                     bind(0, qk);
@@ -275,6 +297,9 @@ public final class ClipMetal implements VisionEncoder {
                 gemm(f2, weight(l.down), vec(l.downB), x, t, ldF, e, 0, true);
             } else {
                 gemm(f1, weight(l.down), vec(l.downB), x, t, ldF, e, 0, true);
+            }
+            if (afterLayer != null) {
+                afterLayer.accept(il);
             }
         }
     }
@@ -337,8 +362,7 @@ public final class ClipMetal implements VisionEncoder {
     public synchronized Encoded encode(Pixels px) {
         return switch (m.projector) {
             case IDEFICS3, GEMMA3 -> siglip(px);
-            case QWEN2VL, QWEN25VL -> qwen(px);
-            case QWEN3VL -> throw new UnsupportedOperationException("qwen3vl_merger is not implemented yet");
+            case QWEN2VL, QWEN25VL, QWEN3VL -> qwen(px);
         };
     }
 
@@ -385,7 +409,7 @@ public final class ClipMetal implements VisionEncoder {
             if (preW != null) {
                 norm(false, x, x, preW, cachedVec("v.pre_ln.bias"), t, e);
             }
-            blocks(x, t, false, null, range[0], range[1], null, null);
+            blocks(x, t, false, null, range[0], range[1], null, null, null);
             float[] pw2 = cachedVec("v.post_ln.weight");
             if (pw2 != null) {
                 norm(false, x, x, pw2, cachedVec("v.post_ln.bias"), t, e);
@@ -614,13 +638,36 @@ public final class ClipMetal implements VisionEncoder {
         Metal.Buffer merged = scratch("out", 4L * tokens * w2.rows());
         metal.begin();
         boolean ok = false;
+        int nDeep = 0;
         try {
             gemm(patches, pw, vec(m.vecOpt("v.patch_embd.bias")), x, t, kPad, e, 0, false);
+            if (m.projector == ClipModel.Projector.QWEN3VL) { // learned positions, interpolated to this grid
+                Metal.Buffer posb = scratch("pos", 4L * t * e);
+                putFloats(posb, ClipCpu.interpolatedPositions(m.mat("v.position_embd.weight"), gx, gy, oy, ox), t * e);
+                add(x, posb, t * e);
+            }
             float[] preW = cachedVec("v.pre_ln.weight");
             if (preW != null) {
                 norm(rms, x, x, preW, cachedVec("v.pre_ln.bias"), t, e);
             }
-            blocks(x, t, rms, csb, lob, hib, lowb, hiwb);
+            Metal.Buffer dsNorm = scratch("dsNorm", 4L * t * e);
+            int[] dsCount = {0};
+            java.util.function.IntConsumer hook = m.projector != ClipModel.Projector.QWEN3VL ? null : il -> {
+                Layer l = m.layers.get(il);
+                if (!l.hasDeepstack()) {
+                    return;
+                }
+                // 2 x 2 neighbouring tokens are consecutive rows of x: the same memory read as rows of 4 E features
+                norm(false, x, dsNorm, l.dsNormW, l.dsNormB, tokens, feat);
+                W f1 = derived("ds1." + il, () -> weight(l.dsFc1));
+                W f2 = derived("ds2." + il, () -> weight(l.dsFc2));
+                Metal.Buffer dh1 = scratch("dsHid", 4L * tokens * f1.rows());
+                Metal.Buffer dout = scratch("ds" + dsCount[0]++, 4L * tokens * f2.rows());
+                gemm(dsNorm, f1, vec(l.dsFc1B), dh1, tokens, feat, f1.rows(), 1, false);
+                gemm(dh1, f2, vec(l.dsFc2B), dout, tokens, f1.rows(), f2.rows(), 0, false);
+            };
+            blocks(x, t, rms, csb, lob, hib, lowb, hiwb, hook);
+            nDeep = dsCount[0];
             float[] pw2 = cachedVec("v.post_ln.weight");
             if (pw2 != null) {
                 norm(rms, x, x, pw2, cachedVec("v.post_ln.bias"), t, e);
@@ -644,7 +691,16 @@ public final class ClipMetal implements VisionEncoder {
                 System.arraycopy(outAll, d * dim, out, blockOrder[d] * dim, dim);
             }
         }
-        return new Encoded(out, tokens, bw, bh);
+        float[][] deep = null;
+        if (nDeep > 0) {
+            deep = new float[nDeep][];
+            for (int j = 0; j < nDeep; j++) {
+                Metal.Buffer b = scratch("ds" + j, 0);
+                deep[j] = new float[tokens * w2.rows()];
+                MemorySegment.copy(b.contents(), ValueLayout.JAVA_FLOAT, 0, deep[j], 0, deep[j].length);
+            }
+        }
+        return new Encoded(out, tokens, bw, bh, deep);
     }
 
     /** Waits for the command buffer and reads the result. */

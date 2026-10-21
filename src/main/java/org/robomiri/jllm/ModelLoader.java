@@ -173,7 +173,8 @@ public final class ModelLoader {
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
-            Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
+            Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"),
+                    chatFormat(p, arch, tok));
             long promptCacheMb = s.getLong("engine.prompt-cache-mb");
             if (promptCacheMb > 0) {
                 engine.setPromptCache(new org.robomiri.jllm.tokenizer.PromptCache(tok, promptCacheMb << 20));
@@ -288,6 +289,21 @@ public final class ModelLoader {
      * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
      * does not (it would need its own copy).
      */
+    /** The chat format of the model; a GGUF of a family whose model_type is shared with another one asks by its own name. */
+    private static org.robomiri.jllm.tokenizer.ChatTemplate.Format chatFormat(Prepared p, Architecture arch, Tokenizer tok) {
+        if (p.gguf() != null) {
+            try (org.robomiri.jllm.gguf.GgufFile f = org.robomiri.jllm.gguf.GgufFile.open(p.gguf())) {
+                String name = f.str("general.architecture", "");
+                if (name.equals("qwen3vl")) {
+                    return org.robomiri.jllm.tokenizer.ChatTemplate.forModelType(name, tok);
+                }
+            } catch (IOException | RuntimeException e) {
+                // fall through to the model type's format
+            }
+        }
+        return org.robomiri.jllm.tokenizer.ChatTemplate.forModelType(arch.core().modelType(), tok);
+    }
+
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
         Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1, true));

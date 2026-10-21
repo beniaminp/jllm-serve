@@ -260,8 +260,8 @@ public final class BatchGroup {
         }
 
         @Override
-        public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
-            locked(() -> inner.forwardEmbeds(embeds, off, n, pos, logits));
+        public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+            locked(() -> inner.forwardEmbeds(embeds, off, n, pos, deepstack, logits));
         }
 
         @Override

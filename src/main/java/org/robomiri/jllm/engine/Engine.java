@@ -507,7 +507,7 @@ public final class Engine implements AutoCloseable {
                 MediaPrompt.Span sp0 = media.spanAt(pos);
                 if (sp0 != null) {
                     int cnt = Math.min(batch, sp0.end() - pos);
-                    backend.forwardEmbeds(sp0.embeds(), pos - sp0.start(), cnt, pos, pos + cnt == prompt.length ? logits : null);
+                    backend.forwardEmbeds(sp0.embeds(), pos - sp0.start(), cnt, pos, sp0.deepstack(), pos + cnt == prompt.length ? logits : null);
                     pos += cnt;
                     continue;
                 }

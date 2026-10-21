@@ -1207,8 +1207,32 @@ public final class MetalBackend implements Backend {
     }
 
     @Override
-    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
-        run(null, embeds, off, n, pos, logits, 0);
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        this.deepstack = deepstack;
+        this.deepstackOff = off;
+        try {
+            run(null, embeds, off, n, pos, logits, 0);
+        } finally {
+            this.deepstack = null;
+        }
+    }
+
+    /** Qwen3-VL: per-layer features added to the hidden state after the first layers of the current pass (rows from {@code deepstackOff}). */
+    private float[][] deepstack;
+    private int deepstackOff;
+
+    /** x += the picture features of layer {@code l}; between two command buffers, as x is host-visible memory. */
+    private void addDeepstack(int l, int n) {
+        float[] ds = deepstack[l];
+        int dim = c.dim();
+        k.commitAndWait();
+        MemorySegment xs = x.contents();
+        long base = (long) deepstackOff * dim;
+        for (int i = 0; i < n * dim; i++) {
+            long o = 4L * i;
+            xs.set(ValueLayout.JAVA_FLOAT, o, xs.get(ValueLayout.JAVA_FLOAT, o) + ds[(int) (base + i)]);
+        }
+        k.begin();
     }
 
     @Override
@@ -1256,6 +1280,9 @@ public final class MetalBackend implements Backend {
                 k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
             }
             L.ffn().run(l, n, fuseNorm);
+            if (deepstack != null && l < deepstack.length) {
+                addDeepstack(l, n);
+            }
             if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                 k.commit(); // the GPU starts on these layers while the next ones are encoded
             }

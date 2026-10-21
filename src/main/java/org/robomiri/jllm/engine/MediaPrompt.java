@@ -32,8 +32,14 @@ public final class MediaPrompt {
      * @param length number of ids (= rows of {@code embeds})
      * @param hash   identifies the picture and how it was encoded (equal hashes, equal embeddings)
      * @param embeds {@code length x dim} floats
+     * @param deepstack Qwen3-VL: extra features of the same shape that the model adds to its hidden state after layer 0, 1, ...
+     *                  (null for the other models)
      */
-    public record Span(int start, int length, String hash, float[] embeds) {
+    public record Span(int start, int length, String hash, float[] embeds, float[][] deepstack) {
+        public Span(int start, int length, String hash, float[] embeds) {
+            this(start, length, hash, embeds, null);
+        }
+
         public int end() {
             return start + length;
         }
