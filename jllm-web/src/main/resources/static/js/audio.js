@@ -319,6 +319,7 @@ const AudioTab = (() => {
         <label>Voice <select id="tts-voice"></select></label>
         <label>Speed <span class="au-range"><input type="range" id="tts-speed" min="0.25" max="4" step="0.05" value="1" aria-label="Speed"><output id="tts-speed-v">1.00×</output></span></label>
       </div>
+      <div class="row"><label class="check" title="Text-to-speech output usually starts with a click and half a second of near silence"><input type="checkbox" id="tts-trim" checked> trim the silence at the start and end</label></div>
       <div class="row">
         <button id="tts-go" class="primary">Speak</button>
         <button id="tts-cancel" class="danger hidden">Cancel</button>
@@ -379,14 +380,16 @@ const AudioTab = (() => {
     savePref('ttsText', text); savePref('ttsModel', model.id); savePref('ttsVoice', $('#tts-voice').value); savePref('ttsSpeed', +$('#tts-speed').value);
     try {
       const r = await AudioIO.speak({input: text, model: model.id, voice: $('#tts-voice').value, speed: +$('#tts-speed').value, signal: tts.abort.signal});
-      tts.clip = r.clip; tts.name = 'speech';
-      shared.speechClip = r.clip; shared.speechName = 'speech';
+      const trim = $('#tts-trim').checked;
+      const clip = trim ? E.trimToSpeech(r.clip, 0.05) : r.clip;
+      tts.clip = clip; tts.name = 'speech';
+      shared.speechClip = clip; shared.speechName = 'speech';
       if (tts.url) URL.revokeObjectURL(tts.url);
-      tts.url = URL.createObjectURL(new Blob([r.wav], {type: 'audio/wav'}));
+      tts.url = URL.createObjectURL(trim ? AudioIO.toWavBlob(clip, 0, false) : new Blob([r.wav], {type: 'audio/wav'}));
       const a = $('#tts-audio');
       a.src = tts.url;
       $('#tts-result').classList.remove('hidden');
-      $('#tts-meta').textContent = `${E.clock(E.duration(r.clip))} · ${r.clip.sampleRate} Hz · took ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+      $('#tts-meta').textContent = `${E.clock(E.duration(clip))} · ${clip.sampleRate} Hz · took ${((performance.now() - t0) / 1000).toFixed(1)} s`;
       a.play().catch(() => { /* autoplay may be blocked: the controls are there */ });
     } catch (e) {
       if (e.name === 'AbortError') $('#tts-msg').innerHTML = '<span class="muted">Cancelled.</span>';
@@ -404,6 +407,8 @@ const AudioTab = (() => {
     $('#au-tts').innerHTML = TTS_HTML;
     $('#tts-text').value = prefs.ttsText || '';
     $('#tts-speed').value = prefs.ttsSpeed || 1;
+    $('#tts-trim').checked = prefs.ttsTrim !== false;
+    $('#tts-trim').addEventListener('change', () => savePref('ttsTrim', $('#tts-trim').checked));
     const speedLabel = () => { $('#tts-speed-v').textContent = (+$('#tts-speed').value).toFixed(2) + '×'; };
     speedLabel();
     const count = () => { $('#tts-count').textContent = $('#tts-text').value.length; updateTtsButtons(); };

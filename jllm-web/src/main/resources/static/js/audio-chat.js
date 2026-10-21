@@ -242,7 +242,7 @@ const AudioChat = (() => {
       const r = await AudioIO.speak({input: text, model: model.id, voice: prefs.ttsVoice || '', speed: prefs.ttsSpeed || 1, signal: abort.signal});
       if (reader.btn !== btn) return;
       if (cut) toast(`Reading the first ${text.length} characters.`, 'info', 3000);
-      reader.url = URL.createObjectURL(new Blob([r.wav], {type: 'audio/wav'}));
+      reader.url = URL.createObjectURL(AudioIO.toWavBlob(E.trimToSpeech(r.clip, 0.05), 0, false));   // without the leading click and silence
       const a = reader.audio = document.createElement('audio');
       a.src = reader.url;
       a.addEventListener('ended', () => { if (reader.btn === btn) resetReader(); });
