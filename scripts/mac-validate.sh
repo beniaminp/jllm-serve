@@ -1,9 +1,11 @@
 #!/bin/bash
 # Validates the Metal features on a real Mac: first correctness on the GPU (every family, CPU == Metal), then speed:
-# each newer feature on (the default) against off, on a dense model and optionally on a mixture-of-experts model.
+# each newer feature on (the default) against off, on a dense model and optionally on a mixture-of-experts model;
+# draft-model speculation (the dense model drafting for itself, adaptive length and draft pipelining on and off) and
+# batched decoding of three slots in shared passes against taking turns.
 # Prints a markdown table; paste it into an issue or docs/11.
 #
-#   scripts/mac-validate.sh                                  Qwen/Qwen3-0.6B, ~15 minutes
+#   scripts/mac-validate.sh                                  Qwen/Qwen3-0.6B, ~25 minutes
 #   scripts/mac-validate.sh --moe Qwen/Qwen3-30B-A3B         plus the MoE rows (needs ~20 GB free memory)
 #   scripts/mac-validate.sh --skip-smoke                     speed only
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
@@ -90,6 +92,35 @@ bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djll
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16
 bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8
+# draft-model speculation on the GPU (the draft is the dense model itself: every draft is accepted, so this measures
+# what a pass of k drafts costs against k plain steps; a real draft is smaller and accepts less)
+bench "speculation off" "$DENSE" "" --engine.speculative off
+bench "draft $DENSE for itself, k 4 (adaptive)" "$DENSE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
+  --engine.draft-tokens 4
+bench "draft for itself, k 4, adaptive length off" "$DENSE" "-Djllm.engine.adaptiveDraft=false" --engine.speculative draft \
+  --engine.draft-model "$DENSE" --engine.draft-tokens 4
+bench "draft for itself, k 4, draft pipelining off" "$DENSE" "-Djllm.engine.draftPipeline=false" --engine.speculative draft \
+  --engine.draft-model "$DENSE" --engine.draft-tokens 4
+
+# batched decoding across slots: three engines (slots) on the weights, generating together in shared passes
+# (MetalBackend.forwardBatch) against taking turns; BatchDecodeTest also checks that the answers equal those alone
+batch() { # label java-opts
+  local label="$1" opts="$2"
+  # shellcheck disable=SC2086
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g $opts \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.BatchDecodeTest "models/$(echo "$DENSE" | tr / _)" bench --backend metal > "$OUT/batch.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/batch.log") |"; return; }
+  local one three
+  one=$(grep -o 'one slot [0-9.]* tok/s' "$OUT/batch.log" | grep -o '[0-9.]*')
+  three=$(grep -o 'three slots together [0-9.]* tok/s ([0-9.]*x)' "$OUT/batch.log" | sed 's/three slots together //')
+  echo "| $label | | one slot $one, three $three | $(grep -o '[0-9]* steps in shared passes' "$OUT/batch.log") |"
+}
+JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+mvn -q compile test-compile
+[ -f target/native/libjllm_metal.dylib ] || ./scripts/build-native.sh >/dev/null
+batch "3 slots generating together (batched)" ""
+batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64
@@ -100,6 +131,8 @@ if [ -n "$MOE" ]; then
   bench "experts of 4 layers on the CPU" "$MOE" "" --backend.metal.cpu-moe 4
   bench "experts of 4 layers on the CPU, int8 off" "$MOE" "" --backend.metal.cpu-moe 4 --backend.cpu.int8-activations false
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
+  bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
+    --engine.draft-tokens 4
 fi
 echo
 echo "(median of $ROUNDS rounds; logs in $OUT)"

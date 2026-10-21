@@ -604,8 +604,23 @@ editing code, quoting a document, extracting fields, structured output. Details 
 
 **Draft model (`draft`).** `engine.draft-model` names a smaller model of the same tokenizer (checked at start-up
 with a probe string), e.g. Qwen3-0.6B for Qwen3-30B-A3B. It gets its own backend (same `backend`, `backend.ctx`,
-`model.quant`) and KV cache in the same process, remembers which tokens that cache holds and re-feeds only the
-difference to the new history, then proposes `engine.draft-tokens` tokens greedily.
+`model.quant`, `backend.kv-dtype`) and KV cache in the same process, on the same device; it is loaded before the target,
+so on Metal the target's memory plan counts it ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)).
+It remembers which tokens its cache holds and re-feeds only the difference to the new history, then proposes up to
+`engine.draft-tokens` tokens greedily. On Metal its decode steps are pipelined: each step takes its token from the
+argmax the GPU wrote in the step before, so the draft runs its steps back to back and returns only token ids
+([08 §8.25](08-metal-backend.md#825-draft-model-speculation-on-the-gpu)).
+
+🧸 How long a draft to ask for is a bet: a long draft wins a lot when the draft model is usually right and wastes the
+target's time when it is not. So the engine keeps score — how often the draft was right, how long a draft step and a
+check take — and asks for the length that gives the most words per second, or for none at all while drafting does not
+pay.
+
+📐 With per-token acceptance α, k drafts yield `E(k) = 1 + α + … + α^k` tokens per pass at a cost of `k·d + a + b·k`
+(d a draft step, `a + b(n−1)` a target pass over n positions); `Speculator.CostModel` measures α, d, a, b and a plain
+step p while running and picks the k that maximizes `E(k) / (k·d + a + b·k)`, or pauses for 16 plain steps when no k
+beats `1/p` (one pause in four tries a pass anyway). Until two passes are measured, and always for prompt lookup, the
+doubling rule of prompt lookup (above) decides. `-Djllm.engine.adaptiveDraft=false` turns the cost model off.
 
 **Back-off.** A pass whose drafts are all rejected cost more than a plain step, so after it the proposer
 sits out 1, 3, 7, then 15 steps (reset by the next accepted draft).
@@ -628,6 +643,13 @@ verification pass is then decided with the constrained rule against the constrai
 *j* drafts (`Sampler.verify(row, draft, constraint, isStop)`): greedy takes the masked argmax, sampling accepts the
 draft with its probability under the masked distribution. Greedy output is therefore exactly the non-speculative
 constrained output (`ToolCallTest` checks it on a scripted fake model and on Qwen3-0.6B).
+**Rolling back.** Nothing is copied or erased on a rejection, for either model and any cache type (f32, f16, q8: each
+position's row is written whole): the target continues at `pos + 1 + accepted`, the positions after it are
+overwritten by its next pass before anything attends to them, and the draft re-feeds what follows the longest prefix
+its cache shares with the new history. `DraftSpecTest` (part of `mvn test`) checks it on the CPU with Qwen3-0.6B
+drafting for itself, once as loaded from the settings and once with a draft that is wrong at every third position;
+`ArchSmoke` on the Metal emulator with every attention family, f32 / f16 / q8 caches, drafting for itself, at Q2_K,
+and (plain Llama) from another random model. Greedy output equals the output without speculation in all of them.
 
 Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
@@ -666,13 +688,19 @@ and attention run per row, each in its own conversation's cache at its own posit
   is alone in its group.
 
 **Results.** A batched step uses the multi-token kernels, which add up in a different order than the single-token
-ones, so its logits agree with a step taken alone to rounding (with int8 activations, to the int8 rounding). The
+ones on the CPU, so its logits agree with a step taken alone to rounding (with int8 activations, to the int8 rounding). The
 greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU, part of `mvn test`; 42 of the
-steps ran in shared passes). Its throughput comparison runs with a second argument, `bench`; it was not measured on a
-quiet machine yet. The CPU backend implements
-`forwardBatch` for every attention family except DeepSeek's MLA. Mamba and the Metal backend fall back to running
-the queued steps one after another, as before: on Metal each slot has its own command queue and buffers, and one
-pass over several slots' caches is not implemented yet.
+steps ran in shared passes). Its throughput comparison runs with a second argument, `bench`, and takes settings after it
+(`--backend metal` on a Mac, as `scripts/mac-validate.sh` runs it); it was not measured on a quiet machine yet.
+
+**Backends.** The CPU backend implements `forwardBatch` for every attention family except DeepSeek's MLA. The Metal
+backend implements it for every attention family including MLA, with f32, f16 and q8 caches, MoE layers and experts on
+the CPU ([08 §8.24](08-metal-backend.md#824-batched-decoding-across-slots-metalbackendforwardbatch)): the pass runs on
+the leader's command queue and activation buffers, and each row's RoPE, cache store and attention are dispatched
+against its own slot's cache buffers. Below 8 slots those kernels compute each row exactly as the slot's own step, so on
+Metal the batched logits were bit-identical to the alone ones in every family tested on the emulator (with experts on the
+CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba falls back
+to running the queued steps one after another.
 
 ## 10.10 Configuration
 

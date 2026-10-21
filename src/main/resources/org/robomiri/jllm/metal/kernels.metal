@@ -1644,6 +1644,31 @@ kernel void rope_store_q8(device float *q [[buffer(0)]],
 template [[host_name("rope_store_q8")]] kernel decltype(rope_store_q8<false>) rope_store_q8<false>;
 template [[host_name("rope_il_store_q8")]] kernel decltype(rope_store_q8<true>) rope_store_q8<true>;
 
+// kv_put<KV>: batched decoding across slots (MetalBackend.forwardBatch). The rows of a batched step belong to different
+// conversations, each with its own cache and position, so the projection writes every row's v to an f32 staging row
+// and this kernel copies one row into its conversation's cache row (bound at that position): unchanged for the f32
+// cache, rounded once to half for the f16 cache (the same round-to-nearest-even half(v + bias) as matmul3<.., half>
+// applies in a single-sequence step). The q8 cache takes kv_store_q8 instead. Grid: (kvDim / CHANNEL_THREADS, ntok).
+
+struct KvPutParams {
+    int kvDim;       // values per row
+    int stride;      // destination row stride in elements
+};
+
+template <typename KV>
+kernel void kv_put(device const float *src [[buffer(0)]],
+                   device KV *dst [[buffer(1)]],
+                   constant KvPutParams &p [[buffer(2)]],
+                   uint2 tgp [[threadgroup_position_in_grid]],
+                   ushort2 tid2 [[thread_position_in_threadgroup]],
+                   ushort2 tpg2 [[threads_per_threadgroup]]) {
+    const int i = int(tgp.x) * int(tpg2.x) + int(tid2.x);
+    if (i < p.kvDim) dst[(ulong)tgp.y * p.stride + i] = KV(src[(ulong)tgp.y * p.kvDim + i]);
+}
+
+template [[host_name("kv_put")]] kernel decltype(kv_put<float>) kv_put<float>;
+template [[host_name("kv_put_h")]] kernel decltype(kv_put<half>) kv_put<half>;
+
 // ---------------------------------------------------------------------------------------------- 5. mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
 // sg, sg + 8, ...: the 32 lanes stride over dim in float4 steps (each iteration reads 512 contiguous bytes of

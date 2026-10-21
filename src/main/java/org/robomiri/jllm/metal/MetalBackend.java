@@ -210,6 +210,13 @@ public final class MetalBackend implements Backend {
     /** Reads {@code x} (normalizing it with the layer's attention norm), writes the attention output to {@link #att}. */
     private interface AttnStep {
         void run(int layer, int n, int pos, boolean fuseNorm);
+
+        /**
+         * Batched decoding across slots ({@link #forwardBatch}): row t of the n rows of x is one token of
+         * {@code owners[t]}'s conversation at {@code positions[t]}; the projections run over all n rows, RoPE, the
+         * cache store and attention once per row in that owner's cache.
+         */
+        void runRows(int layer, int n, MetalBackend[] owners, int[] positions);
     }
 
     /** Reads {@code x} (normalizing it with the layer's MLP norm), adds the feed-forward output to {@link #x}. */
@@ -703,12 +710,25 @@ public final class MetalBackend implements Backend {
         Metal.Buffer postMlpNorm = L.postMlpNorm() != null ? k.upload(L.postMlpNorm()) : null;
         AttnStep attention = switch (spec.attn()) {
             case Attention.Gqa g -> new GqaStep(g, L.gqa(), attnNorm);
-            case Attention.Mla m -> (layer, n, pos, fuseNorm) -> {
-                if (fuseNorm && MetalKernels.FUSE) { // the projections normalize x themselves (*_norm matmuls)
-                    mla.run(layer, n, pos, x, attnNorm);
-                } else {
+            case Attention.Mla m -> new AttnStep() {
+                @Override
+                public void run(int layer, int n, int pos, boolean fuseNorm) {
+                    if (fuseNorm && MetalKernels.FUSE) { // the projections normalize x themselves (*_norm matmuls)
+                        mla.run(layer, n, pos, x, attnNorm);
+                    } else {
+                        k.rmsnorm(x, 0, attnNorm, xb, n, c.dim());
+                        mla.run(layer, n, pos, xb, null);
+                    }
+                }
+
+                @Override
+                public void runRows(int layer, int n, MetalBackend[] owners, int[] positions) {
                     k.rmsnorm(x, 0, attnNorm, xb, n, c.dim());
-                    mla.run(layer, n, pos, xb, null);
+                    MlaMetal[] caches = new MlaMetal[n];
+                    for (int t = 0; t < n; t++) {
+                        caches[t] = owners[t].mla;
+                    }
+                    mla.runRows(layer, n, caches, positions);
                 }
             };
         };
@@ -818,6 +838,53 @@ public final class MetalBackend implements Backend {
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
                     pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
+        }
+
+        /**
+         * The rows' q, k and v in one projection over the n rows (k and v to the f32 rows rowK / rowV, since every
+         * row goes to another cache), then per row: QK-norm + RoPE of its q row and of its k row into its owner's
+         * cache at its position (rounded to half for f16; for q8 back into rowK), its v row into the cache
+         * (kv_put, or kv_store_q8 together with k), and attention over its owner's cache. The per-row dispatches are
+         * the single-sequence kernels with the row's offsets, so a row computes exactly what the owner's own
+         * decode step would.
+         */
+        @Override
+        public void runRows(int layer, int n, MetalBackend[] owners, int[] positions) {
+            int dim = c.dim();
+            int kvDim = g.kvDim();
+            int hd = g.headDim();
+            boolean q8 = kvDtype == KvDtype.Q8;
+            int stride = kvDtype.rowStride(kvDim, g.kvHeads());
+            long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
+            k.rmsnorm(x, 0, attnNorm, xb, n, dim);
+            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
+            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
+            boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
+            for (int t = 0; t < n; t++) {
+                MetalBackend o = owners[t];
+                int pos = positions[t];
+                long cacheOff = pos * rowBytes;
+                long qOff = (long) t * g.qDim() * 4;
+                long kvOff = (long) t * kvDim * 4;
+                Metal.Buffer kc = o.keyCache[layer];
+                Metal.Buffer vc = o.valCache[layer];
+                k.ropeRow(adjacent, kvHalf, q, qOff, rowK, kvOff, q8 ? rowK : kc, q8 ? kvOff : cacheOff,
+                        useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), kvDim, g.heads(),
+                        g.kvHeads(), pos, 0, rotHalf);
+                if (q8) {
+                    k.kvStoreQ8Row(rowK, kvOff, rowV, kvOff, kc, vc, cacheOff, hd, g.kvHeads());
+                } else {
+                    k.kvPut(kvHalf, rowV, kvOff, vc, cacheOff, kvDim);
+                }
+                if (flashDecode && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
+                    k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
+                            hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                } else {
+                    k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
+                            hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                }
+            }
         }
     }
 
@@ -1412,6 +1479,112 @@ public final class MetalBackend implements Backend {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
                     Math.min(w.lmHead.rows, logits.length));
         }
+    }
+
+    // ------------------------------------------------------------------ batched decoding across slots
+
+    /** {@code -Djllm.metal.batchDecode=false}: no batched passes (the batch group's slots then take turns). */
+    static final boolean BATCH_DECODE = !"false".equals(System.getProperty("jllm.metal.batchDecode"));
+
+    /** The f32 k / v rows of a batched step ([maxBatch, kvDim] each), created by the first batched pass. */
+    private Metal.Buffer rowK;
+    private Metal.Buffer rowV;
+
+    /**
+     * One decode step for each of several slots on these weights, in one pass on this backend's command queue and
+     * activation buffers: the projections, the MLP (dense or MoE, with experts on the CPU too) and the LM head run over
+     * the n rows with the multi-row kernels, so every weight is read once for the whole batch; RoPE, the cache store
+     * and attention run per row in the member's own KV cache at its own position ({@code AttnStep.runRows}). The members
+     * must be idle MetalBackends of the same weights and cache type on the same device, which {@link
+     * org.robomiri.jllm.engine.BatchGroup} guarantees by holding its device lock. Every member's pipelined steps are
+     * drained first.
+     */
+    @Override
+    public boolean forwardBatch(Backend[] members, int[] tokens, int[] positions, float[][] logits) {
+        int n = members.length;
+        if (!BATCH_DECODE || closed || n < 1 || n > maxBatch) {
+            return false;
+        }
+        MetalBackend[] owners = new MetalBackend[n];
+        boolean self = false;
+        for (int t = 0; t < n; t++) {
+            if (!(members[t] instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed
+                    || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)) {
+                return false;
+            }
+            for (int u = 0; u < t; u++) {
+                if (owners[u] == o) {
+                    return false; // one cache cannot take two rows of a batch
+                }
+            }
+            owners[t] = o;
+            self |= o == this;
+        }
+        if (!self) {
+            return false;
+        }
+        for (MetalBackend o : owners) {
+            if (o.pipe != null) {
+                o.pipe.drain(); // never interleave with pipelined steps (of any member: the group lock is held)
+            }
+        }
+        if (arch.attention() instanceof Attention.Gqa g && rowK == null) {
+            rowK = k.scratch((long) maxBatch * g.kvDim() * 4);
+            rowV = k.scratch((long) maxBatch * g.kvDim() * 4);
+        }
+        if (logitsAllBuf == null || logitsAllRows < n) {
+            logitsAllRows = Math.min(maxBatch, Math.max(n, 16)); // lives until the backend closes: size once
+            logitsAllBuf = k.scratch((long) logitsAllRows * w.lmHead.rows * 4);
+        }
+        int dim = c.dim();
+        float[] row = new float[dim];
+        for (int t = 0; t < n; t++) {
+            w.embed.dequantizeRow(tokens[t], row, 0);
+            if (c.embedScale() != 1f) {
+                for (int i = 0; i < dim; i++) {
+                    row[i] *= c.embedScale();
+                }
+            }
+            MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+        }
+        countStep = counts != null && steps++ % COUNT_EVERY == 0;
+        watchThermal();
+        k.begin();
+        boolean committed = false;
+        try {
+            for (int l = 0; l < c.layers(); l++) {
+                LayerPlan L = plans[l];
+                L.attention().runRows(l, n, owners, positions);
+                if (L.postAttnNorm() != null) {
+                    k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
+                    k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
+                } else {
+                    k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias());
+                }
+                L.ffn().run(l, n, false);
+                if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
+                    k.commit();
+                }
+            }
+            k.rmsnorm(x, 0, finalNorm, xb, n, dim);
+            k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsAllBuf, 0, n, false, null, c.finalSoftcap());
+            k.commitAndWait();
+            committed = true;
+        } finally {
+            if (!committed) {
+                k.abort();
+            }
+        }
+        if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
+            rebalanceExperts();
+        } else if (counts != null && System.nanoTime() - lastStatsSave > STATS_SAVE_NANOS) {
+            saveExpertStats(true);
+        }
+        for (int t = 0; t < n; t++) {
+            MemorySegment.copy(logitsAllBuf.contents(), ValueLayout.JAVA_FLOAT, (long) t * w.lmHead.rows * 4, logits[t], 0,
+                    Math.min(w.lmHead.rows, logits[t].length));
+        }
+        return true;
     }
 
     /** Bytes this backend keeps resident on the GPU: the weights given to it (minus experts on the CPU) and its buffers. */

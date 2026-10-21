@@ -19,6 +19,7 @@ public enum KernelParams {
     ATTN_COMBINE("AttnCombineParams", "iii"),
     FLASH("FlashParams", "iiiifiiiif"),
     KV_STORE("KvStoreParams", "iiii"),
+    KV_PUT("KvPutParams", "ii"),
     ROUTER("RouterParams", "iiiii"),
     ROUTER_NORM("RouterNormParams", "iiiiif"),
     ROUTER_DS("RouterDsParams", "iiiiiiiiifi"),

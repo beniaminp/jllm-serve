@@ -481,6 +481,7 @@ public final class Engine implements AutoCloseable {
         Backend.GreedyPipe pipe = sampler.greedyPlain() && !exact && con == null ? backend.greedyPipe(vocab) : null;
         Runnable drainPipe = pipe == null ? null : pipe::drain;
         boolean fromPipe = false; // the next token is the result of the oldest pipelined step
+        long pipeLast = 0;        // when the last pipelined token arrived (the speculator's plain-step cost)
         try {
             while (o.out.size() < maxTokens) {
                 if (cancelled.getAsBoolean()) {
@@ -496,6 +497,13 @@ public final class Engine implements AutoCloseable {
                     System.arraycopy(logits, 0, raw, 0, vocab);
                 }
                 int tok = queued ? ready[rIdx] : fromPipe ? pipe.next() : sampler.sample(logits, con, isStop);
+                if (sp != null) { // consecutive pipelined tokens arrive one plain step apart
+                    long now = fromPipe && !queued ? System.nanoTime() : 0;
+                    if (now != 0 && pipeLast != 0) {
+                        sp.plainStep(now - pipeLast);
+                    }
+                    pipeLast = now;
+                }
                 if (tok < 0) { // the constraint allows no token at all (a vocabulary without the needed bytes)
                     o.finish = "stop";
                     break;
@@ -553,7 +561,11 @@ public final class Engine implements AutoCloseable {
                         fromPipe = true;
                     } else {
                         one[0] = tok;
+                        long t = sp != null ? System.nanoTime() : 0;
                         backend.forward(one, 0, 1, pos, logits);
+                        if (sp != null) {
+                            sp.plainStep(System.nanoTime() - t);
+                        }
                         pos++;
                     }
                 }

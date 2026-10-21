@@ -1137,4 +1137,97 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.GATE).i(dim);
         dispatch("shared_gate_add", 4, 0, n, 1, 1, ROW_THREADS, 1, 1);
     }
+
+    // ---------------------------------------------------------------- batched decoding across slots (one row each)
+    // MetalBackend.forwardBatch: the projections and the MLP run over the n rows of a batch at once (the writers
+    // above), while RoPE, the cache store and attention run once per row, each in its own conversation's cache at its
+    // own position. These are the kernels of the single-sequence writers above, dispatched for one token whose
+    // activation rows start at a byte offset (qOff, outOff, ...) instead of row 0.
+
+    /** {@link #rope} for the one token at pos whose q row starts at byte {@code qOff} of q. */
+    void ropeRow(boolean adjacent, boolean kHalf, Metal.Buffer q, long qOff, Metal.Buffer kSrc, long kSrcOff,
+                 Metal.Buffer kOut, long kOutOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin,
+                 int headDim, int qStride, int kvStride, int nHeads, int nKHeads, int pos, int rotOff, int rotHalf) {
+        bind(0, q, qOff);
+        bind(1, kSrc, kSrcOff);
+        bindOrDummy(2, qw);
+        bindOrDummy(3, kw);
+        bind(4, cos, 0);
+        bind(5, sin, 0);
+        bind(6, kOut, kOutOff);
+        p.reset(KernelParams.ROPE).i(headDim).i(qStride).i(kvStride).i(nHeads).i(pos).f(eps).i(qw != null).i(rotOff).i(rotHalf);
+        dispatch((adjacent ? "rope_il" : "rope") + (kHalf && nKHeads > 0 ? "_h" : ""), 7, 0,
+                nHeads + nKHeads, 1, 1, rotHalf, 1, 1);
+    }
+
+    /** {@link #attention} of the one token at pos whose q row starts at byte qOff; its output row goes to byte outOff. */
+    void attentionRow(String kernel, int groups, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
+                      Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
+                      int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
+                      float softcap) {
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, outOff);
+        bind(4, scores, 0);
+        p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
+                .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(0).f(softcap);
+        dispatch(kernel, 5, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
+    }
+
+    /** {@link #flashAttention} of the one token at pos whose q row starts at byte qOff; its output row goes to outOff. */
+    void flashAttentionRow(KvDtype kv, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
+                           Metal.Buffer scores, Metal.Buffer out, long outOff, int nHeads, int nKvHeads, int headDim,
+                           int pos, int ctx, float scale, int qStride, int kvStride, int window, float softcap) {
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int keys = len - first;
+        int nSplit = Math.min(FLASH_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
+        int chunk = (keys + nSplit - 1) / nSplit;
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, scores, 0);
+        p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
+                .i(window).f(softcap).i(nSplit).i(chunk);
+        dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        bind(0, part, 0);
+        bind(1, out, outOff);
+        p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+        dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** {@link #kvStoreQ8} of one token: its f32 staging rows at bytes kOff / vOff, its cache rows at byte offset off. */
+    void kvStoreQ8Row(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                      long off, int headDim, int kvHeads) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads));
+        dispatch("kv_store_q8", 4, 0, 2 * kvHeads, 1, 1, 32, 1, 1);
+    }
+
+    /**
+     * {@code kv_put}: copies the f32 row of kvDim values at byte srcOff of src into the cache row at byte dstOff of dst,
+     * rounded to half when {@code half} (the f16 cache).
+     */
+    void kvPut(boolean half, Metal.Buffer src, long srcOff, Metal.Buffer dst, long dstOff, int kvDim) {
+        bind(0, src, srcOff);
+        bind(1, dst, dstOff);
+        p.reset(KernelParams.KV_PUT).i(kvDim).i(kvDim);
+        dispatch(half ? "kv_put_h" : "kv_put", 2, 0, channelGrid(kvDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** {@link #mlaLatStore} of one token: its latent row at byte latOff, its k_pe row at kpeOff, its cache row at off. */
+    void mlaLatStoreRow(KvDtype kv, Metal.Buffer lat, long latOff, Metal.Buffer kpe, long kpeOff, Metal.Buffer cache,
+                        long off, Attention.Mla m) {
+        bind(0, lat, latOff);
+        bind(1, kpe, kpeOff);
+        bind(2, cache, off);
+        mlaParams(m);
+        dispatch("mla_lat_store" + kvSuffix(kv), 3, 0, 1, 1, 1, CHANNEL_THREADS, 1, 1);
+    }
 }

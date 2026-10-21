@@ -18,7 +18,8 @@ import java.util.Set;
  * agents, whose output keeps copying what is already in the context (lines of a file the agent read, the shape of
  * earlier tool calls): every n-gram of the history is kept in a hash index ({@link NgramIndex}), so an occurrence
  * any distance back is found in constant time, the longest match wins, and the number of drafted tokens adapts to
- * the acceptance rate (doubling while whole drafts are accepted, falling back to what was accepted otherwise). Both propose a deterministic
+ * the acceptance rate (doubling while whole drafts are accepted, falling back to what was accepted otherwise; for a draft
+ * model, once measured, the length that {@link CostModel} finds fastest, or none). Both propose a deterministic
  * sequence, so the proposal distribution is one-hot and the acceptance rule of speculative sampling reduces to
  * {@link Sampler#verify}: greedy decoding accepts a draft token iff it is the target's argmax (the output is
  * the non-speculative output), sampled decoding accepts it with probability p(token) and otherwise draws from p
@@ -178,7 +179,10 @@ public final class Speculator implements AutoCloseable {
      */
     public boolean step(int tok, int pos, int ctxLimit, int room, Sampler sampler, Runnable beforeVerify,
                         TokenConstraint con) {
-        int want = Math.min(Math.min(kNow, room - 1), ctxLimit - pos - 1);
+        // a draft model: the length the measured costs and acceptance rate make best (-1: not measured yet, then the
+        // doubling rule below; 0: speculation does not pay at all right now)
+        int best = cfg.mode() == Mode.DRAFT && adaptive ? cost.bestK(maxDrafts) : -1;
+        int want = Math.min(Math.min(best > 0 ? best : kNow, room - 1), ctxLimit - pos - 1);
         if (want < 1) {
             return false;
         }
@@ -186,7 +190,15 @@ public final class Speculator implements AutoCloseable {
             cooldown--;
             return false;
         }
+        if (best == 0 && ++unprofitable % PROBE_EVERY != 0) {
+            cooldown = PLAIN_STEPS - 1; // plain steps (which also re-measure their cost), then look again
+            return false;
+        }                               // (every PROBE_EVERY-th time a pass is tried anyway: the text may have changed)
+        long t0 = System.nanoTime();
         int m = cfg.mode() == Mode.NGRAM ? lookup(want) : draft.propose(hist, len, want, drafts, vocab, stopIds);
+        if (draft != null && draft.lastSteps() > 0) {
+            cost.draft(System.nanoTime() - t0, draft.lastSteps());
+        }
         TokenConstraint[] at = null; // at[j]: the constraint after tok, d1..dj
         if (con != null && m >= 1) {
             at = forks;
@@ -218,8 +230,11 @@ public final class Speculator implements AutoCloseable {
         if (beforeVerify != null) {
             beforeVerify.run();
         }
+        long t1 = System.nanoTime();
         target.forwardAll(feed, 0, m + 1, pos, rows, stride);
+        cost.verify(m + 1, System.nanoTime() - t1);
         int acc = 0;
+        int examined = 0;
         readyCount = 0;
         for (int j = 0; j <= m; j++) {
             System.arraycopy(rows, j * stride, row, 0, stride);
@@ -231,6 +246,7 @@ public final class Speculator implements AutoCloseable {
                         : sampler.sample(row, at[j], stopIds::contains);
             }
             ready[readyCount++] = s;
+            examined += j < m ? 1 : 0;
             if (s < 0) {
                 break; // the constraint allows nothing (the engine ends the output there)
             }
@@ -244,6 +260,7 @@ public final class Speculator implements AutoCloseable {
             }
             break;
         }
+        cost.acceptance(acc, examined);
         // whole draft accepted: try longer ones next time; else as many as this text supported
         kNow = acc == m ? Math.min(maxDrafts, Math.max(kNow, 2 * m)) : Math.max(1, Math.min(kNow, acc + 1));
         if (acc > 0) {
@@ -256,6 +273,127 @@ public final class Speculator implements AutoCloseable {
         draftedTotal += m;
         acceptedTotal += acc;
         return true;
+    }
+
+    /**
+     * The time of a plain single-token step of the target (the engine reports the steps it takes without a draft), the
+     * baseline a speculative pass has to beat.
+     */
+    public void plainStep(long nanos) {
+        cost.plain(nanos);
+    }
+
+    /** {@code -Djllm.engine.adaptiveDraft=false}: a draft model's length follows the doubling rule only. */
+    private final boolean adaptive = !"false".equals(System.getProperty("jllm.engine.adaptiveDraft"));
+    /** Plain steps taken when the cost model says speculation does not pay, before it is asked again. */
+    static final int PLAIN_STEPS = 16;
+    /** One in this many "does not pay" decisions runs a pass anyway, so a change in acceptance is noticed. */
+    static final int PROBE_EVERY = 4;
+
+    private final CostModel cost = new CostModel();
+    private int unprofitable;
+
+    /** The draft length the cost model would choose now, -1 before it has measurements (for tests and logs). */
+    public int modelDraftLength() {
+        return cost.bestK(maxDrafts);
+    }
+
+    /**
+     * Chooses a draft model's draft length from measured costs. With per-token acceptance probability α (drafts are
+     * accepted left to right until the first miss), a pass with k drafts yields on average
+     * {@code E(k) = 1 + α + α² + … + α^k} tokens (the accepted prefix plus the target's own token) and costs
+     * {@code k · d + V(k + 1)}: k draft steps of d each and one verification pass over k + 1 positions, modelled as
+     * {@code V(n) = a + b (n − 1)}. The best k maximizes {@code E(k) / (k d + a + b k)}; when even that is below the
+     * plain decoding rate {@code 1 / p} (p a plain step), speculation is paused. α, d, p, a and b are exponentially
+     * weighted (recent passes count most): α from the accepted and examined positions of every pass, d from the draft's
+     * time per step, p from the plain steps the engine reports, a and b by least squares over the verification passes
+     * (the pass lengths vary with the doubling rule and with early stops; with too little spread, a is the plain step
+     * and b what remains).
+     */
+    static final class CostModel {
+        private static final double DECAY = 0.9;
+        private static final double PRIOR_B = 0.36; // a pass's extra cost per position as a share of a, before data
+        private double acc = 1.2;                   // prior: alpha 0.6 over two positions
+        private double exam = 2.0;
+        private double draftNs = -1;
+        private double plainNs = -1;
+        private double s0, s1, s2, sy, s1y;          // weighted sums of x = n - 1 and y = V(n)
+        private int passes;
+
+        void acceptance(int accepted, int examined) {
+            acc = DECAY * acc + accepted;
+            exam = DECAY * exam + examined;
+        }
+
+        void draft(long nanos, int steps) {
+            double v = nanos / (double) steps;
+            draftNs = draftNs < 0 ? v : 0.8 * draftNs + 0.2 * v;
+        }
+
+        void plain(long nanos) {
+            plainNs = plainNs < 0 ? nanos : 0.8 * plainNs + 0.2 * nanos;
+        }
+
+        void verify(int n, long nanos) {
+            double x = n - 1;
+            s0 = DECAY * s0 + 1;
+            s1 = DECAY * s1 + x;
+            s2 = DECAY * s2 + x * x;
+            sy = DECAY * sy + nanos;
+            s1y = DECAY * s1y + x * nanos;
+            passes++;
+        }
+
+        double alpha() {
+            return Math.min(0.99, Math.max(0.0, acc / exam));
+        }
+
+        /** {a, b} of V(n) = a + b (n - 1). */
+        double[] fit() {
+            double mx = s1 / s0;
+            double my = sy / s0;
+            double var = s2 / s0 - mx * mx;
+            double a;
+            double b;
+            if (var > 0.25) {
+                b = (s1y / s0 - mx * my) / var;
+                a = my - b * mx;
+            } else if (plainNs > 0) {
+                a = Math.min(plainNs, my);
+                b = mx > 0 ? (my - a) / mx : PRIOR_B * a;
+            } else {
+                a = my / (1 + PRIOR_B * mx);
+                b = PRIOR_B * a;
+            }
+            if (!(a > 0)) {
+                a = Math.max(my / (1 + mx), 1);
+            }
+            return new double[]{a, Math.max(0, b)};
+        }
+
+        /** The best draft length in [1, max], 0 when no length beats plain decoding, -1 before there is data. */
+        int bestK(int max) {
+            if (passes < 2 || draftNs < 0) {
+                return -1;
+            }
+            double[] ab = fit();
+            double alpha = alpha();
+            double plain = plainNs > 0 ? plainNs : ab[0];
+            double bestRate = 1.0 / plain;
+            int best = 0;
+            double e = 1;
+            double ak = 1;
+            for (int k = 1; k <= max; k++) {
+                ak *= alpha;
+                e += ak;
+                double rate = e / (k * draftNs + ab[0] + ab[1] * k);
+                if (rate > bestRate) {
+                    bestRate = rate;
+                    best = k;
+                }
+            }
+            return best;
+        }
     }
 
     /** Tokens decided by the last {@link #step}: the accepted drafts, then one token the target chose itself. */

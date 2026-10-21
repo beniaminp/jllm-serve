@@ -95,6 +95,9 @@ final class SpeculationTest {
     static void run(Path dir) throws Exception {
         int bad = org.robomiri.jllm.engine.NgramIndexCheck.run();
         check(bad == 0, "n-gram index finds the latest earlier occurrence like a brute-force search (" + bad + " mismatches)");
+        List<String> cost = org.robomiri.jllm.engine.CostModelCheck.run();
+        check(cost.isEmpty(), "the draft-length cost model fits the pass cost and picks the fastest length, or none "
+                + (cost.isEmpty() ? "" : cost.toString()));
         samplerVerify();
         engine(dir);
     }
