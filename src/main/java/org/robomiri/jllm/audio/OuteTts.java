@@ -35,7 +35,6 @@ import java.util.Map;
 public final class OuteTts implements SpeechModel {
 
     private static final int AUDIO_CODES = 4100;     // <|0|> .. <|4099|> (the codebook has 4096 entries)
-    private static final String DEFAULT_VOICE = "en_male_1";
     private static final int MAX_ATTEMPTS = 3;
     private static final boolean TRACE = Boolean.getBoolean("jllm.audio.trace");
 
@@ -224,7 +223,7 @@ public final class OuteTts implements SpeechModel {
 
     @Override
     public float[] synthesize(String text, String voice, Options o) {
-        String v = voice == null || voice.isBlank() ? (speakers.containsKey(DEFAULT_VOICE) ? DEFAULT_VOICE
+        String v = voice == null || voice.isBlank() ? (speakers.containsKey(cfg.ttsVoice()) ? cfg.ttsVoice()
                 : speakers.keySet().stream().findFirst().orElse(null)) : voice;
         int[] ids = tok.encode(prompt(text, v), true);
         int maxNew = Math.min(o.maxFrames() > 0 ? o.maxFrames() * 2 : 4096, ctx - ids.length - 8);

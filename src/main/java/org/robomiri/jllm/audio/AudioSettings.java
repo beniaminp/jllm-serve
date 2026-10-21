@@ -8,7 +8,7 @@ import org.robomiri.jllm.config.Settings;
  */
 public record AudioSettings(String backend, String metalDecoder, int threads, long residentMb, String ffmpeg, double maxSeconds, long maxUploadBytes,
                             int ttsMaxChars, String ttsQuant, int ttsCtx, String ttsModel, String sttModel, String codecRepo, String codecFile,
-                            boolean ttsTrim, double ttsTemperature, int ttsTopK, double ttsTopP, double ttsRepetitionPenalty,
+                            String ttsVoice, boolean ttsTrim, double ttsTemperature, int ttsTopK, double ttsTopP, double ttsRepetitionPenalty,
                             boolean sttFallback, boolean sttConditionOnPrevious) {
 
     public static AudioSettings of(Settings s) {
@@ -51,7 +51,7 @@ public record AudioSettings(String backend, String metalDecoder, int threads, lo
                 "must be the name of a .gguf file");
         return new AudioSettings(backend, metalDecoder, threads, resident, ffmpeg, maxSeconds, upload << 20, chars, quant, ttsCtx,
                 s.get("audio.tts-model").trim(), s.get("audio.stt-model").trim(), s.get("audio.codec-repo").trim(), codecFile,
-                s.getBool("audio.tts.trim-silence"), temp, topK, topP, rep, s.getBool("audio.stt.fallback"), s.getBool("audio.stt.condition-on-previous"));
+                s.get("audio.tts.voice").trim(), s.getBool("audio.tts.trim-silence"), temp, topK, topP, rep, s.getBool("audio.stt.fallback"), s.getBool("audio.stt.condition-on-previous"));
     }
 
     private static void require(boolean ok, Settings s, String key, String what) {

@@ -393,6 +393,7 @@ en_male_1 --out hello.wav [--speed 1.2]` do the same from a terminal and print t
 | `audio.stt-model`, `audio.tts-model` | empty | models `./jllm serve` loads at start |
 | `audio.codec-repo`, `audio.codec-file` | `ggml-org/WavTokenizer`, `WavTokenizer-Large-75-F16.gguf` | the codec |
 | `audio.tts.quant`, `audio.tts.ctx` | `q8`, `8192` | the speech language model's weights and context |
+| `audio.tts.voice` | `en_male_1` | the voice when a request names none |
 | `audio.tts.trim-silence` | `true` | cut the silence around the generated speech |
 | `audio.tts.temperature`, `.top-k`, `.top-p`, `.repetition-penalty` | `0.1`, `40`, `0.9`, `1.1` | its sampling |
 | `audio.stt.fallback`, `audio.stt.condition-on-previous` | `true`, `true` | Whisper's decoding behaviour (21.4) |
