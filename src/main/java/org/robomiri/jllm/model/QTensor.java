@@ -159,6 +159,44 @@ public final class QTensor {
         return new QTensor(type, rows, cols, data);
     }
 
+    /**
+     * The experts {@code experts} of a stacked expert tensor ({@code rowsPerExpert} rows per expert), copied in that
+     * order into new page-aligned memory from {@code arena}: rows {@code [i·rowsPerExpert, (i+1)·rowsPerExpert)} of the
+     * result are expert {@code experts[i]}. The layout is this tensor's (the engine's blocks then scales, or a GGUF
+     * view's contiguous blocks); a split GGUF gate | up tensor is packed view by view.
+     */
+    public QTensor gatherExperts(Arena arena, int[] experts, int rowsPerExpert) {
+        if (second != null) {
+            if (interleave == 0 || rowsPerExpert != 2 * interleave) {
+                throw new IllegalArgumentException("not a split expert tensor of " + rowsPerExpert + " rows per expert");
+            }
+            return split(head.gatherExperts(arena, experts, interleave), second.gatherExperts(arena, experts, interleave),
+                    interleave);
+        }
+        int rows = experts.length * rowsPerExpert;
+        long rowBytes = (long) blocksPerRow() * type.blockBytes;
+        long blockRun = rowsPerExpert * rowBytes;
+        if (type.gguf) {
+            long size = rows * rowBytes;
+            MemorySegment seg = arena.allocate(align(Math.max(size, 1), PAGE), PAGE).asSlice(0, size);
+            for (int i = 0; i < experts.length; i++) {
+                MemorySegment.copy(data, rowOffset(experts[i] * rowsPerExpert), seg, i * blockRun, blockRun);
+            }
+            return mapped(type, rows, cols, seg);
+        }
+        MemorySegment seg = arena.allocate(byteSize(type, rows, cols), PAGE);
+        QTensor t = new QTensor(type, rows, cols, seg);
+        long scaleRun = (long) rowsPerExpert * blocksPerRow() * type.scaleBytes;
+        for (int i = 0; i < experts.length; i++) {
+            int r = experts[i] * rowsPerExpert;
+            MemorySegment.copy(data, rowOffset(r), seg, t.rowOffset(i * rowsPerExpert), blockRun);
+            if (scaleRun > 0) {
+                MemorySegment.copy(data, scaleOffset(r), seg, t.scaleOffset(i * rowsPerExpert), scaleRun);
+            }
+        }
+        return t;
+    }
+
     /** True if this tensor is a view of a GGUF file's bytes (not the engine's page-padded layout). */
     public boolean isMapped() {
         return type.gguf;

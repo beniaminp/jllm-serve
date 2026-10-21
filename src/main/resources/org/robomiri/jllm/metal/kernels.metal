@@ -1573,6 +1573,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
     const int row = int(tgp.x) * nsg + sg;
     if (row >= m) return;
     const int s = int(tgp.y);
+    if (assign[s] < 0) return; // an expert left on the CPU (moe_remap)
     const int t = s / p.topK;
     // GGUF types: gate and up experts are two [experts * m, cols] views (wq, and buffer(1) = ws), same row in both
     const ulong growG = QT >= GG_FIRST ? (ulong)assign[s] * m + row : (ulong)assign[s] * p.rowsPerExpert + row;
@@ -1592,6 +1593,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
 }
 
 // moe_down: x[t, row] += sum_k rw[t,k] * (W_{assign[t,k]}[row] . h[t*topK + k]). rowsPerExpert = dim.
+// A slot whose assign is -1 (moe_remap: its expert runs on the CPU) is skipped here and in moe_up / moe_combine.
 // Grid: (ceil(dim / simdgroups), ntok). Looping over k inside keeps a single writer per (t, row).
 
 template <int QT>
@@ -1613,6 +1615,7 @@ kernel void moe_down(device const uchar *wq [[buffer(0)]],
     float total = 0.0f;
     for (int k = 0; k < p.topK; k++) {
         const int s = t * p.topK + k;
+        if (assign[s] < 0) continue; // computed by the CPU
         const ulong grow = (ulong)assign[s] * p.rowsPerExpert + row;
         device const float4 *h4 = (device const float4 *)(h + (ulong)s * p.cols);
         float acc = 0.0f;
@@ -1762,18 +1765,49 @@ kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
     }
 }
 
-// x[t, row] += sum_k ys[t * topK + k, row], k ascending. Grid: (ceil(dim / ROW_THREADS), ntok).
+// x[t, row] += sum_k ys[t * topK + k, row], k ascending, over the slots with an expert on the GPU (moe_sort leaves
+// the others out, so their ys rows are not written). Grid: (ceil(dim / ROW_THREADS), ntok).
 kernel void moe_combine(device const float *ys [[buffer(0)]],
-                        device float *x [[buffer(1)]],
-                        constant MoeParams &p [[buffer(2)]],
+                        device const int *assign [[buffer(1)]],
+                        device float *x [[buffer(2)]],
+                        constant MoeParams &p [[buffer(3)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort tid [[thread_index_in_threadgroup]]) {
     const int row = int(tgp.x) * ROW_THREADS + tid;
     if (row >= p.rowsPerExpert) return;
     const int t = int(tgp.y);
     float total = 0.0f;
-    for (int k = 0; k < p.topK; k++) total += ys[((ulong)t * p.topK + k) * p.rowsPerExpert + row];
+    for (int k = 0; k < p.topK; k++) {
+        const ulong s = (ulong)t * p.topK + k;
+        if (assign[s] >= 0) total += ys[s * p.rowsPerExpert + row];
+    }
     x[(ulong)t * p.rowsPerExpert + row] += total;
+}
+
+// ---- hot experts on the GPU, cold ones on the CPU (backend.metal.cpu-moe)
+// moe_remap: gassign[s] = map[assign[s]], the slot's expert in the layer's packed GPU copy of its hot experts, or -1
+// when the expert stays on the CPU (the MoE kernels above skip those slots); and counts[e] += how many of the slots
+// chose expert e, the usage the placement of the next load is planned from. One threadgroup; each thread counts its
+// own experts over all slots, so no atomics are needed and the counts are exact.
+
+struct MoeRemapParams {
+    int slots;       // ntok * topK
+    int experts;
+};
+
+kernel void moe_remap(device const int *assign [[buffer(0)]],
+                      device const int *map [[buffer(1)]],
+                      device int *gassign [[buffer(2)]],
+                      device uint *counts [[buffer(3)]],
+                      constant MoeRemapParams &p [[buffer(4)]],
+                      ushort tid [[thread_index_in_threadgroup]],
+                      ushort tpg [[threads_per_threadgroup]]) {
+    for (int s = tid; s < p.slots; s += tpg) gassign[s] = map[assign[s]];
+    for (int e = tid; e < p.experts; e += tpg) {
+        uint c = 0;
+        for (int s = 0; s < p.slots; s++) c += assign[s] == e ? 1u : 0u;
+        counts[e] += c;
+    }
 }
 
 typedef decltype(moe_up_mma<4>) moe_up_mma_t;

@@ -44,7 +44,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
-| Experts on the CPU | an MoE model too big for the GPU's memory budget keeps a few layers' experts on the CPU, chosen automatically, instead of paging | [08 §8.18](docs/08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe) |
+| Hot experts on the GPU, cold on the CPU | an MoE model too big for the GPU's memory budget leaves its rarely used experts (learned from your own usage) on the CPU, which computes them alongside the GPU, instead of paging | [08 §8.18](docs/08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
 The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
@@ -275,8 +275,8 @@ exit status 2. `prompt`, `raw` and `config` are command line flags only and are 
 Notable keys besides the usual ones: `backend.kv-dtype` (`f32` or `f16`), `backend.cpu.int8-activations`
 (default `true`; the CPU quantizes activations to int8 for integer dot products, several times faster decode but
 ~1 % different numerics; `false` gives results identical to Metal), `engine.max-prompt-bytes`, `hub.timeout-ms`
-`backend.metal.cpu-moe` (`auto`: MoE experts of just enough layers run on the CPU when the model exceeds
-Metal's working set; `off`, `all` or a number of layers) and the `server.*` limits listed under Security below.
+`backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
+the CPU; `off`, `all` or a number of whole layers) and the `server.*` limits listed under Security below.
 
 Short flags:
 

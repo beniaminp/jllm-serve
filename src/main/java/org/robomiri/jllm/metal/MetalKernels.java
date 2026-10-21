@@ -622,9 +622,24 @@ final class MetalKernels implements AutoCloseable {
                 MM_THREADS, 1, 1);
 
         bind(0, ys, 0);
-        bind(1, x, 0);
+        bind(1, assign, 0);
+        bind(2, x, 0);
         p.reset(KernelParams.MOE).i(dim).i(moeDim).i(topK);
-        dispatch("moe_combine", 2, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
+        dispatch("moe_combine", 3, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * gassign[s] = map[assign[s]] (the expert's index among the layer's GPU experts, or -1 for one on the CPU) for the
+     * n * topK slots, and counts[e] += the slots that chose expert e (moe_remap).
+     */
+    void moeRemap(Metal.Buffer assign, Metal.Buffer map, Metal.Buffer gassign, Metal.Buffer counts, int experts, int topK,
+                  int n) {
+        bind(0, assign, 0);
+        bind(1, map, 0);
+        bind(2, gassign, 0);
+        bind(3, counts, 0);
+        p.reset(KernelParams.MOE_REMAP).i(n * topK).i(experts);
+        dispatch("moe_remap", 4, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */

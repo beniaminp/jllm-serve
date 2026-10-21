@@ -12,8 +12,9 @@ import java.util.Arrays;
  * <pre>
  *     x[t] += Σ_k routeWeight[t·topK + k] · down_e(silu(gate_e(xb[t])) · up_e(xb[t])),    e = assign[t·topK + k]
  * </pre>
- * {@link CpuBackend} runs its MoE layers through it, and the Metal backend runs the layers whose experts it leaves in
- * CPU memory ({@code backend.metal.cpu-moe}) through its own instance. One instance is used by one thread at a time
+ * {@link CpuBackend} runs its MoE layers through it, and the Metal backend runs the experts it leaves in CPU memory
+ * ({@code backend.metal.cpu-moe}) through its own instance. A slot whose {@code assign} is -1 is skipped (its expert
+ * is computed elsewhere: the GPU's share of a layer whose experts are split between the two). One instance is used by one thread at a time
  * (its scratch is shared by the calls); the work inside a call is spread over the pool.
  */
 public final class MoeExperts {
@@ -72,7 +73,8 @@ public final class MoeExperts {
                 for (int i = i0; i < i1; i++) {
                     int k = i / gu;
                     int r = i - k * gu;
-                    gateUp[i] = mm.int8Dot(expGateUp, assign[ao + k] * gu + r, xq, xs, 0);
+                    int e = assign[ao + k];
+                    gateUp[i] = e < 0 ? 0f : mm.int8Dot(expGateUp, e * gu + r, xq, xs, 0);
                 }
             });
         } else {
@@ -80,7 +82,8 @@ public final class MoeExperts {
                 for (int i = i0; i < i1; i++) {
                     int k = i / gu;
                     int r = i - k * gu;
-                    gateUp[i] = VectorKernels.dotRow(expGateUp, assign[ao + k] * gu + r, xb, xo);
+                    int e = assign[ao + k];
+                    gateUp[i] = e < 0 ? 0f : VectorKernels.dotRow(expGateUp, e * gu + r, xb, xo);
                 }
             });
         }
@@ -99,7 +102,10 @@ public final class MoeExperts {
                 for (int r = r0; r < r1; r++) {
                     float sum = 0;
                     for (int k = 0; k < topK; k++) {
-                        sum += routeWeight[ao + k] * mm.int8Dot(expDown, assign[ao + k] * dim + r, xq, xs, k * m);
+                        int e = assign[ao + k];
+                        if (e >= 0) {
+                            sum += routeWeight[ao + k] * mm.int8Dot(expDown, e * dim + r, xq, xs, k * m);
+                        }
                     }
                     x[xo + r] += sum;
                 }
@@ -109,7 +115,10 @@ public final class MoeExperts {
                 for (int r = r0; r < r1; r++) {
                     float sum = 0;
                     for (int k = 0; k < topK; k++) {
-                        sum += routeWeight[ao + k] * VectorKernels.dotRow(expDown, assign[ao + k] * dim + r, hidden, k * m);
+                        int e = assign[ao + k];
+                        if (e >= 0) {
+                            sum += routeWeight[ao + k] * VectorKernels.dotRow(expDown, e * dim + r, hidden, k * m);
+                        }
                     }
                     x[xo + r] += sum;
                 }
@@ -129,7 +138,11 @@ public final class MoeExperts {
 
         Arrays.fill(expertStart, 0, experts + 1, 0);
         for (int s = 0; s < slots; s++) {
-            expertStart[assign[s] + 1]++;
+            if (assign[s] >= 0) {
+                expertStart[assign[s] + 1]++;
+            } else {
+                Arrays.fill(down, s * dim, (s + 1) * dim, 0f); // a skipped slot adds nothing in the combine
+            }
         }
         int used = 0;
         for (int i = 0; i < experts; i++) {
@@ -140,7 +153,9 @@ public final class MoeExperts {
             expertFill[i] = expertStart[i];
         }
         for (int s = 0; s < slots; s++) {
-            slotOrder[expertFill[assign[s]]++] = s;
+            if (assign[s] >= 0) {
+                slotOrder[expertFill[assign[s]]++] = s;
+            }
         }
 
         expertMatmul(w.expGateUp(), gu, used, topK, xb, dim, false, gateUp, gu);

@@ -917,45 +917,85 @@ routed experts are nearly all the bytes (Qwen3-30B-A3B at Q4_0: about 18 of 19.4
 experts out of the GPU's buffers is the cheapest way to fit. Those experts stay in the memory-mapped file and the
 CPU reads them like any file data.
 
-**Which layers.** With `L` the set of layers whose experts go to the CPU, `W` the weights, `B` the GPU's own buffers
-(KV cache, activations) and `E_l` the expert bytes of layer `l`, the GPU keeps
+**How much must move.** With `W` the weights, `B` the GPU's own buffers (KV cache, activations) and `b_l` the
+bytes of one expert of layer `l`, leaving the set `C` of (layer, expert) pairs on the CPU keeps
 
 ```
-G(L) = W + B − Σ_{l ∈ L} E_l
+G(C) = W + B − Σ_{(l,e) ∈ C} b_l          on the GPU, and C is chosen so that G(C) ≤ working set
 ```
 
-`auto` (the default) takes the last MoE layers one by one until `G(L) ≤ working set`, so `L` is empty and nothing
-changes for a model that fits. A number takes that many MoE layers (the last ones), `all` every one, `off` none.
-`-Djllm.metal.workingSetGb=N` replaces Metal's figure, for example to leave memory to other programs. The start-up
-log says what was chosen: `Metal: the experts of 6 of 48 MoE layers run on the CPU (2.3 GB, 10 threads); GPU share …`.
+`auto` (the default) moves nothing when the model fits. `-Djllm.metal.workingSetGb=N` replaces Metal's figure, for
+example to leave memory to other programs. A number (`backend.metal.cpu-moe=6`) puts every expert of that many MoE
+layers on the CPU, `all` all of them, `off` none.
 
-**One CPU layer, step by step.** The GPU runs the attention, the FFN norm and the router as usual; then
+**Which experts: the hot ones stay on the GPU.** 🧸 In the kitchen, a few recipes are cooked all day and most
+almost never. The fast cook keeps the popular pages on his table and gives the second cook the pages nobody orders.
+The second cook is then rarely needed, although the same number of pages left the table.
 
-```
-GPU:  … attention, norm, router ┃                                ┃ next layer …
-CPU:                            ┃ x += Σ_k w_k · expert_k(xb)    ┃
-                         commit + wait                     add, begin
-```
-
-The CPU copies `xb` (n × dim floats), the router's choices and weights out of the shared buffers, runs the
-experts with the CPU backend's own code (`cpu/MoeExperts`, the same code `CpuBackend` uses: the single-token path
-with int8 activations for decode, the expert-grouped path for prefill chunks) and adds the result into `x`. The GPU
-is idle meanwhile, except for one overlap: when the layer has **shared experts** (DeepSeek), they are submitted in
-their own command buffer and run on the GPU while the CPU computes the routed experts.
-
-**Cost.** Per token and CPU layer, the CPU reads `topK · 3 · moeDim · dim` weights:
+📐 Routers are skewed: in a layer of 128 experts a minority takes most of the picks. If `p(l,e)` is how often a token
+picks expert `e` of layer `l` (`Σ_e p(l,e) = topK`), moving it costs about `p(l,e) · b_l / BW_cpu` per token: a
+never-picked expert costs nothing. But every layer with at least one CPU expert costs a GPU → CPU → GPU round trip
+`S` per step, picked or not. `ExpertPlacement.plan` minimizes
 
 ```
-Qwen3-30B-A3B, Q4_0 (16 B of nibbles + a 4 B scale per 32 weights = 0.625 B):  8 · 3 · 768 · 2048 · 0.625 B ≈ 24 MB
+cost(C) = S · |{ layers with a CPU expert }|  +  Σ_{(l,e) ∈ C} p(l,e) · b_l / BW_cpu
 ```
 
-At a CPU memory bandwidth of 60–100 GB/s that is roughly 0.25–0.4 ms, plus one command-buffer round trip
-(≈ 0.1 ms), against ≈ 0.15 ms on the GPU. Each CPU layer therefore costs about 0.2–0.35 ms more per token, under 1 %
-of a 40 ms token. Paging the same 24 MB back from an SSD at ~5 GB/s would cost about 5 ms. Prefill is a different
-story: the GPU's grouped matrix kernels are much faster than the CPU on long chunks, so long prompts slow down
-more. These numbers are estimates, not yet measured on a Mac. Pipelined decoding ([8.16](#816-pipelined-greedy-decoding))
-is off when any layer runs on the CPU, because the GPU cannot run ahead of it.
+with `S` = 100 µs and `BW_cpu` = 60 GB/s (estimates; `-Djllm.metal.cpuMoeSyncUs` changes `S`). It works greedily,
+taking the move with the lowest cost per byte freed: either the next-coldest expert of a layer that already has CPU
+experts, or opening a new layer with its `k` coldest experts (the round trip shared by the `k`). The usage `p` comes
+from earlier runs: counts plus one per expert, so a model without statistics looks uniform. With uniform usage,
+filling one layer is always cheaper than opening another, so the plan is **whole layers**; with real usage it
+moves the cold experts of a few layers instead. The start-up log shows both the bytes and the expected share of
+picks on the CPU:
 
-**Checked by** `scripts/arch-smoke.sh` on the emulator: Qwen3-MoE and the three DeepSeek models generate the same
-tokens with the experts of one layer and of every layer on the CPU as with the CPU backend, and the final logits
-agree within the usual CPU / Metal tolerance.
+```
+Metal: 2.3 GB of experts run on the CPU (10 threads): 0 of 48 MoE layers entirely, 3 in part
+(placed by the usage of earlier runs); expected share of expert picks on the CPU 4 %; GPU share …
+```
+
+**Where the usage comes from.** While any expert is on the CPU, a small kernel after each router, `moe_remap`,
+counts the picks per expert, one thread per expert over the step's slots, so the counts are exact and need no
+atomics. The backend adds them to `~/.cache/jllm/expert-usage/<model>.txt` (one line per MoE layer, halved once a
+layer passes 2³⁰ picks) every ten minutes and when it closes. The first run of a model that does not fit therefore
+moves whole layers; later runs place the experts from how you actually use it (code, chat, another language),
+improving as the counts grow. `-Djllm.metal.hotExperts=false` ignores the statistics.
+
+**A layer whose experts are split.** Its hot experts are copied once, at load, into memory of their own (`QTensor.
+gatherExperts`, in the tensor's own layout) and only that copy is given to the GPU. The mapped file stays untouched
+for the CPU's cold ones. `moe_remap` also writes, for every slot, the expert's index in that copy, or −1 for a
+cold expert. `moe_up`, `moe_down`, `moe_sort` and `moe_combine` skip −1 slots, so the GPU kernels are the same ones
+running on the packed tensors. Then the CPU and GPU work **at the same time**:
+
+```
+GPU:  … attention, norm, router, remap ┃ hot experts (+ shared experts) ┃              ┃ next layer …
+CPU:                                   ┃ cold slots: Σ_k w_k·expert_k   ┃ wait, add    ┃
+                           commit #1    commit #2, wait for #1 only
+```
+
+The CPU waits only for the router's command buffer (`jm_wait_pending(1)`), computes the slots that chose a cold
+expert with `cpu/MoeExperts` (other slots marked −1 are skipped), then waits for the GPU's experts and adds its
+part to `x`. **When no token chose a cold expert, the CPU adds nothing and does not wait for the GPU at all**, so
+that layer costs only the short wait for the router. Layers whose experts are all on the CPU run as before (GPU
+stops after the router; the CPU does all slots; DeepSeek's shared experts overlap on the GPU).
+
+**Cost.** Per token, a cold expert that is picked costs the CPU `3 · moeDim · dim` weights:
+
+```
+Qwen3-30B-A3B, Q4_0 (16 B of nibbles + a 4 B scale per 32 weights = 0.625 B):  3 · 768 · 2048 · 0.625 B ≈ 2.9 MB
+```
+
+That is ≈ 50 µs at 60 GB/s, overlapped with the GPU's hot experts. A whole CPU layer is 8 picks, ≈ 24 MB, so
+0.25–0.4 ms. Add the round trip (≈ 0.1 ms) per layer with CPU experts. Paging 24 MB back from an SSD at
+~5 GB/s would cost about 5 ms. Prefill is a different story: the GPU's grouped matrix kernels are much faster
+than the CPU on long chunks, so long prompts slow down more. All of these numbers are estimates, not yet measured
+on a Mac. Pipelined decoding ([8.16](#816-pipelined-greedy-decoding)) is off while any expert runs on the CPU.
+
+**Checked by** `scripts/arch-smoke.sh` on the emulator. Qwen3-MoE and the three DeepSeek models, in five formats
+each, run with four placements: one whole layer, all layers, every other expert of every layer on the CPU, and all
+but one expert of a layer. Each placement gives the CPU backend's tokens and final logits (within the usual CPU /
+Metal tolerance), both for decode (per-slot kernels, single-token CPU path) and for a 20-token chunk (grouped
+kernels, batched CPU path). The saved usage holds exactly `topK` picks per processed token in every layer.
+`ExpertPlacementCheck` (run by `mvn test`) checks the planner: uniform usage fills whole layers, skewed usage
+moves the coldest experts, at least the bytes asked for are freed, and within a layer a moved expert is never
+more used than a kept one.

@@ -51,10 +51,12 @@ public final class MetalParamsTest {
             problems.add("struct " + orphan + " has no KernelParams layout (no Java writer)");
         }
         checkConstants(src, problems);
+        problems.addAll(org.robomiri.jllm.metal.ExpertPlacementCheck.run());
         if (!problems.isEmpty()) {
             throw new AssertionError("kernels.metal and the Java writers disagree:\n  " + String.join("\n  ", problems));
         }
         System.out.println("ok  " + KernelParams.values().length + " parameter structs match kernels.metal");
+        System.out.println("ok  expert placement: uniform usage fills whole layers, skewed usage moves the coldest experts");
     }
 
     /** Every {@code #define NAME value} of the shader's constants block that the Java side mirrors. */

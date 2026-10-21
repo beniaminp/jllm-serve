@@ -195,31 +195,110 @@ public final class ArchSmoke {
     }
 
     /**
-     * Experts on the CPU (backend.metal.cpu-moe): with the routed experts of one MoE layer, and of all of them, run by
-     * the CPU between the GPU's layers, the generation and the final logits match the CPU backend within the usual
-     * CPU / Metal tolerance (prefill takes the batched expert path, decode the single-token one; DeepSeek's shared
-     * experts run on the GPU at the same time).
+     * Experts on the CPU (backend.metal.cpu-moe): with the routed experts of one MoE layer, of all of them, and split
+     * inside layers (every other expert on the CPU in every MoE layer; all but one in the first), the generation and
+     * the final logits match the CPU backend within the usual CPU / Metal tolerance (decode takes the per-slot
+     * kernels and the single-token CPU path); a 20-token chunk takes the expert-grouped kernels and the CPU's batched
+     * path; and the usage counts the split backend saves hold topK picks per processed token in every MoE layer.
      */
     private static int moeSplitCheck(ModelWeights w, String lib, Architecture cfg, int[] cpu, float[] cpuLogits) throws Exception {
+        Decoder d = (Decoder) cfg;
+        int layers = d.core().layers();
+        boolean[][] alternate = new boolean[layers][];
+        boolean[][] mostlyCold = new boolean[layers][];
+        int topK = 0;
+        boolean first = true;
+        for (int l = 0; l < layers; l++) {
+            if (d.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                topK = m.topK();
+                alternate[l] = new boolean[m.experts()];
+                for (int e = 0; e < m.experts(); e += 2) {
+                    alternate[l][e] = true;
+                }
+                if (first) {
+                    mostlyCold[l] = new boolean[m.experts()];
+                    java.util.Arrays.fill(mostlyCold[l], 1, m.experts(), true);
+                    first = false;
+                }
+            }
+        }
+        java.nio.file.Path stats = java.nio.file.Files.createTempDirectory("jllm-expert-stats");
+        System.setProperty("jllm.metal.expertStatsDir", stats.toString());
         int bad = 0;
-        for (int layers : new int[]{1, Integer.MAX_VALUE}) {
+        Object[][] cases = {
+                {"1 layer", new MoeSplit(1, 4, false)},
+                {"all layers", new MoeSplit(Integer.MAX_VALUE, 4, false)},
+                {"alternate experts", MoeSplit.experts(alternate, 4, false)},
+                {"all but one expert of a layer", MoeSplit.experts(mostlyCold, 4, false)},
+        };
+        int[] chunk = new int[20];
+        for (int i = 0; i < chunk.length; i++) {
+            chunk[i] = PROMPT[i % PROMPT.length] + 3 * i;
+        }
+        float[] cpuChunk = new float[cfg.core().vocabSize()];
+        try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.F32, false)) {
+            b.forward(chunk, 0, chunk.length, 0, cpuChunk);
+        }
+        for (Object[] c : cases) {
             float[] logits = new float[cfg.core().vocabSize()];
+            float[] chunkLogits = new float[cfg.core().vocabSize()];
             int[] got;
-            try (Backend b = new MetalBackend(w, 64, 16, lib, KvDtype.F32, new MoeSplit(layers, 4, false))) {
+            try (Backend b = new MetalBackend(w, 64, 32, lib, KvDtype.F32, (MoeSplit) c[1])) {
                 got = generate(b, logits);
+                b.forward(chunk, 0, chunk.length, 0, chunkLogits);
             }
-            float scale = 0;
-            float diff = 0;
-            for (int i = 0; i < logits.length; i++) {
-                scale = Math.max(scale, Math.abs(cpuLogits[i]));
-                diff = Math.max(diff, Math.abs(cpuLogits[i] - logits[i]));
-            }
-            boolean ok = Arrays.equals(cpu, got) && diff <= 1e-3f * scale + 1e-4f;
-            System.out.printf("  experts on cpu (%s layers): %s max|cpu-split| = %.2e -> %s%n",
-                    layers == Integer.MAX_VALUE ? "all" : layers, Arrays.toString(got), diff, ok ? "ok" : "SPLIT MISMATCH");
+            float diff = maxDiff(cpuLogits, logits);
+            float chunkDiff = maxDiff(cpuChunk, chunkLogits);
+            boolean ok = Arrays.equals(cpu, got) && diff <= 1e-3f * maxAbs(cpuLogits) + 1e-4f
+                    && chunkDiff <= 1e-3f * maxAbs(cpuChunk) + 1e-4f;
+            System.out.printf("  experts on cpu (%s): %s max|cpu-split| = %.2e, 20-token chunk %.2e -> %s%n", c[0],
+                    Arrays.toString(got), diff, chunkDiff, ok ? "ok" : "SPLIT MISMATCH");
             bad += ok ? 0 : 1;
         }
-        return bad;
+        // the four backends above processed the same tokens: per MoE layer the saved picks are a multiple of topK, the
+        // same in every layer
+        long[] sums = new long[layers];
+        try (var files = java.nio.file.Files.list(stats)) {
+            for (java.nio.file.Path f : files.toList()) {
+                for (String line : java.nio.file.Files.readAllLines(f)) {
+                    if (!line.startsWith("#") && line.contains(":")) {
+                        int l = Integer.parseInt(line.substring(0, line.indexOf(':')));
+                        for (String v : line.substring(line.indexOf(':') + 1).split(",")) {
+                            sums[l] += Long.parseLong(v.trim());
+                        }
+                    }
+                }
+                java.nio.file.Files.delete(f);
+            }
+        }
+        java.nio.file.Files.delete(stats);
+        System.clearProperty("jllm.metal.expertStatsDir");
+        long expect = -1;
+        boolean statsOk = true;
+        for (int l = 0; l < layers; l++) {
+            if (alternate[l] != null) {
+                expect = expect < 0 ? sums[l] : expect;
+                statsOk &= sums[l] == expect && sums[l] > 0 && sums[l] % topK == 0;
+            }
+        }
+        System.out.println("  expert usage saved: " + expect + " picks per MoE layer -> " + (statsOk ? "ok" : "STATS WRONG"));
+        return bad + (statsOk ? 0 : 1);
+    }
+
+    private static float maxDiff(float[] a, float[] b) {
+        float d = 0;
+        for (int i = 0; i < a.length; i++) {
+            d = Math.max(d, Math.abs(a[i] - b[i]));
+        }
+        return d;
+    }
+
+    private static float maxAbs(float[] a) {
+        float m = 0;
+        for (float v : a) {
+            m = Math.max(m, Math.abs(v));
+        }
+        return m;
     }
 
     /**

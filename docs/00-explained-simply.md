@@ -230,9 +230,10 @@ together but costs only 8 per word.
 tokens are first **sorted by expert** so each specialist's weights are read once for all the tokens that chose it
 ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)).
 
-When the specialists don't all fit on the GPU's desk, the ones of a few layers stay with the CPU. The GPU stops at
-those layers, the CPU answers, and the GPU continues. That costs a fraction of a millisecond per layer instead of
-fetching pages from the disk ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)).
+When the specialists don't all fit on the GPU's desk, some stay with the CPU. jllm-serve remembers which
+specialists the receptionist calls most and keeps those on the GPU's desk; the ones almost nobody asks for go to the
+CPU. Moving the same number of specialists then costs much less, because the CPU is rarely called. And when no word
+needs a CPU specialist, the GPU doesn't wait at all ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)).
 
 ---
 
