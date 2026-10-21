@@ -95,17 +95,40 @@ public record Qwen3NextLayer(float[] attnNorm, float[] ffnNorm, Mixer mixer, Mlp
         return L;
     }
 
+    /**
+     * The multi-token-prediction block of a Qwen3.5 GGUF ({@code blk.<layers>.*}): a full-attention layer with the MLP
+     * of the model's last layer, under {@code model.layers.<layers>.} like any layer.
+     */
+    static Qwen3NextLayer loadMtp(TensorSource f, String p, Qwen3NextArch arch) {
+        String a = p + "self_attn.";
+        Mixer mixer = new GatedAttention(AttnWeights.Gqa.load(f, a, arch.attention()), f.tensor(a + "q_gate"),
+                f.tensor(a + "o_proj.weight"));
+        Mlp spec = arch.mlps().getLast();
+        Qwen3NextLayer L = new Qwen3NextLayer(f.floats(p + "input_layernorm.weight"),
+                f.floats(p + "post_attention_layernorm.weight"), mixer, MlpWeights.load(f, p, spec),
+                spec instanceof Mlp.Moe ? f.floats(p + "mlp.shared_gate") : null);
+        if (!L.matches(arch, true, spec)) {
+            throw new IllegalArgumentException("the multi-token-prediction layer's weight shapes do not match config " + arch
+                    + ModelWeights.STALE_HINT);
+        }
+        return L;
+    }
+
     /** Every shape a backend relies on. */
     boolean matches(Qwen3NextArch arch, int l) {
+        return matches(arch, arch.isFull(l), arch.mlps().get(l));
+    }
+
+    private boolean matches(Qwen3NextArch arch, boolean full, Mlp mlpSpec) {
         int dim = arch.core().dim();
-        boolean ok = attnNorm.length == dim && ffnNorm.length == dim && mlp.matches(arch.mlps().get(l), dim)
-                && (arch.mlps().get(l) instanceof Mlp.Moe ? sharedGate != null && sharedGate.length == dim : sharedGate == null);
+        boolean ok = attnNorm.length == dim && ffnNorm.length == dim && mlp.matches(mlpSpec, dim)
+                && (mlpSpec instanceof Mlp.Moe ? sharedGate != null && sharedGate.length == dim : sharedGate == null);
         Qwen3NextArch.DeltaNet d = arch.deltaNet();
         return ok && switch (mixer) {
-            case GatedAttention g -> arch.isFull(l) && g.gqa().matches(arch.attention(), dim)
+            case GatedAttention g -> full && g.gqa().matches(arch.attention(), dim)
                     && g.gate().rows == arch.attention().qDim() && g.gate().cols == dim
                     && g.wo().rows == dim && g.wo().cols == arch.attention().qDim();
-            case DeltaNet n -> !arch.isFull(l) && n.inProj().rows == (n.split() ? d.convDim() : d.projDim())
+            case DeltaNet n -> !full && n.inProj().rows == (n.split() ? d.convDim() : d.projDim())
                     && n.inProj().cols == dim
                     && (!n.split() || n.z().rows == d.valueWidth() && n.z().cols == dim
                     && n.ba().rows == 2 * d.valueHeads() && n.ba().cols == dim)

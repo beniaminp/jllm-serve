@@ -201,8 +201,10 @@ public final class Engine implements AutoCloseable {
         if (cfg.mode() == Speculator.Mode.OFF) {
             return false;
         }
-        if (!Speculator.supported(backend)) {
-            System.err.println("note: engine.speculative is ignored: " + backend.name() + " cannot roll back its state");
+        if (!Speculator.supported(backend, cfg.mode())) {
+            System.err.println("note: engine.speculative=" + cfg.mode().name().toLowerCase() + " is ignored: " + backend.name()
+                    + (cfg.mode() == Speculator.Mode.MTP ? " has no multi-token-prediction head it can run"
+                    : " cannot roll back its state"));
             if (draft != null) {
                 draft.close();
             }

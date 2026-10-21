@@ -1,6 +1,10 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.Qwen3NextCpuBackend;
+import org.robomiri.jllm.engine.Speculator;
+import org.robomiri.jllm.sampling.Sampler;
+import org.robomiri.jllm.sampling.SamplingParams;
+import java.util.Set;
 import org.robomiri.jllm.gguf.GgmlType;
 import org.robomiri.jllm.gguf.GgufModel;
 import org.robomiri.jllm.json.Json;
@@ -312,6 +316,25 @@ public final class GgufQwenNextTest {
                 }
             }
         }
+        if (qwen35) { // the multi-token-prediction block (never part of the Hugging Face tiny model): random, its own seed
+            Random mr = new Random(99);
+            String b = "blk." + LAYERS + ".";
+            put(out, b + "nextn.eh_proj.weight", new long[]{DIM, 2 * DIM}, rnd(mr, DIM * 2 * DIM, 0.08, 0));
+            put(out, b + "nextn.enorm.weight", new long[]{DIM}, rnd(mr, DIM, 0.1, 1));
+            put(out, b + "nextn.hnorm.weight", new long[]{DIM}, rnd(mr, DIM, 0.1, 1));
+            put(out, b + "nextn.shared_head_norm.weight", new long[]{DIM}, rnd(mr, DIM, 0.1, 1));
+            put(out, b + "attn_norm.weight", new long[]{DIM}, rnd(mr, DIM, 0.1, 1));
+            put(out, b + "post_attention_norm.weight", new long[]{DIM}, rnd(mr, DIM, 0.1, 1));
+            put(out, b + "attn_q.weight", new long[]{HEADS * HD * 2, DIM}, rnd(mr, HEADS * HD * 2 * DIM, 0.1, 0));
+            put(out, b + "attn_k.weight", new long[]{KV * HD, DIM}, rnd(mr, KV * HD * DIM, 0.1, 0));
+            put(out, b + "attn_v.weight", new long[]{KV * HD, DIM}, rnd(mr, KV * HD * DIM, 0.1, 0));
+            put(out, b + "attn_output.weight", new long[]{DIM, HEADS * HD}, rnd(mr, DIM * HEADS * HD, 0.1, 0));
+            put(out, b + "attn_q_norm.weight", new long[]{HD}, rnd(mr, HD, 0.1, 1));
+            put(out, b + "attn_k_norm.weight", new long[]{HD}, rnd(mr, HD, 0.1, 1));
+            put(out, b + "ffn_gate.weight", new long[]{FF, DIM}, rnd(mr, FF * DIM, 0.1, 0));
+            put(out, b + "ffn_up.weight", new long[]{FF, DIM}, rnd(mr, FF * DIM, 0.1, 0));
+            put(out, b + "ffn_down.weight", new long[]{DIM, FF}, rnd(mr, DIM * FF, 0.1, 0));
+        }
         if (t.moe()) {
             for (int l = 1; l < LAYERS; l++) {
                 String p0 = "model.layers." + l + ".mlp.experts.";
@@ -412,9 +435,6 @@ public final class GgufQwenNextTest {
                 w.f32Tensor(name, dims, data);
             }
         }
-        if (qwen35) { // the multi-token-prediction block: present in the file, never read by the engine
-            w.f32Tensor("blk." + LAYERS + ".nextn.eh_proj.weight", new long[]{2 * DIM, DIM}, new float[2 * DIM * DIM]);
-        }
         w.write(p);
     }
 
@@ -447,6 +467,8 @@ public final class GgufQwenNextTest {
     }
 
     public static void main(String[] args) throws Exception {
+        // the CPU backend token by token for every call: verification passes then compute what single steps compute
+        System.setProperty("jllm.cpu.deterministic", "true");
         String lib = System.getProperty("jllm.metal.lib");
         boolean metal = Metal.available(lib);
         Path dir = Files.createTempDirectory("gguf-qwen-next");
@@ -514,6 +536,9 @@ public final class GgufQwenNextTest {
                 check(vs < 0.1, label + ": Q8_0 gguf vs converted safetensors within quantization noise: " + vs);
                 System.out.printf("%-9s Q8_0 gguf vs safetensors Q8_0: max logit diff %.2e (quantization noise)%n", label, vs);
             }
+            if (qwen35) {
+                mtp(q8, prompt);
+            }
             if (metal) {
                 try (GgufModel g = GgufModel.open(q8); ModelWeights w = g.weights()) {
                     float[][] gpuOut = logits(w, gpu, prompt, 4);
@@ -521,6 +546,217 @@ public final class GgufQwenNextTest {
                     check(diff < 2e-3 && sameTokens(q8cpu, gpuOut), label + ": Metal vs CPU on the GGUF model: " + diff);
                     System.out.printf("%-9s gguf cpu vs metal: max logit diff %.2e%n", label, diff);
                 }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ multi-token prediction
+
+    /** Plain greedy decoding: {@code n} tokens after {@code prompt}. */
+    static int[] plain(Backend b, int[] prompt, int n) {
+        float[] logits = new float[VOCAB];
+        b.forward(prompt, 0, prompt.length, 0, logits);
+        int[] out = new int[n];
+        int pos = prompt.length;
+        for (int i = 0; i < n; i++) {
+            out[i] = GgufModelTest.argmax(logits);
+            if (i + 1 < n) {
+                b.forward(new int[]{out[i]}, 0, 1, pos++, logits);
+            }
+        }
+        return out;
+    }
+
+    /** Greedy decoding through the speculator, the way {@code Engine} drives it. */
+    static int[] speculative(Backend b, Speculator sp, int[] prompt, int n) {
+        SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, n, java.util.List.of());
+        Sampler sampler = new Sampler(greedy, VOCAB, prompt);
+        float[] logits = new float[VOCAB];
+        b.forward(prompt, 0, prompt.length, 0, logits);
+        sp.begin(prompt);
+        int pos = prompt.length;
+        int[] out = new int[n];
+        int size = 0;
+        int[] ready = null;
+        int rIdx = 0;
+        int rLen = 0;
+        int rPre = 0;
+        while (size < n) {
+            boolean queued = rIdx < rLen;
+            int tok = queued ? ready[rIdx] : sampler.sample(logits);
+            boolean pre = queued && rIdx < rPre;
+            if (queued) {
+                rIdx++;
+            }
+            if (!pre) {
+                sampler.accept(tok);
+            }
+            out[size++] = tok;
+            sp.onToken(tok);
+            if (size < n && rIdx >= rLen) {
+                if (sp.step(tok, pos, b.contextLength(), n - size, sampler)) {
+                    ready = sp.ready();
+                    rIdx = 0;
+                    rLen = sp.readyCount();
+                    rPre = sp.preAccepted();
+                    pos = sp.newPos();
+                } else {
+                    b.forward(new int[]{tok}, 0, 1, pos++, logits);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** A backend whose head is an oracle: right about two drafts out of three, so the accept and the rollback paths both run. */
+    private static final class Oracle implements Backend {
+        final Backend inner;
+        final int[] truth;       // the plain greedy continuation
+        final int promptLen;
+        int pos;
+        int ckPos;
+        int asked;
+
+        Oracle(Backend inner, int[] truth, int promptLen) {
+            this.inner = inner;
+            this.truth = truth;
+            this.promptLen = promptLen;
+        }
+
+        public String name() {
+            return "oracle(" + inner.name() + ")";
+        }
+
+        public int contextLength() {
+            return inner.contextLength();
+        }
+
+        public int maxBatch() {
+            return inner.maxBatch();
+        }
+
+        public void forward(int[] t, int off, int n, int p, float[] logits) {
+            inner.forward(t, off, n, p, logits);
+            pos = p + n;
+        }
+
+        public void forwardAll(int[] t, int off, int n, int p, float[] out, int stride) {
+            inner.forwardAll(t, off, n, p, out, stride);
+            pos = p + n;
+        }
+
+        public boolean supportsPrefixReuse() {
+            return false;
+        }
+
+        public boolean hasMtp() {
+            return true;
+        }
+
+        public void enableMtp(boolean on) {
+            inner.enableMtp(on);
+        }
+
+        public boolean mtpReady() {
+            return inner.mtpReady();
+        }
+
+        public void mtpDraft(int token, float[] logits) {
+            int idx = pos - promptLen; // the token is fed at pos: out[idx]; the guess is out[idx + 1]
+            asked++;
+            java.util.Arrays.fill(logits, -1f);
+            int guess = idx + 1 < truth.length ? truth[idx + 1] : 0;
+            if (asked % 3 == 0) {
+                guess = (guess + 1) % VOCAB;
+            }
+            logits[guess] = 1f;
+        }
+
+        public boolean supportsRollback() {
+            return true;
+        }
+
+        public void checkpointState() {
+            inner.checkpointState();
+            ckPos = pos;
+        }
+
+        public void rollbackState() {
+            inner.rollbackState();
+            pos = ckPos;
+        }
+
+        public void close() {
+        }
+    }
+
+    /**
+     * The multi-token-prediction head of a tiny qwen35 file: (1) the head's guess depends only on the history, not on how
+     * the history was fed (one pass, chunks, single tokens); (2) greedy decoding through the speculator equals plain
+     * decoding, with an oracle head (accept and reject paths both taken) and with the real head.
+     */
+    private static void mtp(Path file, int[] prompt) throws Exception {
+        int n = 40;
+        float[][] guess = new float[3][VOCAB];
+        int[][] feeds = {{prompt.length}, {5, 4, 3}, {1}};
+        for (int mode = 0; mode < 3; mode++) {
+            try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
+                 Qwen3NextCpuBackend b = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
+                check(w.mtp != null && b.hasMtp(), "qwen35: the multi-token-prediction head is loaded");
+                b.enableMtp(true);
+                int pos = 0;
+                int ci = 0;
+                float[] sink = new float[VOCAB];
+                while (pos < prompt.length) {
+                    int step = Math.min(feeds[mode][Math.min(ci++, feeds[mode].length - 1)], prompt.length - pos);
+                    b.forward(prompt, pos, step, pos, sink);
+                    pos += step;
+                }
+                check(b.mtpReady(), "qwen35: the head follows the state after the prompt (feed " + mode + ")");
+                b.mtpDraft(17, guess[mode]);
+            }
+        }
+        double d1 = GgufModelTest.maxDiff(new float[][]{guess[0]}, new float[][]{guess[1]});
+        double d2 = GgufModelTest.maxDiff(new float[][]{guess[0]}, new float[][]{guess[2]});
+        check(d1 < 1e-5 && d2 < 1e-5, "qwen35: the head's logits do not depend on how the prompt was chunked: " + d1 + ", " + d2);
+        System.out.printf("qwen35    mtp head logits, whole prompt vs chunks of 5/4/3 vs single tokens: %.2e, %.2e%n", d1, d2);
+        float[] other = new float[VOCAB];
+        try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
+             Qwen3NextCpuBackend b = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
+            b.enableMtp(true);
+            b.forward(prompt, 0, prompt.length, 0, new float[VOCAB]);
+            b.mtpDraft(18, other);
+        }
+        check(GgufModelTest.maxDiff(new float[][]{guess[0]}, new float[][]{other}) > 1e-3,
+                "qwen35: the head's guess depends on the token it is given");
+
+        int[] truth;
+        try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
+             Qwen3NextCpuBackend b = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
+            truth = plain(b, prompt, n);
+        }
+        Speculator.Config cfg = new Speculator.Config(Speculator.Mode.MTP, 1, 4, 1, 0);
+        try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
+             Qwen3NextCpuBackend inner = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
+            Oracle o = new Oracle(inner, truth, prompt.length);
+            try (Speculator sp = new Speculator(cfg, o, null, VOCAB, VOCAB, Set.of())) {
+                int[] got = speculative(o, sp, prompt, n);
+                check(java.util.Arrays.equals(got, truth), "qwen35: speculative output with an oracle head equals plain output: "
+                        + java.util.Arrays.toString(got) + " vs " + java.util.Arrays.toString(truth));
+                check(sp.accepted() > 0 && sp.accepted() < sp.drafted(), "qwen35: the oracle run both accepted and rejected drafts: "
+                        + sp.accepted() + " / " + sp.drafted());
+                System.out.printf("qwen35    mtp speculation with an oracle head: %d of %d drafts accepted, output == plain%n",
+                        sp.accepted(), sp.drafted());
+            }
+        }
+        try (GgufModel g = GgufModel.open(file); ModelWeights w = g.weights();
+             Qwen3NextCpuBackend b = new Qwen3NextCpuBackend(w, 128, 16, 2, KvDtype.F32)) {
+            try (Speculator sp = new Speculator(cfg, b, null, VOCAB, VOCAB, Set.of())) {
+                int[] got = speculative(b, sp, prompt, n);
+                check(java.util.Arrays.equals(got, truth), "qwen35: speculative output with the real (random) head equals plain output: "
+                        + java.util.Arrays.toString(got) + " vs " + java.util.Arrays.toString(truth));
+                System.out.printf("qwen35    mtp speculation with the real head: %d of %d drafts accepted, output == plain%n",
+                        sp.accepted(), sp.drafted());
             }
         }
     }

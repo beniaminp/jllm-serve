@@ -75,6 +75,12 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             case "input_layernorm.weight" -> new String[]{b + "attn_norm.weight"};
             case "post_attention_layernorm.weight" -> new String[]{b + (gguf.hasTensor(b + "post_attention_norm.weight")
                     ? "post_attention_norm.weight" : "ffn_norm.weight")}; // the hybrids (qwen35, qwen3next) name it so
+            case "nextn.eh_proj" -> new String[]{b + "nextn.eh_proj.weight"};
+            case "nextn.enorm" -> new String[]{b + "nextn.enorm.weight"};
+            case "nextn.hnorm" -> new String[]{b + "nextn.hnorm.weight"};
+            case "nextn.embed_tokens" -> new String[]{b + "nextn.embed_tokens.weight"};
+            case "nextn.shared_head_head" -> new String[]{b + "nextn.shared_head_head.weight"};
+            case "nextn.shared_head_norm" -> new String[]{b + "nextn.shared_head_norm.weight"};
             case "mlp.shared.gate_up" -> new String[]{b + "ffn_gate_shexp.weight", b + "ffn_up_shexp.weight"};
             case "mlp.shared.down" -> new String[]{b + "ffn_down_shexp.weight"};
             case "mlp.shared_gate" -> new String[]{b + "ffn_gate_inp_shexp.weight"};

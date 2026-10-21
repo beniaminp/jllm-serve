@@ -26,20 +26,28 @@ import java.util.Set;
  * with that token's mass removed (the output distribution is exactly the target's). The sampler's penalties see
  * the accepted tokens in order.
  *
+ * <p>A third source is the model's own multi-token-prediction head ({@link Mode#MTP}, Qwen3.5 GGUF): after each
+ * sampled token the head proposes the token after it from the main model's last hidden state, and the target verifies
+ * it in the same two-position pass that computes the next step. A hybrid's recurrent state cannot be rewound by
+ * overwriting, so that mode checkpoints it before the pass and, when the draft is rejected, puts it back and replays
+ * the accepted tokens ({@link Backend#checkpointState}).
+ *
  * <p>Rejected positions need no rollback: the KV cache positions after the accepted prefix are overwritten by
- * the next pass. Not usable with a backend whose state cannot be rewound ({@link Backend#supportsPrefixReuse}).
+ * the next pass. Not usable with a backend whose state cannot be rewound ({@link Backend#supportsPrefixReuse}), except
+ * for the MTP mode on a backend that can checkpoint it.
  */
 public final class Speculator implements AutoCloseable {
 
     public enum Mode {
-        OFF, NGRAM, DRAFT;
+        OFF, NGRAM, DRAFT, MTP;
 
         public static Mode parse(String s) {
             return switch (s.toLowerCase(Locale.ROOT)) {
                 case "off", "false", "no", "0" -> OFF;
                 case "ngram", "prompt-lookup" -> NGRAM;
                 case "draft" -> DRAFT;
-                default -> throw new IllegalArgumentException("engine.speculative must be off, ngram or draft, got '" + s + "'");
+                case "mtp" -> MTP;
+                default -> throw new IllegalArgumentException("engine.speculative must be off, ngram, draft or mtp, got '" + s + "'");
             };
         }
     }
@@ -100,6 +108,9 @@ public final class Speculator implements AutoCloseable {
         if (cfg.mode() == Mode.DRAFT && draft == null) {
             throw new IllegalArgumentException("engine.speculative=draft needs a draft model");
         }
+        if (cfg.mode() == Mode.MTP && !supported(target, Mode.MTP)) {
+            throw new IllegalArgumentException("engine.speculative=mtp needs a backend with a multi-token-prediction head");
+        }
         this.cfg = cfg;
         this.target = target;
         this.draft = draft;
@@ -114,11 +125,22 @@ public final class Speculator implements AutoCloseable {
         this.ready = new int[maxDrafts + 1];
         this.forks = new TokenConstraint[maxDrafts + 1];
         this.index = cfg.mode() == Mode.NGRAM ? new NgramIndex(cfg.ngramMin(), cfg.ngramMax()) : null;
+        this.mtpLogits = cfg.mode() == Mode.MTP ? new float[stride] : null;
+        if (cfg.mode() == Mode.MTP) {
+            target.enableMtp(true);
+        }
     }
+
+    private final float[] mtpLogits;
 
     /** Whether the backend can be used for speculation at all (a recurrent state cannot be rolled back). */
     public static boolean supported(Backend b) {
         return b.supportsPrefixReuse() && b.maxBatch() >= 2;
+    }
+
+    /** {@link #supported(Backend)} for the mode: the MTP mode instead needs the head and a state it can roll back. */
+    public static boolean supported(Backend b, Mode mode) {
+        return mode == Mode.MTP ? b.hasMtp() && b.supportsRollback() && b.maxBatch() >= 2 : supported(b);
     }
 
     /** Starts a request: the history is the (prepared) prompt. */
@@ -195,7 +217,8 @@ public final class Speculator implements AutoCloseable {
             return false;
         }                               // (every PROBE_EVERY-th time a pass is tried anyway: the text may have changed)
         long t0 = System.nanoTime();
-        int m = cfg.mode() == Mode.NGRAM ? lookup(want) : draft.propose(hist, len, want, drafts, vocab, stopIds);
+        int m = cfg.mode() == Mode.NGRAM ? lookup(want)
+                : cfg.mode() == Mode.MTP ? mtpPropose(tok, want) : draft.propose(hist, len, want, drafts, vocab, stopIds);
         if (draft != null && draft.lastSteps() > 0) {
             cost.draft(System.nanoTime() - t0, draft.lastSteps());
         }
@@ -231,6 +254,10 @@ public final class Speculator implements AutoCloseable {
             beforeVerify.run();
         }
         long t1 = System.nanoTime();
+        boolean mtp = cfg.mode() == Mode.MTP;
+        if (mtp) {
+            target.checkpointState(); // the recurrent state goes through every fed token: kept to undo the rejected ones
+        }
         target.forwardAll(feed, 0, m + 1, pos, rows, stride);
         cost.verify(m + 1, System.nanoTime() - t1);
         int acc = 0;
@@ -259,6 +286,10 @@ public final class Speculator implements AutoCloseable {
                 continue;
             }
             break;
+        }
+        if (mtp && acc < m) { // the state ran through rejected tokens: back to before the pass, then only the accepted ones
+            target.rollbackState();
+            target.forward(feed, 0, acc + 1, pos, null);
         }
         cost.acceptance(acc, examined);
         // whole draft accepted: try longer ones next time; else as many as this text supported
@@ -394,6 +425,23 @@ public final class Speculator implements AutoCloseable {
             }
             return best;
         }
+    }
+
+    /** The head's guess for the token after {@code tok} (argmax over the valid ids), into {@link #drafts}; 0 when it cannot. */
+    private int mtpPropose(int tok, int want) {
+        if (want < 1 || !target.mtpReady()) {
+            return 0;
+        }
+        target.mtpDraft(tok, mtpLogits);
+        int lim = Math.min(vocab, mtpLogits.length);
+        int best = 0;
+        for (int i = 1; i < lim; i++) {
+            if (mtpLogits[i] > mtpLogits[best]) {
+                best = i;
+            }
+        }
+        drafts[0] = best;
+        return 1;
     }
 
     /** Tokens decided by the last {@link #step}: the accepted drafts, then one token the target chose itself. */

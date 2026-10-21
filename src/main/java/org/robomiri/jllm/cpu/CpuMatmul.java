@@ -68,6 +68,9 @@ final class CpuMatmul {
         for (LayerWeights L : w.layers) {
             m = Math.max(m, L.maxCols());
         }
+        if (w.mtp != null) {
+            m = Math.max(m, Math.max(w.mtp.ehProj().cols, w.mtp.layer().maxCols()));
+        }
         return m;
     }
 

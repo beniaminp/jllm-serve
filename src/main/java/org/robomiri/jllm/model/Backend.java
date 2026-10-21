@@ -76,6 +76,53 @@ public interface Backend extends AutoCloseable {
         return true;
     }
 
+    // ------------------------------------------------------------------ multi-token prediction (Qwen3.5 GGUF)
+
+    /** Whether the model has a multi-token-prediction head this backend can run ({@link Qwen3NextMtp}). */
+    default boolean hasMtp() {
+        return false;
+    }
+
+    /**
+     * Turns the head on or off. While on, every {@link #forward} / {@link #forwardAll} also feeds the head (its own KV
+     * cache and the hidden state of the last position), at the cost of one extra transformer layer per token. Takes
+     * effect from the next prompt (position 0).
+     */
+    default void enableMtp(boolean on) {
+        throw new UnsupportedOperationException(name() + " has no multi-token-prediction head");
+    }
+
+    /** Whether {@link #mtpDraft} can be called now: the head follows every position passed so far. */
+    default boolean mtpReady() {
+        return false;
+    }
+
+    /**
+     * The head's guess for the token that will follow {@code token}, which the model has just chosen to follow the last
+     * position it processed and which is fed next: the head's logits (vocabulary-sized) go to {@code logits}.
+     */
+    default void mtpDraft(int token, float[] logits) {
+        throw new UnsupportedOperationException(name() + " has no multi-token-prediction head");
+    }
+
+    /**
+     * Whether {@link #checkpointState} / {@link #rollbackState} work: a recurrent state is saved before a verification
+     * pass and put back when drafts are rejected (the KV cache needs nothing: later positions are overwritten).
+     */
+    default boolean supportsRollback() {
+        return false;
+    }
+
+    /** Saves the whole state (recurrent states, head bookkeeping) as it is now; one checkpoint is kept. */
+    default void checkpointState() {
+        throw new UnsupportedOperationException(name() + " cannot checkpoint its state");
+    }
+
+    /** Puts the state back to the last {@link #checkpointState}. */
+    default void rollbackState() {
+        throw new UnsupportedOperationException(name() + " cannot roll back its state");
+    }
+
     /**
      * The layout of {@link #saveState}'s output (cache type and shape), or null when this backend cannot save its
      * state. A saved state is only loaded into a backend reporting the same format.

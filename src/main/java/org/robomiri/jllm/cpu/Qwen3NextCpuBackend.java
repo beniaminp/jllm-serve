@@ -8,8 +8,10 @@ import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
 import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.MtpFeeder;
 import org.robomiri.jllm.model.Qwen3NextArch;
 import org.robomiri.jllm.model.Qwen3NextLayer;
+import org.robomiri.jllm.model.Qwen3NextMtp;
 import org.robomiri.jllm.model.Rope;
 
 import java.io.IOException;
@@ -56,6 +58,14 @@ public final class Qwen3NextCpuBackend implements Backend {
     private final Rope rope;
     private final KvCache kv;
     private final MoeExperts experts;
+    /** The multi-token-prediction head (null without one): its KV layer is the one after the full-attention layers'. */
+    private final Qwen3NextMtp mtp;
+    private final MtpFeeder feeder;
+    private final float[] mtpIn;   // [rows, 2 * dim]: the normed token embedding then the normed hidden state of each head row
+    private final float[] hid;     // [n, dim]: the normed hidden states of the last pass
+    private float[][] ckConv;
+    private float[][] ckState;
+    private int ckPos;
 
     private final float[][] convState;
     private final float[][] state;
@@ -107,7 +117,9 @@ public final class Qwen3NextCpuBackend implements Backend {
         this.pool = new ThreadPool(threads);
         Attention.Gqa g = arch.attention();
         rope = new Rope(arch.rope(), ctx);
-        kv = arch.fullLayers() > 0 ? KvCache.create(kvDtype, arch.fullLayers(), g, ctx) : null;
+        this.mtp = w.mtp;
+        kv = arch.fullLayers() > 0 || mtp != null
+                ? KvCache.create(kvDtype, arch.fullLayers() + (mtp != null ? 1 : 0), g, ctx) : null;
         convState = new float[arch.linearLayers()][dn.convStateSize()];
         state = new float[arch.linearLayers()][dn.stateSize()];
         int dim = c.dim();
@@ -139,6 +151,9 @@ public final class Qwen3NextCpuBackend implements Backend {
         mm = new CpuMatmul(pool, int8Activations, CpuBackend.DETERMINISTIC, scratchLen);
         experts = arch.anyMoe()
                 ? new MoeExperts(pool, mm, dim, arch.maxExperts(), arch.maxTopK(), arch.maxMoeDim(), maxBatch) : null;
+        mtpIn = mtp != null ? new float[maxBatch * 2 * dim] : null;
+        hid = mtp != null ? new float[maxBatch * dim] : null;
+        feeder = mtp != null ? new MtpFeeder(dim, this::mtpRows) : null;
         setRecurrence(CHUNKED, CHUNK);
         if (ctx > c.maxPositions()) {
             System.err.println("warning: context " + ctx + " exceeds the model's max_position_embeddings ("
@@ -216,25 +231,30 @@ public final class Qwen3NextCpuBackend implements Backend {
                 case Qwen3NextLayer.GatedAttention a -> attention(a, arch.kindIndex(l), n, pos);
             }
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
-            switch (L.mlp()) {
-                case MlpWeights.Dense d -> {
-                    int h = ((Mlp.Dense) arch.mlps().get(l)).hidden();
-                    mm.mul(d.gateUp(), xb, gateUp, 0, n, false);
-                    siluMul(n, h);
-                    mm.mul(d.down(), hidden, x, 0, n, true);
-                }
-                case MlpWeights.Moe m -> moe((Mlp.Moe) arch.mlps().get(l), m, L.sharedGate(), n);
-            }
+            mlp(L, arch.mlps().get(l), n);
         }
-        if (logits == null) {
+        boolean mtpOn = feeder != null && feeder.enabled();
+        if (logits == null && !mtpOn) {
             statePos = pos + n;
             return;
         }
-        if (stride == 0) {
-            VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim, c.normEps());
+        if (mtpOn) { // the head reads every row's normed hidden state
+            rmsnorm(x, xb, w.finalNorm, n, dim);
+            System.arraycopy(xb, 0, hid, 0, n * dim);
+        }
+        if (logits == null) {
+            statePos = pos + n;
+        } else if (stride == 0) {
+            if (mtpOn) {
+                System.arraycopy(hid, (n - 1) * dim, xb, 0, dim);
+            } else {
+                VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim, c.normEps());
+            }
             mm.mul(w.lmHead, Math.min(w.lmHead.rows, logits.length), xb, logits, 0, 1, false);
         } else {
-            rmsnorm(x, xb, w.finalNorm, n, dim);
+            if (!mtpOn) {
+                rmsnorm(x, xb, w.finalNorm, n, dim);
+            }
             int rows = Math.min(w.lmHead.rows, stride);
             float[] tmp = w.lmHead.rows == stride ? logits : new float[n * w.lmHead.rows];
             mm.mul(w.lmHead, rows, xb, tmp, 0, n, false);
@@ -245,6 +265,114 @@ public final class Qwen3NextCpuBackend implements Backend {
             }
         }
         statePos = pos + n;
+        if (mtpOn) {
+            feeder.afterPass(tokens, off, n, pos, hid);
+        }
+    }
+
+    /** The MLP of a layer (dense SwiGLU or experts plus the gated shared expert) on the normed rows of {@link #xb}, added to {@link #x}. */
+    private void mlp(Qwen3NextLayer L, Mlp spec, int n) {
+        switch (L.mlp()) {
+            case MlpWeights.Dense d -> {
+                mm.mul(d.gateUp(), xb, gateUp, 0, n, false);
+                siluMul(n, ((Mlp.Dense) spec).hidden());
+                mm.mul(d.down(), hidden, x, 0, n, true);
+            }
+            case MlpWeights.Moe m -> moe((Mlp.Moe) spec, m, L.sharedGate(), n);
+        }
+    }
+
+    // ------------------------------------------------------------------ multi-token prediction
+
+    /**
+     * The head on {@code n} rows (docs/16): {@code x = eh_proj [rmsnorm(embedding(token), enorm); rmsnorm(h, hnorm)]}, then
+     * the block as any layer (gated attention over the head's own KV cache, MLP), and for the last row the logits through
+     * {@code shared_head_norm} and the output head.
+     */
+    private void mtpRows(int[] tokens, float[] h, int n, int pos, float[] logits) {
+        int dim = c.dim();
+        float[] eps = {c.normEps()};
+        pool.forRange(n, 1, (t0, t1) -> {
+            float[] emb = new float[dim];
+            for (int t = t0; t < t1; t++) {
+                mtp.embed().dequantizeRow(tokens[t], emb, 0);
+                VectorKernels.rmsnormRow(emb, 0, mtpIn, t * 2 * dim, mtp.enorm(), dim, eps[0]);
+                VectorKernels.rmsnormRow(h, t * dim, mtpIn, t * 2 * dim + dim, mtp.hnorm(), dim, eps[0]);
+            }
+        });
+        mm.mul(mtp.ehProj(), mtpIn, x, 0, n, false);
+        Qwen3NextLayer L = mtp.layer();
+        rmsnorm(x, xb, L.attnNorm(), n, dim);
+        attention(L.attention(), arch.fullLayers(), n, pos);
+        rmsnorm(x, xb, L.ffnNorm(), n, dim);
+        mlp(L, arch.mlps().getLast(), n);
+        if (logits != null) {
+            VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, mtp.headNorm(), dim, c.normEps());
+            mm.mul(mtp.head(), Math.min(mtp.head().rows, logits.length), xb, logits, 0, 1, false);
+        }
+    }
+
+    @Override
+    public boolean hasMtp() {
+        return mtp != null;
+    }
+
+    @Override
+    public void enableMtp(boolean on) {
+        if (mtp == null) {
+            throw new UnsupportedOperationException(name() + ": the model has no multi-token-prediction head");
+        }
+        feeder.enable(on);
+    }
+
+    @Override
+    public boolean mtpReady() {
+        return feeder != null && feeder.ready(statePos);
+    }
+
+    @Override
+    public void mtpDraft(int token, float[] logits) {
+        if (!mtpReady()) {
+            throw new IllegalStateException("the multi-token-prediction head does not follow the state at " + statePos);
+        }
+        feeder.draft(token, logits);
+    }
+
+    @Override
+    public boolean supportsRollback() {
+        return true;
+    }
+
+    @Override
+    public void checkpointState() {
+        if (ckConv == null) {
+            ckConv = new float[convState.length][];
+            ckState = new float[state.length][];
+            for (int l = 0; l < convState.length; l++) {
+                ckConv[l] = new float[convState[l].length];
+                ckState[l] = new float[state[l].length];
+            }
+        }
+        for (int l = 0; l < convState.length; l++) {
+            System.arraycopy(convState[l], 0, ckConv[l], 0, convState[l].length);
+            System.arraycopy(state[l], 0, ckState[l], 0, state[l].length);
+        }
+        ckPos = statePos;
+        if (feeder != null) {
+            feeder.snapshot();
+        }
+    }
+
+    @Override
+    public void rollbackState() {
+        for (int l = 0; l < convState.length; l++) {
+            System.arraycopy(ckConv[l], 0, convState[l], 0, convState[l].length);
+            System.arraycopy(ckState[l], 0, state[l], 0, state[l].length);
+        }
+        statePos = ckPos;
+        if (feeder != null) {
+            feeder.restore();
+        }
     }
 
     // ------------------------------------------------------------------ Gated DeltaNet
@@ -661,6 +789,9 @@ public final class Qwen3NextCpuBackend implements Backend {
     @Override
     public void loadState(int n, ReadableByteChannel in) throws IOException {
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         if (kv != null) {
             kv.read(n, in);
         }
@@ -679,6 +810,9 @@ public final class Qwen3NextCpuBackend implements Backend {
         }
         o.checkPositions(n);
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         if (kv != null) {
             kv.copyFrom(o.kv, n);
         }
