@@ -145,7 +145,7 @@ public final class ModelLoader {
         Tokenizer tok = p.tok();
         ModelWeights weights = p.weights();
         int ctx = s.getInt("backend.ctx");
-        int batch = s.getInt("backend.batch");
+        int batch = batch(s, arch);
         Backend backend;
         try {
             backend = newBackend(s, arch, weights, slots);
@@ -170,6 +170,21 @@ public final class ModelLoader {
             weights.close();
             throw e;
         }
+    }
+
+    /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
+    static final int MOE_BATCH = 256;
+
+    /**
+     * Tokens per prefill chunk: {@code backend.batch}, except that a mixture-of-experts model takes {@link #MOE_BATCH}
+     * unless the setting was given. A chunk reads each chosen expert's weights once for all its tokens (the grouped
+     * kernels on Metal, the dequantized row groups on the CPU), and with 128 experts and top-8 a 64-token chunk gives
+     * an expert only ~4 tokens: 256 tokens measured 1.6x faster per token for the CPU experts (docs/11).
+     */
+    static int batch(Settings s, Architecture arch) {
+        int batch = s.getInt("backend.batch");
+        boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
+        return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
     }
 
     /**
@@ -327,7 +342,7 @@ public final class ModelLoader {
     /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
     private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots) throws Exception {
         int ctx = s.getInt("backend.ctx");
-        int batch = s.getInt("backend.batch");
+        int batch = batch(s, arch);
         String backendName = s.get("backend");
         if (backendName.equals("auto")) {
             backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";

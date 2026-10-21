@@ -643,11 +643,13 @@ public final class MetalBackend implements Backend {
 
     /** {@code x[0, n·dim) += cpuY}: the CPU's experts joining the residual stream (the GPU is idle here). */
     private void addToX(int n) {
-        MemorySegment xs = x.contents();
-        for (int i = 0; i < n * c.dim(); i++) {
-            long o = (long) i * 4;
-            xs.set(ValueLayout.JAVA_FLOAT, o, xs.get(ValueLayout.JAVA_FLOAT, o) + cpuY[i]);
+        int len = n * c.dim();
+        // two bulk copies around a plain loop the JIT vectorizes (cpuXb is free again: the experts are done)
+        MemorySegment.copy(x.contents(), ValueLayout.JAVA_FLOAT, 0, cpuXb, 0, len);
+        for (int i = 0; i < len; i++) {
+            cpuXb[i] += cpuY[i];
         }
+        MemorySegment.copy(cpuXb, 0, x.contents(), ValueLayout.JAVA_FLOAT, 0, len);
     }
 
     // ------------------------------------------------------------------ layer plans

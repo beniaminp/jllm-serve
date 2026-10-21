@@ -235,6 +235,15 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.expertCountEvery` | 8 | layers whose experts are all on the GPU are counted on one forward pass in this many (1 = every pass, as `arch-smoke.sh` uses) |
 | `jllm.metal.emulator` | false | run the Metal backend on the CPU emulator (with `jllm.metal.lib` = the emulator library; [18](18-metal-emulator.md)) |
 
+**Prefill chunk for MoE models.** Unless `backend.batch` is set, a mixture-of-experts model prefills in chunks
+of 256 tokens instead of 64. With 128 experts and top-8, a 64-token chunk gives each expert only about
+`64 · 8 / 128 = 4` tokens. An expert's weights are read once per chunk, and on the CPU each 4-row group is
+dequantized once, both for all its tokens, so that fixed cost is shared by only ~4 tokens. At 256 tokens it is
+shared by ~16. Measured on the CPU expert path (`cpu/MoeExperts`, one Qwen3-30B-A3B-shaped layer, Q4_0, 4 cores,
+best of 3 runs each): 1 040–1 140 → 1 570–1 840 tokens/s, i.e. 1.5–1.6×. The Metal grouped kernels read each
+expert's weights once per tile of up to `MMA_BT` slots, so they should gain the same way; that is not measured on a
+Mac yet. Decode is unchanged (one token per step).
+
 Experts on the CPU are chosen by a setting (`jllm.properties` key, or `--backend.metal.cpu-moe` on the command
 line), not a system property: `backend.metal.cpu-moe` = `auto` (default: only when the device's GPU memory budget is
 exceeded; the rarely used experts by saved usage, whole layers until statistics exist), `off`, `all` or a number of
