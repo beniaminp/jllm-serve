@@ -738,8 +738,10 @@ public final class ArchSmoke {
                 ref[i] = new MetalBackend(w, 64, 16, lib, dt);
                 on[i].replay(true);
                 ref[i].replay(false);
-                on[i].flashDecodeThresholds(prompts[i].length + 6, 4);
-                ref[i].flashDecodeThresholds(prompts[i].length + 6, 4);
+                // the same thresholds in every slot, as in a server: a batched pass decides flash or not for all its rows
+                // by the leader's
+                on[i].flashDecodeThresholds(prompts[1].length + 6, 4);
+                ref[i].flashDecodeThresholds(prompts[1].length + 6, 4);
             }
             if (!on[0].replaying()) {
                 System.out.println("  replay x batch " + dt + ": replay not available");

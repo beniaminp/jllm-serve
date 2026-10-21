@@ -1453,8 +1453,7 @@ replay x `rebalanceExperts` (the re-placement that moves the last experts onto t
 the steps after it are recorded, replayed and still the CPU backend's), and replay x draft pipelining (the draft's
 pipelined steps are replayed, and the output, with the draft or without it, is the same with replay on and off). The
 per-row flash attention of a batched pass takes the instance's thresholds (`flashMinLen`, `flashChunk`), as the
-single step does; with the static defaults only, a batched row and a single step chose other kernels once a test lowered
-them, which a q8 cache amplified to 10^-2 of the logits.
+single step does (the static defaults are the same numbers, so this only shows when a test lowers them).
 
 ---
 
