@@ -198,7 +198,8 @@ public final class Settings {
         }
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
-        for (String k : new String[]{"model.low-disk", "backend.cpu.int8-activations", "chat.thinking", "raw"}) {
+        for (String k : new String[]{"model.low-disk", "backend.cpu.int8-activations", "chat.thinking", "raw",
+                "engine.batch-decode"}) {
             if (has(k)) {
                 getBool(k);
             }

@@ -240,6 +240,13 @@ final class MetalKernels implements AutoCloseable {
         return (rows + SG_PER_TG - 1) / SG_PER_TG;
     }
 
+    /**
+     * Threads per threadgroup of the plain single-token matmul (one simdgroup per output row, so 64, 128 or 256 is
+     * 2, 4 or 8 rows per threadgroup; every row's arithmetic is the same, the results are bit-identical). Chosen per
+     * chip by {@link MetalTuner#decodeThreads}: small matrices fill the GPU better with smaller threadgroups.
+     */
+    int decodeThreads = MetalConstants.MM_THREADS;
+
     private static int tokTiles(int n) {
         return (n + TOK_TILE - 1) / TOK_TILE;
     }
@@ -279,6 +286,9 @@ final class MetalKernels implements AutoCloseable {
             dispatch(kernel("matmul_mma", t.type, ""), 5, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul_pf", t.type, ""), 5, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (norm == null && n == 1) {
+            int sgs = decodeThreads / 32;
+            dispatch(kernel("matmul", t.type, ""), 5, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
         } else {
             dispatch(kernel("matmul", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(t.rows), tokTiles(n), 1, MM_THREADS, 1, 1);

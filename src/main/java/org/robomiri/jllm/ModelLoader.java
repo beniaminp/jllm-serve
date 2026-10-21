@@ -148,7 +148,7 @@ public final class ModelLoader {
         int batch = batch(s, arch);
         Backend backend;
         try {
-            backend = newBackend(s, arch, weights, slots);
+            backend = batched(s, weights, newBackend(s, arch, weights, slots));
         } catch (Exception e) {
             weights.close();
             throw e;
@@ -201,6 +201,18 @@ public final class ModelLoader {
         return spec;
     }
 
+    /** The batch group of each loaded model's weights (engine.batch-decode); weak: gone with the weights. */
+    private static final java.util.Map<ModelWeights, org.robomiri.jllm.engine.BatchGroup> GROUPS =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /** {@code backend} as a member of its weights' batch group, or as it is when batching is off. */
+    private static Backend batched(Settings s, ModelWeights weights, Backend backend) {
+        if (!s.getBool("engine.batch-decode")) {
+            return backend;
+        }
+        return GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup()).join(backend);
+    }
+
     /**
      * Another engine on the weights of {@code l}: its own backend and KV cache, the same tokenizer, template, stop
      * tokens and queue timeout. Lets a server keep several conversations' prefixes cached at once (memory: one KV
@@ -209,7 +221,7 @@ public final class ModelLoader {
      */
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
-        Backend backend = newBackend(s, l.weights().arch, l.weights(), 1);
+        Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1));
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
         Speculator.Config spec = speculation(s, l.weights().arch);

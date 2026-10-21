@@ -146,6 +146,14 @@ public final class CpuBackend implements Backend {
     /** Reads the normalized hidden states {@link #xb}, writes the attention output {@link #att}. */
     private interface AttnStep {
         void run(int layer, int n, int pos);
+
+        /**
+         * One token per row, each row of another backend's conversation ({@link #forwardBatch}): row t belongs to
+         * {@code owners[t]} at {@code positions[t]}. Null when the attention keeps no per-row state this way (MLA).
+         */
+        default boolean runRows(int layer, CpuBackend[] owners, int[] positions) {
+            return false;
+        }
     }
 
     /** {@code x += proj(in)}, or {@code x += rmsnorm(proj(in)) * norm} where the family normalizes the output. */
@@ -199,6 +207,36 @@ public final class CpuBackend implements Backend {
             normRope(kStage, 0, g.kvDim(), g.kvHeads(), w.kNorm(), n, pos);
             kv.store(layer, pos, kStage, vStage, n);
             kv.attention(pool, layer, n, pos, q, att, g.window(), g.scale(), g.softcap());
+        }
+
+        @Override
+        public boolean runRows(int layer, CpuBackend[] owners, int[] positions) {
+            int n = owners.length;
+            matmul(w.wq(), xb, q, 0, n, false);
+            matmul(w.wk(), xb, kStage, 0, n, false);
+            matmul(w.wv(), xb, vStage, 0, n, false);
+            if (w.bq() != null) {
+                addBias(q, 0, w.bq(), n);
+                addBias(kStage, 0, w.bk(), n);
+                addBias(vStage, 0, w.bv(), n);
+            }
+            int qDim = g.qDim();
+            int kvDim = g.kvDim();
+            int outDim = arch.attention().outDim();
+            for (int t = 0; t < n; t++) {
+                // row t at its own position, into its own cache, through that backend's (idle) staging rows
+                CpuBackend o = owners[t];
+                int pos = positions[t];
+                normRopeHeads(q, t * qDim, qDim, g.heads(), w.qNorm(), pos, 0, g.heads());
+                normRopeHeads(kStage, t * kvDim, kvDim, g.kvHeads(), w.kNorm(), pos, 0, g.kvHeads());
+                System.arraycopy(kStage, t * kvDim, o.kStage, 0, kvDim);
+                System.arraycopy(vStage, t * kvDim, o.vStage, 0, kvDim);
+                System.arraycopy(q, t * qDim, o.q, 0, qDim);
+                o.kv.store(layer, pos, o.kStage, o.vStage, 1);
+                o.kv.attention(pool, layer, 1, pos, o.q, o.att, g.window(), g.scale(), g.softcap());
+                System.arraycopy(o.att, 0, att, t * outDim, outDim);
+            }
+            return true;
         }
 
         /** Per-head RMSNorm (if {@code norm != null}) followed by rotary embedding, in place. */
@@ -297,6 +335,48 @@ public final class CpuBackend implements Backend {
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
         run(tokens, off, n, pos, logitsOut, stride);
+    }
+
+    @Override
+    public boolean forwardBatch(Backend[] members, int[] tokens, int[] positions, float[][] logits) {
+        int n = members.length;
+        if (n < 1 || n > maxBatch || kv == null) {
+            return false;
+        }
+        CpuBackend[] owners = new CpuBackend[n];
+        for (int t = 0; t < n; t++) {
+            if (!(members[t] instanceof CpuBackend o) || o.w != w || o.kv == null || positions[t] >= o.ctx) {
+                return false;
+            }
+            owners[t] = o;
+        }
+        int dim = c.dim();
+        for (int t = 0; t < n; t++) {
+            w.embed.dequantizeRow(tokens[t], x, t * dim);
+        }
+        if (c.embedScale() != 1f) {
+            for (int i = 0; i < n * dim; i++) {
+                x[i] *= c.embedScale();
+            }
+        }
+        for (int l = 0; l < c.layers(); l++) {
+            LayerPlan p = plans[l];
+            DecoderLayer L = p.weights();
+            rmsnorm(x, xb, L.attnNorm(), n, dim);
+            if (!p.attention().runRows(l, owners, positions)) {
+                throw new IllegalStateException("layer " + l + " cannot attend per row"); // kv != null: GQA only
+            }
+            p.residual().add(L.wo(), att, L.postAttnNorm(), n);
+            rmsnorm(x, xb, L.ffnNorm(), n, dim);
+            p.ffn().run(n);
+        }
+        int vocab = w.lmHead.rows;
+        float[] all = new float[n * vocab];
+        lmHeadAll(n, all, vocab);
+        for (int t = 0; t < n; t++) {
+            System.arraycopy(all, t * vocab, logits[t], 0, Math.min(vocab, logits[t].length));
+        }
+        return true;
     }
 
     /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */

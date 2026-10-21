@@ -53,6 +53,18 @@ public interface Backend extends AutoCloseable {
      * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.
      */
     /**
+     * Decodes one token for each of several backends that run on the same weights, in one pass: the projections, the
+     * MLP and the LM head go over all the rows at once (the weights are read once for the whole batch, which is what
+     * makes serving several conversations cheaper than serving them one after another), while each row's attention
+     * uses its own backend's cache at its own position. {@code members[i]} gets {@code tokens[i]} at
+     * {@code positions[i]} and its logits in {@code logits[i]}; {@code this} lends its buffers and must be one of the
+     * members. Returns false, having done nothing, when the backend cannot (the caller then runs them one by one).
+     */
+    default boolean forwardBatch(Backend[] members, int[] tokens, int[] positions, float[][] logits) {
+        return false;
+    }
+
+    /**
      * The machine's thermal state as the GPU driver reports it: 0 nominal, 1 fair, 2 serious (the GPU is being slowed
      * down), 3 critical; -1 when the backend cannot tell (the CPU backend, an old native library).
      */

@@ -119,6 +119,63 @@ final class MetalTuner {
         }
     }
 
+    /**
+     * Threads per threadgroup for the plain single-token matmul ({@link MetalKernels#decodeThreads}): 64, 128 and 256
+     * timed on the model's own matrix {@code t} (an output projection: the matrices this kernel serves). The results
+     * are bit-identical for every size (checked), so only speed decides; the emulator keeps the default. Cached per
+     * device and matrix shape like the other decisions; {@code -Djllm.metal.decodeThreads=N} forces it.
+     */
+    static int decodeThreads(MetalKernels k, org.robomiri.jllm.model.QTensor t, Metal.Buffer buf) {
+        Integer forced = Integer.getInteger("jllm.metal.decodeThreads");
+        if (forced != null && (forced == 64 || forced == 128 || forced == 256)) {
+            return forced;
+        }
+        if (Metal.EMULATOR) {
+            return MetalConstants.MM_THREADS;
+        }
+        String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|mv" + t.type + "|" + t.rows + "x" + t.cols)
+                .replace(' ', '_').replace('=', '_').replace(':', '_');
+        Properties cache = load();
+        String cached = cache.getProperty(key);
+        if (cached != null) {
+            return Integer.parseInt(cached);
+        }
+        Metal.Buffer x = k.scratch((long) t.cols * 4);
+        fill(x.contents(), t.cols, false, new Random(5));
+        Metal.Buffer ref = k.scratch((long) t.rows * 4);
+        Metal.Buffer out = k.scratch((long) t.rows * 4);
+        int best = MetalConstants.MM_THREADS;
+        double bestMs = Double.MAX_VALUE;
+        StringBuilder log = new StringBuilder();
+        try {
+            for (int threads : new int[]{128, 64, 256}) { // the default first: the reference for the comparison
+                k.decodeThreads = threads;
+                Metal.Buffer dst = threads == MetalConstants.MM_THREADS ? ref : out;
+                Runnable r = () -> k.matmul(t, buf, x, 0, dst, 0, 1, false, null, 0f);
+                double ms = time(k, () -> {
+                    for (int i = 0; i < 20; i++) {
+                        r.run();
+                    }
+                }, 5);
+                boolean same = dst == ref || dst.contents().mismatch(ref.contents()) == -1;
+                log.append(String.format(java.util.Locale.ROOT, " %d: %.3f ms%s;", threads, ms / 20, same ? "" : " DIFFERS"));
+                if (same && ms < 0.97 * bestMs) {
+                    bestMs = ms;
+                    best = threads;
+                }
+            }
+        } catch (RuntimeException e) {
+            best = MetalConstants.MM_THREADS;
+            log.append(" failed (").append(e.getMessage()).append(")");
+        } finally {
+            k.decodeThreads = MetalConstants.MM_THREADS;
+        }
+        System.err.println("Metal decode matmul threadgroup: " + best + " threads (" + log.toString().trim() + ")");
+        cache.setProperty(key, Integer.toString(best));
+        store(cache);
+        return best;
+    }
+
     /** Best of {@code reps} timed runs, milliseconds. */
     private static double time(MetalKernels k, Runnable r, int reps) {
         double best = Double.MAX_VALUE;
