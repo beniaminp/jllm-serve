@@ -52,7 +52,9 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 The Metal items above were verified for correctness on the emulator (every family, CPU == Metal); their speed has
 not been measured on Apple hardware yet: `scripts/mac-validate.sh` does both on a Mac and prints a table
 ([08 §8.20](docs/08-metal-backend.md#820-validating-on-a-mac)). Compare with `-Djllm.metal.flashPrefill=false`, `-Djllm.metal.moeMma=false`,
-`-Djllm.metal.pipeline=false` (passed through `JAVA_OPTS`) and `./jllm bench`.
+`-Djllm.metal.pipeline=false` (passed through `JAVA_OPTS`) and `./jllm bench`. `scripts/mac-validate.sh --vs-llama` also runs
+llama.cpp's `llama-bench` on the same GGUF file with the same prompt and output lengths and prints both side by side
+([11 §11.1](docs/11-performance.md#against-llamacpp-scriptsmac-validatesh---vs-llama)).
 
 ## Requirements
 

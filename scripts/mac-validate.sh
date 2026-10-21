@@ -6,6 +6,14 @@
 #   scripts/mac-validate.sh                                  Qwen/Qwen3-0.6B, ~15 minutes
 #   scripts/mac-validate.sh --moe Qwen/Qwen3-30B-A3B         plus the MoE rows (needs ~20 GB free memory)
 #   scripts/mac-validate.sh --skip-smoke                     speed only
+#   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
+#   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
+#   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
+#
+# The llama.cpp comparison needs llama-bench (brew install llama.cpp, or LLAMA_BENCH=/path/to/llama-bench) and
+# python3. Both engines read the same .gguf file (default unsloth/Qwen3-0.6B-GGUF, Q4_0; --llama-quant to change),
+# with the same prompt length and number of generated tokens; jllm runs without speculative decoding, as llama-bench
+# has none, and a second jllm row shows it with its default speculation.
 #
 # Keep the Mac plugged in and idle; the table notes the thermal state, since a hot GPU runs slower.
 set -euo pipefail
@@ -15,12 +23,22 @@ DENSE=Qwen/Qwen3-0.6B
 MOE=""
 SMOKE=1
 ROUNDS=3
+VS_LLAMA=""
+LLAMA_ONLY=""
+LLAMA_DENSE=unsloth/Qwen3-0.6B-GGUF
+LLAMA_MOE=""
+LLAMA_QUANT=Q4_0
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) DENSE="$2"; shift 2 ;;
     --moe) MOE="$2"; shift 2 ;;
     --skip-smoke) SMOKE=""; shift ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
+    --vs-llama) VS_LLAMA=1; shift ;;
+    --llama-only) LLAMA_ONLY=1; SMOKE=""; shift ;;
+    --llama-model) LLAMA_DENSE="$2"; shift 2 ;;
+    --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
+    --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -48,6 +66,8 @@ bench() { # label model java-opts settings...
 
 echo
 echo "machine: $(sysctl -n machdep.cpu.brand_string), $(($(sysctl -n hw.memsize) / 1073741824)) GB, $(sw_vers -productVersion)"
+
+if [ -z "$LLAMA_ONLY" ]; then
 echo
 echo "| configuration | prefill tok/s | decode tok/s | note |"
 echo "|---|---|---|---|"
@@ -68,3 +88,66 @@ if [ -n "$MOE" ]; then
 fi
 echo
 echo "(median of $ROUNDS rounds; logs in $OUT)"
+fi
+
+# ---------------------------------------------------------------- jllm vs llama.cpp on the same GGUF file
+# jllm's bench line gives the prompt length P and generated count N; llama-bench then runs -p P (prefill) and -n N
+# (decode), at context depth P when this llama-bench supports -d, so both decode after a prompt of the same length.
+# llama.cpp runs with flash attention off and on; the faster of the two is reported for each column.
+versus() { # gguf-repo
+  local repo="$1" line pre dec ptok ntok file depth=""
+  ./jllm bench --model "$repo" --gguf-quant "$LLAMA_QUANT" --temp 0 --bench.rounds "$ROUNDS" \
+      --engine.speculative off > "$OUT/vj.log" 2>&1 || { echo "| $repo | jllm failed: $(tail -1 "$OUT/vj.log") | | |"; return; }
+  pre=$(grep -o '([0-9.]* tok/s), decode' "$OUT/vj.log" | grep -o '[0-9.]*' | sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')
+  dec=$(grep -o 'decode [0-9]* tok in [0-9]* ms ([0-9.]* tok/s)' "$OUT/vj.log" | grep -o '([0-9.]*' | tr -d '(' | sort -n \
+    | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')
+  line=$(grep -m1 '^prefill [0-9]* tok' "$OUT/vj.log")
+  ptok=$(echo "$line" | awk '{print $2}')
+  ntok=$(echo "$line" | grep -o 'decode [0-9]*' | awk '{print $2}')
+  file=$(find models/"${repo/\//_}" -name "*${LLAMA_QUANT}*.gguf" ! -name '*-0000[2-9]-of-*' 2>/dev/null | sort | head -1)
+  [ -n "$file" ] || { echo "| $repo | no ${LLAMA_QUANT} .gguf under models/${repo/\//_} | | |"; return; }
+  local help depthNote="decode from an empty context (this llama-bench has no -d)"
+  help=$("$LLAMA_BENCH" --help 2>&1 || true)
+  if grep -q -- '--n-depth' <<< "$help"; then depth="-d $ptok"; depthNote="decode at depth $ptok"; fi
+  # flash attention off and on; builds whose -fa takes on/off/auto instead get those values, then the default
+  "$LLAMA_BENCH" -m "$file" -p "$ptok" -n "$ntok" $depth -r "$ROUNDS" -fa 0,1 -o json > "$OUT/vl.json" 2> "$OUT/vl.log" \
+    || "$LLAMA_BENCH" -m "$file" -p "$ptok" -n "$ntok" $depth -r "$ROUNDS" -fa off,on -o json > "$OUT/vl.json" 2> "$OUT/vl.log" \
+    || "$LLAMA_BENCH" -m "$file" -p "$ptok" -n "$ntok" $depth -r "$ROUNDS" -o json > "$OUT/vl.json" 2> "$OUT/vl.log" || {
+    echo "| $repo | llama-bench failed: $(tail -1 "$OUT/vl.log") | | |"; return; }
+  read -r lpre ldec < <(python3 - "$OUT/vl.json" <<'PY'
+import json, sys
+rows = json.load(open(sys.argv[1]))
+pp = max((r["avg_ts"] for r in rows if r.get("n_prompt", 0) > 0 and r.get("n_gen", 0) == 0), default=0)
+tg = max((r["avg_ts"] for r in rows if r.get("n_gen", 0) > 0 and r.get("n_prompt", 0) == 0), default=0)
+print(f"{pp:.1f} {tg:.1f}")
+PY
+)
+  local name; name=$(basename "$file")
+  echo "| $name | jllm (Metal) | $pre | $dec | prompt $ptok tok, $ntok generated |"
+  echo "| | llama.cpp | $lpre | $ldec | $depthNote |"
+  awk -v a="$pre" -v b="$lpre" -v c="$dec" -v d="$ldec" \
+    'BEGIN { printf "| | jllm / llama.cpp | %.2fx | %.2fx | |\n", (b > 0 ? a / b : 0), (d > 0 ? c / d : 0) }'
+  ./jllm bench --model "$repo" --gguf-quant "$LLAMA_QUANT" --temp 0 --bench.rounds "$ROUNDS" > "$OUT/vs.log" 2>&1 && {
+    dec=$(grep -o 'decode [0-9]* tok in [0-9]* ms ([0-9.]* tok/s)' "$OUT/vs.log" | grep -o '([0-9.]*' | tr -d '(' | sort -n \
+      | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')
+    echo "| | jllm, default speculation | | $dec | the bench prompt repeats itself, so this favours speculation |"; }
+}
+
+if [ -n "$VS_LLAMA" ]; then
+  LLAMA_BENCH="${LLAMA_BENCH:-$(command -v llama-bench || true)}"
+  if [ -z "$LLAMA_BENCH" ]; then
+    echo; echo "llama-bench not found: brew install llama.cpp, or set LLAMA_BENCH=/path/to/llama-bench"
+  elif ! command -v python3 > /dev/null; then
+    echo; echo "python3 not found (xcode-select --install): it reads llama-bench's JSON"
+  else
+    echo
+    echo "llama.cpp: $("$LLAMA_BENCH" --version 2>&1 | head -1)"
+    echo
+    echo "| model file | engine | prefill tok/s | decode tok/s | note |"
+    echo "|---|---|---|---|---|"
+    versus "$LLAMA_DENSE"
+    [ -z "$LLAMA_MOE" ] || versus "$LLAMA_MOE"
+    echo
+    echo "(jllm: median of $ROUNDS rounds; llama.cpp: mean of $ROUNDS repetitions, best of flash attention off/on)"
+  fi
+fi
