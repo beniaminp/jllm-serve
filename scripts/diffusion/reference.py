@@ -139,6 +139,8 @@ def main():
     elif a.scheduler == 'dpmpp_2m_karras':
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(cfgd, timestep_spacing=spacing, use_karras_sigmas=True)
     xl = hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None
+    if xl and a.dtype == 'float16':
+        pipe.vae.to(torch.float32)  # the SDXL VAE overflows in float16 (diffusers upcasts it too); jllm runs it in float32
     lh, lw = a.height // 8, a.width // 8
     cfg = a.guidance > 1.0
     meta = dict(prompt=a.prompt, negative=a.negative, width=a.width, height=a.height, steps=a.steps,
@@ -201,12 +203,13 @@ def main():
     r2 = Rng(99)
     z = r2.normal(4 * lh * lw).reshape(1, 4, lh, lw) * 0.8
     with torch.no_grad():
-        dec = vae.decode(torch.from_numpy(z).to(a.device, dtype) / vae.config.scaling_factor).sample
+        vdt = vae.dtype
+        dec = vae.decode(torch.from_numpy(z).to(a.device, vdt) / vae.config.scaling_factor).sample
     save(a.out, 'vae_z.f32', z)
     save(a.out, 'vae_dec.f32', dec.float().cpu().numpy().transpose(0, 2, 3, 1))
     img = np.clip(r2.normal(3 * a.height * a.width).reshape(1, 3, a.height, a.width) * 0.5, -1, 1).astype(np.float32)
     with torch.no_grad():
-        post = vae.encode(torch.from_numpy(img).to(a.device, dtype)).latent_dist
+        post = vae.encode(torch.from_numpy(img).to(a.device, vdt)).latent_dist
     save(a.out, 'vae_img.f32', img.transpose(0, 2, 3, 1))
     save(a.out, 'vae_mean.f32', post.mean.float().cpu().numpy())
     save(a.out, 'vae_std.f32', post.std.float().cpu().numpy())
@@ -246,7 +249,7 @@ def main():
         lat = res.float().cpu().numpy()
         save(a.out, 'latents.f32', lat)
         with torch.no_grad():
-            dimg = vae.decode(res.to(dtype) / vae.config.scaling_factor).sample
+            dimg = vae.decode(res.to(vae.dtype) / vae.config.scaling_factor).sample
         save(a.out, 'image.f32', dimg.float().cpu().numpy().transpose(0, 2, 3, 1))
     json.dump(meta, open(os.path.join(a.out, 'ref.json'), 'w'), indent=1)
     print('wrote', a.out, file=sys.stderr)

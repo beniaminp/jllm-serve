@@ -40,6 +40,7 @@ def run(E, check):
         return (rng.standard_normal(shape) * scale).astype(dtype)
 
     sfx = {np.float32: '_f', np.float16: '_h'}
+    tile_n = {np.float32: 32, np.float16: 64}   # columns of the output tile of the matrix kernels (DF_BNT)
 
     # ---------------------------------------------------------------- df_gemm_nt: act(A W^T + bias) + res
     def gemm(dtype, m, n, k, act=0, bias=True, res=True, vec=None):
@@ -48,10 +49,10 @@ def run(E, check):
         r = rnd(dtype, m, n)
         out = np.zeros((m, n), dtype)
         if vec is None:
-            vec = int(k % 4 == 0 and n % 4 == 0)
+            vec = int(k % 8 == 0 and n % 8 == 0)
         # GemmParams: m n k lda ldb ldc heads aSB aSH bSB bSH cSB cSH alpha hasBias hasRes act vec
         p = pack('iiiiiiiiiiiiifiiii', m, n, k, k, k, n, 1, 0, 0, 0, 0, 0, 0, 1.0, int(bias), int(res), act, vec)
-        E.dispatch('df_gemm_nt' + sfx[dtype], [a, w, out, b, r], p, ((n + 63) // 64, (m + 63) // 64, 1), (128,))
+        E.dispatch('df_gemm_nt' + sfx[dtype], [a, w, out, b, r], p, ((n + tile_n[dtype] - 1) // tile_n[dtype], (m + 63) // 64, 1), (128,))
         ref = a.astype(np.float64) @ w.astype(np.float64).T
         if bias:
             ref = ref + b
@@ -88,17 +89,17 @@ def run(E, check):
                 pr = np.exp(s - s.max(1, keepdims=True))
                 pr /= pr.sum(1, keepdims=True)
                 ref[b, :, h * hd:(h + 1) * hd] = pr @ vh
-        vec = int(dm % 4 == 0 and hd % 4 == 0)
+        vec = int(dm % 8 == 0 and hd % 8 == 0 and ld % 8 == 0)
         for b in range(batch):
             scores = np.zeros((heads, lq, ld), np.float32)
             qb, kb, vb = q[b].copy(), k[b].copy(), v[b].copy()
             ob = np.zeros((lq, dm), dtype)
             p = pack('iiiiiiiiiiiiifiiii', lq, lk, hd, dm, dm, ld, heads, 0, hd, 0, hd, 0, lq * ld, scale, 0, 0, 0, vec)
             name = 'df_scores_h' if dtype == np.float16 else 'df_gemm_nt_f'
-            E.dispatch(name, [qb, kb, scores, scores, scores], p, ((lk + 63) // 64, (lq + 63) // 64, heads), (128,))
+            E.dispatch(name, [qb, kb, scores, scores, scores], p, ((lk + tile_n[dtype] - 1) // tile_n[dtype], (lq + 63) // 64, heads), (128,))
             E.dispatch('df_softmax', [scores], pack('iiii', lk, ld, lq, int(causal)), (heads * lq,), (256,))
             p = pack('iiiiiiiiiiiiifiiii', lq, hd, lk, ld, dm, dm, heads, 0, lq * ld, 0, hd, 0, hd, 1.0, 0, 0, 0, vec)
-            E.dispatch('df_pv' + sfx[dtype], [scores, vb, ob, ob, ob], p, ((hd + 63) // 64, (lq + 63) // 64, heads), (128,))
+            E.dispatch('df_pv' + sfx[dtype], [scores, vb, ob, ob, ob], p, ((hd + tile_n[dtype] - 1) // tile_n[dtype], (lq + 63) // 64, heads), (128,))
             out[b] = ob
         err = np.abs(out - ref).max()
         check(err < tol(dtype, ref) * 0.5, 'naive attention%s b=%d h=%d lq=%d lk=%d hd=%d causal=%s: max err %.2e'
@@ -174,7 +175,7 @@ def run(E, check):
         if direct:
             E.dispatch('df_conv_direct' + sfx[dtype], [x, w, out, bias, chan, res], p, ((m * co + 255) // 256,), (256,))
         else:
-            E.dispatch('df_conv' + sfx[dtype], [x, w, out, bias, chan, res], p, ((co + 63) // 64, (m + 63) // 64, 1), (128,))
+            E.dispatch('df_conv' + sfx[dtype], [x, w, out, bias, chan, res], p, ((co + tile_n[dtype] - 1) // tile_n[dtype], (m + 63) // 64, 1), (128,))
         xl = x.astype(np.float64)
         if ups:
             xl = xl.repeat(2, axis=1).repeat(2, axis=2)

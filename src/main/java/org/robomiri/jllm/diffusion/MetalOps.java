@@ -111,6 +111,8 @@ final class MetalOps implements Ops {
     private final Gpu gpu;
     private final boolean half;
     private final int es;
+    /** Columns of the output tile of the matrix kernels: 64 for half, 32 for float (DF_BNT in diffusion.metal). */
+    private final int tn;
     private final String sfx;
     private final java.util.List<MT> weights = new java.util.ArrayList<>();
 
@@ -118,6 +120,7 @@ final class MetalOps implements Ops {
         this.gpu = gpu;
         this.half = half;
         this.es = half ? 2 : 4;
+        this.tn = half ? 64 : 32;
         this.sfx = half ? "_h" : "_f";
     }
 
@@ -459,7 +462,7 @@ final class MetalOps implements Ops {
         int plen = p(DiffusionParams.GEMM).i(m).i(n).i(k).i(k).i(k).i(n).i(1).i(0).i(0).i(0).i(0).i(0).i(0).f(1f)
                 .i(bias != null ? 1 : 0).i(residual != null ? 1 : 0).i(act.ordinal()).i(k % 8 == 0 && n % 8 == 0 ? 1 : 0).done();
         Metal.Buffer o = buf(out);
-        run("df_gemm_nt" + sfx, cdiv(n, 64), cdiv(m, 64), 1, 128, plen, buf(x), buf(w), o,
+        run("df_gemm_nt" + sfx, cdiv(n, tn), cdiv(m, 64), 1, 128, plen, buf(x), buf(w), o,
                 bias != null ? buf(bias) : o, residual != null ? buf(residual) : o);
     }
 
@@ -496,7 +499,7 @@ final class MetalOps implements Ops {
         Metal.Buffer cb = chanBias != null ? buf(chanBias) : o;
         Metal.Buffer rb = residual != null ? buf(residual) : o;
         if (ci % 8 == 0 && co >= 16) {
-            run("df_conv" + sfx, cdiv(co, 64), cdiv((long) b * ho * wo, 64), 1, 128, plen, buf(x), buf(w), o, bb, cb, rb);
+            run("df_conv" + sfx, cdiv(co, tn), cdiv((long) b * ho * wo, 64), 1, 128, plen, buf(x), buf(w), o, bb, cb, rb);
         } else {
             long total = (long) b * ho * wo * co;
             run("df_conv_direct" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(w), o, bb, cb, rb);
@@ -597,13 +600,13 @@ final class MetalOps implements Ops {
                 int plen = p(DiffusionParams.GEMM).i(lq).i(lk).i(hd).i(dm).i(dm).i(ld).i(nh).i(0).i(hd).i(0).i(hd).i(0).i(lq * ld)
                         .f(scale).i(0).i(0).i(0).i(vec ? 1 : 0).done();
                 // the scores product is df_scores_{f,h}; offsets into q / k / v / out are applied as buffer offsets
-                run(half ? "df_scores_h" : "df_gemm_nt_f", cdiv(lk, 64), cdiv(lq, 64), nh, 128, plen, view(qm, qOff), view(km, kOff), scores.buf,
+                run(half ? "df_scores_h" : "df_gemm_nt_f", cdiv(lk, tn), cdiv(lq, 64), nh, 128, plen, view(qm, qOff), view(km, kOff), scores.buf,
                         scores.buf, scores.buf);
                 plen = p(DiffusionParams.SOFTMAX).i(lk).i(ld).i(lq).i(causal ? 1 : 0).done();
                 run("df_softmax", nh * lq, 1, 1, 256, plen, scores.buf);
                 plen = p(DiffusionParams.GEMM).i(lq).i(hd).i(lk).i(ld).i(dm).i(dm).i(nh).i(0).i(lq * ld).i(0).i(hd).i(0).i(hd)
                         .f(1f).i(0).i(0).i(0).i(vec ? 1 : 0).done();
-                run("df_pv" + sfx, cdiv(hd, 64), cdiv(lq, 64), nh, 128, plen, scores.buf, view(vm, kOff), view(om, qOff),
+                run("df_pv" + sfx, cdiv(hd, tn), cdiv(lq, 64), nh, 128, plen, scores.buf, view(vm, kOff), view(om, qOff),
                         om.buf, om.buf);
             }
         }

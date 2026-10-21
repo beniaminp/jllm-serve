@@ -86,8 +86,9 @@ static inline float df_act(float v, int act) {
 // ---------------------------------------------------------------------------------------------- 2. matrix product
 // df_gemm<TA, TB, TC, TM, BT>: C[z][m][n] = act(alpha * sum_k A[z][m][k] * B[z][n][k] + bias[n]) + res[m][n]
 //   BT = true : B is [N, K] rows (a weight, or the keys of attention); BT = false: B is [K, N] rows (the values).
-// A threadgroup (4 simdgroups) computes a 64 x 64 tile in 32-wide k slices staged in threadgroup memory as TM (half or
-// float); each simdgroup owns a 32 x 32 quarter (4 x 4 simdgroup 8 x 8 accumulators, float). z = batch * heads + head
+// A threadgroup (4 simdgroups) computes a 64 x BNT tile (BNT = 64 for half, 32 for float: see DF_BNT) in 32-wide k slices
+// staged in threadgroup memory as TM (half or float); each simdgroup owns a quarter of it (4 x SJ simdgroup 8 x 8
+// accumulators, float). z = batch * heads + head
 // indexes the independent products of attention (strides in elements); a plain product has heads = 1, z = 0. Rows /
 // columns / k past m / n / k read as zero and are not written. With vec = 1 (lda, ldb and the strides are multiples of 4
 // elements and the pointers aligned) full 16-element runs are loaded as 4-vectors.
@@ -119,6 +120,28 @@ static inline vec<TD, 4> df_cvt4(vec<TS, 4> v) {
     return vec<TD, 4>{TD(v.x), TD(v.y), TD(v.z), TD(v.w)};
 }
 
+// Tile shapes. Four simdgroups share a threadgroup and each owns 4 x SJ blocks of 8 x 8 (float) accumulators:
+//   half:  SJ = 4, a 64 x 64 output tile (every simdgroup a 32 x 32 quarter, 16 accumulators)
+//   float: SJ = 2, a 64 x 32 output tile (a 32 x 16 quarter, 8 accumulators): with 16 float accumulators and float fragments
+//          the compiler's register allocation falls over and the kernel runs 8 times slower, measured
+// BNT is the tile's width in n. The staged slices (TM) and the float tile the accumulators go through before the epilogue are
+// optionally padded (DF_PAD_BYTES per row) against threadgroup-memory bank conflicts; DF_LOAD16B copies half rows with two
+// 16-byte loads instead of four 8-byte ones (vec = 1 then means: all strides and offsets are multiples of 8 elements).
+//   LDK: row stride (TM elements) of a slice that is 32 wide in k     LDN: of a slice that is BNT wide in n
+//   LDS: row stride (floats) of the accumulator tile
+#ifndef DF_PAD_BYTES
+#define DF_PAD_BYTES 0
+#endif
+#ifndef DF_LOAD16B
+#define DF_LOAD16B 0
+#endif
+#define DF_BNT(TM) (sizeof(TM) == 4 ? 32 : 64)
+#define DF_SJ(TM) (DF_BNT(TM) / 16)
+#define DF_LDK(TM) (DF_BK + DF_PAD_BYTES / int(sizeof(TM)))
+#define DF_LDN(TM) (DF_BNT(TM) + DF_PAD_BYTES / int(sizeof(TM)))
+#define DF_LDS(TM) (DF_BNT(TM) + DF_PAD_BYTES / 4)
+#define DF_SMEM_FLOATS 5120     // 20 KB: the two slices (at most 2 x 64 x 36 x 4 B) or the accumulator tile
+
 // 8 contiguous elements (16-byte aligned for half) to threadgroup memory, converted when the types differ
 template <typename TS, typename TM>
 static inline void df_load8(device const TS *src, threadgroup TM *dst) {
@@ -127,12 +150,6 @@ static inline void df_load8(device const TS *src, threadgroup TM *dst) {
     d4[0] = df_cvt4<TM, TS>(s4[0]);
     d4[1] = df_cvt4<TM, TS>(s4[1]);
 }
-
-#if DF_LOAD16B
-static inline void df_load8(device const half *src, threadgroup half *dst) {
-    *(threadgroup float4 *)dst = *(device const float4 *)src;
-}
-#endif
 
 template <typename TS, typename TM>
 static inline void df_load16(device const TS *src, threadgroup TM *dst, int avail, bool useVec) {
@@ -145,24 +162,11 @@ static inline void df_load16(device const TS *src, threadgroup TM *dst, int avai
     }
 }
 
-// The staged slices are padded by 16 bytes per row so that the 8 rows of an 8 x 8 simdgroup_load fall into different
-// threadgroup-memory banks (a row of 32 halves is 64 bytes: rows i and i + 2 would share a bank).
-//   LDK: row stride (in TM elements) of a slice that is 32 wide in k     LDN: of a slice that is 64 wide in n
-//   LDS: row stride (floats) of the float32 tile the accumulators are stored in before the epilogue
-#ifndef DF_PAD_BYTES
-#define DF_PAD_BYTES 0
-#endif
-#define DF_LDK(TM) (DF_BK + DF_PAD_BYTES / int(sizeof(TM)))
-#define DF_LDN(TM) (DF_BN + DF_PAD_BYTES / int(sizeof(TM)))
-#define DF_LDS (DF_BN + DF_PAD_BYTES / 4)
-#define DF_SMEM_FLOATS 5120     // 20 KB: both slices (float: 2 x 64 x 36 x 4 B = 18 KB) or the 64 x 68 float tile (17 KB)
-
-// same element type on both sides (half, half): 16-byte vectors, two per 16 elements (vec = 1 guarantees 16-byte alignment:
-// the strides and offsets are multiples of 8 halves)
-#ifndef DF_LOAD16B
-#define DF_LOAD16B 1
-#endif
 #if DF_LOAD16B
+static inline void df_load8(device const half *src, threadgroup half *dst) {
+    *(threadgroup float4 *)dst = *(device const float4 *)src;
+}
+
 static inline void df_load16(device const half *src, threadgroup half *dst, int avail, bool useVec) {
     if (useVec && avail >= 16) {
         device const float4 *s4 = (device const float4 *)src;
@@ -175,21 +179,23 @@ static inline void df_load16(device const half *src, threadgroup half *dst, int 
 }
 #endif
 
-// the 4 x 4 accumulators of one simdgroup over the staged 64 x 32 A and B slices
+// the accumulators of one simdgroup (4 x SJ blocks) over the staged 64 x 32 A and BNT x 32 B slices
 template <typename TM, bool BT>
 static inline void df_mma(threadgroup TM *sa, threadgroup TM *sb, thread simdgroup_float8x8 *acc, ushort sr, ushort sc) {
     constexpr int LDK = DF_LDK(TM);
     constexpr int LDN = DF_LDN(TM);
+    constexpr int SJ = DF_SJ(TM);
     for (int kk = 0; kk < 4; kk++) {
-        simdgroup_matrix<TM, 8, 8> af[4];
-        simdgroup_matrix<TM, 8, 8> bf[4];
-        for (int i = 0; i < 4; i++) simdgroup_load(af[i], sa + (sr * 32 + i * 8) * LDK + kk * 8, LDK);
-        for (int j = 0; j < 4; j++) {
-            if (BT) simdgroup_load(bf[j], sb + (sc * 32 + j * 8) * LDK + kk * 8, LDK, ulong2(0, 0), true);
-            else simdgroup_load(bf[j], sb + (kk * 8) * LDN + sc * 32 + j * 8, LDN);
+        simdgroup_matrix<TM, 8, 8> bf[SJ];
+        for (int j = 0; j < SJ; j++) {
+            if (BT) simdgroup_load(bf[j], sb + (sc * 8 * SJ + j * 8) * LDK + kk * 8, LDK, ulong2(0, 0), true);
+            else simdgroup_load(bf[j], sb + (kk * 8) * LDN + sc * 8 * SJ + j * 8, LDN);
         }
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) simdgroup_multiply_accumulate(acc[i * 4 + j], af[i], bf[j], acc[i * 4 + j]);
+        for (int i = 0; i < 4; i++) {  // one A fragment at a time: fewer live registers
+            simdgroup_matrix<TM, 8, 8> af;
+            simdgroup_load(af, sa + (sr * 32 + i * 8) * LDK + kk * 8, LDK);
+            for (int j = 0; j < SJ; j++) simdgroup_multiply_accumulate(acc[i * SJ + j], af, bf[j], acc[i * SJ + j]);
+        }
     }
 }
 
@@ -205,10 +211,13 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr int LDK = DF_LDK(TM);
     constexpr int LDN = DF_LDN(TM);
+    constexpr int LDS = DF_LDS(TM);
+    constexpr int BNT = DF_BNT(TM);
+    constexpr int SJ = DF_SJ(TM);
     threadgroup float smem[DF_SMEM_FLOATS];
     threadgroup TM *sa = (threadgroup TM *)smem;
     threadgroup TM *sb = sa + DF_BM * LDK;
-    const int n0 = int(tgp.x) * DF_BN;
+    const int n0 = int(tgp.x) * BNT;
     const int m0 = int(tgp.y) * DF_BM;
     const int z = int(tgp.z);
     const int zb = z / p.heads;
@@ -220,8 +229,8 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
     const ushort sc = sg >> 1;
     const bool useVec = p.vec != 0;
 
-    simdgroup_float8x8 acc[16];
-    for (int i = 0; i < 16; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc[4 * SJ];
+    for (int i = 0; i < 4 * SJ; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     const int ar = tid >> 1;            // A rows / BT B rows: 64 rows, two threads (16 k each) per row
     const int ak = (tid & 1) * 16;
@@ -235,11 +244,13 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
             else for (int i = 0; i < 16; i++) dst[i] = TM(0);
         }
         if (BT) {
-            const int n = n0 + ar;
-            threadgroup TM *dst = sb + ar * LDK + ak;
-            if (n < p.n) df_load16<TB, TM>(bb + (long)n * p.ldb + k0 + ak, dst, p.k - k0 - ak, useVec);
-            else for (int i = 0; i < 16; i++) dst[i] = TM(0);
-        } else {
+            if (ar < BNT) {
+                const int n = n0 + ar;
+                threadgroup TM *dst = sb + ar * LDK + ak;
+                if (n < p.n) df_load16<TB, TM>(bb + (long)n * p.ldb + k0 + ak, dst, p.k - k0 - ak, useVec);
+                else for (int i = 0; i < 16; i++) dst[i] = TM(0);
+            }
+        } else if (bn < BNT) {
             const int kr = k0 + bk;
             threadgroup TM *dst = sb + bk * LDN + bn;
             if (kr < p.k) df_load16<TB, TM>(bb + (long)kr * p.ldb + n0 + bn, dst, p.n - n0 - bn, useVec);
@@ -252,16 +263,16 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
     // tile -> threadgroup memory (aliasing the slices) -> epilogue
     threadgroup float *stg = smem;
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * DF_LDS + sc * 32 + j * 8, DF_LDS);
+        for (int j = 0; j < SJ; j++) simdgroup_store(acc[i * SJ + j], stg + (sr * 32 + i * 8) * LDS + sc * 8 * SJ + j * 8, LDS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const TC *rb = res + (long)zb * p.cSB + (long)zh * p.cSH;
-    for (int e = tid; e < DF_BM * DF_BN; e += DF_THREADS) {
-        const int r = e >> 6;
-        const int cc = e & 63;
+    for (int e = tid; e < DF_BM * BNT; e += DF_THREADS) {
+        const int r = e / BNT;
+        const int cc = e - r * BNT;
         const int m = m0 + r;
         const int n = n0 + cc;
         if (m < p.m && n < p.n) {
-            float v = stg[r * DF_LDS + cc] * p.alpha;
+            float v = stg[r * LDS + cc] * p.alpha;
             if (p.hasBias != 0) v += bias[n];
             v = df_act(v, p.act);
             if (p.hasRes != 0) v += float(rb[(long)m * p.ldc + n]);
@@ -306,18 +317,21 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr int LDK = DF_LDK(TM);
+    constexpr int LDS = DF_LDS(TM);
+    constexpr int BNT = DF_BNT(TM);
+    constexpr int SJ = DF_SJ(TM);
     threadgroup float smem[DF_SMEM_FLOATS];
     threadgroup TM *sa = (threadgroup TM *)smem;
     threadgroup TM *sb = sa + DF_BM * LDK;
-    const int n0 = int(tgp.x) * DF_BN;
+    const int n0 = int(tgp.x) * BNT;
     const int m0 = int(tgp.y) * DF_BM;
     const int M = p.batch * p.ho * p.wo;
     const int K = p.kh * p.kw * p.cin;
     const ushort sr = sg & 1;
     const ushort sc = sg >> 1;
 
-    simdgroup_float8x8 acc[16];
-    for (int i = 0; i < 16; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc[4 * SJ];
+    for (int i = 0; i < 4 * SJ; i++) acc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     const int ar = tid >> 1;
     const int ak = (tid & 1) * 16;
@@ -352,18 +366,20 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                 for (int i = 0; i < 8; i++) da[g * 8 + i] = TM(0);
             }
         }
-        threadgroup TM *db = sb + ar * LDK + ak;
-        if (n < p.cout) {
-            device const T *wr = w + (long)n * K + k0 + ak;
-            const int avail = K - k0 - ak;
-            if (avail >= 16) {
-                df_load8(wr, db);
-                df_load8(wr + 8, db + 8);
+        if (ar < BNT) {
+            threadgroup TM *db = sb + ar * LDK + ak;
+            if (n < p.cout) {
+                device const T *wr = w + (long)n * K + k0 + ak;
+                const int avail = K - k0 - ak;
+                if (avail >= 16) {
+                    df_load8(wr, db);
+                    df_load8(wr + 8, db + 8);
+                } else {
+                    for (int i = 0; i < 16; i++) db[i] = i < avail ? TM(wr[i]) : TM(0);
+                }
             } else {
-                for (int i = 0; i < 16; i++) db[i] = i < avail ? TM(wr[i]) : TM(0);
+                for (int i = 0; i < 16; i++) db[i] = TM(0);
             }
-        } else {
-            for (int i = 0; i < 16; i++) db[i] = TM(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         df_mma<TM, true>(sa, sb, acc, sr, sc);
@@ -371,15 +387,15 @@ kernel void df_conv(device const T *x [[buffer(0)]],
     }
     threadgroup float *stg = smem;
     for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) simdgroup_store(acc[i * 4 + j], stg + (sr * 32 + i * 8) * DF_LDS + sc * 32 + j * 8, DF_LDS);
+        for (int j = 0; j < SJ; j++) simdgroup_store(acc[i * SJ + j], stg + (sr * 32 + i * 8) * LDS + sc * 8 * SJ + j * 8, LDS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int e = tid; e < DF_BM * DF_BN; e += DF_THREADS) {
-        const int r = e >> 6;
-        const int cc = e & 63;
+    for (int e = tid; e < DF_BM * BNT; e += DF_THREADS) {
+        const int r = e / BNT;
+        const int cc = e - r * BNT;
         const int mm = m0 + r;
         const int nn = n0 + cc;
         if (mm < M && nn < p.cout) {
-            float v = stg[r * DF_LDS + cc];
+            float v = stg[r * LDS + cc];
             if (p.hasBias != 0) v += bias[nn];
             if (p.hasChan != 0) v += float(chan[(long)(mm / (p.ho * p.wo)) * p.cout + nn]);
             if (p.hasRes != 0) v += float(res[(long)mm * p.cout + nn]);

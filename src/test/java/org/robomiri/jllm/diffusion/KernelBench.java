@@ -10,18 +10,19 @@ public final class KernelBench {
     public static void main(String[] a) {
         String precision = a.length > 0 ? a[0] : "f16";
         int iters = a.length > 1 ? Integer.parseInt(a[1]) : 20;
+        String only = a.length > 2 ? a[2] : "linear,conv,attention,groupnorm"; // sections to run
         try (Devices dev = Devices.open("metal", precision, false)) {
             Ops ops = dev.main();
             java.util.Random rnd = new java.util.Random(1);
             // linear: rows x K times K x N
-            for (int[] s : new int[][]{{4096, 1280, 1280}, {4096, 320, 320}, {1024, 5120, 1280}, {16384, 320, 1280}}) {
+            for (int[] s : only.contains("linear") ? new int[][]{{4096, 1280, 1280}, {4096, 320, 320}, {1024, 5120, 1280}, {16384, 320, 1280}} : new int[0][]) {
                 Tn x = ops.upload(rand(rnd, s[0] * s[2]), s[0], s[2]);
                 Tn w = ops.upload(rand(rnd, s[1] * s[2]), s[1], s[2]);
                 double sec = time(ops, iters, () -> ops.free(ops.linear(x, w, null, null, Ops.Act.NONE)));
                 System.out.printf("linear %5d x %4d x %4d: %7.2f ms  %7.1f GFLOP/s%n", s[0], s[2], s[1], sec * 1e3, 2.0 * s[0] * s[1] * s[2] / sec / 1e9);
             }
             // convolution 3x3: [1,h,w,c] with [c,3,3,c]
-            for (int[] s : new int[][]{{64, 64, 320, 320}, {32, 32, 640, 640}, {16, 16, 1280, 1280}, {128, 128, 512, 512}, {256, 256, 256, 256}, {512, 512, 128, 128}}) {
+            for (int[] s : !only.contains("conv") ? new int[0][] : new int[][]{{64, 64, 320, 320}, {32, 32, 640, 640}, {16, 16, 1280, 1280}, {128, 128, 512, 512}, {256, 256, 256, 256}, {512, 512, 128, 128}}) {
                 Tn x = ops.upload(rand(rnd, s[0] * s[1] * s[2]), 1, s[0], s[1], s[2]);
                 Tn w = ops.upload(rand(rnd, s[3] * 9 * s[2]), s[3], 3, 3, s[2]);
                 double sec = time(ops, Math.max(3, iters / 4), () -> ops.free(ops.conv2d(x, w, null, 1, 1, 1, 1, 1, null, null)));
@@ -29,7 +30,7 @@ public final class KernelBench {
                         2.0 * s[0] * s[1] * s[2] * s[3] * 9 / sec / 1e9);
             }
             // attention
-            for (int[] s : new int[][]{{4096, 4096, 5, 64}, {1024, 1024, 10, 64}, {4096, 77, 5, 64}, {4096, 4096, 8, 40}, {4096, 32, 5, 64}, {4096, 64, 5, 64}, {4096, 128, 5, 64}, {4096, 512, 5, 64}, {256, 77, 5, 64}}) {
+            for (int[] s : !only.contains("attention") ? new int[0][] : new int[][]{{4096, 4096, 5, 64}, {1024, 1024, 10, 64}, {4096, 77, 5, 64}, {4096, 4096, 8, 40}, {4096, 32, 5, 64}, {4096, 64, 5, 64}, {4096, 128, 5, 64}, {4096, 512, 5, 64}, {256, 77, 5, 64}}) {
                 int dm = s[2] * s[3];
                 Tn q = ops.upload(rand(rnd, s[0] * dm), 1, s[0], dm);
                 Tn k = ops.upload(rand(rnd, s[1] * dm), 1, s[1], dm);
@@ -39,7 +40,7 @@ public final class KernelBench {
                         4.0 * s[0] * s[1] * dm / sec / 1e9);
             }
             // group norm (memory bound)
-            for (int[] s : new int[][]{{64, 64, 320}, {256, 256, 256}, {512, 512, 128}}) {
+            for (int[] s : !only.contains("groupnorm") ? new int[0][] : new int[][]{{64, 64, 320}, {256, 256, 256}, {512, 512, 128}}) {
                 Tn x = ops.upload(rand(rnd, s[0] * s[1] * s[2]), 1, s[0], s[1], s[2]);
                 Tn g = ops.weight(vecTensor(s[2], rnd), Ops.Kind.VECTOR);
                 double sec = time(ops, Math.max(3, iters / 4), () -> ops.free(ops.groupNorm(x, g, g, 32, 1e-5f, true)));
