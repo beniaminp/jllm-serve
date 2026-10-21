@@ -30,5 +30,6 @@ Suggested reading order:
 | 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format: header, metadata and tensor directory byte by byte, the Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K block layouts, mapping metadata and tensor names onto the typed `Architecture`, why Llama's q/k rows are permuted (and how interleaved RoPE undoes it), zero-copy mapping on CPU and Metal, the tokenizer stored in the file, choosing and downloading one file of a GGUF repository |
 | 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding — measured |
 | 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
+| 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push to Docker Hub, run; the /data volume, the API key, memory sizing, proxies, what was verified |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

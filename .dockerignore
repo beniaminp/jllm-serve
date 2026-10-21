@@ -1,0 +1,12 @@
+# only the sources are needed to build the image
+**/target
+models
+kv-cache
+.git
+.claude
+*.gguf
+jllm.properties
+jllm-web/jllm-web.properties
+jllm-web/jllm-web-tools.json
+jllm-web.properties
+jllm-web-tools.json

@@ -1,0 +1,17 @@
+# docker compose up -d   → console at http://localhost:8090/ ; `docker compose logs jllm` shows the API key
+services:
+  jllm:
+    image: ${JLLM_IMAGE:-jllm-serve:latest}   # or your pushed name, e.g. you/jllm-serve:1.0
+    build: .
+    ports:
+      - "8090:8090"            # "127.0.0.1:8090:8090" keeps it to this machine
+    volumes:
+      - jllm-data:/data        # models, converted caches, saved conversations, settings
+    environment:
+      # JLLM_API_KEY: ""       # empty: generated on first start and printed to the log; "none": no key
+      # HF_TOKEN: ""           # for gated / private Hugging Face models
+      # JLLM_AUTOLOAD: "Qwen/Qwen3-0.6B"
+      JLLM_HEAP_PERCENT: "60"
+    restart: unless-stopped
+volumes:
+  jllm-data:

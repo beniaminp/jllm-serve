@@ -131,6 +131,21 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"s
 `GET /health`, `GET /` (chat UI). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`.
 
+## Docker
+
+One image with the engine and the web console, for any machine with Docker (CPU backend: a container cannot use
+the Metal GPU, also not on a Mac):
+
+```sh
+docker run -d --name jllm -p 8090:8090 -v jllm-data:/data <you>/jllm-serve:latest
+docker logs jllm                      # the generated API key the console asks for
+open http://localhost:8090/
+```
+
+Build it with `scripts/docker-build.sh` (add `-t <you>/jllm-serve:1.0 --push` for a linux/amd64 + linux/arm64
+image on Docker Hub) or `docker compose up -d`. Data, settings and the key live in the `/data` volume. Details,
+environment variables and memory sizing: [docs/19](docs/19-docker.md).
+
 ## Web console (`jllm-web/`)
 
 A separate Spring Boot module on top of the engine: a browser console to chat, manage models and change settings,
