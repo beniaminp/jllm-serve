@@ -1049,6 +1049,15 @@ public final class JsonConstraint extends ByteConstraint {
         }
     }
 
+    /**
+     * Turns the allowed-token masks (trie walks, memoized masks and lists) of every constraint on or off
+     * ({@code engine.constraint-masks}); off, a token is allowed when its bytes are accepted one by one, and the
+     * sampler searches the most likely tokens and then the whole vocabulary, as it did before the masks.
+     */
+    public static void setFastMasks(boolean on) {
+        ByteConstraint.setFastMasks(on);
+    }
+
     /** A cache of allowed-token masks for the constraints of one schema ({@link Schema} keys are by identity). */
     public static Object newMaskCache() {
         return new MaskCache();

@@ -121,6 +121,36 @@ mvn -q compile test-compile
 [ -f target/native/libjllm_metal.dylib ] || ./scripts/build-native.sh >/dev/null
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
+# constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
+# with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
+# the run when the tokens differ from speculation off; its decode time is the median of 5 generations.
+# ConstraintBench times the token mask (CPU, microseconds per token) with the masks on and off (engine.constraint-masks).
+echo
+echo "| constrained tool call (Qwen3-0.6B, greedy, 'required') | tokens | drafts accepted | decode ms | tokens vs speculation off |"
+echo "|---|---|---|---|---|"
+"$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+  -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+  org.robomiri.jllm.ToolCallCheck --backend metal --ctx 1024 --check-rounds 5 --check-table --check-max 48 \
+  --check-draft "$DENSE" > "$OUT/tc.log" 2>&1 \
+  && grep '^| .* | weather/required=true/' "$OUT/tc.log" \
+    | awk -F'|' '{printf "|%s %s|%s|%s|%s|%s|\n", $2, $3, $4, $5, $6, $7}' \
+  || { echo "| failed | | | | $(tail -1 "$OUT/tc.log") |"; }
+masks() { # label java-opts
+  # shellcheck disable=SC2086
+  "$JAVA" --add-modules jdk.incubator.vector $2 -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench \
+    "models/$(echo "$DENSE" | tr / _)" 10 > "$OUT/cb.log" 2>&1 || { echo "| $label | failed | | $(tail -1 "$OUT/cb.log") |"; return; }
+  local g d x
+  g=$(grep '^agree *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  d=$(grep '^distracted *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  x=$(grep '^disagree *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  echo "| $label | agree $g, distracted $d, disagree $x | | |"
+}
+echo
+echo "| token mask of constrained sampling (greedy, us per token) | agree, distracted, disagree | | |"
+echo "|---|---|---|---|"
+masks "masks on (default)" ""
+masks "masks on, shared memo (-Dwarm)" "-Dwarm=true"
+masks "masks off (engine.constraint-masks=false)" "-Djllm.constraint.masks=false"
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64

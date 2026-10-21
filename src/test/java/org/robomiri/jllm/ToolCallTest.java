@@ -1,6 +1,7 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.engine.DraftModel;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.Speculator;
 import org.robomiri.jllm.json.Json;
@@ -332,9 +333,22 @@ public final class ToolCallTest {
 
     static Run fakeRun(Tokenizer tok, Architecture cfg, int[] prompt, String script, int eos, boolean spec, boolean jump,
                        Supplier<TokenConstraint> con) {
+        return fakeRun(tok, cfg, prompt, script, eos, spec, jump, con, null);
+    }
+
+    /**
+     * @param draftScript when not null, speculation is by a draft model that writes this script (its own scripted
+     *                    backend, greedy, with no constraint: it proposes the masked distractions too)
+     */
+    static Run fakeRun(Tokenizer tok, Architecture cfg, int[] prompt, String script, int eos, boolean spec, boolean jump,
+                       Supplier<TokenConstraint> con, String draftScript) {
         ScriptBackend b = new ScriptBackend(tok, script, prompt.length, cfg.core().vocabSize(), eos);
         Engine e = new Engine(b, tok, cfg, Set.of(eos));
-        if (spec) {
+        if (draftScript != null) {
+            ScriptBackend db = new ScriptBackend(tok, draftScript, prompt.length, cfg.core().vocabSize(), eos);
+            check(e.enableSpeculation(new Speculator.Config(Speculator.Mode.DRAFT, 8, 4, 2, 0),
+                    new DraftModel(db, cfg.core().vocabSize(), null)), "draft speculation on");
+        } else if (spec) {
             check(e.enableSpeculation(new Speculator.Config(Speculator.Mode.NGRAM, 8, 4, 2, 0), null), "speculation on");
         }
         e.setJumpForward(jump);
@@ -374,6 +388,33 @@ public final class ToolCallTest {
                     "speculation under the constraint: identical tokens (" + spec1.r.stats().acceptedTokens() + "/"
                             + spec1.r.stats().draftedTokens() + " drafts accepted, " + spec1.forwards + " vs "
                             + plain.forwards + " passes)");
+            // the per-token path of the masks (engine.constraint-masks=false) chooses the same tokens
+            Run slow;
+            JsonConstraint.setFastMasks(false);
+            try {
+                slow = fakeRun(tok, cfg, prompt, script, eos, false, false, con);
+            } finally {
+                JsonConstraint.setFastMasks(true);
+            }
+            check(Arrays.equals(plain.r.tokens(), slow.r.tokens()), "masks off: identical tokens");
+            // draft-model speculation under the constraint (docs/17 17.7): a draft that writes the script too (it
+            // proposes the distractions the constraint masks as well, so its drafts are cut), and one that writes
+            // another call (rejected at the first different token); the tokens equal the plain ones,
+            // with and without jump-forward
+            String wrong = script.replaceFirst("get_weather", "read_file").replace("Paris", "Rome").replace("celsius", "fahrenheit");
+            // (the draft length follows the doubling rule: the cost model's measured timings mean nothing on a fake)
+            System.setProperty("jllm.engine.adaptiveDraft", "false");
+            for (boolean j : new boolean[]{false, true}) {
+                Run ref = j ? fakeRun(tok, cfg, prompt, script, eos, false, true, con) : plain;
+                for (String ds : new String[]{script, wrong}) {
+                    Run d = fakeRun(tok, cfg, prompt, script, eos, false, j, con, ds);
+                    check(Arrays.equals(ref.r.tokens(), d.r.tokens()) && d.r.stats().draftedTokens() > 0,
+                            "draft model " + (ds == script ? "writing the script" : "writing another call") + ", jump=" + j
+                                    + ": identical tokens (" + d.r.stats().acceptedTokens() + "/" + d.r.stats().draftedTokens()
+                                    + " drafts accepted, " + d.forwards + " vs " + ref.forwards + " passes)");
+                }
+            }
+            System.clearProperty("jllm.engine.adaptiveDraft");
             Run jump = fakeRun(tok, cfg, prompt, script, eos, false, true, con);
             check(jump.r.text().equals(script) && jump.r.stats().forcedTokens() > 0 && jump.forwards < plain.forwards,
                     "jump-forward: the same text, " + jump.r.stats().forcedTokens() + " tokens forced, " + jump.forwards
