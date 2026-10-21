@@ -1591,6 +1591,10 @@ public final class MetalBackend implements Backend {
         }
         countStep = counts != null && steps++ % COUNT_EVERY == 0;
         watchThermal();
+        int encoder = k.concurrentMode();
+        if (MetalKernels.CONCURRENT_BATCH && n > 1 && k.metal.canRunConcurrent()) {
+            k.encoder(1); // the per-row dispatches of the n slots are independent: let them overlap
+        }
         k.begin();
         boolean committed = false;
         try {
@@ -1616,6 +1620,7 @@ public final class MetalBackend implements Backend {
             if (!committed) {
                 k.abort();
             }
+            k.encoder(encoder);
         }
         if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
             rebalanceExperts();

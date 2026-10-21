@@ -192,7 +192,7 @@ public final class ArchSmoke {
             if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
-            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            if (!recurrent && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += batchCheck(w, lib, cfg);
                 failures += draftCheck(w, dir, lib, cfg);
             }

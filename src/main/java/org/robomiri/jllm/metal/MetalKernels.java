@@ -120,11 +120,14 @@ final class MetalKernels implements AutoCloseable {
             case "barriers" -> 2;
             case "unsafe" -> 3; // no barriers at all: wrong results, for timing the upper bound only
             case "resources" -> 1 | 4;
-            case "false", "auto" -> 0;
+            case "false", "auto", "batch" -> 0; // (batch: serial, except in the passes of batched decoding)
             default -> throw new IllegalArgumentException("jllm.metal.concurrent=" + v
-                    + ": expected false, true, auto, barriers or resources");
+                    + ": expected false, true, auto, batch, barriers, resources or unsafe");
         };
     }
+
+    /** {@code -Djllm.metal.concurrent=batch}: the concurrent encoder for the passes of batched decoding only. */
+    static final boolean CONCURRENT_BATCH = "batch".equals(CONCURRENT);
 
     /** The mode "concurrent on" means: {@code -Djllm.metal.concurrent}'s when that names a concurrent one, else 1. */
     static int concurrentOn() {
@@ -172,6 +175,22 @@ final class MetalKernels implements AutoCloseable {
 
     boolean concurrent() {
         return concurrentMode != 0;
+    }
+
+    int concurrentMode() {
+        return concurrentMode;
+    }
+
+    /**
+     * Switches the encoder for the command buffers opened from now on without dropping the recorded decode steps (a
+     * program recorded in one mode runs correctly in the other; only its groups matter in the concurrent one): for a
+     * pass that wants the other encoder once, such as a batched decode step.
+     */
+    void encoder(int mode) {
+        if (mode != concurrentMode) {
+            concurrentMode = mode;
+            metal.concurrent(mode);
+        }
     }
 
     /**
