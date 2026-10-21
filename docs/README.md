@@ -32,5 +32,6 @@ Suggested reading order:
 | 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding — measured |
 | 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
 | 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push to Docker Hub, run; the /data volume, the API key, memory sizing, proxies, what was verified |
+| 22 | [Image generation](22-image-generation.md) | What "denoising" means, the forward and reverse diffusion math, latent space and the VAE, the CLIP text encoder, the UNet (ResNet blocks, spatial transformers, cross-attention), classifier-free guidance, the samplers (Euler, ancestral, DPM++ 2M, Karras), Turbo distillation, image to image / inpainting / outpainting, the seeded random numbers, how the CPU and Metal backends compute it (convolution as a matrix product, the kernels), the API and the Images tab, checked against diffusers, measured speed, what video will reuse |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).
