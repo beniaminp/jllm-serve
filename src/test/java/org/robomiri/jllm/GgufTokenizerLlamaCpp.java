@@ -54,7 +54,7 @@ public final class GgufTokenizerLlamaCpp {
 
     // ------------------------------------------------------------------ byte-level alphabet
 
-    private static final String[] BYTE_CHAR = new String[256];
+    static final String[] BYTE_CHAR = new String[256];
 
     static {
         List<Integer> bs = new ArrayList<>();
@@ -153,7 +153,7 @@ public final class GgufTokenizerLlamaCpp {
         int eot = tokens.size();
         for (Object[] sp : new Object[][]{{"<|endoftext|>", GgufTokenizer.CONTROL}, {"<|im_start|>", GgufTokenizer.CONTROL},
                 {"<|im_end|>", GgufTokenizer.CONTROL}, {"<think>", GgufTokenizer.USER_DEFINED},
-                {"</think>", GgufTokenizer.USER_DEFINED}, {"<unk>", GgufTokenizer.UNKNOWN}, {SEP, GgufTokenizer.CONTROL},
+                {"</think>", GgufTokenizer.USER_DEFINED}, {"<unk>", GgufTokenizer.UNKNOWN}, {SEP, GgufTokenizer.CONTROL}, {USEP, GgufTokenizer.USER_DEFINED},
                 {"<|fim_prefix|>", GgufTokenizer.NORMAL}, {"</s>", GgufTokenizer.NORMAL}}) {
             tokens.add((String) sp[0]);
             types.add((Integer) sp[1]);
@@ -337,6 +337,9 @@ public final class GgufTokenizerLlamaCpp {
         // the separator the comparison cuts the output at: a control token at the end of the vocabulary
         tokens.add(SEP);
         types.add(GgufTokenizer.CONTROL);
+        scores.add(0f);
+        tokens.add(USEP);
+        types.add(GgufTokenizer.USER_DEFINED);
         scores.add(0f);
         GgufWriter w = base("llama", kind.phi3 ? "Phi3" : kind.label);
         w.str("tokenizer.ggml.pre", "default");
@@ -574,9 +577,17 @@ public final class GgufTokenizerLlamaCpp {
 
     /** llama-tokenize's ids for the text file; null with a message on failure. */
     static int[] llamaIds(String exe, Path gguf, Path textFile, boolean bos) throws IOException, InterruptedException {
+        return llamaIds(exe, gguf, textFile, bos, true);
+    }
+
+    /** @param parseSpecial false: llama-tokenize --no-parse-special (control tokens in the text stay text) */
+    static int[] llamaIds(String exe, Path gguf, Path textFile, boolean bos, boolean parseSpecial) throws IOException, InterruptedException {
         List<String> cmd = new ArrayList<>(List.of(exe, "-m", gguf.toString(), "--ids", "--no-escape", "--log-disable", "-f", textFile.toString()));
         if (!bos) {
             cmd.add("--no-bos");
+        }
+        if (!parseSpecial) {
+            cmd.add("--no-parse-special");
         }
         Process p = new ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD).start();
         String out;
@@ -647,24 +658,32 @@ public final class GgufTokenizerLlamaCpp {
     /** Strings per llama-tokenize call: its handling of special tokens is quadratic in their number. */
     static final int CHUNK = 1500;
 
-    /** @return the number of strings that differ */
-    static int compare(String exe, Case c, List<String> all, Path tmp, int showMax, StringBuilder log) throws Exception {
+    /** The user-defined token the strings are joined with when special tokens are not parsed (llama.cpp matches those anyway). */
+    static final String USEP = "<|usep|>";
+
+    /**
+     * @param parse true: special tokens in the text are tokens ({@code llama-tokenize} default, {@code encode(text, true)});
+     *              false: {@code --no-parse-special} against {@code encode(text, false)}, the path for untrusted chat content
+     * @return the number of strings that differ
+     */
+    static int compare(String exe, Case c, List<String> all, Path tmp, int showMax, StringBuilder log, boolean parse) throws Exception {
         Tokenizer tok = load(c.file());
-        int sep = tok.tokenId(c.sep());
+        String sepText = parse ? c.sep() : USEP;
+        int sep = tok.tokenId(sepText);
         int bad = 0;
-        all = all.stream().filter(x -> !x.contains(c.sep())).toList();
+        all = all.stream().filter(x -> !x.contains(sepText)).toList();
         for (int from = 0; from < all.size(); from += CHUNK) {
             List<String> strings = all.subList(from, Math.min(all.size(), from + CHUNK));
             Path text = tmp.resolve("corpus-" + c.file().getFileName() + ".txt");
-            Files.writeString(text, String.join(c.sep(), strings), StandardCharsets.UTF_8);
-            int[] want = llamaIds(exe, c.file(), text, false);
+            Files.writeString(text, String.join(sepText, strings), StandardCharsets.UTF_8);
+            int[] want = llamaIds(exe, c.file(), text, false, parse);
             if (want == null) {
                 log.append("   llama-tokenize failed on ").append(c.file().getFileName()).append('\n');
                 bad += strings.size();
                 continue;
             }
             List<int[]> w = split(want, sep);
-            List<int[]> g = split(tok.encode(String.join(c.sep(), strings), true), sep);
+            List<int[]> g = split(tok.encode(String.join(sepText, strings), parse), sep);
             if (w.size() != strings.size() || g.size() != strings.size()) {
                 log.append("   separator count: llama.cpp ").append(w.size()).append(" ours ").append(g.size()).append(" expected ")
                         .append(strings.size()).append('\n');
@@ -674,8 +693,8 @@ public final class GgufTokenizerLlamaCpp {
                 int[] b = i < g.size() ? g.get(i) : new int[0];
                 if (!Arrays.equals(a, b)) {
                     if (bad++ < showMax) {
-                        log.append("   ").append(show(strings.get(i))).append("\n      llama.cpp ").append(Arrays.toString(a))
-                                .append("\n      ours      ").append(Arrays.toString(b)).append('\n');
+                        log.append("   ").append(parse ? "" : "(no-parse) ").append(show(strings.get(i))).append("\n      llama.cpp ")
+                                .append(Arrays.toString(a)).append("\n      ours      ").append(Arrays.toString(b)).append('\n');
                     }
                 }
             }
@@ -743,7 +762,9 @@ public final class GgufTokenizerLlamaCpp {
         List<Case> all = writeAll(dir);
         for (Case c : all) {
             String key = c.label().startsWith("pre=") || c.label().equals("pre=(absent)") ? groupKey(c.label().substring(4)) : c.label();
-            seen.putIfAbsent(key, c);
+            if (seen.putIfAbsent(key, c) != null) {
+                Files.deleteIfExists(c.file()); // an alias of a pre value already in the list
+            }
         }
         return new ArrayList<>(seen.values());
     }
@@ -977,9 +998,18 @@ public final class GgufTokenizerLlamaCpp {
                 continue;
             }
             StringBuilder log = new StringBuilder();
-            int bad = compare(exe, c, strings, work, show, log);
+            int bad = compare(exe, c, strings, work, show, log, true);
+            // special tokens left as text (the path for chat content): byte-level BPE vocabularies, which have the separator
+            int badRaw = 0;
+            int rawTotal = 0;
+            if (external.isEmpty() && c.label().startsWith("pre=")) {
+                badRaw = compare(exe, c, strings, work, show, log, false);
+                rawTotal = strings.size();
+            }
+            bad += badRaw;
             results.put(c.label(), new int[]{strings.size() - bad, bad});
-            System.out.printf("%-34s %s %d/%d%n", c.label(), bad == 0 ? "PASS" : "FAIL", strings.size() - bad, strings.size());
+            System.out.printf("%-34s %s %d/%d%s%n", c.label(), bad == 0 ? "PASS" : "FAIL", strings.size() - (bad - badRaw), strings.size(),
+                    rawTotal == 0 ? "" : "  no-parse-special " + (rawTotal - badRaw) + "/" + rawTotal);
             if (bad > 0) {
                 failedVocabs++;
                 System.out.print(log);
@@ -996,6 +1026,13 @@ public final class GgufTokenizerLlamaCpp {
             int bosFailed = checkBos(exe, work, log);
             System.out.print(log);
             failedVocabs += bosFailed;
+        }
+        if (dir == null) {
+            try (var files = Files.walk(work)) {
+                for (Path f : files.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(f);
+                }
+            }
         }
         return failedVocabs == 0 ? 0 : 1;
     }

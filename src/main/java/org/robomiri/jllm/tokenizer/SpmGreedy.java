@@ -13,8 +13,9 @@ import java.util.PriorityQueue;
  * {@code tokenizer.ggml.model = llama}: the text is cut into characters, then the adjacent pair whose concatenation
  * is a token of the vocabulary (of any type) and has the highest score is merged, over and over (equal scores: the
  * leftmost pair first); a character that is no token becomes its {@code <0xXX>} byte tokens. This is not the same
- * as BPE merges ranked by score: tokens of any type take part, and two pairs with equal scores merge left to right
- * instead of in the order of the merge list.
+ * as BPE merges ranked by score: user-defined and byte tokens take part, and two pairs with equal scores merge left
+ * to right instead of in the order of the merge list. (Control tokens do not: llama.cpp lets them, so that with
+ * special tokens not parsed the text "&lt;/s&gt;" becomes the token; here it stays text.)
  */
 final class SpmGreedy {
 
@@ -27,7 +28,9 @@ final class SpmGreedy {
         this.scores = scores;
         ids = new HashMap<>(tokens.length * 2);
         for (int i = 0; i < tokens.length; i++) {
-            ids.put(tokens[i], i); // a repeated text resolves to its last id, like token_to_id[word] = i
+            if (tokens[i] != null) { // null: a control token, which takes no part in the merges (see GgufTokenizer)
+                ids.put(tokens[i], i); // a repeated text resolves to its last id, like token_to_id[word] = i
+            }
         }
         for (int b = 0; b < 256; b++) {
             Integer id = ids.get(String.format("<0x%02X>", b));
@@ -48,7 +51,7 @@ final class SpmGreedy {
         String[] tokens = new String[t.size()];
         double[] scores = new double[t.size()];
         for (int i = 0; i < tokens.length; i++) {
-            tokens[i] = (String) t.get(i);
+            tokens[i] = (String) t.get(i); // null for a control token
             scores[i] = ((Number) sc.get(i)).doubleValue();
         }
         return new SpmGreedy(tokens, scores);

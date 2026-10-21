@@ -314,9 +314,11 @@ public final class GgufTokenizer {
         Set<String> seen = new HashSet<>();
         for (int id = 0; id < n; id++) {
             String t = s.tokens()[id];
-            allTokens.add(t);
-            allScores.add(s.scores() != null && id < s.scores().length ? s.scores()[id] : 0.0);
             Kind k = kind(s, id);
+            // llama.cpp lets every token take part in the merges; the control tokens do not here: they are found in the
+            // text before the merges run, and text that merely spells one (untrusted chat content) must stay text
+            allTokens.add(k == Kind.SPECIAL ? null : t);
+            allScores.add(s.scores() != null && id < s.scores().length ? s.scores()[id] : 0.0);
             switch (k) {
                 case SPECIAL -> {
                     added.add(addedToken(id, t, true, rstrips(s, id, k)));

@@ -74,7 +74,9 @@ public final class GgufTokenizerTest {
             Path recorded = vocab.resolve("synthetic-llama-cpp.txt.gz");
             if (Files.isRegularFile(recorded)) {
                 StringBuilder log = new StringBuilder();
-                int[] r = GgufTokenizerLlamaCpp.verifyRecorded(recorded, Files.createTempDirectory("gguf-tok"), log);
+                Path work = Files.createTempDirectory("gguf-tok");
+                int[] r = GgufTokenizerLlamaCpp.verifyRecorded(recorded, work, log);
+                Files.deleteIfExists(work);
                 System.out.print(log);
                 check(r[1] == 0 && r[0] > 0, "synthetic vocabularies: " + r[0] + " of " + (r[0] + r[1]) + " strings give llama.cpp's ids");
                 System.out.printf("%-34s %d of %d strings give llama.cpp's ids (%d vocabularies)%n", recorded.getFileName(), r[0],
