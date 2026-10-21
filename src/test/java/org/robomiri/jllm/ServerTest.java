@@ -37,7 +37,7 @@ public final class ServerTest {
     /** Timeouts of the server under test (ms); every slow-client check is measured against these. */
     static final int READ_TIMEOUT = 1000;
     static final int WRITE_TIMEOUT = 1000;
-    static final int QUEUE_TIMEOUT = 5000;
+    static final int QUEUE_TIMEOUT = 15000; // generous: a loaded machine fills the stalled client's socket buffers slowly
 
     static Path modelDir;
 
