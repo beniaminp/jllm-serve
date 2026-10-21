@@ -837,6 +837,25 @@ public final class SmokeTest {
             check(gqa(cfg(tmp, """
                     {"model_type":"qwen3","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":28,
                      "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"vocab_size":151936}"""), 0).qkNorm(), "qwen3 qk-norm");
+            // attention_bias: q/k/v and o_proj for Llama / Qwen3 / Gemma, q/k/v only for Qwen2 / GLM, refused for Mistral
+            String biased = """
+                    {"model_type":"%s","hidden_size":1024,"intermediate_size":3072,"num_hidden_layers":2,
+                     "num_attention_heads":16,"num_key_value_heads":8,"head_dim":64,"vocab_size":1000,"attention_bias":true}""";
+            for (String mt : new String[]{"llama", "qwen3", "gemma2", "gemma3_text"}) {
+                Architecture a = cfg(tmp, biased.formatted(mt));
+                check(gqa(a, 1).bias() && gqa(a, 1).outBias() && a.core().description().contains(" bias obias"),
+                        mt + " attention_bias: q/k/v and o_proj biases: " + a.core().description());
+            }
+            check(!gqa(cfg(tmp, biased.formatted("llama").replace("true", "false")), 0).outBias()
+                    && !gqa(q2, 0).outBias() && gqa(cfg(tmp, biased.formatted("glm")), 0).bias()
+                    && !gqa(cfg(tmp, biased.formatted("glm")), 0).outBias(), "no o_proj bias for qwen2 / glm or without the key");
+            expectIae(() -> {
+                try {
+                    cfg(tmp, biased.formatted("mistral"));
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }, "attention_bias", "mistral attention_bias rejected");
             expectIae(() -> {
                 try {
                     cfg(tmp, "{\"model_type\":\"mistral\",\"hidden_size\":32,\"intermediate_size\":37,\"num_hidden_layers\":2,"

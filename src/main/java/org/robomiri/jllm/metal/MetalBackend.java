@@ -162,7 +162,7 @@ public final class MetalBackend implements Backend {
      * dispatches the straight-line code recorded before, in the same order.
      */
     private record LayerPlan(Metal.Buffer attnNorm, Metal.Buffer postAttnNorm, QTensor wo, Metal.Buffer woBuf,
-                             AttnStep attention, FfnStep ffn) {
+                             Metal.Buffer woBias, AttnStep attention, FfnStep ffn) {
     }
 
     /** Reads {@code x} (normalizing it with the layer's attention norm), writes the attention output to {@link #att}. */
@@ -543,7 +543,7 @@ public final class MetalBackend implements Backend {
     private long laterUploads() {
         long b = 0;
         for (int l = 0; l < c.layers(); l++) {
-            b += 6L * c.dim() * 4; // up to four norms, q/k/v biases are smaller than the rest together
+            b += 7L * c.dim() * 4; // up to four norms, the o_proj bias; q/k/v biases are smaller than the rest together
             if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
                 b += (long) m.experts() * (c.dim() + 1) * 4; // router (+ DeepSeek's bias)
             }
@@ -670,7 +670,8 @@ public final class MetalBackend implements Backend {
             case Mlp.Dense d -> new DenseStep(d, L.dense(), ffnNorm, postMlpNorm);
             case Mlp.Moe m -> new MoeStep(m, L.moe(), ffnNorm, cold, index);
         };
-        return new LayerPlan(attnNorm, postAttnNorm, L.wo(), k.wrap(L.wo().data), attention, ffn);
+        return new LayerPlan(attnNorm, postAttnNorm, L.wo(), k.wrap(L.wo().data), L.bo() != null ? k.upload(L.bo()) : null,
+                attention, ffn);
     }
 
     /**
@@ -1030,10 +1031,10 @@ public final class MetalBackend implements Backend {
             L.attention().run(l, n, pos, fuseNorm);
             if (L.postAttnNorm() != null) {
                 // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
-                k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f);
+                k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
                 k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
             } else {
-                k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f);
+                k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
             }
             L.ffn().run(l, n, fuseNorm);
             if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {

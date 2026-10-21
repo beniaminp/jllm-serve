@@ -67,22 +67,34 @@ def q4_weights(rows, cols, rng):
     return packed.copy(), s.reshape(-1).copy(), w.reshape(rows, cols)
 
 
-def matmul(name, rows, cols, ntok, grid, threads=128, tgmem=0):
+def matmul(name, rows, cols, ntok, grid, threads=128, tgmem=0, bias=False, acc=False):
     rng = np.random.default_rng(2)
     wq, ws, w = q4_weights(rows, cols, rng)
     x = rng.standard_normal((ntok, cols)).astype(np.float32)
-    out = np.zeros((ntok, rows), np.float32)
+    out0 = rng.standard_normal((ntok, rows)).astype(np.float32) if acc else np.zeros((ntok, rows), np.float32)
+    out = out0.copy()
     nw = np.ones(cols, np.float32)
-    E.dispatch(name, [wq, ws, x, out, nw], pack('iiiiff', rows, cols, ntok, 0, 1e-6, 0.0), grid, (threads,), tgmem)
+    b = rng.standard_normal(rows).astype(np.float32)
+    # MatmulParams: rows cols ntok accumulate eps softcap hasBias (the o_proj bias, bound at 5)
+    E.dispatch(name, [wq, ws, x, out, nw, b], pack('iiiiffi', rows, cols, ntok, int(acc), 1e-6, 0.0, int(bias)), grid,
+               (threads,), tgmem)
     ref = x.astype(np.float64) @ w.T.astype(np.float64)
+    if bias:
+        ref += b
+    if acc:
+        ref += out0
     err = np.abs(out - ref).max() / np.abs(ref).max()
-    check(err < 1e-5, '%s %dx%d, %d tokens: rel err %.2e' % (name, rows, cols, ntok, err))
+    check(err < 1e-5, '%s %dx%d, %d tokens%s%s: rel err %.2e' % (name, rows, cols, ntok, ', bias' if bias else '',
+                                                               ', accumulate' if acc else '', err))
 
 
 for cols in (128, 1024):
     matmul('matmul_q4', 128, cols, 3, (128 // 4, 1))
     matmul('matmul_pf_q4', 128, cols, 9, ((128 + 7) // 8, 2))
     matmul('matmul_mma_q4', 128, cols, 40, (2, 2), threads=128, tgmem=0)
+matmul('matmul_q4', 128, 128, 3, (128 // 4, 1), bias=True, acc=True)
+matmul('matmul_pf_q4', 96, 128, 9, ((96 + 7) // 8, 2), bias=True)
+matmul('matmul_mma_q4', 96, 128, 40, (2, 2), threads=128, tgmem=0, bias=True, acc=True)
 
 attention('attention_g1_d64', 64)
 attention('attention_g1_d128', 128)

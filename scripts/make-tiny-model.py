@@ -2,7 +2,7 @@
 """Writes a tiny random-weight Hugging Face checkpoint (config.json + model.safetensors, float32) for
 pipeline tests. Standard library only.
 
-usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N]
+usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N] [--attention-bias]
   family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
@@ -42,6 +42,8 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
                routed_scaling_factor 2.5, norm_topk_prob, plus a stray layer 4 (V3's MTP layer, must be ignored)
 MLA head sizes are nope 32 + rope 32 = 64 for q/k and v 32, so the attention kernel's separate q/k and v widths
 are exercised.
+--attention-bias sets attention_bias: true on a llama / qwen3 / gemma config, which (as in transformers) gives
+q_proj, k_proj, v_proj AND o_proj a bias.
 """
 import json
 import math
@@ -296,10 +298,16 @@ def main():
         cfg["head_dim"] = int(sys.argv[sys.argv.index("--head-dim") + 1])
     if "--vocab" in sys.argv:  # e.g. 262144 for Gemma 3's vocabulary size
         cfg["vocab_size"] = int(sys.argv[sys.argv.index("--vocab") + 1])
+    if "--attention-bias" in sys.argv:
+        cfg["attention_bias"] = True
     hd = cfg.get("head_dim", d // heads)
     glm = cfg["model_type"] in ("glm", "glm4")
     ffn, vocab = cfg["intermediate_size"], cfg["vocab_size"]
     bias = cfg["model_type"] == "qwen2" or (glm and cfg.get("attention_bias", True))
+    # Llama / Qwen3 / Gemma read attention_bias for all four projections (Qwen2 and GLM: q/k/v only)
+    obias = bool(cfg.get("attention_bias")) and cfg["model_type"] in ("llama", "qwen3", "qwen3_moe", "gemma2",
+                                                                        "gemma3_text")
+    bias = bias or obias
     fused = cfg["model_type"] == "phi3"
     gemma = cfg["model_type"].startswith("gemma")
     # Gemma stores norm gains as w and applies 1 + w, so random gains are centered on 0
@@ -340,6 +348,8 @@ def main():
             vec(p + "self_attn.q_proj.bias", heads * hd, 0.0, 0.15)
             vec(p + "self_attn.k_proj.bias", kv * hd, 0.0, 0.15)
             vec(p + "self_attn.v_proj.bias", kv * hd, 0.0, 0.15)
+        if obias:
+            vec(p + "self_attn.o_proj.bias", d, 0.0, 0.15)
         if cfg["model_type"] == "glm4":
             vec(p + "post_self_attn_layernorm.weight", d)
             vec(p + "post_mlp_layernorm.weight", d)

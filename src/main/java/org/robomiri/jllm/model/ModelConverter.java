@@ -353,6 +353,9 @@ public final class ModelConverter {
                             rules.add(quantize(p + "self_attn." + n + ".weight", quant));
                         }
                     }
+                    if (g.outBias()) {
+                        rules.add(f32(p + "self_attn.o_proj.bias", p + "self_attn.o_proj.bias"));
+                    }
                 }
                 case Attention.Mla m -> rules.addAll(mlaRules(p, m, dim));
             }

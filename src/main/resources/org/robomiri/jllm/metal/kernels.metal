@@ -142,6 +142,7 @@ struct MatmulParams {
     int accumulate;
     float eps;      // NORM variants only
     float softcap;  // > 0: out = tanh(out / softcap) * softcap (Gemma's final-logit cap on the LM head), 0 = off
+    int hasBias;    // 1: out[t, r] (+)= W[r] . x[t] + bias[r] (o_proj bias), bias bound at 5; v + b is one float
 };
 
 // Gemma 2 / 3 soft-capping; the argument of tanh is clamped because fast-math tanh overflows for large inputs
@@ -364,7 +365,8 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
                    device const float *x [[buffer(2)]],
                    device float *out [[buffer(3)]],
                    device const float *nw [[buffer(4)]],
-                   constant MatmulParams &p [[buffer(5)]],
+                   device const float *bias [[buffer(5)]],
+                   constant MatmulParams &p [[buffer(6)]],
                    threadgroup float *xn [[threadgroup(0)]],
                    uint2 tgp [[threadgroup_position_in_grid]],
                    ushort sg [[simdgroup_index_in_threadgroup]],
@@ -390,6 +392,7 @@ kernel void matmul(device const uchar *wq [[buffer(0)]],
             float v = simd_sum(acc[t]);
             if (lane == 0) {
                 ulong o = (ulong)(t0 + t) * p.rows + row;
+                if (p.hasBias) v += bias[row];
                 out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
             }
         }
@@ -618,7 +621,8 @@ kernel void matmul_pf(device const uchar *wq [[buffer(0)]],
                       device const float *x [[buffer(2)]],
                       device float *out [[buffer(3)]],
                       device const float *nw [[buffer(4)]],
-                      constant MatmulParams &p [[buffer(5)]],
+                      device const float *bias [[buffer(5)]],
+                      constant MatmulParams &p [[buffer(6)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
                       ushort sg [[simdgroup_index_in_threadgroup]],
                       ushort lane [[thread_index_in_simdgroup]],
@@ -648,6 +652,7 @@ kernel void matmul_pf(device const uchar *wq [[buffer(0)]],
                     float v = simd_sum(acc[r][t]);
                     if (lane == 0) {
                         ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
+                        if (p.hasBias) v += bias[row0 + r];
                         out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
                     }
                 }
@@ -880,7 +885,8 @@ kernel void matmul_mma(device const uchar *wq [[buffer(0)]],
                        device const float *x [[buffer(2)]],
                        device float *out [[buffer(3)]],
                        device const float *nw [[buffer(4)]],
-                       constant MatmulParams &p [[buffer(5)]],
+                       device const float *bias [[buffer(5)]],
+                       constant MatmulParams &p [[buffer(6)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -894,7 +900,7 @@ kernel void matmul_mma(device const uchar *wq [[buffer(0)]],
     for (int i = tid; i < MMA_BR * MMA_BT; i += MM_THREADS) {
         const int t = i / MMA_BR, r = i % MMA_BR;
         if (t0 + t < p.ntok && row0 + r < p.rows) {
-            const float v = sa[t * MMA_BR + r];
+            const float v = p.hasBias ? sa[t * MMA_BR + r] + bias[row0 + r] : sa[t * MMA_BR + r];
             const ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
             out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
         }

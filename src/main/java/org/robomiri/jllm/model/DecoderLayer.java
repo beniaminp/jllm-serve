@@ -9,9 +9,10 @@ package org.robomiri.jllm.model;
  * @param postAttnNorm the norm on the attention output, null unless the layer's norms are a sandwich
  * @param postMlpNorm  the norm on the MLP output, null unless the layer's norms are a sandwich
  * @param wo           {@code o_proj [dim, attn.outDim()]}
+ * @param bo           {@code o_proj.bias [dim]}, null unless the attention spec has {@link Attention#outBias}
  */
 public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNorm, float[] postMlpNorm,
-                           AttnWeights attn, QTensor wo, MlpWeights mlp) implements LayerWeights {
+                           AttnWeights attn, QTensor wo, float[] bo, MlpWeights mlp) implements LayerWeights {
 
     static DecoderLayer load(TensorSource f, String p, LayerSpec s) {
         LayerSpec.Norms n = s.norms();
@@ -22,6 +23,7 @@ public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNo
                 n.post() ? f.floats(p + n.postMlpNorm() + ".weight") : null,
                 AttnWeights.load(f, p + "self_attn.", s.attn()),
                 f.tensor(p + "self_attn.o_proj.weight"),
+                s.attn().outBias() ? f.floats(p + "self_attn.o_proj.bias") : null,
                 MlpWeights.load(f, p, s.mlp()));
     }
 
@@ -32,6 +34,7 @@ public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNo
                 && (postAttnNorm == null || (postAttnNorm.length == dim && postMlpNorm.length == dim))
                 && attn.matches(s.attn(), dim)
                 && wo.rows == dim && wo.cols == s.attn().outDim()
+                && s.attn().outBias() == (bo != null) && (bo == null || bo.length == dim)
                 && mlp.matches(s.mlp(), dim);
     }
 

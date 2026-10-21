@@ -17,6 +17,9 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
     /** Index into {@link Decoder#ropeTables()} of the table this layer rotates with. */
     int ropeTable();
 
+    /** True if {@code o_proj} has a bias ({@code DecoderLayer.bo}), added to the projection before the residual. */
+    boolean outBias();
+
     /** True if {@code o} is the same variant with the same head shape (what a backend sizes its caches from). */
     boolean sameShape(Attention o);
 
@@ -28,11 +31,12 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
      * @param ropeTable the rotary table (Gemma 3 sliding layers use a second one)
      * @param qkNorm    per-head RMSNorm on queries and keys before RoPE (Qwen3, Gemma 3)
      * @param bias      q/k/v projections have a bias (Qwen2, GLM)
+     * @param outBias   {@code o_proj} has a bias too ({@code attention_bias} of Llama, Qwen3, Gemma)
      * @param scale     multiplier of {@code q.k} before the softmax
      * @param softcap   {@code tanh(s / cap) * cap} on the scaled score, 0 = off (Gemma 2)
      */
     record Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
-               float scale, float softcap) implements Attention {
+               boolean outBias, float scale, float softcap) implements Attention {
 
         @Override
         public int qDim() {
@@ -67,6 +71,12 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
      */
     record Mla(int heads, int qLoraRank, int kvLoraRank, int nope, int rope, int vDim, int ropeTable, float scale)
             implements Attention {
+
+        /** DeepSeek's {@code attention_bias} would also bias q_a / kv_a; the family rejects it, so never. */
+        @Override
+        public boolean outBias() {
+            return false;
+        }
 
         /** Per-head query / key width. */
         public int qkDim() {

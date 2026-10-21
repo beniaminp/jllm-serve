@@ -21,16 +21,16 @@ means the value comes from `config.json`; defaults are those of the family's tra
 
 | `model_type` | Architecture class | q/k/v bias | QK-norm | Sliding window | RoPE (pairing; scaling) | Norms | MLP | BOS (from the tokenizer) | Tied head | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `llama` | `LlamaForCausalLM` | no | no | none | `HALF`; `rope_scaling` `llama3` (3.1+), `linear` | `PRE` | dense SiLU | yes | config (default false) | |
+| `llama` | `LlamaForCausalLM` | `attention_bias` (default false; also `o_proj`) | no | none | `HALF`; `rope_scaling` `llama3` (3.1+), `linear` | `PRE` | dense SiLU | yes | config (default false) | |
 | `mistral` | `MistralForCausalLM` | no | no | `sliding_window` on every layer (null in v0.3) | `HALF`; none | `PRE` | dense SiLU | yes | config (false) | |
 | `qwen2` | `Qwen2ForCausalLM` | **always** (the key is absent) | no | layers ≥ `max_window_layers`, only if `use_sliding_window` | `HALF`; none | `PRE` | dense SiLU | no (R1-Distill-Qwen: yes) | config | |
-| `qwen3` | `Qwen3ForCausalLM` | no | **yes** | same rule as `qwen2` | `HALF`; none | `PRE` | dense SiLU | no | config | |
-| `qwen3_moe` | `Qwen3MoeForCausalLM` | no | yes | same rule as `qwen2` | `HALF`; none | `PRE` | MoE, `Router.Softmax`, `norm_topk_prob` from config; dense in `mlp_only_layers` and off the `decoder_sparse_step` grid | no | config | chapter 12 |
+| `qwen3` | `Qwen3ForCausalLM` | as `llama` | **yes** | same rule as `qwen2` | `HALF`; none | `PRE` | dense SiLU | no | config | |
+| `qwen3_moe` | `Qwen3MoeForCausalLM` | as `llama` | yes | same rule as `qwen2` | `HALF`; none | `PRE` | MoE, `Router.Softmax`, `norm_topk_prob` from config; dense in `mlp_only_layers` and off the `decoder_sparse_step` grid | no | config | chapter 12 |
 | `glm` | `GlmForCausalLM` | `attention_bias`, **default true** | no | none | `INTERLEAVED`, `partial_rotary_factor` default 0.5 | `PRE` | dense SiLU, fused `gate_up_proj` | no (`[gMASK]<sop>`) | config | eps default 1.5625e-7; 14.8 |
 | `glm4` | `Glm4ForCausalLM` | as `glm` | no | none | as `glm` | `SANDWICH_GLM4` (4 norms) | dense SiLU, fused `gate_up_proj` | no | config | 14.8 |
 | `phi3` | `Phi3ForCausalLM` | no | no | `sliding_window` on every layer | `HALF`; `longrope` (short/long factors), `partial_rotary_factor` | `PRE` | dense SiLU; fused `qkv_proj`, `gate_up_proj` | no | config | eps default 1e-5; 14.9 |
-| `gemma2` | `Gemma2ForCausalLM` | no | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
-| `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | no | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
+| `gemma2` | `Gemma2ForCausalLM` | as `llama` | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
+| `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | as `llama` | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | rejected | no | none | MLA rotary slice `INTERLEAVED`, `yarn` | `PRE` | dense for the first `first_k_dense_replace` layers, then MoE + shared experts; `Router.DeepSeek` softmax, `greedy` / `group_limited_greedy` | yes | config (false) | MLA latent KV cache; 14.11 |
 | `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints dequantized by the converter (14.11.7) |
 | `mamba` | `MambaForCausalLM` | n/a | n/a | n/a (no attention) | none (no positions) | one RMSNorm per block | no MLP: conv + selective scan mixer | no | default true | `MambaArch`; chapter 15 |
@@ -59,8 +59,8 @@ The checkpoints each row was verified against:
 | `mamba` | `state-spaces/mamba-130m-hf` … `mamba-2.8b-hf` | chapter 15 |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
-`gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` outside `qwen2` and `glm` (it would also add an `o_proj`
-bias), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope`/`yarn` (`su` is the legacy spelling of
+`gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` for `mistral`, `phi3` or DeepSeek (transformers ignores
+it for the first two; DeepSeek would also bias `q_a_proj` / `kv_a_proj_with_mqa`), or a `rope_scaling` type other than `default`/`linear`/`llama3`/`longrope`/`yarn` (`su` is the legacy spelling of
 `longrope`; `yarn` follows 14.11.2 in every family) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
@@ -71,7 +71,7 @@ quantization block), and the Metal backend additionally needs `head_dim` to be a
 
 | Feature | Llama 3.x | Mistral | Qwen2 / 2.5 | Qwen3 |
 |---|---|---|---|---|
-| q/k/v bias (`attention_bias`) | no | no | **yes** (always, even though the key is absent) | no |
+| q/k/v bias (`attention_bias`) | no (q/k/v/o if set) | no | **yes** (always, even though the key is absent; no `o_proj` bias) | no (q/k/v/o if set) |
 | per-head q/k RMSNorm | no | no | no | **yes** |
 | sliding window | no | `sliding_window` (null in v0.3), all layers | only if `use_sliding_window`, layers ≥ `max_window_layers` | same rule as Qwen2 |
 | RoPE scaling | `llama3` (3.1+) | none | none | none |
@@ -84,10 +84,27 @@ quantization block), and the Metal backend additionally needs `head_dim` to be a
 How each is implemented:
 
 - **Bias.** `Attention.Gqa.bias` is true for `qwen2` (always) and for `glm` / `glm4` (`attention_bias`, default true);
-  every other family rejects `attention_bias: true`, because transformers would then also add an `o_proj` bias, which
-  is not implemented. The converter stores `self_attn.{q,k,v}_proj.bias` as f32 (they are tiny); the backends add
-  them right after the q/k/v matmuls and *before* RoPE. CPU: `addBias`, a loop over the freshly written rows; Metal:
-  the bias is an epilogue argument of the fused `matmul3` kernel that projects q, k and v, so it costs no dispatch.
+  the converter stores `self_attn.{q,k,v}_proj.bias` as f32 (they are tiny); the backends add them right after the
+  q/k/v matmuls and *before* RoPE. CPU: `addBias`, a loop over the freshly written rows; Metal: the bias is an
+  epilogue argument of the fused `matmul3` kernel that projects q, k and v, so it costs no dispatch.
+- **`o_proj` bias.** In transformers' Llama, Qwen3 (and Qwen3-MoE) and Gemma 2 / 3 attention one flag,
+  `attention_bias`, biases all four projections; Qwen2 and GLM hard-code `o_proj` without one. So for `llama`, `qwen3`
+  and `gemma` (`Draft.Bias.CONFIG_QKVO`) `attention_bias: true` sets both `Attention.Gqa.bias` and `outBias`, the
+  converter also keeps `self_attn.o_proj.bias [dim]` as f32 (`DecoderLayer.bo`), and the description gains `obias`.
+  The bias belongs to the projection, so it is added *before* the residual add and, for Gemma's sandwich norms,
+  before the post-attention norm:
+
+  ```
+  plain:      x = x + (W_o · att + b_o)
+  sandwich:   x = x + rmsnorm(W_o · att + b_o) · g_post
+  ```
+
+  CPU (`CpuBackend.addPlain` / `addPostNormed`): with a bias the product is staged in `xb` and `x[t, i] += xb[t, i] +
+  b_o[i]`, or `b_o` is added to `xb` before `addNormed`. Metal: `MatmulParams.hasBias` and a bias buffer (index 5) in
+  `matmul`, `matmul_pf` and `matmul_mma`, added in the epilogue (`v + b`, then accumulated into `x` or stored for
+  `rmsnorm_add`), so it costs no dispatch either. The MLA layers share this code (`DecoderLayer.bo`), but DeepSeek keeps
+  rejecting `attention_bias`. Checked by the `LlamaBias` and `Gemma2Bias` tiny models of the arch smoke (CPU == Metal,
+  14.7) and `SmokeTest.modelConfigs`.
 - **QK-norm.** `Attention.Gqa.qkNorm` is true for `qwen3` / `qwen3_moe` and `gemma3_text`; `ModelWeights` checks that
   the `q_norm`/`k_norm` tensors exist exactly when it is set. The norm is applied per head right before RoPE (on Metal
   inside the `rope` kernel, so the same dispatch).
@@ -203,8 +220,7 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
   `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
 - `dynamic` RoPE scaling, YaRN with `truncate: false`; `hidden_act`
-  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; an `o_proj`
-  bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
+  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
   vocabularies with byte fallback. That is the tokenizer's job (chapter 4), not the model's.
 - Hub test checkpoints: `hf-internal-testing/tiny-random-LlamaForCausalLM` has `hidden_size = 16`, which is not a
@@ -228,10 +244,10 @@ deterministic, so any disagreement is a bug in a backend. The models:
 
 | family | tiny models (what each isolates) |
 |---|---|
-| Llama / Mistral / Qwen2 | plain Llama (GQA, untied head); Llama 3 `rope_scaling` (MHA, tied); Mistral with `sliding_window = 4`; Qwen2 with bias and a window on layers ≥ 2 |
+| Llama / Mistral / Qwen2 | plain Llama (GQA, untied head); Llama 3 `rope_scaling` (MHA, tied); Llama with `attention_bias` (q/k/v and `o_proj` biases); Mistral with `sliding_window = 4`; Qwen2 with bias and a window on layers ≥ 2 |
 | GLM (14.8) | `glm` (bias, `head_dim` 32, factor 0.5); `glmedge` (`head_dim` 64, factor 1.0, no bias, tied); `glm4` (four norms) |
 | Phi-3 (14.9) | fused weights + longrope long factors + partial rotary + window; the same with short factors and tied embeddings; `head_dim` 64 MHA with plain RoPE |
-| Gemma (14.10) | Gemma 2 (`head_dim` 64, cap 1.0 so that it matters on random weights, final cap 30, local layers 0 and 2 with window 6); Gemma 3 text (q/k norm, 5 local + 1 global, linear ×8 global and 10 000-base local RoPE); the multimodal wrapper layout; `head_dim` 256 variants of both |
+| Gemma (14.10) | Gemma 2 (`head_dim` 64, cap 1.0 so that it matters on random weights, final cap 30, local layers 0 and 2 with window 6); Gemma 3 text (q/k norm, 5 local + 1 global, linear ×8 global and 10 000-base local RoPE); the multimodal wrapper layout; `head_dim` 256 variants of both; Gemma 2 with `attention_bias` (the `o_proj` bias before the post-attention norm) |
 | DeepSeek (14.11) | `deepseek_v2` (`q_lora_rank` null, group-limited routing, 2 shared experts), `deepseek_v2q` (q LoRA, `norm_topk_prob`, scaling 2.5), `deepseek_v3` (sigmoid, `noaux_tc`) |
 | Mamba (chapter 15) | `mamba` (d_model 64, tied head) and `mamba3` (d_model 128, state 8, conv 3, untied head), plus chunking-invariance and state checks |
 
