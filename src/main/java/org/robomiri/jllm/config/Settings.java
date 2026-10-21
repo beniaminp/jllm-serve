@@ -58,7 +58,8 @@ public final class Settings {
             Map.entry("port", "server.port"));
 
     /** Flags that are not properties: per-invocation inputs. */
-    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config");
+    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config", "audio", "out", "voice",
+            "language", "translate", "words", "format", "speed"); // the last seven: `transcribe` and `speak`
 
     private final Properties props = new Properties();
     private final Map<String, String> sources = new LinkedHashMap<>();
