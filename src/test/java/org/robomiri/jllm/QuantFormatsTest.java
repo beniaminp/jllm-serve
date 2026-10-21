@@ -439,7 +439,9 @@ public final class QuantFormatsTest {
                 b = GgufModelTest.logits(w, prompt, 4);
             }
             double diff = GgufModelTest.maxDiff(b, a);
-            check(diff == 0 && n > 0, format + ": " + n + " quantized matrices converted, logits equal to the F32 checkpoint"
+            // the same Q8_0 weights either way; the last float bits of a run can still change when the JIT compiles the
+            // Vector API kernels between the two runs (interpreted and intrinsic lane reductions add in different orders)
+            check(diff <= 1e-5 && n > 0, format + ": " + n + " quantized matrices converted, logits equal to the F32 checkpoint"
                     + " of the same values: max diff " + diff);
             // and the quantization is real: the logits differ from those of the original weights
             Path od = Files.createDirectories(root.resolve(format + "-orig"));
