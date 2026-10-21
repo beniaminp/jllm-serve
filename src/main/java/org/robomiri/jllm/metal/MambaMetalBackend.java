@@ -60,6 +60,20 @@ public final class MambaMetalBackend implements Backend {
         Metal.Buffer outProj;
     }
 
+    /**
+     * Selects the concurrent compute encoder (true: independent dispatches overlap, a barrier goes between dependent ones)
+     * or the serial one (false) for the passes that follow; the results are bit-identical. The default is
+     * {@code -Djllm.metal.concurrent} (docs/08 section 8.26).
+     */
+    public void concurrent(boolean on) {
+        k.concurrent(on ? MetalKernels.concurrentOn() : 0);
+    }
+
+    /** Memory barriers the concurrent encoder has inserted so far. */
+    public long barriers() {
+        return k.metal.barriers();
+    }
+
     public MambaMetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib) {
         this.w = w;
         this.m = w.mambaArch();

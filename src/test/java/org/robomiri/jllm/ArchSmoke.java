@@ -188,6 +188,7 @@ public final class ArchSmoke {
                 failures += recurrent ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
+            failures += concurrentCheck(w, lib, cfg, quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD);
             if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
@@ -543,6 +544,266 @@ public final class ArchSmoke {
 
     private static final int REPLAY_STEPS = 40;
     private static final java.util.Set<String> replayF16 = new java.util.HashSet<>();
+
+    // ------------------------------------------------------------------ the concurrent compute encoder (docs/08 8.26)
+
+    private static final int CONC_CHUNK = 40; // >= 32 tokens: the simdgroup-matrix prefill kernels too
+
+    /** Concurrent encoder on or off for a backend of any Metal family. */
+    private static void concurrent(Backend b, boolean on) {
+        if (b instanceof MetalBackend m) {
+            m.concurrent(on);
+        } else if (b instanceof MambaMetalBackend m) {
+            m.concurrent(on);
+        } else if (b instanceof Qwen3NextMetalBackend m) {
+            m.concurrent(on);
+        }
+    }
+
+    private static long barriers(Backend b) {
+        return b instanceof MetalBackend m ? m.barriers() : b instanceof MambaMetalBackend m ? m.barriers()
+                : b instanceof Qwen3NextMetalBackend m ? m.barriers() : 0;
+    }
+
+    /**
+     * Every kind of pass in a row, recording each logits vector: a 40-token prefill chunk (the simdgroup-matrix kernels), 10
+     * decode steps (replay, the pipelined path is {@link #concurrentPipe}), a 7-token chunk (the row kernels), and a
+     * 4-token {@code forwardAll} (draft verification's multi-token pass).
+     */
+    private static List<float[]> concurrentScenario(Backend b, int vocab) {
+        List<float[]> out = new ArrayList<>();
+        int[] tok = new int[CONC_CHUNK];
+        for (int i = 0; i < tok.length; i++) {
+            tok[i] = (i * 37 + 11) % vocab;
+        }
+        float[] l = new float[vocab];
+        b.forward(tok, 0, tok.length, 0, l);
+        out.add(l.clone());
+        int pos = tok.length;
+        for (int i = 0; i < 10; i++) {
+            b.forward(new int[]{argmax(l)}, 0, 1, pos++, l);
+            out.add(l.clone());
+        }
+        int[] chunk = new int[7];
+        for (int i = 0; i < chunk.length; i++) {
+            chunk[i] = (i * 53 + 5) % vocab;
+        }
+        b.forward(chunk, 0, chunk.length, pos, l);
+        out.add(l.clone());
+        pos += chunk.length;
+        float[] all = new float[4 * vocab];
+        b.forwardAll(new int[]{3, 77, 150, 21}, 0, 4, pos, all, vocab);
+        out.add(all);
+        return out;
+    }
+
+    private interface BackendMaker {
+        Backend make() throws Exception;
+    }
+
+    /**
+     * The concurrent compute encoder against the serial one on a backend of the same weights: the logits of every pass of
+     * {@link #concurrentScenario} must be bit-identical (the encoder only lets independent dispatches overlap, so any
+     * difference is a missing barrier). Races are intermittent, so the concurrent run is repeated {@code runs} times.
+     * With {@code full} (Q4_0): the f16 and q8 caches, experts split between CPU and GPU, pipelined greedy decoding and
+     * batched decoding of three slots too.
+     */
+    private static int concurrentCheck(ModelWeights w, String lib, Architecture cfg, boolean full) throws Exception {
+        if (!Metal.available(lib)) {
+            return 0;
+        }
+        int vocab = cfg.core().vocabSize();
+        boolean mamba = cfg instanceof MambaArch;
+        boolean hybrid = cfg instanceof Qwen3NextArch;
+        int bad = 0;
+        List<Object[]> cases = new ArrayList<>(); // label, maker
+        for (KvDtype dt : mamba ? new KvDtype[]{KvDtype.F32} : full ? KvDtype.values() : new KvDtype[]{KvDtype.F32}) {
+            if (hybrid && dt == KvDtype.Q8) {
+                continue; // no q8 cache for the hybrid
+            }
+            BackendMaker mk = () -> mamba ? new MambaMetalBackend(w, 64, CONC_CHUNK, lib)
+                    : hybrid ? new Qwen3NextMetalBackend(w, 64, CONC_CHUNK, lib, dt) : new MetalBackend(w, 64, CONC_CHUNK, lib, dt);
+            cases.add(new Object[]{"kv " + dt, mk});
+        }
+        java.nio.file.Path stats = null;
+        if (full && cfg instanceof Decoder d && d.anyMoe() && !hybrid) {
+            // experts on the CPU: the GPU's command buffer is submitted and waited for halfway through the layer, whole
+            // layers, and a layer split between the two (every other expert on the CPU)
+            boolean[][] alternate = new boolean[d.core().layers()][];
+            for (int l = 0; l < alternate.length; l++) {
+                if (d.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                    alternate[l] = new boolean[m.experts()];
+                    for (int e = 0; e < m.experts(); e += 2) {
+                        alternate[l][e] = true;
+                    }
+                }
+            }
+            stats = Files.createTempDirectory("jllm-expert-stats");
+            System.setProperty("jllm.metal.expertStatsDir", stats.toString());
+            Object[][] splits = {{"experts of 1 layer on the cpu", new MoeSplit(1, 4, false)},
+                    {"experts of all layers on the cpu", new MoeSplit(Integer.MAX_VALUE, 4, false)},
+                    {"every other expert on the cpu", MoeSplit.experts(alternate, 4, false)}};
+            for (Object[] s : splits) {
+                cases.add(new Object[]{"kv F32, " + s[0],
+                        (BackendMaker) () -> new MetalBackend(w, 64, CONC_CHUNK, lib, KvDtype.F32, (MoeSplit) s[1])});
+            }
+        }
+        try {
+            bad += concurrentCases(cases, vocab);
+        } finally {
+            if (stats != null) {
+                try (var files = Files.list(stats)) {
+                    for (Path f : files.toList()) {
+                        Files.delete(f);
+                    }
+                }
+                Files.delete(stats);
+                System.clearProperty("jllm.metal.expertStatsDir");
+            }
+        }
+        if (full && !mamba && !hybrid) {
+            bad += concurrentPipe(w, lib, cfg);
+            bad += concurrentBatch(w, lib, cfg);
+        }
+        return bad;
+    }
+
+    private static int concurrentCases(List<Object[]> cases, int vocab) throws Exception {
+        int bad = 0;
+        for (Object[] c : cases) {
+            BackendMaker mk = (BackendMaker) c[1];
+            List<float[]> want;
+            try (Backend b = mk.make()) {
+                concurrent(b, false);
+                want = concurrentScenario(b, vocab);
+            }
+            int runs = 3;
+            long barriers = 0;
+            boolean same = true;
+            for (int r = 0; r < runs; r++) {
+                try (Backend b = mk.make()) {
+                    concurrent(b, true);
+                    List<float[]> got = concurrentScenario(b, vocab);
+                    barriers = barriers(b);
+                    for (int i = 0; i < want.size(); i++) {
+                        if (!Arrays.equals(want.get(i), got.get(i))) {
+                            System.out.println("  concurrent encoder, " + c[0] + ": pass " + i + " differs (run " + r + ")");
+                            same = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            System.out.println("  concurrent encoder, " + c[0] + ": " + want.size() + " passes x " + runs
+                    + " runs, logits " + (same ? "bit-identical to serial" : "DIFFER") + " (" + barriers + " barriers)"
+                    + (same ? "" : "  CONCURRENT MISMATCH"));
+            bad += same ? 0 : 1;
+        }
+        return bad;
+    }
+
+    /** Pipelined greedy decoding (token ring, replay) with the concurrent encoder gives the serial encoder's tokens. */
+    private static int concurrentPipe(ModelWeights w, String lib, Architecture cfg) {
+        int vocab = cfg.core().vocabSize();
+        int[][] ids = new int[2][];
+        for (int mode = 0; mode < 2; mode++) {
+            try (MetalBackend b = new MetalBackend(w, 64, 16, lib)) {
+                b.concurrent(mode == 1);
+                Backend.GreedyPipe pipe = b.greedyPipe(vocab);
+                if (pipe == null) {
+                    return 0;
+                }
+                float[] l = new float[vocab];
+                b.forward(PROMPT, 0, PROMPT.length, 0, l);
+                int n = 20;
+                ids[mode] = new int[n];
+                pipe.submit(argmax(l), PROMPT.length);
+                for (int i = 0; i < n; i++) {
+                    if (i + 1 < n) {
+                        pipe.submit(-1, PROMPT.length + i + 1);
+                    }
+                    ids[mode][i] = pipe.next();
+                }
+                pipe.drain();
+            }
+        }
+        boolean ok = Arrays.equals(ids[0], ids[1]);
+        System.out.println("  concurrent encoder, pipelined greedy decoding: tokens " + (ok ? "same" : "DIFFERENT")
+                + (ok ? "" : "  CONCURRENT MISMATCH"));
+        return ok ? 0 : 1;
+    }
+
+    /**
+     * Batched decoding of three slots (per-row dispatches in independent groups) with the concurrent encoder: every row's
+     * logits in every shared pass are bit-identical to the serial encoder's, for the f32, f16 and q8 caches.
+     */
+    private static int concurrentBatch(ModelWeights w, String lib, Architecture cfg) throws Exception {
+        int vocab = cfg.core().vocabSize();
+        int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
+        int bad = 0;
+        for (KvDtype dt : KvDtype.values()) {
+            List<float[]> want = null;
+            boolean same = true;
+            long barriers = 0;
+            for (int mode = 0; mode < 4; mode++) { // serial once, then the concurrent encoder three times
+                List<float[]> got = new ArrayList<>();
+                MetalBackend[] b = new MetalBackend[3];
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        b[i] = new MetalBackend(w, 64, 16, lib, dt);
+                        b[i].concurrent(mode > 0);
+                    }
+                    int[] tok = new int[3];
+                    float[][] l = new float[3][vocab];
+                    for (int i = 0; i < 3; i++) {
+                        b[i].forward(prompts[i], 0, prompts[i].length, 0, l[i]);
+                        tok[i] = argmax(l[i]);
+                    }
+                    for (int s = 1; s < NEW_TOKENS; s++) {
+                        int lead = s % 3;
+                        Backend[] members = new Backend[3];
+                        int[] tokens = new int[3];
+                        int[] positions = new int[3];
+                        float[][] out = new float[3][];
+                        for (int r = 0; r < 3; r++) {
+                            int i = (lead + r) % 3;
+                            members[r] = b[i];
+                            tokens[r] = tok[i];
+                            positions[r] = prompts[i].length + s - 1;
+                            out[r] = l[i];
+                        }
+                        if (!b[lead].forwardBatch(members, tokens, positions, out)) {
+                            System.out.println("  concurrent encoder, batched decode kv " + dt + ": no batched pass  BATCH FAILED");
+                            return bad + 1;
+                        }
+                        for (int i = 0; i < 3; i++) {
+                            tok[i] = argmax(l[i]);
+                            got.add(l[i].clone());
+                        }
+                    }
+                    barriers = b[0].barriers();
+                } finally {
+                    for (MetalBackend x : b) {
+                        if (x != null) {
+                            x.close();
+                        }
+                    }
+                }
+                if (want == null) {
+                    want = got;
+                } else {
+                    for (int i = 0; i < want.size() && same; i++) {
+                        same &= Arrays.equals(want.get(i), got.get(i));
+                    }
+                }
+            }
+            System.out.println("  concurrent encoder, batched decode, 3 slots, kv " + dt + ": logits "
+                    + (same ? "bit-identical to serial" : "DIFFER") + " (" + barriers + " barriers on the first slot)"
+                    + (same ? "" : "  CONCURRENT MISMATCH"));
+            bad += same ? 0 : 1;
+        }
+        return bad;
+    }
 
     /**
      * Decode replay (a single-token step recorded once per shape, then re-run with its position patched in) against
