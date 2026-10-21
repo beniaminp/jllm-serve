@@ -1,6 +1,7 @@
 package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.KvDtype;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -36,7 +37,7 @@ final class MetalTuner {
     private MetalTuner() {
     }
 
-    static Decision decide(MetalKernels k, Attention.Gqa g, boolean kvHalf, String attnKernel, int attnGroup) {
+    static Decision decide(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup) {
         String forcedPrefill = MetalKernels.FLASH_PREFILL;
         String forcedDecode = MetalKernels.FLASH_DECODE_MODE;
         boolean prefillFits = MetalKernels.flashPrefillFits(g.headDim());
@@ -45,7 +46,7 @@ final class MetalTuner {
                     "forced");
         }
         String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|hd" + g.headDim() + "|g"
-                + g.heads() / g.kvHeads() + (kvHalf ? "|f16" : "|f32")).replace(' ', '_').replace('=', '_').replace(':', '_');
+                + g.heads() / g.kvHeads() + "|" + kv).replace(' ', '_').replace('=', '_').replace(':', '_');
         Properties cache = load();
         String cached = cache.getProperty(key);
         boolean[] got;
@@ -55,8 +56,8 @@ final class MetalTuner {
             note = "cached " + cached;
         } else {
             StringBuilder sb = new StringBuilder();
-            got = new boolean[]{prefillFits && check(k, g, kvHalf, attnKernel, attnGroup, true, sb),
-                    check(k, g, kvHalf, attnKernel, attnGroup, false, sb)};
+            got = new boolean[]{prefillFits && check(k, g, kv, attnKernel, attnGroup, true, sb),
+                    check(k, g, kv, attnKernel, attnGroup, false, sb)};
             note = sb.toString().trim();
             cache.setProperty(key, "flashPrefill=" + (got[0] ? 1 : 0) + ",flashDecode=" + (got[1] ? 1 : 0));
             store(cache);
@@ -67,7 +68,7 @@ final class MetalTuner {
     }
 
     /** Runs candidate and reference on the same synthetic data; true if the candidate is to be used. */
-    private static boolean check(MetalKernels k, Attention.Gqa g, boolean kvHalf, String attnKernel, int attnGroup, boolean prefill,
+    private static boolean check(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup, boolean prefill,
                                  StringBuilder log) {
         boolean emu = Metal.EMULATOR;
         int hd = g.headDim();
@@ -80,22 +81,23 @@ final class MetalTuner {
         int pos = keys - n;
         Random rnd = new Random(11);
         Metal.Buffer q = k.scratch((long) n * qDim * 4);
-        Metal.Buffer kc = k.scratch((long) keys * kvDim * (kvHalf ? 2 : 4));
-        Metal.Buffer vc = k.scratch((long) keys * kvDim * (kvHalf ? 2 : 4));
-        fill(q.contents(), n * qDim, false, rnd);
-        fill(kc.contents(), keys * kvDim, kvHalf, rnd);
-        fill(vc.contents(), keys * kvDim, kvHalf, rnd);
+        int stride = kv.rowStride(kvDim, kvHeads); // cache row stride in elements (q8: bytes, with the scales)
+        Metal.Buffer kc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+        Metal.Buffer vc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+        fill(q.contents(), 1, KvDtype.F32, 1, n * qDim, rnd);
+        fill(kc.contents(), keys, kv, kvHeads, kvDim, rnd);
+        fill(vc.contents(), keys, kv, kvHeads, kvDim, rnd);
         Metal.Buffer ref = k.scratch((long) n * qDim * 4);
         Metal.Buffer cand = k.scratch((long) n * qDim * 4);
         Metal.Buffer scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, n) * heads * keys * 4);
         Metal.Buffer part = prefill ? null : k.scratch((long) heads * MetalKernels.FLASH_SPLITS * (hd + 2) * 4);
         float scale = (float) (1 / Math.sqrt(hd));
         Runnable reference = () -> k.attention(attnKernel, attnGroup, q, kc, vc, ref, scores, heads, kvHeads, hd, hd, pos, keys,
-                scale, qDim, kvDim, kvDim, qDim, 0, 0f, n);
+                scale, qDim, stride, stride, qDim, 0, 0f, n);
         Runnable candidate = prefill
-                ? () -> k.flashPrefill(kvHalf, hd, q, kc, vc, cand, heads, kvHeads, pos, n, scale, qDim, kvDim, qDim, 0, 0f)
-                : () -> k.flashAttention(kvHalf, q, kc, vc, part, scores, cand, heads, kvHeads, hd, pos, keys, scale, qDim,
-                kvDim, 0, 0f);
+                ? () -> k.flashPrefill(kv, hd, q, kc, vc, cand, heads, kvHeads, pos, n, scale, qDim, stride, qDim, 0, 0f)
+                : () -> k.flashAttention(kv, q, kc, vc, part, scores, cand, heads, kvHeads, hd, pos, keys, scale, qDim,
+                stride, 0, 0f);
         String what = prefill ? "flash prefill" : "flash decode";
         try {
             double tRef = time(k, reference, emu ? 1 : 5);
@@ -141,7 +143,7 @@ final class MetalTuner {
             return Integer.parseInt(cached);
         }
         Metal.Buffer x = k.scratch((long) t.cols * 4);
-        fill(x.contents(), t.cols, false, new Random(5));
+        fill(x.contents(), 1, KvDtype.F32, 1, t.cols, new Random(5));
         Metal.Buffer ref = k.scratch((long) t.rows * 4);
         Metal.Buffer out = k.scratch((long) t.rows * 4);
         int best = MetalConstants.MM_THREADS;
@@ -189,13 +191,21 @@ final class MetalTuner {
         return best;
     }
 
-    private static void fill(MemorySegment seg, int count, boolean half, Random rnd) {
-        for (int i = 0; i < count; i++) {
-            float v = rnd.nextFloat() * 2 - 1;
-            if (half) {
-                seg.setAtIndex(ValueLayout.JAVA_SHORT, i, Float.floatToFloat16(v));
-            } else {
-                seg.setAtIndex(ValueLayout.JAVA_FLOAT, i, v);
+    /** {@code rows} rows of {@code width} random values in [-1, 1) as a cache of type {@code kv} stores them. */
+    private static void fill(MemorySegment seg, int rows, KvDtype kv, int heads, int width, Random rnd) {
+        long rb = kv.rowBytes(width, heads);
+        for (int r = 0; r < rows; r++) {
+            for (int i = 0; i < width; i++) {
+                float v = rnd.nextFloat() * 2 - 1;
+                long o = r * rb;
+                switch (kv) {
+                    case F32 -> seg.set(ValueLayout.JAVA_FLOAT, o + 4L * i, v);
+                    case F16 -> seg.set(ValueLayout.JAVA_SHORT, o + 2L * i, Float.floatToFloat16(v));
+                    case Q8 -> seg.set(ValueLayout.JAVA_BYTE, o + i, (byte) Math.round(v * 127));
+                }
+            }
+            for (int h = 0; kv == KvDtype.Q8 && h < heads; h++) { // per-head scales between 0.5 / 127 and 1.5 / 127
+                seg.set(ValueLayout.JAVA_FLOAT_UNALIGNED, r * rb + width + 4L * h, (0.5f + rnd.nextFloat()) / 127);
             }
         }
     }

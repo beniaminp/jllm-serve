@@ -10,6 +10,7 @@ mkdir -p "$OUT/emu"
 python3 scripts/metal-emu/transpile.py src/main/resources/org/robomiri/jllm/metal/kernels.metal "$OUT/emu/kernels.cpp"
 EXT=so
 [ "$(uname)" = "Darwin" ] && EXT=dylib
-clang++ -std=c++17 -O2 -g -fPIC -shared -Wno-unknown-attributes -Iscripts/metal-emu \
+# -fsigned-char: MSL's char is signed (the q8 KV cache), C++'s is unsigned on some ARM targets
+clang++ -std=c++17 -O2 -g -fPIC -shared -fsigned-char -Wno-unknown-attributes -Iscripts/metal-emu \
   -o "$OUT/libjllm_metal_emu.$EXT" "$OUT/emu/kernels.cpp" scripts/metal-emu/runtime.cpp
 echo "$OUT/libjllm_metal_emu.$EXT"

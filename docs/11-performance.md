@@ -170,6 +170,7 @@ and the scalar `exp` / `silu` loops are still visible here (fast math, now the d
 | KV cache, f32, per 1 024 tokens of `--ctx` | 28 layers × 1024 × 1024 × 8 B = 235 MB | 48 × 1024 × 512 × 8 B = 201 MB |
 | KV cache at `--ctx 4096` | 940 MB | 805 MB |
 | KV cache with `backend.kv-dtype=f16` (2 B per element) | 117 MB per 1 024 tokens; **470 MB** at `--ctx 4096` | 101 MB per 1 024 tokens; **403 MB** at `--ctx 4096` |
+| KV cache with `backend.kv-dtype=q8` (1 B per element + 4 B per `headDim` row) | 61 MB per 1 024 tokens; **242 MB** at `--ctx 4096` | 52 MB per 1 024 tokens; **208 MB** at `--ctx 4096` |
 | KV cache, DeepSeek-V2-Lite (MLA latent cache, [14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | 27 layers × 1024 × (512 + 64) × 4 B = 64 MB per 1 024 tokens; **255 MB** at `--ctx 4096`, 127 MB at f16 (the expanded per-head cache of the first version was 553 KB per token, 2.2 GB at `--ctx 4096`); plus 216 MB of dequantized `kv_b_proj` halves | — |
 | attention score scratch (Metal) `min(32, batch) × heads × ctx × 4 B` | 32 × 16 × 4096 × 4 = 8.4 MB | 32 × 32 × 2048 × 4 = 8.4 MB |
 | activations, logits, MoE slot buffers | < 50 MB | < 100 MB |

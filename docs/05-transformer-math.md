@@ -846,7 +846,8 @@ still projected, normalized and rotated in f32, rounded **once** (round-to-neare
 and expanded back to f32 inside attention, so the arithmetic is unchanged and only the stored values lose
 precision (~3 significant decimal digits instead of ~7). That halves the cache — 470 MB instead of 940 MB at
 `ctx = 4096` for the 0.6B model — and the bytes attention reads per token; greedy outputs on the test prompts are
-unchanged ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
+unchanged. `backend.kv-dtype=q8` stores signed bytes with one f32 scale per row of a kv head (`scale = max|x| / 127`,
+error ≤ `max|x| / 254`): 242 MB at `ctx = 4096` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
 [11 §11.3](11-performance.md#113-memory-footprint)).
 
 **A smaller cache by design: DeepSeek's latent attention.** The cache above stores, per token and layer, a key

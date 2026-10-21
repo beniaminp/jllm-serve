@@ -57,6 +57,7 @@ bench "flash decode off" "$DENSE" "-Djllm.metal.flashDecode=false"
 bench "pipelined decoding off" "$DENSE" "-Djllm.metal.pipeline=false"
 bench "simdgroup-matrix prefill off" "$DENSE" "-Djllm.metal.mmaPrefill=false"
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16
+bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64

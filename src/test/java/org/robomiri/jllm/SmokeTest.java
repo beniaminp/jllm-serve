@@ -953,7 +953,7 @@ public final class SmokeTest {
     /**
      * The KV cache's tiled prefill attention against its per-token decode path (same kernels, so the same bits are
      * expected once both are compiled; the check tolerates the last bit because the interpreter's lane reduction
-     * order differs from C2's) and against a double-precision reference, for f32 and f16 caches, with and without a
+     * order differs from C2's) and against a double-precision reference, for f32, f16 and q8 caches, with and without a
      * sliding window and soft-capping.
      */
     static void kvCacheAttention() throws Exception {
@@ -1001,15 +1001,9 @@ public final class SmokeTest {
                                     System.arraycopy(one, 0, decode, t * qDim, qDim);
                                 }
                             }
-                            // double-precision reference on the stored (possibly f16-rounded) rows
-                            float[] ks = new float[n * kvDim];
-                            float[] vs = new float[n * kvDim];
-                            for (int i = 0; i < ks.length; i++) {
-                                ks[i] = dtype == org.robomiri.jllm.model.KvDtype.F16
-                                        ? Float.float16ToFloat(Float.floatToFloat16(k[i])) : k[i];
-                                vs[i] = dtype == org.robomiri.jllm.model.KvDtype.F16
-                                        ? Float.float16ToFloat(Float.floatToFloat16(v[i])) : v[i];
-                            }
+                            // double-precision reference on the stored (possibly f16-rounded or q8-quantized) rows
+                            float[] ks = stored(dtype, k, hd);
+                            float[] vs = stored(dtype, v, hd);
                             double maxRef = 0;
                             double maxPd = 0;
                             int exact = 0;
@@ -1066,6 +1060,33 @@ public final class SmokeTest {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);
         }
+    }
+
+    /**
+     * The values a cache of type {@code dtype} gives back for {@code x} (rows of heads of {@code hd} values): f16
+     * rounding, or q8 per head row ({@code scale = max|x| / 127}, {@code q = rint(x / scale)}), whose error must stay
+     * within {@code scale / 2}.
+     */
+    static float[] stored(org.robomiri.jllm.model.KvDtype dtype, float[] x, int hd) {
+        float[] r = new float[x.length];
+        for (int o = 0; o < x.length; o += hd) {
+            float max = 0f;
+            for (int i = o; i < o + hd; i++) {
+                max = Math.max(max, Math.abs(x[i]));
+            }
+            float scale = max / 127f;
+            for (int i = o; i < o + hd; i++) {
+                r[i] = switch (dtype) {
+                    case F32 -> x[i];
+                    case F16 -> Float.float16ToFloat(Float.floatToFloat16(x[i]));
+                    case Q8 -> scale == 0f ? 0f : (float) Math.max(-127, Math.min(127, Math.rint(x[i] / scale))) * scale;
+                };
+                if (Math.abs(r[i] - x[i]) > max / 254f * 1.0001f) {
+                    throw new AssertionError(dtype + " rounding error above max|x| / 254");
+                }
+            }
+        }
+        return r;
     }
 
     /**
@@ -1222,7 +1243,7 @@ public final class SmokeTest {
      * be rewound (Mamba) only when the new prompt extends everything it has seen, otherwise it restarts at 0.
      */
     /**
-     * {@link org.robomiri.jllm.engine.Engine#saveCache} / {@code loadCache} on the real model, for f32 and f16 caches:
+     * {@link org.robomiri.jllm.engine.Engine#saveCache} / {@code loadCache} on the real model, for f32, f16 and q8 caches:
      * a cache saved by one engine and loaded into a fresh one (another backend on the same weights) holds the same
      * tokens, saves back to an identical file, and continues a conversation exactly like the original engine; a wrong
      * fingerprint is refused.
@@ -1230,7 +1251,7 @@ public final class SmokeTest {
     static void persistCache(Path dir) throws Exception {
         Path tmp = Files.createTempDirectory("jllm-kvfile");
         try {
-            for (String dtype : new String[]{"f32", "f16"}) {
+            for (String dtype : new String[]{"f32", "f16", "q8"}) {
                 org.robomiri.jllm.config.Settings st = org.robomiri.jllm.config.Settings.load(new String[]{"--backend", "cpu",
                         "--model.dir", dir.toAbsolutePath().getParent().toString(), "--backend.ctx", "256", "--backend.kv-dtype", dtype, "--engine.speculative", "off"});
                 try (org.robomiri.jllm.ModelLoader.Loaded l = org.robomiri.jllm.ModelLoader.load(st,

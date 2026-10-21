@@ -282,7 +282,8 @@ the projection that follows it (the `*_norm` kernel variants normalise the input
 28 layers × 6 = 168, plus the final `rmsnorm` and the LM head `matmul_q8` (151 936 rows, grid (37 984, 1),
 Gemma's logit soft-cap in its epilogue): **170 dispatches per decode step**, in 4 command buffers
 (`-Djllm.metal.commitLayers=8`). With `backend.kv-dtype=f16` the kernel names gain `_h` and k goes through
-a staging row — [8.9](#89-the-f16-kv-cache). With `-Djllm.metal.flashDecode=true` step 4 of a decode step
+a staging row — [8.9](#89-the-f16-kv-cache); with `q8` they gain `_q8`, k and v go through staging rows and one
+`kv_store_q8` per layer quantizes them. With `-Djllm.metal.flashDecode=true` step 4 of a decode step
 over ≥ 512 positions becomes `attention_split` + `attention_combine` — [8.11](#811-flash-decoding-chosen-at-start-up).
 
 ### Dispatch list per MoE layer (Qwen3-30B-A3B: dim 2048, qDim 4096, kvDim 512, 128 experts, top-8, moeDim 768)
@@ -684,6 +685,42 @@ this is worth a few percent of decode at a few hundred tokens of context (the at
 dominant cost there — [8.7](#87-measured-numbers-and-where-the-time-goes)); at 3 000 tokens the prefill is a
 third faster and decode ~10 % faster. Measurements are in [11 §11.3](11-performance.md#113-memory-footprint).
 
+### q8
+
+`backend.kv-dtype=q8` stores int8 values with one f32 scale per (position, kv head) row (the math and the error
+bound are in [07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache)). A position's row of `keyCache` /
+`valCache` is its `kvDim` int8 values followed by `kvHeads` f32 scales — `kvDim + 4·kvHeads` bytes, 1 056 instead of
+2 048 (f16) for the 0.6B model — which is also exactly the saved-cache row ([8.17](#817-saving-loading-and-copying-the-kv-cache)).
+Quantizing needs a whole row's maximum, which no single thread of the projection epilogue or of `rope` sees, so both
+k and v take the f32 path and a new kernel quantizes them:
+
+| step | q8 |
+|---|---|
+| 2 `matmul3` | the plain (`float`) variant: k rows into `kStage`, v rows into a second staging buffer `vStage` |
+| 3 `rope` | the `float` variant, k rotated in place in `kStage` |
+| 3b `kv_store_q8` | new, grid `(2·kvHeads, n)`, one simdgroup per (token, kv head) row of k or v: `simd_max` of `|x|`, `scale = max / 127`, `q = rint(x / scale)` clamped to ±127 as `char`, the scale after the row's values |
+| 4 attention | `attention_g1_d128_q8` (`KV = char`); flash decoding `attention_split_q8`, flash prefill `attention_fa_d128_q8` |
+
+The attention kernels read `char` and multiply once per row: `kv_scale(row, stride, nKvHeads, h)` returns the scale of
+a q8 row and the constant 1 for `float` / `half` rows (overloads, so the existing instantiations compile to the same
+code), the score becomes `simd_sum(q · k_int) · (scale_attn · scale_k)` and the softmax weight `p · scale_v` before it
+multiplies the integer values; `attention_fa` multiplies as it stages a block into threadgroup memory. Row strides
+are passed in elements, which for `char` are bytes and include the scales. Every specialization the f16 cache has
+exists for q8 (`attention[_q8]`, `attention_g{1,2,4,8}_d{64,128,256}_q8`), and `MetalTuner` checks the flash kernels
+against `attention_t` on a q8 cache too (its own cache key `|q8`). DeepSeek's latent rows are stored by
+`mla_lat_store_q8` (one scale per `[c | k_pe]` row, `aw + 4` bytes) and read by `attention_mla_q8`.
+
+The cost is one extra dispatch per layer (`kv_store_q8`, `2·kvHeads·n` simdgroups) and the f32 round trip of v
+through `vStage`; the reads in attention shrink from 2 to ~1 byte per value. CPU and Metal quantize the same f32
+numbers with the same formula, but their f32 k / v differ in the last bits, so a value on a rounding edge can land one
+step apart: `ArchSmoke` runs every family with q8 on both backends and requires the usual 10⁻³ relative agreement of
+the logits (observed: at most 2.5 × 10⁻⁴ of the largest logit, on Gemma-2; ~10⁻⁶ for most families). It also
+prints the distance from the f32 cache — 0.04 % to 1.2 % of the largest logit, up to 25 % on the tiny DeepSeeks,
+whose routing amplifies any perturbation (their f16 caches already move the logits by 0.2–0.4 %) — and bounds it by
+200 times the f16 cache's distance (observed 20–45× for the dense families, up to 115× for the DeepSeeks);
+`kernel_tests.py` checks `kv_store_q8` bit for bit against numpy and the q8 attention, split and flash kernels
+against a float64 reference.
+
 ---
 
 ## 8.10 The tiled prefill matmuls
@@ -899,8 +936,9 @@ backend call drains it first. `-Djllm.metal.pipeline=false` turns it off.
 
 `MetalBackend.saveState` / `loadState` / `copyStateFrom` implement the backend-neutral cache file and the slot copy
 of [17 §17.2–17.3](17-agent-speedups.md#172-slots-that-share-a-prefix). The format string
-`kv f16 layers=L kvDim=K headDim=D` (or `f32`) is the same the CPU backend writes; rows are written as per layer,
-per position, K then V, little-endian. The cache buffers live in unified memory, so loading reads from the file
+`kv f16 layers=L kvDim=K headDim=D` (or `f32`, `q8`) is the same the CPU backend writes; rows are written as per
+layer, per position, K then V, little-endian (q8: the row's `kvDim` int8 values, then its `kvHeads` f32 scales — the
+cache's own row layout, so saving is a copy here too). The cache buffers live in unified memory, so loading reads from the file
 straight into them, and a slot copy is a `memcpy` of `n` rows per layer between two engines' buffers.
 
 ---

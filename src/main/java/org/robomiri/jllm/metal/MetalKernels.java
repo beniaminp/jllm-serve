@@ -1,6 +1,7 @@
 package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
 
@@ -504,6 +505,30 @@ final class MetalKernels implements AutoCloseable {
         dispatch("argmax", 2, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
+    /** Suffix of the attention / cache-store instantiations for a cache type: none (f32), {@code _h}, {@code _q8}. */
+    static String kvSuffix(KvDtype kv) {
+        return switch (kv) {
+            case F32 -> "";
+            case F16 -> "_h";
+            case Q8 -> "_q8";
+        };
+    }
+
+    /**
+     * {@code kv_store_q8}: quantizes the n f32 staging rows of k and v ({@code [n, kvDim]}) into the q8 cache rows at
+     * byte offset {@code off} of kc / vc (row stride {@code kvDim + 4 * kvHeads}: int8 values, then a scale per head).
+     */
+    void kvStoreQ8(Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc, Metal.Buffer vc, long off, int headDim,
+                   int kvHeads, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, 0);
+        bind(1, vStage, 0);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads));
+        dispatch("kv_store_q8", 4, 0, 2 * kvHeads, n, 1, 32, 1, 1);
+    }
+
     /** Whether {@code attention_fa} exists for this head width. */
     static boolean flashPrefillFits(int headDim) {
         return headDim == 64 || headDim == 128 || headDim == 256;
@@ -511,9 +536,9 @@ final class MetalKernels implements AutoCloseable {
 
     /**
      * Flash-attention prefill of the n tokens at pos ({@code attention_fa}): one dispatch over (heads, n / FA_ROWS
-     * tiles), no scores scratch. kc / vc are the full caches with row stride kStride.
+     * tiles), no scores scratch. kc / vc are the full caches with row stride kStride (elements; q8: bytes).
      */
-    void flashPrefill(boolean kvHalf, int headDim, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
+    void flashPrefill(KvDtype kv, int headDim, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
                       int nHeads, int nKvHeads, int pos, int n, float scale, int qStride, int kStride, int oStride,
                       int window, float softcap) {
         bind(0, q, 0);
@@ -522,7 +547,7 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, 0);
         p.reset(KernelParams.FLASH).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(kStride).i(oStride)
                 .i(window).f(softcap);
-        dispatch("attention_fa_d" + headDim + (kvHalf ? "_h" : ""), 4, 0, nHeads,
+        dispatch("attention_fa_d" + headDim + kvSuffix(kv), 4, 0, nHeads,
                 (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
     }
 
@@ -530,7 +555,7 @@ final class MetalKernels implements AutoCloseable {
      * Flash decoding for the single token at pos: {@code attention_split} over (heads, nSplit) into the partials
      * buffer {@code part} (heads * FLASH_SPLITS * (headDim + 2) floats), then {@code attention_combine} into out.
      */
-    void flashAttention(boolean kvHalf, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
+    void flashAttention(KvDtype kv, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
                         Metal.Buffer scores, Metal.Buffer out, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
                         float scale, int qStride, int kvStride, int window, float softcap) {
         int len = pos + 1;
@@ -545,7 +570,7 @@ final class MetalKernels implements AutoCloseable {
         bind(4, scores, 0);
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
                 .i(window).f(softcap).i(nSplit).i(chunk);
-        dispatch(kvHalf ? "attention_split_h" : "attention_split", 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
@@ -679,14 +704,17 @@ final class MetalKernels implements AutoCloseable {
 
     // ---------------------------------------------------------------- DeepSeek MLA
 
-    /** Stores the latent cache rows [c | k_pe] of n tokens from lat / kpe at byte offset off of the cache (half when kvHalf). */
-    void mlaLatStore(boolean kvHalf, Metal.Buffer lat, Metal.Buffer kpe, Metal.Buffer cache, long off, Attention.Mla m,
+    /**
+     * Stores the latent cache rows [c | k_pe] of n tokens from lat / kpe at byte offset off of the cache (f32, half,
+     * or q8 with one scale per row).
+     */
+    void mlaLatStore(KvDtype kv, Metal.Buffer lat, Metal.Buffer kpe, Metal.Buffer cache, long off, Attention.Mla m,
                      int n) {
         bind(0, lat, 0);
         bind(1, kpe, 0);
         bind(2, cache, off);
         mlaParams(m);
-        dispatch(kvHalf ? "mla_lat_store_h" : "mla_lat_store", 3, 0, n, 1, 1, CHANNEL_THREADS, 1, 1);
+        dispatch("mla_lat_store" + kvSuffix(kv), 3, 0, n, 1, 1, CHANNEL_THREADS, 1, 1);
     }
 
     /** qa[t, h] = [W_kb_k[h]^T q_nope | q_pe] for the n rows of q (mla_absorb_q); wk is [heads][nope][kvLora] f32. */

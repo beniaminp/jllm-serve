@@ -691,7 +691,7 @@ Implementation notes:
 - **KV cache.** One row `[c | rope(k_pe)]` of `kv_lora + rope` values per token and layer, on both backends, f32 or
   (`backend.kv-dtype=f16`) half with the arithmetic in f32, exactly as the dense families' caches: V2-Lite needs
   `576 · 4 B` = 2.3 KB per layer and token, **62 KB per token over 27 layers (255 MB at `--ctx 4096`), 31 KB / 127 MB at
-  f16**. Caching the expanded per-head keys and values instead would take `(16·192 + 16·128) · 4 B` = 20 KB per layer
+  f16, 16 KB / 64 MB at q8 (one scale per latent row, [07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache))**. Caching the expanded per-head keys and values instead would take `(16·192 + 16·128) · 4 B` = 20 KB per layer
   and token, **553 KB per token** (2.2 GB at `--ctx 4096`), 9× as much, and the value of MLA would be lost: the whole
   reason for the latent is a cache that does not grow with `H`. The absorbed order of the floating-point operations
   moves the logits in the last bits only: when the engine switched from the expanded to the latent layout, the largest

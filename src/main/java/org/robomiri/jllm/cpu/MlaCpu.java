@@ -28,8 +28,9 @@ import java.util.Arrays;
  * its first {@code kvLora} entries, and one small per-head matmul with {@code W_kb_v[h]} follows the softmax.
  *
  * <p>The cache therefore holds one row of {@code kvLora + rope} numbers per token and layer (f32, or f16 with
- * {@code backend.kv-dtype=f16}: stored as half, expanded to f32 per row before the SIMD kernels read it): 576
- * floats = 2.3 KB for DeepSeek-V2-Lite instead of the 20 KB of the expanded per-head keys and values. Attention
+ * {@code backend.kv-dtype=f16}: stored as half, expanded to f32 per row before the SIMD kernels read it; q8: int8
+ * with one f32 scale for the whole row, as {@link KvCache.Q8} has per kv head row): 576 floats = 2.3 KB for
+ * DeepSeek-V2-Lite instead of the 20 KB of the expanded per-head keys and values. Attention
  * is tiled like {@link KvCache}: each task owns a tile of tokens and a range of heads and reads every cached row
  * once for all of them (the row is shared by the heads, so this is multi-query attention with one kv head).
  */
@@ -46,9 +47,12 @@ final class MlaCpu {
     private final int qaStride;
     private final int oStride;
 
-    /** The latent cache, one of the two: rows of {@code aw} per token. */
+    /** The latent cache, one of the three: rows of {@code aw} per token (q8: and one scale per row). */
     private final float[][] cache32;
     private final short[][] cache16;
+    private final byte[][] cache8;
+    private final float[][] scale8;
+    private final int ctx;
     /** Per layer {@code W_kb_k[h]^T} as [heads][kvLora][nope] and {@code W_kb_v[h]} as [heads][v][kvLora], f32. */
     private final float[][] wkT;
     private final float[][] wv;
@@ -80,6 +84,9 @@ final class MlaCpu {
         int nLayers = w.arch.core().layers();
         cache32 = kvDtype == KvDtype.F32 ? new float[nLayers][ctx * aw] : null;
         cache16 = kvDtype == KvDtype.F16 ? new short[nLayers][ctx * aw] : null;
+        cache8 = kvDtype == KvDtype.Q8 ? new byte[nLayers][ctx * aw] : null;
+        scale8 = kvDtype == KvDtype.Q8 ? new float[nLayers][ctx] : null;
+        this.ctx = ctx;
         layers = new AttnWeights.Mla[nLayers];
         wkT = new float[nLayers][];
         wv = new float[nLayers][];
@@ -156,16 +163,46 @@ final class MlaCpu {
             float[] kc = cache32[l];
             System.arraycopy(lat, t * kvl, kc, s * aw, kvl);
             System.arraycopy(kpe, t * rd, kc, s * aw + kvl, rd);
-        } else {
+        } else if (cache16 != null) {
             short[] kc = cache16[l];
             KvCache.F16.toHalf(lat, t * kvl, kc, s * aw, kvl);
             KvCache.F16.toHalf(kpe, t * rd, kc, s * aw + kvl, rd);
+        } else {
+            float max = 0f;
+            for (int i = 0; i < kvl; i++) {
+                max = Math.max(max, Math.abs(lat[t * kvl + i]));
+            }
+            for (int i = 0; i < rd; i++) {
+                max = Math.max(max, Math.abs(kpe[t * rd + i]));
+            }
+            float sc = KvDtype.q8Scale(max);
+            scale8[l][s] = sc;
+            byte[] kc = cache8[l];
+            for (int i = 0; i < kvl; i++) {
+                kc[s * aw + i] = KvDtype.q8(lat[t * kvl + i], sc);
+            }
+            for (int i = 0; i < rd; i++) {
+                kc[s * aw + kvl + i] = KvDtype.q8(kpe[t * rd + i], sc);
+            }
+        }
+    }
+
+    /** The first {@code len} values of cache row {@code s} (f16 or q8) as floats into {@code dst[d ..]}. */
+    private void expand(int l, int s, int len, float[] dst, int d) {
+        if (cache16 != null) {
+            KvCache.F16.toFloat(cache16[l], s * aw, dst, d, len);
+            return;
+        }
+        byte[] kc = cache8[l];
+        float sc = scale8[l][s];
+        for (int i = 0; i < len; i++) {
+            dst[d + i] = kc[s * aw + i] * sc;
         }
     }
 
     /**
      * One task per (token tile, head range): scores of every (token, head) of the task against each cached row
-     * (read in place for f32, expanded once per task for f16), softmax, the weighted latent sum, then
+     * (read in place for f32, expanded once per task for f16 and q8), softmax, the weighted latent sum, then
      * {@code W_kb_v[h]} on it. Later tiles see more keys and are handed out first; a short chunk (decode) splits
      * the heads instead so that every thread has work.
      */
@@ -173,13 +210,11 @@ final class MlaCpu {
         int kvl = m.kvLoraRank();
         int vd = m.vDim();
         float scale = m.scale();
-        int ctx = cache32 != null ? cache32[l].length / aw : cache16[l].length / aw;
         int tiles = (n + tile - 1) / tile;
         int chunks = Math.min(heads, Math.max(1, (2 * b.pool.threads() + tiles - 1) / tiles)); // head ranges per tile
         int hpc = (heads + chunks - 1) / chunks;                                              // heads per range
         chunks = (heads + hpc - 1) / hpc;
         float[] rows32 = cache32 != null ? cache32[l] : null;
-        short[] rows16 = cache16 != null ? cache16[l] : null;
         float[] wvl = wv[l];
         float[] att = b.att;
         int hc = chunks;
@@ -197,7 +232,7 @@ final class MlaCpu {
                     if (rows32 != null) {
                         so = s * aw;
                     } else {
-                        KvCache.F16.toFloat(rows16, s * aw, sc, rowOff, aw);
+                        expand(l, s, aw, sc, rowOff);
                         so = rowOff;
                     }
                     for (int t = Math.max(t0, s - pos); t < t1; t++) { // tokens that see position s
@@ -220,7 +255,7 @@ final class MlaCpu {
                     if (rows32 != null) {
                         so = s * aw;
                     } else {
-                        KvCache.F16.toFloat(rows16, s * aw, sc, rowOff, kvl);
+                        expand(l, s, kvl, sc, rowOff);
                         so = rowOff;
                     }
                     for (int t = Math.max(t0, s - pos); t < t1; t++) {
