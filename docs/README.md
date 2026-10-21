@@ -14,7 +14,7 @@ Suggested reading order:
 | 0 | [Explained simply](00-explained-simply.md) | The whole project in pictures and stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
 | 1 | [Overview](01-overview.md) | What an LLM is, what "inference" means, the pipeline from text to text, the supported model families, project layout |
 | 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, downloading only the shards a model needs |
-| 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion), MLX 4-/8-bit checkpoints |
+| 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion), MLX 4-/8-bit and mxfp4 / mxfp8 checkpoints, FP8 checkpoints |
 | 4 | [The tokenizer](04-tokenizer.md) | Byte-level BPE from scratch, regex pre-tokenization, the chat template, streaming UTF-8 |
 | 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU, the KV cache — every formula the code implements |
 | 6 | [Quantization (Q4/Q8)](06-quantization.md) | Why 4-bit weights work, the Q4_0/Q8_0 block format, the error it introduces |
