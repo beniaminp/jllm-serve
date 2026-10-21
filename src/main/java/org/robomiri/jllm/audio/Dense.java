@@ -51,13 +51,23 @@ public final class Dense {
                 throw new IllegalArgumentException(t.name() + " has " + t.numel() + " values, expected " + rows + "x" + cols);
             }
             if (resident) {
-                return new Mat(rows, cols, t.toFloatArray(), null, bias);
+                return new Mat(rows, cols, t.toFloatArray(), t, bias);
             }
             return new Mat(rows, cols, null, t, bias);
         }
 
         public Mat withBias(float[] b) {
             return new Mat(rows, cols, f, t, b);
+        }
+
+        /** The checkpoint tensor behind the matrix, or null for a matrix made from floats. */
+        public SafeTensors.Tensor tensor() {
+            return t;
+        }
+
+        /** Resident floats, or null when the matrix is converted from the checkpoint per use. */
+        public float[] floats() {
+            return f;
         }
 
         public long bytesResident() {

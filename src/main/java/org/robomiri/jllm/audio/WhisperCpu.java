@@ -57,11 +57,11 @@ public final class WhisperCpu implements WhisperNet {
         }
     }
 
-    /** A decoder session on an encoder output computed elsewhere (the Metal net's word-timestamp pass). */
-    public Session sessionOf(float[] encoderOutput) {
+    /** A decoder session on an encoder output computed elsewhere (and its cross-attention keys and values, if they are). */
+    public Session sessionOf(float[] encoderOutput, float[][] crossK, float[][] crossVt) {
         lock.lock();
         try {
-            return new CpuSession(encoderOutput);
+            return crossK == null ? new CpuSession(encoderOutput) : new CpuSession(encoderOutput, crossK, crossVt);
         } finally {
             lock.unlock();
         }
@@ -288,6 +288,20 @@ public final class WhisperCpu implements WhisperNet {
                 valuesByHead(v, t2, heads, hd, crossVt[i], 0, t2, t2);
                 selfK[i] = new float[maxPos * d];
                 selfVt[i] = new float[maxPos * d];
+            }
+        }
+
+        /** A session whose cross-attention keys / values were computed elsewhere (the GPU): [layer][head][pos][hd] / [head][hd][pos]. */
+        CpuSession(float[] enc, float[][] crossK, float[][] crossVt) {
+            this.enc = enc;
+            this.crossK = crossK;
+            this.crossVt = crossVt;
+            maxPos = c.targetPos();
+            selfK = new float[c.decLayers()][];
+            selfVt = new float[c.decLayers()][];
+            for (int i = 0; i < c.decLayers(); i++) {
+                selfK[i] = new float[maxPos * c.dModel()];
+                selfVt[i] = new float[maxPos * c.dModel()];
             }
         }
 

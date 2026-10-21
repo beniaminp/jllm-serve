@@ -34,7 +34,7 @@ public final class WhisperModel implements AutoCloseable {
             WhisperNet net = null;
             if (!"cpu".equals(backend)) {
                 try {
-                    net = WhisperMetalLoader.tryCreate(w);
+                    net = WhisperMetalLoader.tryCreate(w, threads);
                 } catch (RuntimeException | LinkageError e) {
                     if ("metal".equals(backend)) {
                         throw e;
