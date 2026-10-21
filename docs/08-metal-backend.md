@@ -889,6 +889,14 @@ simdgroup per output row: 64, 128 or 256 threads, i.e. 2, 4 or 8 rows per thread
 model's own output projection, checks that the results are bit-identical, and keeps the fastest. Small matrices fill
 the GPU better with smaller threadgroups, and which size pays differs between chips. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
 
+Two more choices are made the same way ([8.21](#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)):
+which flash prefill form runs (`attention_fa` or `attention_fb`: each is checked against `attention_t`, and of those
+that agree and are faster the faster wins; the log line ends in `[attention_fb]` when it is that one), and, for every
+distinct prefill matrix shape of the model, whether the f32 `*_mma` or the half-weight `*_hmma` matmul runs
+(`MetalTuner.prefillMatmuls`: both on the model's own weights with 128 random activation rows, `*_hmma` kept when it
+agrees within the bound above and is at least 3 % faster; log line `Metal prefill matmuls: half-weight MMA for k of
+n shapes (…)`).
+
 ---
 
 ## 8.15 Expert-grouped MoE prefill
@@ -1081,9 +1089,125 @@ The emulator ([18](18-metal-emulator.md)) proves that the kernels compute the ri
 are. `scripts/mac-validate.sh` does both on a real Mac:
 - it runs `scripts/arch-smoke.sh` on the GPU;
 - it benchmarks a dense model with each newer feature on (the default) and off: flash prefill, flash decode,
-  pipelined decoding, simdgroup-matrix prefill and the f16 cache;
+  pipelined decoding, simdgroup-matrix prefill and the f16 cache; the half-weight MMA prefill forced on and off and
+  the two flash prefill forms ([8.21](#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)), also with a
+  ~2 000-token prompt (`--bench.prompt-repeat 200`);
 - optionally (`--moe <repo>`) it benchmarks an MoE model with 256- vs 64-token chunks, grouped prefill on and off,
-  experts on the CPU with int8 on and off, and all experts on the GPU.
+  the half-weight MMA prefill on and off, experts on the CPU with int8 on and off, and all experts on the GPU.
 
 It prints a markdown table of prefill and decode tokens per second (median of the rounds) for the docs.
 
+
+---
+
+## 8.21 Half-weight MMA prefill and the second flash prefill form
+
+🧸 A kitchen has one small counter where the cooks lay out what they need for the next step. Until now every
+ingredient card was written with seven digits, so the cards were big and only two cooks fitted at the counter; the
+cards also lay in long rows, so a helper fetching eight of them walked to the same shelf eight times. Now the cards
+carry three digits (plenty for a recipe whose amounts were only known to two digits anyway), they are half the size,
+four cooks fit, and they are stacked in neat little piles that a helper grabs in one go. While the cooks work on one
+step, the helpers already bring the ingredients of the next. And nobody cooks for empty chairs any more: when only
+five guests ordered from a cook, she makes five plates, not thirty-two.
+
+📐 **What stays.** The `*_hmma` kernels (section 11 of `kernels.metal`: `matmul_hmma`, `matmul3_hmma[_h]`,
+`matmul_swiglu_hmma`, `moe_up_hmma`, `moe_down_hmma`, for every weight format: `q4`, `q8`, `q2k`, `q6k` and the GGUF
+`q4g`, `q8g`, `q4k`, `q5k`) compute the same tiles as the `*_mma` kernels of [8.10](#810-the-tiled-prefill-matmuls):
+a threadgroup of 4 simdgroups owns a 64-row × 32-token output tile, each simdgroup a 32 × 16 quarter held in
+`2 × 4` `simdgroup_float8x8` accumulators, and the row is walked in 32-wide k steps (one quantization block):
+
+```
+for each k step b:   every thread dequantizes 16 weights of one tile row, stages 8 activations of one token
+                     barrier
+                     for kk in 0..3:  A_i = X[16 st + 8i .. , 8kk ..]    (f32, i = 0, 1)
+                                      B_j = W[32 sr + 8j .. , 8kk ..]ᵀ  (j = 0..3)
+                                      C_ij += A_i · B_j                  (8 multiply-accumulates of 8 × 8 × 8)
+                     barrier
+```
+
+They take the same buffers, parameters and grids, so `MetalKernels` switches between the two forms by name.
+
+**What changes, and why each step pays.**
+
+1. *Half weights.* `sa` holds `fl16(q · s)` instead of `q · s`: 64 × 32 × 2 B = 4 KB instead of 8 KB. With the f32
+   activations (4 KB) the threadgroup needs 8 KB instead of 12 KB; the f32 result tile of the staging epilogue
+   (32 × 64 × 4 B = 8 KB) aliases both. If a GPU core keeps as much threadgroup memory resident as one threadgroup may
+   use (32 KB), that is 4 resident threadgroups instead of 2, i.e. twice the simdgroups to hide a memory or barrier
+   stall behind. The multiply is `simdgroup_float8x8 × simdgroup_half8x8 → simdgroup_float8x8` (f32 accumulation).
+2. *8 × 8 blocks.* Both tiles are stored as contiguous 64-element blocks, block `(rb, kb)` at `(rb · 4 + kb) · 64`.
+   In the old layout a `simdgroup_load` read 8 rows that are 32 floats = 128 B apart; with threadgroup memory in
+   banks of 4 B, 32 banks wide (128 B per cycle), all 8 rows start in the same bank and the load is served in up to 8
+   passes. A contiguous block is 128 B (half) or 256 B (f32): one or two passes. Per kk step a simdgroup issues 6
+   loads for 8 multiply-accumulates, so the loads are not a small share.
+3. *Loads one step ahead.* The next block's quant bytes (Q4_0: 8 B + the scale, Q8_0: 16 B + the scale) and
+   activations (2 × float4) are loaded into registers before the current step's multiply-accumulates and only
+   written to threadgroup memory after them, so the device-memory latency of step b + 1 overlaps the arithmetic of
+   step b. (The other formats decode straight from device memory into the tile; their blocks are larger and less
+   regular.)
+4. *No work for empty token blocks.* A tile with `ntv` valid tokens lets simdgroup `(sr, st)` multiply only
+   `nᵢ = clamp(⌈(ntv − 16 st) / 8⌉, 0, 2)` of its two 8-token blocks. Expert tiles of the grouped MoE prefill
+   ([8.15](#815-expert-grouped-moe-prefill)) hold `n · topK / E` slots on average: 16 of 32 at a 256-token chunk
+   with 128 experts and top-8, so the `*_mma` kernels spend half their multiply-accumulates on padding there.
+5. *Direct stores.* A full tile of `matmul` without bias or soft-cap, and a full tile inside the q or k range of
+   `matmul3` without bias, goes from the accumulators straight to device memory with `simdgroup_store` (with
+   `accumulate` the accumulators start from the output tile, `out += W x`), saving a barrier and a 2 048-element
+   copy per tile. Partial tiles and the other epilogues (bias, soft-cap, SwiGLU, f16 V cache rows, MoE scatter) go
+   through threadgroup memory as before.
+
+**Accuracy.** Rounding to half (round to nearest even, unit roundoff `u = 2⁻¹¹`) moves each weight by
+`|fl16(w) − w| ≤ u |w|`. For a dot product `y = Σₖ wₖ xₖ` with independent rounding errors spread evenly in that
+interval,
+
+```
+std(Δy) = (u / √3) · sqrt(Σₖ wₖ² xₖ²)      and, for terms of random sign,  std(y) ≈ sqrt(Σₖ wₖ² xₖ²)
+⇒  |Δy| / |y|  ≈  u / √3  ≈  2.8e-4  (typical)
+```
+
+`kernel_tests.py` measures 1.4e-4 to 4.5e-4 of `max |y|` across the formats against exact weights, and below 1e-6
+against the same weights rounded to half (so the arithmetic itself adds only f32 rounding). The quantization step of
+the weights is far larger (Q4_0: `s / 2` on values up to `8s`, ~6 % relative), so the half rounding changes the
+model by less than 1 % of what quantizing it did; llama.cpp's `kernel_mul_mm` stores its dequantized weights as
+half too. Nothing overflows: a weight is `q · s` with `|q| ≤ 127` and an f32 or f16 scale, far below 65 504;
+weights below 6.1e-5 become subnormal halves and lose relative, not absolute, precision (`≤ 2⁻²⁵` each). The
+activations stay f32: rounding them too would add the same `u / √3` again for nothing in memory traffic (they are
+4 KB per tile either way), and the activations of some models have outliers in the thousands, uncomfortably close
+to half's 65 504.
+
+**Choosing per shape.** `MetalTuner.prefillMatmuls` collects the model's distinct prefill matrix shapes (family,
+format, rows, cols) and times both forms on each with the model's own weights and 128 random activation rows (MoE:
+128 slots in tiles of 16 over 8 experts). `*_hmma` is kept where `max |hmma − mma| ≤ 1e-3 · max |mma| + 1e-5` and it
+is at least 3 % faster; the decision is cached like the others ([8.14](#814-the-kernel-self-check-metaltuner)). On
+the emulator, where nothing can be timed, the check still runs and logs its agreement but the more accurate f32 form
+is kept (the half-weight form only exists to be faster); `-Djllm.metal.hmma=true` runs it there.
+`-Djllm.metal.hmma=true|false` forces one form everywhere; shapes the check did not see (an LM head in a multi-token
+verification pass) keep the f32 kernels.
+
+**The second flash prefill form, `attention_fb`.** The online softmax of [8.13](#813-flash-attention-prefill-attention_fa)
+is unchanged; the staging of keys and values is not:
+
+| | `attention_fa` | `attention_fb` |
+|---|---|---|
+| per block of BK keys | K staged, S = QKᵀ, softmax, barrier, V staged, O += PV: 4 barriers | K and V staged together: 2 barriers |
+| staged element type | f32 (half / q8 caches widened, q8 also multiplied by its scale per element) | f32 for an f32 cache; **half** for f16 (exact) and q8 (int8 values are exact in half) |
+| q8 row scales | multiplied into every staged element | kept apart (`kq`, `vq`), applied once per key: `s_ij · scale_j`, `p_ij · scale_j` |
+| row stride in threadgroup memory | D (a multiple of 128 B: 8 loaded rows share a bank) | D + 16 B (rows start in different banks) |
+| BK at D = 128 | 32 (16 KB of K, then 16 KB of V) | 32 with half staging (2 × 8.5 KB), 16 with f32 |
+
+`P` and the output accumulators stay f32. A half `P` would round every probability by up to `2⁻¹¹` relative
+(`PV` then carries ~1e-4 relative error) for no saving: the probabilities never leave registers and threadgroup
+scratch. The tuner checks both forms against `attention_t` and keeps the faster of those that agree
+(`-Djllm.metal.flashPrefillKernel=fa|fb` forces one).
+
+**Tested.** `kernel_tests.py` checks every `*_hmma` kernel in all eight formats against numpy decoders of the block
+layouts, with partial row tiles (96 rows), partial token tiles (37 and 7 tokens), full tiles taking the direct store
+with and without `accumulate`, bias, soft-cap, GeGLU, the f16 V output, and MoE tiles of 1, 3, 5, 16 and 32 slots
+scattered over the chunk; the old `*_mma` kernels are checked against the same decoders. `attention_fb` runs the
+`attention_fa` cases plus half and q8 caches at D = 64, 128 and 256. End to end (Qwen3-MoE tiny model, all five
+formats, MMA forced down to 2-token chunks on the emulator) the half-weight kernels keep the greedy tokens equal to
+the CPU's with final-logit differences of ~4e-3 at max |logit| ≈ 22 (f32 MMA: ~1e-5), inside the smoke test's
+`1e-3 · max + 1e-4` bound; only the q8-cache comparisons, which re-quantize K and V to int8 and so turn a 2e-4
+shift into whole rounding steps, exceed theirs. `arch-smoke.sh` therefore runs the f32 form
+(`-Djllm.metal.hmma=false`, overridable). **Speed is not measured here**: the emulator
+runs one GPU thread per CPU fiber, so its timings say nothing about a GPU. `scripts/mac-validate.sh` has the rows
+that measure it on a Mac (half-weight MMA forced on / off, `fa` / `fb`, a ~2 000-token prompt); the expected gains
+and their arithmetic are in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design).

@@ -112,6 +112,7 @@ public final class MambaMetalBackend implements Backend {
             ssmState[l] = k.metal.newBuffer((long) di * m.dState() * 4);
         }
         finalNorm = k.upload(w.finalNorm);
+        MetalTuner.prefillMatmuls(k, w); // f32 or half-weight MMA prefill kernels, per projection shape
         x = k.scratch((long) maxBatch * c.dim() * 4);
         xb = k.scratch((long) maxBatch * c.dim() * 4);
         xz = k.scratch((long) maxBatch * 2 * di * 4);

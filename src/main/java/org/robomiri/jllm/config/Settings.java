@@ -184,7 +184,7 @@ public final class Settings {
      */
     public Settings validate() {
         for (String k : new String[]{"backend.ctx", "backend.batch", "bench.max-tokens", "bench.rounds",
-                "server.max-connections"}) {
+                "bench.prompt-repeat", "server.max-connections"}) {
             require(getInt(k) >= 1, k, "must be at least 1");
         }
         require(getInt("backend.threads") >= 0, "backend.threads", "must be 0 (= all processors) or positive");

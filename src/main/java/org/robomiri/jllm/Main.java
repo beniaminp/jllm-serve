@@ -164,7 +164,7 @@ public final class Main {
     private static void bench(ModelLoader.Loaded l, Settings s) {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < 40; i++) {
+            for (int i = 0; i < s.getInt("bench.prompt-repeat"); i++) {
                 sb.append("The quick brown fox jumps over the lazy dog. ");
             }
             int[] prompt = engine.renderChat(List.of(new ChatTemplate.Message("user", sb.toString())), false);

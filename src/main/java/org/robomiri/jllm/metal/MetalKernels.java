@@ -61,6 +61,12 @@ final class MetalKernels implements AutoCloseable {
     static final boolean MMA_PREFILL = Boolean.parseBoolean(System.getProperty("jllm.metal.mmaPrefill", "true"));
     static final int MMA_MIN_TOKENS = Integer.getInteger("jllm.metal.mmaMinTokens", 32);
     /**
+     * Which form of the simdgroup-matrix prefill matmuls runs (section 11 of kernels.metal): "auto" (default) = per
+     * matrix shape, as {@link MetalTuner#prefillMatmuls} decided on this device (the f32 {@code *_mma} kernels for a
+     * shape it did not check); "true" = the half-weight {@code *_hmma} kernels everywhere; "false" = never.
+     */
+    static final String HMMA = System.getProperty("jllm.metal.hmma", "auto");
+    /**
      * Layers per command buffer: the dispatches of every COMMIT_LAYERS layers are submitted (without waiting)
      * while the following layers are still being encoded, so GPU execution overlaps the CPU-side encoding
      * instead of starting only after the whole pass is recorded. 0 = one command buffer per forward pass.
@@ -224,6 +230,34 @@ final class MetalKernels implements AutoCloseable {
                 && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
     }
 
+    /** The MMA prefill families whose two forms ({@code <family>_mma}, {@code <family>_hmma}) are chosen per shape. */
+    enum MmaFamily { MATMUL, MATMUL3, SWIGLU, MOE_UP, MOE_DOWN }
+
+    /** Per-shape choice of the half-weight MMA kernels (key: {@link #hmmaKey}), filled by {@link MetalTuner#prefillMatmuls}. */
+    final java.util.Map<String, Boolean> hmmaChoice = new java.util.HashMap<>();
+    /** Non-null while {@link MetalTuner} times one form against the other: overrides every choice. */
+    Boolean hmmaForce;
+
+    /** {@code rows}: output rows of the dispatch (q + k + v for matmul3, hidden units for swiglu, rows per expert for MoE). */
+    static String hmmaKey(MmaFamily f, QType type, int rows, int cols) {
+        return f + "|" + type + "|" + rows + "x" + cols;
+    }
+
+    /** Whether a prefill MMA dispatch of this family and shape uses the half-weight kernels. */
+    boolean hmma(MmaFamily f, QType type, int rows, int cols) {
+        if (hmmaForce != null) {
+            return hmmaForce;
+        }
+        if (!"auto".equals(HMMA)) {
+            return Boolean.parseBoolean(HMMA);
+        }
+        return hmmaChoice.getOrDefault(hmmaKey(f, type, rows, cols), false);
+    }
+
+    private String mmaKernel(String base, MmaFamily f, QType type, int rows, int cols, String suffix) {
+        return kernel(base + (hmma(f, type, rows, cols) ? "_hmma" : "_mma"), type, suffix);
+    }
+
     /** Threadgroups along the row axis for the MMA prefill matmuls (MMA_BR rows per threadgroup). */
     private static int mmaGrid(int rows, int perTg) {
         return (rows + perTg - 1) / perTg;
@@ -291,7 +325,8 @@ final class MetalKernels implements AutoCloseable {
         bindOrDummy(5, bias);
         p.reset(KernelParams.MATMUL).i(t.rows).i(t.cols).i(n).i(acc).f(eps).f(softcap).i(bias != null);
         if (norm == null && useMma(n, t.type)) {
-            dispatch(kernel("matmul_mma", t.type, ""), 6, 0, mmaGrid(t.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+            dispatch(mmaKernel("matmul", MmaFamily.MATMUL, t.type, t.rows, t.cols, ""), 6, 0, mmaGrid(t.rows, MMA_BR),
+                    mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul_pf", t.type, ""), 6, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n == 1) {
@@ -344,7 +379,8 @@ final class MetalKernels implements AutoCloseable {
         int rows = wq.rows + wk.rows + wv.rows;
         String vh = vHalf ? "_h" : "";
         if (norm == null && useMma(n, wq.type)) {
-            dispatch(kernel("matmul3_mma", wq.type, vh), 14, 0, mmaGrid(rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+            dispatch(mmaKernel("matmul3", MmaFamily.MATMUL3, wq.type, rows, wq.cols, vh), 14, 0, mmaGrid(rows, MMA_BR),
+                    mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", wq.type, vh), 14, 0, pfGrid(rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {
@@ -384,7 +420,8 @@ final class MetalKernels implements AutoCloseable {
                 .i(w.cols).i(n).f(eps).i(bias != null);
         String vh = which == 2 && vHalf ? "_h" : "";
         if (norm == null && useMma(n, w.type)) {
-            dispatch(kernel("matmul3_mma", w.type, vh), 14, 0, mmaGrid(w.rows, MMA_BR), mmaTiles(n), 1, MM_THREADS, 1, 1);
+            dispatch(mmaKernel("matmul3", MmaFamily.MATMUL3, w.type, w.rows, w.cols, vh), 14, 0, mmaGrid(w.rows, MMA_BR),
+                    mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", w.type, vh), 14, 0, pfGrid(w.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
         } else {
@@ -413,8 +450,8 @@ final class MetalKernels implements AutoCloseable {
         bindOrDummy(4, norm);
         p.reset(KernelParams.SWIGLU).i(hidden).i(t.cols).i(n).f(eps).i(gelu);
         if (norm == null && useMma(n, t.type)) {
-            dispatch(kernel("matmul_swiglu_mma", t.type, ""), 5, 0, mmaGrid(hidden, MMA_BR / 2), mmaTiles(n), 1,
-                    MM_THREADS, 1, 1);
+            dispatch(mmaKernel("matmul_swiglu", MmaFamily.SWIGLU, t.type, hidden, t.cols, ""), 5, 0,
+                    mmaGrid(hidden, MMA_BR / 2), mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int gx = (hidden + SG_PER_TG * PF_UNITS - 1) / (SG_PER_TG * PF_UNITS);
             dispatch(kernel("matmul_swiglu_pf", t.type, ""), 5, 0, gx, pfTiles(n), 1, MM_THREADS, 1, 1);
@@ -538,6 +575,13 @@ final class MetalKernels implements AutoCloseable {
      * Flash-attention prefill of the n tokens at pos ({@code attention_fa}): one dispatch over (heads, n / FA_ROWS
      * tiles), no scores scratch. kc / vc are the full caches with row stride kStride (elements; q8: bytes).
      */
+    /**
+     * The flash prefill kernel {@link #flashPrefill} dispatches: {@code attention_fa}, or its second form
+     * {@code attention_fb} (K and V staged together, half staging for the f16 / q8 caches) when {@link MetalTuner#decide}
+     * found it correct and faster on this device ({@code -Djllm.metal.flashPrefillKernel=fa|fb} forces one).
+     */
+    String flashPrefillKernel = "attention_fa";
+
     void flashPrefill(KvDtype kv, int headDim, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
                       int nHeads, int nKvHeads, int pos, int n, float scale, int qStride, int kStride, int oStride,
                       int window, float softcap) {
@@ -547,7 +591,7 @@ final class MetalKernels implements AutoCloseable {
         bind(3, out, 0);
         p.reset(KernelParams.FLASH).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(kStride).i(oStride)
                 .i(window).f(softcap);
-        dispatch("attention_fa_d" + headDim + kvSuffix(kv), 4, 0, nHeads,
+        dispatch(flashPrefillKernel + "_d" + headDim + kvSuffix(kv), 4, 0, nHeads,
                 (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
     }
 
@@ -656,7 +700,22 @@ final class MetalKernels implements AutoCloseable {
         bind(2, tiles, 0);
         p.reset(KernelParams.MOE_SORT).i(slots).i(experts).i(maxTiles);
         dispatch("moe_sort", 3, 0, 1, 1, 1, ROW_THREADS, 1, 1);
+        moeUpTiles(gateUp, bGateUp, xb, order, tiles, hidden, moeDim, topK, maxTiles);
+        moeDownTiles(down, bDown, hidden, order, tiles, rw, ys, dim, topK, maxTiles);
 
+        bind(0, ys, 0);
+        bind(1, assign, 0);
+        bind(2, x, 0);
+        p.reset(KernelParams.MOE).i(dim).i(moeDim).i(topK);
+        dispatch("moe_combine", 3, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * hidden[s] = silu(Wgate_e . x[s / topK]) * (Wup_e . x[s / topK]) for the slots of the expert tiles in {@code tiles}
+     * (moe_sort's list, at most {@code maxTiles}): moe_up_mma or moe_up_hmma, as chosen for this shape.
+     */
+    void moeUpTiles(QTensor gateUp, Metal.Buffer bGateUp, Metal.Buffer xb, Metal.Buffer order, Metal.Buffer tiles,
+                    Metal.Buffer hidden, int moeDim, int topK, int maxTiles) {
         bind(0, bGateUp, 0);
         if (gateUp.isSplit()) {
             bind(1, upBuffer(gateUp), 0);
@@ -668,9 +727,13 @@ final class MetalKernels implements AutoCloseable {
         bind(4, tiles, 0);
         bind(5, hidden, 0);
         p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK);
-        dispatch(kernel("moe_up_mma", gateUp.type, ""), 6, 0, mmaGrid(moeDim, MetalConstants.MMA_BR / 2), maxTiles, 1,
-                MM_THREADS, 1, 1);
+        dispatch(mmaKernel("moe_up", MmaFamily.MOE_UP, gateUp.type, moeDim, gateUp.cols, ""), 6, 0,
+                mmaGrid(moeDim, MetalConstants.MMA_BR / 2), maxTiles, 1, MM_THREADS, 1, 1);
+    }
 
+    /** ys[s] = rw[s] * W_e . hidden[s] for the slots of the expert tiles: moe_down_mma or moe_down_hmma. */
+    void moeDownTiles(QTensor down, Metal.Buffer bDown, Metal.Buffer hidden, Metal.Buffer order, Metal.Buffer tiles,
+                      Metal.Buffer rw, Metal.Buffer ys, int dim, int topK, int maxTiles) {
         bind(0, bDown, 0);
         bind(1, bDown, scaleOff(down));
         bind(2, hidden, 0);
@@ -679,14 +742,8 @@ final class MetalKernels implements AutoCloseable {
         bind(5, rw, 0);
         bind(6, ys, 0);
         p.reset(KernelParams.MOE).i(dim).i(down.cols).i(topK);
-        dispatch(kernel("moe_down_mma", down.type, ""), 7, 0, mmaGrid(dim, MetalConstants.MMA_BR), maxTiles, 1,
-                MM_THREADS, 1, 1);
-
-        bind(0, ys, 0);
-        bind(1, assign, 0);
-        bind(2, x, 0);
-        p.reset(KernelParams.MOE).i(dim).i(moeDim).i(topK);
-        dispatch("moe_combine", 3, 0, (dim + ROW_THREADS - 1) / ROW_THREADS, n, 1, ROW_THREADS, 1, 1);
+        dispatch(mmaKernel("moe_down", MmaFamily.MOE_DOWN, down.type, dim, down.cols, ""), 7, 0,
+                mmaGrid(dim, MetalConstants.MMA_BR), maxTiles, 1, MM_THREADS, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */

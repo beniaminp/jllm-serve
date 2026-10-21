@@ -358,6 +358,7 @@ public final class MetalBackend implements Backend {
             plans[l] = plan(arch.layers().get(l), w.decoderLayer(l), cold[l], l);
         }
         k.decodeThreads = MetalTuner.decodeThreads(k, plans[0].wo(), plans[0].woBuf());
+        MetalTuner.prefillMatmuls(k, w); // f32 or half-weight MMA prefill kernels, per matrix shape
         if (ctx > c.maxPositions()) {
             System.err.printf("warning: ctx %d exceeds the model's max_position_embeddings (%d); RoPE positions "
                     + "beyond that are extrapolated and quality degrades%n", ctx, c.maxPositions());

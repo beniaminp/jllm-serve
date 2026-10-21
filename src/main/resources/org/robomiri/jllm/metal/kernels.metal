@@ -7,6 +7,8 @@
 //   8. Q6_K (block format, row / tile walks and the _q6k instantiations of every matmul / moe kernel)
 //   9. flash-attention prefill (attention_fa: simdgroup-matrix QK^T and PV, online softmax)
 //  10. pipelined greedy decoding (embed_token: the embedding of a token id the GPU chose; argmax)
+//  11. half-weight MMA prefill (*_hmma: the section 2b / 5 MMA kernels with half weight tiles, chosen per shape)
+//  12. flash prefill, second form (attention_fb: K and V staged together, half staging for f16 / q8 caches)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
