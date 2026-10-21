@@ -294,3 +294,10 @@ mvn -q test                         # SmokeTest.mamba: config, hand-computed sca
 requires CPU and Metal to agree: 60 of 60 combinations pass. For Mamba it also feeds the prompt in different chunkings
 and requires the same logits, checks that continuing at a wrong position is refused and that `supportsPrefixReuse()` is false. `scripts/make-tiny-model.py <dir> mamba130m` writes a (non-tiny) random checkpoint with
 the exact mamba-130m shapes for benchmarking.
+
+The real `state-spaces/mamba-130m-hf` weights were compared with transformers' `MambaForCausalLM` (float32, its
+reference PyTorch scan) by `scripts/real-weights-check.sh` ([14.13](14-model-families.md#1413-verified-on-real-weights)):
+the tokenizer gives the same ids on both prompts and all probes, the engine's Q8_0 logits correlate with the
+transformers ones at 0.998 – 0.999 (quantization noise of a 768-wide model) and at 1.000000 with the same model run
+on Q8_0-rounded weights (largest error 0.28 % of the largest logit); greedy decoding agrees for 16/16 ids on the code
+prompt and diverges on the prose prompt at step 6 on a 0.13-logit near tie.

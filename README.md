@@ -107,9 +107,14 @@ and the verification.
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
 Family details (what differs between them, verified tensor names, limits) are in
-[docs/14](docs/14-model-families.md) and [docs/15](docs/15-mamba.md). Note: the Llama/Mistral/Qwen2/GLM/Phi/
-Gemma/DeepSeek/Mamba paths were verified against reference implementations on synthetic checkpoints and on
-tokenizer fixtures, not yet on the real published weights — run a real checkpoint before relying on them.
+[docs/14](docs/14-model-families.md) and [docs/15](docs/15-mamba.md). Verification: every family runs on synthetic
+checkpoints and tokenizer fixtures (CPU == Metal, reference implementations). On real published weights, the CPU
+backend at Q8_0 was compared with Hugging Face transformers (float32) for Qwen3-0.6B, Qwen2.5-0.5B-Instruct,
+Llama-3.2-1B-Instruct, GLM-Edge-1.5B-Chat, Gemma-2-2B-it, Gemma-3-1B-it, mamba-130m and the community
+TinyMistral-248M: prompt ids and chat templates are identical, and the logits agree to a correlation ≥ 0.99998 with
+the same model run on Q8_0-rounded weights (greedy differences come from the quantization, mostly at near ties), see
+[docs/14.13](docs/14-model-families.md#1413-verified-on-real-weights) and `scripts/real-weights-check.sh`.
+Phi-3/4, `glm4`, Mistral-7B, Qwen3-MoE and DeepSeek are still verified on synthetic checkpoints and configs only.
 
 The `./jllm` launcher compiles the Java code and the native Metal library on first use. Equivalent manual steps:
 
@@ -368,6 +373,7 @@ mvn test                   # SmokeTest + ServerTest + MetalParamsTest + the GGUF
 sh scripts/arch-smoke.sh   # 21 synthetic models x 5 formats, CPU == Metal (MoE also with experts on the CPU); DeepSeek vs float64
 METAL_EMU=1 sh scripts/arch-smoke.sh            # the same on any OS, Metal side on the CPU emulator (needs clang++, python3)
 sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   # single Metal kernels on the emulator vs numpy
+REAL_PYTHON=<venv>/bin/python scripts/real-weights-check.sh Qwen/Qwen2.5-0.5B-Instruct   # engine vs transformers on real weights (docs/14.13)
 ```
 
 `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server

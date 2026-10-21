@@ -10,7 +10,8 @@ embedding, N × (RMSNorm → attention → RMSNorm → SwiGLU MLP), final RMSNor
 switches, all read from `config.json` by the family's parser in `Families` and stored as typed values in an
 `Architecture` (section 14.12). Qwen3 is the reference; this chapter lists what changes. Section map: 14.1 the
 families at a glance, 14.2 – 14.6 what the Llama-like families have in common (and what they lack), 14.7 how it is
-tested, 14.8 GLM, 14.9 Phi-3/4, 14.10 Gemma, 14.11 DeepSeek-V2/V3, 14.12 the typed model and how to add a family.
+tested, 14.8 GLM, 14.9 Phi-3/4, 14.10 Gemma, 14.11 DeepSeek-V2/V3, 14.12 the typed model and how to add a family,
+14.13 the comparison with transformers on real published weights.
 Qwen3-MoE is [chapter 12](12-mixture-of-experts.md), Mamba [chapter 15](15-mamba.md).
 
 ## 14.1 Supported families
@@ -240,7 +241,7 @@ deterministic, so any disagreement is a bug in a backend. The models:
 `deepseekRouting`, `deepseekConfigs` (14.11), `modelConfigs`, and `ConverterTest` (conversion, resume, the tiny Qwen3-MoE
 checkpoint of chapter 12). The DeepSeek models are in addition compared with an independent float64 reference
 (`scripts/deepseek-ref.py`, `DeepSeekRef`, 14.11.8). Family-specific verification is described in each family's own
-"Testing" subsection.
+"Testing" subsection; the comparison with transformers on real published checkpoints is 14.13.
 
 ## 14.8 GLM (`glm`, `glm4`)
 
@@ -567,8 +568,8 @@ caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU ==
 
 Images (the vision tower and projector are skipped, so Gemma 3 4B+ is text-only);
 the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
-configs above were read), no real weights were run; `yarn` and `dynamic` RoPE scaling; Gemma 3n and
-Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
+configs above were read); real weights were run only for `gemma-2-2b-it` and `gemma-3-1b-it` (14.13); `yarn` and
+`dynamic` RoPE scaling; Gemma 3n and Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
@@ -885,3 +886,87 @@ defaults are those of the safetensors load. Four architectures are mapped today 
 `qwen3moe`); adding one means its metadata keys in `GgufArchitecture`, its tensor names in `GgufWeights.resolve` and,
 if llama.cpp's converter permutes or folds something for it (Llama's q/k rows, Gemma's `1 + w` norms), the matching
 switch in the `Architecture`. See [16](16-gguf.md).
+
+## 14.13 Verified on real weights
+
+Everything above was first checked on tiny random checkpoints (14.7), which exercise every code path but cannot show
+that a real model computes the right thing: a wrong norm epsilon, a swapped RoPE pairing or a missing scale is
+invisible on random weights. This section compares the engine with Hugging Face transformers on published
+checkpoints.
+
+```
+scripts/real-weights-check.sh <hf-repo | model-dir> [q8|q4|q2k|q6k]
+```
+
+`scripts/real_ref.py` loads the checkpoint with transformers (float32, eager attention, CPU) and runs five prompts:
+three chat conversations rendered with the tokenizer's own `apply_chat_template` (one user turn; system + user;
+user / assistant / user) and two raw texts (prose, code) tokenized with the tokenizer's default special tokens. For
+each it records 16 greedy ids (`generate` with the end-of-sequence stop and every logits processor removed) and the
+full logits of every step. It then rounds every weight that the engine's converter quantizes to Q8_0 (the weight of
+each `Linear` / `Embedding` whose input width is a multiple of 32: blocks of 32, scale `amax / 127`) and records the
+logits of the same 16 steps again, teacher-forced on the same ids. `RealWeightsCheck` converts the checkpoint, runs the
+CPU backend with float activations (`backend.cpu.int8-activations` off, `-Djllm.cpu.fastmath=false`, f32 KV cache)
+on the reference's prompt ids and reports, per prompt:
+
+- **ids / template**: the engine's own ids for the prompt (`ChatTemplate` for a conversation, `promptBos` +
+  `encode` for raw text) equal the reference's, and the rendered template text equals `apply_chat_template`'s; plus
+  six tokenizer probes (whitespace runs, numbers, CJK / Cyrillic / emoji, code, literal special-token text);
+- **greedy**: free-running greedy decoding from the reference's prompt ids, the number of ids equal to the
+  reference's before the first divergence, and the reference's logit margin there (its top logit minus its logit of
+  the engine's choice: a small margin is a near tie that quantization noise can flip, after which the two
+  continuations are different texts and no longer comparable);
+- **teacher-forced**: one pass over the prompt plus the reference's 16 ids: the engine's argmax against the
+  reference's id at each step, the mean top-20 overlap and the mean Pearson correlation of the full logit rows;
+- **vs Q8-rounded reference**: the same rows against the reference that has the engine's quantized weights. Only
+  the float rounding of the activations differs there, so this separates quantization noise (the previous columns)
+  from a wrong computation (this one): Pearson correlation and the largest |engine − reference| relative to the
+  largest |logit| over all steps.
+
+Results at Q8_0 (head Q8_0), transformers 5.20.2, five prompts × 16 steps unless noted:
+
+| Checkpoint | `model_type` | Prompt ids / probes / template | Greedy ids equal to the reference | First divergence: step (reference margin) | Teacher-forced argmax | Top-20 overlap | Pearson vs float32 | vs Q8-rounded reference: Pearson, max error, argmax |
+|---|---|---|---|---|---|---|---|---|
+| `Qwen/Qwen3-0.6B` (control) | `qwen3` | 5/5, 6/6, 3/3 | 80/80 (5/5 prompts) | none | 80/80 | 0.979 | 0.9997 – 0.9998 | 0.999998, 0.74 %, 80/80 |
+| `Qwen/Qwen2.5-0.5B-Instruct` | `qwen2` | 5/5, 6/6, 3/3 | 65/80 (4/5) | raw prose: step 1 (0.028) | 79/80 | 0.983 | 0.9996 – 0.9998 | 0.999997, 0.62 %, 79/80 |
+| `unsloth/Llama-3.2-1B-Instruct` | `llama` | 5/5, 6/6, 3/3 | 66/80 (4/5) | system + user: step 2 (0.075) | 79/80 | 0.980 | 0.9993 – 0.9998 | 0.999996, 0.39 %, 80/80 |
+| `Locutusque/TinyMistral-248M` | `mistral` | 2/2, 6/6, no template | 32/32 (2/2) | none | 32/32 | 0.997 | 0.99997 – 0.99998 | 1.000000, 0.03 %, 32/32 |
+| `THUDM/glm-edge-1.5b-chat` | `glm` | 5/5, 6/6, 3/3 | 80/80 (5/5) | none | 80/80 | 0.984 | 0.9998 – 0.9999 | 0.999998, 0.31 %, 80/80 |
+| `unsloth/gemma-3-1b-it` | `gemma3_text` | 5/5, 6/6, 3/3 | 72/80 (4/5) | one user turn: step 8 (0.617), after the answer's `<end_of_turn>` | 79/80 | 0.971 | 0.9988 – 0.9999 | 0.999986, 0.96 %, 80/80 |
+| `unsloth/gemma-2-2b-it` | `gemma2` | 4/4, 6/6, 2/2 (the system conversation is refused by the official template) | 64/64 (4/4) | none | 64/64 | 0.991 | 0.9998 – 0.9999 | 0.999998, 0.58 %, 32/32 on the raw prompts (not recorded for the chats) |
+| `state-spaces/mamba-130m-hf` | `mamba` | 2/2, 6/6, no template | 22/32 (1/2) | raw prose: step 6 (0.126) | 30/32 | 0.953 | 0.9984 – 0.9990 | 1.000000, 0.28 %, 32/32 |
+
+- **No engine bug showed up.** Against the Q8-rounded reference every family agrees to a Pearson correlation of
+  0.99998 or better, a largest error under 1 % of the largest logit, and the same argmax at every step but one (a
+  Qwen2.5 near tie, below): once the weights are equal the engine computes what transformers computes. What remains
+  against the float32 reference (Pearson 0.998 – 0.9999, top-20 overlap 0.95 – 0.997) is Q8_0 quantization noise; it
+  is largest for the smallest model (mamba-130m) and for Gemma 3.
+- **Divergences are near ties.** Every free-running divergence happened where the float32 reference itself had a
+  margin of 0.03 – 0.13 logits between its choice and the engine's, after which the two continuations are different
+  texts. The exception is Gemma 3's one-turn chat: the divergence comes after the answer ended (`<end_of_turn>`, where
+  the reference goes on with a run of `<end_of_turn>` and stray tokens), and the Q8-rounded reference makes the same
+  choice as the engine (80/80 argmax), so it is the quantized weights' choice, not a computation difference.
+- **Tokenizer and templates.** The engine's prompt ids equal transformers' on all prompts and all six probes for every
+  model, and the rendered chat text equals `apply_chat_template` for every conversation (Llama 3.2's template prints
+  today's date; both sides render the same day). TinyMistral and mamba-130m-hf ship no chat template (raw prompts
+  only). Gemma 2's official template raises `System role not supported`; the engine instead folds a system message
+  into the first user turn as Gemma 3's template does, so that conversation was not compared.
+- **What the prompts reach.** Llama 3 RoPE scaling; Qwen2 q/k/v bias; GLM-Edge's interleaved RoPE, fused
+  `gate_up_proj` and tied head; Gemma 3's q/k norms, two RoPE tables and 5 local + 1 global layers; Gemma 2's
+  attention and final soft-caps; TinyMistral's 32-token sliding window (the code prompt runs to 39 tokens); Mamba's
+  convolution and selective scan. Not reached: Gemma's 512 / 4096-token windows (all prompts are at most 76 tokens
+  plus 16).
+- **Gemma embedding scale.** The engine multiplies the embedding by `bf16(√1152) = 34.0` (14.10.1, as transformers does
+  for the bf16 checkpoint); a float32 load computes `√1152 = 33.94` instead. The 0.17 % difference is inside the
+  Gemma 3 numbers above.
+- **Reference precision.** float32, except Llama 3.2 and Gemma 2 with `REF_DTYPE=upcast` (the bf16 weights are kept and
+  upcast per matmul, so the activations are float32; identical to a float32 load, max difference 0.0 on
+  Qwen2.5-0.5B) to fit in memory next to other jobs.
+- **Not checked.** Phi-3.5-mini / Phi-4-mini (3.8 B: a 7.6 GB checkpoint plus a 4 GB Q8_0 cache and a 15 GB float32
+  reference did not fit the ~14 GB of free disk and the shared 15 GB of RAM of the machine used); an official
+  Mistral (the smallest is 7 B; TinyMistral-248M is a community `mistral` checkpoint); `glm4`, Qwen3-MoE and
+  DeepSeek (9 B and up); the other quantizations (the script takes `q4` / `q2k` / `q6k`); the int8-activation
+  kernels (the default) and the Metal backend, whose agreement with this float path is the arch smoke's job (14.7).
+- **Cost.** With float activations one prompt took from 2 minutes (TinyMistral) to 25 minutes (Gemma 2, longer for
+  its 52-token chat) on 4 cores shared with other jobs. The script deletes the checkpoint and the cache afterwards
+  unless `KEEP=1`; `LOW_DISK=1` deletes the safetensors as soon as they are converted, and
+  `JAVA_OPTS=-Dreal.prompts=raw_text,raw_code` runs a subset of the prompts.
