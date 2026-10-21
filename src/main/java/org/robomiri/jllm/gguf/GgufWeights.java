@@ -43,6 +43,8 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     private final Arena arena = Arena.ofShared();
     private final Map<GgmlType, Integer> converted = new EnumMap<>(GgmlType.class);
     private long convertedBytes;
+    /** Bytes of memory the conversions allocated (the Q8_0 results, the copies of Q2_K tensors). */
+    private long residentBytes;
     private long viewedBytes;
 
     public GgufWeights(GgufFile gguf) {
@@ -184,6 +186,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         for (int i = 0; i < parts.length; i++) {
             segs[i] = gguf.data(parts[i]);
         }
+        residentBytes += QTensor.byteSize(QType.Q8_0, rows, cols);
         return QTensor.quantize(arena, QType.Q8_0, rows, cols, (r, dst) -> {
             int i = 0;
             while (r >= starts[i + 1]) {
@@ -210,6 +213,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             MemorySegment.copy(gguf.data(gate), 0, dst, 0, gate.size());
             MemorySegment.copy(gguf.data(up), 0, dst, gate.size(), gate.size());
             convertedBytes += 2 * gate.size();
+            residentBytes += 2 * gate.size();
             return QTensor.mapped(q, 2 * rowsOf(gate), colsOf(gate), dst);
         }
         return requantize(2 * rowsOf(gate), colsOf(gate), gate, up);
@@ -243,6 +247,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
                 MemorySegment.copy(u, (long) e * m * rb, dst, ((long) e * 2 + 1) * m * rb, (long) m * rb);
             }
             convertedBytes += 2 * gate.size();
+            residentBytes += 2 * gate.size();
             return QTensor.mapped(q, 2 * experts * m, cols, dst);
         }
         // mixed or non-native types: interleave the rows through float
@@ -252,6 +257,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         converted.merge(gate.type(), 1, Integer::sum);
         converted.merge(up.type(), 1, Integer::sum);
         convertedBytes += gate.size() + up.size();
+        residentBytes += QTensor.byteSize(QType.Q8_0, 2 * experts * m, cols);
         MemorySegment g = gguf.data(gate);
         MemorySegment u = gguf.data(up);
         return QTensor.quantize(arena, QType.Q8_0, 2 * experts * m, cols, (r, dst) -> {
@@ -277,8 +283,9 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         }
         StringBuilder sb = new StringBuilder();
         converted.forEach((t, n) -> sb.append(sb.isEmpty() ? "" : ", ").append(n).append(" x ").append(t));
-        return String.format("%.0f MB of weights used in place, %.0f MB converted or copied at load%s",
-                viewedBytes / 1e6, convertedBytes / 1e6, sb.isEmpty() ? "" : " (requantized to Q8_0: " + sb + ")");
+        return String.format("%.0f MB of weights used in place, %.0f MB converted or copied at load (%.0f MB of memory)%s",
+                viewedBytes / 1e6, convertedBytes / 1e6, residentBytes / 1e6,
+                sb.isEmpty() ? "" : " (requantized to Q8_0: " + sb + ")");
     }
 
     @Override
