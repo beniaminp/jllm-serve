@@ -196,6 +196,7 @@ public class ModelManager implements DisposableBean {
             throw new IllegalArgumentException("a local file needs no download: load it");
         }
         Map<String, String> extra = settingsFor(t, r.settings());
+        locate(t, extra);
         Settings s = settings.with(extra); // validates before the job is queued
         Job job = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
         submit(downloads, job, () -> {
@@ -212,6 +213,7 @@ public class ModelManager implements DisposableBean {
     public Job.View load(LoadRequest r) {
         Target t = target(r.source(), r.revision(), r.ggufFile(), r.ggufQuant(), r.id());
         Map<String, String> extra = settingsFor(t, r.settings());
+        locate(t, extra);
         Settings s = settings.with(extra);
         int slots = r.slots() == null ? 1 : r.slots();
         if (slots < 1 || slots > 8) {
@@ -375,6 +377,30 @@ public class ModelManager implements DisposableBean {
 
     private static Path repoDir(Settings s, String repo) {
         return Path.of(s.get("model.dir")).resolve(repo.replace('/', '_'));
+    }
+
+    /**
+     * A request that names no {@code model.dir} reads the model from the models folder that already holds it
+     * ({@code model.dir} first, then {@code jllm.web.model-dirs}), so a model on disk is never downloaded again
+     * because it sits in another folder than the default one. Only when no folder has it does the download go to
+     * {@code model.dir}.
+     */
+    private void locate(Target t, Map<String, String> extra) {
+        if (t.local() || extra.containsKey("model.dir")) {
+            return;
+        }
+        String name = t.model().replace('/', '_');
+        for (Path root : modelRoots()) {
+            Path dir = root.resolve(name);
+            try {
+                if (Files.isRegularFile(dir.resolve("config.json")) || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
+                    extra.put("model.dir", root.toString());
+                    return;
+                }
+            } catch (IOException | RuntimeException e) {
+                // unreadable: look further
+            }
+        }
     }
 
     /** A safetensors checkpoint whose quantized cache for the requested format is already converted. */
