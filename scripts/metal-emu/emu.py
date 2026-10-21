@@ -3,6 +3,7 @@ dispatch per call. See kernel_tests.py."""
 import ctypes
 import os
 import struct
+import sys
 
 import numpy as np
 
@@ -11,7 +12,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
 
 class Emu:
     def __init__(self, lib=None):
-        lib = lib or os.path.join(ROOT, 'target', 'native', 'libjllm_metal_emu.so')
+        lib = lib or os.path.join(ROOT, 'target', 'native', 'libjllm_metal_emu.' + ('dylib' if sys.platform == 'darwin' else 'so'))
         self.l = ctypes.CDLL(lib)
         l = self.l
         l.jm_create.restype = ctypes.c_void_p
