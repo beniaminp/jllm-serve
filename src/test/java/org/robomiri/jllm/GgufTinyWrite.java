@@ -26,7 +26,9 @@ public final class GgufTinyWrite {
         }
         GgufQwenNextTest.withVocab = true;
         GgufQwenNextTest.quantizeBa = args.length > 3 && args[3].equals("ba");
-        GgufQwenNextTest.Tiny t = GgufQwenNextTest.tiny(!qwen35, 7 + args[0].hashCode());
+        qwen35 = args[0].startsWith("qwen35");
+        boolean moe = !args[0].equals("qwen35");
+        GgufQwenNextTest.Tiny t = GgufQwenNextTest.tiny(moe, 7 + args[0].hashCode());
         boolean q8 = args.length > 2 && !args[2].equals("f32");
         if (args.length > 2 && args[2].equals("deq")) { // F32 tensors holding exactly the values a Q8_0 file would: no quantization left
             java.util.Map<String, float[]> eff = new LinkedHashMap<>();

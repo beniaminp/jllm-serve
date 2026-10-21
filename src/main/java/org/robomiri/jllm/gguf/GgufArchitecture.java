@@ -31,7 +31,9 @@ final class GgufArchitecture {
         /** Qwen3.5 dense hybrid (Gated DeltaNet + gated attention, tiled value heads): {@link GgufQwenNext}. */
         QWEN35("qwen35", "qwen3_next"),
         /** Qwen3-Next (80B-A3B MoE hybrid, grouped value heads): {@link GgufQwenNext}. */
-        QWEN3NEXT("qwen3next", "qwen3_next");
+        QWEN3NEXT("qwen3next", "qwen3_next"),
+        /** Qwen3.5 MoE (35B-A3B...): Qwen3-Next's experts and gated shared expert with Qwen3.5's tiled value heads. */
+        QWEN35MOE("qwen35moe", "qwen3_next");
 
         final String ggufName;
         final String modelType;
@@ -43,7 +45,7 @@ final class GgufArchitecture {
 
         /** True for the Gated DeltaNet hybrids, whose tensors {@link GgufQwenNext} maps. */
         boolean hybrid() {
-            return this == QWEN35 || this == QWEN3NEXT;
+            return this == QWEN35 || this == QWEN3NEXT || this == QWEN35MOE;
         }
 
         static Family of(String ggufName) {
@@ -195,9 +197,11 @@ final class GgufArchitecture {
         } else {
             c.put("full_attention_interval", g.num(p + "full_attention_interval", 4));
         }
+        if (family != Family.QWEN3NEXT) { // the Qwen3.5 generation: value heads tiled
+            c.put(Architecture.GGUF_TILED_VALUE_HEADS, true);
+        }
         if (family == Family.QWEN35) {
             c.put("num_experts", 0L);
-            c.put(Architecture.GGUF_TILED_VALUE_HEADS, true);
         } else {
             c.put("num_experts", need(g, p + "expert_count"));
             c.put("num_experts_per_tok", need(g, p + "expert_used_count"));

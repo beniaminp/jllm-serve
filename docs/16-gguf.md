@@ -123,6 +123,7 @@ Qwen3ForCausalLM dim=1024 ffn=3072 layers=28 heads=16/8 headDim=128 vocab=151936
 | `llama` | `llama` (`mistral` when the file has a sliding window or "mistral" in its name) | the q/k row permutation, 16.5 |
 | `qwen35` | `qwen3_next` (reported as `qwen3_5`: it has a chat template of its own) | Qwen3.5: Gated DeltaNet layers + gated attention, a dense MLP everywhere, value heads in tiled order, a multi-token-prediction block, 16.12 |
 | `qwen3next` | `qwen3_next` | Qwen3-Next-80B-A3B: the same hybrid with experts and a gated shared expert, value heads grouped, 16.12 |
+| `qwen35moe` | `qwen3_next` (`qwen3_5`) | Qwen3.5-35B-A3B and its siblings: Qwen3-Next's experts and gated shared expert with Qwen3.5's tiled value heads and separate beta / alpha; checked on tiny models against llama.cpp only, 16.12 |
 
 | GGUF key (prefix `<arch>.`) | config.json key |
 |---|---|
@@ -470,9 +471,9 @@ the load is dominated by the tokenizer.
 
 ## 16.10 Limits and what is next
 
-* **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen3next` (16.12). Gemma 2/3, Phi-3, GLM-4,
+* **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen3next` and `qwen35moe` (16.12). Gemma 2/3, Phi-3, GLM-4,
   DeepSeek-2 and Mamba are supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are
-  not mapped yet (unless a later section says so). `qwen35moe` (Qwen3.5-35B-A3B) is not mapped.
+  not mapped yet (unless a later section says so).
 * **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.
 * **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
   variant and `dynamic` scaling are not.

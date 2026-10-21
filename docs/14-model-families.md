@@ -1267,7 +1267,7 @@ python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
   The recurrent state cannot be rewound by overwriting, so that mode checkpoints it around each verification pass.
 - **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.12](16-gguf.md#1612-qwen35-and-qwen3next-as-gguf-files).
   The `gguf` package lists both the fused DeltaNet input `ssm_in` + `ssm_ba` and the split `attn_qkv` + `attn_gate`; the
-  split one (what current converters write) is mapped. The legacy fused `ssm_in` is not. `qwen35moe` is not mapped.
+  split one (what current converters write) is mapped (and `qwen35moe`, on tiny models only). The legacy fused `ssm_in` is not.
 - The chunked delta rule on Metal (prefill uses the token loop); a state snapshot to rewind to a shared prefix;
   `backend.metal.cpu-moe` (experts in CPU memory, 12.x) and flash-attention / flash decoding for the attention layers
   (they use `attention_t`); measured speed on real weights (an 80B checkpoint does not fit this machine).

@@ -79,6 +79,7 @@ EOF
 
 compare qwen35 qwen35
 compare qwen3next qwen3next allmoe
+compare qwen35moe qwen35moe allmoe
 
 # the multi-token-prediction head: per position, does the draft equal the next token?
 $J org.robomiri.jllm.GgufTinyWrite qwen35 "$OUT/mtp.gguf" deq ba focus | tail -1 > /dev/null

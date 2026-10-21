@@ -318,7 +318,7 @@ public final class GgufQwenNextTest {
                 }
             }
         }
-        if (qwen35) { // the multi-token-prediction block (never part of the Hugging Face tiny model): random, its own seed
+        if (qwen35 && !t.moe()) { // the multi-token-prediction block (never part of the Hugging Face tiny model): random, its own seed
             Random mr = new Random(99);
             String b = "blk." + LAYERS + ".";
             put(out, b + "nextn.eh_proj.weight", new long[]{DIM, 2 * DIM}, rnd(mr, DIM * 2 * DIM, 0.08, 0));
@@ -404,11 +404,11 @@ public final class GgufQwenNextTest {
     /** Name fragment of the tensors written as zeros (for bisecting against llama.cpp), or null. */
     static String zero;
 
-    static GgufWriter meta(boolean qwen35) {
-        String arch = qwen35 ? "qwen35" : "qwen3next";
+    static GgufWriter meta(boolean qwen35, boolean moe) {
+        String arch = qwen35 ? (moe ? "qwen35moe" : "qwen35") : "qwen3next";
         String a = arch + ".";
         GgufWriter w = new GgufWriter().str("general.architecture", arch).str("general.name", "tiny-" + arch);
-        w.u32(a + "block_count", LAYERS + (qwen35 ? 1 : 0)).u32(a + "embedding_length", DIM).u32(a + "feed_forward_length", FF)
+        w.u32(a + "block_count", LAYERS + (qwen35 && !moe ? 1 : 0)).u32(a + "embedding_length", DIM).u32(a + "feed_forward_length", FF)
                 .u32(a + "attention.head_count", HEADS).u32(a + "attention.head_count_kv", KV).u32(a + "context_length", 512)
                 .f32(a + "rope.freq_base", 1000000f).f32(a + "attention.layer_norm_rms_epsilon", 1e-6f)
                 .u32(a + "attention.key_length", HD).u32(a + "attention.value_length", HD).u32(a + "rope.dimension_count", ROT)
@@ -416,8 +416,12 @@ public final class GgufQwenNextTest {
                 .u32(a + "ssm.time_step_rank", NV).u32(a + "ssm.inner_size", NV * DV).u32(a + "full_attention_interval", INTERVAL)
                 .u32("tokenizer.ggml.bos_token_id", 1).u32("tokenizer.ggml.eos_token_id", 2);
         if (qwen35) {
-            w.u32(a + "nextn_predict_layers", 1).i32s(a + "rope.dimension_sections", 3, 3, 2, 0);
-        } else {
+            w.i32s(a + "rope.dimension_sections", 3, 3, 2, 0);
+            if (!moe) {
+                w.u32(a + "nextn_predict_layers", 1);
+            }
+        }
+        if (moe) {
             w.u32(a + "expert_count", EXPERTS).u32(a + "expert_used_count", TOPK).u32(a + "expert_feed_forward_length", MOE_DIM)
                     .u32(a + "expert_shared_feed_forward_length", SHARED);
         }
@@ -441,7 +445,7 @@ public final class GgufQwenNextTest {
      */
     static void write(Path p, Tiny t, boolean qwen35, boolean q8, Map<String, float[]> effective, boolean useEffective)
             throws IOException {
-        GgufWriter w = meta(qwen35);
+        GgufWriter w = meta(qwen35, t.moe());
         for (Map.Entry<String, Object[]> e : convert(t, qwen35).entrySet()) {
             String name = e.getKey();
             long[] shape = (long[]) e.getValue()[0];
@@ -510,6 +514,7 @@ public final class GgufQwenNextTest {
         try {
             variant(dir, false, true, metal, lib);  // qwen3next: grouped value heads, fused ssm_ba, MoE with a shared expert
             variant(dir, true, false, metal, lib);  // qwen35: tiled value heads, separate beta / alpha, dense FFN, an MTP block
+            variant(dir, true, true, metal, lib);   // qwen35moe: the same with Qwen3-Next's experts and gated shared expert
             malformed(dir);
         } finally {
             try (var s = Files.walk(dir)) {
@@ -523,7 +528,7 @@ public final class GgufQwenNextTest {
     }
 
     private static void variant(Path root, boolean qwen35, boolean moe, boolean metal, String lib) throws Exception {
-        String label = qwen35 ? "qwen35" : "qwen3next";
+        String label = qwen35 ? (moe ? "qwen35moe" : "qwen35") : "qwen3next";
         Tiny t = tiny(moe, 7 + label.hashCode());
         Path hfDir = Files.createDirectories(root.resolve("hf-" + label));
         Files.writeString(hfDir.resolve("config.json"), Json.write(t.config()));
@@ -571,7 +576,7 @@ public final class GgufQwenNextTest {
                 check(vs < 0.1, label + ": Q8_0 gguf vs converted safetensors within quantization noise: " + vs);
                 System.out.printf("%-9s Q8_0 gguf vs safetensors Q8_0: max logit diff %.2e (quantization noise)%n", label, vs);
             }
-            if (qwen35) {
+            if (qwen35 && !moe) {
                 mtp(q8, prompt, metal ? gpu : null);
             }
             if (metal) {

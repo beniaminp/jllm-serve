@@ -51,7 +51,7 @@ final class GgufQwenNext {
         this.w = w;
         this.gguf = gguf;
         this.arena = arena;
-        this.qwen35 = arch.equals("qwen35");
+        this.qwen35 = arch.startsWith("qwen35"); // qwen35 and qwen35moe: tiled value heads, separate beta / alpha
         this.valueHeads = (int) gguf.num(arch + ".ssm.time_step_rank", 0);
         this.keyHeads = (int) gguf.num(arch + ".ssm.group_count", 0);
         this.headDim = (int) gguf.num(arch + ".attention.key_length", 0);
