@@ -276,7 +276,6 @@ public final class GgufTokenizerLlamaCpp {
             scores.add(0f);
             have.add(t);
         }
-        int pieceStart = tokens.size();
         // single characters
         String singles = "abcdefghijklmnopqrstuvwxyz0123456789.,!?'\"-:;()/_<>|*=+\u2581ABCXYZ";
         List<String> chars = new ArrayList<>();
@@ -285,9 +284,7 @@ public final class GgufTokenizerLlamaCpp {
         }
         chars.add("\u00e9");
         chars.add("\u4e2d");
-        if (!kind.gemma) {
-            // Llama 2 has no "\n" token, only <0x0A>
-        } else {
+        if (kind.gemma) { // Llama 2 has no "\n" token, only <0x0A>; Gemma has one
             chars.add("\n");
         }
         for (String c : chars) {
