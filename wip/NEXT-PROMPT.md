@@ -97,9 +97,14 @@ Steps:
    - choose the defaults from that data;
    - add q4 to replay, batched decoding and the saved-cache formats;
    - run arch smoke, write docs 05 / 07 / 08 / 11, then delete `wip/q4-kv-cache.patch`.
-5. Run `scripts/mac-validate.sh --vs-llama` (and `--moe unsloth/Qwen3-30B-A3B-GGUF` with
-   `--llama-moe unsloth/Qwen3-30B-A3B-GGUF` if memory allows). Put the tables in `docs/11-performance.md` and the
-   README. Every Metal speedup above is still unmeasured.
+5. Re-run `scripts/mac-validate.sh --vs-llama` on a Mac (and `--moe unsloth/Qwen3-30B-A3B-GGUF` with
+   `--llama-moe unsloth/Qwen3-30B-A3B-GGUF` if memory allows).
+   - The features before this merge were measured on an M1 Pro (README, docs 08 §8.20, docs 11): llama.cpp is still
+     about 2× faster.
+   - Decode replay and fusion, half-weight MMA prefill, Metal batched decoding and draft speculation are not
+     measured yet.
+
+   Update the tables, and use them to decide what to tune first.
 6. Build and run the arm64 Docker image on an ARM machine or a Mac (`scripts/docker-build.sh`; docs/19). The native
    CPU library's NEON/dotprod levels were only checked under qemu.
 
