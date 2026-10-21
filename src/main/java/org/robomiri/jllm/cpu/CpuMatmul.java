@@ -13,7 +13,8 @@ import org.robomiri.jllm.model.QType;
  * <ul>
  *   <li>{@code n == 1}: every row is one {@link VectorKernels#dotRow} streaming the quantized blocks, or, with int8
  *       activations on and a Q4_0 / Q8_0 / K-quant weight ({@link #useInt8}), one {@link Int8Kernels#dotRow} /
- *       {@link KQuantKernels#dotRow} against the activation quantized once per call ({@link #quantizeInt8}).</li>
+ *       {@link KQuantKernels#dotRow} against the activation quantized once per call ({@link #quantizeInt8}). With the
+ *       native library ({@link NativeCpu}) loaded, each thread's range of rows is one call into it instead.</li>
  *   <li>{@code n > 1}: four rows are dequantized into thread-local scratch once and reused for every token
  *       ({@link VectorKernels#dot4x4} / {@link VectorKernels#dot4}); rows left over when {@code rows % 4 != 0}
  *       fall back to {@code dotRow}. With {@link CpuBackend#DETERMINISTIC} the tokens go one by one through the
@@ -34,6 +35,9 @@ final class CpuMatmul {
     private float[] xs;
     private int[] xsum;
     private float[] permuted;
+    /** The native int8 kernels (null: the Java ones) and their activation buffer. */
+    private final NativeCpu nat;
+    private final NativeCpu.Activation act = new NativeCpu.Activation();
 
     /**
      * @param int8       quantize single-token activations to int8 and use the integer kernels for Q4_0 / Q8_0 weights
@@ -41,10 +45,21 @@ final class CpuMatmul {
      *                   will be multiplied with {@code n > 1}
      */
     CpuMatmul(ThreadPool pool, boolean int8, boolean deterministic, int scratchLen) {
+        this(pool, int8, deterministic, scratchLen, int8 ? NativeCpu.get() : null);
+    }
+
+    /** @param nat the native int8 kernels to use, or null for the Java ones */
+    CpuMatmul(ThreadPool pool, boolean int8, boolean deterministic, int scratchLen, NativeCpu nat) {
         this.pool = pool;
         this.int8 = int8;
         this.deterministic = deterministic;
         this.scratch = ThreadLocal.withInitial(() -> new float[scratchLen]);
+        this.nat = int8 ? nat : null;
+    }
+
+    /** What computes the int8 dot products, for the backends' names. */
+    String describeInt8() {
+        return nat != null ? "int8 activations (native " + nat.level() + ")" : Int8Kernels.describe();
     }
 
     /** The widest {@code cols} of any tensor of {@code w}: the row-group scratch must hold four rows of it. */
@@ -109,8 +124,9 @@ final class CpuMatmul {
                     }
                 }
                 faster = best8 < bestF;
-                System.err.printf("int8 activations: auto -> %s (%s %dx%d: int8 %.0f us, float %.0f us)%n",
-                        faster ? "on" : "off", t.type, t.rows, t.cols, best8 / 1e3, bestF / 1e3);
+                System.err.printf("int8 activations: auto -> %s (%s %dx%d: int8 %.0f us [%s], float %.0f us)%n",
+                        faster ? "on" : "off", t.type, t.rows, t.cols, best8 / 1e3,
+                        i8.nativeInt8(t) ? "native " + i8.nat.level() : "java", bestF / 1e3);
             }
         }
         PROBED.put(w, faster);
@@ -124,6 +140,24 @@ final class CpuMatmul {
     boolean useInt8(QTensor wt) {
         return int8 && ((wt.type == QType.Q4_0 || wt.type == QType.Q8_0 || wt.type == QType.Q4_0G || wt.type == QType.Q8_0G)
                 && wt.cols % QType.BLOCK == 0 || KQuantKernels.supports(wt));
+    }
+
+    /** Whether the single-token int8 matmul of {@code wt} runs in the native library. */
+    boolean nativeInt8(QTensor wt) {
+        return nat != null && useInt8(wt) && nat.supports(wt);
+    }
+
+    /** Quantizes {@code in[off .. off + n)} into the native activation buffer (for {@link #nativeRows}). */
+    void quantizeNative(float[] in, int off, int n) {
+        nat.quantize(in, off, n, act);
+    }
+
+    /**
+     * {@code out[outOff + i] (+)= dot(W[r0 + i, :], x)} in the native library, x the last {@link #quantizeNative}
+     * activation from 32-block {@code xBlock} on.
+     */
+    void nativeRows(QTensor wt, int r0, int r1, int xBlock, float[] out, int outOff, boolean acc) {
+        nat.dotRows(wt, r0, r1, act, xBlock, out, outOff, acc);
     }
 
     /** Row {@code r} of {@code wt} (a {@link #useInt8} type) times the last {@link #quantizeInt8} activation from {@code xo}. */
@@ -250,6 +284,11 @@ final class CpuMatmul {
 
     /** The single-token kernel: {@code out[outOff + r] (+)= dot(W[r, :], in[inOff, :])} for {@code r < rows}, parallel over rows. */
     void mulOne(QTensor wt, int rows, float[] in, int inOff, float[] out, int outOff, boolean acc) {
+        if (nativeInt8(wt)) { // one downcall per chunk of rows
+            nat.quantize(in, inOff, wt.cols, act);
+            pool.forRange(rows, 16, (r0, r1) -> nat.dotRows(wt, r0, r1, act, 0, out, outOff + r0, acc));
+            return;
+        }
         if (useInt8(wt)) {
             short[] xq = quantizeInt8(in, inOff, wt.cols);
             float[] xs = this.xs;

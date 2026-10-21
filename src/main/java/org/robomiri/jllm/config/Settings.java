@@ -198,6 +198,8 @@ public final class Settings {
         }
         require(get("backend.cpu.int8-activations").trim().matches("(?i)auto|true|false"),
                 "backend.cpu.int8-activations", "must be auto, true or false");
+        require(get("backend.cpu.native").trim().matches("(?i)auto|true|false"),
+                "backend.cpu.native", "must be auto, true or false");
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "chat.thinking", "raw",

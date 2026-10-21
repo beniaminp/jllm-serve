@@ -168,6 +168,42 @@
                         </configuration>
                     </execution>
                     <execution>
+                        <!-- libjllm_cpu for the check below; a machine without a C compiler skips it -->
+                        <id>build-native-cpu</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>sh</executable>
+                            <arguments>
+                                <argument>${project.basedir}/scripts/build-native-cpu.sh</argument>
+                                <argument>--optional</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>native-cpu-check</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.NativeCpuCheck</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <execution>
                         <id>gguf-metal-check</id>
                         <phase>test</phase>
                         <goals>
