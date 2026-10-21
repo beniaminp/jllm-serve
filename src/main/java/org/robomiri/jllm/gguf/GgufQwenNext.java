@@ -168,7 +168,9 @@ final class GgufQwenNext {
             return w.requantizeRows(t, src);
         }
         long rb = t.rowBytes();
-        MemorySegment dst = arena.allocate(rb * src.length, 64);
+        long size = rb * src.length;
+        // page aligned and padded to whole pages: the Metal backend wraps the memory without copying it
+        MemorySegment dst = arena.allocate((size + QTensor.PAGE - 1) / QTensor.PAGE * QTensor.PAGE, QTensor.PAGE).asSlice(0, size);
         MemorySegment in = gguf.data(t);
         for (int i = 0; i < src.length; i++) {
             MemorySegment.copy(in, src[i] * rb, dst, i * rb, rb);

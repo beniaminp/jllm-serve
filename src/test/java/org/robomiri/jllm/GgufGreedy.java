@@ -18,33 +18,32 @@ import java.util.List;
 
 /**
  * Greedy decoding of a Qwen3-Next / Qwen3.5 GGUF straight from the weights (no engine, no sampler), for comparing with
- * llama.cpp: prints the prompt ids, the top-5 log-probabilities of the first position and the greedy ids and text.
+ * llama.cpp: per prompt it prints the prompt ids, the top-5 log-probabilities of the first position, the greedy ids and
+ * text, and the prefill and decode speed.
  *
  * <pre>
- * GgufGreedy model.gguf cpu|metal prompt.txt [--chat] [--think] [-n 32] [--ctx 512] [--batch 512]
+ * GgufGreedy model.gguf cpu|metal [-n 32] [--ctx 512] [--batch 512] [--kv f16|f32] MODE:prompt.txt ...
  * </pre>
- * {@code --chat}: the prompt file is one user message rendered with the model's chat template (thinking off unless
- * {@code --think}). Prints prefill and decode speed.
+ * MODE {@code raw}: the file's text as it is; {@code chat}: one user message rendered with the model's chat template with
+ * thinking off; {@code think}: the same with thinking on. The model is loaded once; every prompt starts at position 0.
  */
 public final class GgufGreedy {
 
     public static void main(String[] args) throws Exception {
         Path file = Path.of(args[0]);
         String backend = args[1];
-        String prompt = Files.readString(Path.of(args[2]));
-        boolean chat = false;
-        boolean think = false;
         int n = 32;
         int ctx = 512;
         int batch = 512;
-        for (int i = 3; i < args.length; i++) {
+        KvDtype kvd = KvDtype.F16;
+        List<String> prompts = new ArrayList<>();
+        for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
-                case "--chat" -> chat = true;
-                case "--think" -> think = true;
                 case "-n" -> n = Integer.parseInt(args[++i]);
                 case "--ctx" -> ctx = Integer.parseInt(args[++i]);
                 case "--batch" -> batch = Integer.parseInt(args[++i]);
-                default -> throw new IllegalArgumentException(args[i]);
+                case "--kv" -> kvd = KvDtype.parse(args[++i]);
+                default -> prompts.add(args[i]);
             }
         }
         long t0 = System.nanoTime();
@@ -52,48 +51,60 @@ public final class GgufGreedy {
             Tokenizer tok = GgufModel.tokenizer(g.file());
             Qwen3NextArch arch = (Qwen3NextArch) g.architecture();
             System.out.println("arch: " + arch);
-            int[] ids;
-            if (chat) {
-                ChatTemplate.Format f = ChatTemplate.forModelType(arch.core().modelType(), tok);
-                ids = f.renderTokens(tok, List.of(new ChatTemplate.Message("user", prompt)), true, think);
-                System.out.println("template: " + f.name() + "\n" + f.render(List.of(new ChatTemplate.Message("user", prompt)), true, think));
-            } else {
-                ids = tok.encode(prompt);
-            }
-            System.out.println("prompt ids (" + ids.length + "): " + Arrays.toString(ids));
             try (ModelWeights w = g.weights()) {
                 System.out.printf("loaded in %.1fs%n", (System.nanoTime() - t0) / 1e9);
                 try (Backend b = backend.equals("metal")
-                        ? new Qwen3NextMetalBackend(w, ctx, batch, System.getProperty("jllm.metal.lib"), KvDtype.F16)
-                        : new Qwen3NextCpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), KvDtype.F16)) {
-                    int vocab = arch.core().vocabSize();
-                    float[] logits = new float[vocab];
-                    long p0 = System.nanoTime();
-                    for (int off = 0; off < ids.length; off += batch) {
-                        int len = Math.min(batch, ids.length - off);
-                        b.forward(ids, off, len, off, off + len == ids.length ? logits : null);
+                        ? new Qwen3NextMetalBackend(w, ctx, batch, System.getProperty("jllm.metal.lib"), kvd)
+                        : new Qwen3NextCpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), kvd)) {
+                    System.out.println("backend: " + b.name());
+                    for (String spec : prompts) {
+                        run(b, tok, arch, spec, n, batch);
                     }
-                    double prefill = (System.nanoTime() - p0) / 1e9;
-                    System.out.printf("prefill %d tokens in %.2fs = %.1f tok/s%n", ids.length, prefill, ids.length / prefill);
-                    top(logits, tok, 5);
-                    List<Integer> out = new ArrayList<>();
-                    int pos = ids.length;
-                    long d0 = System.nanoTime();
-                    for (int i = 0; i < n; i++) {
-                        int next = argmax(logits);
-                        out.add(next);
-                        if (i + 1 < n) {
-                            b.forward(new int[]{next}, 0, 1, pos++, logits);
-                        }
-                    }
-                    double decode = (System.nanoTime() - d0) / 1e9;
-                    System.out.printf("decode %d tokens in %.2fs = %.2f tok/s%n", n - 1, decode, (n - 1) / decode);
-                    int[] o = out.stream().mapToInt(Integer::intValue).toArray();
-                    System.out.println("greedy ids: " + Arrays.toString(o));
-                    System.out.println("text: " + tok.decode(o).replace("\n", "\\n"));
                 }
             }
         }
+    }
+
+    private static void run(Backend b, Tokenizer tok, Qwen3NextArch arch, String spec, int n, int batch) throws Exception {
+        int colon = spec.indexOf(':');
+        String mode = spec.substring(0, colon);
+        String text = Files.readString(Path.of(spec.substring(colon + 1)));
+        int[] ids;
+        if (mode.equals("raw")) {
+            ids = tok.encode(text);
+        } else {
+            ChatTemplate.Format f = ChatTemplate.forModelType(arch.core().modelType(), tok);
+            List<ChatTemplate.Message> msgs = List.of(new ChatTemplate.Message("user", text));
+            boolean think = mode.equals("think");
+            ids = f.renderTokens(tok, msgs, true, think);
+            System.out.println("template " + f.name() + " renders:\n" + f.render(msgs, true, think).replace("\n", "\\n"));
+        }
+        System.out.println("== " + spec + "\nprompt ids (" + ids.length + "): " + Arrays.toString(ids));
+        int vocab = arch.core().vocabSize();
+        float[] logits = new float[vocab];
+        long p0 = System.nanoTime();
+        for (int off = 0; off < ids.length; off += batch) {
+            int len = Math.min(batch, ids.length - off);
+            b.forward(ids, off, len, off, off + len == ids.length ? logits : null);
+        }
+        double prefill = (System.nanoTime() - p0) / 1e9;
+        System.out.printf("prefill %d tokens in %.2fs = %.1f tok/s%n", ids.length, prefill, ids.length / prefill);
+        top(logits, tok, 5);
+        List<Integer> out = new ArrayList<>();
+        int pos = ids.length;
+        long d0 = System.nanoTime();
+        for (int i = 0; i < n; i++) {
+            int next = argmax(logits);
+            out.add(next);
+            if (i + 1 < n) {
+                b.forward(new int[]{next}, 0, 1, pos++, logits);
+            }
+        }
+        double decode = (System.nanoTime() - d0) / 1e9;
+        System.out.printf("decode %d tokens in %.2fs = %.2f tok/s%n", n - 1, decode, (n - 1) / decode);
+        int[] o = out.stream().mapToInt(Integer::intValue).toArray();
+        System.out.println("greedy ids: " + Arrays.toString(o));
+        System.out.println("text: " + tok.decode(o).replace("\n", "\\n"));
     }
 
     private static int argmax(float[] a) {
@@ -122,7 +133,7 @@ public final class GgufGreedy {
             idx[i] = i;
         }
         Arrays.sort(idx, (x, y) -> Float.compare(logits[y], logits[x]));
-        StringBuilder sb = new StringBuilder("top-" + k + " (id logit logprob):");
+        StringBuilder sb = new StringBuilder("top-" + k + " (id logit logprob token):");
         for (int i = 0; i < k; i++) {
             sb.append(String.format("%n  %d  %.4f  %.4f  %s", idx[i], logits[idx[i]], logits[idx[i]] - lse,
                     tok.decode(new int[]{idx[i]}).replace("\n", "\\n")));
