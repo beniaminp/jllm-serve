@@ -151,7 +151,7 @@ kv_store_q8(128)
 kv_store_q8(64, n_kv=3)
 
 
-def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False, q8=False):
+def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False, q8=False, kind='fa'):
     rng = np.random.default_rng(3)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     kc32 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
@@ -165,7 +165,7 @@ def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.
     scale = 1 / np.sqrt(hd)
     # FlashParams: nHeads nKvHeads pos0 ntok scale qStride kStride oStride window softcap
     p = pack('iiiifiiiif', n_heads, n_kv, pos0, ntok, scale, n_heads * hd, stride, n_heads * hd, window, softcap)
-    name = 'attention_fa_d%d%s' % (hd, '_h' if half else '_q8' if q8 else '')
+    name = 'attention_%s_d%d%s' % (kind, hd, '_h' if half else '_q8' if q8 else '')
     E.dispatch(name, [q, kc, vc, out], p, (n_heads, (ntok + 31) // 32), (128,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale, window, softcap)
     err = np.abs(out - ref).max()
@@ -182,6 +182,13 @@ flash(128, n_heads=8, n_kv=1, ntok=7)
 flash(256, ntok=33)
 flash(128, q8=True)
 flash(64, window=20, pos0=60, ntok=40, q8=True)
+# attention_fb (K and V staged together, half staging for the f16 / q8 caches, padded rows): the same cases
+for kw in ({'hd': 64}, {'hd': 128}, {'hd': 128, 'half': True}, {'hd': 64, 'pos0': 0, 'ntok': 32},
+           {'hd': 128, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 64, 'softcap': 5.0},
+           {'hd': 128, 'n_heads': 8, 'n_kv': 1, 'ntok': 7}, {'hd': 256, 'ntok': 33}, {'hd': 256, 'ntok': 33, 'half': True},
+           {'hd': 64, 'half': True, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 128, 'q8': True},
+           {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9}):
+    flash(kind='fb', **kw)
 
 
 def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
@@ -208,4 +215,277 @@ def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
 
 
 split_q8(128)
+
+
+# ---- half-weight MMA prefill kernels (*_hmma) in every weight format, against numpy.
+# Each format's bytes are random (with sane f16 / f32 scales) and decoded here following the block layouts of
+# kernels.metal (and llama.cpp for the GGUF ones); the established *_mma kernel is checked against the same decoder
+# first, so a decoder slip cannot hide a kernel error. The *_hmma kernels store each dequantized weight as half: they
+# are checked strictly (2e-5 of max|ref|) against the reference with the weights rounded to half (numpy's f16 rounding
+# is round-to-nearest-even, as the GPU's), and loosely (2e-3) against the exact weights.
+
+def f16(rng, shape, lo, hi):
+    return rng.uniform(lo, hi, shape).astype(np.float16)
+
+
+def fmt_weights(fmt, rows, cols, rng):
+    """(wq bytes, ws f32 scales or a dummy, w [rows, cols] f32 as the kernels dequantize it) of one tensor."""
+    dummy = np.zeros(4, np.float32)
+    if fmt == 'q4':
+        wq, ws, w = q4_weights(rows, cols, rng)
+        return wq, ws, w
+    if fmt == 'q8':
+        q = rng.integers(-127, 128, (rows, cols)).astype(np.int8)
+        s = (rng.random((rows, cols // 32)) * 0.01 + 0.001).astype(np.float32)
+        w = (q.astype(np.float32).reshape(rows, cols // 32, 32) * s[:, :, None]).reshape(rows, cols)
+        return q.view(np.uint8).reshape(-1).copy(), s.reshape(-1).copy(), w
+    if fmt == 'q4g' or fmt == 'q8g':
+        nb = cols // 32
+        q4 = fmt == 'q4g'
+        blk = np.zeros((rows, nb, 18 if q4 else 34), np.uint8)
+        d = f16(rng, (rows, nb), 0.002, 0.02)
+        blk[:, :, 0:2] = d.view(np.uint8).reshape(rows, nb, 2)
+        blk[:, :, 2:] = rng.integers(0, 256, (rows, nb, blk.shape[2] - 2))
+        if q4:
+            qs = blk[:, :, 2:]
+            v = np.concatenate([qs & 15, qs >> 4], axis=2).astype(np.float32) - 8
+        else:
+            v = blk[:, :, 2:].view(np.int8).astype(np.float32)
+        w = (v * d.astype(np.float32)[:, :, None]).reshape(rows, cols)
+        return blk.reshape(-1).copy(), dummy, w
+    nsb = cols // 256
+    w = np.zeros((rows, nsb, 256), np.float32)
+    if fmt == 'q2k':
+        blk = np.zeros((rows, nsb, 84), np.uint8)
+        blk[:, :, :80] = rng.integers(0, 256, (rows, nsb, 80))
+        d = f16(rng, (rows, nsb), 0.005, 0.05)
+        dmin = f16(rng, (rows, nsb), 0.0, 0.02)
+        blk[:, :, 80:82] = d.view(np.uint8).reshape(rows, nsb, 2)
+        blk[:, :, 82:84] = dmin.view(np.uint8).reshape(rows, nsb, 2)
+        for j in range(16):
+            s = blk[:, :, j]
+            dl = d.astype(np.float32) * (s & 15).astype(np.float32)
+            ml = dmin.astype(np.float32) * (s >> 4).astype(np.float32)
+            off = 16 + (j >> 3) * 32 + (j & 1) * 16
+            q = ((blk[:, :, off:off + 16] >> (2 * ((j & 7) >> 1))) & 3).astype(np.float32)
+            w[:, :, 16 * j:16 * j + 16] = q * dl[:, :, None] - ml[:, :, None]
+    elif fmt == 'q6k':
+        blk = np.zeros((rows, nsb, 210), np.uint8)
+        blk[:, :, :192] = rng.integers(0, 256, (rows, nsb, 192))
+        blk[:, :, 192:208] = rng.integers(-64, 64, (rows, nsb, 16)).astype(np.int8).view(np.uint8)
+        d = f16(rng, (rows, nsb), 0.0005, 0.005)
+        blk[:, :, 208:210] = d.view(np.uint8).reshape(rows, nsb, 2)
+        sc = blk[:, :, 192:208].view(np.int8).astype(np.float32)
+        for j in range(16):
+            h, g, lb = j >> 3, (j & 7) >> 1, j & 1
+            ql = blk[:, :, 64 * h + 32 * (g & 1) + 16 * lb:][:, :, :16]
+            qh = blk[:, :, 128 + 32 * h + 16 * lb:][:, :, :16]
+            q = ((ql >> ((g >> 1) * 4)) & 15) | (((qh >> (2 * g)) & 3) << 4)
+            dl = d.astype(np.float32) * sc[:, :, j]
+            w[:, :, 16 * j:16 * j + 16] = (q.astype(np.float32) - 32) * dl[:, :, None]
+    else:  # q4k / q5k
+        q5 = fmt == 'q5k'
+        blk = np.zeros((rows, nsb, 176 if q5 else 144), np.uint8)
+        blk[:, :, 4:] = rng.integers(0, 256, (rows, nsb, blk.shape[2] - 4))
+        d = f16(rng, (rows, nsb), 0.0005, 0.005)
+        dmin = f16(rng, (rows, nsb), 0.0, 0.002)
+        blk[:, :, 0:2] = d.view(np.uint8).reshape(rows, nsb, 2)
+        blk[:, :, 2:4] = dmin.view(np.uint8).reshape(rows, nsb, 2)
+        sc = blk[:, :, 4:16].astype(np.uint32)
+        for j in range(8):
+            if j < 4:
+                s, m = sc[:, :, j] & 63, sc[:, :, j + 4] & 63
+            else:
+                s = (sc[:, :, j + 4] & 15) | ((sc[:, :, j - 4] >> 6) << 4)
+                m = (sc[:, :, j + 4] >> 4) | ((sc[:, :, j] >> 6) << 4)
+            dl = d.astype(np.float32) * s.astype(np.float32)
+            ml = dmin.astype(np.float32) * m.astype(np.float32)
+            qs = blk[:, :, (48 if q5 else 16) + (j >> 1) * 32:][:, :, :32]
+            v = (qs >> ((j & 1) * 4)) & 15
+            if q5:
+                v = v | (((blk[:, :, 16:48] >> j) & 1) << 4)
+            w[:, :, 32 * j:32 * j + 32] = v.astype(np.float32) * dl[:, :, None] - ml[:, :, None]
+    return blk.reshape(-1).copy(), dummy, w.reshape(rows, cols)
+
+
+GGUF = ('q4g', 'q8g', 'q4k', 'q5k')
+
+
+def rel_errs(out, w, x_ref_fn):
+    """(error against the half-rounded weights, error against the exact ones), relative to max|ref|."""
+    exact = x_ref_fn(w.astype(np.float64))
+    halfw = x_ref_fn(w.astype(np.float16).astype(np.float64))
+    scale = np.abs(exact).max()
+    return np.abs(out - halfw).max() / scale, np.abs(out - exact).max() / scale
+
+
+def report(name, desc, out, w, fn, half):
+    eh, ee = rel_errs(out, w, fn)
+    if half:
+        check(eh < 2e-5 and ee < 2e-3, '%s %s: rel err %.1e (half weights), %.1e (exact)' % (name, desc, eh, ee))
+    else:
+        check(ee < 1e-5, '%s %s: rel err %.1e' % (name, desc, ee))
+
+
+def mm_test(fmt, kind, rows, cols, ntok, acc=False, bias=False, softcap=0.0):
+    rng = np.random.default_rng(10)
+    wq, ws, w = fmt_weights(fmt, rows, cols, rng)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    out0 = rng.standard_normal((ntok, rows)).astype(np.float32) if acc else np.zeros((ntok, rows), np.float32)
+    out = out0.copy()
+    b = rng.standard_normal(rows).astype(np.float32)
+    name = 'matmul_%s_%s' % (kind, fmt)
+    E.dispatch(name, [wq, ws, x, out, np.ones(cols, np.float32), b],
+               pack('iiiiffi', rows, cols, ntok, int(acc), 1e-6, softcap, int(bias)),
+               ((rows + 63) // 64, (ntok + 31) // 32), (128,))
+
+    def ref(wm):
+        r = x.astype(np.float64) @ wm.T + (b if bias else 0)
+        if softcap > 0:
+            r = np.tanh(r / softcap) * softcap
+        return r + (out0 if acc else 0)
+    report(name, '%dx%d, %d tokens%s%s%s' % (rows, cols, ntok, ', acc' if acc else '', ', bias' if bias else '',
+                                             ', softcap' if softcap else ''), out, w, ref, kind == 'hmma')
+
+
+def mm3_test(fmt, kind, rows, cols, ntok, half=False, bias=False):
+    rng = np.random.default_rng(11)
+    ws_ = [fmt_weights(fmt, r, cols, rng) for r in rows]
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    outs = [np.full((ntok, rows[0]), np.nan, np.float32), np.full((ntok, rows[1]), np.nan, np.float32),
+            np.full((ntok, rows[2]), np.nan, np.float16 if half else np.float32)]
+    bs = [rng.standard_normal(r).astype(np.float32) for r in rows]
+    name = 'matmul3_%s_%s%s' % (kind, fmt, '_h' if half else '')
+    bufs = [ws_[0][0], ws_[0][1], ws_[1][0], ws_[1][1], ws_[2][0], ws_[2][1], x] + outs \
+        + [np.ones(cols, np.float32)] + bs
+    E.dispatch(name, bufs, pack('iiiiifi', rows[0], rows[1], rows[2], cols, ntok, 1e-6, int(bias)),
+               ((sum(rows) + 63) // 64, (ntok + 31) // 32), (128,))
+    w = np.concatenate([t[2] for t in ws_])
+    b = np.concatenate(bs)
+    out = np.concatenate([o.astype(np.float32) for o in outs], axis=1)
+    if half:  # the v rows are rounded to half once more on the way out: compare them at half precision
+        eh, ee = rel_errs(out, w, lambda wm: x.astype(np.float64) @ wm.T + (b if bias else 0))
+        ok = eh < 1e-3 and ee < 2e-3
+        check(ok, '%s %s, %d tokens%s: rel err %.1e (half weights, v as half), %.1e (exact)'
+              % (name, rows, ntok, ', bias' if bias else '', eh, ee))
+        return
+    report(name, '%s, %d tokens%s' % (rows, ntok, ', bias' if bias else ''), out, w,
+           lambda wm: x.astype(np.float64) @ wm.T + (b if bias else 0), kind == 'hmma')
+
+
+def silu(g):
+    return g / (1 + np.exp(-g))
+
+
+def gelu(g):
+    return 0.5 * g * (1 + np.tanh(0.7978845608028654 * (g + 0.044715 * g ** 3)))
+
+
+def swiglu_test(fmt, kind, hidden, cols, ntok, use_gelu=False):
+    rng = np.random.default_rng(12)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    if fmt in GGUF:  # gate and up are separate views; the up view is bound as buffer(1)
+        gq, _, gw = fmt_weights(fmt, hidden, cols, rng)
+        uq, _, uw = fmt_weights(fmt, hidden, cols, rng)
+        wq, ws, w = gq, uq, np.concatenate([gw, uw])
+    else:
+        wq, ws, w = fmt_weights(fmt, 2 * hidden, cols, rng)
+    out = np.full((ntok, hidden), np.nan, np.float32)
+    name = 'matmul_swiglu_%s_%s' % (kind, fmt)
+    E.dispatch(name, [wq, ws, x, out, np.ones(cols, np.float32)], pack('iiifi', hidden, cols, ntok, 1e-6, int(use_gelu)),
+               ((hidden + 31) // 32, (ntok + 31) // 32), (128,))
+    act = gelu if use_gelu else silu
+
+    def ref(wm):
+        y = x.astype(np.float64) @ wm.T
+        return act(y[:, :hidden]) * y[:, hidden:]
+    report(name, 'hidden %d x %d, %d tokens%s' % (hidden, cols, ntok, ', gelu' if use_gelu else ''), out, w, ref,
+           kind == 'hmma')
+
+
+def moe_tiles(counts, experts, rng):
+    """Slots grouped by expert as moe_sort leaves them: order[] and tiles [n, (expert, start, count)...]."""
+    order, tiles, start = [], [], 0
+    for e, c in zip(experts, counts):
+        order += list(range(start, start + c))
+        tiles += [e, start, c]
+        start += c
+    perm = rng.permutation(start)  # the slots of a tile are scattered over the chunk's tokens
+    return np.array([perm[i] for i in order], np.int32), np.array([len(counts)] + tiles, np.int32), start
+
+
+def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts=(2, 0, 3, 2)):
+    rng = np.random.default_rng(13)
+    order, tiles, slots = moe_tiles(counts, experts, rng)
+    ntok = (slots + top_k - 1) // top_k
+    x = rng.standard_normal((ntok, dim)).astype(np.float32)
+    if fmt in GGUF:  # gate experts [E * m] in buffer 0, up experts [E * m] in buffer 1
+        gq, _, gw = fmt_weights(fmt, n_exp * m, dim, rng)
+        uq, _, uw = fmt_weights(fmt, n_exp * m, dim, rng)
+        wq, ws = gq, uq
+        wg, wu = gw.reshape(n_exp, m, dim), uw.reshape(n_exp, m, dim)
+    else:            # expert e: rows e * 2m .. (gate m, then up m)
+        wq, ws, w2 = fmt_weights(fmt, n_exp * 2 * m, dim, rng)
+        w2 = w2.reshape(n_exp, 2 * m, dim)
+        wg, wu = w2[:, :m], w2[:, m:]
+    hid = np.full((ntok * top_k, m), np.nan, np.float32)
+    name = 'moe_up_%s_%s' % (kind, fmt)
+    E.dispatch(name, [wq, ws, x, order, tiles, hid], pack('iii', 2 * m, dim, top_k),
+               ((m + 31) // 32, len(counts)), (128,))
+    slot_e = np.zeros(slots, int)
+    for e, s0, c in tiles[1:].reshape(-1, 3):
+        slot_e[order[s0:s0 + c]] = e
+
+    def up_ref(g, u):
+        out = np.zeros((slots, m))
+        for s in range(slots):
+            xv = x[s // top_k].astype(np.float64)
+            out[s] = silu(g[slot_e[s]] @ xv) * (u[slot_e[s]] @ xv)
+        return out
+    exact = up_ref(wg.astype(np.float64), wu.astype(np.float64))
+    halfw = up_ref(wg.astype(np.float16).astype(np.float64), wu.astype(np.float16).astype(np.float64))
+    got = hid[:slots]
+    sc = np.abs(exact).max()
+    eh, ee = np.abs(got - halfw).max() / sc, np.abs(got - exact).max() / sc
+    ok = (eh < 2e-5 and ee < 2e-3) if kind == 'hmma' else ee < 1e-5
+    check(ok, '%s m=%d dim=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, m, dim, list(counts), eh, ee))
+
+    # down: ys[s] = rw[s] * W_e h[s], rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
+    h = rng.standard_normal((slots, m)).astype(np.float32)
+    rw = rng.random(slots).astype(np.float32)
+    if fmt in GGUF and m % 256 != 0 and fmt in ('q4k', 'q5k'):
+        return
+    dq, ds, dw = fmt_weights(fmt, n_exp * dim, m, rng)
+    dw = dw.reshape(n_exp, dim, m)
+    ys = np.full((slots, dim), np.nan, np.float32)
+    name = 'moe_down_%s_%s' % (kind, fmt)
+    E.dispatch(name, [dq, ds, h, order, tiles, rw, ys], pack('iii', dim, m, top_k), ((dim + 63) // 64, len(counts)),
+               (128,))
+
+    def down_ref(wd):
+        return np.stack([rw[s] * (wd[slot_e[s]] @ h[s].astype(np.float64)) for s in range(slots)])
+    exact = down_ref(dw.astype(np.float64))
+    halfw = down_ref(dw.astype(np.float16).astype(np.float64))
+    sc = np.abs(exact).max()
+    eh, ee = np.abs(ys - halfw).max() / sc, np.abs(ys - exact).max() / sc
+    ok = (eh < 2e-5 and ee < 2e-3) if kind == 'hmma' else ee < 1e-5
+    check(ok, '%s dim=%d m=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), eh, ee))
+
+
+for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k'):
+    kq = fmt in ('q2k', 'q6k', 'q4k', 'q5k')  # 256-weight super-blocks
+    cols = 256 if kq else 128
+    for kind in ('mma', 'hmma'):
+        mm_test(fmt, kind, 96, cols, 37)                       # partial row and token tiles: staging epilogue
+        mm_test(fmt, kind, 128, 2 * cols, 64, acc=True)        # full tiles: stored straight from the accumulators
+        mm_test(fmt, kind, 64, cols, 32, bias=True)            # full tile with a bias: staging epilogue
+        mm3_test(fmt, kind, (128, 64, 64), cols, 64)           # q / k tiles direct, v tile staged
+        mm3_test(fmt, kind, (64, 32, 32), cols, 37, bias=True)
+        mm3_test(fmt, kind, (64, 32, 32), cols, 40, half=True)
+        swiglu_test(fmt, kind, 48, cols, 37)
+        moe_test(fmt, kind, 64 if not kq else 256, cols)
+mm_test('q4', 'hmma', 96, 256, 40, softcap=3.0)
+mm_test('q4', 'hmma', 64, 128, 7)                              # one 8-token block of the tile only
+swiglu_test('q8', 'hmma', 32, 128, 64, use_gelu=True)
+moe_test('q4', 'hmma', 96, 128, counts=(32, 32, 3), experts=(1, 3, 1))
 sys.exit(1 if failures else 0)

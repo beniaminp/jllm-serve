@@ -263,23 +263,25 @@ static inline void simdgroup_store(simdgroup_matrix<T, R, C> s, P dst, ulong str
             else dst[r * stride + c] = s.m[i][j];
         }
 }
-template <typename T, int M, int K, int N>
-static inline void simdgroup_multiply_accumulate(thread simdgroup_matrix<T, M, N> &d,
-                                                 simdgroup_matrix<T, M, K> a, simdgroup_matrix<T, K, N> b,
-                                                 simdgroup_matrix<T, M, N> c) {
-    simdgroup_matrix<T, M, N> r;
+// The operands may differ in element type (Metal allows e.g. float x half -> float, which the half-weight prefill
+// kernels use): every product and sum is formed in f32, as the GPU's f32 accumulators do.
+template <typename TD, typename TA, typename TB, typename TC, int M, int K, int N>
+static inline void simdgroup_multiply_accumulate(thread simdgroup_matrix<TD, M, N> &d,
+                                                 simdgroup_matrix<TA, M, K> a, simdgroup_matrix<TB, K, N> b,
+                                                 simdgroup_matrix<TC, M, N> c) {
+    simdgroup_matrix<TD, M, N> r;
     for (int i = 0; i < M; i++)
         for (int j = 0; j < N; j++) {
-            float s = c.m[i][j];
+            float s = (float) c.m[i][j];
             for (int k = 0; k < K; k++) s += (float) a.m[i][k] * (float) b.m[k][j];
-            r.m[i][j] = (T) s;
+            r.m[i][j] = (TD) s;
         }
     d = r;
 }
-template <typename T, int M, int K, int N>
-static inline void simdgroup_multiply(thread simdgroup_matrix<T, M, N> &d, simdgroup_matrix<T, M, K> a,
-                                      simdgroup_matrix<T, K, N> b) {
-    simdgroup_multiply_accumulate(d, a, b, make_filled_simdgroup_matrix<T, M, N>((T) 0));
+template <typename TD, typename TA, typename TB, int M, int K, int N>
+static inline void simdgroup_multiply(thread simdgroup_matrix<TD, M, N> &d, simdgroup_matrix<TA, M, K> a,
+                                      simdgroup_matrix<TB, K, N> b) {
+    simdgroup_multiply_accumulate(d, a, b, make_filled_simdgroup_matrix<TD, M, N>((TD) 0));
 }
 
 template <typename T>
