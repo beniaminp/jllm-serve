@@ -382,25 +382,57 @@ public class ModelManager implements DisposableBean {
     /**
      * A request that names no {@code model.dir} reads the model from the models folder that already holds it
      * ({@code model.dir} first, then {@code jllm.web.model-dirs}), so a model on disk is never downloaded again
-     * because it sits in another folder than the default one. Only when no folder has it does the download go to
-     * {@code model.dir}.
+     * because it sits in another folder than the default one. A folder where the model is usable (the quantized
+     * cache, every weight file, or the GGUF file) wins over one with only its metadata (what an interrupted
+     * download leaves); only when no folder has it does the download go to {@code model.dir}.
      */
     private void locate(Target t, Map<String, String> extra) {
         if (t.local() || extra.containsKey("model.dir")) {
             return;
         }
+        Settings s = settings.with(extra);
         String name = t.model().replace('/', '_');
+        Path partial = null;
         for (Path root : modelRoots()) {
             Path dir = root.resolve(name);
             try {
-                if (Files.isRegularFile(dir.resolve("config.json")) || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
+                boolean st = Files.isRegularFile(dir.resolve("config.json"));
+                List<String> gguf = HuggingFaceHub.localGgufNames(dir);
+                if (!st && gguf.isEmpty()) {
+                    continue;
+                }
+                boolean usable = t.file() != null ? Files.isRegularFile(dir.resolve(t.file()))
+                        : !gguf.isEmpty() && (t.quant() != null || !st)
+                        || st && (QuantFile.exists(dir, QType.parse(s.get("model.quant")), QType.parseHead(s.get("model.head-quant")))
+                                  || allWeights(dir));
+                if (usable) {
                     extra.put("model.dir", root.toString());
                     return;
+                }
+                if (partial == null) {
+                    partial = root;
                 }
             } catch (IOException | RuntimeException e) {
                 // unreadable: look further
             }
         }
+        if (partial != null) {
+            extra.put("model.dir", partial.toString()); // finish the download where it started
+        }
+    }
+
+    /** Every weight file the checkpoint's index (or the single-file name) lists is on disk. */
+    private static boolean allWeights(Path dir) throws IOException {
+        List<String> names = HuggingFaceHub.weightFileNames(dir);
+        if (names.isEmpty()) {
+            return false;
+        }
+        for (String n : names) {
+            if (!Files.isRegularFile(dir.resolve(n))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A safetensors checkpoint whose quantized cache for the requested format is already converted. */
