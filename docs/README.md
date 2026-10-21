@@ -12,6 +12,7 @@ Suggested reading order:
 | # | Document | What you will learn |
 |---|---|---|
 | 0 | [Explained simply](00-explained-simply.md) | The whole project in pictures and stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
+| 0b | [From prompt to answer, on paper](00b-math-on-paper.md) | One question through a toy model (20 tokens, 4-wide vectors, two layers) with every number written down: template, BPE, embedding, weighted RMSNorm, q/k/v, q-norm and k-norm, RoPE, attention, SwiGLU, logits, softmax, sampling, the KV cache, Q4_0 |
 | 1 | [Overview](01-overview.md) | What an LLM is, what "inference" means, the pipeline from text to text, the supported model families, project layout |
 | 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, downloading only the shards a model needs |
 | 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion), MLX 4-/8-bit and mxfp4 / mxfp8 checkpoints, FP8 checkpoints |
