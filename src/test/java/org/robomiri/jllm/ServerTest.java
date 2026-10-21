@@ -39,13 +39,23 @@ public final class ServerTest {
     static final int WRITE_TIMEOUT = 1000;
     static final int QUEUE_TIMEOUT = 5000;
 
+    static Path modelDir;
+
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args.length > 0 ? args[0] : "models/Qwen_Qwen3-0.6B");
+        modelDir = dir;
         settings();
+        jsonConstraintUnit();
         Tokenizer tok = Tokenizer.load(dir.resolve("tokenizer.json"));
         try (Fixture f = new Fixture(tok, "qwen3", 1 << 20)) {
             basics(f);
             badRequests(f);
+            logprobs(f);
+            logitBias(f);
+            multipleChoices(f);
+            bestOf(f);
+            echoAndSuffix(f);
+            jsonOutput(f);
             keepAlive(f);
             stalledStreamClient(f);
             disconnectedClient(f, false);
@@ -175,10 +185,333 @@ public final class ServerTest {
         r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
                 + "{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]}");
         check(r.status == 400 && r.body.contains("image_url"), "image content part: 400");
-        for (String field : new String[]{"\"logit_bias\":{\"1\":5}", "\"echo\":true", "\"suffix\":\"x\"", "\"best_of\":2"}) {
-            r = f.post("/v1/completions", "{\"prompt\":\"hi\"," + field + "}");
-            check(r.status == 400 && r.body.contains("not supported"), field + ": 400");
+        r = f.post("/v1/chat/completions", "{" + msgs + ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}");
+        check(r.status == 400 && r.body.contains("not supported"), "tools: 400 (the web console's job)");
+        // the OpenAI extras: invalid values are a 400 naming the field
+        String[][] bad = {
+                {"/v1/completions", "\"logit_bias\":{\"x\":5}", "logit_bias"},
+                {"/v1/completions", "\"logit_bias\":{\"1\":101}", "logit_bias"},
+                {"/v1/completions", "\"logit_bias\":{\"999999999\":1}", "logit_bias"},
+                {"/v1/completions", "\"best_of\":2,\"stream\":true", "best_of"},
+                {"/v1/completions", "\"best_of\":2,\"n\":3", "best_of"},
+                {"/v1/completions", "\"n\":17", "'n'"},
+                {"/v1/completions", "\"n\":0", "'n'"},
+                {"/v1/completions", "\"logprobs\":21", "logprobs"},
+                {"/v1/completions", "\"echo\":true,\"suffix\":\"x\"", "echo"},
+                {"/v1/chat/completions", "\"echo\":true", "echo"},
+                {"/v1/chat/completions", "\"top_logprobs\":3", "top_logprobs"},
+                {"/v1/chat/completions", "\"logprobs\":true,\"top_logprobs\":21", "top_logprobs"},
+                {"/v1/chat/completions", "\"response_format\":{\"type\":\"xml\"}", "response_format"},
+                {"/v1/chat/completions", "\"response_format\":{\"type\":\"json_schema\"}", "json_schema"},
+                {"/v1/chat/completions", "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":"
+                        + "{\"type\":\"string\",\"pattern\":\"a+\"}}}", "'pattern'"},
+                {"/v1/chat/completions", "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":"
+                        + "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"string\"}]}}}", "anyOf"},
+        };
+        for (String[] b : bad) {
+            String prompt = b[0].contains("chat") ? msgs : "\"prompt\":\"hi\"";
+            r = f.post(b[0], "{" + prompt + ",\"max_tokens\":2," + b[1] + "}");
+            check(r.status == 400 && r.body.contains(b[2]), b[0] + " " + b[1] + ": 400 naming " + b[2] + " (" + r.body + ")");
         }
+    }
+
+    // ------------------------------------------------------------------ OpenAI extras
+
+    /** The log-probability the fake backend's default logits give a token: 1 for {@code token}, 0 elsewhere. */
+    static double fakeLogprob(Fixture f, boolean favoured) {
+        int v = f.tok.vocabSize();
+        double lse = Math.log(Math.E + (v - 1));
+        return (favoured ? 1 : 0) - lse;
+    }
+
+    static boolean near(Object x, double want) {
+        return x instanceof Number n && Math.abs(n.doubleValue() - want) < 1e-4;
+    }
+
+    /** logprobs are the log-softmax of the raw logits, in the chat and the completions shape, streamed too. */
+    static void logprobs(Fixture f) throws Exception {
+        String hello = org.robomiri.jllm.server.OpenAiFeatures.tokenText(f.tok, f.backend.token);
+        Resp r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"lp\"}],\"max_tokens\":3,"
+                + "\"temperature\":0,\"logprobs\":true,\"top_logprobs\":2}");
+        Map<String, Object> choice = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+        List<Object> content = Json.list(Json.map(choice, "logprobs"), "content");
+        Map<String, Object> first = (Map<String, Object>) content.getFirst();
+        List<Object> top = Json.list(first, "top_logprobs");
+        check(r.status == 200 && content.size() == 3 && first.get("token").equals(hello)
+                        && near(first.get("logprob"), fakeLogprob(f, true)) && top.size() == 2
+                        && near(((Map<?, ?>) top.getFirst()).get("logprob"), fakeLogprob(f, true))
+                        && near(((Map<?, ?>) top.get(1)).get("logprob"), fakeLogprob(f, false))
+                        && Json.list(first, "bytes").size() == hello.getBytes(StandardCharsets.UTF_8).length,
+                "chat logprobs: log-softmax of the logits (" + first.get("logprob") + "), top 2, bytes");
+        // completions: logprobs: k gives tokens / token_logprobs / top_logprobs / text_offset
+        r = f.post("/v1/completions", "{\"prompt\":\"lp\",\"max_tokens\":3,\"temperature\":0,\"logprobs\":1}");
+        choice = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+        Map<String, Object> lp = Json.map(choice, "logprobs");
+        check(r.status == 200 && Json.list(lp, "tokens").equals(List.of(hello, hello, hello))
+                        && near(Json.list(lp, "token_logprobs").get(2), fakeLogprob(f, true))
+                        && Json.list(lp, "text_offset").equals(List.of(0L, (long) hello.length(), 2L * hello.length()))
+                        && ((Map<?, ?>) Json.list(lp, "top_logprobs").getFirst()).containsKey(hello),
+                "completion logprobs: tokens, token_logprobs, top_logprobs, text_offset");
+        // streamed: every token's entry arrives in some chunk
+        r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"lp\"}],\"max_tokens\":4,"
+                + "\"temperature\":0,\"logprobs\":true,\"stream\":true}");
+        int entries = 0;
+        for (Map<String, Object> ev : events(r.body)) {
+            for (Object c : Json.list(ev, "choices")) {
+                Map<String, Object> l = Json.map(c, "logprobs");
+                if (l != null) {
+                    entries += Json.list(l, "content").size();
+                }
+            }
+        }
+        check(r.status == 200 && entries == 4 && r.body.endsWith("data: [DONE]\n\n"), "streamed logprobs: 4 entries over the chunks");
+    }
+
+    /** logit_bias is added to the logits: +50 makes a token win, -100 bans the favourite. */
+    static void logitBias(Fixture f) throws Exception {
+        int other = f.tok.encode(" world")[0];
+        Resp r = f.post("/v1/completions", "{\"prompt\":\"bias\",\"max_tokens\":3,\"temperature\":0,\"logit_bias\":{\""
+                + other + "\":50}}");
+        String text = (String) ((Map<?, ?>) Json.list(Json.parseObject(r.body), "choices").getFirst()).get("text");
+        check(r.status == 200 && text.equals(" world world world"), "logit_bias +50: the biased token wins (" + text + ")");
+        r = f.post("/v1/completions", "{\"prompt\":\"bias\",\"max_tokens\":2,\"temperature\":0.8,\"seed\":3,\"logit_bias\":{\""
+                + f.backend.token + "\":-100}}");
+        text = (String) ((Map<?, ?>) Json.list(Json.parseObject(r.body), "choices").getFirst()).get("text");
+        check(r.status == 200 && !text.contains("hello"), "logit_bias -100: the favourite is never sampled");
+    }
+
+    /** n choices: indexed, independently sampled (seed + i), the prompt prefilled once; streamed with indices. */
+    static void multipleChoices(Fixture f) throws Exception {
+        String body = "{\"prompt\":\"many choices please\",\"max_tokens\":4,\"temperature\":1,\"top_k\":0,\"top_p\":1,"
+                + "\"seed\":7,\"n\":3}";
+        int fed0 = f.backend.fed.get();
+        Resp r = f.post("/v1/completions", body);
+        int fed = f.backend.fed.get() - fed0;
+        Map<String, Object> j = Json.parseObject(r.body);
+        List<Object> choices = Json.list(j, "choices");
+        long promptTokens = Json.num(Json.map(j, "usage"), "prompt_tokens", -1);
+        Set<String> texts = new java.util.HashSet<>();
+        for (int i = 0; i < choices.size(); i++) {
+            texts.add((String) ((Map<?, ?>) choices.get(i)).get("text"));
+            check(Json.num(choices.get(i), "index", -1) == i, "n=3: choice " + i + " has index " + i);
+        }
+        check(r.status == 200 && choices.size() == 3 && texts.size() == 3
+                        && Json.num(Json.map(j, "usage"), "completion_tokens", -1) == 12,
+                "n=3: three different samples, usage counts all 12 completion tokens");
+        // choice 0 prefills the prompt, choices 1 and 2 recompute only its last token
+        check(fed == promptTokens + 3 * 4 - 1, "n=3: prompt prefilled once (" + fed + " tokens fed for a "
+                + promptTokens + "-token prompt)");
+        Resp again = f.post("/v1/completions", body);
+        check(again.status == 200 && Json.list(Json.parseObject(again.body), "choices").equals(choices),
+                "n=3 with a seed: the same choices again");
+        // choice 0 of n equals the single seeded request
+        Resp one = f.post("/v1/completions", body.replace(",\"n\":3", ""));
+        check(((Map<?, ?>) Json.list(Json.parseObject(one.body), "choices").getFirst()).get("text")
+                .equals(((Map<?, ?>) choices.getFirst()).get("text")), "n=3: choice 0 is the single request's sample");
+        // streaming: each choice has its role chunk, deltas and one finish chunk, all tagged with its index
+        r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":2,"
+                + "\"temperature\":0,\"n\":2,\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+        int[] roles = new int[2];
+        int[] finishes = new int[2];
+        StringBuilder[] content = {new StringBuilder(), new StringBuilder()};
+        long completion = -1;
+        for (Map<String, Object> ev : events(r.body)) {
+            for (Object c : Json.list(ev, "choices")) {
+                int i = (int) Json.num(c, "index", -1);
+                Map<String, Object> delta = Json.map(c, "delta");
+                if (delta.containsKey("role")) {
+                    roles[i]++;
+                }
+                if (delta.get("content") instanceof String piece) {
+                    content[i].append(piece);
+                }
+                if (((Map<?, ?>) c).get("finish_reason") != null) {
+                    finishes[i]++;
+                }
+            }
+            if (Json.map(ev, "usage") != null) {
+                completion = Json.num(Json.map(ev, "usage"), "completion_tokens", -1);
+            }
+        }
+        check(r.status == 200 && roles[0] == 1 && roles[1] == 1 && finishes[0] == 1 && finishes[1] == 1
+                        && content[0].toString().equals(" hello hello") && content[1].toString().equals(" hello hello")
+                        && completion == 4,
+                "stream n=2: per-index role, content and finish chunks; usage sums both choices");
+    }
+
+    /** best_of: the n candidates with the highest cumulative logprob are returned. */
+    static void bestOf(Fixture f) throws Exception {
+        f.backend.logitsFn = Fixture::noisyLogits;
+        try {
+            String base = "{\"prompt\":\"pick the best\",\"max_tokens\":3,\"temperature\":1,\"top_k\":0,\"seed\":11";
+            Resp all = f.post("/v1/completions", base + ",\"n\":4,\"logprobs\":0}");
+            List<Object> choices = Json.list(Json.parseObject(all.body), "choices");
+            String best = null;
+            double bestScore = Double.NEGATIVE_INFINITY;
+            for (Object c : choices) {
+                double sum = 0;
+                for (Object x : Json.list(Json.map(c, "logprobs"), "token_logprobs")) {
+                    sum += ((Number) x).doubleValue();
+                }
+                if (sum > bestScore) {
+                    bestScore = sum;
+                    best = (String) ((Map<?, ?>) c).get("text");
+                }
+            }
+            Resp r = f.post("/v1/completions", base + ",\"best_of\":4}");
+            Map<String, Object> j = Json.parseObject(r.body);
+            List<Object> got = Json.list(j, "choices");
+            check(r.status == 200 && got.size() == 1 && ((Map<?, ?>) got.getFirst()).get("text").equals(best)
+                            && !((Map<?, ?>) got.getFirst()).containsKey("logprobs")
+                            && Json.num(Json.map(j, "usage"), "completion_tokens", -1) == 12,
+                    "best_of=4: the most likely of the 4 candidates (" + best + "), usage counts all 12 tokens");
+        } finally {
+            f.backend.logitsFn = null;
+        }
+    }
+
+    /** echo prepends the prompt (with its logprobs); suffix builds a fill-in-the-middle prompt. */
+    static void echoAndSuffix(Fixture f) throws Exception {
+        String prompt = "echo this";
+        int n = f.tok.encode(prompt).length;
+        Resp r = f.post("/v1/completions", "{\"prompt\":\"" + prompt + "\",\"max_tokens\":2,\"temperature\":0,\"echo\":true,\"logprobs\":1}");
+        Map<String, Object> c = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+        Map<String, Object> lp = Json.map(c, "logprobs");
+        List<Object> tl = Json.list(lp, "token_logprobs");
+        List<Object> offsets = Json.list(lp, "text_offset");
+        check(r.status == 200 && c.get("text").equals(prompt + " hello hello") && tl.size() == n + 2 && tl.getFirst() == null
+                        && near(tl.get(1), f.backend.token == f.tok.encode(prompt)[1] ? fakeLogprob(f, true) : fakeLogprob(f, false))
+                        && ((Number) offsets.get(n)).intValue() == prompt.length(),
+                "echo + logprobs: prompt text and its token logprobs (first null), then the completion");
+        r = f.post("/v1/completions", "{\"prompt\":\"" + prompt + "\",\"max_tokens\":0,\"echo\":true,\"logprobs\":0}");
+        c = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+        check(r.status == 200 && c.get("text").equals(prompt) && Json.list(Json.map(c, "logprobs"), "tokens").size() == n,
+                "echo with max_tokens 0: scores the prompt only");
+        r = f.post("/v1/completions", "{\"prompt\":\"" + prompt + "\",\"max_tokens\":2,\"temperature\":0,\"echo\":true,\"stream\":true}");
+        StringBuilder text = new StringBuilder();
+        for (Map<String, Object> ev : events(r.body)) {
+            for (Object ch : Json.list(ev, "choices")) {
+                text.append(((Map<?, ?>) ch).get("text"));
+            }
+        }
+        check(r.status == 200 && text.toString().equals(prompt + " hello hello"), "streamed echo: the prompt comes first");
+        // suffix: <|fim_prefix|>prefix<|fim_suffix|>suffix<|fim_middle|>
+        r = f.post("/v1/completions", "{\"prompt\":\"def f(\",\"suffix\":\"\\n    return x\",\"max_tokens\":1,\"temperature\":0}");
+        check(r.status == 200 && f.backend.firstToken == f.tok.tokenId("<|fim_prefix|>"), "suffix: a fill-in-the-middle prompt");
+        Map<String, Object> json = Json.parseObject(Files.readString(modelDir.resolve("tokenizer.json")));
+        Json.list(json, "added_tokens").removeIf(t -> Json.str(t, "content", "").startsWith("<|fim_"));
+        Tokenizer plain = Tokenizer.fromMaps(json, Map.of()); // the same vocabulary without the FIM tokens
+        try {
+            org.robomiri.jllm.server.OpenAiFeatures.fimPrompt(plain, "a", "b");
+            check(false, "suffix without FIM tokens rejected");
+        } catch (IllegalArgumentException e) {
+            check(e.getMessage().contains("fim_prefix"), "suffix without FIM tokens: " + e.getMessage());
+        }
+    }
+
+    /** response_format: the output is valid JSON matching the schema, also with logits that favour other text. */
+    static void jsonOutput(Fixture f) throws Exception {
+        f.backend.logitsFn = Fixture::noisyLogits;
+        try {
+            String schema = "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"},\"n\":{\"type\":\"integer\"},"
+                    + "\"color\":{\"enum\":[\"red\",\"green\"]}},\"required\":[\"ok\",\"n\",\"color\"],\"additionalProperties\":false}";
+            String body = "{\"messages\":[{\"role\":\"user\",\"content\":\"json please\"}],\"max_tokens\":300,\"temperature\":0,"
+                    + "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":" + schema + "}}}";
+            long t0 = System.nanoTime();
+            Resp r = f.post("/v1/chat/completions", body);
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            Map<String, Object> c = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+            String content = (String) Json.map(c, "message").get("content");
+            Map<String, Object> obj = Json.parseObject(content);
+            check(r.status == 200 && "stop".equals(c.get("finish_reason")) && obj.keySet().equals(Set.of("ok", "n", "color"))
+                            && obj.get("ok") instanceof Boolean && obj.get("n") instanceof Long
+                            && List.of("red", "green").contains(obj.get("color")),
+                    "json_schema: " + Json.write(obj) + " (" + ms + " ms)");
+            // streamed: the same text
+            r = f.post("/v1/chat/completions", body.replace("\"temperature\":0,", "\"temperature\":0,\"stream\":true,"));
+            StringBuilder streamed = new StringBuilder();
+            for (Map<String, Object> ev : events(r.body)) {
+                for (Object ch : Json.list(ev, "choices")) {
+                    if (Json.map(ch, "delta").get("content") instanceof String piece) {
+                        streamed.append(piece);
+                    }
+                }
+            }
+            check(streamed.toString().equals(content), "json_schema streamed: the same output");
+            // json_object with sampling, n=2: each output is an object (or a valid prefix of one when cut by max_tokens)
+            r = f.post("/v1/completions", "{\"prompt\":\"obj\",\"max_tokens\":40,\"temperature\":0.7,\"seed\":5,\"n\":2,"
+                    + "\"response_format\":{\"type\":\"json_object\"}}");
+            for (Object ch : Json.list(Json.parseObject(r.body), "choices")) {
+                String text = (String) ((Map<?, ?>) ch).get("text");
+                boolean complete = "stop".equals(((Map<?, ?>) ch).get("finish_reason"));
+                org.robomiri.jllm.sampling.JsonConstraint jc = new org.robomiri.jllm.sampling.JsonConstraint(
+                        org.robomiri.jllm.sampling.JsonConstraint.Schema.anyObject(), new byte[0][]);
+                check(r.status == 200 && text.strip().startsWith("{") && jc.allowsText(text)
+                                && (!complete || Json.parse(text) instanceof Map),
+                        "json_object: " + (complete ? "a complete object" : "a valid prefix") + ": " + text.strip());
+            }
+        } finally {
+            f.backend.logitsFn = null;
+        }
+        // with the fake's default logits (" hello" first, everything else tied), greedy picks the first valid token
+        Resp r = f.post("/v1/completions", "{\"prompt\":\"bool\",\"max_tokens\":10,\"temperature\":0,"
+                + "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"type\":\"boolean\"}}}}");
+        Map<String, Object> c = (Map<String, Object>) Json.list(Json.parseObject(r.body), "choices").getFirst();
+        check(r.status == 200 && List.of("true", "false").contains(((String) c.get("text")).strip()) && "stop".equals(c.get("finish_reason")),
+                "json_schema boolean: " + c.get("text"));
+    }
+
+    /** The JSON automaton on its own: what each schema keyword admits. */
+    static void jsonConstraintUnit() {
+        String schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"maxLength\":3},"
+                + "\"age\":{\"type\":\"integer\"},\"tags\":{\"type\":\"array\",\"items\":{\"enum\":[\"a\",\"b\"]},\"maxItems\":2},"
+                + "\"next\":{\"anyOf\":[{\"$ref\":\"#\"},{\"type\":\"null\"}]}},\"required\":[\"name\"],\"additionalProperties\":false}";
+        org.robomiri.jllm.sampling.JsonConstraint.Schema s = org.robomiri.jllm.sampling.JsonConstraint.Schema.compile(Json.parseObject(schema));
+        String[][] cases = {
+                {"{\"name\":\"bob\",\"age\":42,\"tags\":[\"a\",\"b\"],\"next\":null}", "true"},
+                {"{\"name\":\"x\",\"next\":{\"name\":\"y\",\"next\":null}}", "true"},
+                {" {\n  \"name\" : \"\\u00e9\\n\"\n}", "true"},
+                {"{\"name\":\"bobby\"}", "false"},      // maxLength
+                {"{\"age\":1}", "false"},                // required name missing at '}'
+                {"{\"age\":1.5", "false"},               // integer
+                {"{\"name\":\"x\",\"other\":1}", "false"}, // additionalProperties false
+                {"{\"name\":\"x\",\"name\":\"y\"}", "false"}, // duplicate key
+                {"{\"tags\":[\"c\"]}", "false"},        // enum
+                {"{\"tags\":[\"a\",\"a\",\"a\"]}", "false"}, // maxItems
+                {"{\"next\":5}", "false"},               // anyOf: object or null
+                {"{\"name\":\"\\x\"}", "false"},       // bad escape
+                {"{\"name\":\"x\"} ", "false"},         // nothing after the value
+                {"{\"name\":\"x\",}", "false"},         // trailing comma
+                {"{\"name\":\"a\tb\"}", "false"},        // raw control character
+        };
+        for (String[] c : cases) {
+            org.robomiri.jllm.sampling.JsonConstraint jc = new org.robomiri.jllm.sampling.JsonConstraint(s, new byte[0][]);
+            boolean ok = c[1].equals("true") ? jc.completesWith(c[0]) : jc.allowsText(c[0]);
+            check(ok == c[1].equals("true"), "json schema automaton: " + c[0].replace("\n", "\\n") + " -> " + ok);
+        }
+        org.robomiri.jllm.sampling.JsonConstraint num = new org.robomiri.jllm.sampling.JsonConstraint(
+                org.robomiri.jllm.sampling.JsonConstraint.Schema.compile(Json.parseObject("{\"type\":\"number\"}")), new byte[0][]);
+        check(num.completesWith("-12.5e+3") && num.completesWith("0") && !num.allowsText("012") && num.allowsText("1.")
+                        && !num.completesWith("1.") && !num.allowsText("1.5.") && !num.allowsText("--1"),
+                "json schema automaton: numbers");
+        String deep = "{\"type\":\"array\",\"items\":{\"type\":\"array\"},\"minItems\":1}";
+        org.robomiri.jllm.sampling.JsonConstraint arr = new org.robomiri.jllm.sampling.JsonConstraint(
+                org.robomiri.jllm.sampling.JsonConstraint.Schema.compile(Json.parseObject(deep)), new byte[0][]);
+        check(arr.completesWith("[[1,[2]],[]]") && !arr.allowsText("[]") && !arr.allowsText("[1]")
+                        && !arr.allowsText("[" + " ".repeat(65) + "[]]") && !arr.allowsText("[\n\n[]]")
+                        && arr.completesWith("[\n  [\n    1\n  ]\n]"),
+                "json schema automaton: minItems, nested items, whitespace cap (one newline per gap)");
+    }
+
+    /** The data events of an SSE body, parsed (the [DONE] marker skipped). */
+    static List<Map<String, Object>> events(String body) {
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (String e : body.split("\n\n")) {
+            if (e.startsWith("data: {")) {
+                out.add(Json.parseObject(e.substring(6)));
+            }
+        }
+        return out;
     }
 
     /** Two requests on one connection (the second must not be disturbed by the first's bookkeeping). */
@@ -356,6 +689,9 @@ public final class ServerTest {
         final int ctx;
         final int token;
         final AtomicInteger forwards = new AtomicInteger();
+        final AtomicInteger fed = new AtomicInteger(); // tokens run through forward(), prefill and decode
+        /** Fills the logits for position {@code pos}, instead of the default (" hello" first); null = default. */
+        volatile java.util.function.ObjIntConsumer<float[]> logitsFn;
         volatile long delayMs;
         volatile int failAfter = -1; // throw from forward() once this many calls happened (-1 = never)
         volatile int firstToken = -1; // the token at position 0 of the most recent prefill
@@ -383,6 +719,7 @@ public final class ServerTest {
         @Override
         public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
             int calls = forwards.incrementAndGet();
+            fed.addAndGet(n);
             if (pos == 0) {
                 firstToken = tokens[off];
             }
@@ -397,8 +734,13 @@ public final class ServerTest {
                 }
             }
             if (logits != null) {
-                Arrays.fill(logits, 0f);
-                logits[token] = 1f;
+                var fn = logitsFn;
+                if (fn != null) {
+                    fn.accept(logits, pos + n - 1);
+                } else {
+                    Arrays.fill(logits, 0f);
+                    logits[token] = 1f;
+                }
             }
         }
 
@@ -430,6 +772,17 @@ public final class ServerTest {
             server = new ApiServer(engine, "test-model", "127.0.0.1", 0,
                     new ApiServer.Options(SamplingParams.defaults(), false, 0, 0, http));
             serveThread = Thread.ofPlatform().daemon().start(server::serve);
+        }
+
+        /** Deterministic pseudo-random logits in [0, 8) per position: a "model" with opinions that are not JSON. */
+        static void noisyLogits(float[] logits, int pos) {
+            long h = 0x9E3779B97F4A7C15L * (pos + 1);
+            for (int i = 0; i < logits.length; i++) {
+                long x = h + i * 0xBF58476D1CE4E5B9L;
+                x = (x ^ (x >>> 31)) * 0x94D049BB133111EBL;
+                x ^= x >>> 29;
+                logits[i] = (x >>> 40) * (8f / (1 << 24));
+            }
         }
 
         Socket connect() throws IOException {

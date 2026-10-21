@@ -127,6 +127,16 @@ public class ModelManager implements DisposableBean {
         throw new NoSuchElementException("model '" + id + "' is not loaded; loaded: " + String.join(", ", loaded.keySet()));
     }
 
+    /** Tests: serves {@code engine} (typically on a fake backend) as model {@code id}, without weights or saved caches. */
+    synchronized void registerForTest(String id, org.robomiri.jllm.engine.Engine engine) {
+        loaded.put(id, new LoadedModel(id, "test", new ModelLoader.Loaded(null, engine), List.of(), Map.of(), 0, null));
+    }
+
+    /** Tests: removes a model {@link #registerForTest} added (its engine is closed by the caller). */
+    synchronized void removeForTest(String id) {
+        loaded.remove(id);
+    }
+
     /** Unloads a model: running requests on it are cancelled first. */
     public void unload(String id) throws InterruptedException {
         LoadedModel m;

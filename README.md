@@ -129,7 +129,22 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
 `GET /health`, `GET /` (chat UI). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
-`presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`.
+`presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`, `logit_bias` (token id →
+−100…100, added to the logits). Also supported:
+
+- `n` (up to 16 choices; the prompt is prefilled once and reused from the prefix cache, streamed chunks carry the
+  choice `index`);
+- `logprobs` / `top_logprobs` (chat) and `logprobs: k` (completions): the log-softmax of the model's raw logits,
+  `z_t − log Σ exp(z_j)`, before penalties, bias, temperature and truncation; streamed too;
+- `response_format` `json_object` or `json_schema`: constrained decoding, where tokens that would make the output an
+  invalid JSON prefix are masked before sampling (a byte-level automaton checks the most likely candidates first),
+  enforcing `type`, `properties`, `required`, `additionalProperties`, `items`, `enum`/`const`, `anyOf` of different
+  types, local `$ref`, min/max items and length; other schema keywords are a 400;
+- completions only: `echo` (with prompt logprobs), `suffix` (fill-in-the-middle for tokenizers with
+  `<|fim_prefix|>`/`<|fim_suffix|>`/`<|fim_middle|>`, a 400 otherwise) and `best_of` (the n most likely of best_of
+  candidates; not with `stream`).
+
+Details and the math: [docs/10 §10.6](docs/10-engine-and-server.md#106-the-openai-compatible-api).
 
 ## Docker
 
@@ -185,7 +200,8 @@ repository by its launcher).
   weight settings to the next load.
 - **Logs**: the engine's output (download progress, conversion, MCP server stderr, errors) live, with a filter.
 - **API**: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions` (same fields and streaming
-  behaviour as `jllm serve`). Chat completions also accept OpenAI **function calling**: `tools` and `tool_choice`
+  behaviour as `jllm serve`, including `n`, `logprobs`, `logit_bias`, `response_format`, `echo`, `suffix` and
+  `best_of`). Chat completions also accept OpenAI **function calling**: `tools` and `tool_choice`
   (`auto`, `none`, `required` or a named function); the model's calls come back as `tool_calls` with finish reason
   `tool_calls`, and `tool` messages carry the results back. `POST /api/chat` is the console's chat with server-side
   tools (an event stream). The management API: `/api/models/load|download|loaded|local`, `/api/hub/inspect`,

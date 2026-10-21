@@ -4,8 +4,11 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
+import org.robomiri.jllm.server.OpenAiFeatures;
+import org.robomiri.jllm.tokenizer.Tokenizer;
 import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.chat.ChatSupport;
 import org.robomiri.jllm.web.chat.ReasoningSplitter;
@@ -35,7 +38,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code POST /v1/completions}, both with {@code "stream": true} (server-sent events). The {@code model} field picks
  * the loaded model. Chat requests may pass {@code tools}: the model's calls come back as {@code tool_calls} with
  * finish reason {@code tool_calls}, and the client sends the results as {@code tool} messages (see
- * {@link ToolCallFormat}).
+ * {@link ToolCallFormat}). {@code n}, {@code best_of}, {@code logprobs}, {@code logit_bias}, {@code response_format},
+ * {@code echo} and {@code suffix} work as on the engine's own server ({@link OpenAiFeatures}).
  */
 @RestController
 public class OpenAiController {
@@ -119,18 +123,36 @@ public class OpenAiController {
 
     private void completion(Map<String, Object> body, LoadedModel model, HttpServletResponse res, boolean chat) throws IOException {
         Engine engine = model.engine();
+        Tokenizer tok = engine.tokenizer();
         Settings s = settings.current();
         String modelId = model.id();
         int[] prompt;
         SamplingParams params;
+        OpenAiFeatures.Options o;
+        int echoFrom; // the prompt tokens an echo returns start here (after a BOS the engine put in front)
+        String echoText = "";
         Set<String> toolNames = new HashSet<>();
         try {
             ChatSupport.checkUnsupported(body, chat);
+            o = OpenAiFeatures.parse(body, chat, tok.vocabSize());
             long maxPromptBytes = s.getLong("engine.max-prompt-bytes") > 0
                     ? s.getLong("engine.max-prompt-bytes") : 16L * engine.backend().contextLength();
-            prompt = ChatSupport.checkContext(engine, chat ? chatPrompt(engine, body, s.getBool("chat.thinking"), maxPromptBytes, toolNames)
-                    : rawPrompt(engine, body, maxPromptBytes));
-            params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length);
+            int[] ids;
+            if (chat) {
+                ids = chatPrompt(engine, body, s.getBool("chat.thinking"), o.json(), maxPromptBytes, toolNames);
+            } else if (o.suffix() != null) {
+                String text = rawText(body);
+                ChatSupport.checkPromptBytes(ChatSupport.utf8Length(text) + ChatSupport.utf8Length(o.suffix()), maxPromptBytes);
+                ids = OpenAiFeatures.fimPrompt(tok, text, o.suffix());
+            } else {
+                ids = rawPrompt(engine, body, maxPromptBytes);
+            }
+            prompt = ChatSupport.checkContext(engine, ids);
+            echoFrom = prompt.length - ids.length;
+            if (o.echo()) {
+                echoText = rawText(body);
+            }
+            params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length, o.echo());
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));
             return;
@@ -151,13 +173,15 @@ public class OpenAiController {
         boolean splitReasoning = chat && !"none".equalsIgnoreCase(Json.str(body, "reasoning_format", props.reasoningFormat()));
         boolean startsInThink = splitReasoning && ReasoningSplitter.promptOpensThink(engine, prompt);
         int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
+        Engine.Decoding decoding = o.decoding(tok);
+        int count = o.count();
 
         try (LoadedModel.Slot slot = model.pick(prompt)) {
             Engine e = slot.engine();
             if (!stream) {
-                Engine.Result r;
+                List<Engine.Result> all;
                 try {
-                    r = e.generate(prompt, params, null, () -> model.closing() || deadline.getAsBoolean());
+                    all = e.generate(prompt, params, decoding, count, null, () -> model.closing() || deadline.getAsBoolean());
                 } catch (Engine.OverloadedException ex) {
                     ChatSupport.send(res, 503, ChatSupport.error(ex.getMessage(), "server_error", "overloaded"));
                     return;
@@ -165,68 +189,173 @@ public class OpenAiController {
                     ChatSupport.send(res, 400, ChatSupport.error(ex.getMessage(), "invalid_request_error", "context_length_exceeded"));
                     return;
                 }
-                model.record(slot, r.stats());
-                String finish = deadline.finishReason(r);
-                Map<String, Object> choice;
-                if (chat) {
-                    String text = r.text();
-                    List<Object> calls = null;
-                    if (tools) {
-                        ToolCallFormat.Parsed parsed = ToolCallFormat.parse(text, toolNames);
-                        if (!parsed.calls().isEmpty()) {
-                            text = parsed.content();
-                            calls = toolCalls(parsed.calls(), false);
-                            finish = "tool_calls";
+                Engine.Stats total = OpenAiFeatures.total(all);
+                model.record(slot, total);
+                List<Engine.Result> chosen = OpenAiFeatures.select(all, o);
+                List<Object> choices = new ArrayList<>();
+                String lastFinish = null;
+                for (int i = 0; i < chosen.size(); i++) {
+                    Engine.Result r = chosen.get(i);
+                    String finish = deadline.finishReason(r);
+                    Map<String, Object> choice;
+                    if (chat) {
+                        String text = r.text();
+                        List<Object> calls = null;
+                        if (tools) {
+                            ToolCallFormat.Parsed parsed = ToolCallFormat.parse(text, toolNames);
+                            if (!parsed.calls().isEmpty()) {
+                                text = parsed.content();
+                                calls = toolCalls(parsed.calls(), false);
+                                finish = "tool_calls";
+                            }
                         }
-                    }
-                    Map<String, Object> message = Json.obj("role", "assistant");
-                    if (splitReasoning) {
-                        String[] parts = ReasoningSplitter.split(text, startsInThink);
-                        if (!parts[0].isEmpty()) {
-                            message.put("reasoning_content", parts[0]);
+                        Map<String, Object> message = Json.obj("role", "assistant");
+                        if (splitReasoning) {
+                            String[] parts = ReasoningSplitter.split(text, startsInThink);
+                            if (!parts[0].isEmpty()) {
+                                message.put("reasoning_content", parts[0]);
+                            }
+                            text = parts[1];
                         }
-                        text = parts[1];
+                        message.put("content", calls != null && text.isBlank() ? null : text);
+                        if (calls != null) {
+                            message.put("tool_calls", calls);
+                        }
+                        choice = Json.obj("index", i, "message", message);
+                    } else {
+                        choice = Json.obj("index", i, "text", echoText + r.text());
                     }
-                    message.put("content", calls != null && text.isBlank() ? null : text);
-                    if (calls != null) {
-                        message.put("tool_calls", calls);
+                    if (o.logprobs()) {
+                        choice.put("logprobs", OpenAiFeatures.choiceLogprobs(chat, r, o, prompt, echoFrom, tok));
                     }
-                    choice = Json.obj("index", 0, "message", message, "finish_reason", finish);
-                } else {
-                    choice = Json.obj("index", 0, "text", r.text(), "finish_reason", finish);
+                    choice.put("finish_reason", finish);
+                    choices.add(choice);
+                    lastFinish = finish;
                 }
-                log(modelId, slot, chat, messages, toolNames.size(), r.stats(), finish);
+                log(modelId, slot, chat, messages, toolNames.size(), count, total, lastFinish);
                 ChatSupport.send(res, 200, Json.write(Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                        "choices", List.of(choice), "usage", ChatSupport.usage(r.stats()))));
+                        "choices", choices, "usage", ChatSupport.usage(total))));
                 return;
             }
 
             // the headers go out now and keep-alive comments while the prompt is prefilled (minutes for a coding
-            // agent's prompt on a CPU); a refusal after this point becomes an error event
+            // agent's prompt on a CPU); a refusal after this point becomes an error event. The choices run one
+            // after the other; every chunk carries its choice's index.
             ChatSupport.Sse sse = new ChatSupport.Sse(res);
             IOException[] failure = new IOException[1];
-            startStream(sse, chat, id, object, created, modelId);
-            java.util.function.BiConsumer<String, String> send = (field, piece) -> {
-                if (failure[0] != null) {
-                    return;
+            sse.start();
+            List<Engine.Result> finished = new ArrayList<>();
+            String echoed = echoText;
+            String[] lastFinish = new String[1];
+            Engine.ChoiceSink sink = new Engine.ChoiceSink() {
+                /** The text path of the running choice: tool-call holdback, then reasoning split, then events. */
+                private ReasoningSplitter splitter;
+                private ToolCallFormat.Holdback holdback;
+                private Engine.TextSink entry;
+                private final List<TokenLogprob> pending = new ArrayList<>();
+                private final int[] offset = new int[1];
+                private List<TokenLogprob> promptLps;
+
+                private void event(Map<String, Object> choice, boolean last) {
+                    if (failure[0] != null) {
+                        return;
+                    }
+                    Map<String, Object> ev = Json.obj("id", id, "object", object, "created", created, "model", modelId,
+                            "choices", List.of(choice));
+                    if (last && includeUsage && !separateUsage) {
+                        ev.put("usage", ChatSupport.usage(OpenAiFeatures.total(finished)));
+                    }
+                    try {
+                        sse.event(ev);
+                    } catch (IOException ex) {
+                        failure[0] = ex; // the client went away: stop generating
+                    }
                 }
-                Map<String, Object> choice = chat
-                        ? Json.obj("index", 0, "delta", Json.obj(field, piece), "finish_reason", null)
-                        : Json.obj("index", 0, "text", piece, "finish_reason", null);
-                try {
-                    sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
-                } catch (IOException ex) {
-                    failure[0] = ex; // the client went away: stop generating
+
+                private void send(int i, String field, String piece) {
+                    Map<String, Object> choice = chat
+                            ? Json.obj("index", i, "delta", Json.obj(field, piece))
+                            : Json.obj("index", i, "text", piece);
+                    if (o.logprobs()) {
+                        choice.put("logprobs", OpenAiFeatures.drainLogprobs(chat, pending, tok, offset));
+                    }
+                    choice.put("finish_reason", null);
+                    event(choice, false);
+                }
+
+                @Override
+                public void start(int i) {
+                    pending.clear();
+                    offset[0] = 0;
+                    splitter = splitReasoning ? new ReasoningSplitter(piece -> send(i, "reasoning_content", piece),
+                            piece -> send(i, "content", piece), startsInThink) : null;
+                    Engine.TextSink deltas = splitter != null ? splitter : piece -> send(i, "content", piece);
+                    holdback = tools ? new ToolCallFormat.Holdback(deltas) : null;
+                    entry = holdback != null ? holdback : deltas;
+                    if (chat) {
+                        event(Json.obj("index", i, "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null), false);
+                    }
+                }
+
+                @Override
+                public void prefilled(int i, List<TokenLogprob> lps) {
+                    if (i == 0) {
+                        promptLps = lps;
+                    }
+                    if (o.echo()) {
+                        Map<String, Object> choice = Json.obj("index", i, "text", echoed);
+                        if (o.logprobs()) {
+                            choice.put("logprobs", OpenAiFeatures.echoLogprobs(prompt, echoFrom, promptLps, tok, offset));
+                        }
+                        choice.put("finish_reason", null);
+                        event(choice, false);
+                    }
+                }
+
+                @Override
+                public void text(int i, String text) {
+                    entry.accept(text);
+                }
+
+                @Override
+                public void token(int i, TokenLogprob lp) {
+                    pending.add(lp);
+                }
+
+                @Override
+                public void done(int i, Engine.Result r) {
+                    finished.add(r);
+                    String finish = deadline.finishReason(r);
+                    List<Object> calls = null;
+                    if (holdback != null) {
+                        ToolCallFormat.Parsed parsed = ToolCallFormat.parse(r.text(), toolNames);
+                        if (!holdback.callStarted()) {
+                            holdback.finish(); // (a bare JSON call was streamed as text; the structured call follows anyway)
+                        }
+                        if (!parsed.calls().isEmpty()) {
+                            calls = toolCalls(parsed.calls(), true);
+                            finish = "tool_calls";
+                        }
+                    }
+                    if (splitter != null) {
+                        splitter.finish();
+                    }
+                    lastFinish[0] = finish;
+                    if (calls != null) {
+                        event(Json.obj("index", i, "delta", Json.obj("tool_calls", calls), "finish_reason", null), false);
+                    }
+                    Map<String, Object> last = chat
+                            ? Json.obj("index", i, "delta", Json.obj())
+                            : Json.obj("index", i, "text", "");
+                    if (o.logprobs()) {
+                        last.put("logprobs", OpenAiFeatures.drainLogprobs(chat, pending, tok, offset));
+                    }
+                    last.put("finish_reason", finish);
+                    event(last, i == count - 1);
                 }
             };
-            ReasoningSplitter splitter = splitReasoning
-                    ? new ReasoningSplitter(piece -> send.accept("reasoning_content", piece), piece -> send.accept("content", piece), startsInThink)
-                    : null;
-            Engine.TextSink deltas = splitter != null ? splitter : piece -> send.accept("content", piece);
-            ToolCallFormat.Holdback holdback = tools ? new ToolCallFormat.Holdback(deltas) : null;
-            Engine.Result r;
             try (AutoCloseable alive = sse.keepAlive()) {
-                r = e.generate(prompt, params, holdback != null ? holdback : deltas,
+                e.generate(prompt, params, decoding, count, sink,
                         () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
             } catch (Engine.OverloadedException | IllegalArgumentException ex) {
                 sse.event(Json.obj("error", Json.obj("message", ex.getMessage(), "type",
@@ -239,54 +368,27 @@ public class OpenAiController {
             } catch (Exception ex) { // AutoCloseable.close: cannot happen
                 throw new IllegalStateException(ex);
             }
-            model.record(slot, r.stats());
-            String finish = deadline.finishReason(r);
-            List<Object> calls = null;
-            if (holdback != null) {
-                ToolCallFormat.Parsed parsed = ToolCallFormat.parse(r.text(), toolNames);
-                if (!holdback.callStarted()) {
-                    holdback.finish(); // (a bare JSON call was streamed as text; the structured call follows anyway)
-                }
-                if (!parsed.calls().isEmpty()) {
-                    calls = toolCalls(parsed.calls(), true);
-                    finish = "tool_calls";
-                }
-            }
-            if (splitter != null) {
-                splitter.finish();
-            }
-            log(modelId, slot, chat, messages, toolNames.size(), r.stats(), finish);
+            Engine.Stats total = OpenAiFeatures.total(finished);
+            model.record(slot, total);
+            log(modelId, slot, chat, messages, toolNames.size(), count, total, lastFinish[0]);
             if (failure[0] != null || sse.failed()) {
                 return; // nothing more can be sent
             }
-            if (calls != null) {
-                sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices",
-                        List.of(Json.obj("index", 0, "delta", Json.obj("tool_calls", calls), "finish_reason", null))));
-            }
-            Map<String, Object> last = chat
-                    ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
-                    : Json.obj("index", 0, "text", "", "finish_reason", finish);
-            Map<String, Object> event = Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(last));
-            if (includeUsage && !separateUsage) {
-                event.put("usage", ChatSupport.usage(r.stats()));
-            }
-            sse.event(event);
             if (includeUsage && separateUsage) {
                 sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                        "choices", List.of(), "usage", ChatSupport.usage(r.stats())));
+                        "choices", List.of(), "usage", ChatSupport.usage(total)));
             }
             sse.raw("data: [DONE]\n\n");
         }
     }
 
     /** One line per request in the log: enough to see what an agent is doing and where the time goes. */
-    private static void log(String model, LoadedModel.Slot slot, boolean chat, int messages, int tools, Engine.Stats st,
-                            String finish) {
-        System.err.printf("%s %s [slot %d] %d msg%s%s | prompt %d tok (%d cached) %.1f s | %d tok %.1f tok/s | %s%n",
+    private static void log(String model, LoadedModel.Slot slot, boolean chat, int messages, int tools, int choices,
+                            Engine.Stats st, String finish) {
+        System.err.printf("%s %s [slot %d] %d msg%s%s%s | prompt %d tok (%d cached) %.1f s | %d tok %.1f tok/s | %s%n",
                 chat ? "chat" : "completion", model, slot.index(), messages, messages == 1 ? "" : "s",
-                tools > 0 ? ", " + tools + " tools" : "", st.promptTokens(), st.cachedTokens(), st.prefillMs() / 1000,
-                st.generatedTokens(), st.tokPerSec(), finish);
+                tools > 0 ? ", " + tools + " tools" : "", choices > 1 ? ", " + choices + " choices" : "",
+                st.promptTokens(), st.cachedTokens(), st.prefillMs() / 1000, st.generatedTokens(), st.tokPerSec(), finish);
     }
 
     /** OpenAI {@code tool_calls}; calls the model wrote unreadably are passed on with their raw error as arguments. */
@@ -304,30 +406,28 @@ public class OpenAiController {
         return out;
     }
 
-    private static void startStream(ChatSupport.Sse sse, boolean chat, String id, String object, long created, String modelId) throws IOException {
-        if (sse.started()) {
-            return;
-        }
-        sse.start();
-        if (chat) {
-            sse.event(Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(Json.obj("index", 0, "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null))));
-        }
-    }
-
-    private static int[] rawPrompt(Engine engine, Map<String, Object> body, long maxPromptBytes) {
+    /** The completions prompt: a string, or a single-element string array (validated in checkUnsupported). */
+    private static String rawText(Map<String, Object> body) {
         Object p = body.get("prompt");
         if (p instanceof List<?> l) {
             p = l.getFirst();
         }
-        String text = p instanceof String str ? str : "";
+        return p instanceof String str ? str : "";
+    }
+
+    private static int[] rawPrompt(Engine engine, Map<String, Object> body, long maxPromptBytes) {
+        String text = rawText(body);
         ChatSupport.checkPromptBytes(ChatSupport.utf8Length(text), maxPromptBytes);
         return engine.tokenizer().encode(text);
     }
 
-    /** @param toolNames receives the names of the functions offered (empty when no tools are in play) */
-    private int[] chatPrompt(Engine engine, Map<String, Object> body, boolean thinkingDefault, long maxPromptBytes,
-                             Set<String> toolNames) {
+    /**
+     * @param thinkingDefault whether Qwen3 thinking is on when the request does not say
+     * @param json            whether the output is constrained to JSON: thinking is then off (a think block is not JSON)
+     * @param toolNames       receives the names of the functions offered (empty when no tools are in play)
+     */
+    private int[] chatPrompt(Engine engine, Map<String, Object> body, boolean thinkingDefault, boolean json,
+                             long maxPromptBytes, Set<String> toolNames) {
         List<Object> msgs = ChatSupport.messages(body, maxPromptBytes);
         String block = null;
         Object choice = body.get("tool_choice");
@@ -352,6 +452,6 @@ public class OpenAiController {
             System.err.println("note: enable_thinking only applies to the Qwen3 chat template; this model uses \""
                     + template + "\", the field is ignored (reported once)");
         }
-        return engine.renderChat(ToolCallFormat.toTemplate(msgs, block, template), ChatSupport.thinking(body, thinkingDefault));
+        return engine.renderChat(ToolCallFormat.toTemplate(msgs, block, template), ChatSupport.thinking(body, thinkingDefault) && !json);
     }
 }

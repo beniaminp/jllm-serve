@@ -1,9 +1,11 @@
 package org.robomiri.jllm.server;
 
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
+import org.robomiri.jllm.tokenizer.Tokenizer;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -11,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -168,18 +171,36 @@ public final class ApiServer implements AutoCloseable {
             res.send(400, "application/json", error("invalid JSON: " + e.getMessage()));
             return;
         }
+        Tokenizer tok = engine.tokenizer();
         int[] prompt;
         SamplingParams params;
+        OpenAiFeatures.Options o;
+        int echoFrom; // the prompt tokens an echo returns start here (after a BOS the engine put in front)
+        String echoText = "";
         try {
             checkUnsupported(body, chat);
-            prompt = engine.preparePrompt(chat ? chatPrompt(body) : rawPrompt(body)); // with the family BOS, if any
+            o = OpenAiFeatures.parse(body, chat, tok.vocabSize());
+            int[] ids;
+            if (chat) {
+                ids = chatPrompt(body, o.json());
+            } else if (o.suffix() != null) {
+                checkPromptBytes(utf8Length(promptText(body)) + utf8Length(o.suffix()));
+                ids = OpenAiFeatures.fimPrompt(tok, promptText(body), o.suffix());
+            } else {
+                ids = rawPrompt(body);
+            }
+            prompt = engine.preparePrompt(ids); // with the family BOS, if any
+            echoFrom = prompt.length - ids.length;
+            if (o.echo()) {
+                echoText = promptText(body);
+            }
             int ctx = engine.backend().contextLength();
             if (prompt.length >= ctx) {
                 throw new RequestError(400, "prompt has " + prompt.length + " tokens, context is " + ctx
                         + " (at least one token must be left for the completion)",
                         "invalid_request_error", "context_length_exceeded");
             }
-            params = params(body, ctx - prompt.length);
+            params = params(body, ctx - prompt.length, o.echo());
         } catch (RequestError e) {
             res.send(e.status, "application/json", error(e));
             return;
@@ -196,12 +217,14 @@ public final class ApiServer implements AutoCloseable {
         String id = (chat ? "chatcmpl-" : "cmpl-") + Long.toHexString(System.currentTimeMillis()) + "-" + counter.incrementAndGet();
         long created = System.currentTimeMillis() / 1000;
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
+        Engine.Decoding decoding = o.decoding(tok);
 
         Deadline deadline = new Deadline(requestTimeoutMs);
         if (!stream) {
-            Engine.Result r;
+            List<Engine.Result> all;
             try {
-                r = engine.generate(prompt, params, null, () -> req.clientGone() || deadline.getAsBoolean());
+                all = engine.generate(prompt, params, decoding, o.count(), null,
+                        () -> req.clientGone() || deadline.getAsBoolean());
             } catch (Engine.OverloadedException e) {
                 res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
                 return;
@@ -209,35 +232,118 @@ public final class ApiServer implements AutoCloseable {
                 res.send(400, "application/json", error(e.getMessage(), "invalid_request_error", "context_length_exceeded"));
                 return;
             }
-            String finish = deadline.finishReason(r);
-            Map<String, Object> choice = chat
-                    ? Json.obj("index", 0, "message", Json.obj("role", "assistant", "content", r.text()), "finish_reason", finish)
-                    : Json.obj("index", 0, "text", r.text(), "finish_reason", finish);
+            List<Object> choices = new ArrayList<>();
+            List<Engine.Result> chosen = OpenAiFeatures.select(all, o);
+            for (int i = 0; i < chosen.size(); i++) {
+                Engine.Result r = chosen.get(i);
+                Map<String, Object> choice = chat
+                        ? Json.obj("index", i, "message", Json.obj("role", "assistant", "content", r.text()))
+                        : Json.obj("index", i, "text", echoText + r.text());
+                if (o.logprobs()) {
+                    choice.put("logprobs", OpenAiFeatures.choiceLogprobs(chat, r, o, prompt, echoFrom, tok));
+                }
+                choice.put("finish_reason", deadline.finishReason(r));
+                choices.add(choice);
+            }
             res.send(200, "application/json", Json.write(Json.obj(
                     "id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(choice),
-                    "usage", usage(r.stats()))));
+                    "choices", choices,
+                    "usage", usage(OpenAiFeatures.total(all)))));
             return;
         }
 
-        // The stream headers are sent lazily, at the first token: until then a queue timeout can still be a 503.
+        // The stream headers are sent lazily, once the engine has the request: until then a queue timeout can still
+        // be a 503. The choices run one after the other; every chunk carries its choice's index.
         IOException[] failure = new IOException[1];
-        Engine.Result r;
-        try {
-            r = engine.generate(prompt, params, text -> {
+        int count = o.count(); // (best_of is not allowed with stream)
+        boolean[] begun = new boolean[count];
+        List<List<TokenLogprob>> pending = new ArrayList<>();
+        int[][] offsets = new int[count][1];
+        for (int i = 0; i < count; i++) {
+            pending.add(new ArrayList<>());
+        }
+        List<Engine.Result> finished = new ArrayList<>();
+        AtomicReference<List<TokenLogprob>> promptLps = new AtomicReference<>();
+        String echoed = echoText;
+        Engine.ChoiceSink sink = new Engine.ChoiceSink() {
+            /** Starts the stream and the choice: the role (chat) or the echoed prompt (completions). */
+            private void begin(int i) throws IOException {
+                startStream(res);
+                if (begun[i]) {
+                    return;
+                }
+                begun[i] = true;
+                if (chat) {
+                    sse(res, chunk(id, object, created, Json.obj("index", i,
+                            "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null)));
+                } else if (o.echo()) {
+                    Map<String, Object> c = Json.obj("index", i, "text", echoed);
+                    if (o.logprobs()) {
+                        c.put("logprobs", OpenAiFeatures.echoLogprobs(prompt, echoFrom, promptLps.get(), tok, offsets[i]));
+                    }
+                    c.put("finish_reason", null);
+                    sse(res, chunk(id, object, created, c));
+                }
+            }
+
+            private void send(int i, String text, String finish, Engine.Result last) {
                 if (failure[0] != null) {
                     return;
                 }
-                Map<String, Object> choice = chat
-                        ? Json.obj("index", 0, "delta", Json.obj("content", text), "finish_reason", null)
-                        : Json.obj("index", 0, "text", text, "finish_reason", null);
                 try {
-                    startStream(res, chat, id, object, created);
-                    sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice)));
+                    begin(i);
+                    Map<String, Object> c = chat
+                            ? Json.obj("index", i, "delta", text == null ? Json.obj() : Json.obj("content", text))
+                            : Json.obj("index", i, "text", text == null ? "" : text);
+                    if (o.logprobs()) {
+                        c.put("logprobs", OpenAiFeatures.drainLogprobs(chat, pending.get(i), tok, offsets[i]));
+                    }
+                    c.put("finish_reason", finish);
+                    Map<String, Object> event = chunk(id, object, created, c);
+                    if (last != null && i == count - 1 && includeUsage && !separateUsage) {
+                        event.put("usage", usage(OpenAiFeatures.total(finished)));
+                    }
+                    sse(res, event);
                 } catch (IOException e) {
                     failure[0] = e; // client disconnected: stop generating
                 }
-            }, () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
+            }
+
+            @Override
+            public void prefilled(int i, List<TokenLogprob> lps) {
+                if (i == 0) {
+                    promptLps.set(lps);
+                }
+                if (failure[0] == null && o.echo()) {
+                    try {
+                        begin(i);
+                    } catch (IOException e) {
+                        failure[0] = e;
+                    }
+                }
+            }
+
+            @Override
+            public void text(int i, String text) {
+                send(i, text, null, null);
+            }
+
+            @Override
+            public void token(int i, TokenLogprob lp) {
+                pending.get(i).add(lp);
+            }
+
+            @Override
+            public void done(int i, Engine.Result r) {
+                finished.add(r);
+                if (!req.clientGone()) {
+                    send(i, null, deadline.finishReason(r), r);
+                }
+            }
+        };
+        try {
+            engine.generate(prompt, params, decoding, count, sink,
+                    () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
         } catch (RuntimeException e) {
             if (res.started()) {
                 // The status line is long gone: tell the client in-band (OpenAI SDKs raise on an "error" event),
@@ -262,30 +368,21 @@ public final class ApiServer implements AutoCloseable {
         if (req.clientGone()) {
             throw new IOException("client disconnected");
         }
-        startStream(res, chat, id, object, created);
-        String finish = deadline.finishReason(r);
-        Map<String, Object> last = chat
-                ? Json.obj("index", 0, "delta", Json.obj(), "finish_reason", finish)
-                : Json.obj("index", 0, "text", "", "finish_reason", finish);
-        Map<String, Object> event = Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                "choices", List.of(last));
-        if (includeUsage && !separateUsage) {
-            event.put("usage", usage(r.stats()));
-        }
-        sse(res, event);
+        startStream(res);
         if (includeUsage && separateUsage) {
             sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(), "usage", usage(r.stats())));
+                    "choices", List.of(), "usage", usage(OpenAiFeatures.total(finished))));
         }
         res.write("data: [DONE]\n\n");
         res.end();
     }
 
+    private Map<String, Object> chunk(String id, String object, long created, Map<String, Object> choice) {
+        return Json.obj("id", id, "object", object, "created", created, "model", modelId, "choices", List.of(choice));
+    }
+
     /** Rejects request features this server cannot honour rather than silently ignoring them. */
     private static void checkUnsupported(Map<String, Object> b, boolean chat) {
-        if (Json.num(b, "n", 1) != 1) {
-            throw RequestError.invalid("'n' other than 1 is not supported");
-        }
         Object tools = b.get("tools");
         if (tools instanceof List<?> l && !l.isEmpty()) {
             throw RequestError.invalid("'tools' is not supported");
@@ -293,27 +390,6 @@ public final class ApiServer implements AutoCloseable {
         Object toolChoice = b.get("tool_choice");
         if (toolChoice != null && !"none".equals(toolChoice)) {
             throw RequestError.invalid("'tool_choice' is not supported");
-        }
-        Map<String, Object> format = Json.map(b, "response_format");
-        if (format != null && !"text".equals(Json.str(format, "type", "text"))) {
-            throw RequestError.invalid("'response_format' other than text is not supported");
-        }
-        Object logprobs = b.get("logprobs"); // boolean on chat, an integer (top n) on completions
-        if (Boolean.TRUE.equals(logprobs) || logprobs instanceof Number n && n.intValue() != 0) {
-            throw RequestError.invalid("'logprobs' is not supported");
-        }
-        Map<String, Object> bias = Json.map(b, "logit_bias");
-        if (bias != null && !bias.isEmpty()) {
-            throw RequestError.invalid("'logit_bias' is not supported");
-        }
-        if (Boolean.TRUE.equals(b.get("echo"))) {
-            throw RequestError.invalid("'echo' is not supported");
-        }
-        if (b.get("suffix") != null) {
-            throw RequestError.invalid("'suffix' is not supported");
-        }
-        if (Json.num(b, "best_of", 1) != 1) {
-            throw RequestError.invalid("'best_of' other than 1 is not supported");
         }
         if (!chat && b.get("prompt") instanceof List<?> l) {
             if (l.size() != 1 || !(l.getFirst() instanceof String)) {
@@ -323,15 +399,10 @@ public final class ApiServer implements AutoCloseable {
         }
     }
 
-    /** Sends the SSE headers (and, for chat, the initial role event) unless already done. */
-    private void startStream(HttpServer.Response res, boolean chat, String id, String object, long created) throws IOException {
-        if (res.started()) {
-            return;
-        }
-        res.startStream(200, "text/event-stream; charset=utf-8");
-        if (chat) {
-            sse(res, Json.obj("id", id, "object", object, "created", created, "model", modelId,
-                    "choices", List.of(Json.obj("index", 0, "delta", Json.obj("role", "assistant", "content", ""), "finish_reason", null))));
+    /** Sends the SSE headers unless already done. */
+    private static void startStream(HttpServer.Response res) throws IOException {
+        if (!res.started()) {
+            res.startStream(200, "text/event-stream; charset=utf-8");
         }
     }
 
@@ -362,12 +433,17 @@ public final class ApiServer implements AutoCloseable {
                 "tokens_per_second", Math.round(s.tokPerSec() * 10) / 10.0);
     }
 
-    private int[] rawPrompt(Map<String, Object> body) {
+    /** The completions prompt: a string, or a single-element string array (validated in checkUnsupported). */
+    private static String promptText(Map<String, Object> body) {
         Object p = body.get("prompt");
-        if (p instanceof List<?> l) { // a single-element string array (validated in checkUnsupported)
+        if (p instanceof List<?> l) {
             p = l.getFirst();
         }
-        String text = p instanceof String str ? str : "";
+        return p instanceof String str ? str : "";
+    }
+
+    private int[] rawPrompt(Map<String, Object> body) {
+        String text = promptText(body);
         checkPromptBytes(utf8Length(text));
         return engine.tokenizer().encode(text);
     }
@@ -398,7 +474,8 @@ public final class ApiServer implements AutoCloseable {
         return n;
     }
 
-    private int[] chatPrompt(Map<String, Object> body) {
+    /** @param json whether the output is constrained to JSON: Qwen3 thinking is then off (a think block is not JSON) */
+    private int[] chatPrompt(Map<String, Object> body, boolean json) {
         List<Object> msgs = Json.list(body, "messages");
         if (msgs == null || msgs.isEmpty()) {
             throw new IllegalArgumentException("'messages' is required");
@@ -440,11 +517,14 @@ public final class ApiServer implements AutoCloseable {
             System.err.println("note: enable_thinking only applies to the Qwen3 chat template; this model uses \""
                     + template + "\", the field is ignored (reported once)");
         }
-        return engine.renderChat(list, thinking);
+        return engine.renderChat(list, thinking && !json);
     }
 
-    /** @param room how many tokens the context has left after the prompt (at least 1) */
-    private SamplingParams params(Map<String, Object> b, int room) {
+    /**
+     * @param room      how many tokens the context has left after the prompt (at least 1)
+     * @param allowZero whether {@code max_tokens: 0} is valid (an echo that only scores the prompt)
+     */
+    private SamplingParams params(Map<String, Object> b, int room, boolean allowZero) {
         SamplingParams d = defaults;
         List<String> stop = new ArrayList<>();
         Object s = b.get("stop");
@@ -456,8 +536,8 @@ public final class ApiServer implements AutoCloseable {
             }
         }
         long maxTokens = Json.num(b, "max_completion_tokens", Json.num(b, "max_tokens", d.maxTokens()));
-        if (maxTokens <= 0) {
-            throw RequestError.invalid("max_tokens must be at least 1");
+        if (maxTokens < (allowZero ? 0 : 1)) {
+            throw RequestError.invalid("max_tokens must be at least " + (allowZero ? 0 : 1));
         }
         maxTokens = Math.min(maxTokens, room); // the engine stops at the context edge anyway; this also avoids int overflow
         return new SamplingParams(

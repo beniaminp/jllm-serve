@@ -216,12 +216,16 @@ The sign rule in the repetition penalty (`divide if positive, multiply if negati
 *down*; a naive "always divide" would make negative logits *more* likely. `applyPenalties` is skipped entirely
 when all three are at their neutral values, so the default configuration pays nothing.
 
+**Logit bias.** After the penalties, OpenAI's `logit_bias` (a dense `bias[]` by token id, values −100…100, given to
+the `Sampler` constructor) is added to the logits: `z + bias`. It is the caller's own nudge, so it applies to
+every token, seen or not; −100 makes a token practically impossible (e^−100), +100 practically certain.
+
 ---
 
 ## 9.7 The full order of operations
 
 ```
-logits  ──penalties──▶  ──[greedy? argmax]──▶  ──top-k (heap) or nucleus bound──▶
+logits  ──penalties──▶  ──logit bias──▶  ──[greedy? argmax]──▶  ──top-k (heap) or nucleus bound──▶
         ──softmax with 1/T──▶  ──top-p──▶  ──min-p──▶  ──weighted draw──▶  token
 ```
 
@@ -230,6 +234,12 @@ where temperature is applied, and that is harmless: top-k selects by logit, and 
 `T` never changes which `k` are largest. The subsequent softmax over the kept set is then identical to HF's
 (HF sets discarded logits to −∞, which also gives them zero weight). For the default `top_k = 20`, outputs are
 distributed exactly as in `transformers`.
+
+With a constraint (`response_format`, [10 §10.6](10-engine-and-server.md#106-the-openai-compatible-api)),
+`sample(logits, allowed)` runs the same steps on the *allowed* tokens only: after penalties and bias it takes the
+256 most likely tokens, keeps those the constraint allows (testing them most likely first, scanning the whole
+vocabulary only when none is allowed), and greedy takes the first, sampling applies temperature, top-k, top-p and
+min-p to the allowed candidates, renormalized.
 
 ---
 

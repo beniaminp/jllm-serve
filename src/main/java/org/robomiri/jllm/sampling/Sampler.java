@@ -2,9 +2,10 @@ package org.robomiri.jllm.sampling;
 
 import java.util.Arrays;
 import java.util.SplittableRandom;
+import java.util.function.IntPredicate;
 
 /**
- * Token sampler: penalties, temperature, top-k, top-p (nucleus), min-p, then a categorical draw.
+ * Token sampler: penalties, logit bias, temperature, top-k, top-p (nucleus), min-p, then a categorical draw.
  * One instance per generation request (it tracks token counts for the penalties).
  */
 public final class Sampler {
@@ -14,6 +15,7 @@ public final class Sampler {
     private final SplittableRandom rng;
     private final boolean[] seen;
     private final int[] generatedCounts;
+    private final float[] bias; // OpenAI logit_bias, added to the logits after the penalties; null = none
 
     // scratch
     private final int[] idx;
@@ -25,7 +27,16 @@ public final class Sampler {
      * @param vocab number of valid token ids; logits beyond it (padding rows of the embedding) are never sampled
      */
     public Sampler(SamplingParams p, int vocab, int[] prompt) {
+        this(p, vocab, prompt, null);
+    }
+
+    /**
+     * @param bias added to the logits before sampling (after the penalties), indexed by token id; null for none.
+     *             OpenAI's {@code logit_bias}: -100 effectively bans a token, +100 all but forces it
+     */
+    public Sampler(SamplingParams p, int vocab, int[] prompt, float[] bias) {
         this.p = p;
+        this.bias = bias;
         this.vocab = vocab;
         this.rng = p.seed() >= 0 ? new SplittableRandom(p.seed()) : new SplittableRandom();
         this.seen = new boolean[vocab];
@@ -54,7 +65,7 @@ public final class Sampler {
      */
     public boolean greedyPlain() {
         return (p.temperature() == 0f || p.topK() == 1) && p.repetitionPenalty() == 1f && p.presencePenalty() == 0f
-                && p.frequencyPenalty() == 0f;
+                && p.frequencyPenalty() == 0f && bias == null;
     }
 
     /** Samples the next token. {@code logits} is modified in place. */
@@ -63,6 +74,85 @@ public final class Sampler {
             return argmax(logits);
         }
         return draw(logits);
+    }
+
+    /** How many of the most likely tokens a constrained step considers (and checks) before widening its search. */
+    static final int CONSTRAINED_POOL = 256;
+    private int[] cIdx;
+    private float[] cVal;
+
+    /**
+     * Samples the next token among those {@code allowed} accepts (constrained decoding), or returns -1 when none
+     * is. The constraint is checked lazily: the {@value #CONSTRAINED_POOL} most likely tokens (after penalties and
+     * bias) are tested, most likely first; only if none of them is allowed is the whole vocabulary scanned. Greedy
+     * takes the first allowed token. Sampling draws from the allowed tokens among those candidates, renormalized:
+     * top-k keeps the k most likely allowed tokens, top-p and min-p apply to the renormalized distribution, so the
+     * tail beyond the candidates (negligible next to them) is left out. {@code logits} is modified in place.
+     */
+    public int sample(float[] logits, IntPredicate allowed) {
+        if (allowed == null) {
+            return sample(logits);
+        }
+        applyPenalties(logits);
+        boolean greedy = p.temperature() == 0f || p.topK() == 1;
+        int want = greedy ? 1 : p.topK() > 0 ? Math.min(p.topK(), CONSTRAINED_POOL) : CONSTRAINED_POOL;
+        int pool = Math.min(vocab, CONSTRAINED_POOL);
+        if (cIdx == null) {
+            cIdx = new int[pool];
+            cVal = new float[pool];
+        }
+        int m = topK(logits, pool, cIdx, cVal, null);
+        int n = 0;
+        for (int i = 0; i < m && n < want; i++) {
+            if (allowed.test(cIdx[i])) {
+                cIdx[n] = cIdx[i];
+                cVal[n] = cVal[i];
+                n++;
+            }
+        }
+        if (n == 0 && m < vocab) { // nothing likely is allowed: search everything
+            n = topK(logits, want, cIdx, cVal, allowed);
+        }
+        if (n == 0) {
+            return -1;
+        }
+        if (greedy || n == 1) {
+            return cIdx[0];
+        }
+        float invT = 1f / p.temperature();
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            float e = (float) Math.exp((cVal[i] - cVal[0]) * invT);
+            cVal[i] = e;
+            sum += e;
+        }
+        int kept = n;
+        if (p.topP() < 1f) {
+            double cum = 0;
+            for (int i = 0; i < n; i++) {
+                cum += cVal[i] / sum;
+                if (cum >= p.topP()) {
+                    kept = i + 1;
+                    break;
+                }
+            }
+        }
+        double t = 0;
+        for (int i = 0; i < kept; i++) {
+            if (cVal[i] < p.minP()) { // relative to the most likely allowed token (weight 1)
+                cVal[i] = 0f;
+            }
+            t += cVal[i];
+        }
+        double r = rng.nextDouble() * t;
+        double acc = 0;
+        for (int i = 0; i < kept; i++) {
+            acc += cVal[i];
+            if (r < acc) {
+                return cIdx[i];
+            }
+        }
+        return cIdx[0];
     }
 
     /**
@@ -189,10 +279,7 @@ public final class Sampler {
         float pres = p.presencePenalty();
         float freq = p.frequencyPenalty();
         boolean any = rep != 1f || pres != 0f || freq != 0f;
-        if (!any) {
-            return;
-        }
-        for (int t = 0; t < vocab; t++) {
+        for (int t = 0; any && t < vocab; t++) {
             if (!seen[t]) {
                 continue;
             }
@@ -202,6 +289,11 @@ public final class Sampler {
             int cnt = generatedCounts[t];
             if (cnt > 0) {
                 logits[t] -= pres + freq * cnt;
+            }
+        }
+        if (bias != null) {
+            for (int t = 0; t < vocab; t++) {
+                logits[t] += bias[t];
             }
         }
     }
@@ -218,23 +310,34 @@ public final class Sampler {
 
     /** Selects the k largest logits into idx/val, sorted descending. Uses a size-k min-heap. */
     private int topK(float[] logits, int k) {
+        return topK(logits, k, idx, val, null);
+    }
+
+    /**
+     * Selects the {@code k} largest logits among the tokens {@code allowed} accepts (all when null) into
+     * {@code ix}/{@code v}, sorted descending.
+     */
+    private int topK(float[] logits, int k, int[] ix, float[] v, IntPredicate allowed) {
         int n = 0;
         for (int i = 0; i < vocab; i++) {
-            float v = logits[i];
+            float x = logits[i];
             if (n < k) {
-                val[n] = v;
-                idx[n] = i;
-                siftUp(n++);
-            } else if (v > val[0]) {
-                val[0] = v;
-                idx[0] = i;
-                siftDown(0, n);
+                if (allowed != null && !allowed.test(i)) {
+                    continue;
+                }
+                v[n] = x;
+                ix[n] = i;
+                siftUp(ix, v, n++);
+            } else if (x > v[0] && (allowed == null || allowed.test(i))) {
+                v[0] = x;
+                ix[0] = i;
+                siftDown(ix, v, 0, n);
             }
         }
         // heap-sort ascending min-heap into descending order
         for (int end = n - 1; end > 0; end--) {
-            swap(0, end);
-            siftDown(0, end);
+            swap(ix, v, 0, end);
+            siftDown(ix, v, 0, end);
         }
         return n;
     }
@@ -282,42 +385,42 @@ public final class Sampler {
         System.arraycopy(v2, 0, val, 0, n);
     }
 
-    private void siftUp(int i) {
+    private static void siftUp(int[] ix, float[] v, int i) {
         while (i > 0) {
             int parent = (i - 1) / 2;
-            if (val[i] >= val[parent]) {
+            if (v[i] >= v[parent]) {
                 return;
             }
-            swap(i, parent);
+            swap(ix, v, i, parent);
             i = parent;
         }
     }
 
-    private void siftDown(int i, int n) {
+    private static void siftDown(int[] ix, float[] v, int i, int n) {
         while (true) {
             int l = 2 * i + 1;
             int r = l + 1;
             int m = i;
-            if (l < n && val[l] < val[m]) {
+            if (l < n && v[l] < v[m]) {
                 m = l;
             }
-            if (r < n && val[r] < val[m]) {
+            if (r < n && v[r] < v[m]) {
                 m = r;
             }
             if (m == i) {
                 return;
             }
-            swap(i, m);
+            swap(ix, v, i, m);
             i = m;
         }
     }
 
-    private void swap(int a, int b) {
-        float tv = val[a];
-        val[a] = val[b];
-        val[b] = tv;
-        int ti = idx[a];
-        idx[a] = idx[b];
-        idx[b] = ti;
+    private static void swap(int[] ix, float[] v, int a, int b) {
+        float tv = v[a];
+        v[a] = v[b];
+        v[b] = tv;
+        int ti = ix[a];
+        ix[a] = ix[b];
+        ix[b] = ti;
     }
 }
