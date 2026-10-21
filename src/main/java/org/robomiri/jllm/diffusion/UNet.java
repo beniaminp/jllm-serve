@@ -401,6 +401,11 @@ public final class UNet implements AutoCloseable {
         return out;
     }
 
+    /** Bytes of the checkpoint this network was read from. */
+    public long weightBytes() {
+        return ckpt.bytes();
+    }
+
     @Override
     public void close() {
         ld.free();

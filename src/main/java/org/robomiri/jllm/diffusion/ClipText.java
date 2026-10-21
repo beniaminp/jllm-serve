@@ -176,6 +176,11 @@ public final class ClipText implements AutoCloseable {
         return h3;
     }
 
+    /** Bytes of the checkpoint this network was read from. */
+    public long weightBytes() {
+        return ckpt.bytes();
+    }
+
     @Override
     public void close() {
         ckpt.close();

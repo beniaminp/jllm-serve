@@ -92,7 +92,7 @@ static inline float df_act(float v, int act) {
 // columns / k past m / n / k read as zero and are not written. With vec = 1 (lda, ldb and the strides are multiples of 4
 // elements and the pointers aligned) full 16-element runs are loaded as 4-vectors.
 
-struct GemmParams {
+struct DfGemmParams {
     int m;
     int n;
     int k;
@@ -113,12 +113,18 @@ struct GemmParams {
     int vec;
 };
 
+// 4 elements converted to another element type (Metal's float4(half4))
+template <typename TD, typename TS>
+static inline vec<TD, 4> df_cvt4(vec<TS, 4> v) {
+    return vec<TD, 4>{TD(v.x), TD(v.y), TD(v.z), TD(v.w)};
+}
+
 template <typename TS, typename TM>
 static inline void df_load16(device const TS *src, threadgroup TM *dst, int avail, bool useVec) {
     if (useVec && avail >= 16) {
         device const vec<TS, 4> *s4 = (device const vec<TS, 4> *)src;
         threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)dst;
-        for (int i = 0; i < 4; i++) d4[i] = vec<TM, 4>(s4[i]);
+        for (int i = 0; i < 4; i++) d4[i] = df_cvt4<TM, TS>(s4[i]);
     } else {
         for (int i = 0; i < 16; i++) dst[i] = i < avail ? TM(src[i]) : TM(0);
     }
@@ -146,7 +152,7 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
                     device TC *c [[buffer(2)]],
                     device const float *bias [[buffer(3)]],
                     device const TC *res [[buffer(4)]],
-                    constant GemmParams &p [[buffer(5)]],
+                    constant DfGemmParams &p [[buffer(5)]],
                     uint3 tgp [[threadgroup_position_in_grid]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -220,7 +226,7 @@ kernel void df_gemm(device const TA *a [[buffer(0)]],
 // pixel, k a (tap, input channel) pair; the A slices are gathered from the input while they are staged (zeros outside the
 // image), so no im2col buffer exists. cin is a multiple of 8, so 8 consecutive k stay inside one tap.
 
-struct ConvParams {
+struct DfConvParams {
     int batch;
     int h;
     int w;
@@ -245,7 +251,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                     device const float *bias [[buffer(3)]],
                     device const T *chan [[buffer(4)]],
                     device const T *res [[buffer(5)]],
-                    constant ConvParams &p [[buffer(6)]],
+                    constant DfConvParams &p [[buffer(6)]],
                     uint3 tgp [[threadgroup_position_in_grid]],
                     ushort tid [[thread_index_in_threadgroup]],
                     ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -288,8 +294,8 @@ kernel void df_conv(device const T *x [[buffer(0)]],
                 if (iy >= 0 && iy < p.h && ix >= 0 && ix < p.w) {
                     device const vec<T, 4> *s4 = (device const vec<T, 4> *)(x + ((long)(bi * p.h + iy) * p.w + ix) * p.cin + ci);
                     threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)(da + g * 8);
-                    d4[0] = vec<TM, 4>(s4[0]);
-                    d4[1] = vec<TM, 4>(s4[1]);
+                    d4[0] = df_cvt4<TM, T>(s4[0]);
+                    d4[1] = df_cvt4<TM, T>(s4[1]);
                 } else {
                     for (int i = 0; i < 8; i++) da[g * 8 + i] = TM(0);
                 }
@@ -304,7 +310,7 @@ kernel void df_conv(device const T *x [[buffer(0)]],
             if (avail >= 16) {
                 device const vec<T, 4> *s4 = (device const vec<T, 4> *)wr;
                 threadgroup vec<TM, 4> *d4 = (threadgroup vec<TM, 4> *)db;
-                for (int i = 0; i < 4; i++) d4[i] = vec<TM, 4>(s4[i]);
+                for (int i = 0; i < 4; i++) d4[i] = df_cvt4<TM, T>(s4[i]);
             } else {
                 for (int i = 0; i < 16; i++) db[i] = i < avail ? TM(wr[i]) : TM(0);
             }
@@ -360,7 +366,7 @@ kernel void df_conv_direct(device const T *x [[buffer(0)]],
                            device const float *bias [[buffer(3)]],
                            device const T *chan [[buffer(4)]],
                            device const T *res [[buffer(5)]],
-                           constant ConvParams &p [[buffer(6)]],
+                           constant DfConvParams &p [[buffer(6)]],
                            uint gid [[thread_position_in_grid]]) {
     const long total = (long)p.batch * p.ho * p.wo * p.cout;
     if ((long)gid >= total) return;
@@ -397,7 +403,7 @@ template [[host_name("df_conv_direct_h")]] kernel decltype(df_conv_direct<half>)
 // (two passes over the data for the variance), then (x - mean) * rstd * gamma + beta, optionally followed by SiLU.
 // df_layernorm<T>: one threadgroup per row.
 
-struct NormParams {
+struct DfNormParams {
     int c;          // channels (the last dimension)
     int hw;         // rows per batch element (pixels or tokens)
     int groups;     // group norm only
@@ -411,7 +417,7 @@ kernel void df_groupnorm(device const T *x [[buffer(0)]],
                          device const float *gamma [[buffer(1)]],
                          device const float *beta [[buffer(2)]],
                          device T *out [[buffer(3)]],
-                         constant NormParams &p [[buffer(4)]],
+                         constant DfNormParams &p [[buffer(4)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
@@ -450,7 +456,7 @@ kernel void df_layernorm(device const T *x [[buffer(0)]],
                          device const float *gamma [[buffer(1)]],
                          device const float *beta [[buffer(2)]],
                          device T *out [[buffer(3)]],
-                         constant NormParams &p [[buffer(4)]],
+                         constant DfNormParams &p [[buffer(4)]],
                          uint row [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
@@ -489,7 +495,7 @@ template [[host_name("df_layernorm_h")]] kernel decltype(df_layernorm<half>) df_
 // (their distribution over the lanes is not specified); S and P go through an 8 x 32 scratch per simdgroup. Keys past lk
 // (and, with causal, past the row) are masked. q, k, v, out are [batch][length][heads * D] rows with the given strides.
 
-struct FlashParams {
+struct DfFlashParams {
     int heads;
     int lq;
     int lk;
@@ -501,38 +507,38 @@ struct FlashParams {
     int causal;
 };
 
-template <typename T, int D>
-kernel void df_flash(device const T *q [[buffer(0)]],
-                     device const T *k [[buffer(1)]],
-                     device const T *v [[buffer(2)]],
-                     device T *out [[buffer(3)]],
-                     constant FlashParams &p [[buffer(4)]],
+template <typename TT, int D>
+kernel void df_flash(device const TT *q [[buffer(0)]],
+                     device const TT *k [[buffer(1)]],
+                     device const TT *v [[buffer(2)]],
+                     device TT *out [[buffer(3)]],
+                     constant DfFlashParams &p [[buffer(4)]],
                      uint3 tgp [[threadgroup_position_in_grid]],
                      ushort tid [[thread_index_in_threadgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]]) {
     constexpr int NI = D / 8;                  // 8-wide slices of the head
     constexpr int NJ = DF_FA_BK / 8;           // 8-key slices of a block
-    threadgroup T kvs[DF_FA_BK * D];
+    threadgroup TT kvs[DF_FA_BK * D];
     threadgroup float sb[4][8 * DF_FA_BK];
     threadgroup float st[4][64];
-    threadgroup T sq[4][64];
+    threadgroup TT sq[4][64];
 
     const int h = int(tgp.x);
     const int bi = int(tgp.z);
     const int t0 = int(tgp.y) * DF_FA_ROWS;
     const int r0 = t0 + int(sg) * 8;
-    device const T *qb = q + (long)bi * p.lq * p.qs + h * D;
-    device const T *kb = k + (long)bi * p.lk * p.ks + h * D;
-    device const T *vb = v + (long)bi * p.lk * p.vs + h * D;
+    device const TT *qb = q + (long)bi * p.lq * p.qs + h * D;
+    device const TT *kb = k + (long)bi * p.lk * p.ks + h * D;
+    device const TT *vb = v + (long)bi * p.lk * p.vs + h * D;
     const int tEnd = min(p.lq, t0 + DF_FA_ROWS);
     const int lastKey = p.causal != 0 ? min(p.lk, tEnd) : p.lk;
 
-    simdgroup_matrix<T, 8, 8> qm[NI];
+    simdgroup_matrix<TT, 8, 8> qm[NI];
     for (int i = 0; i < NI; i++) {
         for (int e = lane; e < 64; e += 32) {
             const int t = r0 + e / 8;
-            sq[sg][e] = t < p.lq ? qb[(long)t * p.qs + i * 8 + e % 8] : T(0);
+            sq[sg][e] = t < p.lq ? qb[(long)t * p.qs + i * 8 + e % 8] : TT(0);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_load(qm[i], &sq[sg][0], 8);
@@ -552,15 +558,15 @@ kernel void df_flash(device const T *q [[buffer(0)]],
         for (int e = tid; e < DF_FA_BK * D / 4; e += DF_THREADS) {
             const int key = k0 + (e * 4) / D;
             const int d = (e * 4) % D;
-            vec<T, 4> val = vec<T, 4>(T(0));
-            if (key < p.lk) val = *(device const vec<T, 4> *)(kb + (long)key * p.ks + d);
-            *(threadgroup vec<T, 4> *)(kvs + e * 4) = val;
+            vec<TT, 4> val = vec<TT, 4>{TT(0), TT(0), TT(0), TT(0)};
+            if (key < p.lk) val = *(device const vec<TT, 4> *)(kb + (long)key * p.ks + d);
+            *(threadgroup vec<TT, 4> *)(kvs + e * 4) = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < NJ; j++) {
             simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             for (int i = 0; i < NI; i++) {
-                simdgroup_matrix<T, 8, 8> kt;
+                simdgroup_matrix<TT, 8, 8> kt;
                 simdgroup_load(kt, &kvs[j * 8 * D + i * 8], D, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(s, qm[i], kt, s);
             }
@@ -596,16 +602,16 @@ kernel void df_flash(device const T *q [[buffer(0)]],
         for (int e = tid; e < DF_FA_BK * D / 4; e += DF_THREADS) {
             const int key = k0 + (e * 4) / D;
             const int d = (e * 4) % D;
-            vec<T, 4> val = vec<T, 4>(T(0));
-            if (key < p.lk) val = *(device const vec<T, 4> *)(vb + (long)key * p.vs + d);
-            *(threadgroup vec<T, 4> *)(kvs + e * 4) = val;
+            vec<TT, 4> val = vec<TT, 4>{TT(0), TT(0), TT(0), TT(0)};
+            if (key < p.lk) val = *(device const vec<TT, 4> *)(vb + (long)key * p.vs + d);
+            *(threadgroup vec<TT, 4> *)(kvs + e * 4) = val;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < NJ; j++) {
             simdgroup_float8x8 pm;
             simdgroup_load(pm, &sb[sg][j * 8], DF_FA_BK);
             for (int i = 0; i < NI; i++) {
-                simdgroup_matrix<T, 8, 8> vm;
+                simdgroup_matrix<TT, 8, 8> vm;
                 simdgroup_load(vm, &kvs[j * 8 * D + i * 8], D);
                 simdgroup_multiply_accumulate(om[i], pm, vm, om[i]);
             }
@@ -626,7 +632,7 @@ kernel void df_flash(device const T *q [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int e = lane; e < 64; e += 32) {
             const int t = r0 + e / 8;
-            if (t < p.lq) out[(long)bi * p.lq * p.os + (long)t * p.os + h * D + i * 8 + e % 8] = T(st[sg][e]);
+            if (t < p.lq) out[(long)bi * p.lq * p.os + (long)t * p.os + h * D + i * 8 + e % 8] = TT(st[sg][e]);
         }
     }
 }
@@ -649,7 +655,7 @@ DF_INST_FLASH(160)
 // df_softmax: in place on rows of float scores [rows][ld]: the first n entries of a row are softmax-ed (causal: only the
 // first row%lq + 1), the rest of the padded row is zeroed, so the P V product can read the padding.
 
-struct SoftmaxParams {
+struct DfSoftmaxParams {
     int n;          // valid scores per row
     int ld;         // row stride
     int lq;         // rows per (batch, head): the causal limit of row r is r % lq + 1
@@ -657,7 +663,7 @@ struct SoftmaxParams {
 };
 
 kernel void df_softmax(device float *s [[buffer(0)]],
-                       constant SoftmaxParams &p [[buffer(1)]],
+                       constant DfSoftmaxParams &p [[buffer(1)]],
                        uint row [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]],
@@ -676,7 +682,7 @@ kernel void df_softmax(device float *s [[buffer(0)]],
 
 // ---------------------------------------------------------------------------------------------- 6. elementwise and layout
 
-struct EwParams {
+struct DfEwParams {
     long n;         // output elements
     int a;          // kernel specific (channels, ...)
     int b;
@@ -686,20 +692,20 @@ struct EwParams {
 
 template <typename T>
 kernel void df_add(device const T *x [[buffer(0)]], device const T *y [[buffer(1)]], device T *out [[buffer(2)]],
-                   constant EwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+                   constant DfEwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     if ((long)gid < p.n) out[gid] = T(float(x[gid]) + float(y[gid]));
 }
 
 template <typename T>
 kernel void df_silu_k(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
-                      constant EwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+                      constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
     if ((long)gid < p.n) out[gid] = T(df_silu(float(x[gid])));
 }
 
 // x[row][0..n) * gelu(x[row][n..2n)): p.a = n
 template <typename T>
 kernel void df_geglu(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
-                     constant EwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+                     constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
     if ((long)gid >= p.n) return;
     const long row = gid / p.a;
     const int j = int(gid - row * p.a);
@@ -709,7 +715,7 @@ kernel void df_geglu(device const T *x [[buffer(0)]], device T *out [[buffer(1)]
 // nearest-neighbour 2x: out [B, 2h, 2w, C]; p.a = h, p.b = w, p.c = C
 template <typename T>
 kernel void df_upsample2x(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
-                          constant EwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+                          constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
     if ((long)gid >= p.n) return;
     const int c = int(gid % p.c);
     const long px = gid / p.c;
@@ -723,7 +729,7 @@ kernel void df_upsample2x(device const T *x [[buffer(0)]], device T *out [[buffe
 // channel concatenation: p.a = ca, p.b = cb
 template <typename T>
 kernel void df_concat(device const T *x [[buffer(0)]], device const T *y [[buffer(1)]], device T *out [[buffer(2)]],
-                      constant EwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+                      constant DfEwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     if ((long)gid >= p.n) return;
     const int ct = p.a + p.b;
     const long row = gid / ct;

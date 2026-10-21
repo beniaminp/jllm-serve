@@ -388,6 +388,11 @@ public final class Vae implements AutoCloseable {
         return new Posterior(mean, std, h, w);
     }
 
+    /** Bytes of the checkpoint this network was read from. */
+    public long weightBytes() {
+        return ckpt.bytes();
+    }
+
     @Override
     public void close() {
         ld.free();

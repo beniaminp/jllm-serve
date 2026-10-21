@@ -55,6 +55,12 @@ public final class CpuOps implements Ops {
     }
 
     private final Arena arena = Arena.ofShared();
+    private final java.util.concurrent.atomic.AtomicLong packed = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Bytes of the packed weights (off-heap). */
+    long weightBytes() {
+        return packed.get();
+    }
     private final ThreadLocal<float[]> scratch = ThreadLocal.withInitial(() -> new float[0]);
 
     @Override
@@ -144,6 +150,7 @@ public final class CpuOps implements Ops {
         }
         int npad = (n + NR - 1) / NR * NR;
         MemorySegment seg = arena.allocate((long) k * npad * 4L, 64);
+        packed.addAndGet((long) k * npad * 4L);
         final int kk = k;
         final float[] r = rows;
         IntStream.range(0, npad / NR).parallel().forEach(p -> {

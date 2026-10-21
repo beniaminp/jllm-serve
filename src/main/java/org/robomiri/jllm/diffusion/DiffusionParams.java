@@ -7,12 +7,12 @@ package org.robomiri.jllm.diffusion;
  * the dispatch, and {@code DiffusionParamsTest} checks the layouts against the struct definitions in the shader source.
  */
 enum DiffusionParams {
-    GEMM("GemmParams", "iiiiiiiiiiiiifiiii"),
-    CONV("ConvParams", "iiiiiiiiiiiiiii"),
-    NORM("NormParams", "iiifii"),
-    FLASH("FlashParams", "iiiiiiifi"),
-    SOFTMAX("SoftmaxParams", "iiii"),
-    EW("EwParams", "liiii");
+    GEMM("DfGemmParams", "iiiiiiiiiiiiifiiii"),
+    CONV("DfConvParams", "iiiiiiiiiiiiiii"),
+    NORM("DfNormParams", "iiifii"),
+    FLASH("DfFlashParams", "iiiiiiifi"),
+    SOFTMAX("DfSoftmaxParams", "iiii"),
+    EW("DfEwParams", "liiii");
 
     final String struct;
     final String kinds;

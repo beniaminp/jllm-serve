@@ -124,6 +124,16 @@ public final class ImagePipeline implements AutoCloseable {
         return vae.scale << (unet.blockCount - 1);
     }
 
+    /** Bytes of the checkpoint files the networks were read from (what is on disk). */
+    public long weightBytes() {
+        return clip1.weightBytes() + (clip2 == null ? 0 : clip2.weightBytes()) + unet.weightBytes() + vae.weightBytes();
+    }
+
+    /** Bytes the networks and their activations occupy on the device (GPU buffers, or off-heap weights on the CPU). */
+    public long memoryBytes() {
+        return devices.memoryBytes();
+    }
+
     public String description() {
         return className + (xl ? " (XL)" : "") + ", unet in_channels=" + unet.inChannels + ", " + devices.description();
     }

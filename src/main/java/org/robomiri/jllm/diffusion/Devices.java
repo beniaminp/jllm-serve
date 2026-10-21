@@ -30,6 +30,12 @@ public final class Devices implements AutoCloseable {
         return description;
     }
 
+    /** Bytes held on the device (GPU buffers: weights and pooled activations; CPU: the off-heap packed weights). */
+    public long memoryBytes() {
+        long a = main instanceof MetalOps m ? m.liveBytes() : main instanceof CpuOps c ? c.weightBytes() : 0;
+        return a;
+    }
+
     /** CPU in float32. */
     public static Devices cpu() {
         CpuOps ops = new CpuOps();

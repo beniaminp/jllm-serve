@@ -55,6 +55,9 @@ EMU_ELEM(int)
 EMU_ELEM(uint)
 EMU_ELEM(ulong)
 
+// metal::vec<T, N> (the generic vector type; the image-generation kernels use it in templates)
+template <typename T, int N> using vec = T __attribute__((ext_vector_type(N)));
+
 template <typename V, typename = void> struct emu_is_vec : std::false_type {};
 template <typename V> struct emu_is_vec<V, std::void_t<typename emu_elem<V>::type>> : std::true_type {};
 

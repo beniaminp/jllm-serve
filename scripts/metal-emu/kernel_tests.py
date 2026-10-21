@@ -708,4 +708,8 @@ router_norm()
 router_norm(remap=True, ntok=5)
 router_norm(ds=True)
 router_norm(ds=True, method=1, sigmoid=0, remap=True)
+# the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout
+import kernel_tests_diffusion
+
+kernel_tests_diffusion.run(E, check)
 sys.exit(1 if failures else 0)
