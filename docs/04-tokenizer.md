@@ -1,7 +1,7 @@
 # 4. The tokenizer: byte-level BPE from scratch
 
 Code: `tokenizer/Tokenizer.java`, `tokenizer/ChatTemplate.java`, `tokenizer/StreamDecoder.java`, `tokenizer/AddedTokenTrie.java`,
-`tokenizer/LongLongMap.java`, `tokenizer/Normalizers.java`, `tokenizer/PreTokenizers.java`
+`tokenizer/LongLongMap.java`, `tokenizer/Normalizers.java`, `tokenizer/PreTokenizers.java`, `tokenizer/Unigram.java`
 
 ## 4.1 Why tokens at all?
 
@@ -241,9 +241,8 @@ decode to the same text but would be out-of-distribution for the model and hurt 
 
 The same `Tokenizer` class loads the tokenizers of Llama 3, Mistral, Gemma 2/3, Phi-3 / Phi-4-mini / phi-4,
 GLM-4 / GLM-Edge, DeepSeek-V2 / DeepSeek-R1-Distill and Mamba (GPT-NeoX). All of them are
-`"model": {"type": "BPE"}`; none uses the Unigram
-model, so no Unigram/Viterbi segmentation is implemented (such a file is rejected with "only BPE tokenizers are
-supported"). What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
+`"model": {"type": "BPE"}`. (The Unigram and WordPiece models are implemented too, for tokenizers outside these
+families; see 4.12.) What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
 
 | Family | normalizer | pre-tokenizer | model flags | decoder |
 |---|---|---|---|---|
@@ -294,7 +293,12 @@ loop is the same O(n log n) heap, so this stays fast, but such chunks are too lo
 - **Normalizers** `Sequence`, `NFC/NFD/NFKC/NFKD`, `Prepend`, `Replace` (string or regex; the regex is compiled
   with `UNICODE_CHARACTER_CLASS` like the pre-tokenizer patterns, so `\s` matches NBSP as in Rust), `Strip`
   (Rust's `char::is_whitespace`, i.e. exactly the Unicode `White_Space` set — the same predicate decides what
-  `lstrip` / `rstrip` added tokens swallow), `Lowercase`.
+  `lstrip` / `rstrip` added tokens swallow), `Lowercase` (code point by code point, like Rust: a final `Σ`
+  becomes `σ`, not the `ς` of `String.toLowerCase`), and for the models of 4.12 `StripAccents`, `Nmt`,
+  `Precompiled` and `BertNormalizer`.
+- **BPE `dropout`** is ignored with a one-line note on stderr. The reference applies it when encoding (each merge
+  is skipped with that probability, so the same text gets different ids on every call); that is a regularization
+  for training, and an inference engine wants reproducible ids, i.e. dropout 0.
 - **Added tokens with `lstrip` / `rstrip`.** Phi-3 and Phi-4 declare `<|user|>`, `<|end|>`, `<|assistant|>`, … with
   `rstrip: true`: the tokenizer swallows the whitespace after such a token, so `<|user|>\nhi` encodes as
   `<|user|>` `hi` and the newline never reaches the model. The reference does this and so do we, also across the
@@ -308,13 +312,12 @@ loop is the same O(n log n) heap, so this stays fast, but such chunks are too lo
   for the families whose template starts with it.
 
 Unknown normalizer, pre-tokenizer, decoder or post-processor types throw `IllegalArgumentException` instead of
-silently tokenizing differently, as do a non-empty `continuing_subword_prefix` / `end_of_word_suffix`
-(WordPiece-style BPE), a non-zero `dropout`, a `Replace` decoder other than `▁ → " "`, a `Strip` decoder that is
+silently tokenizing differently, as do a non-empty `continuing_subword_prefix` / `end_of_word_suffix` on a BPE
+model (BPE with WordPiece-style affixes), a `Replace` decoder other than `▁ → " "`, a `Strip` decoder that is
 not "leading spaces of the fused text", and a `tokenizer_config.json` that is not valid JSON. Not supported (the
-`Tokenizer` javadoc keeps the list): the Unigram model, `Precompiled` normalizers (SentencePiece `.model`
-blobs), `single_word` added tokens, the `normalized: true` added-token flag (those tokens are matched on the raw
-text, which is identical for Mamba's whitespace tokens), `clean_up_tokenization_spaces`, and tool-calling parts
-of the chat templates.
+`Tokenizer` javadoc keeps the list): the WordLevel model, `single_word` added tokens, the `normalized: true`
+added-token flag (those tokens are matched on the raw text, which is identical for Mamba's whitespace tokens),
+`clean_up_tokenization_spaces`, and tool-calling parts of the chat templates.
 
 ### Chat templates per family
 
@@ -354,7 +357,8 @@ produces); `ChatTemplate.llama3("26 Jul 2024")` pins it, which the fixture test 
 
 ### Verification
 
-`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each of the 14 families (3 083 checks when all fixtures are present), `encode` with the
+`TokenizerFamiliesTest` (plain `main`, like `SmokeTest`) compares, for each of the 14 families and the five
+Unigram / WordPiece tokenizers of 4.12 (4 239 checks when all tokenizer files are present), `encode` with the
 ids of the Python `tokenizers` package on 150 strings (English, code, numbers, CJK/emoji/RTL,
 leading/trailing/multiple spaces, newlines, special and non-special added tokens, indented code, the empty
 string, random mixes) — both with special tokens enabled and in the content mode (`encode_special_tokens`) —
@@ -377,6 +381,9 @@ argument:
 | `gemma3` | google/gemma-3-1b-it | | `dsr1` | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B |
 | `gemma2` | unsloth/gemma-2-2b-it | | `dsv2` | deepseek-ai/DeepSeek-V2-Lite |
 | `phi3` | microsoft/Phi-3-mini-4k-instruct | | `mamba` | state-spaces/mamba-130m-hf |
+| `t5` | google-t5/t5-small | | `bert` | google-bert/bert-base-uncased |
+| `albert` | albert/albert-base-v2 | | `mbert` | google-bert/bert-base-multilingual-cased |
+| `xlmr` | FacebookAI/xlm-roberta-base | | | |
 
 ```
 python3 -m venv /tmp/tokv && /tmp/tokv/bin/pip install tokenizers jinja2
@@ -384,4 +391,156 @@ java -cp target/classes:target/test-classes org.robomiri.jllm.TokenizerFamiliesT
 ```
 
 Families whose directory is missing are skipped. `-Dtokenizer.fixtures=<dir>` points the test at a larger corpus
-generated with `gen_tokenizer_fixtures.py … <dir> 4000`.
+generated with `gen_tokenizer_fixtures.py … <dir> 4000` (a fourth argument `families` or `other` limits the run to
+the 14 families or to the tokenizers of 4.12; those also get 37 extra strings aimed at their normalizers: accents
+and case, compatibility forms, control and format characters, CJK, punctuation runs, long words). With 4 000
+random strings each, the five tokenizers of 4.12 and the GGUF `t5` path match the reference on all 20 835 cases.
+
+## 4.12 Other model types: Unigram and WordPiece
+
+None of the model families the engine runs needs this section: they all tokenize with BPE, byte-level or
+SentencePiece-style (4.11). `tokenizer.json` knows two more model types, though, used by encoder and embedding
+models (T5, ALBERT, XLM-R, BERT and its many descendants), and `Tokenizer` reads them so that such tokenizers
+load and give exactly the reference ids — for future families, embedding models, or anyone who wants to count
+tokens for them. No model weights of these kinds are run.
+
+### Unigram (SentencePiece unigram)
+
+A BPE vocabulary is a list of merges; a **unigram** vocabulary is a list of pieces with a score each:
+
+```json
+"model": {"type": "Unigram", "unk_id": 2, "byte_fallback": false,
+          "vocab": [["<pad>", 0.0], ["</s>", 0.0], ["<unk>", 0.0], ["▁", -2.01], [".", -3.06], ["▁the", -3.42], ...]}
+```
+
+The score is the natural log of the piece's probability under a model in which a text is a sequence of pieces
+drawn independently. The probability of one segmentation `x₁ x₂ … xₙ` of a word is the product of its pieces'
+probabilities, so its log is the **sum of the scores**, and the tokenizer picks the segmentation with the largest
+sum — the most probable one:
+
+```
+best(word) = argmax over all segmentations x₁…xₙ of word   Σᵢ log p(xᵢ)
+```
+
+There are exponentially many segmentations, but the best one is found by dynamic programming over positions
+(the Viterbi algorithm): the best segmentation of the first `e` characters ends in some piece `s[b, e)`, and what
+precedes that piece must itself be the best segmentation of the first `b` characters. So
+
+```
+best[0] = 0
+best[e] = max over pieces s[b, e) in the vocabulary of   best[b] + score(s[b, e))
+```
+
+and the answer is read backwards from `best[length]` through the remembered start of each last piece. Example
+with T5's vocabulary: `▁unbelievable` is itself a piece (score −12.95); `▁un` + `be` + `lie` + `v` + `able` sums
+to −41.17 and the thirteen single characters to −73.25, so the whole word wins. `▁tokenization` is not a piece;
+its best segmentation is `▁token` + `ization` (−12.08 − 9.97 = −22.05). Every additional piece adds another
+negative score, so long pieces win unless they are rare.
+
+The exact algorithm (`Unigram.java`, the reference's `encode_optimized`):
+
+```
+pieces are stored in a trie (UTF-16 characters, child links in a LongLongMap)
+best[0] = 0; from[e] = none for all e > 0
+for each character position b, in increasing order:
+    walk the trie along s[b..]: for every piece s[b, e) found (shorter pieces first)
+        cand = score(piece) + best[b]
+        if from[e] is none or cand > best[e]:  best[e] = cand, from[e] = b, id[e] = piece
+    if no piece is exactly the single character at b:      (the character is unknown)
+        e = b + 1 character; cand = (min score of the vocabulary − 10) + best[b]; same update with id = unk
+backtrack from e = length; adjacent unknown characters are fused into one run
+each run of unknowns: the vocabulary id of the run's text if it happens to be a piece, else its <0xXX> byte
+tokens when byte_fallback is on and all exist, else unk_id
+```
+
+The strict `>` decides ties: the first candidate found wins, i.e. the one whose last piece starts earliest (at
+equal scores `ab` beats `a` + `b`). The unknown score — 10 below the worst piece — makes an unknown character
+always the last resort, yet still allows a path through any text. The work is O(length × longest piece), and
+results are memoized per pre-tokenized word like BPE chunks.
+
+Unigram tokenizers usually come with:
+
+- **`Precompiled` normalizer**: the `precompiled_charsmap` of the SentencePiece `.model` file, base64-encoded.
+  It is a double-array trie ("darts-clone": each 32-bit unit packs a label byte, a has-leaf bit and an XOR
+  offset) over UTF-8 byte strings, whose leaf values point into a blob of NUL-terminated replacement strings.
+  For the usual `nmt_nfkc` rule set the table encodes NFKC plus SentencePiece's own clean-up (control characters
+  removed, odd spaces made plain). `Normalizers.Precompiled` reads the table and applies it like the reference:
+  the text is cut into grapheme clusters (`\X`); a cluster shorter than 6 bytes is replaced as a whole when a
+  prefix of it is in the trie (the shortest such prefix decides), otherwise each code point is looked up alone.
+  Interpreting the real table rather than calling `java.text.Normalizer` makes the result exact; only a file
+  whose `precompiled_charsmap` is `null` (which the reference refuses to load) falls back to plain NFKC, an
+  approximation that differs on control characters and unusual spaces.
+- **`WhitespaceSplit` + `Metaspace`** pre-tokenizer: split on whitespace, then put `▁` in front of each word —
+  the dummy prefix, so that a word at the start of the text and after a space are the same piece.
+- **`Metaspace` decoder**: `▁` becomes a space, except in the first token (4.11).
+
+ALBERT adds two `Replace` normalizers (two backticks or two apostrophes become `"`), `NFKD`, `StripAccents` (drops all combining marks) and `Lowercase` in
+front of its charsmap. XLM-R's vocabulary has 250 002 pieces and loads in about a second.
+
+**From GGUF.** A GGUF file with `tokenizer.ggml.model = t5` stores the pieces in `tokenizer.ggml.tokens`, the
+scores in `tokenizer.ggml.scores` and the charsmap in `tokenizer.ggml.precompiled_charsmap` (raw bytes).
+`GgufTokenizer` turns them into the same Unigram `tokenizer.json` (`remove_extra_whitespaces` becomes the
+`WhitespaceSplit`, `add_space_prefix` the Metaspace prefix, control / unknown tokens become special added
+tokens). The test rebuilds T5's tokenizer this way from its pieces, scores and charsmap and gets the reference
+ids for every fixture string.
+
+### WordPiece (BERT)
+
+```json
+"normalizer":    {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true,
+                  "strip_accents": null, "lowercase": true},
+"pre_tokenizer": {"type": "BertPreTokenizer"},
+"model":         {"unk_token": "[UNK]", "continuing_subword_prefix": "##", "max_input_chars_per_word": 100,
+                  "vocab": {"[PAD]": 0, ..., "the": 1996, ..., "##s": 2015, ...}},
+"decoder":       {"type": "WordPiece", "prefix": "##", "cleanup": true}
+```
+
+(Older files such as this one have no `"type"` in the model; like the reference, `Tokenizer` recognizes the
+model by its fields: a vocabulary *list* is Unigram, a `continuing_subword_prefix` without merges is WordPiece.)
+
+WordPiece has no scores and no merges, only a vocabulary in which a piece that continues a word is written
+with the prefix `##`. Encoding a word is **greedy longest-match-first**: take the longest vocabulary entry that
+the word starts with, then the longest `##` entry at the position after it, and so on:
+
+```
+"tokenization"  →  "token"  then "##ization"             (ids 19204, 3989)
+"unaffable"     →  "una"  then "##ffa"  then "##ble"      (ids 14477, 20961, 3468)
+```
+
+The second line shows the greediness: `una` is the longest prefix in the vocabulary, so the split is `una|ffa|ble`
+rather than the linguistically nicer `un|aff|able`.
+
+Exactly (`Tokenizer.wordPiece`):
+
+```
+if the word has more than max_input_chars_per_word characters: return [unk]
+start = 0
+while start < length:
+    for end = length down to start + 1 (one character at a time):
+        candidate = word[start, end), with "##" in front unless start = 0
+        if candidate is in the vocabulary: emit it, start = end, continue the outer loop
+    no candidate at all: return [unk]          (the whole word, not just the rest)
+```
+
+Greedy is not optimal in any probabilistic sense — it is simply what BERT was trained with — and a word whose
+remainder cannot be spelled at some point becomes a single `[UNK]`, losing the pieces already found.
+
+The pipeline around it:
+
+- **`BertNormalizer`**, in this order: *clean text* (drop NUL, U+FFFD and characters of category Cc / Cf / Co
+  except tab, newline and carriage return; every whitespace character becomes a space), *handle Chinese
+  characters* (a space on both sides of every CJK ideograph, so each becomes its own word), *strip accents*
+  (NFD, then drop nonspacing marks; `strip_accents: null` means "when lowercasing"), *lowercase* (per code
+  point).
+- **`BertPreTokenizer`**: split on whitespace (removed), then make every punctuation character its own piece:
+  ASCII punctuation including symbols such as `$ + < = > ^ | ~`, and Unicode category P. `"(hello) €5"` is `(`,
+  `hello`, `)`, `€5`: the euro sign (a currency symbol, category Sc) is not split off, and WordPiece then makes
+  it `€` `##5`.
+- **`WordPiece` decoder**: the first token as is; every other token loses its `##` and is glued to the previous
+  one, or gets a space in front if it has no `##`. With `cleanup`, each token then has the space removed before
+  `. ? ! ,` and before English contractions (`n't`, `'m`, `'s`, `'ve`, `'re`). This is done per token, so
+  `tokenBytes(id, first)` and `StreamDecoder` reproduce it. Without any decoder the reference joins the token
+  strings with spaces, which a Unigram or WordPiece tokenizer here does too.
+
+The BOS of these tokenizers comes from their `TemplateProcessing` post-processor as before: `[CLS]` for BERT and
+ALBERT, `<s>` for XLM-R, none for T5; `encode` never adds it (nor the trailing `[SEP]` / `</s>`).

@@ -225,8 +225,8 @@ org.robomiri.jllm
 ├── hub.HuggingFaceHub   lists a repo, downloads files (resumable, SHA-256 verified, retries), one shard on demand
 ├── safetensors.SafeTensors   memory-mapped tensor views over .safetensors files
 ├── tokenizer
-│   ├── Tokenizer        BPE (byte-level and SentencePiece-style): String ⇄ int[]
-│   ├── Normalizers, PreTokenizers, AddedTokenTrie, LongLongMap   the tokenizer.json pieces
+│   ├── Tokenizer        BPE (byte-level and SentencePiece-style), Unigram, WordPiece: String ⇄ int[]
+│   ├── Normalizers, PreTokenizers, Unigram, AddedTokenTrie, LongLongMap   the tokenizer.json pieces
 │   ├── ChatTemplate     one prompt format per family (ChatML for Qwen3/Qwen2, Llama 3, Gemma, ...), thinking on/off
 │   └── StreamDecoder    emits text only when a UTF-8 character is complete
 ├── model

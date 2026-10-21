@@ -345,7 +345,7 @@ against a fake backend (settings validation, bad requests, keep-alive, slow, sta
 ```sh
 CP=target/classes:target/test-classes
 J="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp $CP org.robomiri.jllm"
-$J.TokenizerFamiliesTest /tmp/jllm-tokenizers   # 3 083 checks, 14 tokenizer families
+$J.TokenizerFamiliesTest /tmp/jllm-tokenizers   # 4 239 checks: 14 tokenizer families + 5 Unigram/WordPiece tokenizers
 $J.ConverterTest --dir <scratch dir>            # converter, resume and cache-invalidation tests
 ```
 
