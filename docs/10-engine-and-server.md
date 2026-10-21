@@ -453,7 +453,10 @@ little is forced; tool calls use a fixed layout and gain much more.
 name must be one of the tools and the arguments must match its `parameters` schema, compiled *leniently* (keywords
 the automaton cannot enforce, such as `pattern` or `minimum`, are ignored rather than refused, since the client did
 not write the schema for us). `tool_choice: "required"` or a named function forces the call; `response_format`
-together with `tools` is allowed and means "tool calls or that JSON answer". See
+together with `tools` is allowed and means "tool calls or that JSON answer". Three settings keep the old paths:
+`engine.constrained-tools=false` (tool calls are free text parsed afterwards; `response_format` and `tools` exclude
+each other again), `engine.jump-forward=false` (every token sampled) and `engine.constraint-masks=false` (candidates
+tested one by one, no trie masks). See
 [17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward).
 
 **`echo` (completions): the prompt in front.** `"echo": true` returns the prompt followed by the completion in

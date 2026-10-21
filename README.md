@@ -42,6 +42,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Feature | What it does | Docs |
 |---|---|---|
 | Prompt lookup for agents | an n-gram index over the whole context drafts up to 16 tokens that the model verifies in one pass; 20 → 81 tok/s when rewriting code from the prompt, −4 % on free text | [17 §17.1](docs/17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) |
+| Constrained tool calls | inside `<tool_call>` the model can only write a known tool and arguments that match its schema, so a call always parses; the fixed parts of a call are appended in one pass without sampling (jump-forward), speculation checks its drafts against the constraint, and the token mask is computed with a byte trie and memoized (`engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks`) | [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward) |
 | Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
@@ -348,6 +349,7 @@ run in the small C library `libjllm_cpu` when it is found and passes its self-ch
 AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
 `scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 
