@@ -60,6 +60,7 @@ const Chat = (() => {
           if (running?.conv === c) return;
           if (c.messages.length && !confirm(`Delete "${c.title}"?`)) return;
           convs = convs.filter(x => x !== c);
+          Vision.release(c.messages); // vision: forget its pictures
           if (currentId === c.id) currentId = convs[0]?.id ?? null;
           if (!currentId) newConv(false); else { save(); renderConvs(); renderMessages(); renderToolsButton(); }
         } else if (act === 'rename') {
@@ -174,6 +175,7 @@ const Chat = (() => {
       el.querySelector('.bubble').textContent = t.msg.content;
       el.querySelector('[data-a=copy]').onclick = e => copyText(t.msg.content, e.target);
       el.querySelector('[data-a=edit]').onclick = () => editUser(c, t.index, el);
+      Vision.decorate(el, t.msg); // vision: thumbnails
       return el;
     }
     const live = running?.conv === c && isLast ? running : null;
@@ -258,7 +260,7 @@ const Chat = (() => {
   // what goes to the server: the OpenAI fields only
   function wire(messages) {
     return messages.filter(m => !(m.role === 'assistant' && !m.content && !m.tool_calls?.length)).map(m => {
-      const o = {role: m.role, content: m.content ?? ''};
+      const o = {role: m.role, content: m.role === 'user' ? Vision.content(m) : (m.content ?? '')}; // vision: picture parts
       if (m.tool_calls) o.tool_calls = m.tool_calls;
       if (m.tool_call_id) { o.tool_call_id = m.tool_call_id; o.name = m.name; }
       return o;
@@ -270,6 +272,7 @@ const Chat = (() => {
     if (!model) { toast('Load a model first (Models page).', 'err'); return; }
     const system = $('#p-system').value.trim();
     store.set('jllm.system', system);
+    await Vision.prepare(c.messages); // vision: data: URLs of the pictures, so wire() stays synchronous
     const body = {model, messages: [...(system ? [{role: 'system', content: system}] : []), ...wire(c.messages)],
       tools: (c.tools || []).filter(n => availableTools.some(t => t.name === n && t.enabled)),
       enable_thinking: $('#chat-think').checked, ...params()};
@@ -351,8 +354,9 @@ const Chat = (() => {
     if (running) return;
     if (!current()) newConv(false);
     const c = current();
-    c.messages.push({role: 'user', content: text});
-    if (c.title === 'New chat') c.title = text.replace(/\s+/g, ' ').slice(0, 48);
+    const images = Vision.take(); // vision: the pictures attached to the composer
+    c.messages.push({role: 'user', content: text, ...(images.length ? {images} : {})});
+    if (c.title === 'New chat') c.title = (text.replace(/\s+/g, ' ').slice(0, 48)) || 'Picture'; // vision: image-only first message
     save(); renderConvs();
     run(c);
   }
@@ -370,6 +374,7 @@ const Chat = (() => {
     if (running) return;
     const bubble = el.querySelector('.bubble');
     const old = c.messages[index].content;
+    const oldImages = c.messages[index].images || []; // vision: an edit keeps the pictures
     bubble.innerHTML = `<textarea rows="3" style="width:100%;min-width:320px"></textarea><div class="row" style="justify-content:flex-end">`
       + `<button class="ghost small" data-x>cancel</button><button class="primary small" data-ok>send</button></div>`;
     const ta = bubble.querySelector('textarea');
@@ -377,9 +382,9 @@ const Chat = (() => {
     bubble.querySelector('[data-x]').onclick = () => renderMessages();
     bubble.querySelector('[data-ok]').onclick = () => {
       const t = ta.value.trim();
-      if (!t) return;
+      if (!t && !oldImages.length) return;
       c.messages.splice(index);
-      c.messages.push({role: 'user', content: t});
+      c.messages.push({role: 'user', content: t, ...(oldImages.length ? {images: oldImages} : {})});
       save();
       run(c);
     };
@@ -390,7 +395,7 @@ const Chat = (() => {
     if (!c?.messages.length) return;
     let md = `# ${c.title}\n\n`;
     for (const m of c.messages) {
-      if (m.role === 'user') md += `## You\n\n${m.content}\n\n`;
+      if (m.role === 'user') md += `## You\n\n${m.images?.length ? `[${m.images.length} image${m.images.length > 1 ? 's' : ''}]\n\n` : ''}${m.content}\n\n`; // vision
       else if (m.role === 'assistant') {
         const {rest} = splitThink(m.content);
         if (rest.trim()) md += `## ${m.model || 'Assistant'}\n\n${rest.trim()}\n\n`;
@@ -468,7 +473,7 @@ const Chat = (() => {
     $('#composer').addEventListener('submit', ev => {
       ev.preventDefault();
       const t = $('#input').value.trim();
-      if (!t || running) return;
+      if ((!t && !Vision.hasPending()) || running) return; // vision: a message may be only pictures
       $('#input').value = '';
       autoGrow();
       send(t);
