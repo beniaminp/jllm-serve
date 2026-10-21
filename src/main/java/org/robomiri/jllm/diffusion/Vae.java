@@ -178,6 +178,16 @@ public final class Vae implements AutoCloseable {
         if (h <= tileLatents && w <= tileLatents) {
             return decodeTile(z, b, h, w);
         }
+        return decodeTiled(z, b, h, w, this::decodeTile);
+    }
+
+    /** Decodes one tile of latents {@code [b, th, tw, C]} to pixels {@code [b, th·f, tw·f, 3]}. */
+    interface TileDecoder {
+        float[] decode(float[] tile, int b, int th, int tw);
+    }
+
+    /** The tiling plan and the blending of {@link #decode}, for any tile decoder (tests use a decoder that is a pure function). */
+    float[] decodeTiled(float[] z, int b, int h, int w, TileDecoder tileDecoder) {
         int c = latentChannels;
         int hs = h * scale;
         int ws = w * scale;
@@ -195,7 +205,7 @@ public final class Vae implements AutoCloseable {
                         System.arraycopy(z, ((bi * h + y0 + y) * w + x0) * c, tile, ((bi * th + y) * tw) * c, tw * c);
                     }
                 }
-                float[] img = decodeTile(tile, b, th, tw);
+                float[] img = tileDecoder.decode(tile, b, th, tw);
                 blendInto(out, wsum, img, b, y0 * scale, x0 * scale, th * scale, tw * scale, hs, ws, blend,
                         y0 > 0, x0 > 0, y0 + th < h, x0 + tw < w, 3);
                 if (x0 + tw >= w) {

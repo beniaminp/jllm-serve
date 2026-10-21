@@ -1,0 +1,1 @@
+{"model_max_length": 77, "pad_token": "<|endoftext|>", "bos_token": "<|startoftext|>", "eos_token": "<|endoftext|>", "unk_token": "<|endoftext|>", "tokenizer_class": "CLIPTokenizer", "added_tokens_decoder": {"632": {"content": "<|startoftext|>", "normalized": true, "special": true}, "633": {"content": "<|endoftext|>", "normalized": true, "special": true}}}
