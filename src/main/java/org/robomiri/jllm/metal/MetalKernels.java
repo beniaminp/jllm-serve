@@ -1098,6 +1098,14 @@ final class MetalKernels implements AutoCloseable {
     void gdnRule(Metal.Buffer qkv, Metal.Buffer proj, Metal.Buffer a, Metal.Buffer dtBias, Metal.Buffer state,
                  Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
                  int bOff, float l2Eps, int n) {
+        gdnRule(qkv, proj, a, dtBias, state, out, keyHeads, valueHeads, keyDim, valueDim, qkvStride, projStride, bOff, l2Eps,
+                false, n);
+    }
+
+    /** As above; {@code tiled}: value head h reads key head h % keyHeads (Qwen3.5 GGUF order) instead of h / group. */
+    void gdnRule(Metal.Buffer qkv, Metal.Buffer proj, Metal.Buffer a, Metal.Buffer dtBias, Metal.Buffer state,
+                 Metal.Buffer out, int keyHeads, int valueHeads, int keyDim, int valueDim, int qkvStride, int projStride,
+                 int bOff, float l2Eps, boolean tiled, int n) {
         bind(0, qkv, 0);
         bind(1, proj, 0);
         bind(2, a, 0);
@@ -1105,7 +1113,7 @@ final class MetalKernels implements AutoCloseable {
         bind(4, state, 0);
         bind(5, out, 0);
         p.reset(KernelParams.GDN_RULE).i(keyHeads).i(valueHeads).i(keyDim).i(valueDim).i(n).i(qkvStride).i(projStride)
-                .i(bOff).f(l2Eps);
+                .i(bOff).f(l2Eps).i(tiled ? 1 : 0);
         dispatch("gdn_rule", 6, 0, (valueDim + GDN_COLS - 1) / GDN_COLS, valueHeads, 1, GDN_COLS * 32, 1, 1);
     }
 

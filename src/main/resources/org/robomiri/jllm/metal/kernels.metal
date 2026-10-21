@@ -3117,6 +3117,7 @@ struct GdnRuleParams {
     int projStride; // floats per token of the projection (b and a of the token are read from it)
     int bOff;       // offset of b in a projection row; a follows after valueHeads
     float eps;      // of the q / k L2 norm
+    int tiled;      // 1: value head h reads key head h % keyHeads (Qwen3.5 GGUF order); 0: h / (valueHeads / keyHeads)
 };
 
 // The gated delta rule of value head h = tgp.y, state column j (value dim) = tgp.x * GDN_COLS + simdgroup:
@@ -3140,7 +3141,7 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
     if (j >= p.valueDim) return;   // the whole simdgroup leaves together: no barrier below
     const int dk = p.keyDim;
     const int per = dk / 32;
-    const int kh = h / (p.valueHeads / p.keyHeads);
+    const int kh = p.tiled != 0 ? h % p.keyHeads : h / (p.valueHeads / p.keyHeads);
     const int kw = p.keyHeads * dk;
     const float scale = rsqrt(float(dk));
     device float *col = state + ((ulong)h * p.valueDim + j) * dk;

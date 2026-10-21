@@ -37,6 +37,9 @@ public final class GgufTokenizer {
 
     private static final String QWEN2 =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    /** Qwen3.5: letters include combining marks ({@code \p{M}}), as llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 and the tokenizer.json. */
+    private static final String QWEN35 =
+            "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     private static final String LLAMA3 =
             "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     private static final String GPT2 = PreTokenizers.GPT2_REGEX;
@@ -47,6 +50,7 @@ public final class GgufTokenizer {
      */
     public static final Map<String, String> PRE = Map.of(
             "qwen2", QWEN2,
+            "qwen35", QWEN35,
             "llama-bpe", LLAMA3,
             "llama3", LLAMA3,
             "llama-v3", LLAMA3,
@@ -160,7 +164,7 @@ public final class GgufTokenizer {
                 Json.obj("type", "ByteLevel", "add_prefix_space", false, "trim_offsets", false, "use_regex", false)));
         Map<String, Object> json = Json.obj("model", model, "added_tokens", added, "pre_tokenizer", pre,
                 "decoder", Json.obj("type", "ByteLevel", "add_prefix_space", false, "trim_offsets", false, "use_regex", false));
-        if ("qwen2".equals(s.pre())) {
+        if ("qwen2".equals(s.pre()) || "qwen35".equals(s.pre())) {
             json.put("normalizer", Json.obj("type", "NFC")); // Qwen's tokenizer.json normalizes to NFC, the GGUF does not say so
         }
         return Tokenizer.fromMaps(json, config(s));

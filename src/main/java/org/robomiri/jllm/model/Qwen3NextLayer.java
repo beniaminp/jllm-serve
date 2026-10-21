@@ -30,9 +30,30 @@ public record Qwen3NextLayer(float[] attnNorm, float[] ffnNorm, Mixer mixer, Mlp
      * @param dtBias  {@code dt_bias} per value head
      * @param norm    the gated RMSNorm's gain {@code [valueDim]}, applied as is (not zero-centred)
      * @param outProj {@code [dim, valueWidth]}
+     * @param z       null for the fused layout above. A GGUF file stores the projections separately, and keeps the tiny
+     *                b / a one in floats: then {@code inProj} is {@code [convDim, dim]} (q, k, v only), {@code z} is
+     *                {@code [valueWidth, dim]} (the gate of the gated norm) and {@code ba} is {@code [2 * valueHeads,
+     *                dim]}, rows [b (all heads) | a], each product written to its own buffer
+     * @param ba      see {@code z}; null exactly when {@code z} is
      */
-    public record DeltaNet(QTensor inProj, float[] conv, float[] a, float[] dtBias, float[] norm, QTensor outProj)
-            implements Mixer {
+    public record DeltaNet(QTensor inProj, float[] conv, float[] a, float[] dtBias, float[] norm, QTensor outProj,
+                           QTensor z, QTensor ba) implements Mixer {
+
+        public DeltaNet(QTensor inProj, float[] conv, float[] a, float[] dtBias, float[] norm, QTensor outProj) {
+            this(inProj, conv, a, dtBias, norm, outProj, null, null);
+        }
+
+        public DeltaNet {
+            if ((z == null) != (ba == null)) {
+                throw new IllegalArgumentException("z and ba are both set or both null");
+            }
+        }
+
+        /** True if the projections are separate tensors ({@link #z}, {@link #ba}) rather than one fused matrix. */
+        public boolean split() {
+            return z != null;
+        }
+
         @Override
         public int maxCols() {
             return Math.max(inProj.cols, outProj.cols);
@@ -59,7 +80,9 @@ public record Qwen3NextLayer(float[] attnNorm, float[] ffnNorm, Mixer mixer, Mlp
         } else {
             String q = p + "linear_attn.";
             mixer = new DeltaNet(f.tensor(q + "in_proj"), f.floats(q + "conv1d.weight"), f.floats(q + "A"),
-                    f.floats(q + "dt_bias"), f.floats(q + "norm.weight"), f.tensor(q + "out_proj.weight"));
+                    f.floats(q + "dt_bias"), f.floats(q + "norm.weight"), f.tensor(q + "out_proj.weight"),
+                    f.has(q + "in_proj_z") ? f.tensor(q + "in_proj_z") : null,
+                    f.has(q + "in_proj_z") ? f.tensor(q + "in_proj_ba") : null);
         }
         Mlp spec = arch.mlps().get(l);
         Qwen3NextLayer L = new Qwen3NextLayer(f.floats(p + "input_layernorm.weight"),
@@ -82,7 +105,10 @@ public record Qwen3NextLayer(float[] attnNorm, float[] ffnNorm, Mixer mixer, Mlp
             case GatedAttention g -> arch.isFull(l) && g.gqa().matches(arch.attention(), dim)
                     && g.gate().rows == arch.attention().qDim() && g.gate().cols == dim
                     && g.wo().rows == dim && g.wo().cols == arch.attention().qDim();
-            case DeltaNet n -> !arch.isFull(l) && n.inProj().rows == d.projDim() && n.inProj().cols == dim
+            case DeltaNet n -> !arch.isFull(l) && n.inProj().rows == (n.split() ? d.convDim() : d.projDim())
+                    && n.inProj().cols == dim
+                    && (!n.split() || n.z().rows == d.valueWidth() && n.z().cols == dim
+                    && n.ba().rows == 2 * d.valueHeads() && n.ba().cols == dim)
                     && n.conv().length == d.convDim() * d.convKernel() && n.a().length == d.valueHeads()
                     && n.dtBias().length == d.valueHeads() && n.norm().length == d.valueDim()
                     && n.outProj().rows == dim && n.outProj().cols == d.valueWidth();

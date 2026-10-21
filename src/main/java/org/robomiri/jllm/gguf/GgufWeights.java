@@ -44,8 +44,14 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     private long convertedBytes;
     private long viewedBytes;
 
+    /** The Gated DeltaNet hybrids' own tensor mapping (qwen35, qwen3next), else null. */
+    private final GgufQwenNext hybrid;
+
     public GgufWeights(GgufFile gguf) {
         this.gguf = gguf;
+        String arch = gguf.str("general.architecture", "");
+        GgufArchitecture.Family f = GgufArchitecture.Family.of(arch);
+        this.hybrid = f != null && f.hybrid() ? new GgufQwenNext(this, gguf, arena, arch) : null;
     }
 
     /** The llama.cpp names behind a canonical name: one, two for a fused pair, or null if the name is unknown. */
@@ -67,7 +73,11 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         String b = "blk." + m.group(1) + ".";
         return switch (m.group(2)) {
             case "input_layernorm.weight" -> new String[]{b + "attn_norm.weight"};
-            case "post_attention_layernorm.weight" -> new String[]{b + "ffn_norm.weight"};
+            case "post_attention_layernorm.weight" -> new String[]{b + (gguf.hasTensor(b + "post_attention_norm.weight")
+                    ? "post_attention_norm.weight" : "ffn_norm.weight")}; // the hybrids (qwen35, qwen3next) name it so
+            case "mlp.shared.gate_up" -> new String[]{b + "ffn_gate_shexp.weight", b + "ffn_up_shexp.weight"};
+            case "mlp.shared.down" -> new String[]{b + "ffn_down_shexp.weight"};
+            case "mlp.shared_gate" -> new String[]{b + "ffn_gate_inp_shexp.weight"};
             case "self_attn.q_norm.weight" -> new String[]{b + "attn_q_norm.weight"};
             case "self_attn.k_norm.weight" -> new String[]{b + "attn_k_norm.weight"};
             case "self_attn.q_proj.weight" -> new String[]{b + "attn_q.weight"};
@@ -88,6 +98,9 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
 
     @Override
     public boolean has(String name) {
+        if (hybrid != null && hybrid.owns(name)) {
+            return hybrid.has(name);
+        }
         String[] g = resolve(name);
         if (g == null) {
             return false;
@@ -111,6 +124,9 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
 
     @Override
     public QTensor tensor(String name) {
+        if (hybrid != null && hybrid.owns(name)) {
+            return hybrid.tensor(name);
+        }
         String[] g = require(name);
         if (g.length == 1) {
             return matrix(gguf.tensor(g[0]));
@@ -121,7 +137,14 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
 
     @Override
     public float[] floats(String name) {
-        GgufFile.Tensor t = gguf.tensor(require(name)[0]);
+        if (hybrid != null && hybrid.owns(name)) {
+            return hybrid.floats(name);
+        }
+        return floatsOf(gguf.tensor(require(name)[0]));
+    }
+
+    /** The elements of a float-typed tensor in file order. */
+    float[] floatsOf(GgufFile.Tensor t) {
         if (!GgmlCodec.isFloat(t.type())) {
             throw new IllegalArgumentException(t + " is quantized; a float vector (norm, bias, router) was expected");
         }
@@ -145,8 +168,28 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     }
 
     /** A matrix (or the rows of a stack of matrices) in the engine's formats: a view when the format matches, else Q8_0. */
-    private QTensor matrix(GgufFile.Tensor t) {
+    QTensor matrix(GgufFile.Tensor t) {
         return matrix(t, true);
+    }
+
+    /** Rows {@code src[i]} of {@code t} as a Q8_0 matrix (for formats that are not viewed in place, or a small float matrix). */
+    QTensor requantizeRows(GgufFile.Tensor t, int[] src) {
+        if (!GgmlCodec.canDequantize(t.type())) {
+            throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported");
+        }
+        int cols = colsOf(t);
+        if (cols % QType.BLOCK != 0) {
+            throw new IllegalArgumentException(t + ": a row of " + cols + " elements cannot be quantized to Q8_0");
+        }
+        countConverted(t.type(), t.size());
+        MemorySegment seg = gguf.data(t);
+        return QTensor.quantize(arena, QType.Q8_0, src.length, cols, (r, dst) ->
+                GgmlCodec.dequantizeRow(t.type(), seg, (long) src[r] * t.rowBytes(), cols, dst, 0));
+    }
+
+    void countConverted(GgmlType type, long bytes) {
+        converted.merge(type, 1, Integer::sum);
+        convertedBytes += bytes;
     }
 
     private QTensor matrix(GgufFile.Tensor t, boolean count) {
@@ -159,7 +202,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     }
 
     /** Q8_0 matrix of {@code rows} rows whose row r comes from {@code src[...]}. */
-    private QTensor requantize(int rows, int cols, GgufFile.Tensor... parts) {
+    QTensor requantize(int rows, int cols, GgufFile.Tensor... parts) {
         for (GgufFile.Tensor t : parts) {
             if (!GgmlCodec.canDequantize(t.type())) {
                 throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported (supported: F32, F16,"

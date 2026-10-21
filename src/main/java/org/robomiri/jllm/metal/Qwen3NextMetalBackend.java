@@ -67,6 +67,9 @@ public final class Qwen3NextMetalBackend implements Backend {
     private Metal.Buffer x;
     private Metal.Buffer xb;
     private Metal.Buffer proj;
+    /** Only for a GGUF model ({@link Qwen3NextLayer.DeltaNet#split()}): the z and the b | a products. */
+    private Metal.Buffer projZ;
+    private Metal.Buffer projBa;
     private Metal.Buffer qkv;
     private Metal.Buffer o;
     private Metal.Buffer q;
@@ -89,6 +92,8 @@ public final class Qwen3NextMetalBackend implements Backend {
         Metal.Buffer ffnNorm;
         // DeltaNet
         Metal.Buffer inProj;
+        Metal.Buffer inProjZ;
+        Metal.Buffer inProjBa;
         Metal.Buffer conv;
         Metal.Buffer a;
         Metal.Buffer dtBias;
@@ -163,6 +168,7 @@ public final class Qwen3NextMetalBackend implements Backend {
         ropeCos = k.upload(rope.cos);
         ropeSin = k.upload(rope.sin);
         layers = new LayerBufs[c.layers()];
+        boolean splitProj = false;
         keyCache = new Metal.Buffer[arch.fullLayers()];
         valCache = new Metal.Buffer[arch.fullLayers()];
         convState = new Metal.Buffer[arch.linearLayers()];
@@ -177,6 +183,11 @@ public final class Qwen3NextMetalBackend implements Backend {
             switch (L.mixer()) {
                 case Qwen3NextLayer.DeltaNet d -> {
                     b.inProj = k.wrap(d.inProj().data);
+                    if (d.split()) {
+                        b.inProjZ = k.wrap(d.z().data);
+                        b.inProjBa = k.wrap(d.ba().data);
+                        splitProj = true;
+                    }
                     b.conv = k.upload(d.conv());
                     b.a = k.upload(d.a());
                     b.dtBias = k.upload(d.dtBias());
@@ -219,6 +230,10 @@ public final class Qwen3NextMetalBackend implements Backend {
         x = k.scratch((long) maxBatch * dim * 4);
         xb = k.scratch((long) maxBatch * dim * 4);
         proj = k.scratch((long) maxBatch * dn.projDim() * 4);
+        if (splitProj) {
+            projZ = k.scratch((long) maxBatch * dn.valueWidth() * 4);
+            projBa = k.scratch((long) maxBatch * 2 * dn.valueHeads() * 4);
+        }
         qkv = k.scratch((long) maxBatch * dn.convDim() * 4);
         o = k.scratch((long) maxBatch * dn.valueWidth() * 4);
         q = k.scratch((long) maxBatch * g.qDim() * 4);
@@ -335,10 +350,19 @@ public final class Qwen3NextMetalBackend implements Backend {
         int pd = dn.projDim();
         int cd = dn.convDim();
         k.matmul(d.inProj(), b.inProj, xb, 0, proj, 0, n, false, null, 0f);
-        k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n);
-        k.gdnRule(qkv, proj, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
-                cd, pd, cd + dn.valueWidth(), 1e-6f, n);
-        k.gdnNormGate(o, proj, b.gdnNorm, dn.valueDim(), dn.valueHeads(), pd, cd, n);
+        if (d.split()) { // q k v | z | b a are three products in three buffers
+            k.matmul(d.z(), b.inProjZ, xb, 0, projZ, 0, n, false, null, 0f);
+            k.matmul(d.ba(), b.inProjBa, xb, 0, projBa, 0, n, false, null, 0f);
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), cd, cd, n);
+            k.gdnRule(qkv, projBa, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
+                    cd, 2 * dn.valueHeads(), 0, 1e-6f, dn.tiled(), n);
+            k.gdnNormGate(o, projZ, b.gdnNorm, dn.valueDim(), dn.valueHeads(), dn.valueWidth(), 0, n);
+        } else {
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n);
+            k.gdnRule(qkv, proj, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
+                    cd, pd, cd + dn.valueWidth(), 1e-6f, dn.tiled(), n);
+            k.gdnNormGate(o, proj, b.gdnNorm, dn.valueDim(), dn.valueHeads(), pd, cd, n);
+        }
         k.matmul(d.outProj(), b.outProj, o, 0, x, 0, n, true, null, 0f);
     }
 

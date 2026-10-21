@@ -46,8 +46,20 @@ public record Qwen3NextArch(Core core, List<Boolean> fullAttention, Attention.Gq
      * @param keyDim     {@code linear_key_head_dim}
      * @param valueDim   {@code linear_value_head_dim}
      * @param convKernel {@code linear_conv_kernel_dim}: taps of the depthwise causal conv over [q | k | v]
+     * @param tiled      the order of the value heads: false = grouped by key head (value head {@code h} uses key head
+     *                   {@code h / group}: Hugging Face's Qwen3-Next), true = tiled ({@code h % keyHeads}: the order
+     *                   llama.cpp's converter writes for Qwen3.5, see {@code docs/16-gguf.md})
      */
-    public record DeltaNet(int keyHeads, int valueHeads, int keyDim, int valueDim, int convKernel) {
+    public record DeltaNet(int keyHeads, int valueHeads, int keyDim, int valueDim, int convKernel, boolean tiled) {
+
+        public DeltaNet(int keyHeads, int valueHeads, int keyDim, int valueDim, int convKernel) {
+            this(keyHeads, valueHeads, keyDim, valueDim, convKernel, false);
+        }
+
+        /** The key head whose q and k value head {@code h} reads. */
+        public int keyHeadOf(int h) {
+            return tiled ? h % keyHeads : h / group();
+        }
 
         /** Width of all q (or k) heads of a token. */
         public int keyWidth() {
@@ -210,7 +222,7 @@ public record Qwen3NextArch(Core core, List<Boolean> fullAttention, Attention.Gq
 
         DeltaNet dn = new DeltaNet((int) Json.num(c, "linear_num_key_heads", 16), (int) Json.num(c, "linear_num_value_heads", 32),
                 (int) Json.num(c, "linear_key_head_dim", 128), (int) Json.num(c, "linear_value_head_dim", 128),
-                (int) Json.num(c, "linear_conv_kernel_dim", 4));
+                (int) Json.num(c, "linear_conv_kernel_dim", 4), Json.bool(c, Architecture.GGUF_TILED_VALUE_HEADS, false));
         if (dn.keyHeads() <= 0 || dn.valueHeads() <= 0 || dn.valueHeads() % dn.keyHeads() != 0 || dn.keyDim() <= 0
                 || dn.valueDim() <= 0 || dn.convKernel() < 1 || dn.convKernel() > 8) {
             throw new IllegalArgumentException("invalid linear attention config: " + dn
@@ -268,12 +280,13 @@ public record Qwen3NextArch(Core core, List<Boolean> fullAttention, Attention.Gq
         }
 
         String description = String.format("%s dim=%d ffn=%d layers=%d heads=%d/%d headDim=%d rotary=%d vocab=%d theta=%.0f"
-                        + " gdn(k=%dx%d v=%dx%d conv=%d) kinds=%s%s%s", arch, dim, hidden, layers, heads, kvHeads, headDim,
-                rotaryDim, vocab, theta, dn.keyHeads(), dn.keyDim(), dn.valueHeads(), dn.valueDim(), dn.convKernel(), kinds,
+                        + " gdn(k=%dx%d v=%dx%d conv=%d%s) kinds=%s%s%s", arch, dim, hidden, layers, heads, kvHeads, headDim,
+                rotaryDim, vocab, theta, dn.keyHeads(), dn.keyDim(), dn.valueHeads(), dn.valueDim(), dn.convKernel(), dn.tiled() ? " tiled" : "", kinds,
                 experts > 0 ? String.format(" experts=%d/%d moeDim=%d shared=%d%s", topK, experts, moeDim, sharedDim,
                         normTopK ? "" : " unnormalized") : "",
                 scaling instanceof Scaling.None ? "" : " scaled-rope");
-        Core core = new Core(arch, "qwen3_next", dim, layers, vocab, (float) Json.dbl(c, "rms_norm_eps", 1e-6),
+        // Qwen3.5 (the GGUF qwen35, the only family with tiled value heads) has its own chat template
+        Core core = new Core(arch, dn.tiled() ? "qwen3_5" : "qwen3_next", dim, layers, vocab, (float) Json.dbl(c, "rms_norm_eps", 1e-6),
                 Json.bool(c, "tie_word_embeddings", false), (int) Json.num(c, "bos_token_id", -1),
                 Families.intList(c, "eos_token_id"), (int) Json.num(c, "max_position_embeddings", 32768), 1f, 0f, false,
                 description);

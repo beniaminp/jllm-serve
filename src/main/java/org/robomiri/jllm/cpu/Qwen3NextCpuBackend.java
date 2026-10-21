@@ -67,6 +67,9 @@ public final class Qwen3NextCpuBackend implements Backend {
     private final float[] xb;
     // DeltaNet
     private final float[] proj;
+    /** Only for a GGUF model: z and b|a of {@link Qwen3NextLayer.DeltaNet#split()} layers. */
+    private final float[] projZ;
+    private final float[] projBa;
     private final float[] qkv;
     private final float[] o;
     private final float[] decay;   // [n, valueHeads]: log-space decay g = A * softplus(a + dt_bias)
@@ -111,6 +114,12 @@ public final class Qwen3NextCpuBackend implements Backend {
         x = new float[maxBatch * dim];
         xb = new float[maxBatch * dim];
         proj = new float[maxBatch * dn.projDim()];
+        boolean splitProj = false;
+        for (int l = 0; l < c.layers(); l++) {
+            splitProj |= w.qwen3NextLayer(l).mixer() instanceof Qwen3NextLayer.DeltaNet d && d.split();
+        }
+        projZ = splitProj ? new float[maxBatch * dn.valueWidth()] : null;
+        projBa = splitProj ? new float[maxBatch * 2 * dn.valueHeads()] : null;
         qkv = new float[maxBatch * dn.convDim()];
         o = new float[maxBatch * dn.valueWidth()];
         decay = new float[maxBatch * dn.valueHeads()];
@@ -258,19 +267,31 @@ public final class Qwen3NextCpuBackend implements Backend {
         int nk = dn.keyHeads();
         int dk = dn.keyDim();
         mm.mul(d.inProj(), xb, proj, 0, n, false);
+        // where the conv input, z and b | a of a token start: one fused row, or three separate products
+        boolean sp = d.split();
+        int ps = sp ? cd : pd;
+        float[] zArr = sp ? projZ : proj;
+        int zs = sp ? dn.valueWidth() : pd;
+        int zo0 = sp ? 0 : cd;
+        float[] baArr = sp ? projBa : proj;
+        int bas = sp ? 2 * nv : pd;
+        int bao = sp ? 0 : cd + dn.valueWidth();
+        if (sp) {
+            mm.mul(d.z(), xb, projZ, 0, n, false);
+            mm.mul(d.ba(), xb, projBa, 0, n, false);
+        }
         float[] cs = convState[li];
         float[] cw = d.conv();
         pool.forRange(cd, 32, (c0, c1) -> {
             for (int ch = c0; ch < c1; ch++) {
                 for (int t = 0; t < n; t++) {
-                    qkv[t * cd + ch] = MambaCpuBackend.convStep(cw, ch * kc, 0f, cs, ch * (kc - 1), kc, proj[t * pd + ch]);
+                    qkv[t * cd + ch] = MambaCpuBackend.convStep(cw, ch * kc, 0f, cs, ch * (kc - 1), kc, proj[t * ps + ch]);
                 }
             }
         });
         // q / k L2 normalization (q also scaled by keyDim^-0.5), beta and the decay of every token and head
         float qScale = (float) (1.0 / Math.sqrt(dk));
         int kw = dn.keyWidth();
-        int bOff = cd + dn.valueWidth();
         pool.forRange(n, 1, (t0, t1) -> {
             for (int t = t0; t < t1; t++) {
                 int r = t * cd;
@@ -279,8 +300,8 @@ public final class Qwen3NextCpuBackend implements Backend {
                     l2norm(qkv, r + kw + h * dk, dk, 1f);
                 }
                 for (int h = 0; h < nv; h++) {
-                    float b = proj[t * pd + bOff + h];
-                    float a = proj[t * pd + bOff + nv + h];
+                    float b = baArr[t * bas + bao + h];
+                    float a = baArr[t * bas + bao + nv + h];
                     beta[t * nv + h] = sigmoid(b);
                     decay[t * nv + h] = d.a()[h] * MambaCpuBackend.softplus(a + d.dtBias()[h]);
                 }
@@ -307,10 +328,10 @@ public final class Qwen3NextCpuBackend implements Backend {
                 int t = i / nv;
                 int h = i - t * nv;
                 int oo = t * vw + h * dv;
-                int zo = t * pd + cd + h * dv;
+                int zo = t * zs + zo0 + h * dv;
                 VectorKernels.rmsnormRow(o, oo, o, oo, nw, dv, c.normEps());
                 for (int j = 0; j < dv; j++) {
-                    o[oo + j] *= VectorKernels.silu(proj[zo + j]);
+                    o[oo + j] *= VectorKernels.silu(zArr[zo + j]);
                 }
             }
         });
@@ -340,14 +361,13 @@ public final class Qwen3NextCpuBackend implements Backend {
         int dv = dn.valueDim();
         int cd = dn.convDim();
         int kw = dn.keyWidth();
-        int group = dn.group();
         int vw = dn.valueWidth();
         pool.forRange(nv * dv, 8, (i0, i1) -> {
             for (int i = i0; i < i1; i++) {
                 int h = i / dv;
                 int j = i - h * dv;
                 int so = i * dk; // = (h * dv + j) * dk
-                int kh = h / group;
+                int kh = dn.keyHeadOf(h);
                 for (int t = 0; t < n; t++) {
                     recurrentStep(s, so, dk, qkv, t * cd + kw + kh * dk, qkv, t * cd + kh * dk,
                             qkv[t * cd + 2 * kw + h * dv + j], (float) Math.exp(decay[t * nv + h]), beta[t * nv + h],
@@ -408,7 +428,7 @@ public final class Qwen3NextCpuBackend implements Backend {
         int cd = dn.convDim();
         int kw = dn.keyWidth();
         int vw = dn.valueWidth();
-        int kh = h / dn.group();
+        int kh = dn.keyHeadOf(h);
         int sBase = h * dv * dk;
         float acc = 0;
         for (int u = 0; u < len; u++) {

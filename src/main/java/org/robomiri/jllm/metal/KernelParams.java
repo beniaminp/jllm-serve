@@ -32,7 +32,7 @@ public enum KernelParams {
     MAMBA_CONV("MambaConvParams", "iii"),
     MAMBA_SCAN("MambaScanParams", "iiii"),
     GDN_CONV("GdnConvParams", "iiiii"),
-    GDN_RULE("GdnRuleParams", "iiiiiiiif"),
+    GDN_RULE("GdnRuleParams", "iiiiiiiifi"),
     GDN_NORM("GdnNormParams", "iiiif"),
     GATE("GateParams", "i");
 
