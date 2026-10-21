@@ -43,10 +43,15 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer flashPart;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
     // through an f32 staging row and rope_h rounds it into the cache after the rotation, attention_h
-    // reads half; see the "f16 KV cache" section of kernels.metal
+    // reads half; see the "f16 KV cache" section of kernels.metal. q8 (backend.kv-dtype=q8): k and v both go
+    // through f32 staging rows (rope rotates k in place) and kv_store_q8 quantizes each (token, kv head) row into
+    // the cache, whose position rows are kvDim int8 values followed by one f32 scale per kv head; the *_q8
+    // attention kernels read them
+    private final KvDtype kvDtype;
     private final boolean kvHalf;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private Metal.Buffer kStage;
+    private Metal.Buffer vStage;
 
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
@@ -261,6 +266,7 @@ public final class MetalBackend implements Backend {
         this.c = arch.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
+        this.kvDtype = kvDtype;
         this.kvHalf = kvDtype == KvDtype.F16;
         this.k = new MetalKernels(metal, c.normEps());
         try {
@@ -280,7 +286,7 @@ public final class MetalBackend implements Backend {
         // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
         attnGroup = attnGroupOverride(a);
         int hd = a.headDim();
-        String vh = kvHalf ? "_h" : "";
+        String vh = MetalKernels.kvSuffix(kvDtype);
         attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
         if (arch.maxExperts() > MetalConstants.MAX_EXPERTS) {
             throw new IllegalArgumentException("Metal router kernel supports at most " + MetalConstants.MAX_EXPERTS + " experts");
@@ -308,12 +314,14 @@ public final class MetalBackend implements Backend {
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
         if (a instanceof Attention.Gqa g) { // DeepSeek: MlaMetal owns its latent cache
-            long kvBytes = (long) ctx * g.kvDim() * kvDtype.bytes;
+            long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
             for (int l = 0; l < c.layers(); l++) {
                 keyCache[l] = k.scratch(kvBytes);
                 valCache[l] = k.scratch(kvBytes);
             }
-            kStage = kvHalf ? k.scratch((long) maxBatch * g.kvDim() * 4) : null; // f32 k rows before RoPE
+            // f32 k rows before RoPE (f16, q8) and v rows before the quantization (q8)
+            kStage = kvDtype != KvDtype.F32 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            vStage = kvDtype == KvDtype.Q8 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
         }
         x = k.scratch((long) maxBatch * c.dim() * 4);
         xb = k.scratch((long) maxBatch * c.dim() * 4);
@@ -323,7 +331,7 @@ public final class MetalBackend implements Backend {
         scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * a.heads() * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
         if (a instanceof Attention.Gqa g) {
-            MetalTuner.Decision d = MetalTuner.decide(k, g, kvHalf, attnKernel, attnGroup);
+            MetalTuner.Decision d = MetalTuner.decide(k, g, kvDtype, attnKernel, attnGroup);
             flashPrefill = d.flashPrefill();
             flashDecode = d.flashDecode();
             System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
@@ -744,9 +752,13 @@ public final class MetalBackend implements Backend {
         public void run(int layer, int n, int pos, boolean fuseNorm) {
             int dim = c.dim();
             int kvDim = g.kvDim();
-            long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
-            Metal.Buffer kDst = kvHalf ? kStage : keyCache[layer];
-            long kOff = kvHalf ? 0 : cacheOff;
+            boolean q8 = kvDtype == KvDtype.Q8;
+            int stride = kvDtype.rowStride(kvDim, g.kvHeads()); // cache row stride in elements (q8: bytes)
+            long cacheOff = pos * kvDtype.rowBytes(kvDim, g.kvHeads());
+            Metal.Buffer kDst = kvDtype != KvDtype.F32 ? kStage : keyCache[layer];
+            long kOff = kvDtype != KvDtype.F32 ? 0 : cacheOff;
+            Metal.Buffer vDst = q8 ? vStage : valCache[layer];
+            long vOff = q8 ? 0 : cacheOff;
             Metal.Buffer in = x;
             Metal.Buffer norm = attnNorm;
             if (!fuseNorm) {
@@ -754,27 +766,31 @@ public final class MetalBackend implements Backend {
                 in = xb;
                 norm = null;
             }
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, valCache[layer], cacheOff, kvHalf, bq, bk, bv, n);
+            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vDst, vOff, kvHalf, bq, bk, bv, n);
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
-            // and written to the cache rows at pos (the same rows for f32, rounded to half for f16)
+            // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
+            // into the staging rows, which kv_store_q8 then quantizes together with v)
             boolean useNorm = !partial && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
-            k.rope(table.pairing() == RopeTable.Pairing.INTERLEAVED, kvHalf, q, kDst, kOff, keyCache[layer], cacheOff,
-                    useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
+            k.rope(table.pairing() == RopeTable.Pairing.INTERLEAVED, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer],
+                    q8 ? 0 : cacheOff, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                     g.headDim(), g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
             int hd = g.headDim();
+            if (q8) {
+                k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
+            }
             if (flashDecode && n == 1 && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
-                k.flashAttention(kvHalf, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
-                        hd, pos, ctx, g.scale(), g.qDim(), kvDim, g.window(), g.softcap());
+                k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
+                        hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
                 return;
             }
             if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
-                k.flashPrefill(kvHalf, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
-                        g.scale(), g.qDim(), kvDim, g.qDim(), g.window(), g.softcap());
+                k.flashPrefill(kvDtype, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
+                        g.scale(), g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                 return;
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
-                    pos, ctx, g.scale(), g.qDim(), kvDim, kvDim, g.qDim(), g.window(), g.softcap(), n);
+                    pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
         }
     }
 
@@ -1353,7 +1369,8 @@ public final class MetalBackend implements Backend {
 
     /**
      * The KV cache rows as CpuBackend saves them ({@code KvCache.write}): per layer, per position, the K row then the V
-     * row, little-endian f32 or IEEE half; Metal's {@code half} has the same bits, so a cache saved by either backend
+     * row, little-endian f32 or IEEE half, or q8's kvDim int8 values followed by the kvHeads f32 scales; Metal's
+     * {@code half} has the same bits and its q8 cache rows are that layout already, so a cache saved by either backend
      * has the same layout. DeepSeek's latent cache is not saved.
      */
     @Override
@@ -1361,11 +1378,12 @@ public final class MetalBackend implements Backend {
         if (!(arch.attention() instanceof Attention.Gqa g)) {
             return null;
         }
-        return "kv " + (kvHalf ? "f16" : "f32") + " layers=" + c.layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
+        return "kv " + kvDtype + " layers=" + c.layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
     }
 
     private long rowBytes() {
-        return (long) ((Attention.Gqa) arch.attention()).kvDim() * (kvHalf ? 2 : 4);
+        Attention.Gqa g = (Attention.Gqa) arch.attention();
+        return kvDtype.rowBytes(g.kvDim(), g.kvHeads());
     }
 
     @Override

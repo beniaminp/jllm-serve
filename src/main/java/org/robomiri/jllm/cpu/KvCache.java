@@ -3,6 +3,7 @@ package org.robomiri.jllm.cpu;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
 
+import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.VectorOperators;
@@ -23,8 +24,9 @@ import java.util.Arrays;
  * with broadcast query elements, with no horizontal reduction per key. V is stored as rows ({@code [ctx, kvDim]}),
  * the shape the output accumulation wants. {@link F32} holds floats that the kernels read in place. {@link F16}
  * holds IEEE halves packed two to an {@code int}, which vector code converts with shifts and masks into thread-local
- * scratch, a block of keys at a time. The math is f32 in both cases; f16 only changes what is stored between
- * forward calls.
+ * scratch, a block of keys at a time. {@link Q8} holds int8 values with one f32 scale per (position, kv head) row,
+ * widened and multiplied by their scales with vector code into the same scratch. The math is f32 in every case; the
+ * element type only changes what is stored between forward calls.
  *
  * <p><b>Tiling.</b> The work is split into tiles of one kv head and up to {@link #MAX_TILE} consecutive tokens
  * (fewer when their score rows over the {@code pos + n} keys would exceed {@link #SCORE_BUDGET}), which serve
@@ -82,7 +84,7 @@ public abstract class KvCache {
 
     /** Heap bytes of the keys and values of {@code layers} layers for {@code ctx} positions. */
     public static long bytes(KvDtype dtype, int layers, Attention.Gqa a, int ctx) {
-        return 2L * layers * ctx * a.kvDim() * (dtype == KvDtype.F16 ? 2 : 4);
+        return 2L * layers * ctx * dtype.rowBytes(a.kvDim(), a.kvHeads());
     }
 
     /**
@@ -98,7 +100,7 @@ public abstract class KvCache {
         if (need > 0.92 * free) {
             throw new IllegalStateException(String.format(java.util.Locale.ROOT, "the %s KV cache for a context of %d"
                     + " needs %.2f GB of Java heap, but only %.2f GB are free (heap -Xmx %.1f GB): lower backend.ctx,"
-                    + " use backend.kv-dtype=f16, or give the JVM more heap (JLLM_XMX=16g)", dtype, ctx, need / 1e9,
+                    + " use backend.kv-dtype=f16 or q8, or give the JVM more heap (JLLM_XMX=16g)", dtype, ctx, need / 1e9,
                     free / 1e9, Runtime.getRuntime().maxMemory() / 1e9));
         }
     }
@@ -127,6 +129,7 @@ public abstract class KvCache {
         return switch (dtype) {
             case F32 -> new F32(layers, a, ctx);
             case F16 -> new F16(layers, a, ctx);
+            case Q8 -> new Q8(layers, a, ctx);
         };
     }
 
@@ -177,7 +180,7 @@ public abstract class KvCache {
 
     /** Layout of {@link #write}: the element type and the shape, so a file is only read into an equal cache. */
     public final String format() {
-        return (this instanceof F16 ? "f16" : "f32") + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
+        return (this instanceof F16 ? "f16" : this instanceof Q8 ? "q8" : "f32") + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
     }
 
     /** Positions {@code [0, n)} of every layer copied from {@code o}, a cache of the same {@link #format}. */
@@ -196,20 +199,31 @@ public abstract class KvCache {
     /** Rows per buffer of {@link #write} / {@link #read}. */
     private static final int IO_ROWS = 256;
 
+    /** Bytes of one position's K (or V) row in {@link #write}'s format. */
+    private int ioRowBytes() {
+        return (int) (this instanceof F16 ? KvDtype.F16 : this instanceof Q8 ? KvDtype.Q8 : KvDtype.F32)
+                .rowBytes(kvDim, kvHeads);
+    }
+
     /**
      * Writes positions {@code [0, n)} of every layer: per layer, per position, the K row then the V row in natural
-     * element order, little-endian, as f32 or f16 (the stored type, so nothing is rounded).
+     * element order, little-endian, as f32 or f16, or for q8 the {@code kvDim} int8 values followed by the
+     * {@code kvHeads} f32 scales (the stored type, so nothing is rounded).
      */
     public final void write(int n, WritableByteChannel out) throws IOException {
         boolean half = this instanceof F16;
-        int el = half ? 2 : 4;
+        Q8 q8 = this instanceof Q8 c ? c : null;
         float[] row = new float[kvDim];
-        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * kvDim * el).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * ioRowBytes()).order(ByteOrder.LITTLE_ENDIAN);
         for (int layer = 0; layer < layers; layer++) {
             for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
                 buf.clear();
                 for (int s = s0; s < Math.min(n, s0 + IO_ROWS); s++) {
                     for (int kind = 0; kind < 2; kind++) {
+                        if (q8 != null) {
+                            q8.writeRow(layer, kind == 1, s, buf);
+                            continue;
+                        }
                         for (int g = 0; g < kvHeads; g++) {
                             expand(layer, kind == 1, s, g * headDim, row, g * headDim);
                         }
@@ -236,20 +250,28 @@ public abstract class KvCache {
             throw new IOException("the saved cache holds " + n + " positions, the context is " + ctx);
         }
         boolean half = this instanceof F16;
-        int el = half ? 2 : 4;
+        Q8 q8 = this instanceof Q8 c ? c : null;
+        int rb = ioRowBytes();
         float[] k = new float[IO_ROWS * kvDim];
         float[] v = new float[IO_ROWS * kvDim];
-        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * kvDim * el).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * rb).order(ByteOrder.LITTLE_ENDIAN);
         for (int layer = 0; layer < layers; layer++) {
             for (int s0 = 0; s0 < n; s0 += IO_ROWS) {
                 int m = Math.min(n - s0, IO_ROWS);
-                buf.clear().limit(m * 2 * kvDim * el);
+                buf.clear().limit(m * 2 * rb);
                 while (buf.hasRemaining()) {
                     if (in.read(buf) < 0) {
                         throw new EOFException("the saved cache file is truncated");
                     }
                 }
                 buf.flip();
+                if (q8 != null) { // the stored int8 values and scales as they are: no second rounding
+                    for (int r = 0; r < m; r++) {
+                        q8.readRow(layer, false, s0 + r, buf);
+                        q8.readRow(layer, true, s0 + r, buf);
+                    }
+                    continue;
+                }
                 for (int r = 0; r < m; r++) {
                     for (int kind = 0; kind < 2; kind++) {
                         float[] dst = kind == 0 ? k : v;
@@ -1079,6 +1101,197 @@ public abstract class KvCache {
         static void toFloat(short[] src, int so, float[] dst, int d, int n) {
             for (int i = 0; i < n; i++) {
                 dst[d + i] = Float.float16ToFloat(src[so + i]);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ q8
+
+    /**
+     * q8: int8 values, symmetric, with one f32 scale per (position, kv head) row of {@code headDim} values
+     * ({@code scale = max|x| / 127}, {@code q = rint(x / scale)}, see {@link KvDtype#q8}), so a stored value is off by
+     * at most {@code scale / 2}. K chunks are transposed like {@link F32} ({@code [kvHeads][chunks][hd][CHUNK]} bytes)
+     * with the scales of a chunk's keys next to each other ({@code [kvHeads][chunks][CHUNK]}), so a vector of
+     * {@code FL} keys is widened ({@code B2F}) and multiplied by a vector of their scales; V rows are
+     * {@code [ctx, kvDim]} bytes with scales {@code [ctx, kvHeads]}. The byte arrays carry 16 bytes of padding so a
+     * 16-byte load at the last vector stays inside them.
+     */
+    static final class Q8 extends KvCache {
+        private static final VectorSpecies<Byte> B16 = VectorKernels.B16;
+        final byte[][] key;
+        final float[][] keyScale;
+        final byte[][] val;
+        final float[][] valScale;
+
+        Q8(int layers, Attention.Gqa a, int ctx) {
+            super(layers, a, ctx);
+            key = new byte[layers][kvHeads * chunks() * headDim * CHUNK + 16];
+            keyScale = new float[layers][kvHeads * chunks() * CHUNK];
+            val = new byte[layers][ctx * kvDim + 16];
+            valScale = new float[layers][ctx * kvHeads];
+        }
+
+        /** Index of key {@code s}'s scale for kv head {@code g}. */
+        private int keyScaleAt(int g, int s) {
+            return (g * chunks() + s / CHUNK) * CHUNK + s % CHUNK;
+        }
+
+        private static float maxAbs(float[] x, int o, int n) {
+            float m = 0f;
+            for (int i = 0; i < n; i++) {
+                m = Math.max(m, Math.abs(x[o + i]));
+            }
+            return m;
+        }
+
+        @Override
+        public void store(int layer, int pos, float[] k, float[] v, int n) {
+            byte[] kc = key[layer];
+            byte[] vc = val[layer];
+            for (int t = 0; t < n; t++) {
+                int s = pos + t;
+                for (int g = 0; g < kvHeads; g++) {
+                    int src = t * kvDim + g * headDim;
+                    float ks = KvDtype.q8Scale(maxAbs(k, src, headDim));
+                    keyScale[layer][keyScaleAt(g, s)] = ks;
+                    int base = keyChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim; i++) {
+                        kc[base + i * CHUNK] = KvDtype.q8(k[src + i], ks);
+                    }
+                    float vs = KvDtype.q8Scale(maxAbs(v, src, headDim));
+                    valScale[layer][s * kvHeads + g] = vs;
+                    int vb = s * kvDim + g * headDim;
+                    for (int i = 0; i < headDim; i++) {
+                        vc[vb + i] = KvDtype.q8(v[src + i], vs);
+                    }
+                }
+            }
+        }
+
+        /** Puts row {@code s} (K or V) as {@link #write} stores it: {@code kvDim} int8 values, then the scales. */
+        void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
+            for (int g = 0; g < kvHeads; g++) {
+                if (values) {
+                    buf.put(val[layer], s * kvDim + g * headDim, headDim);
+                } else {
+                    int base = keyChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim; i++) {
+                        buf.put(key[layer][base + i * CHUNK]);
+                    }
+                }
+            }
+            for (int g = 0; g < kvHeads; g++) {
+                buf.putFloat(values ? valScale[layer][s * kvHeads + g] : keyScale[layer][keyScaleAt(g, s)]);
+            }
+        }
+
+        /** Reads what {@link #writeRow} put into row {@code s}. */
+        void readRow(int layer, boolean values, int s, ByteBuffer buf) {
+            for (int g = 0; g < kvHeads; g++) {
+                if (values) {
+                    buf.get(val[layer], s * kvDim + g * headDim, headDim);
+                } else {
+                    int base = keyChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim; i++) {
+                        key[layer][base + i * CHUNK] = buf.get();
+                    }
+                }
+            }
+            for (int g = 0; g < kvHeads; g++) {
+                float sc = buf.getFloat();
+                if (values) {
+                    valScale[layer][s * kvHeads + g] = sc;
+                } else {
+                    keyScale[layer][keyScaleAt(g, s)] = sc;
+                }
+            }
+        }
+
+        @Override
+        void copyLayer(KvCache o, int layer, int n, int chunksUsed) {
+            Q8 src = (Q8) o;
+            for (int g = 0; g < kvHeads; g++) {
+                System.arraycopy(src.key[layer], src.keyChunk(g, 0), key[layer], keyChunk(g, 0), chunksUsed * headDim * CHUNK);
+                System.arraycopy(src.keyScale[layer], src.keyScaleAt(g, 0), keyScale[layer], keyScaleAt(g, 0), chunksUsed * CHUNK);
+            }
+            System.arraycopy(src.val[layer], 0, val[layer], 0, n * kvDim);
+            System.arraycopy(src.valScale[layer], 0, valScale[layer], 0, n * kvHeads);
+        }
+
+        @Override
+        float[] keysInPlace(int layer) {
+            return null;
+        }
+
+        @Override
+        float[] valuesInPlace(int layer) {
+            return null;
+        }
+
+        /** The first {@code FL} of the 16 bytes at {@code a[i ..]}, widened to floats. */
+        private static FloatVector widen(byte[] a, int i) {
+            return (FloatVector) ByteVector.fromArray(B16, a, i).castShape(VectorKernels.F, 0);
+        }
+
+        @Override
+        void expandKeys(int layer, int g, int c0, int c1, float[] dst, int d) {
+            byte[] kc = key[layer];
+            float[] ks = keyScale[layer];
+            int fl = VectorKernels.FL;
+            int hd = headDim;
+            for (int c = c0; c < c1; c++) {
+                int src = keyChunk(g, c);
+                int o = d + (c - c0) * hd * CHUNK;
+                int so = (g * chunks() + c) * CHUNK;
+                for (int v = 0; v < CHUNK; v += fl) {
+                    FloatVector sc = FloatVector.fromArray(VectorKernels.F, ks, so + v); // the scales of FL keys
+                    for (int i = 0; i < hd; i++) {
+                        widen(kc, src + i * CHUNK + v).mul(sc).intoArray(dst, o + i * CHUNK + v);
+                    }
+                }
+            }
+        }
+
+        @Override
+        void expandValues(int layer, int g, int s0, int s1, int i0, int i1, float[] dst, int d) {
+            byte[] vc = val[layer];
+            int fl = VectorKernels.FL;
+            int w = i1 - i0;
+            for (int s = s0; s < s1; s++) {
+                int src = s * kvDim + g * headDim;
+                int o = d + (s - s0) * w - i0;
+                float sc = valScale[layer][s * kvHeads + g];
+                for (int i = i0; i < i1; i += fl) {
+                    widen(vc, src + i).mul(sc).intoArray(dst, o + i);
+                }
+            }
+        }
+
+        @Override
+        void expand(int layer, boolean values, int s, int ko, float[] dst, int d) {
+            int g = ko / headDim;
+            if (values) {
+                float sc = valScale[layer][s * kvHeads + g];
+                for (int i = 0; i < headDim; i++) {
+                    dst[d + i] = val[layer][s * kvDim + ko + i] * sc;
+                }
+                return;
+            }
+            float sc = keyScale[layer][keyScaleAt(g, s)];
+            int base = keyChunk(g, s / CHUNK) + s % CHUNK;
+            for (int i = 0; i < headDim; i++) {
+                dst[d + i] = key[layer][base + i * CHUNK] * sc;
+            }
+        }
+
+        @Override
+        public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
+                       float softcap) {
+            // with as many kv heads as threads the tiled kernel is already balanced and keeps a head's work on one core
+            if (n == 1 && vectorized() && kvHeads < pool.threads()) {
+                attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
+            } else {
+                attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
             }
         }
     }

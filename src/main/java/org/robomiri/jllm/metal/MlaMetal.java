@@ -9,12 +9,13 @@ import org.robomiri.jllm.model.ModelWeights;
  * DeepSeek multi-head latent attention on the GPU, driven by {@link MetalBackend} (see {@code MlaCpu} for the
  * math of the absorbed form). Projections, norms and the rotary embedding (the interleaved {@code rope_il} on the
  * slice after the nope part) reuse the generic kernels; the attention is the generic kernel's
- * {@code attention_mla[_h]} instantiation over one shared kv head with keys {@code kv_lora_rank + rope} and values
+ * {@code attention_mla[_h|_q8]} instantiation over one shared kv head with keys {@code kv_lora_rank + rope} and values
  * {@code kv_lora_rank} wide; the kernels specific to DeepSeek are {@code mla_lat_store}, {@code mla_absorb_q} and
  * {@code mla_apply_v} (the router and the shared experts are the backend's MoE step).
  *
  * <p>The cache holds the latent rows {@code [c | k_pe]}: {@code (kv_lora_rank + rope)} values per token and layer in
- * f32 or, with {@code backend.kv-dtype=f16}, half (2.3 KB resp. 1.2 KB per token and layer for DeepSeek-V2-Lite).
+ * f32 or, with {@code backend.kv-dtype=f16}, half, or with {@code q8} int8 and one f32 scale per row (2.3 KB, 1.2 KB
+ * resp. 0.6 KB per token and layer for DeepSeek-V2-Lite).
  * The two halves of {@code kv_b_proj} live on the GPU dequantized to f32, {@code heads * (nope + v) * kv_lora_rank}
  * floats per layer (8 MB for V2-Lite).
  */
@@ -38,9 +39,9 @@ final class MlaMetal {
     private final MetalKernels k;
     private final Attention.Mla m;
     private final int ctx;
-    private final boolean kvHalf;
+    private final KvDtype kv;
     private final Bufs[] bufs;
-    /** Per layer: ctx rows of kvLora + rope (f32 or half). */
+    /** Per layer: ctx rows of kvLora + rope (f32, half, or int8 followed by the row's f32 scale). */
     private final Metal.Buffer[] cache;
     private final Metal.Buffer qa;
     private final Metal.Buffer qaNorm;
@@ -56,7 +57,7 @@ final class MlaMetal {
         this.k = mb.k;
         this.m = m;
         this.ctx = ctx;
-        this.kvHalf = kvDtype == KvDtype.F16;
+        this.kv = kvDtype;
         int kvl = m.kvLoraRank();
         int aw = m.latentDim();
         if (kvl % 32 != 0 || aw % 32 != 0 || aw > MetalConstants.MLA_MAX_PER * 32 || m.rope() / 2 > 256) {
@@ -90,7 +91,7 @@ final class MlaMetal {
         // all n tokens of the chunk before it is read.
         cache = new Metal.Buffer[layers];
         for (int l = 0; l < layers; l++) {
-            cache[l] = k.scratch((long) ctx * aw * kvDtype.bytes);
+            cache[l] = k.scratch((long) ctx * kvDtype.rowBytes(aw, 1));
         }
         qa = k.scratch((long) maxBatch * Math.max(m.qLoraRank(), 1) * 4);
         qaNorm = k.scratch((long) maxBatch * Math.max(m.qLoraRank(), 1) * 4);
@@ -131,11 +132,12 @@ final class MlaMetal {
                 heads, 0, pos, nope, rd / 2, n);
         k.rope(true, false, kpe, kpe, 0, kpe, 0, null, null, cos, sin, rd, rd, rd, 1, 0, pos, 0, rd / 2, n);
 
-        k.mlaLatStore(kvHalf, latNorm, kpe, cache[l], (long) pos * aw * (kvHalf ? 2 : 4), m, n);
+        k.mlaLatStore(kv, latNorm, kpe, cache[l], pos * kv.rowBytes(aw, 1), m, n);
         k.mlaAbsorbQ(mb.q, b.wk, qAbs, m, n);
         // one kv head (the cache row) shared by all query heads; the value is the leading kvl of the key row
-        k.attention(kvHalf ? "attention_mla_h" : "attention_mla", 1, qAbs, cache[l], cache[l], oLat, mb.scores, heads, 1,
-                aw, kvl, pos, ctx, m.scale(), heads * aw, aw, aw, heads * kvl, 0, 0f, n);
+        int stride = kv.rowStride(aw, 1);
+        k.attention("attention_mla" + MetalKernels.kvSuffix(kv), 1, qAbs, cache[l], cache[l], oLat, mb.scores, heads, 1,
+                aw, kvl, pos, ctx, m.scale(), heads * aw, stride, stride, heads * kvl, 0, 0f, n);
         k.mlaApplyV(oLat, b.wv, mb.att, m, n);
     }
 }

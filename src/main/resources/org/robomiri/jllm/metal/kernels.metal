@@ -1157,7 +1157,8 @@ template [[host_name("rope_il_h")]] kernel decltype(rope<half, true>) rope<half,
 // ---------------------------------------------------------------------------------------------- 4. attention
 // Causal attention for the tokens t = tokenOffset + tgp.y of a tile at positions pos0 + t, 256 threads =
 // 8 simdgroups per threadgroup. attention_t<KV, G, PERK, PERV> is the one kernel behind every variant:
-//   KV          cache element type (float, or half for backend.kv-dtype=f16; converted on load, all arithmetic f32)
+//   KV          cache element type (float, half for backend.kv-dtype=f16, char for q8: int8 values with a scale per
+//               (position, kv head) row, see kv_scale; converted on load, all arithmetic f32)
 //   G           query heads of one KV head per threadgroup (grid (nHeads / G, tile)); G > 1 shares each K/V row
 //               across the group and is opt-in (-Djllm.metal.attnGroup, JLLM_ATTN_GROUPS)
 //   PERK, PERV  key / value head width in units of 32 (compile-time), or 0 for the widths in the params:
@@ -1179,13 +1180,24 @@ struct AttnParams {
     int ctx;
     float scale;
     int qStride;     // q row stride (nHeads * qkDim)
-    int kStride;     // key cache row stride (nKvHeads * qkDim)
-    int vStride;     // value cache row stride (nKvHeads * vDim)
+    int kStride;     // key cache row stride in elements (nKvHeads * qkDim; q8: + 4 * nKvHeads scale bytes)
+    int vStride;     // value cache row stride in elements (as kStride)
     int oStride;     // output row stride (nHeads * vDim)
     int window;      // sliding-window length in tokens, 0 = full causal attention
     int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
     float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
 };
+
+// The q8 cache (backend.kv-dtype=q8, KV = char): a position's row of the cache is its kvDim int8 values followed by
+// one f32 scale per kv head (stride = kvDim + 4 * nKvHeads bytes; DeepSeek's latent row: aw values, one scale), so
+// value i of kv head h at position s is row[h * headDim + i] * scale[h]. kv_scale(row, stride, nKvHeads, h) is that
+// scale for a q8 row and 1 for float / half rows (the product then compiles to the plain f32 / f16 arithmetic): the
+// kernels multiply a score (q . k_int) or a probability by it once per row instead of every element.
+static inline float kv_scale(device const float *, int, int, int) { return 1.0f; }
+static inline float kv_scale(device const half *, int, int, int) { return 1.0f; }
+static inline float kv_scale(device const char *row, int stride, int nKvHeads, int kvh) {
+    return ((device const float *)(row + stride - 4 * nKvHeads))[kvh];
+}
 
 template <typename KV, int G, int PERK, int PERV, int MAXP = MAX_PER>
 kernel void attention_t(device const float *q [[buffer(0)]],
@@ -1233,12 +1245,13 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     for (int g = 0; g < G; g++) mx[g] = -INFINITY;
     for (int s = first + sg; s < len; s += nsg) {
         device const KV *kv = kb + (ulong)s * p.kStride;
+        const float ks = p.scale * kv_scale(kc + (ulong)s * p.kStride, p.kStride, p.nKvHeads, kvh);
         float kr[MK];
         for (int i = 0; i < MK; i++) kr[i] = i < perK ? float(kv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
             float d = 0.0f;
             for (int i = 0; i < MK; i++) if (i < perK) d += qr[g][i] * kr[i];
-            d = simd_sum(d) * p.scale;
+            d = simd_sum(d) * ks;
             if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
             if (lane == 0) sc[g][s] = d;
             mx[g] = max(mx[g], d);
@@ -1282,10 +1295,11 @@ kernel void attention_t(device const float *q [[buffer(0)]],
         for (int i = 0; i < MV; i++) o[g][i] = 0.0f;
     for (int s = first + sg; s < len; s += nsg) {
         device const KV *vv = vb + (ulong)s * p.vStride;
+        const float vs = kv_scale(vc + (ulong)s * p.vStride, p.vStride, p.nKvHeads, kvh);
         float vr[MV];
         for (int i = 0; i < MV; i++) vr[i] = i < perV ? float(vv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
-            const float pr = sc[g][s];
+            const float pr = sc[g][s] * vs;
             for (int i = 0; i < MV; i++) if (i < perV) o[g][i] += pr * vr[i];
         }
     }
@@ -1302,17 +1316,18 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     }
 }
 
-// attention / attention_h: runtime widths (head dims other than 64 / 128 / 256);
-// attention_mla / attention_mla_h: runtime widths up to MLA_MAX_PER * 32 (DeepSeek's absorbed queries);
-// attention_g{G}_d{headDim}[_h]: compile-time widths, G query heads per threadgroup.
+// attention / attention_h / attention_q8: runtime widths (head dims other than 64 / 128 / 256);
+// attention_mla[_h|_q8]: runtime widths up to MLA_MAX_PER * 32 (DeepSeek's absorbed queries);
+// attention_g{G}_d{headDim}[_h|_q8]: compile-time widths, G query heads per threadgroup.
 #define ATTN_INST(KV, G, PER, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_t<KV, G, PER, PER>) attention_t<KV, G, PER, PER>;
-ATTN_INST(float, 1, 0, "attention")           ATTN_INST(half, 1, 0, "attention_h")
+ATTN_INST(float, 1, 0, "attention")           ATTN_INST(half, 1, 0, "attention_h")          ATTN_INST(char, 1, 0, "attention_q8")
 template [[host_name("attention_mla")]] kernel decltype(attention_t<float, 1, 0, 0, MLA_MAX_PER>) attention_t<float, 1, 0, 0, MLA_MAX_PER>;
 template [[host_name("attention_mla_h")]] kernel decltype(attention_t<half, 1, 0, 0, MLA_MAX_PER>) attention_t<half, 1, 0, 0, MLA_MAX_PER>;
-ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(half, 1, 2, "attention_g1_d64_h")
-ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(half, 1, 4, "attention_g1_d128_h")
-ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(half, 1, 8, "attention_g1_d256_h")
+template [[host_name("attention_mla_q8")]] kernel decltype(attention_t<char, 1, 0, 0, MLA_MAX_PER>) attention_t<char, 1, 0, 0, MLA_MAX_PER>;
+ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(half, 1, 2, "attention_g1_d64_h")   ATTN_INST(char, 1, 2, "attention_g1_d64_q8")
+ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(half, 1, 4, "attention_g1_d128_h")  ATTN_INST(char, 1, 4, "attention_g1_d128_q8")
+ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(half, 1, 8, "attention_g1_d256_h")  ATTN_INST(char, 1, 8, "attention_g1_d256_q8")
 // The grouped variants are only instantiated when the host defines JLLM_ATTN_GROUPS (-Djllm.metal.attnGroup).
 #ifdef JLLM_ATTN_GROUPS
 ATTN_INST(float, 2, 2, "attention_g2_d64")    ATTN_INST(float, 4, 2, "attention_g4_d64")    ATTN_INST(float, 8, 2, "attention_g8_d64")
@@ -1321,6 +1336,9 @@ ATTN_INST(float, 2, 8, "attention_g2_d256")   ATTN_INST(float, 4, 8, "attention_
 ATTN_INST(half, 2, 2, "attention_g2_d64_h")   ATTN_INST(half, 4, 2, "attention_g4_d64_h")   ATTN_INST(half, 8, 2, "attention_g8_d64_h")
 ATTN_INST(half, 2, 4, "attention_g2_d128_h")  ATTN_INST(half, 4, 4, "attention_g4_d128_h")  ATTN_INST(half, 8, 4, "attention_g8_d128_h")
 ATTN_INST(half, 2, 8, "attention_g2_d256_h")  ATTN_INST(half, 4, 8, "attention_g4_d256_h")  ATTN_INST(half, 8, 8, "attention_g8_d256_h")
+ATTN_INST(char, 2, 2, "attention_g2_d64_q8")  ATTN_INST(char, 4, 2, "attention_g4_d64_q8")  ATTN_INST(char, 8, 2, "attention_g8_d64_q8")
+ATTN_INST(char, 2, 4, "attention_g2_d128_q8") ATTN_INST(char, 4, 4, "attention_g4_d128_q8") ATTN_INST(char, 8, 4, "attention_g8_d128_q8")
+ATTN_INST(char, 2, 8, "attention_g2_d256_q8") ATTN_INST(char, 4, 8, "attention_g4_d256_q8") ATTN_INST(char, 8, 8, "attention_g8_d256_q8")
 #endif
 
 // ---------------------------------------------------------------------------------------------- 4. attention: flash decoding
@@ -1341,7 +1359,7 @@ struct AttnSplitParams {
     int ctx;
     float scale;
     int qStride;
-    int kvStride;
+    int kvStride;    // cache row stride in elements (q8: with the scales, see kv_scale)
     int window;
     float softcap;
     int nSplit;
@@ -1388,7 +1406,7 @@ kernel void attention_split(device const float *q [[buffer(0)]],
         device const KV *kv = kb + (ulong)s * p.kvStride;
         float d = 0.0f;
         for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
-        d = simd_sum(d) * p.scale;
+        d = simd_sum(d) * (p.scale * kv_scale(kc + (ulong)s * p.kvStride, p.kvStride, p.nKvHeads, kvh));
         if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
         if (lane == 0) sc[s] = d;
         mx = max(mx, d);
@@ -1413,7 +1431,7 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     float o[MAX_PER];
     for (int i = 0; i < MAX_PER; i++) o[i] = 0.0f;
     for (int s = s0 + sg; s < s1; s += nsg) {
-        const float pr = sc[s];
+        const float pr = sc[s] * kv_scale(vc + (ulong)s * p.kvStride, p.kvStride, p.nKvHeads, kvh);
         device const KV *vv = vb + (ulong)s * p.kvStride;
         for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
     }
@@ -1469,12 +1487,49 @@ kernel void attention_combine(device const float *part [[buffer(0)]],
 
 template [[host_name("attention_split")]] kernel decltype(attention_split<float>) attention_split<float>;
 template [[host_name("attention_split_h")]] kernel decltype(attention_split<half>) attention_split<half>;
+template [[host_name("attention_split_q8")]] kernel decltype(attention_split<char>) attention_split<char>;
 
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
 // row, normalised and rotated there, and rounded once by rope<half, ..> when it writes the cache row
 // (round-to-nearest-even, the same rounding as Java's Float.floatToFloat16). The *_h attention instantiations
 // read half K/V with the same f32 arithmetic (attention_t<half, ...> above).
+//
+// Optional int8 cache (backend.kv-dtype=q8): the quantization needs the whole row of a kv head (its largest
+// magnitude), so both k and v go through f32 staging rows (matmul3<.., float> writes them, rope<float, ..> rotates k
+// in place) and kv_store_q8 then quantizes every (token, kv head) row into the cache: scale = max|x| / 127,
+// q = rint(x / scale) clamped to [-127, 127] (Java: KvDtype.q8), the int8 values at row[h * headDim ..] and the
+// scale after the row's kvDim values (see kv_scale). The *_q8 attention instantiations read char * scale.
+
+struct KvStoreParams {
+    int headDim;
+    int kvDim;       // values per position (nKvHeads * headDim)
+    int nKvHeads;
+    int stride;      // bytes per cache position row: kvDim + 4 * nKvHeads
+};
+
+// Grid: (2 * nKvHeads, ntok), one simdgroup (32 threads) per row; x < nKvHeads quantizes k head x, the others v
+// head x - nKvHeads. k / v are the f32 staging rows [ntok, kvDim]; kc / vc are bound at the row of the chunk's
+// first position.
+kernel void kv_store_q8(device const float *k [[buffer(0)]],
+                        device const float *v [[buffer(1)]],
+                        device char *kc [[buffer(2)]],
+                        device char *vc [[buffer(3)]],
+                        constant KvStoreParams &p [[buffer(4)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_simdgroup]]) {
+    const bool isV = int(tgp.x) >= p.nKvHeads;
+    const int h = isV ? int(tgp.x) - p.nKvHeads : int(tgp.x);
+    device const float *x = (isV ? v : k) + (ulong)tgp.y * p.kvDim + h * p.headDim;
+    device char *row = (isV ? vc : kc) + (ulong)tgp.y * p.stride;
+    float mx = 0.0f;
+    for (int i = lane; i < p.headDim; i += 32) mx = max(mx, fabs(x[i]));
+    const float s = simd_max(mx) / 127.0f;
+    for (int i = lane; i < p.headDim; i += 32) {
+        row[h * p.headDim + i] = s > 0.0f ? char(clamp(rint(x[i] / s), -127.0f, 127.0f)) : char(0);
+    }
+    if (lane == 0) ((device float *)(row + p.kvDim))[h] = s;
+}
 
 // ---------------------------------------------------------------------------------------------- 5. mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
@@ -2069,6 +2124,38 @@ kernel void mla_lat_store_t(device const float *lat [[buffer(0)]],
 template [[host_name("mla_lat_store")]] kernel decltype(mla_lat_store_t<float>) mla_lat_store_t<float>;
 template [[host_name("mla_lat_store_h")]] kernel decltype(mla_lat_store_t<half>) mla_lat_store_t<half>;
 
+// mla_lat_store_q8: the same row quantized for backend.kv-dtype=q8: one scale for the whole row [c | k_pe]
+// (max|x| / 127 over both parts, as kv_store_q8 per kv head), stored after its kvLora + rope int8 values (row stride
+// kvLora + rope + 4 bytes; attention_mla_q8 reads it through kv_scale with one kv head). Grid: (ntok), CHANNEL_THREADS.
+kernel void mla_lat_store_q8(device const float *lat [[buffer(0)]],
+                             device const float *kpe [[buffer(1)]],
+                             device char *cache [[buffer(2)]],
+                             constant MlaParams &p [[buffer(3)]],
+                             uint2 tgp [[threadgroup_position_in_grid]],
+                             ushort2 tid2 [[thread_position_in_threadgroup]],
+                             ushort2 tpg2 [[threads_per_threadgroup]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]],
+                             ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int t = int(tgp.x);
+    const int aw = p.kvLora + p.rope;
+    device const float *c = lat + (ulong)t * p.kvLora;
+    device const float *r = kpe + (ulong)t * p.rope;
+    device char *row = cache + (ulong)t * (aw + 4);
+    float mx = 0.0f;
+    for (int i = tid; i < p.kvLora; i += tpg) mx = max(mx, fabs(c[i]));
+    for (int i = tid; i < p.rope; i += tpg) mx = max(mx, fabs(r[i]));
+    const float s = tg_max(mx, buf, sg, lane, nsg) / 127.0f;
+    for (int i = tid; i < aw; i += tpg) {
+        const float x = i < p.kvLora ? c[i] : r[i - p.kvLora];
+        row[i] = s > 0.0f ? char(clamp(rint(x / s), -127.0f, 127.0f)) : char(0);
+    }
+    if (tid == 0) *((device float *)(row + aw)) = s;
+}
+
 // mla_absorb_q: qa[t, h] = [W_kb_k[h]^T q_nope[t, h] | q_pe[t, h]] from q ([ntok, heads * (nope + rope)], q_pe
 // already rotated in place) and wk ([heads][nope][kvLora]). One thread per output j, the nope-long sum reads
 // wk[h][i][j] coalesced across the threadgroup. Grid: (heads, ntok), ROW_THREADS.
@@ -2456,7 +2543,7 @@ GG_INSTANTIATE("q5k", GG_Q5_K)
 // and finally O = diag(1 / l) O. The row rescales are products with a diagonal matrix, so the kernel never
 // addresses the elements of a simdgroup matrix directly (their distribution over the lanes is not specified); S and
 // P go through 8 x BK threadgroup scratch per simdgroup for the masking and the exponentials. Everything is f32 (a
-// half KV cache is widened as it is staged). Summation order differs from attention_t, so results agree to rounding
+// half KV cache is widened as it is staged, a q8 one widened and multiplied by its row scales). Summation order differs from attention_t, so results agree to rounding
 // (kernel_tests.py checks it against a float64 reference; the Metal tuner against attention_t on the device).
 
 struct FlashParams {
@@ -2466,7 +2553,7 @@ struct FlashParams {
     int ntok;        // tokens in the chunk
     float scale;
     int qStride;     // q row stride (nHeads * D)
-    int kStride;     // key / value cache row stride (nKvHeads * D)
+    int kStride;     // key / value cache row stride (nKvHeads * D; q8: + 4 * nKvHeads bytes of scales)
     int oStride;     // output row stride (nHeads * D)
     int window;      // sliding-window length, 0 = full causal attention
     float softcap;   // > 0: score = tanh(score / softcap) * softcap
@@ -2523,7 +2610,8 @@ kernel void attention_fa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup); // the previous block's V is no longer read
         for (int e = tid; e < BK * D; e += FA_THREADS) {
             const int key = k0 + e / D;
-            kvs[e] = key < lastKey ? float(kb[(ulong)key * p.kStride + e % D]) : 0.0f;
+            kvs[e] = key < lastKey ? float(kb[(ulong)key * p.kStride + e % D])
+                                     * kv_scale(kc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // S = Q K^T: K is loaded transposed, slice (dims i*8.., keys j*8..)
@@ -2573,7 +2661,8 @@ kernel void attention_fa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup); // every simdgroup is done with the K block
         for (int e = tid; e < BK * D; e += FA_THREADS) {
             const int key = k0 + e / D;
-            kvs[e] = key < lastKey ? float(vb[(ulong)key * p.kStride + e % D]) : 0.0f;
+            kvs[e] = key < lastKey ? float(vb[(ulong)key * p.kStride + e % D])
+                                     * kv_scale(vc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < NJ; j++) {
@@ -2613,6 +2702,9 @@ template [[host_name("attention_fa_d128")]] kernel decltype(attention_fa<float, 
 template [[host_name("attention_fa_d128_h")]] kernel decltype(attention_fa<half, 128>) attention_fa<half, 128>;
 template [[host_name("attention_fa_d256")]] kernel decltype(attention_fa<float, 256>) attention_fa<float, 256>;
 template [[host_name("attention_fa_d256_h")]] kernel decltype(attention_fa<half, 256>) attention_fa<half, 256>;
+template [[host_name("attention_fa_d64_q8")]] kernel decltype(attention_fa<char, 64>) attention_fa<char, 64>;
+template [[host_name("attention_fa_d128_q8")]] kernel decltype(attention_fa<char, 128>) attention_fa<char, 128>;
+template [[host_name("attention_fa_d256_q8")]] kernel decltype(attention_fa<char, 256>) attention_fa<char, 256>;
 
 // ---------------------------------------------------------------------------------------------- 10. pipelined greedy decoding
 // A greedy decode step can be queued before the CPU has seen the previous token: argmax writes the chosen id into a

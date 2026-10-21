@@ -17,6 +17,7 @@ public enum KernelParams {
     ATTN_SPLIT("AttnSplitParams", "iiiiifiiifii"),
     ATTN_COMBINE("AttnCombineParams", "iii"),
     FLASH("FlashParams", "iiiifiiiif"),
+    KV_STORE("KvStoreParams", "iiii"),
     ROUTER("RouterParams", "iiiii"),
     ROUTER_DS("RouterDsParams", "iiiiiiiiifi"),
     MOE("MoeParams", "iii"),

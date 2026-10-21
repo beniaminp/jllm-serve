@@ -29,7 +29,8 @@ import java.util.List;
 /**
  * Pipeline test for the model families on tiny random checkpoints: for each model directory and quantization
  * the checkpoint is converted, loaded, and 8 tokens are generated greedily (from a fixed 12-token prompt, so
- * no tokenizer is needed) on the CPU backend and on the Metal backend; the two id sequences must be equal.
+ * no tokenizer is needed) on the CPU backend and on the Metal backend; the two id sequences must be equal. Every
+ * family is also run with the q8 KV cache on both backends (see {@code q8Check}).
  *
  * <p>usage: {@code ArchSmoke <metal-lib|-> <model-dir>...}. Exits with status 1 on any mismatch.
  */
@@ -167,6 +168,9 @@ public final class ArchSmoke {
             }
             if (cfg instanceof Decoder d && d.anyMoe()) {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
+            }
+            if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                failures += q8Check(w, lib, cfg, cpu);
             }
             if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD && ((Decoder) cfg).attention() instanceof Attention.Gqa) {
                 for (KvDtype dt : KvDtype.values()) {
@@ -447,6 +451,58 @@ public final class ArchSmoke {
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
         }
         return bad;
+    }
+
+    /**
+     * The q8 KV cache (int8 with a scale per row of a kv head; DeepSeek: per latent row) on both backends, teacher-forced
+     * through the prompt followed by the f32 CPU run's tokens: once as one 20-token chunk (the prefill kernels, flash
+     * prefill where the tuner enabled it) and once as the prompt then token by token (decode). CPU q8 and Metal q8 must
+     * agree within the usual CPU / Metal tolerance at every step. The distance of the q8 logits from the f32 cache's
+     * (CPU) is printed and only bounded loosely, by 25% of the largest logit: it is the quantization's effect on a
+     * random model, which some families amplify (the tiny DeepSeek turns the f16 cache's 0.2% into 13% for q8), so
+     * the bound catches a broken dequantization, not a few percent.
+     */
+    private static int q8Check(ModelWeights w, String lib, Architecture cfg, int[] tokens) throws Exception {
+        int[] seq = Arrays.copyOf(PROMPT, PROMPT.length + tokens.length);
+        System.arraycopy(tokens, 0, seq, PROMPT.length, tokens.length);
+        float[][] f32;
+        float[][] cpu;
+        float[][] gpu;
+        try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.F32, false)) {
+            f32 = forced(b, seq, cfg.core().vocabSize());
+        }
+        try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.Q8, false)) {
+            cpu = forced(b, seq, cfg.core().vocabSize());
+        }
+        try (Backend b = new MetalBackend(w, 64, 32, lib, KvDtype.Q8)) {
+            gpu = forced(b, seq, cfg.core().vocabSize());
+        }
+        float scale = 0;
+        float diff = 0;
+        float drift = 0;
+        for (int r = 0; r < cpu.length; r++) {
+            for (int i = 0; i < cpu[r].length; i++) {
+                scale = Math.max(scale, Math.abs(f32[r][i]));
+                diff = Math.max(diff, Math.abs(cpu[r][i] - gpu[r][i]));
+                drift = Math.max(drift, Math.abs(cpu[r][i] - f32[r][i]));
+            }
+        }
+        boolean agree = diff <= 1e-3f * scale + 1e-4f;
+        boolean close = drift <= 0.25f * scale;
+        System.out.printf("  kv q8: max|cpu-metal| = %.2e%s, max|q8-f32| = %.2e%s (max|logit| = %.2f)%n", diff,
+                agree ? "" : " MISMATCH", drift, close ? "" : " TOO FAR", scale);
+        return (agree ? 0 : 1) + (close ? 0 : 1);
+    }
+
+    /** The logits of {@code seq}'s last token as one chunk, then those of every token after the prompt fed one at a time. */
+    private static float[][] forced(Backend b, int[] seq, int vocab) {
+        float[][] out = new float[1 + seq.length - PROMPT.length][vocab];
+        b.forward(seq, 0, seq.length, 0, out[0]);
+        b.forward(PROMPT, 0, PROMPT.length, 0, out[1]);
+        for (int i = PROMPT.length; i + 1 < seq.length; i++) {
+            b.forward(seq, i, 1, i, out[2 + i - PROMPT.length]);
+        }
+        return out;
     }
 
     /**
