@@ -611,7 +611,9 @@ and attention run per row, each in its own conversation's cache at its own posit
 
 **Results.** A batched step uses the multi-token kernels, which add up in a different order than the single-token
 ones, so its logits agree with a step taken alone to rounding (with int8 activations, to the int8 rounding). The
-greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU). The CPU backend implements
+greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU, part of `mvn test`; 42 of the
+steps ran in shared passes). Its throughput comparison runs with a second argument, `bench`; it was not measured on a
+quiet machine yet. The CPU backend implements
 `forwardBatch` for every attention family except DeepSeek's MLA. Mamba and the Metal backend fall back to running
 the queued steps one after another, as before: on Metal each slot has its own command queue and buffers, and one
 pass over several slots' caches is not implemented yet.

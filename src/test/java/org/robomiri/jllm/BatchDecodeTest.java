@@ -19,7 +19,7 @@ import java.util.concurrent.Future;
  * time give the same greedy answers as when each runs alone, their steps really are computed together, and the total
  * throughput is printed for one slot alone and three at once.
  *
- * <p>usage: BatchDecodeTest &lt;model dir&gt; (models/Qwen_Qwen3-0.6B)
+ * <p>usage: BatchDecodeTest &lt;model dir&gt; [bench] (models/Qwen_Qwen3-0.6B; {@code bench} adds the throughput run)
  */
 public final class BatchDecodeTest {
 
@@ -34,6 +34,15 @@ public final class BatchDecodeTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
+        run(dir, args.length > 1 && args[1].equals("bench"));
+        if (failures > 0) {
+            System.out.println(failures + " FAILED");
+            System.exit(1);
+        }
+        System.out.println("batch decode test passed");
+    }
+
+    private static void run(Path dir, boolean bench) throws Exception {
         // float activations: a batched step runs the multi-token kernels, which add in another order than the int8
         // single-token ones; with float activations both are the same arithmetic up to summation order
         Settings st = Settings.load(new String[]{"--backend", "cpu", "--model.dir", dir.toAbsolutePath().getParent().toString(),
@@ -73,6 +82,10 @@ public final class BatchDecodeTest {
             check(batched > 0, "decode steps were computed together (" + batched + " steps in shared passes, "
                     + (after[0] - before[0]) + " passes)");
 
+            if (!bench) {
+                ex.shutdown();
+                return;
+            }
             // throughput: one slot alone, then three at once (int8 activations as by default would be faster for
             // both; this compares like with like)
             SamplingParams longer = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 64, List.of());
@@ -96,11 +109,6 @@ public final class BatchDecodeTest {
             System.out.printf("throughput (prompt included): one slot %.1f tok/s, three slots together %.1f tok/s (%.1fx)%n",
                     one, three, three / one);
         }
-        if (failures > 0) {
-            System.out.println(failures + " FAILED");
-            System.exit(1);
-        }
-        System.out.println("batch decode test passed");
     }
 
     private static int[] chat(Engine e, String user) {
