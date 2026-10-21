@@ -31,10 +31,13 @@ public class ToolRegistry {
     private final List<Tool> builtins;
     private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
 
-    public ToolRegistry(ToolsConfig config, McpManager mcp) {
+    public ToolRegistry(ToolsConfig config, McpManager mcp, org.robomiri.jllm.web.models.ModelManager models,
+                        org.robomiri.jllm.web.settings.SettingsService settings, org.robomiri.jllm.web.chat.ImageStore images) {
         this.config = config;
         this.mcp = mcp;
-        this.builtins = BuiltinTools.all(config::general);
+        List<Tool> all = new ArrayList<>(BuiltinTools.all(config::general));
+        all.add(new DescribeImageTool(models, settings, images, config::general)); // vision: lets a text model ask a vision model
+        this.builtins = List.copyOf(all);
     }
 
     /** All tools, the switched-off built-ins included (marked). */
