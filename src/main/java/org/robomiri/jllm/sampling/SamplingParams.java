@@ -55,6 +55,12 @@ public record SamplingParams(
         return new SamplingParams(0.6f, 20, 0.95f, 0f, 1f, 0f, 0f, -1, 2048, List.of());
     }
 
+    /** The same parameters with another seed (OpenAI {@code n}: choice i of a seeded request uses seed + i). */
+    public SamplingParams withSeed(long newSeed) {
+        return new SamplingParams(temperature, topK, topP, minP, repetitionPenalty, presencePenalty,
+                frequencyPenalty, newSeed, maxTokens, stop);
+    }
+
     public SamplingParams withMaxTokens(int n) {
         return new SamplingParams(temperature, topK, topP, minP, repetitionPenalty, presencePenalty,
                 frequencyPenalty, seed, n, stop);

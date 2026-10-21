@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.sampling.Sampler;
 import org.robomiri.jllm.sampling.SamplingParams;
+import org.robomiri.jllm.sampling.TokenConstraint;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 import org.robomiri.jllm.tokenizer.StreamDecoder;
 import org.robomiri.jllm.tokenizer.Tokenizer;
@@ -14,6 +15,8 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntPredicate;
+import java.util.function.Supplier;
 
 /**
  * Generation loop: tokenizes, prefills in chunks, samples one token at a time and streams text.
@@ -45,13 +48,77 @@ public final class Engine implements AutoCloseable {
         }
     }
 
-    public record Result(String text, int[] tokens, String finishReason, Stats stats) {
+    /**
+     * @param logprobs       one entry per generated token when {@link Decoding#logprobs()} was asked for, else null
+     * @param promptLogprobs one entry per prompt token (the first is null: nothing predicts it) when
+     *                       {@link Decoding#promptLogprobs()} was asked for, else null
+     */
+    public record Result(String text, int[] tokens, String finishReason, Stats stats, List<TokenLogprob> logprobs,
+                         List<TokenLogprob> promptLogprobs) {
+        public Result(String text, int[] tokens, String finishReason, Stats stats) {
+            this(text, tokens, finishReason, stats, null, null);
+        }
+
+        /** The sum of the generated tokens' log-probabilities (the sequence's log-likelihood); needs logprobs. */
+        public double cumulativeLogprob() {
+            double s = 0;
+            for (TokenLogprob lp : logprobs) {
+                s += lp.logprob();
+            }
+            return s;
+        }
     }
 
     /** Receives generated text as it becomes available. */
     @FunctionalInterface
     public interface TextSink {
         void accept(String text);
+    }
+
+    /**
+     * Per-request decoding options beyond {@link SamplingParams} (the OpenAI fields {@code logit_bias},
+     * {@code logprobs}, {@code echo} and {@code response_format}).
+     *
+     * @param logitBias      added to the logits before sampling, by token id (length at least the vocabulary); null = none
+     * @param logprobs       report the log-probability of every generated token ({@link TokenLogprob})
+     * @param topLogprobs    and this many alternatives per position (0 = none)
+     * @param promptLogprobs report the prompt tokens' log-probabilities too: the whole prompt is run through
+     *                       {@link Backend#forwardAll} (no prefix cache, small chunks)
+     * @param constraint     creates a fresh {@link TokenConstraint} for each sequence; null = unconstrained
+     */
+    public record Decoding(float[] logitBias, boolean logprobs, int topLogprobs, boolean promptLogprobs,
+                           Supplier<TokenConstraint> constraint) {
+        public static final Decoding NONE = new Decoding(null, false, 0, false, null);
+
+        /** Whether every step needs its own logits on the CPU (no speculation, no pipelined greedy decoding). */
+        boolean exact() {
+            return logprobs || promptLogprobs || constraint != null;
+        }
+    }
+
+    /** Receives the output of {@link #generate(int[], SamplingParams, Decoding, int, ChoiceSink, BooleanSupplier)}, choice by choice. */
+    public interface ChoiceSink {
+        /** Choice {@code index} starts (the choices run one after the other). */
+        default void start(int index) {
+        }
+
+        /**
+         * The prompt of choice {@code index} has been prefilled; {@code promptLogprobs} as in {@link Result} (null
+         * unless {@link Decoding#promptLogprobs()}, and then only for choice 0: the others repeat it).
+         */
+        default void prefilled(int index, List<TokenLogprob> promptLogprobs) {
+        }
+
+        /** Text of choice {@code index}, as it becomes available. */
+        void text(int index, String text);
+
+        /** A generated token's log-probability (with {@link Decoding#logprobs()}), before the text it adds. */
+        default void token(int index, TokenLogprob lp) {
+        }
+
+        /** Choice {@code index} is finished. */
+        default void done(int index, Result r) {
+        }
     }
 
     private final Backend backend;
@@ -203,7 +270,48 @@ public final class Engine implements AutoCloseable {
         promptTokens = preparePrompt(promptTokens);
         acquire();
         try {
-            return generateLocked(promptTokens, p, sink, cancelled);
+            return generateLocked(promptTokens, p, Decoding.NONE, sink, null, 0, cancelled);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Generates {@code n} independent completions of one prompt (OpenAI {@code n} / {@code best_of}), one after the
+     * other under a single hold of the engine: the prompt is prefilled once, each further choice reuses it from the
+     * prefix cache and recomputes only its last token. Choice {@code i} of a seeded request samples with seed
+     * {@code seed + i} (choice 0 exactly like a single request); an unseeded one draws a fresh seed per choice.
+     *
+     * @param sink receives the choices' text and logprobs as they are produced; may be null
+     * @throws OverloadedException if the engine stayed busy with other requests for longer than the queue timeout
+     */
+    public List<Result> generate(int[] promptTokens, SamplingParams p, Decoding d, int n, ChoiceSink sink,
+                                 BooleanSupplier cancelled) {
+        int[] prompt = preparePrompt(promptTokens);
+        acquire();
+        try {
+            List<Result> results = new ArrayList<>(n);
+            List<TokenLogprob> promptLp = null;
+            for (int i = 0; i < n; i++) {
+                int c = i;
+                SamplingParams pi = i == 0 || p.seed() < 0 ? p : p.withSeed(p.seed() + i);
+                Decoding di = i == 0 ? d : new Decoding(d.logitBias(), d.logprobs(), d.topLogprobs(), false, d.constraint());
+                if (sink != null) {
+                    sink.start(c);
+                }
+                Result r = generateLocked(prompt, pi, di, sink == null ? null : text -> sink.text(c, text), sink, c,
+                        cancelled);
+                if (i == 0) {
+                    promptLp = r.promptLogprobs();
+                } else if (d.promptLogprobs()) { // the prompt is the same for every choice: computed once
+                    r = new Result(r.text(), r.tokens(), r.finishReason(), r.stats(), r.logprobs(), promptLp);
+                }
+                if (sink != null) {
+                    sink.done(c, r);
+                }
+                results.add(r);
+            }
+            return results;
         } finally {
             lock.unlock();
         }
@@ -245,7 +353,9 @@ public final class Engine implements AutoCloseable {
         }
     }
 
-    private Result generateLocked(int[] prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
+    /** @param choices with {@code index}: told about the prefill and each token's logprob; may be null */
+    private Result generateLocked(int[] prompt, SamplingParams p, Decoding d, TextSink sink, ChoiceSink choices,
+                                  int index, BooleanSupplier cancelled) {
         int ctx = backend.contextLength();
         if (prompt.length >= ctx) {
             throw new IllegalArgumentException("prompt has " + prompt.length + " tokens, context is " + ctx);
@@ -255,7 +365,11 @@ public final class Engine implements AutoCloseable {
         }
         int vocab = Math.min(model.vocabSize(), tokenizer.vocabSize());
         float[] logits = new float[model.vocabSize()];
-        Sampler sampler = new Sampler(p, vocab, prompt);
+        Sampler sampler = new Sampler(p, vocab, prompt, d.logitBias());
+        TokenConstraint con = d.constraint() == null ? null : d.constraint().get();
+        // an end-of-sequence token is allowed exactly when the constrained output is complete
+        IntPredicate allowed = con == null ? null : id -> eosIds.contains(id) ? con.canEnd() : con.allows(id);
+        List<TokenLogprob> promptLp = d.promptLogprobs() ? new ArrayList<>(prompt.length) : null;
 
         // prefix cache: reuse the longest common prefix, but always recompute at least the last token
         int reuse = 0;
@@ -265,6 +379,10 @@ public final class Engine implements AutoCloseable {
         }
         if (!backend.supportsPrefixReuse() && reuse < cachedLen) {
             reuse = 0; // a recurrent state cannot be rewound: only an exact extension of the cached tokens is reusable
+        }
+        if (promptLp != null) {
+            reuse = 0; // every prompt position's logits are needed
+            promptLp.add(null); // nothing predicts the first token
         }
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
@@ -281,12 +399,19 @@ public final class Engine implements AutoCloseable {
                 return new Result("", new int[0], "cancelled",
                         new Stats(prompt.length, reuse, 0, (System.nanoTime() - t0) / 1e6, 0));
             }
+            if (promptLp != null) {
+                pos = prefillAll(prompt, pos, logits, vocab, d.topLogprobs(), promptLp);
+                continue;
+            }
             int n = Math.min(batch, prompt.length - pos);
             boolean last = pos + n == prompt.length;
             backend.forward(prompt, pos, n, pos, last ? logits : null);
             pos += n;
         }
         long t1 = System.nanoTime();
+        if (choices != null) {
+            choices.prefilled(index, promptLp);
+        }
 
         List<Integer> out = new ArrayList<>();
         StreamDecoder dec = new StreamDecoder(tokenizer); // strips the leading space SentencePiece decoders drop, like decode()
@@ -297,7 +422,10 @@ public final class Engine implements AutoCloseable {
         boolean stopHit = false; // a stop string was found: everything after it is discarded
         int maxTokens = Math.min(p.maxTokens(), ctx - prompt.length);
         int[] one = new int[1];
-        Speculator sp = spec;
+        boolean exact = d.exact(); // every step's logits are needed here: no speculation, no pipelined greedy steps
+        float[] raw = d.logprobs() ? new float[vocab] : null; // the model's logits before the sampler changes them
+        List<TokenLogprob> lps = d.logprobs() ? new ArrayList<>() : null;
+        Speculator sp = exact ? null : spec;
         long drafted0 = 0;
         long accepted0 = 0;
         int[] ready = null; // tokens a verification pass already decided: ready[rIdx..rLen), the first rPre accepted
@@ -312,7 +440,7 @@ public final class Engine implements AutoCloseable {
 
         // greedy without penalties on a backend that can pick the argmax itself: each plain step is queued before the
         // CPU has seen the previous token (the device feeds its own argmax), so the GPU never waits for the CPU
-        Backend.GreedyPipe pipe = sampler.greedyPlain() ? backend.greedyPipe(vocab) : null;
+        Backend.GreedyPipe pipe = sampler.greedyPlain() && !exact ? backend.greedyPipe(vocab) : null;
         Runnable drainPipe = pipe == null ? null : pipe::drain;
         boolean fromPipe = false; // the next token is the result of the oldest pipelined step
         try {
@@ -321,8 +449,20 @@ public final class Engine implements AutoCloseable {
                     finish = "cancelled";
                     break;
                 }
+                if (con != null && con.mustEnd()) { // the constrained output is complete: end it
+                    finish = "stop";
+                    break;
+                }
                 boolean queued = rIdx < rLen;
-                int tok = queued ? ready[rIdx] : fromPipe ? pipe.next() : sampler.sample(logits);
+                if (raw != null) {
+                    System.arraycopy(logits, 0, raw, 0, vocab);
+                }
+                int tok = queued ? ready[rIdx] : fromPipe ? pipe.next()
+                        : con != null ? sampler.sample(logits, allowed) : sampler.sample(logits);
+                if (tok < 0) { // the constraint allows no token at all (a vocabulary without the needed bytes)
+                    finish = "stop";
+                    break;
+                }
                 boolean preAccepted = queued && rIdx < rPre;
                 if (queued) {
                     rIdx++;
@@ -333,6 +473,16 @@ public final class Engine implements AutoCloseable {
                 }
                 if (!preAccepted) {
                     sampler.accept(tok);
+                }
+                if (con != null) {
+                    con.accept(tok);
+                }
+                if (lps != null) {
+                    TokenLogprob lp = TokenLogprob.of(raw, vocab, tok, d.topLogprobs());
+                    lps.add(lp);
+                    if (choices != null) {
+                        choices.token(index, lp);
+                    }
                 }
                 out.add(tok);
                 if (sp != null) {
@@ -401,7 +551,32 @@ public final class Engine implements AutoCloseable {
         int[] tokens = out.stream().mapToInt(Integer::intValue).toArray();
         Stats stats = new Stats(prompt.length, reuse, tokens.length, (t1 - t0) / 1e6, (t2 - t1) / 1e6,
                 sp == null ? 0 : (int) (sp.drafted() - drafted0), sp == null ? 0 : (int) (sp.accepted() - accepted0));
-        return new Result(text.toString(), tokens, finish, stats);
+        return new Result(text.toString(), tokens, finish, stats, lps, promptLp);
+    }
+
+    /**
+     * Prefills from {@code pos} with the logits of every position ({@link Backend#forwardAll}, in chunks of at
+     * most 16 tokens so that the logits buffer stays small), recording each next prompt token's log-probability.
+     * The last position's logits go to {@code logits}.
+     *
+     * @return the new position
+     */
+    private int prefillAll(int[] prompt, int pos, float[] logits, int vocab, int top, List<TokenLogprob> promptLp) {
+        int stride = logits.length;
+        int n = Math.min(Math.min(16, backend.maxBatch()), prompt.length - pos);
+        float[] rows = new float[n * stride];
+        float[] row = new float[stride];
+        backend.forwardAll(prompt, pos, n, pos, rows, stride);
+        for (int i = 0; i < n; i++) {
+            System.arraycopy(rows, i * stride, row, 0, stride);
+            int next = pos + i + 1;
+            if (next < prompt.length) {
+                promptLp.add(TokenLogprob.of(row, vocab, prompt[next], top));
+            } else {
+                System.arraycopy(row, 0, logits, 0, stride);
+            }
+        }
+        return pos + n;
     }
 
     /**
