@@ -11,6 +11,7 @@ import org.robomiri.jllm.server.OpenAiFeatures;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.chat.ChatSupport;
+import org.robomiri.jllm.web.chat.ClientGone;
 import org.robomiri.jllm.web.chat.ReasoningSplitter;
 import org.robomiri.jllm.web.chat.ChatSupport.RequestError;
 import org.robomiri.jllm.web.models.LoadedModel;
@@ -32,6 +33,7 @@ import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 /**
  * The OpenAI-compatible API over the loaded models: {@code GET /v1/models}, {@code POST /v1/chat/completions} and
@@ -115,13 +117,15 @@ public class OpenAiController {
             return;
         }
         try (LoadedModel.Lease lease = model.lease()) {
-            completion(body, model, res, chat);
+            completion(body, model, res, chat, ClientGone.of(req));
         } catch (LoadedModel.UnavailableException e) {
             ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "model_unavailable"));
         }
     }
 
-    private void completion(Map<String, Object> body, LoadedModel model, HttpServletResponse res, boolean chat) throws IOException {
+    /** @param gone whether the client has closed the connection: generation stops and nothing is sent */
+    private void completion(Map<String, Object> body, LoadedModel model, HttpServletResponse res, boolean chat,
+                            BooleanSupplier gone) throws IOException {
         Engine engine = model.engine();
         Tokenizer tok = engine.tokenizer();
         Settings s = settings.current();
@@ -181,7 +185,8 @@ public class OpenAiController {
             if (!stream) {
                 List<Engine.Result> all;
                 try {
-                    all = e.generate(prompt, params, decoding, count, null, () -> model.closing() || deadline.getAsBoolean());
+                    all = e.generate(prompt, params, decoding, count, null,
+                            () -> model.closing() || deadline.getAsBoolean() || gone.getAsBoolean());
                 } catch (Engine.OverloadedException ex) {
                     ChatSupport.send(res, 503, ChatSupport.error(ex.getMessage(), "server_error", "overloaded"));
                     return;
@@ -191,6 +196,10 @@ public class OpenAiController {
                 }
                 Engine.Stats total = OpenAiFeatures.total(all);
                 model.record(slot, total);
+                if (gone.getAsBoolean()) { // nobody to answer: the slot is free again right away
+                    log(modelId, slot, chat, messages, toolNames.size(), count, total, "cancelled: the client went away");
+                    return;
+                }
                 List<Engine.Result> chosen = OpenAiFeatures.select(all, o);
                 List<Object> choices = new ArrayList<>();
                 String lastFinish = null;
@@ -356,7 +365,8 @@ public class OpenAiController {
             };
             try (AutoCloseable alive = sse.keepAlive()) {
                 e.generate(prompt, params, decoding, count, sink,
-                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean());
+                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
+                                || gone.getAsBoolean());
             } catch (Engine.OverloadedException | IllegalArgumentException ex) {
                 sse.event(Json.obj("error", Json.obj("message", ex.getMessage(), "type",
                         ex instanceof Engine.OverloadedException ? "server_error" : "invalid_request_error",
@@ -370,8 +380,10 @@ public class OpenAiController {
             }
             Engine.Stats total = OpenAiFeatures.total(finished);
             model.record(slot, total);
-            log(modelId, slot, chat, messages, toolNames.size(), count, total, lastFinish[0]);
-            if (failure[0] != null || sse.failed()) {
+            boolean away = failure[0] != null || sse.failed() || gone.getAsBoolean();
+            log(modelId, slot, chat, messages, toolNames.size(), count, total,
+                    away ? "cancelled: the client went away" : lastFinish[0]);
+            if (away) {
                 return; // nothing more can be sent
             }
             if (includeUsage && separateUsage) {

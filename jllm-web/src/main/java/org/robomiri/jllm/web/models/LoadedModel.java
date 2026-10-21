@@ -244,6 +244,11 @@ public final class LoadedModel {
         return slots.size();
     }
 
+    /** Slots a request is running on or has reserved right now. */
+    public int busySlots() {
+        return (int) slots.stream().filter(s -> s.users.get() > 0).count();
+    }
+
     /** True once unloading started: running generations should stop. */
     public boolean closing() {
         return closing;
