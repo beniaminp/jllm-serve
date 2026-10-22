@@ -2349,7 +2349,7 @@ public final class MetalBackend implements Backend {
     public java.util.Map<String, Object> memoryReport() {
         java.util.Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("backend", "metal");
-        out.put("device", k.metal.deviceName());
+        out.put("deviceName", k.metal.deviceName());
         long budget = workingSet();
         boolean[][] cold = placement != null ? placement.cold : new boolean[c.layers()][];
         long expertsCpu = 0;
