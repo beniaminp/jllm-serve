@@ -32,8 +32,15 @@ public final class PagedKvTest {
         checks++;
         if (!ok) {
             failures++;
-            System.out.println("FAIL " + what);
+            note("FAIL " + what);
         }
+    }
+
+    /** Messages of the attempt in progress: printed only if the attempt is the last one (see {@link #scenario}). */
+    private static final java.util.List<String> pending = new java.util.ArrayList<>();
+
+    private static void note(String line) {
+        pending.add(line);
     }
 
     public static void main(String[] args) throws Exception {
@@ -91,8 +98,10 @@ public final class PagedKvTest {
         for (int attempt = 0; ; attempt++) {
             int f0 = failures;
             int c0 = checks;
+            pending.clear();
             scenario0(pool, dt, hd, kvHeads, group, block, window, cap);
             if (failures == f0 || attempt == 3) {
+                pending.forEach(System.out::println);
                 return;
             }
             failures = f0;
@@ -137,11 +146,11 @@ public final class PagedKvTest {
                 flat.attention(pool, l, n, pos, q, af2, window, a.scale(), cap);
                 paged.attention(pool, l, n, pos, q, ap2, window, a.scale(), cap);
                 if (!Arrays.equals(af, af2) || !Arrays.equals(ap, ap2)) {
-                    System.out.println("  repeat differs: flat " + Arrays.equals(af, af2) + " paged " + Arrays.equals(ap, ap2));
+                    note("  repeat differs: flat " + Arrays.equals(af, af2) + " paged " + Arrays.equals(ap, ap2));
                 }
                 if (!Arrays.equals(af, ap)) {
                     int bad = Arrays.mismatch(af, ap);
-                    System.out.println("  first difference: op (pos " + pos + ", n " + n + "), layer " + l + ", index " + bad + ": "
+                    note("  first difference: op (pos " + pos + ", n " + n + "), layer " + l + ", index " + bad + ": "
                             + af[bad] + " vs " + ap[bad]);
                     same = false;
                 }

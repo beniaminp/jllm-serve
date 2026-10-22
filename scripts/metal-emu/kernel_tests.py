@@ -84,6 +84,8 @@ def paged(caches, page):
 def paged_rows(pool, tbl, page, first, n):
     """The rows of positions [first, first + n) of a paged cache."""
     block = 1 << page
+    if n <= 0:
+        return np.zeros((0,), pool.dtype)
     return np.stack([pool[tbl[p // block] * block + p % block] for p in range(first, first + n)])
 
 
@@ -116,7 +118,8 @@ def kv_store_q8(hd, n_kv=2, ntok=5, pos0=3, ctx=12, page=0):
     rng = np.random.default_rng(4)
     k = (rng.standard_normal((ntok, n_kv * hd)) * rng.random((ntok, 1)) * 4).astype(np.float32)
     v = rng.standard_normal((ntok, n_kv * hd)).astype(np.float32)
-    k[1, :hd] = 0  # an all-zero row: scale 0, values 0
+    if ntok > 1:
+        k[1, :hd] = 0  # an all-zero row: scale 0, values 0
     stride = n_kv * hd + 4 * n_kv
     kc = np.full((ctx, stride), 0x5A, np.uint8)
     vc = np.full((ctx, stride), 0x5A, np.uint8)

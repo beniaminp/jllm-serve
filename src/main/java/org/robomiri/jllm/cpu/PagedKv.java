@@ -12,6 +12,7 @@ import jdk.incubator.vector.VectorSpecies;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 
 /**
  * The CPU attention over a block table (docs/24 §24.4): the same tile kernels as the flat cache ({@link KvCache}), reading
@@ -47,6 +48,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         this.dtype = st.dtype;
         this.B = st.B;
         this.pairs = st.pairs;
+        this.direct = dtype == KvDtype.F32 && B % (2 * VectorKernels.FL) == 0 && !Boolean.getBoolean("jllm.cpu.pagedGather");
         if (B % VectorKernels.FL != 0 || B % 2 != 0) {
             throw new IllegalArgumentException("backend.kv-block " + B + " must be a multiple of the vector length " + VectorKernels.FL);
         }
@@ -205,14 +207,237 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         st.getRow(layer, seq.block(s / B), s % B, values, buf);
     }
 
+    /** Decode over f32 blocks without the gather ({@code -Djllm.cpu.pagedGather=true} turns it off, for comparisons). */
+    private final boolean direct;
+
     @Override
     public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                           float softcap) {
+        if (n == 1 && direct && vectorized()) {
+            attentionDecodeDirect(pool, layer, pos, q, att, window, scale, softcap);
+            return;
+        }
         // the same choice as the flat caches, so that decode and prefill take the same kernels
         if (n == 1 && vectorized() && kvHeads < pool.threads()) {
             attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
         } else {
             attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
+        }
+    }
+
+    // ------------------------------------------------------------------ decode straight from the blocks (f32)
+
+    /** Decode scores of every query head over the context, shared by the tasks of one {@link #attentionDecodeDirect}. */
+    private float[] blockScores = new float[0];
+
+    /**
+     * {@link KvCache#attentionDecode} for f32 blocks, reading the keys and values where they are instead of gathering
+     * them into scratch first (the gather doubles the memory traffic of a decode step): the scores of a block's
+     * {@code B} keys are {@code headDim} FMAs with broadcast query elements over the block's transposed
+     * {@code [headDim][B]} keys ({@link #scores}), the outputs add the block's V rows in ascending key order
+     * ({@link #accumulate}). Every score and every output element is the same chain of operations as the flat kernel's,
+     * so the result is the same bit for bit; only the task split is by blocks.
+     */
+    private void attentionDecodeDirect(ThreadPool pool, int layer, int pos, float[] q, float[] att, int window, float scale,
+                                       float softcap) {
+        int hd = headDim;
+        int fl = VectorKernels.FL;
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int heads = kvHeads * group;
+        int span = roundUp(len, B);
+        if (blockScores.length < (long) heads * span) {
+            blockScores = new float[(int) Math.min(Integer.MAX_VALUE - 16, Math.max((long) heads * span, 2L * blockScores.length))];
+        }
+        float[] sc = blockScores;
+        int blk0 = first / B;
+        int blk1 = (len + B - 1) / B;
+        int want = 2 * pool.threads();
+        int keyParts = Math.max(1, Math.min((want + kvHeads - 1) / kvHeads, (blk1 - blk0) / 2)); // >= 2 blocks per task
+        int mapped = seq.blocks();
+        if (blk1 > mapped) {
+            throw new IllegalStateException("position " + pos + " is past the sequence's blocks");
+        }
+        pool.forRangeFine(kvHeads * keyParts, 1, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int g = i / keyParts;
+                int part = i % keyParts;
+                int pa = blk0 + (int) ((long) (blk1 - blk0) * part / keyParts);
+                int pb = blk0 + (int) ((long) (blk1 - blk0) * (part + 1) / keyParts);
+                for (int blk = pa; blk < pb; blk++) {
+                    int id = seq.block(blk);
+                    MemorySegment seg = st.slab(id);
+                    long kb = st.base(id, layer) + (long) g * hd * B * 4;
+                    int row = g * group;
+                    int r = 0;
+                    for (; r + 3 < group; r += 4) {
+                        scores4(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd, (row + r + 3) * hd, hd,
+                                sc, (row + r) * span + blk * B, span, scale);
+                    }
+                    for (; r + 1 < group; r += 2) {
+                        scores2(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, hd, sc, (row + r) * span + blk * B, span, scale);
+                    }
+                    for (; r < group; r++) {
+                        scores1(seg, kb, q, (row + r) * hd, hd, sc, (row + r) * span + blk * B, scale);
+                    }
+                }
+            }
+        });
+        boolean capped = softcap > 0 && !VectorKernels.FASTMATH;
+        pool.forRangeFine(heads, 1, (h0, h1) -> {
+            for (int h = h0; h < h1; h++) {
+                int o = h * span;
+                if (capped) {
+                    for (int s = first; s < len; s++) {
+                        sc[o + s] = (float) Math.tanh(sc[o + s] / softcap) * softcap;
+                    }
+                }
+                float inv = 1f / softmax(sc, o + first, len - first, softcap);
+                VectorKernels.scale(sc, o + first, len - first, inv);
+                Arrays.fill(att, h * hd, (h + 1) * hd, 0f);
+            }
+        });
+        int slice = hd % (4 * fl) == 0 ? 4 * fl : hd % (2 * fl) == 0 ? 2 * fl : fl;
+        int slices = hd / slice;
+        pool.forRangeFine(kvHeads * slices, 1, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                int g = i / slices;
+                int e0 = (i % slices) * slice;
+                for (int blk = blk0; blk < blk1; blk++) {
+                    int lo = Math.max(first, blk * B);
+                    int hi = Math.min(len, (blk + 1) * B);
+                    int id = seq.block(blk);
+                    MemorySegment seg = st.slab(id);
+                    long vb = st.base(id, layer) + st.kBytes + ((long) g * hd + e0) * 4; // key 0 of the block, element e0
+                    for (int r = 0; r < group; r++) {
+                        int h = g * group + r;
+                        accumulate(sc, span, h, lo, hi, blk * B, seg, vb, kvDim, att, h * hd + e0, slice);
+                    }
+                }
+            }
+        });
+    }
+
+    /** Scores of four query rows against the {@code B} keys of the block at {@code k[kb ..]} ({@code [hd][B]} floats), as {@code KvCache.score4}. */
+    private void scores4(MemorySegment k, long kb, float[] q, int q0, int q1, int q2, int q3, int hd, float[] sc, int so, int stride,
+                         float scale) {
+        int fl = VectorKernels.FL;
+        for (int v = 0; v < B; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(F);
+            FloatVector a1 = a0;
+            FloatVector a2 = a0;
+            FloatVector a3 = a0;
+            FloatVector b0 = a0;
+            FloatVector b1 = a0;
+            FloatVector b2 = a0;
+            FloatVector b3 = a0;
+            for (int i = 0; i < hd; i++) {
+                long at = kb + ((long) i * B + v) * 4;
+                FloatVector ka = FloatVector.fromMemorySegment(F, k, at, ORDER);
+                FloatVector kz = FloatVector.fromMemorySegment(F, k, at + fl * 4L, ORDER);
+                FloatVector x0 = FloatVector.broadcast(F, q[q0 + i]);
+                FloatVector x1 = FloatVector.broadcast(F, q[q1 + i]);
+                FloatVector x2 = FloatVector.broadcast(F, q[q2 + i]);
+                FloatVector x3 = FloatVector.broadcast(F, q[q3 + i]);
+                a0 = ka.fma(x0, a0);
+                b0 = kz.fma(x0, b0);
+                a1 = ka.fma(x1, a1);
+                b1 = kz.fma(x1, b1);
+                a2 = ka.fma(x2, a2);
+                b2 = kz.fma(x2, b2);
+                a3 = ka.fma(x3, a3);
+                b3 = kz.fma(x3, b3);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+            a1.mul(scale).intoArray(sc, so + stride + v);
+            b1.mul(scale).intoArray(sc, so + stride + v + fl);
+            a2.mul(scale).intoArray(sc, so + 2 * stride + v);
+            b2.mul(scale).intoArray(sc, so + 2 * stride + v + fl);
+            a3.mul(scale).intoArray(sc, so + 3 * stride + v);
+            b3.mul(scale).intoArray(sc, so + 3 * stride + v + fl);
+        }
+    }
+
+    private void scores2(MemorySegment k, long kb, float[] q, int q0, int q1, int hd, float[] sc, int so, int stride, float scale) {
+        int fl = VectorKernels.FL;
+        for (int v = 0; v < B; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(F);
+            FloatVector a1 = a0;
+            FloatVector b0 = a0;
+            FloatVector b1 = a0;
+            for (int i = 0; i < hd; i++) {
+                long at = kb + ((long) i * B + v) * 4;
+                FloatVector ka = FloatVector.fromMemorySegment(F, k, at, ORDER);
+                FloatVector kz = FloatVector.fromMemorySegment(F, k, at + fl * 4L, ORDER);
+                FloatVector x0 = FloatVector.broadcast(F, q[q0 + i]);
+                FloatVector x1 = FloatVector.broadcast(F, q[q1 + i]);
+                a0 = ka.fma(x0, a0);
+                b0 = kz.fma(x0, b0);
+                a1 = ka.fma(x1, a1);
+                b1 = kz.fma(x1, b1);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+            a1.mul(scale).intoArray(sc, so + stride + v);
+            b1.mul(scale).intoArray(sc, so + stride + v + fl);
+        }
+    }
+
+    private void scores1(MemorySegment k, long kb, float[] q, int q0, int hd, float[] sc, int so, float scale) {
+        int fl = VectorKernels.FL;
+        for (int v = 0; v < B; v += 2 * fl) {
+            FloatVector a0 = FloatVector.zero(F);
+            FloatVector b0 = a0;
+            for (int i = 0; i < hd; i++) {
+                long at = kb + ((long) i * B + v) * 4;
+                FloatVector x0 = FloatVector.broadcast(F, q[q0 + i]);
+                a0 = FloatVector.fromMemorySegment(F, k, at, ORDER).fma(x0, a0);
+                b0 = FloatVector.fromMemorySegment(F, k, at + fl * 4L, ORDER).fma(x0, b0);
+            }
+            a0.mul(scale).intoArray(sc, so + v);
+            b0.mul(scale).intoArray(sc, so + v + fl);
+        }
+    }
+
+    /**
+     * Row {@code r}: keys {@code [from, to)} (inside the block starting at position {@code b0}) added to its output
+     * slice {@code att[qo ..]} of {@code width} elements, up to four vectors at a time; the V rows of the block start at
+     * byte {@code vb} of {@code v} with {@code vStride} floats between keys. As {@code KvCache.accumulate1}.
+     */
+    private void accumulate(float[] sc, int span, int r, int from, int to, int b0, MemorySegment v, long vb, int vStride,
+                            float[] att, int qo, int width) {
+        if (from >= to) {
+            return;
+        }
+        int fl = VectorKernels.FL;
+        int p = r * span;
+        int c = 0;
+        for (; c + 4 * fl <= width; c += 4 * fl) {
+            var x0 = FloatVector.fromArray(F, att, qo + c);
+            var x1 = FloatVector.fromArray(F, att, qo + c + fl);
+            var x2 = FloatVector.fromArray(F, att, qo + c + 2 * fl);
+            var x3 = FloatVector.fromArray(F, att, qo + c + 3 * fl);
+            for (int s = from; s < to; s++) {
+                long vo = vb + ((long) (s - b0) * vStride + c) * 4;
+                var w = FloatVector.broadcast(F, sc[p + s]);
+                x0 = FloatVector.fromMemorySegment(F, v, vo, ORDER).fma(w, x0);
+                x1 = FloatVector.fromMemorySegment(F, v, vo + fl * 4L, ORDER).fma(w, x1);
+                x2 = FloatVector.fromMemorySegment(F, v, vo + 2 * fl * 4L, ORDER).fma(w, x2);
+                x3 = FloatVector.fromMemorySegment(F, v, vo + 3 * fl * 4L, ORDER).fma(w, x3);
+            }
+            x0.intoArray(att, qo + c);
+            x1.intoArray(att, qo + c + fl);
+            x2.intoArray(att, qo + c + 2 * fl);
+            x3.intoArray(att, qo + c + 3 * fl);
+        }
+        for (; c < width; c += fl) {
+            var x = FloatVector.fromArray(F, att, qo + c);
+            for (int s = from; s < to; s++) {
+                x = FloatVector.fromMemorySegment(F, v, vb + ((long) (s - b0) * vStride + c) * 4, ORDER)
+                        .fma(FloatVector.broadcast(F, sc[p + s]), x);
+            }
+            x.intoArray(att, qo + c);
         }
     }
 }

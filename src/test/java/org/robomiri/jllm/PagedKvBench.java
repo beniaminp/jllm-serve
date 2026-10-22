@@ -70,9 +70,16 @@ public final class PagedKvBench {
             }
         }
         System.out.println("settings: " + String.join(" ", extra));
-        memory(dir, extra, dt);
-        ttft(dir, extra);
-        speed(dir, extra);
+        String only = System.getProperty("bench.only", "memory,ttft,speed"); // -Dbench.only=speed
+        if (only.contains("memory")) {
+            memory(dir, extra, dt);
+        }
+        if (only.contains("ttft")) {
+            ttft(dir, extra);
+        }
+        if (only.contains("speed")) {
+            speed(dir, extra);
+        }
     }
 
     /** N conversations with a shared 4 096-token system prompt and 64 own tokens each. */
