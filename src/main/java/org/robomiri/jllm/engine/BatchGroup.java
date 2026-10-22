@@ -30,7 +30,14 @@ public final class BatchGroup {
     /** A slot that decoded within this much time counts as generating. */
     private static final long ACTIVE_NANOS = 200_000_000L;
 
+    /** The longest a background request lets interactive ones go first when it waits for the device ({@link Priority}). */
+    static final long BACKGROUND_MAX_WAIT_MS = Long.getLong("jllm.engine.backgroundMaxWaitMs", 2000);
+
     private final ReentrantLock device = new ReentrantLock();
+    /** Honour {@link Priority} in the order of the device waits ({@code engine.priority-order}). */
+    private final boolean priorityOrder;
+    /** Interactive requests waiting for, or in, a decode step: background ones let them have the device first. */
+    private final java.util.concurrent.atomic.AtomicInteger interactiveWaiting = new java.util.concurrent.atomic.AtomicInteger();
     /** The CPU threads the members' CPU backends share (they never compute at the same time); closed with the last. */
     private org.robomiri.jllm.cpu.ThreadPool cpuPool;
     private final List<Member> members = new ArrayList<>();
@@ -43,6 +50,7 @@ public final class BatchGroup {
         final int token;
         final int pos;
         final float[] logits;
+        final Priority priority = Priority.current();
         boolean done;
         RuntimeException error;
 
@@ -51,6 +59,40 @@ public final class BatchGroup {
             this.token = token;
             this.pos = pos;
             this.logits = logits;
+        }
+    }
+
+    public BatchGroup() {
+        this(true);
+    }
+
+    /** @param priorityOrder whether {@link Priority#BACKGROUND} requests give way to interactive ones at the device */
+    public BatchGroup(boolean priorityOrder) {
+        this.priorityOrder = priorityOrder;
+    }
+
+    /** Takes the device lock; a background request first lets the interactive ones that wait for the device go ahead. */
+    private void lockDevice() {
+        if (!priorityOrder || device.isHeldByCurrentThread()) {
+            device.lock();
+        } else if (Priority.current() == Priority.INTERACTIVE) {
+            interactiveWaiting.incrementAndGet();
+            try {
+                device.lock();
+            } finally {
+                interactiveWaiting.decrementAndGet();
+            }
+        } else {
+            // polls instead of queueing on the lock: a background request already in the lock's queue could not be
+            // overtaken by an interactive one that arrives later
+            long give = System.nanoTime() + BACKGROUND_MAX_WAIT_MS * 1_000_000;
+            while (System.nanoTime() < give) {
+                if (interactiveWaiting.get() == 0 && device.tryLock()) {
+                    return;
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(200_000);
+            }
+            device.lock();
         }
     }
 
@@ -85,8 +127,22 @@ public final class BatchGroup {
     }
 
     private void decode(Member self, int token, int pos, float[] logits) {
+        if (priorityOrder && Priority.current() == Priority.INTERACTIVE) {
+            interactiveWaiting.incrementAndGet();
+            try {
+                decodeStep(self, token, pos, logits);
+            } finally {
+                interactiveWaiting.decrementAndGet();
+            }
+        } else {
+            decodeStep(self, token, pos, logits);
+        }
+    }
+
+    private void decodeStep(Member self, int token, int pos, float[] logits) {
         Step mine = new Step(self, token, pos, logits);
         long now = System.nanoTime();
+        long give = now + BACKGROUND_MAX_WAIT_MS * 1_000_000;
         self.lastDecode = now;
         int others = othersGenerating(self, now);
         synchronized (this) {
@@ -94,7 +150,10 @@ public final class BatchGroup {
             notifyAll();
         }
         while (true) {
-            if (device.tryLock()) {
+            // a background step does not lead a batch while an interactive one waits (it may still ride in that batch)
+            boolean yield = priorityOrder && mine.priority == Priority.BACKGROUND && interactiveWaiting.get() > 0
+                    && System.nanoTime() < give;
+            if (!yield && device.tryLock()) {
                 try {
                     synchronized (this) {
                         if (mine.done) {
@@ -151,7 +210,11 @@ public final class BatchGroup {
         synchronized (this) {
             int max = leader.inner.maxBatch();
             // the leader's own step first: its backend lends the buffers
-            pending.sort((a, b) -> Boolean.compare(b.member == leader, a.member == leader));
+            // (then the interactive steps before the background ones, if more are queued than one pass takes)
+            pending.sort((a, b) -> {
+                int c = Boolean.compare(b.member == leader, a.member == leader);
+                return c != 0 || !priorityOrder ? c : a.priority.compareTo(b.priority);
+            });
             batch = new ArrayList<>(pending.subList(0, Math.min(max, pending.size())));
             pending.removeAll(batch);
         }
@@ -214,7 +277,7 @@ public final class BatchGroup {
         }
 
         private void locked(Runnable r) {
-            device.lock();
+            lockDevice();
             try {
                 r.run();
             } finally {
@@ -338,8 +401,20 @@ public final class BatchGroup {
         }
 
         @Override
+        public org.robomiri.jllm.kv.KvSequence kvSequence() {
+            return inner.kvSequence();
+        }
+
+        @Override
+        public StateSnapshot snapshotState(int n) {
+            StateSnapshot[] r = new StateSnapshot[1];
+            locked(() -> r[0] = inner.snapshotState(n));
+            return r[0];
+        }
+
+        @Override
         public void saveState(int n, WritableByteChannel out) throws IOException {
-            device.lock();
+            lockDevice();
             try {
                 inner.saveState(n, out);
             } finally {
@@ -349,7 +424,7 @@ public final class BatchGroup {
 
         @Override
         public void loadState(int n, ReadableByteChannel in) throws IOException {
-            device.lock();
+            lockDevice();
             try {
                 inner.loadState(n, in);
             } finally {

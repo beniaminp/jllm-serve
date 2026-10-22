@@ -133,7 +133,7 @@ public final class Main {
         List<org.robomiri.jllm.vision.Rgb> images = new ArrayList<>();
         StringBuilder content = new StringBuilder();
         for (String f : s.get("image").split(",")) {
-            if (f.isBlank()) {
+            if (f.isBlank() || f.trim().equals("-")) { // ("-": no picture, the same output path for comparing a text-only prompt)
                 continue;
             }
             try {

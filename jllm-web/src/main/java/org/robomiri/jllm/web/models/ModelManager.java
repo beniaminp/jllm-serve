@@ -333,6 +333,9 @@ public class ModelManager implements DisposableBean {
             snapshot.put("slots", String.valueOf(slots));
             LoadedModel m = new LoadedModel(t.id(), t.model(), l, extraSlots, snapshot, (System.nanoTime() - t0) / 1e9,
                     kvStore);
+            if (kvStore != null) {
+                kvStore.attachSpill(m); // a paged model's evicted blocks go to the block store
+            }
             synchronized (this) {
                 loaded.put(t.id(), m);
             }

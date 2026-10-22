@@ -237,7 +237,11 @@ final class SpeculationTest {
             Map<Integer, Integer> hq = new HashMap<>(); // plain again, other seeds: the sampling noise to compare against
             Map<Integer, Integer> hs = new HashMap<>();
             Engine ep = engine(new FakeBackend(true), cfg, tok, null);
+            // the fake backend's pass times are noise, which the cost model that pauses prompt lookup would act on: this
+            // check needs the lookups to happen, so it runs them at every match (jllm.engine.adaptiveNgram=false)
+            System.setProperty("jllm.engine.adaptiveNgram", "false");
             Engine es = engine(new FakeBackend(true), cfg, tok, ng);
+            System.clearProperty("jllm.engine.adaptiveNgram");
             long acceptedTotal = 0;
             long draftedTotal = 0;
             for (int i = 0; i < runs; i++) {

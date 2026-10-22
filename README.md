@@ -57,6 +57,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Constrained tool calls | inside `<tool_call>` the model can only write a known tool and arguments that match its schema, so a call always parses; the fixed parts of a call are appended in one pass without sampling (jump-forward), speculation checks its drafts against the constraint, and the token mask is computed with a byte trie and memoized (a 32-token call: 254 → 149 ms on an M1 Pro with jump-forward; the mask 60–170 µs per token where it was 190–510 µs; `engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks`) | [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward) |
 | Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend; on Metal as one pass over the slots' separate caches, `engine.batch-decode`, default `true`; `false` = every slot on its own) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots), [08 §8.24](docs/08-metal-backend.md#824-batched-decoding-across-slots-metalbackendforwardbatch) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
+| Paged KV cache with a prefix tree | `backend.kv-paged=true`: KV memory as one pool of 16-position blocks per model with a block table per slot, instead of a full-size array per slot. Blocks are allocated as a conversation grows; a radix tree over the token ids gives identical prefixes (a shared system prompt, a retry, a subagent forked from one context) one copy across slots and conversations, with reference counts and copy on write; unreferenced blocks are evicted least recently used first and spilled to a disk block store. The CPU tile kernels and the Metal split / flash / decode / prefill kernels read through the block table, bit for bit as with the flat cache (f32, f16, q8); decode replay, pipelined decoding, batched rows, speculation rollback and saved caches work unchanged; every index is `long` (a million-position test). Qwen3-0.6B: 8 conversations sharing a 4 096-token prompt take 1.1 GB instead of 7.7 GB, a resent 4 160-token conversation 32 ms to first token on Metal instead of 6.3 s (CPU 71 ms instead of 24 s), decode −3 % on Metal; q4, DeepSeek and the recurrent hybrids stay flat. Off by default | [24](docs/24-paged-kv-cache.md) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
 | Decode replay | a decode step's ~170 GPU dispatches are recorded once and replayed with one native call per token instead of one call per dispatch | [08 §8.22](docs/08-metal-backend.md#822-decode-replay-one-native-call-per-token) |
@@ -64,6 +65,9 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Multi-row decode matvec on Metal | the single-token matmuls give a simdgroup 4 rows that share the activations and the rmsnorm prologue: matvecs per token 6.76 → 5.52 ms, 0.6B decode 118 → 132 tok/s, GGUF Q4_0 105 → 133 (`-Djllm.metal.mvRows=1` for the old kernels) | [08 §8.30](docs/08-metal-backend.md#830-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_) |
 | Decode attention on Metal | independent simdgroups with online softmax in registers and K/V rows shared by a kv head's query heads, picked by the start-up check: ~2× at 3 000 tokens of context (63 → 93 tok/s; f16 / q8 caches 62 → 113) | [08 §8.31](docs/08-metal-backend.md#831-decode-attention-attention_dec) |
 | Prefill chunk `auto` | 256-token chunks for dense models on Metal (prefill 1 426 → 2 012 tok/s on Qwen3-0.6B), logits identical across chunk sizes | [08 §8.29](docs/08-metal-backend.md#829-the-prefill-chunk-backendbatchauto) |
+| Context from memory | `backend.ctx=auto` sizes the context from the free memory (Metal working set minus the weights and other models, or the free Java heap), up to 131 072 and the trained length, and logs it: 40 960 for Qwen3-0.6B, 44 032 for the 27B hybrid GGUF, 18 432 for the 30B MoE at f32 (37 888 at f16); a number still overrides | [10 §10.13](docs/10-engine-and-server.md#1013-the-default-context-length-backendctxauto) |
+| Request priority | `"priority": "background"` (or `X-Jllm-Priority`) makes a subagent or batch job give way at the GPU: a short interactive request behind a long background prompt gets its first token in 127 ms instead of 937 ms (`engine.priority-order`) | [10 §10.14](docs/10-engine-and-server.md#1014-request-priority) |
+| Prompt lookup that pauses | speculation on agent-like prompts, measured: code edit +106 % (0.6B) / +33 … +68 % (30B MoE) / +44 % (CPU), tool calls and prose within −10 %; lookups pause while the measured cost says no draft pays, so the CPU's slow multi-token pass costs 4 – 5 % on prose and tool calls instead of 37 – 40 %; now on for MoE models too | [11 §11.11](docs/11-performance.md#1111-agent-defaults-measured) |
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
@@ -89,7 +93,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 | Video generation | AnimateDiff written from scratch on the image stack: the motion adapter's 21 temporal transformers (group norm over the whole clip, attention along the frame axis of every pixel, sinusoidal frame positions) inside the SD 1.5 UNet with the frames in the batch, DDIM and the linear schedule it was trained with, the VAE per frame; animated GIF (median-cut palette, dithering, LZW), lossless animated WebP (VP8L: predictors, back references, prefix codes) and MP4 through ffmpeg, all written in Java; `/v1/videos/generations` and `/encode` (streaming progress and previews), `./jllm video`, a Video tab with gallery and frame-strip editor, `generate_video` chat tool; new kernels (axis swap, row table add; RMS norm, rotary, modulation, frame shift for Wan). Equal to diffusers' `AnimateDiffPipeline` on the same noise: UNet within 8·10⁻⁶ relative, 16-frame clips at 78–87 dB PSNR (float16: 45 dB). Wan 2.1 (DiT, causal 3-D VAE, UMT5 with int8 weights, UniPC) checked against diffusers on tiny pipelines (130 dB) and on the real transformer and VAE | [23](docs/23-video-generation.md) |
 | Image generation | Stable Diffusion 1.x / 2.x / Turbo and SDXL written from scratch (CLIP tokenizer and text encoders, UNet, VAE with tiled decoding, Euler / Euler-ancestral / DPM++ 2M, classifier-free guidance, image to image, inpainting with blending or a 9-channel UNet, outpainting, upscaling); on Metal in float16 with its own kernels (implicit-GEMM convolution, flash attention, chunked group norm) and on the CPU; `/v1/images/generations` and `/edits` (streaming progress and previews), `./jllm image`, an Images tab with gallery and canvas editor, `generate_image` / `edit_image` chat tools. Equal to Hugging Face diffusers stage by stage on the same noise: float32 UNet within 5·10⁻⁶ relative, final images at 74–137 dB PSNR (float16: 50–77 dB) | [22](docs/22-image-generation.md) |
-| Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL; the Gemma 3 projector) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
+| Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL, Qwen3.5, Gemma 3) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
 
 The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
 batched decoding and draft speculation were merged after it and are verified on the emulator only) were verified for correctness on the emulator (every family, CPU == Metal) and on an M1 Pro
@@ -242,9 +246,11 @@ the server fetches, never from private addresses unless `vision.allow-private-ur
 attaches, pastes or drops pictures; a text-only model can use a loaded vision model through the `describe_image` tool.
 Put the picture before the question. Settings: `vision.*` in [`jllm.properties`](src/main/resources/jllm.properties);
 the chapter is [docs/20](docs/20-vision.md). `unsloth/Qwen3.8-27B-GGUF` (Qwen3.5, a Gated DeltaNet hybrid) sees pictures on CPU
-and Metal and matches llama.cpp's prompt ids, first-position log-probs and greedy answer. Gemma 3: the projector and the
-attention that runs both ways inside a picture are implemented and checked, and the `gemma3` GGUF text architecture is mapped
-(docs/16 §16.15; its layout is checked against llama.cpp on tiny files, no real Gemma 3 file was loaded).
+and Metal and matches llama.cpp's prompt ids, first-position log-probs and greedy answer. Gemma 3 4B (`ggml-org/gemma-3-4b-it-GGUF`, Q4_K_M + the f16 projector) sees pictures too, with the attention that runs both ways
+inside a picture that Gemma 3 was trained with (the picture goes through in one pass, so `backend.batch` is raised to 256 for
+Gemma 3 at its default): its prompt ids and 32 greedy tokens equal llama.cpp's on two pictures and a text-only prompt, and
+the first-position log-probabilities are within 0.06 of them, the size of the difference the two text paths already have
+without a picture ([docs/20 §20.13](docs/20-vision.md#2013-gemma-3-attention-that-runs-both-ways-inside-a-picture)).
 
 ### API
 
@@ -271,7 +277,10 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"s
   the constraint);
 - completions only: `echo` (with prompt logprobs), `suffix` (fill-in-the-middle for tokenizers with
   `<|fim_prefix|>`/`<|fim_suffix|>`/`<|fim_middle|>`, a 400 otherwise) and `best_of` (the n most likely of best_of
-  candidates; not with `stream`).
+  candidates; not with `stream`);
+- `priority`: `"interactive"` (the default) or `"background"` (an extension; or the header `X-Jllm-Priority`): a
+  subagent or batch job that gives way to people waiting when requests contend for the device
+  ([docs/10 §10.14](docs/10-engine-and-server.md#1014-request-priority)).
 
 Details and the math: [docs/10 §10.6](docs/10-engine-and-server.md#106-the-openai-compatible-api).
 
@@ -463,7 +472,8 @@ Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, `q8`: int
 kv head, about a quarter of the f32 cache, or `q4`: Hadamard-rotated keys and 4-bit groups of 32 with a half scale,
 about an eighth, for long contexts), `backend.kv-q4-recent` (q4: the latest positions also kept in half precision,
 default 128, 0 = none), `backend.kv-q8-rotate` (q8: rotate the keys before the int8 quantization, default `true`,
-`false` = the previous format; saved q8 caches of the old format are refused under the new default), `backend.cpu.int8-activations`
+`false` = the previous format; saved q8 caches of the old format are refused under the new default), `backend.kv-paged` (default false: one pool of `backend.kv-block`-position blocks per model with a
+block table per slot and a prefix tree, docs/24; `backend.kv-pool-tokens`, `backend.kv-prefix-share`), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
 `false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
@@ -474,7 +484,7 @@ path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engin
 `vision.*` (the multimodal projector, where the picture encoder runs, token budget, size limits: [docs/20](docs/20-vision.md#209-settings)),
 `engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
-the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides) and the `server.*` limits listed under Security below.
+the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides), `backend.ctx` (`auto` = sized from the memory free for the KV cache, [docs/10 §10.13](docs/10-engine-and-server.md#1013-the-default-context-length-backendctxauto); a number overrides) with `backend.ctx-max` (its cap, 131072), `engine.priority-order` (background requests give way at the device) and the `server.*` limits listed under Security below.
 
 Settings added with the features above (all in [`src/main/resources/jllm.properties`](src/main/resources/jllm.properties), documented there; a flag
 `--key value` or the console's Settings page changes any of them; `./jllm config` prints the effective values):
@@ -515,9 +525,10 @@ Short flags:
 --head-quant q8|q6k   format of the embedding / LM head (default q8; q6k = Q6_K, a separate jllm-q4_0-h6k cache)
 --gguf-quant LABEL    GGUF repository: the file whose name carries LABEL (Q4_K_M, Q8_0, ...); --gguf-file NAME: exact file name
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
---ctx N               context length / KV cache size (default 4096)
+--ctx N|auto          context length / KV cache size (default auto: sized from the free memory, up to 131072 and the model's trained length; logged at load)
 --batch N|auto       prefill chunk size (default auto: 256 on Metal and for MoE models, 64 on the CPU)
 --backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N; --backend.kv-q8-rotate true|false
+--backend.kv-paged true|false     paged KV cache with a prefix tree (docs/24); --backend.kv-block N, --backend.kv-pool-tokens N
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)

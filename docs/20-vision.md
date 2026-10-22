@@ -391,38 +391,198 @@ the answers of the two backends are the same, and text after a picture request e
 
 ## 20.13 Gemma 3: attention that runs both ways inside a picture
 
-🧸 When you read a sentence you only know the words before the one you are on. A picture is not a sentence: you see all of it at
-once. Gemma 3 was trained that way: the 256 "picture words" of one picture may look at *each other*, forwards as well as
-backwards. The words before the picture and after it behave as usual.
+Code: `Backend.forwardEmbedsBidirectional` (`model/Backend`), its two implementations in `cpu/CpuBackend.GqaStep.run` and
+`metal/MetalBackend.GqaStep.run`, the feeding in `engine/Engine.generateLocked`, the flag `MediaPrompt.nonCausal` set by
+`vision/VisionContext` for the `gemma3` projector, the batch rule in `ModelLoader.batch`; tests in `VisionTest`
+(`bidirectional`, and the engine-level checks of `tinyModel`).
 
-📐 The mask of ordinary (causal) attention lets row `i` see the keys `j ≤ i`. For the rows `S` of one picture Gemma 3 adds
-`M[i][j] = 1` for all `i, j ∈ S`. `Backend.forwardEmbedsBidirectional` does this without a new kernel: all `n` rows of the
-picture store their keys and values first (the projections, QK-norm and RoPE are per row, as always), then every row
-attends *as if it were the last row of the picture* (keys `[0, pos + n)`): on the CPU one `kv.attention` call per row, on
-Metal one single-row `attention_t` dispatch per row (`attentionRow`, the same kernels and the same numpy tests as decoding).
-Consequences:
+### 🧸 In plain words
 
-* The picture must go through the model in **one pass**: `n` ≤ the backend's batch. `backend.batch` at its default is raised
-  to 256 for a `gemma3` model (a picture is 256 tokens), a smaller explicit value is refused with a message naming the
-  setting, and the engine rounds a cache reuse that would end inside a picture back to the picture's first token.
-* A layer with a sliding window (Gemma's local layers, 1 024 keys) counts the window back from the picture's *last* row for
-  every row; it differs from counting from the row itself only if more than ~770 tokens of text precede the picture.
-* The prefix cache is keyed by the picture's hash, not by the attention mode; one model always uses one mode.
-* Cost: 256 rows × layers small attention dispatches instead of one; a one-time price per picture.
+When you read a sentence you only know the words *before* the one you are on: a word cannot peek at the ones that come
+after it. A picture is not a sentence. You see all of it at once, the sun in the corner and the house in the middle
+together. Gemma 3 was trained this way: the 256 "picture words" of one picture may look at *each other*, forwards as well as
+backwards, and at everything that came before them. The words after the picture still read in the normal order, and they
+can see the whole picture. Think of a queue of people, each of whom can only see the people in front of them, except that
+the people standing together for a group photo may all look at each other; the people behind the group see the whole group.
 
-Checked with a *set oracle* on a tiny model (`VisionTest.bidirectional`): give the n rows of a picture the same rotary
-position. Attention that runs both ways is then a weighted sum over a *set* of keys, so permuting the picture's rows must
-not change anything the text after it sees (max difference below 10⁻⁴ on the CPU and the GPU), while causal attention does
-change (> 10⁻³), and the CPU and Metal agree with each other (< 5·10⁻³) by hand and through the engine with M-RoPE positions.
+The engine's job is to let the picture words look at each other without breaking the rule for the words around them. The
+catch is that a picture word can only be looked at once the thinking for it has been done *in that same layer*, so the
+whole picture has to be worked on in one go, not in small pieces.
 
-**Not checked end to end:** the `gemma3` GGUF text architecture is not part of this build (the GGUF loader refuses it), so
-a Gemma 3 model cannot be loaded yet and nothing here was compared with llama.cpp on a real Gemma 3 file; the projector
-itself was (20.10). The picture side is ready for it: `MediaPrompt.nonCausal` is set for the `gemma3` projector, the engine
-feeds the picture whole through `forwardEmbedsBidirectional`, and a backend that cannot do it refuses the request.
+### 📐 How it works
+
+**The mask.** Attention (chapter 5) scores a query row `i` against every key row `j` and turns the scores into weights:
+
+```
+a_ij = softmax_j( s_ij + M_ij ),      s_ij = q_i · k_j / sqrt(256)        (Gemma 3: query_pre_attn_scalar = 256)
+out_i = Σ_j a_ij v_j                  M_ij = 0 if row i may see row j, −∞ if not
+```
+
+Ordinary (causal) attention: `M_ij = 0` for `j ≤ i`. Gemma 3 adds: `M_ij = 0` for all `i, j` inside the same picture `S`.
+The tokens `<start_of_image>` and `<end_of_image>` that frame the picture are *not* part of `S`. For a prompt
+`<bos> <start_of_turn> user ⏎ <start_of_image> [p0 p1 p2] <end_of_image> Q …` (three picture rows instead of 256) the grid
+of "who sees whom" (1 = may see, `.` = may not; rows are queries, columns are keys) is:
+
+```
+             keys →   bos sot usr ⏎  soi | p0  p1  p2 | eoi  Q
+query ↓
+bos                    1   .   .   .   .  |  .   .   .  |  .   .
+start_of_turn          1   1   .   .   .  |  .   .   .  |  .   .
+user                   1   1   1   .   .  |  .   .   .  |  .   .
+newline                1   1   1   1   .  |  .   .   .  |  .   .
+start_of_image         1   1   1   1   1  |  .   .   .  |  .   .
+                      ----------------------------------------------
+p0                     1   1   1   1   1  |  1   1   1  |  .   .      <- causal would be:  1 . .
+p1                     1   1   1   1   1  |  1   1   1  |  .   .      <-                   1 1 .
+p2                     1   1   1   1   1  |  1   1   1  |  .   .      <-                   1 1 1
+                      ----------------------------------------------
+end_of_image           1   1   1   1   1  |  1   1   1  |  1   .
+Q (text after)         1   1   1   1   1  |  1   1   1  |  1   1
+```
+
+Everything outside the two middle rows' picture block is the ordinary lower triangle; the picture block is a full square.
+
+**A worked example with the real sizes.** `shapes.png` with the question "What shapes and colors do you see in this
+picture?" is 278 tokens: 5 before the picture (`<bos> <start_of_turn> user ⏎ <start_of_image>`), the picture's 256, and 17 after.
+Picture row `p0` sees `5 + 1 = 6` keys with causal attention and `5 + 256 = 261` with Gemma 3's; the last picture row sees 261 either
+way. On average a picture row sees 133 keys causally and 261 both ways, so the picture's attention costs about twice as
+much (about 256 × 261 score products per head per layer instead of 256 × 133).
+
+**Why the picture goes through in one pass.** Row `p0` at layer `l` needs the key and value of row `p255` at layer `l`,
+and those are computed from `p255`'s hidden state *after layer `l − 1`*, which itself looked at all the other rows.
+So the layers must be run over all 256 rows together: the projections, QK-norm and RoPE of every row first, the
+keys and values of all rows into the cache, and only then the attention of every row. The engine therefore feeds a
+`nonCausal` picture as a single pass (`n = 256` rows), after the text before it and before the text after it.
+
+**How it is done without a new kernel.** After the rows' keys and values are stored, row `t` of the pass (position
+`pos + t`) attends *as if it were the last row of the pass*: the keys `[0, pos + n)`, which is exactly the causal rule for row
+`pos + n − 1`.
+
+* CPU (`CpuBackend.GqaStep.run`): one `kv.attention(pool, layer, 1, pos + n − 1, qRow, aRow, …)` call per row, with the row's
+  query copied out and its output copied back; the KV cache classes (f32, f16, q8) are used as they are.
+* Metal (`MetalBackend.GqaStep.run`): one single-row `attention_t` dispatch per row through `MetalKernels.attentionRow`
+  (the kernel and the dispatch of the batched decode step), with the scores scratch sliced so that the rows of a layer run
+  concurrently. The flash prefill kernels have the causal triangle built in, so they are bypassed for such a pass.
+
+A Gemma layer with a sliding window (the "local" layers, window 1 024 keys) counts the window back from the last row of the
+picture for every row. For a row it only differs from counting back from the row itself if more than ~770 tokens of text
+come before the picture.
+
+**Where the rest of Gemma 3's picture handling is.**
+
+```
+<bos> <start_of_turn> user ⏎ <start_of_image> [256 × placeholder] <end_of_image> Question <end_of_turn> ⏎ <start_of_turn> model ⏎
+ ids:  2      105      2364 107     255999          rows from the projector     256000     3689 …
+```
+
+The placeholder is an id the model never looks up (the rows come from the projector, scaled by nothing: Gemma scales only
+the embeddings of *tokens* by `sqrt(dim)`, not the picture rows, as llama.cpp's graph). The text-only vocabulary of a
+Gemma 3 GGUF ends before `<image_soft_token>` (id 262 144), so `VisionContext` uses `<pad>` as the placeholder there.
+The tokens' positions are the plain `0, 1, 2, …` (no M-RoPE); the global layers use RoPE with linear scaling ×8, the local
+ones base 10 000 (chapter 14).
+
+### Why this design
+
+* **No new kernel, one more method.** A masked variant of the prefill attention kernels (`attention_t`, `attention_fa`,
+  `attention_fb`, and the q4 forms) would be faster for 256 rows, but each carries its own tiling of the causal triangle;
+  reusing the single-row decode kernels gives the exact kernels that decoding is checked with (chapter 8) at the price of 256 small
+  dispatches per layer, a one-time cost per picture (prefill of the 278-token prompt took 1.4 s, of which the attention
+  dispatches are a part). If pictures become the bottleneck, a masked `attention_t` is the next step.
+* **One pass, not a layer-major loop.** Running the layers on chunks of the picture, layer by layer, would let `backend.batch`
+  stay at 64 but needs the hidden state of all rows to be kept between the chunks and the loop order turned inside out
+  in every backend. Raising the batch to 256 costs only larger activation buffers (256 × 10 240 floats = 10 MB per buffer
+  for Gemma 3 4B).
+* **Rows "as the last row" instead of a mask argument on the cache classes.** The three KV cache types and the q4 simulation
+  all have `attention(…, n, pos, …)` with the causal rule inside; adding a parameter would touch all of them.
+
+### Settings
+
+| Switch | Default | Meaning |
+|---|---|---|
+| `backend.batch` | 64, **256 for a `gemma3` model while it is at its default** | tokens per pass. The picture's 256 tokens must fit in one pass; with a smaller explicit value the request is refused: "a picture of 256 tokens attends to itself both ways and must fit in one pass, but the batch is 64: set backend.batch to at least 256" |
+| `-Djllm.vision.causal=true` (JVM flag) | off | the picture attends causally like text. Wrong for real Gemma 3 answers (see the table), kept as the comparison and as the old path |
+| `vision.*` | see 20.9 | the projector, the encoder's backend, the token budget (fixed at 256 tokens for Gemma 3), the size limits |
+
+The Metal q4 KV cache (`backend.kv-dtype=q4`) has its own attention path and does not do this; a request with a picture on
+that combination is refused. `scripts/mac-validate.sh --vision mmproj.gguf picture.png --vision-model gemma.gguf` has the
+on/off row (default against `-Djllm.vision.causal=true`).
+
+### Measured
+
+Machine: Apple M1 Pro, JDK 26, the project's heavy lock held, 2026-10-22. Model: `ggml-org/gemma-3-4b-it-GGUF`
+(`gemma-3-4b-it-Q4_K_M.gguf`, `mmproj-model-f16.gguf`), pictures `shapes.png` (640 × 480) and `scene.png` (800 × 600), 32 new tokens,
+temperature 0, thinking not applicable. Command lines:
+
+```
+JAVA_OPTS=-Djllm.vision.debug=true ./jllm run --model gemma-3-4b-it-Q4_K_M.gguf --mmproj mmproj-model-f16.gguf \
+    --image shapes.png --prompt "What shapes and colors do you see in this picture?" --temp 0 --max-tokens 32 --backend metal --ctx 1024
+GPU=1 vision-llamacpp-check gemma-3-4b-it-Q4_K_M.gguf mmproj-model-f16.gguf \
+    "<start_of_turn>user\n<__media__>What shapes and colors do you see in this picture?<end_of_turn>\n<start_of_turn>model\n" shapes.png 32 99
+```
+
+(`scripts/vision-llamacpp-check.cpp` is the second program: libmtmd's tokenizer and `mtmd_helper_eval_chunks`, which sets
+llama.cpp's non-causal attention for the picture, then the first position's top-5 and 32 greedy tokens; `--image -` of
+`jllm run` and `-` for the picture are the text-only forms.)
+
+*Prompt ids*: identical to llama.cpp's in all three cases (picture + `shapes.png` question: `2 105 2364 107 255999 [256] 256000 3689 15965
+532 7913 776 611 1460 528 672 6083 236881 106 107 105 4368 107`; the `scene.png` prompt; a text-only prompt).
+*Greedy tokens (32)*: identical to llama.cpp's in all three cases ("Here's a breakdown of the shapes and colors I see in the
+image: * **Shapes:** * A red circle *"; "The image depicts a simple, stylized landscape featuring a green field, a gray pyramid-shaped
+mountain, a red house, and a yellow sun in a blue sky"; "The sky appears blue due to a phenomenon called Rayleigh scattering, …").
+
+*Log-probabilities at the first position* (natural log; llama.cpp against jllm):
+
+| `shapes.png` | llama.cpp | jllm, both ways (default) | jllm with llama.cpp's own embeddings | jllm, CPU encoder | jllm, f16 KV | **jllm, causal picture** |
+|---|---|---|---|---|---|---|
+| `Here` | −0.32422 | −0.26553 | −0.26481 | −0.26364 | −0.26558 | −0.05192 |
+| `Okay` | −1.28473 | −1.45667 | −1.45907 | −1.46294 | −1.45653 | −2.98662 |
+| `Let` | −8.89864 | −8.86567 | −8.86310 | −8.86596 | −8.86628 | −9.34682 |
+| `Certainly` | −10.24162 | −10.14024 | −10.14554 | −10.14461 | −10.13941 | −10.04553 |
+| `Alright` | −11.47596 | −11.44506 | −11.44685 | −11.45199 | −11.44446 | −12.40469 |
+
+| `scene.png` | llama.cpp | jllm, both ways | jllm, f16 KV | **jllm, causal picture** |
+|---|---|---|---|---|
+| first | `The` −0.42684 | `The` −0.46115 | `The` −0.45988 | **`This`** −0.16587 |
+| second | `This` −1.07410 | `This` −1.00826 | `This` −1.01052 | `The` −2.27898 |
+| third | `Here` −5.14519 | `Here` −5.38495 | `Here` −5.37954 | `Here` −2.98666 |
+
+What the table says: with attention that runs both ways the log-probabilities are within 0.06 (0.24 for a −5 entry) of
+llama.cpp's, with a causal picture they are 0.27 off for the best token of `shapes.png` and the order of the two best tokens of
+`scene.png` is reversed. The remaining difference is not the picture's embeddings (llama.cpp's own embeddings give the same
+numbers), not our encoder (the CPU encoder gives the same), not the KV precision (f16 gives the same); it is the size of the
+differences between the two *text* paths on this Q4_K_M file. To see that, the same comparison without a picture
+(`--image -`, `-` for llama.cpp):
+
+| text only | llama.cpp | jllm |
+|---|---|---|
+| "What shapes and colors do you see in this picture?" | `Okay` −0.32389, `Please` −1.28789, `Unfortunately` −7.20351 | `Okay` −0.29323, `Please` −1.37449, `Unfortunately` −6.82108 |
+| "Tell me about the shapes and colors of a rainbow." | `Okay` −0.00029, `Let` −8.27948 | `Okay` −0.00019, `Let` −8.68965 |
+
+differences of the same size (0.03 … 0.4) with no picture at all, from the two engines' different Q4_K arithmetic (their
+integer-dot-product kernels against ours, activations quantized differently), accumulated over 34 layers.
+
+Time (cold process, so it includes building the Metal pipelines): `shapes.png`: encoding 2 970 ms, prefill of the 278 tokens
+1 373 ms, 32 tokens in 1 263 ms (25.3 tok/s), 5 629 ms in all; llama.cpp's `mtmd_helper_eval_chunks` (encoding and
+prefill of the same prompt) took 4 122 ms. Text only: 20 tokens prefilled in 173 ms, 26.1 tok/s.
+
+### Checks and limits
+
+* `VisionTest.bidirectional`, a *set oracle* on a tiny Qwen2 model that needs no reference implementation: give the n rows
+  of a picture the same rotary position. Attention that runs both ways is then a weighted sum over a *set* of keys, so permuting the
+  picture's rows must not change anything the text after it sees (max logit difference below 10⁻⁴ on the CPU and the GPU),
+  while with causal attention it does (above 10⁻³). The CPU and Metal agree with each other (below 5·10⁻³) by hand and through the
+  engine, with the picture's own positions and without; a batch smaller than the picture is refused; the cache of rows computed
+  causally is never taken for rows computed both ways (a fresh engine is used; a model always runs in one mode).
+* Against llama.cpp: the table above on a real Gemma 3 4B (ids and the 32 tokens identical, log-probabilities as discussed).
+* A cancelled prefill that stopped inside a picture is restarted at the picture's first token.
+* Not done or not exact: the sliding-window rule above (differs from llama.cpp only with > ~770 tokens before the picture); the Metal q4 KV cache;
+  one picture is limited to what fits in `backend.batch` (256 tokens: Gemma 3's fixed size, so always); the cost of the 256
+  single-row dispatches (above).
 
 ## 20.14 Limits, and what differs from Hugging Face
 
-* **Gemma 3 end to end** waits for the `gemma3` GGUF text architecture (20.13); everything on the picture side is there.
+* **Gemma 3** works end to end (20.13) on CPU and Metal: the picture side is the 896 × 896 fixed size with 256 tokens, the
+  text side the `gemma3` GGUF architecture; the Gemma 3 1B text-only model has no projector.
 * **Qwen3.5 / "Qwen3.8"** works (20.12) on CPU and Metal; only the pictures' quality depends on the Q4_0 file.
 * Pictures only: no video (a second frame), no audio input.
 * One picture is encoded in one command buffer; a huge picture (`vision.image-max-tokens` large) needs

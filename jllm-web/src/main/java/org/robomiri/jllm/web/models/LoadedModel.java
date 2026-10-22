@@ -175,6 +175,10 @@ public final class LoadedModel {
      * </ol>
      */
     private synchronized Choice choose(int[] prompt) {
+        // a paged KV cache shares blocks through the pool's prefix tree, whichever slot runs the prompt: the engine takes
+        // over what any slot or conversation computed (Engine.generate), so no slot needs to be picked for its prefix
+        // and nothing is copied; the slot whose own conversation the prompt continues still saves the table rebuild
+        boolean paged = slots.getFirst().engine.backend().kvSequence() != null;
         Slot cont = null;
         int contLen = 0;
         Slot donor = null;
@@ -190,7 +194,7 @@ public final class LoadedModel {
                 cont = s;
                 contLen = len;
             }
-            if (len > donorLen) {
+            if (len > donorLen && !paged) {
                 donor = s;
                 donorLen = len;
             }
@@ -198,7 +202,7 @@ public final class LoadedModel {
                 victim = s;
             }
         }
-        if (cont != null && contLen >= donorLen) {
+        if (cont != null && (paged || contLen >= donorLen)) {
             cont.users.incrementAndGet();
             return new Choice(cont, null);
         }

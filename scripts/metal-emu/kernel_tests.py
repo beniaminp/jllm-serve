@@ -58,7 +58,38 @@ def q8_rows(x, n_kv, hd):
     return np.ascontiguousarray(out), (q.astype(np.float32) * scale[:, :, None]).reshape(rows, -1)
 
 
-def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False):
+def paged(caches, page):
+    """The paged KV cache's layout (docs/24): the per-position arrays of `caches` (each [ctx, ...]) scattered, 2^page
+    positions to a block, over a pool in shuffled block order with unused blocks between them filled with garbage (NaN, or
+    0x5A bytes), so that a wrong address shows; returns the pools and the block table (int32 per logical block). With
+    page == 0 the arrays as they are (the flat cache) and a one-int dummy table."""
+    if page == 0:
+        return list(caches) + [np.zeros(1, np.int32)]
+    block = 1 << page
+    ctx = caches[0].shape[0]
+    nb = (ctx + block - 1) // block
+    total = nb + 3
+    ids = np.random.default_rng(page * 7919 + ctx).permutation(total)[:nb].astype(np.int32)
+    out = []
+    for c in caches:
+        pool = np.empty((total * block,) + c.shape[1:], c.dtype)
+        pool[...] = np.nan if c.dtype.kind == 'f' else 0x5A
+        for i in range(nb):
+            seg = c[i * block:(i + 1) * block]
+            pool[ids[i] * block:ids[i] * block + len(seg)] = seg
+        out.append(pool)
+    return out + [ids]
+
+
+def paged_rows(pool, tbl, page, first, n):
+    """The rows of positions [first, first + n) of a paged cache."""
+    block = 1 << page
+    if n <= 0:
+        return np.zeros((0,), pool.dtype)
+    return np.stack([pool[tbl[p // block] * block + p % block] for p in range(first, first + n)])
+
+
+def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False, page=0):
     rng = np.random.default_rng(1)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     kc = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
@@ -71,37 +102,68 @@ def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False
     out = np.zeros((ntok, n_heads * hd), np.float32)
     scores = np.zeros((ntok * n_heads * ctx,), np.float32)
     scale = 1 / np.sqrt(hd)
-    # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap
-    p = pack('iiiiiifiiiiiif', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride,
-             n_heads * hd, 0, 0, 0.0)
-    E.dispatch(name, [q, kc, vc, out, scores], p, (n_heads // G, ntok), (256,))
+    # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap pageShift
+    p = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride,
+             n_heads * hd, 0, 0, 0.0, page)
+    kc, vc, tbl = paged([kc, vc], page)
+    E.dispatch(name, [q, kc, vc, out, scores, tbl], p, (n_heads // G, ntok), (256,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, '%s hd=%d: max err %.2e' % (name, hd, err))
+    check(err < 1e-4, '%s hd=%d%s: max err %.2e' % (name, hd, ', paged (blocks of %d)' % (1 << page) if page else '', err))
 
 
-def kv_store_q8(hd, n_kv=2, ntok=5, pos0=3, ctx=12):
+def kv_store_q8(hd, n_kv=2, ntok=5, pos0=3, ctx=12, page=0):
     """kv_store_q8 quantizes the staging rows of k and v into the cache rows [pos0, pos0 + ntok) bit for bit as
     numpy (and the engine's Java side) does, and leaves the other rows alone."""
     rng = np.random.default_rng(4)
     k = (rng.standard_normal((ntok, n_kv * hd)) * rng.random((ntok, 1)) * 4).astype(np.float32)
     v = rng.standard_normal((ntok, n_kv * hd)).astype(np.float32)
-    k[1, :hd] = 0  # an all-zero row: scale 0, values 0
+    if ntok > 1:
+        k[1, :hd] = 0  # an all-zero row: scale 0, values 0
     stride = n_kv * hd + 4 * n_kv
     kc = np.full((ctx, stride), 0x5A, np.uint8)
     vc = np.full((ctx, stride), 0x5A, np.uint8)
-    # KvStoreParams: headDim kvDim nKvHeads stride; the cache is bound at row pos0
-    kview = kc[pos0:]
-    vview = vc[pos0:]
-    kb = np.ascontiguousarray(kview)
-    vb = np.ascontiguousarray(vview)
-    E.dispatch('kv_store_q8', [k, v, kb, vb], pack('iiii', hd, n_kv * hd, n_kv, stride), (2 * n_kv, ntok), (32,))
+    # KvStoreParams: headDim kvDim nKvHeads stride pos pageShift; flat: the cache is bound at row pos0
     want_k, kd = q8_rows(k, n_kv, hd)
     want_v, vd = q8_rows(v, n_kv, hd)
-    ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
+    if page:  # paged: the pools bound at row 0, rows of positions pos0 .. pos0 + ntok - 1 through the block table
+        kb, vb, tbl = paged([kc, vc], page)
+        E.dispatch('kv_store_q8', [k, v, kb, vb, tbl], pack('iiiiii', hd, n_kv * hd, n_kv, stride, pos0, page),
+                   (2 * n_kv, ntok), (32,))
+        ok = (paged_rows(kb, tbl, page, pos0, ntok) == want_k).all() and (paged_rows(vb, tbl, page, pos0, ntok) == want_v).all()
+        ok = ok and (paged_rows(kb, tbl, page, 0, pos0) == 0x5A).all() and (paged_rows(kb, tbl, page, pos0 + ntok, ctx - pos0 - ntok) == 0x5A).all()
+    else:
+        kview = kc[pos0:]
+        vview = vc[pos0:]
+        kb = np.ascontiguousarray(kview)
+        vb = np.ascontiguousarray(vview)
+        E.dispatch('kv_store_q8', [k, v, kb, vb, np.zeros(1, np.int32)], pack('iiiiii', hd, n_kv * hd, n_kv, stride, 0, 0),
+                   (2 * n_kv, ntok), (32,))
+        ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
     err = max(np.abs(kd - k).max() / (np.abs(k).max() / 254), np.abs(vd - v).max() / (np.abs(v).max() / 254))
-    check(ok and err <= 1.0001, 'kv_store_q8 hd=%d: rows as numpy %s, max error %.3f of max|x| / 254'
-          % (hd, 'yes' if ok else 'NO', err))
+    check(ok and err <= 1.0001, 'kv_store_q8 hd=%d%s: rows as numpy %s, max error %.3f of max|x| / 254'
+          % (hd, ', paged (blocks of %d)' % (1 << page) if page else '', 'yes' if ok else 'NO', err))
+
+
+def kv_store_pg(half, n_kv=2, hd=64, ntok=21, pos0=13, ctx=70, page=4):
+    """kv_store_pg (the paged f32 / f16 cache's store): the staging rows of k and v land in the rows of positions pos0 ..
+    pos0 + ntok - 1 through the block table, as float32 (f16: rounded to half like numpy's astype), the other rows untouched."""
+    rng = np.random.default_rng(11)
+    kvd = n_kv * hd
+    k = rng.standard_normal((ntok, kvd)).astype(np.float32)
+    v = rng.standard_normal((ntok, kvd)).astype(np.float32)
+    dt = np.float16 if half else np.float32
+    kc = np.full((ctx, kvd), 7, dt)
+    vc = np.full((ctx, kvd), 7, dt)
+    kb, vb, tbl = paged([kc, vc], page)
+    channel_threads = 64  # MetalConstants.CHANNEL_THREADS
+    chunks = (kvd + channel_threads - 1) // channel_threads
+    # KvPagedParams: kvDim stride pos pageShift
+    E.dispatch('kv_store_pg_h' if half else 'kv_store_pg', [k, v, kb, vb, tbl], pack('iiii', kvd, kvd, pos0, page),
+               (2 * chunks, ntok), (channel_threads,))
+    ok = np.array_equal(paged_rows(kb, tbl, page, pos0, ntok), k.astype(dt)) and np.array_equal(paged_rows(vb, tbl, page, pos0, ntok), v.astype(dt))
+    ok = ok and (paged_rows(kb, tbl, page, 0, pos0) == 7).all() and (paged_rows(vb, tbl, page, pos0 + ntok, ctx - pos0 - ntok) == 7).all()
+    check(ok, 'kv_store_pg%s hd=%d kvHeads=%d, %d rows at %d, blocks of %d: rows as numpy' % ('_h' if half else '', hd, n_kv, ntok, pos0, 1 << page))
 
 
 def q4_weights(rows, cols, rng):
@@ -155,9 +217,23 @@ if not ONLY:
     attention('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4, q8=True)
     kv_store_q8(128)
     kv_store_q8(64, n_kv=3)
+    # the paged cache (docs/24): the same kernels over a shuffled pool and a block table
+    attention('attention_g1_d64', 64, ctx=50, pos0=30, ntok=9, page=4)
+    attention('attention_g1_d128', 128, ctx=70, pos0=41, ntok=5, page=5)
+    attention('attention', 96, ctx=40, pos0=17, page=4)
+    attention('attention_g1_d128_q8', 128, ctx=70, pos0=33, ntok=6, q8=True, page=4)
+    attention('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4, q8=True, ctx=45, pos0=31, page=4)
+    attention('attention_g1_d64', 64, ctx=300, pos0=290, ntok=4, page=6)
+    kv_store_q8(128, page=4)
+    kv_store_q8(64, n_kv=3, ntok=40, pos0=11, ctx=70, page=4)
+    kv_store_q8(128, ntok=1, pos0=31, ctx=70, page=5)
+    for _half in (False, True):
+        kv_store_pg(_half)
+        kv_store_pg(_half, hd=128, ntok=1, pos0=47, page=5)
+        kv_store_pg(_half, n_kv=3, hd=32, ntok=64, pos0=0, ctx=100, page=4)
 
 
-def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False, q8=False, kind='fa'):
+def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False, q8=False, kind='fa', page=0):
     rng = np.random.default_rng(3)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     kc32 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
@@ -169,13 +245,15 @@ def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.
         (kc, kd), (vc, vd), stride = q8_rows(kc32, n_kv, hd), q8_rows(vc32, n_kv, hd), n_kv * hd + 4 * n_kv
     out = np.full((ntok, n_heads * hd), np.nan, np.float32)
     scale = 1 / np.sqrt(hd)
-    # FlashParams: nHeads nKvHeads pos0 ntok scale qStride kStride oStride window softcap
-    p = pack('iiiifiiiif', n_heads, n_kv, pos0, ntok, scale, n_heads * hd, stride, n_heads * hd, window, softcap)
+    # FlashParams: nHeads nKvHeads pos0 ntok scale qStride kStride oStride window softcap pageShift
+    p = pack('iiiifiiiifi', n_heads, n_kv, pos0, ntok, scale, n_heads * hd, stride, n_heads * hd, window, softcap, page)
     name = 'attention_%s_d%d%s' % (kind, hd, '_h' if half else '_q8' if q8 else '')
-    E.dispatch(name, [q, kc, vc, out], p, (n_heads, (ntok + 31) // 32), (128,))
+    kc, vc, tbl = paged([kc, vc], page)
+    E.dispatch(name, [q, kc, vc, out, tbl], p, (n_heads, (ntok + 31) // 32), (128,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale, window, softcap)
     err = np.abs(out - ref).max()
-    check(err < 2e-5, '%s pos0=%d ntok=%d window=%d softcap=%g: max err %.2e' % (name, pos0, ntok, window, softcap, err))
+    check(err < 2e-5, '%s pos0=%d ntok=%d window=%d softcap=%g%s: max err %.2e'
+          % (name, pos0, ntok, window, softcap, ', paged (blocks of %d)' % (1 << page) if page else '', err))
 
 
 if not ONLY:
@@ -196,9 +274,15 @@ if not ONLY:
                {'hd': 64, 'half': True, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 128, 'q8': True},
                {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9}):
         flash(kind='fb', **kw)
+    # the paged cache: both forms, every cache type, windows and soft-caps, chunk starts inside a block
+    for _kind in ('fa', 'fb'):
+        for kw in ({'hd': 64}, {'hd': 128, 'half': True}, {'hd': 128, 'q8': True}, {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40},
+                   {'hd': 128, 'softcap': 5.0, 'pos0': 17}, {'hd': 256, 'ntok': 33, 'half': True}, {'hd': 64, 'pos0': 0, 'ntok': 32}):
+            flash(kind=_kind, page=4, **kw)
+        flash(64, kind=_kind, page=6, pos0=100, ntok=45, ctx=192)
 
 
-def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
+def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, page=0):
     """Flash decoding (attention_split_q8 + attention_combine) of one token over a q8 cache."""
     rng = np.random.default_rng(5)
     q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
@@ -211,21 +295,24 @@ def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
     scores = np.zeros(n_heads * ctx, np.float32)
     out = np.zeros((1, n_heads * hd), np.float32)
     scale = 1 / np.sqrt(hd)
-    # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk
-    E.dispatch('attention_split_q8', [q, kc, vc, part, scores],
-               pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, 0, 0.0, n_split, chunk),
+    # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk pageShift
+    kc, vc, tbl = paged([kc, vc], page)
+    E.dispatch('attention_split_q8', [q, kc, vc, part, scores, tbl],
+               pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, 0, 0.0, n_split, chunk, page),
                (n_heads, n_split), (256,))
     E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, 1, scale)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, 'attention_split_q8 hd=%d, %d splits: max err %.2e' % (hd, n_split, err))
+    check(err < 1e-4, 'attention_split_q8 hd=%d, %d splits%s: max err %.2e' % (hd, n_split, ', paged' if page else '', err))
 
 
 if not ONLY:
     split_q8(128)
+    split_q8(128, page=4)
+    split_q8(64, page=5, pos0=250, n_split=3)
 
 
-def attention_dec(hd, G, kv='f32', n_heads=8, n_kv=2, pos0=100, n_split=1, window=0, softcap=0.0, ctx=320, wide=True):
+def attention_dec(hd, G, kv='f32', n_heads=8, n_kv=2, pos0=100, n_split=1, window=0, softcap=0.0, ctx=320, wide=True, page=0):
     """attention_dec (section 4b): one token over a cache, G query heads per threadgroup, n_split key ranges (merged by
     attention_combine when n_split > 1) against a float64 numpy reference on the values the cache holds."""
     rng = np.random.default_rng(6 + hd + G)
@@ -247,16 +334,18 @@ def attention_dec(hd, G, kv='f32', n_heads=8, n_kv=2, pos0=100, n_split=1, windo
     part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
     out = np.zeros((1, n_heads * hd), np.float32)
     scale = 1 / np.sqrt(hd)
-    # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk
-    E.dispatch('attention_dec_g%d_d%d%s' % (G, hd, suffix), [q, kc, vc, part, out],
-               pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, window, softcap, n_split,
-                    0), (n_heads // G, (n_split + 3) // 4), (128,))
+    # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk pageShift
+    kc, vc, tbl = paged([kc, vc], page)
+    E.dispatch('attention_dec_g%d_d%d%s' % (G, hd, suffix), [q, kc, vc, part, out, tbl],
+               pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, window, softcap, n_split,
+                    0, page), (n_heads // G, (n_split + 3) // 4), (128,))
     if n_split > 1:
         E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, 1, scale, window, softcap)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, 'attention_dec_g%d_d%d%s, %d keys, %d split(s)%s%s: max err %.2e'
-          % (G, hd, suffix, keys, n_split, ', window %d' % window if window else '', ', softcap' if softcap else '', err))
+    check(err < 1e-4, 'attention_dec_g%d_d%d%s, %d keys, %d split(s)%s%s%s: max err %.2e'
+          % (G, hd, suffix, keys, n_split, ', window %d' % window if window else '', ', softcap' if softcap else '',
+             ', paged (blocks of %d)' % (1 << page) if page else '', err))
 
 
 for _hd in (64, 128, 256):
@@ -271,6 +360,13 @@ attention_dec(128, 2, pos0=0)                                         # one key
 attention_dec(128, 2, pos0=300, window=64)                            # sliding window
 attention_dec(64, 2, pos0=250, n_split=7, softcap=3.0)                # Gemma's soft-cap, a split count that is no multiple of 4
 attention_dec(128, 1, pos0=200, n_split=40)                           # splits with no keys at all
+for _hd in (64, 128, 256):                                              # the paged cache (docs/24)
+    for _kv in ('f32', 'f16', 'q8'):
+        attention_dec(_hd, 2, _kv, page=4)
+        attention_dec(_hd, 1, _kv, pos0=300, n_split=3, page=5)
+attention_dec(128, 2, pos0=300, window=64, page=4)
+attention_dec(64, 2, pos0=250, n_split=7, softcap=3.0, page=6)
+attention_dec(128, 2, pos0=0, page=4)
 
 
 def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
@@ -701,9 +797,9 @@ def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0
         part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
         scores = np.zeros(n_heads * ctx, np.float32)
         out = np.zeros((1, n_heads * hd), np.float32)
-        p = pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, 1 / np.sqrt(hd), n_heads * hd, n_kv * hd, window, 0.0,
-                 n_split, chunk)
-        E.dispatch('attention_split', [q, kc, vc, part, scores], p, (n_heads, n_split), (256,))
+        p = pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, 1 / np.sqrt(hd), n_heads * hd, n_kv * hd, window, 0.0,
+                 n_split, chunk, 0)
+        E.dispatch('attention_split', [q, kc, vc, part, scores, np.zeros(1, np.int32)], p, (n_heads, n_split), (256,))
         E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
         outs.append(out)
     ref = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, 1, 1 / np.sqrt(hd), window)
@@ -758,7 +854,8 @@ def rope_store_q8(hd, n_heads=4, n_kv=2, ntok=3, pos0=5, ctx=16, rot_half=None, 
                (n_heads + n_kv, ntok), (rot_half,))
     kc_a = np.full((ntok, stride), 0x5A, np.uint8)
     vc_a = np.full((ntok, stride), 0x5A, np.uint8)
-    E.dispatch('kv_store_q8', [k_a, v, kc_a, vc_a], pack('iiii', hd, kv_dim, n_kv, stride), (2 * n_kv, ntok), (32,))
+    E.dispatch('kv_store_q8', [k_a, v, kc_a, vc_a, np.zeros(1, np.int32)], pack('iiiiii', hd, kv_dim, n_kv, stride, 0, 0),
+               (2 * n_kv, ntok), (32,))
     # fused
     q_b, k_b = q0.copy(), k0.copy()
     kc_b = np.full((ntok, stride), 0x5A, np.uint8)
@@ -1352,40 +1449,51 @@ kv_store_q4(128, rotate=False)
 # ---- q8 KV cache with Hadamard-rotated keys (backend.kv-q8-rotate): kv_store_q8r and the q8 attention kernels on it
 
 
-def kv_store_q8r(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12):
+def kv_store_q8r(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, page=0):
     """kv_store_q8r rotates k (and the queries, in place) and quantizes it with q8's one-scale-per-head-row rule, v as
     kv_store_q8 does, all bit for bit as numpy (and KvCache.Q8 with rotate) does; the other cache rows stay."""
     rng = np.random.default_rng(11)
     kv_dim = n_kv * hd
     k = (rng.standard_normal((ntok, kv_dim)) * rng.random((ntok, 1)) * 4).astype(np.float32)
     k[:, 5] *= 20  # an outlier channel
-    k[1, :hd] = 0  # an all-zero row: scale 0, values 0
+    if ntok > 1:
+        k[1, :hd] = 0  # an all-zero row: scale 0, values 0
     v = rng.standard_normal((ntok, kv_dim)).astype(np.float32)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     q0 = q.copy()
     stride = kv_dim + 4 * n_kv
     kc = np.full((ctx, stride), 0x5A, np.uint8)
     vc = np.full((ctx, stride), 0x5A, np.uint8)
-    kb = np.ascontiguousarray(kc[pos0:])
-    vb = np.ascontiguousarray(vc[pos0:])
-    # KvStoreQ8RParams: headDim kvDim nKvHeads qStride stride
-    E.dispatch('kv_store_q8r', [k, v, kb, vb, q], pack('iiiii', hd, kv_dim, n_kv, n_heads * hd, stride),
-               (2 * n_kv + n_heads, ntok), (32,))
+    # KvStoreQ8RParams: headDim kvDim nKvHeads qStride stride pos pageShift; flat: the cache is bound at row pos0
     krot = q4_rotate(k.reshape(ntok, n_kv, hd)).reshape(ntok, kv_dim)
     want_k, kd = q8_rows(krot, n_kv, hd)
     want_v, vd = q8_rows(v, n_kv, hd)
-    ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
+    if page:  # paged: the pools bound at row 0, the rows of positions pos0 .. pos0 + ntok - 1 through the block table
+        kb, vb, tbl = paged([kc, vc], page)
+        E.dispatch('kv_store_q8r', [k, v, kb, vb, q, tbl], pack('iiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, pos0, page),
+                   (2 * n_kv + n_heads, ntok), (32,))
+        ok = (paged_rows(kb, tbl, page, pos0, ntok) == want_k).all() and (paged_rows(vb, tbl, page, pos0, ntok) == want_v).all()
+        ok = ok and (paged_rows(kb, tbl, page, 0, pos0) == 0x5A).all()
+    else:
+        kb = np.ascontiguousarray(kc[pos0:])
+        vb = np.ascontiguousarray(vc[pos0:])
+        E.dispatch('kv_store_q8r', [k, v, kb, vb, q, np.zeros(1, np.int32)], pack('iiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, 0, 0),
+                   (2 * n_kv + n_heads, ntok), (32,))
+        ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
     okq = (q == q4_rotate(q0.reshape(ntok, n_heads, hd)).reshape(ntok, -1)).all()
     # the rotated row is within half a step (max|x| / 254) of the rotated key
     err = np.abs(kd - krot).max() / (np.abs(krot).max() / 254)
-    check(ok and okq and err <= 1.0001, 'kv_store_q8r hd=%d: rows as numpy %s, queries rotated %s, max error %.3f of max|x| / 254'
-          % (hd, 'yes' if ok else 'NO', 'yes' if okq else 'NO', err))
+    check(ok and okq and err <= 1.0001, 'kv_store_q8r hd=%d%s: rows as numpy %s, queries rotated %s, max error %.3f of max|x| / 254'
+          % (hd, ', paged (blocks of %d)' % (1 << page) if page else '', 'yes' if ok else 'NO', 'yes' if okq else 'NO', err))
 
 
 kv_store_q8r(128)
 kv_store_q8r(64, n_kv=3, n_heads=6)
 kv_store_q8r(96)
 kv_store_q8r(256, n_kv=1, ntok=3)
+kv_store_q8r(128, page=4)
+kv_store_q8r(64, n_kv=3, n_heads=6, ntok=40, pos0=11, ctx=70, page=4)
+kv_store_q8r(128, ntok=1, pos0=31, ctx=70, page=5)
 
 
 def attention_q8_rot(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1):
@@ -1409,15 +1517,15 @@ def attention_q8_rot(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1):
     out = np.zeros((ntok, n_heads * hd), np.float32)
     scores = np.zeros((ntok * n_heads * ctx,), np.float32)
     # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap
-    p = pack('iiiiiifiiiiiif', n_heads, n_kv, hd, hd, pos0, ctx, scale / B, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0)
-    E.dispatch(name, [qr, kb, vb, out, scores], p, (n_heads // G, ntok), (256,))
+    p = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale / B, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0, 0)
+    E.dispatch(name, [qr, kb, vb, out, scores, np.zeros(1, np.int32)], p, (n_heads // G, ntok), (256,))
     ref_rot = attention_ref(qr, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale / B)
     exact = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, ntok, scale)
     # the same kernel over plain q8 rows of the unrotated keys
     (pk, pkd) = q8_rows(kc, n_kv, hd)
     out0 = np.zeros_like(out)
-    p0 = pack('iiiiiifiiiiiif', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0)
-    E.dispatch(name, [q, pk, vb, out0, scores.copy()], p0, (n_heads // G, ntok), (256,))
+    p0 = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0, 0)
+    E.dispatch(name, [q, pk, vb, out0, scores.copy(), np.zeros(1, np.int32)], p0, (n_heads // G, ntok), (256,))
     e_rot, e_plain = np.abs(out - exact).max(), np.abs(out0 - exact).max()
     check(np.abs(out - ref_rot).max() < 1e-4 and e_rot < e_plain,
           '%s hd=%d rotated keys: max err %.2e vs the kernel on the dequantized rows, %.2e vs f32 keys (plain q8 %.2e)'
@@ -1447,7 +1555,7 @@ def rope_store_q8r(hd, n_heads=4, n_kv=2, ntok=3, pos0=5, ctx=16, rot_half=None,
                (n_heads + n_kv, ntok), (rot_half,))
     kc_a = np.full((ntok, stride), 0x5A, np.uint8)
     vc_a = np.full((ntok, stride), 0x5A, np.uint8)
-    E.dispatch('kv_store_q8r', [k_a, v, kc_a, vc_a, q_a], pack('iiiii', hd, kv_dim, n_kv, n_heads * hd, stride),
+    E.dispatch('kv_store_q8r', [k_a, v, kc_a, vc_a, q_a, np.zeros(1, np.int32)], pack('iiiiiii', hd, kv_dim, n_kv, n_heads * hd, stride, 0, 0),
                (2 * n_kv + n_heads, ntok), (32,))
     q_b, k_b = q0.copy(), k0.copy()
     kc_b = np.full((ntok, stride), 0x5A, np.uint8)
@@ -1492,8 +1600,8 @@ def attention_dec_rot(hd, G, n_heads=8, n_kv=2, pos0=300, n_split=3, ctx=320):
         kc, kd = q8_rows(kk, n_kv, hd)
         part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
         out = np.zeros((1, n_heads * hd), np.float32)
-        E.dispatch('attention_dec_g%d_d%d_q8' % (G, hd), [qq, kc, vc, part, out],
-                   pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, sc, n_heads * hd, stride, 0, 0.0, n_split, 0),
+        E.dispatch('attention_dec_g%d_d%d_q8' % (G, hd), [qq, kc, vc, part, out, np.zeros(1, np.int32)],
+                   pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, sc, n_heads * hd, stride, 0, 0.0, n_split, 0, 0),
                    (n_heads // G, (n_split + 3) // 4), (128,))
         if n_split > 1:
             E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))

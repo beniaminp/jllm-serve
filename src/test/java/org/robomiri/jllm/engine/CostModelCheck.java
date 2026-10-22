@@ -55,6 +55,40 @@ public final class CostModelCheck {
                 }
             }
         }
+        // prompt lookup as a gate (draft cost 0): a CPU-like pass (a = 6 plain steps, b = 0.5 step) pays only for long, well
+        // accepted drafts; a Metal-like pass (a = 1 step, b = 0.4) pays from lower acceptance on
+        for (double[] c : new double[][]{{6, 0.5}, {1, 0.4}}) {
+            double plain = 10 * ms;
+            for (double alpha : new double[]{0.1, 0.7, 0.99}) {
+                Speculator.CostModel m = new Speculator.CostModel();
+                m.draft(0, 1);
+                for (int pass = 0; pass < 50; pass++) {
+                    int n = 2 + pass % 15;
+                    m.verify(n, (long) (plain * (c[0] + c[1] * (n - 1))));
+                    m.plain((long) plain);
+                    m.acceptance((int) Math.round(100 * alpha), 100);
+                }
+                int got = m.bestK(16);
+                boolean pays = alpha > 0.9 || c[0] == 1 && alpha > 0.6;
+                if (pays != got > 0) {
+                    bad.add("lookup gate: a = " + c[0] + " steps, b = " + c[1] + ", alpha " + alpha + ": best k " + got + (pays ? ", should draft" : ", should pause"));
+                }
+            }
+        }
+        Speculator.CostModel m = new Speculator.CostModel();
+        m.draft(0, 1);
+        for (int pass = 0; pass < 20; pass++) {
+            m.verify(2 + pass % 8, (long) (12 * ms));
+            m.plain((long) (10 * ms));
+            m.acceptance(0, 4);
+        }
+        if (m.bestK(16) != 0) {
+            bad.add("failing drafts must pause lookups");
+        }
+        m.forgetAcceptance();
+        if (m.bestK(16) == 0) {
+            bad.add("a new request starts from the prior acceptance, not from the last request's");
+        }
         if (new Speculator.CostModel().bestK(8) != -1) {
             bad.add("a cost model without measurements must leave the choice to the doubling rule (-1)");
         }
