@@ -20,7 +20,7 @@ Suggested reading order:
 | 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU, the KV cache — every formula the code implements |
 | 6 | [Quantization (Q4/Q8)](06-quantization.md) | Why 4-bit weights work, the Q4_0/Q8_0 block format, the error it introduces |
 | 7 | [The CPU backend](07-cpu-backend.md) | SIMD with the Vector API, dot-product kernels, prefill vs decode, the custom thread pool |
-| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM bindings, the Objective-C shim, each compute kernel, flash-attention prefill, the start-up kernel self-check, expert-grouped MoE prefill, pipelined decoding, hot MoE experts on the GPU and cold ones on the CPU when the GPU memory budget is exceeded |
+| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM bindings, the Objective-C shim, each compute kernel, flash-attention prefill, the start-up kernel self-check, expert-grouped MoE prefill, pipelined decoding, hot MoE experts on the GPU and cold ones on the CPU when the GPU memory budget is exceeded, the prefill chunk, the multi-row decode matvec, the decode attention |
 | 9 | [Sampling](09-sampling.md) | Softmax, temperature, top-k, top-p, min-p, repetition penalties |
 | 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix caching, stop strings, HTTP/1.1, SSE streaming, the OpenAI API |
 | 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers (Metal, CPU with int8 activations, f16 KV cache), what to improve next |

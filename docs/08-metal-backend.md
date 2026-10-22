@@ -890,6 +890,8 @@ simdgroup per output row: 64, 128 or 256 threads, i.e. 2, 4 or 8 rows per thread
 model's own output projection, checks that the results are bit-identical, and keeps the fastest. Small matrices fill
 the GPU better with smaller threadgroups, and which size pays differs between chips. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
 
+The decode attention `attention_dec` ([8.28](#828-decode-attention-attention_dec)) is chosen the same way, per cache type: it must agree with `attention_t` and be ≥ 3 % faster over 2 048 keys and not slower over 400.
+
 Two more choices are made the same way ([8.21](#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)):
 which flash prefill form runs (`attention_fa` or `attention_fb`: each is checked against `attention_t`, and of those
 that agree and are faster the faster wins; the log line ends in `[attention_fb]` when it is that one), and, for every
@@ -1532,7 +1534,10 @@ for 16 GPU cores, and the weights are read again for every chunk (413 tokens = 7
 `backend.batch` is therefore `auto` by default (`ModelLoader.batch`): **256** for mixture-of-experts models (as before)
 and for plain decoders on Metal, 64 for the CPU backends, Mamba and the Qwen3-Next dense layers (not measured);
 `--batch N` or `backend.batch=N` still pins a number, and `-Djllm.metal.autoBatch=N` changes what `auto` means on Metal.
-512 gains only 2 % over 256 for twice the scratch, so 256 it is.
+512 gains only 2 % over 256 for twice the scratch, so 256 it is. The same on the GGUF file (Qwen3-0.6B-Q4_0.gguf): 1 382
+(64) / 1 900 (256) / 2 026 (512) tok/s; with a 2 000-token prompt (`--bench.prompt-repeat 200`, attention is a larger share):
+999 / 1 155 / 1 172. The 30B MoE, which already took 256, for comparison: 211 (64) / 301 (256) / 326 (512) tok/s prefill,
+decode unchanged at 26 – 27 tok/s, so a MoE chunk of 512 would gain another 8 % (left at 256: its scratch is twice as large).
 
 What scales with the chunk: `x`, `xb` (`n · dim`), `q`, `att` (`n · qDim`), `hidden` (`n · ffn`: 3 MB at 256 for the
 0.6B model, 14 MB for a 8B model with a 14 336-wide MLP) and the f16/q8 staging rows. What does not: the attention
@@ -1583,47 +1588,57 @@ row, which gives them the grid and norm savings but no activation reuse. The GGU
 
 **Bit-identity, and where it is not.** Each row is accumulated in `mm_row`'s order (same blocks, same lane order, same
 block-dot expression, one `simd_sum`), so the sum is the same mathematically, and on the emulator, which cannot
-reassociate, every kernel and format equals its one-row twin **byte for byte** (`kernel_tests.py`, 150+ cases with tails
-and straddling q/k/v ranges). On the GPU Metal compiles with fast-math and may round a sum differently in a loop of another shape.
-Measured on the M1 Pro (`MvCheck`-style runs of one matmul, and the logits of 48 decode steps after a 600-token prompt):
-Q8_0, Q8_0 GGUF, Q4_K, Q5_K, Q6_K and the f16 path agree to the byte; **own Q4_0 differs in the last bit of ~70 % of the
-outputs (≤ 5e-7 on a range of 2.5), GGUF Q4_0 likewise** (greedy tokens unchanged in every run). A variant that keeps
-`mm_row`'s token loop (up to 8 tokens, runtime count) with several rows per simdgroup reproduces the one-row bytes for
-Q4_0 on every shape tried (and for GGUF Q4_0 at NR = 4 only), but it holds `NR × 8` accumulators and measured **no
-faster than the one-row kernels** (6.96 ms vs 7.0 ms per token, NR = 4: 9.5 ms), i.e. the whole gain; so the kernels
-here take one token (`ntok == 1`), keep the activations in registers across rows, and accept the ulp. What stays exact
-is what matters for consistency: every decode path (alone, pipelined, replayed, the draft) uses the same family, and
-`-Djllm.metal.mvRows=1` brings the one-row kernels back bit for bit. Batched rows (2..7 tokens) and prefill tiles keep
-their kernels; batched against alone already differs at rounding level by design (§8.24, bound 1e-4 of the largest
-logit in `ArchSmoke`).
+reassociate, every kernel and format equals its one-row twin **byte for byte** (`kernel_tests.py`: 8 formats, NR = 2 and
+4, tails, q/k/v ranges that straddle a simdgroup's rows, partial token tiles). On the GPU Metal compiles with fast-math
+and may round a sum differently in a loop of another shape. Measured on the M1 Pro (logits of 48 decode steps after a
+600-token prompt hashed, and single matmuls compared byte by byte): Q8_0, Q4_K_M (Q4_K, Q6_K) and the f16 cache path give
+**the same logits as the one-row kernels, bit for bit**; **own Q4_0 and GGUF Q4_0 differ in the last bit of ~70 % of the
+outputs** (≤ 5e-7 on a range of 2.5), the greedy tokens are the same in every run. A variant that keeps `mm_row`'s
+token loop around several rows (`acc[NR][8]`, runtime token count) did reproduce the one-row bytes for own Q4_0 (not for
+GGUF Q4_0 at NR = 2 or 8), but it measured **no faster than the one-row kernels** (6.96 ms of matvecs per token at NR = 2,
+9.5 ms at NR = 4 against 7.0), i.e. it gave up the whole gain, so it was dropped. What is kept exact is what matters for
+consistency: **one code path for every token count**. The kernels take up to `TOK_TILE` = 8 tokens per threadgroup row
+and run them one after the other through the same loop body (a batched step's rows, a verification pass of fewer than 8
+tokens), so a row computes the same bits whether its token is decoded alone or in a batch (the weights of the
+threadgroup's rows stay in cache between the tokens); the replayed, pipelined and draft steps use the same kernels.
+`-Djllm.metal.mvRows=1` brings the one-row kernels back, bit for bit. (The first version of these kernels used the
+one-row kernels for 2..7 tokens; with a q8 or f16 cache the ulp then showed up as `ArchSmoke`'s batched-against-alone
+bound being exceeded, 4e-3 – 6e-2 against 1e-4 of the logit range: the cache rounding amplifies a last-bit difference.)
 
-**Choosing NR.** Time of the matvecs of a whole token (28 layers + LM head, 28 distinct weight sets so nothing stays
-cached; a micro-benchmark that loads the model, `MvBench` in the review notes; M1 Pro, best of 9; µs per layer unless
-noted):
+**Choosing NR.** Time of the matvecs of a whole token (28 layers + LM head over 28 distinct weight sets, so nothing
+stays cached; a micro-benchmark that loads the model, `MvBench` in the review notes; M1 Pro, best of 9; µs per layer
+unless noted):
 
 | kernel (Qwen3-0.6B Q4_0 cache) | one row, 64 threads (the tuned default before) | NR = 2 | NR = 4 |
 |---|---|---|---|
-| q/k/v + norm (4 096 × 1 024) | 73 | 63 | 68 |
-| o_proj (1 024 × 2 048) | 28 | 24 | 23 |
-| gate/up + swiglu + norm (6 144 × 1 024) | 83 | 61 | 58 |
-| down (1 024 × 3 072) | 35 | 29 | 28 |
-| LM head (151 936 × 1 024, Q8_0), µs | 1 442 | 1 228 | 1 230 |
-| **whole token, ms** | **6.76** | **5.43** | 5.55 |
-| same, Qwen3-0.6B-Q4_0.gguf | 7.74 | 5.83 | 5.67 |
+| q/k/v + norm (4 096 × 1 024) | 73 | 72 | 68 |
+| o_proj (1 024 × 2 048) | 28 | 24 | 24 |
+| gate/up + swiglu + norm (6 144 × 1 024) | 83 | 60 | 58 |
+| down (1 024 × 3 072) | 35 | 28 | 28 |
+| LM head (151 936 × 1 024, Q8_0), µs | 1 454 | 1 233 | 1 225 |
+| **whole token, ms** | **6.76** | **5.66** | **5.52** |
+| same, Qwen3-0.6B-Q4_0.gguf | 7.74 | 6.03 | 5.65 |
 
-−20 % of the matvec time for the safetensors cache and −25 % for the GGUF file (whose blocks cost more to unpack, see
-below). NR = 2 and 4 are within noise of each other; 2 is the default (fewer registers, and the 8-row tile of a
-SwiGLU simdgroup at NR = 4 is the first to spill on a wider model). A threadgroup of 64, 128 or 256 threads changes
-nothing (5.43 – 5.44 ms). `NR = 8` was tried and dropped: the SwiGLU kernel then holds 16 accumulators and 16 row
-pointers per lane and spills (130 µs per layer against 61). `-Djllm.metal.mvRows=0|1|2|4`, `-Djllm.metal.mvThreads`
-(threads of the plain, non-norm variants; the fused ones need 128).
+−18 % of the matvec time for the safetensors cache and −27 % for the GGUF file (whose blocks cost more to unpack, see
+below). **NR = 4 is the default.** A threadgroup of 64, 128 or 256 threads changes nothing (5.52 – 5.68 ms). `NR = 8` was
+tried and dropped: the SwiGLU kernel then holds 16 accumulators and 16 row pointers per lane and spills (130 µs per layer
+against 61). `-Djllm.metal.mvRows=0|1|2|4`, `-Djllm.metal.mvThreads` (threads of the plain, non-norm variants; the fused
+ones need 128).
 
-The kernels are still far from the memory roof: o_proj streams 1.25 MB in 24 µs (52 GB/s), the LM head 165 MB in
-1.23 ms (134 GB/s). A 1–3 MB matvec is a latency affair — launch, ramp-up, the norm prologue of the fused variants (the
-same kernel without the norm: qkv 39–50 µs, swiglu 39–54 µs, so the prologue is worth ~15–20 µs a layer) and the tail —
-which is why the lever left is fewer and overlapping dispatches ([08 §8.22](#822-decode-replay-one-native-call-per-token),
-the encoder), not another tile shape. GGUF Q4_0 stays ~7 % behind the own Q4_0 format (5.83 vs 5.43 ms) because its
-18-byte blocks are read as ushorts (2-byte aligned) and the weights are scaled before the dot instead of once after it.
+End to end (`./jllm bench`, 413-token prompt, 128 tokens, speculation off, median of 3 rounds, decode tok/s):
+
+| | one-row kernels, `attention_t` | + multi-row, 2 rows | + multi-row, 4 rows | 4 rows + `attention_dec` ([8.28](#828-decode-attention-attention_dec)) |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_0 cache | 117.9 | 134.9 | 132.1 | **143.3** (+22 %) |
+| Qwen3-0.6B-Q4_0.gguf | 104.7 | 132.6 (2 rows, with `attention_dec`) | 134.8 (with `attention_dec`) | **134.8** (+29 %) |
+
+(The 30B MoE, whose decode is mostly the experts, goes 25.0 → 27.0 tok/s with both.) The kernels are still far from the
+memory roof: o_proj streams 1.25 MB in 24 µs (52 GB/s), the LM head 165 MB in 1.23 ms (134 GB/s). A 1–3 MB matvec is a
+latency affair: launch, ramp-up, the norm prologue of the fused variants (the same kernel without the norm takes 39 – 50
+µs for qkv and 41 – 67 µs for swiglu, so the prologue is worth ~15 µs a layer) and the tail. The lever left is fewer and
+overlapping dispatches ([8.22](#822-decode-replay-one-native-call-per-token), the concurrent encoder), not another tile shape.
+GGUF Q4_0 stays ~2 % behind the own Q4_0 format at NR = 4 (5.65 vs 5.52 ms): its 18-byte blocks are read as ushorts (2-byte
+aligned) and the dequantized weights are scaled before the dot instead of once after it.
 
 ---
 
@@ -1645,8 +1660,9 @@ one at ~70 GB/s. `attention_dec<KV, G, D, W>` is written for decode (one token, 
   one group of `G` query heads that share a kv head (`G` = 2 for Qwen3-0.6B's 16/8 heads: each K and V row is read once for
   two heads), keeps the online-softmax state `(m, l, o[D])` in registers, and writes its own unnormalised partial
   `(o, m, l)`, the layout of `attention_split`; `attention_combine` merges the partials. There is no threadgroup memory
-  and no barrier. A decode step has `heads / G · nSplit` such workers; with `nSplit = ceil(keys / 32)` capped at 16
-  (`decChunk`, `decMaxSplits`) that is 16 · 8/… ‹TBD› workers at 413 keys.
+  and no barrier. A decode step has `heads / G · nSplit` such workers; `nSplit = ceil(keys / 32)` capped at 24
+  (`decChunk`, `decMaxSplits`): 8 · 13 = 104 workers at 413 keys, 8 · 24 = 192 at 3 000 (chunks of 128 keys), against the
+  16 threadgroups of `attention_t`.
 * **Eight lanes share a key, four keys run at once.** Lane `tx = lane & 7` loads the `W`-element chunks `tx, tx+8, …` of the
   key's head row (8 lanes = 128 contiguous bytes per vector load) and multiplies them with the query held in registers;
   `ty = lane >> 3` selects one of four keys. A block is 32 keys = 8 steps of 4 keys; the partial dot products of the 8 steps
@@ -1675,4 +1691,25 @@ speculation and batched decoding still compute exactly what separate decode step
 prefill kernels as before. A recorded decode step depends on the number of splits, which is part of its replay key
 (a new recording about every 32–64 tokens).
 
-‹TBD: numbers›
+**Measured** (M1 Pro, Qwen3-0.6B Q4_0 cache, 128 generated tokens after a prompt of the given length, `./jllm bench
+--batch 256 --engine.speculative off`, median of 3; decode tok/s; the multi-row matvec of [8.27](#827-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_)
+is on in the right-hand columns, the left one is the code before this change):
+
+| context / cache | one-row matvec, `attention_t` | multi-row matvec, `attention_t` | multi-row matvec + `attention_dec` |
+|---|---|---|---|
+| 413 tokens, f32 | 117.9 | 134.9 (2 rows) | 139.6 (2 rows), **143.3** (4 rows) |
+| ~1 000 tokens, f32 | 97.1 | 107.3 | 113.7 |
+| ~3 000 tokens, f32 | 59.5 | 63.5 | 86.3 (16 splits max), **92.9** (24) |
+| ~3 000 tokens, f16 | 62.7 | – | **113.4** (8-byte half loads: 106.1) |
+| ~3 000 tokens, q8 | 62.4 | – | **114.4** |
+
+At 3 000 tokens the attention was 9 ms of a 17 ms token: `attention_dec` brings it to ~5 ms (f32) and ~2.5 ms (f16, q8);
+the split policy matters (maxSplits 8 / 16 / 24 / 32: 66 / 86 / 93 / 85 tok/s). In isolation (28 layer caches, so
+nothing is cached between layers; µs per layer, f32) `attention_t` takes 77 / 125 / 345 µs at 413 / 1 000 / 3 000 keys and
+`attention_dec` 55 – 60 / 70 – 80 / 167 – 199 µs; it reaches 130 – 150 GB/s on a 3 000-key cache where `attention_t`
+reached ~70. The start-up check logged `0.101 vs 0.236 ms` (2 048 keys) and `0.042 vs 0.053 ms` (400 keys) per call. At
+~200 keys it is not faster (the partial/combine pair costs a second dispatch): there the check's 400-key leg decides.
+The 30B MoE (decode dominated by its experts): 25.0 → 27.0 tok/s with the multi-row matvec and `attention_dec` together.
+
+What did not pay and was left out: 4 query heads per threadgroup for 128-wide heads (registers), 64 keys per simdgroup for
+short contexts (fewer workers), 16-byte loads for q8 (the rows are only 4-byte aligned).

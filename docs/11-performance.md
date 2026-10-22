@@ -67,10 +67,10 @@ Apple M1 Pro, Q4_0 weights (Q8_0 embedding / LM head), 413-token prompt, 128 gen
 
 | model | backend | prefill | decode | weight traffic at that decode rate | % of bandwidth ceiling |
 |---|---|---|---|---|---|
-| Qwen3-0.6B | **Metal** (f32, f16 or q8 KV cache) | **~1 430 tok/s** (~536 with `-Djllm.metal.mmaPrefill=false`) | **~117 tok/s** | 53 GB/s | 26 % |
+| Qwen3-0.6B | **Metal** (f32, f16 or q8 KV cache) | **~2 100 tok/s** (1 426 with 64-token chunks, ~536 with `-Djllm.metal.mmaPrefill=false`) | **~143 tok/s** (speculation off; 118 before the multi-row matvec and decode attention) | 65 GB/s | 32 % |
 | Qwen3-0.6B | **CPU, int8 activations** (default) | **~275 tok/s** | **~51 tok/s** | 23 GB/s | 11 % |
 | Qwen3-0.6B | CPU, float activations | ~237 tok/s | ~13 tok/s | 6 GB/s | 3 % |
-| Qwen3-30B-A3B | **Metal** | **~49 tok/s** | **~25 tok/s** | 51 GB/s (≈ 2.05 GB per token) | 26 % |
+| Qwen3-30B-A3B | **Metal** | **~300 tok/s** (413-token prompt, 256-token chunks; 211 with 64) | **~27 tok/s** (25.0 before) | 55 GB/s (≈ 2.05 GB per token) | 28 % |
 | Qwen3-30B-A3B | **CPU, int8 activations** | **~12 tok/s** | **~6 tok/s** | 12 GB/s | 6 % |
 
 Short prompts decode faster still (less attention work). Metal and CPU-with-int8-off produce identical greedy
@@ -171,7 +171,22 @@ Measured on the M1 Pro (plugged in, no thermal warning) on 2026-10-21 against ll
 | | jllm / llama.cpp | 0.44x | 0.51x | |
 | | jllm, default speculation | | 207.4 | the bench prompt repeats itself, so this favours speculation |
 
-llama.cpp prefills 2.3× and decodes 2× faster on the same file. The file is 382 MB, so jllm's decode reads ~40 GB/s
+After the prefill chunk (`backend.batch=auto` = 256), the multi-row decode matvec and the decode attention
+([08 §8.26 – 8.28](08-metal-backend.md#826-the-prefill-chunk-backendbatchauto)), the same command on 2026-10-22 (llama.cpp
+built against ggml 0.27.0 now, 3 repetitions):
+
+| model file | engine | prefill tok/s | decode tok/s | note |
+|---|---|---|---|---|
+| Qwen3-0.6B-Q4_0.gguf | jllm (Metal) | 1903.4 | 137.5 | prompt 413 tok, 128 generated |
+| | llama.cpp | 3096.8 | 216.9 | decode at depth 413 |
+| | jllm / llama.cpp | 0.61x | 0.63x | was 0.44x and 0.51x |
+| | jllm, default speculation | | 204.8 | the bench prompt repeats itself, so this favours speculation |
+
+(jllm's GGUF prefill is 1 903 against 2 011 for its own Q4_0 cache.) The gap that remains is dispatch latency rather than
+kernels: the matvecs of a token take 5.5 ms for 382 MB where llama.cpp's whole token takes 4.6 ms, and
+[11.2](#112-where-the-time-goes) shows the layer matvecs at 50 – 70 GB/s.
+
+Before those three changes (the first table): llama.cpp prefilled 2.3× and decoded 2× faster on the same file. The file is 382 MB, so jllm's decode reads ~40 GB/s
 of weights and llama.cpp's ~78 GB/s, both well under the ~200 GB/s roof, so the gap is most likely the dispatch and
 latency overhead of 11.2, not bandwidth. (jllm's decode here is lower than the ~117 tok/s of 11.1 partly because all 128
 tokens are generated, where its own Q4_0 cache stops at 91.) The speculation row matches llama.cpp only because the
@@ -180,6 +195,16 @@ bench prompt is repetitive.
 ## 11.2 Where the time goes
 
 ### Metal decode (~9 ms per token at 413-token context)
+
+**Measured split** (M1 Pro, Qwen3-0.6B Q4_0, 413-token context, 2026-10-22; `MvBench`-style micro-benchmarks over 28
+distinct layers, so nothing is cached between layers, and `./jllm bench`): of the ~8.5 ms per token before the multi-row
+matvec ([08 §8.27](08-metal-backend.md#827-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_)), **6.8 ms were the
+matvecs** (q/k/v 73 µs, o_proj 28, gate/up 83, down 35 µs per layer, the LM head 1.45 ms) and the rest rope, attention
+(~1.5 ms at 413 positions, ~9.5 ms at 3 000), the norms and the CPU side. The matvecs ran at 40 – 70 GB/s for the layer
+matrices and 115 GB/s for the LM head: the 1 – 3 MB matrices are latency-bound, not bandwidth-bound. Now: matvecs 5.5 ms
+(4 rows per simdgroup, 18 % less), attention ~1.2 ms at 413 positions and ~5 ms at 3 000 ([08 §8.28](08-metal-backend.md#828-decode-attention-attention_dec)).
+`./jllm bench` decode, speculation off: 117.9 → 143.3 tok/s at 413 tokens, 97.1 → 113.7 at ~1 000, 59.5 → 92.9 at ~3 000
+(f16 and q8 caches at 3 000: 62 → 113).
 
 1. **Dispatch count.** 6 kernels per layer × 28 + 2 = 170 dispatches per token (338 for the 30B MoE model since
    its norm moved into the router, 386 before; the first version had 338). Each costs a few microseconds of GPU
@@ -198,13 +223,15 @@ bench prompt is repetitive.
    Not yet measured on a Mac (the emulator's wall time means nothing); `scripts/mac-validate.sh` compares replay on
    and off.
 2. **Under-filled GPU.** `o_proj` / `down_proj` have 1024 output rows → 256 threadgroups of 4
-   simdgroups; the 16-core GPU wants thousands in flight to hide memory latency. Latency, not bandwidth, bounds
+   simdgroups (128 with the multi-row kernels, whose lanes each keep 4 rows' loads in flight); the 16-core GPU wants thousands in flight to hide memory latency. Latency, not bandwidth, bounds
    these matmuls.
 3. **The LM head.** `151 936 × 1024` in Q8_0 = 165 MB, over a third of all bytes, for one 1024-vector.
 4. **Attention.** For each of 28 layers × 16 heads the kernel streams the whole 413-position KV prefix
    (413 × 128 × 4 B × 2 = 423 KB per head) through one threadgroup; writing scores to device memory and
-   reading them back twice costs extra traffic. The opt-in flash decoding (`-Djllm.metal.flashDecode=true`,
-   [08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) spreads long contexts over more threadgroups.
+   reading them back twice costs extra traffic. That is `attention_t`, which streamed the cache at ~70 GB/s; flash decoding
+   ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) spreads long contexts over more threadgroups but kept the
+   per-key loop, and `attention_dec` ([08 §8.28](08-metal-backend.md#828-decode-attention-attention_dec)) replaced both: simdgroups as independent
+   workers, online softmax in registers, K/V rows shared by the two query heads of a kv head; 130 – 150 GB/s, ~2× at 3 000 tokens.
 5. **CPU-side work per token**: sampling over 151 936 logits (~0.3 ms), the embedding row copy, and the
    `commitAndWait` round trip. The command buffers are committed every 8 layers, so encoding overlaps GPU work and
    only the last part is exposed; pipelined greedy decoding takes sampling off the CPU, and decode replay replaces
@@ -348,6 +375,9 @@ Done:
 | **f16 KV cache**: `backend.kv-dtype=f16` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache)) | halves cache memory (940 → 470 MB at `--ctx 4096`) and attention read traffic; speed equal or better, outputs unchanged on the test prompts | `cpu/KvCache`, `_h` kernels |
 | **Expert-grouped MoE prefill on CPU** ([07 §7.7](07-cpu-backend.md#77-mixture-of-experts-on-cpu-cpubackendmoeffn-moeexperts)) | each expert row dequantized once per chunk and reused for its tokens | `MoeExperts.batched` |
 | **Tiled CPU attention** over (kv head, token tile) | each K / V row read once per tile; bit-identical | `KvCache.attentionTiled` |
+| **Prefill chunk `backend.batch=auto`**: 256 tokens for dense decoders on Metal (64 filled 32 MMA threadgroups on 16 cores) | prefill 1 426 → 2 012 tok/s (Qwen3-0.6B, 413 tokens), logits bit-identical across chunk sizes | `ModelLoader.batch`, [08 §8.26](08-metal-backend.md#826-the-prefill-chunk-backendbatchauto) |
+| **Multi-row decode matvec** on Metal (`mv<NR>_*`, 4 rows per simdgroup, activations reused across rows, rmsnorm prologue shared by more rows) | matvecs per token 6.76 → 5.52 ms; decode 118 → 132 tok/s (0.6B), GGUF Q4_0 105 → 133; `-Djllm.metal.mvRows=1` for the old kernels | `mvr_matmul*`, [08 §8.27](08-metal-backend.md#827-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_) |
+| **Decode attention** on Metal (`attention_dec`: independent simdgroups, online softmax in registers, shared K/V rows, reduce-scatter dot products), chosen by the self-check | decode at ~3 000 tokens 63 → 93 tok/s (f16/q8 caches: 62 → 113); +3 % at 413 tokens; agrees to rounding, not bit-identical | `attention_dec`, `MetalTuner.decodeAttention`, [08 §8.28](08-metal-backend.md#828-decode-attention-attention_dec) |
 | **Flash decoding** on Metal, chosen by the start-up self-check ([08 §8.11](08-metal-backend.md#811-flash-decoding-chosen-at-start-up)) | +3–5 % decode at ~3 000 tokens of context, not bit-identical (agrees to rounding) | `attention_split`, `attention_combine` |
 | **Vectorized `exp` / `tanh`** on CPU, default (`jllm.cpu.fastmath=false` to disable) | +5–9 % decode at ~3 000 tokens, −40 % long-prompt attention | `VectorKernels.expFast` |
 | **MLA latent cache** (DeepSeek): absorbed `W_kb`, one 576-wide row per token | 2.2 GB → 255 MB at `--ctx 4096` ([14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | `MlaCpu`, `MlaMetal` |
@@ -362,6 +392,7 @@ Remaining, by expected payoff:
 | 4 | ~~Flash-style prefill attention~~ (done: `attention_fa`, and `attention_fb`, [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa), [§8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) | | |
 | 5 | ~~`simdgroup_matrix` prefill matmuls~~ (done: `*_mma`, and the half-weight `*_hmma` with the per-shape choice, [11.8](#118-the-prefill-kernels-against-llamacpps-design)); next: **measure `*_hmma` on a Mac**, then larger tiles (64 × 64 with 8 simdgroups) or Metal 4 tensor ops on M5-class GPUs | see 11.8 | `kernels.metal`, `MetalTuner` |
 | 6 | **Mixed-precision low-bit formats** (a Q2_K / Q3_K mix with higher-precision sensitive tensors) | smaller files and fewer bytes per token ([13](13-q2k-quantization.md)) | quantizer, `QType`, kernels |
+| 6b | After the matvec and attention work the 0.6B decode token is ~7 ms; what is left is mostly dispatch latency (170 dispatches in a serial encoder): overlap independent dispatches ([08](08-metal-backend.md), concurrent encoder), fuse the attention combine into the o_proj prologue, prefetch a threadgroup's first weights before its norm prologue, aligned 16-byte loads of GGUF Q4_0 blocks (−2 %) | up to ~2 ms per token | `kernels.metal`, `jllm_metal.m` |
 | 7 | Smaller items: fuse RMSNorm into the next matmul on CPU, wider threadgroups for small Metal matmuls, coalesced router weight reads, parallel shard downloads | each a few percent to 2× in its own corner | `CpuBackend`, `kernels.metal`, `HuggingFaceHub` |
 
 A future direction, not started: a Windows backend (for example OpenCL or DirectML) so the GPU / NPU of a
