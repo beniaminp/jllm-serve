@@ -56,7 +56,9 @@ public final class GgufQwenNextTest {
         }
     }
 
-    static final int DIM = 128, HEADS = 4, KV = 2, HD = 64, VOCAB = 96, FF = 192, NK = 2, NV = 4, DK = 32, DV = 32,
+    /** Settable (VisionTest writes a model with a byte-level vocabulary): the vocabulary size of the tiny models. */
+    static int VOCAB = 96;
+    static final int DIM = 128, HEADS = 4, KV = 2, HD = 64, FF = 192, NK = 2, NV = 4, DK = 32, DV = 32,
             KC = 4, EXPERTS = 4, TOPK = 2, MOE_DIM = 32, SHARED = 64, ROT = 16;
     /** Layers and the full-attention interval: fixed for the test, settable by {@link GgufTinyWrite} to bisect against llama.cpp. */
     static int LAYERS = 4, INTERVAL = 2;
@@ -397,6 +399,10 @@ public final class GgufQwenNextTest {
      */
     /** Adds a vocabulary (byte-level BPE, no merges) so that llama.cpp can load the tiny file too: ids are fed directly. */
     static boolean withVocab;
+    /** With {@link #withVocab}: the token strings (VOCAB of them) instead of t0, t1, ... (VisionTest needs the Qwen-VL control tokens). */
+    static String[] vocabNames;
+    /** ... and their {@code token_type}s (default all normal). */
+    static int[] vocabTypes;
     /** A Jinja chat template to store in the tiny file (to ask llama.cpp to render conversations with it). */
     static String chatTemplate;
     /** Scale the output rows of four tokens up (a file for comparing the multi-token-prediction head with llama.cpp). */
@@ -431,8 +437,8 @@ public final class GgufQwenNextTest {
             String[] tokens = new String[VOCAB];
             int[] types = new int[VOCAB];
             for (int i = 0; i < VOCAB; i++) {
-                tokens[i] = "t" + i;
-                types[i] = 1;
+                tokens[i] = vocabNames != null ? vocabNames[i] : "t" + i;
+                types[i] = vocabTypes != null ? vocabTypes[i] : 1;
             }
             w.str("tokenizer.ggml.model", "gpt2").str("tokenizer.ggml.pre", "qwen35").strings("tokenizer.ggml.tokens", tokens)
                     .i32s("tokenizer.ggml.token_type", types).strings("tokenizer.ggml.merges");
