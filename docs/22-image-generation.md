@@ -609,7 +609,7 @@ curl localhost:8080/v1/images/generations -H 'Content-Type: application/json' -d
   "steps": 4, "guidance": 0, "seed": 42, "scheduler": "euler" }'
 ```
 
-`size` is `WxH`, both multiples of 64 (32 for the tiny test model); `response_format` is `b64_json` (default) or `url` (a path
+`size` is `WxH`, both multiples of 64 (32 for SDXL-type models, whose UNet has three levels, and for the tiny test model); `response_format` is `b64_json` (default) or `url` (a path
 `/v1/images/files/<id>.png`, served without the API key: the id is the capability); extras beyond OpenAI's: `negative_prompt`,
 `steps`, `guidance` (or `guidance_scale`), `seed`, `scheduler` (`euler`, `euler_a`, `dpmpp_2m`, `dpmpp_2m_karras`), `clip_skip`.
 The response lists `data[i] = {b64_json | url, seed, width, height, revised_prompt}`, `usage` and `timing` (text / unet / vae seconds).
@@ -633,7 +633,7 @@ image-to-image / inpaint / outpaint requests with a strength slider. **Chat tool
 them on in the chat's tools menu): the model writes the prompt, the picture appears inline in the conversation, and `edit_image`
 takes its link back (`strength`, or a `region` rectangle to repaint).
 
-**Limits of the API** (checked in `ImageApi` / `ImagePipeline.validate`): `n` 1 to 10 pictures per request (made one after the other: a pipeline serves one request at a time), `steps` 1 to 200, `guidance` 0 to 50, `size` a multiple of the model's step (64 for the Stable Diffusion UNets, 32 for the tiny test model), at most 2048 × 2048 pixels in area, `strength` 0 to 1, `upscale` 1 to 4 with an `image`;
+**Limits of the API** (checked in `ImageApi` / `ImagePipeline.validate`): `n` 1 to 10 pictures per request (made one after the other: a pipeline serves one request at a time), `steps` 1 to 200, `guidance` 0 to 50, `size` a multiple of the model's step (`vae scale × 2^(levels − 1)`: 64 for the four-level UNets of SD 1.x / 2.x, 32 for SDXL's three levels and for the tiny test models), at most 2048 × 2048 pixels in area, `strength` 0 to 1, `upscale` 1 to 4 with an `image`;
 a `mask` without an `image` is a 400, as is a bad number (each message names the field).
 
 ### 22.12.1 Settings
