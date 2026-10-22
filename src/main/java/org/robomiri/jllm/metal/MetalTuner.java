@@ -473,6 +473,8 @@ final class MetalTuner {
                 }
                 case org.robomiri.jllm.model.Qwen3NextLayer q -> { // its own backend (Qwen3NextMetalBackend) does not use the tuned prefill matmuls
                 }
+                case org.robomiri.jllm.model.HybridLayer q -> { // nor does the hybrid backend
+                }
             }
         }
         return new ArrayList<>(m.values());

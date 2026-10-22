@@ -122,6 +122,13 @@ public final class CpuBackend implements Backend {
         Attention a = arch.attention();
         switch (a) {
             case Attention.Gqa g -> {
+                if (kvDtype == KvDtype.Q4 && anySpecial(arch, ctx)) {
+                    // the cache format is the same on both backends (a saved cache loads into either), and the GPU's q4
+                    // attention kernels have no sinks, chunks or temperature
+                    System.err.println("note: backend.kv-dtype=q4 is not implemented for attention sinks, chunked attention or "
+                            + "attention temperature (gpt-oss, Llama 4), using q8");
+                    kvDtype = KvDtype.Q8;
+                }
                 kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];
@@ -160,6 +167,16 @@ public final class CpuBackend implements Backend {
         for (int l = 0; l < c.layers(); l++) {
             plans[l] = plan(arch.layers().get(l), w.decoderLayer(l));
         }
+    }
+
+    /** Whether some layer needs sinks / chunks / the attention temperature at this context ({@link Attention.Gqa#special}). */
+    private static boolean anySpecial(Decoder d, int ctx) {
+        for (LayerSpec s : d.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.forContext(ctx).special()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ layer plans

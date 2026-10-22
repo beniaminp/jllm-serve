@@ -41,7 +41,10 @@ final class Families {
             Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"),
             Map.entry("qwen3_next", "Qwen3NextForCausalLM"),
             Map.entry("gpt_oss", "GptOssForCausalLM"),
-            Map.entry("llama4_text", "Llama4ForCausalLM"));
+            Map.entry("llama4_text", "Llama4ForCausalLM"),
+            Map.entry("granitemoehybrid", "GraniteMoeHybridForCausalLM"),
+            Map.entry("nemotron_h", "NemotronHForCausalLM"),
+            Map.entry("jamba", "JambaForCausalLM"));
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
     private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration",
@@ -83,6 +86,9 @@ final class Families {
         return switch (modelType) {
             case "mamba" -> mamba(c, arch);
             case "qwen3_next" -> Qwen3NextArch.parse(c, arch);
+            case "granitemoehybrid" -> HybridParsers.granite(c, arch);
+            case "nemotron_h" -> HybridParsers.nemotron(c, arch);
+            case "jamba" -> HybridParsers.jamba(c, arch);
             case "llama" -> llama(new Draft(c, modelType, arch));
             case "mistral" -> mistral(new Draft(c, modelType, arch));
             case "qwen2" -> qwen2(new Draft(c, modelType, arch));

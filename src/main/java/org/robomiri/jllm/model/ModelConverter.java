@@ -310,6 +310,7 @@ public final class ModelConverter {
             case MambaArch m -> planMamba(m);
             case Decoder d -> planDecoder(d);
             case Qwen3NextArch q -> planQwen3Next(q);
+            case HybridArch h -> planHybrid(h);
         };
     }
 
@@ -800,6 +801,137 @@ public final class ModelConverter {
             units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
         units.add(new Unit("final", finalRules(f32PlusOne(FINAL_NORM, FINAL_NORM))));
+        return units;
+    }
+
+    // ------------------------------------------------------------------ attention / state-space hybrids
+
+    /** A cache tensor of zeros (a conv bias the checkpoint does not have). */
+    private static Rule zeros(String cacheName, int n) {
+        return new Rule(cacheName, List.of(), (a, s) -> new float[n]);
+    }
+
+    /**
+     * Granite 4, Nemotron-H and Jamba under the canonical names of {@link HybridLayer}: {@code input_layernorm} /
+     * {@code post_attention_layernorm} for the one or two norms of a layer, {@code self_attn.*}, {@code mixer.*} for the
+     * state-space blocks ({@code A = -exp(A_log)}, a zero conv bias when absent, Jamba's three norms as
+     * {@code dt_norm} / {@code b_norm} / {@code c_norm}), {@code mlp.gate_up} / {@code mlp.down_proj.weight} for a dense
+     * block (Granite's {@code shared_mlp.input_linear} is already [gate; up]; Nemotron-H's {@code up_proj} has no gate) and the
+     * MoE tensors as for the decoders. Where the checkpoints name things: Granite {@code model.layers.N.mamba} /
+     * {@code .self_attn} / {@code .shared_mlp} / {@code .block_sparse_moe}, Nemotron-H {@code backbone.layers.N.norm} /
+     * {@code .mixer}, Jamba {@code model.layers.N.mamba} / {@code .self_attn} / {@code .feed_forward} / {@code pre_ff_layernorm}.
+     */
+    private List<Unit> planHybrid(HybridArch h) {
+        String type = h.core().modelType();
+        boolean nemo = type.equals("nemotron_h");
+        boolean jamba = type.equals("jamba");
+        int dim = h.core().dim();
+        List<Unit> units = new ArrayList<>();
+        units.add(new Unit("embed", List.of(quantize(EMBED, nemo ? "backbone.embeddings.weight" : EMBED, head, 0, 0))));
+        for (int l = 0; l < h.core().layers(); l++) {
+            HybridArch.Layer spec = h.layers().get(l);
+            String sp = (nemo ? "backbone.layers." : "model.layers.") + l + ".";
+            String cp = "model.layers." + l + ".";
+            List<Rule> rules = new ArrayList<>();
+            rules.add(f32(cp + "input_layernorm.weight", sp + (nemo ? "norm.weight" : "input_layernorm.weight")));
+            if (spec.mixer() != HybridArch.Mixer.NONE && spec.ffn() != null) {
+                rules.add(f32(cp + "post_attention_layernorm.weight",
+                        sp + (jamba ? "pre_ff_layernorm.weight" : "post_attention_layernorm.weight")));
+            }
+            String ms = sp + (nemo ? "mixer." : spec.mixer() == HybridArch.Mixer.ATTENTION ? "self_attn." : "mamba.");
+            String mc = cp + "mixer.";
+            switch (spec.mixer()) {
+                case ATTENTION -> {
+                    for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                        rules.add(quantize(cp + "self_attn." + n + ".weight", ms + n + ".weight", quant, 0, 0));
+                    }
+                }
+                case MAMBA2 -> {
+                    rules.add(quantize(mc + "in_proj.weight", ms + "in_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "conv1d.weight", ms + "conv1d.weight"));
+                    rules.add(shardOf.containsKey(ms + "conv1d.bias") ? f32(mc + "conv1d.bias", ms + "conv1d.bias")
+                            : zeros(mc + "conv1d.bias", h.mamba2().convDim()));
+                    rules.add(f32(mc + "dt_bias", ms + "dt_bias"));
+                    rules.add(negExp(mc + "A", ms + "A_log"));
+                    rules.add(f32(mc + "D", ms + "D"));
+                    rules.add(f32(mc + "norm.weight", ms + "norm.weight"));
+                    rules.add(quantize(mc + "out_proj.weight", ms + "out_proj.weight", quant, 0, 0));
+                }
+                case MAMBA1 -> {
+                    rules.add(quantize(mc + "in_proj.weight", ms + "in_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "conv1d.weight", ms + "conv1d.weight"));
+                    rules.add(shardOf.containsKey(ms + "conv1d.bias") ? f32(mc + "conv1d.bias", ms + "conv1d.bias")
+                            : zeros(mc + "conv1d.bias", h.mamba1().dInner()));
+                    rules.add(quantize(mc + "x_proj.weight", ms + "x_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "dt_proj.weight", ms + "dt_proj.weight"));
+                    rules.add(f32(mc + "dt_proj.bias", ms + "dt_proj.bias"));
+                    rules.add(negExp(mc + "A", ms + "A_log"));
+                    rules.add(f32(mc + "D", ms + "D"));
+                    rules.add(quantize(mc + "out_proj.weight", ms + "out_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "dt_norm.weight", ms + "dt_layernorm.weight"));
+                    rules.add(f32(mc + "b_norm.weight", ms + "b_layernorm.weight"));
+                    rules.add(f32(mc + "c_norm.weight", ms + "c_layernorm.weight"));
+                }
+                case NONE -> {
+                }
+            }
+            switch (spec.ffn()) {
+                case null -> {
+                }
+                case Mlp.Dense d -> {
+                    if (nemo) { // a ReLU-squared MLP: up_proj and down_proj only
+                        rules.add(quantize(cp + "mlp.gate_up", ms + "up_proj.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", ms + "down_proj.weight", quant, 0, 0));
+                    } else if (jamba) {
+                        String f = sp + "feed_forward.";
+                        rules.add(stack(cp + "mlp.gate_up", List.of(f + "gate_proj.weight", f + "up_proj.weight"), quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", f + "down_proj.weight", quant, 0, 0));
+                    } else {
+                        rules.add(quantize(cp + "mlp.gate_up", sp + "shared_mlp.input_linear.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", sp + "shared_mlp.output_linear.weight", quant, 0, 0));
+                    }
+                }
+                case Mlp.Moe m -> {
+                    int e = m.experts();
+                    int md = m.moeDim();
+                    if (jamba) {
+                        String f = sp + "feed_forward.";
+                        rules.add(f32(cp + "mlp.router", f + "router.weight"));
+                        if (shardOf.containsKey(f + "experts.gate_up_proj")) {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "experts.gate_up_proj", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "experts.down_proj", quant, new long[]{e, dim, md}));
+                        } else {
+                            List<String> gateUp = new ArrayList<>(2 * e);
+                            List<String> downs = new ArrayList<>(e);
+                            for (int i = 0; i < e; i++) {
+                                String ep = f + "experts." + i + ".";
+                                gateUp.add(ep + "gate_proj.weight");
+                                gateUp.add(ep + "up_proj.weight");
+                                downs.add(ep + "down_proj.weight");
+                            }
+                            rules.add(stack(cp + "mlp.experts.gate_up", gateUp, quant, md, 0));
+                            rules.add(stack(cp + "mlp.experts.down", downs, quant, 0, md));
+                        }
+                    } else { // Granite: input_linear [E, 2m, dim] is [gate; up] per expert, output_linear [E, dim, m]
+                        String f = sp + "block_sparse_moe.";
+                        rules.add(f32(cp + "mlp.router", shardOf.containsKey(f + "router.layer.weight") ? f + "router.layer.weight"
+                                : f + "router.weight"));
+                        if (shardOf.containsKey(f + "input_linear.weight")) {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "input_linear.weight", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "output_linear.weight", quant, new long[]{e, dim, md}));
+                        } else {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "experts.gate_up_proj", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "experts.down_proj", quant, new long[]{e, dim, md}));
+                        }
+                        rules.add(quantize(cp + "mlp.shared.gate_up", sp + "shared_mlp.input_linear.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.shared.down", sp + "shared_mlp.output_linear.weight", quant, 0, 0));
+                    }
+                }
+            }
+            units.add(new Unit("layer." + l, List.copyOf(rules)));
+        }
+        String finalNorm = nemo ? "backbone.norm_f.weight" : jamba ? "model.final_layernorm.weight" : FINAL_NORM;
+        units.add(new Unit("final", finalRules(f32(FINAL_NORM, finalNorm))));
         return units;
     }
 

@@ -1,10 +1,13 @@
 package org.robomiri.jllm;
 
 import org.robomiri.jllm.cpu.CpuBackend;
+import org.robomiri.jllm.cpu.HybridCpuBackend;
 import org.robomiri.jllm.json.Json;
+import org.robomiri.jllm.metal.HybridMetalBackend;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
+import org.robomiri.jllm.model.HybridArch;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
@@ -51,14 +54,17 @@ public final class ArchRefCheck {
         int failures = 0;
         try (ModelWeights w = ModelWeights.load(dir, arch, quant, QuantFile.DEFAULT_HEAD, ShardProvider.local(dir), null)) {
             int ctx = 64;
-            try (Backend b = new CpuBackend(w, ctx, 16, 4, KvDtype.F32, false)) {
+            try (Backend b = arch instanceof HybridArch ? new HybridCpuBackend(w, ctx, 16, 4, KvDtype.F32)
+                    : new CpuBackend(w, ctx, 16, 4, KvDtype.F32, false)) {
                 failures += check("cpu", b, prompt, ids, want, vocab, TOL_CPU);
             }
             if (lib != null) {
-                try (Backend b = new MetalBackend(w, ctx, 16, lib)) {
+                try (Backend b = arch instanceof HybridArch ? new HybridMetalBackend(w, ctx, 16, lib, KvDtype.F32)
+                        : new MetalBackend(w, ctx, 16, lib)) {
                     failures += check("metal", b, prompt, ids, want, vocab, TOL_GPU);
                 }
-                try (Backend b = new MetalBackend(w, ctx, 16, lib, KvDtype.F16)) {
+                try (Backend b = arch instanceof HybridArch ? new HybridMetalBackend(w, ctx, 16, lib, KvDtype.F16)
+                        : new MetalBackend(w, ctx, 16, lib, KvDtype.F16)) {
                     failures += check("metal f16 cache", b, prompt, ids, want, vocab, 1e-2f);
                 }
             }

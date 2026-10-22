@@ -12,6 +12,14 @@ usage: hf-arch-ref.py <family> <out-dir> [--seed N]
                         temperature tuning (floor 8), L2 q/k norm, llama3-scaled interleaved RoPE, MoE (top 1 of 4,
                         sigmoid weight on the input, shared expert) on every layer
           llama4-mix    as llama4 with interleave_moe_layer_step 2: dense and MoE layers alternate
+          granite       GraniteMoeHybridForCausalLM: 5 layers mamba / mamba / attention / mamba / attention, Mamba-2 with 8
+                        heads of 32 and 2 groups (the gated norm covers the whole width), 4 experts top 2 plus the shared
+                        MLP in every layer, the muP multipliers (embedding 2, residual 0.5, attention 0.2, logits / 4), no RoPE
+          granite-rope  a dense Granite (no experts, only the shared MLP) whose attention layers rotate (RoPE)
+          nemotronh     NemotronHForCausalLM: pattern "M-M*-M" (Mamba-2, ReLU-squared MLP, attention), 2 groups with a
+                        group-wise gated norm, the step size clamped below at time_step_min
+          jamba         JambaForCausalLM: Mamba-1 with the dt / B / C norms in 3 of 4 layers, attention in layer 2, a MoE
+                        (4 experts top 2, softmax then top-k) in every other layer, a SwiGLU MLP in the rest
 
 Writes <out-dir>/config.json + model.safetensors (a Hugging Face checkpoint the engine converts like any other) and
 <out-dir>/ref/ref.json (prompt ids, the 12 greedy ids) + ref/logits.f32 (little-endian float32, one row of vocab logits
@@ -27,7 +35,7 @@ import sys
 import numpy as np
 import torch
 
-FAMILIES = ("gptoss", "gptoss-mxfp4", "llama4", "llama4-mix")
+FAMILIES = ("gptoss", "gptoss-mxfp4", "llama4", "llama4-mix", "granite", "granite-rope", "nemotronh", "jamba")
 VOCAB = 1000
 PROMPT_LEN = 40
 STEPS = 12
@@ -72,10 +80,18 @@ def randomize(model, gen, mxfp4=False):
     """Weights that make every piece matter: routing varies by token, sinks and biases are not negligible."""
     with torch.no_grad():
         for name, p in model.named_parameters():
-            if name.endswith("layernorm.weight") or name.endswith("norm.weight"):
+            if name.endswith(("layernorm.weight", "norm.weight", "norm_f.weight")):
                 p.copy_(1.0 + 0.2 * torch.randn(p.shape, generator=gen))
             elif name.endswith("sinks"):
                 p.copy_(torch.randn(p.shape, generator=gen))
+            elif name.endswith("A_log"):
+                p.copy_(torch.log(1.0 + 7.0 * torch.rand(p.shape, generator=gen)))
+            elif name.endswith("dt_bias"):
+                p.copy_(torch.randn(p.shape, generator=gen) * 0.8 - 0.5)
+            elif name.endswith(".D") or name == "D":
+                p.copy_(1.0 + 0.3 * torch.randn(p.shape, generator=gen))
+            elif "conv1d" in name and name.endswith("weight"):
+                p.copy_(0.4 * torch.randn(p.shape, generator=gen))
             elif "bias" in name:
                 p.copy_(0.2 * torch.randn(p.shape, generator=gen))
             elif "router" in name:
@@ -88,6 +104,32 @@ def randomize(model, gen, mxfp4=False):
 
 def build(family):
     from transformers import GptOssConfig, GptOssForCausalLM, Llama4ForCausalLM, Llama4TextConfig
+    if family.startswith("granite"):
+        from transformers import GraniteMoeHybridConfig, GraniteMoeHybridForCausalLM
+        rope = family == "granite-rope"
+        cfg = GraniteMoeHybridConfig(
+            vocab_size=VOCAB, hidden_size=128, intermediate_size=64, shared_intermediate_size=96, num_hidden_layers=5,
+            num_attention_heads=4, num_key_value_heads=2, num_local_experts=0 if rope else 4, num_experts_per_tok=2,
+            layer_types=["mamba", "mamba", "attention", "mamba", "attention"], mamba_n_heads=8, mamba_d_head=32,
+            mamba_n_groups=2, mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, max_position_embeddings=512,
+            position_embedding_type="rope" if rope else None, embedding_multiplier=2.0, logits_scaling=4.0,
+            residual_multiplier=0.5, attention_multiplier=0.2, rms_norm_eps=1e-5,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0})
+        return GraniteMoeHybridForCausalLM(cfg)
+    if family == "nemotronh":
+        from transformers import NemotronHConfig, NemotronHForCausalLM
+        cfg = NemotronHConfig(vocab_size=VOCAB, hidden_size=128, intermediate_size=192, hybrid_override_pattern="M-M*-M",
+                              num_hidden_layers=6, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                              mamba_num_heads=8, mamba_head_dim=32, n_groups=2, ssm_state_size=16, conv_kernel=4,
+                              max_position_embeddings=512, layer_norm_epsilon=1e-5, time_step_min=0.05)
+        return NemotronHForCausalLM(cfg)
+    if family == "jamba":
+        from transformers import JambaConfig, JambaForCausalLM
+        cfg = JambaConfig(vocab_size=VOCAB, hidden_size=128, intermediate_size=192, num_hidden_layers=4,
+                          num_attention_heads=4, num_key_value_heads=2, num_experts=4, num_experts_per_tok=2,
+                          attn_layer_period=4, attn_layer_offset=2, expert_layer_period=2, expert_layer_offset=1,
+                          mamba_d_state=8, mamba_d_conv=4, mamba_expand=2, mamba_dt_rank=8, max_position_embeddings=512)
+        return JambaForCausalLM(cfg)
     if family.startswith("gptoss"):
         cfg = GptOssConfig(vocab_size=VOCAB, hidden_size=128, intermediate_size=64, num_hidden_layers=4,
                            num_attention_heads=4, num_key_value_heads=2, head_dim=32, num_local_experts=8,
@@ -118,8 +160,9 @@ def rounded_copy(model, family, state):
             if name.endswith("experts.gate_up_proj") or name.endswith("experts.down_proj"):
                 if family == "gptoss-mxfp4":
                     continue  # already the exact MXFP4 values
-                t.copy_(q8_round(t, axis=1))  # [E, in, out]: blocks along `in`
-            elif t.dim() == 2 and "router" not in name and "bias" not in name:  # the engine keeps biases and the router in f32
+                # gpt-oss / Llama 4: [E, in, out], blocks along `in`; Granite / Jamba: [E, out, in], blocks along the last axis
+                t.copy_(q8_round(t, axis=1 if family.startswith(("gptoss", "llama4")) else -1))
+            elif t.dim() == 2 and "router" not in name and "bias" not in name and "dt_proj" not in name and not name.endswith("A_log"):  # the engine keeps biases, the router and dt_proj in f32
                 t.copy_(q8_round(t, axis=-1))
     return m
 
@@ -157,19 +200,22 @@ def main():
                     extra[base + "_scales"] = torch.from_numpy(scales)
                     p.copy_(deq.transpose(1, 2))
     from safetensors.torch import save_file
-    sd = {k: v.contiguous() for k, v in model.state_dict().items()}
-    if mx:
+    if not mx:
+        model.save_pretrained(out, safe_serialization=True)  # the checkpoint names transformers writes
+        sd = model.state_dict()
+    else:
+        sd = {k: v.contiguous() for k, v in model.state_dict().items()}
         for k in [k for k in sd if k.endswith("experts.gate_up_proj") or k.endswith("experts.down_proj")]:
             del sd[k]
         sd.update(extra)
-    # transformers' own save for the config, our tensors for the weights (the MXFP4 variant has different names)
-    model.config.save_pretrained(out)
+        model.config.save_pretrained(out)
     if mx:
         cfg = json.load(open(os.path.join(out, "config.json")))
         cfg["quantization_config"] = {"modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router",
                                                                  "model.embed_tokens", "lm_head"], "quant_method": "mxfp4"}
         json.dump(cfg, open(os.path.join(out, "config.json"), "w"), indent=2)
-    save_file(sd, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
+    if mx:
+        save_file(sd, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
 
     rng = np.random.default_rng(seed)
     prompt = [int(x) for x in rng.integers(3, VOCAB, PROMPT_LEN)]

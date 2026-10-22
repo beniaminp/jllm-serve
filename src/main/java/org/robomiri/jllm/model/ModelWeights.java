@@ -56,6 +56,12 @@ public final class ModelWeights implements AutoCloseable {
                 }
                 finalNormName = "model.norm.weight";
             }
+            case HybridArch h -> {
+                for (int l = 0; l < c.layers(); l++) {
+                    layers[l] = HybridLayer.load(file, "model.layers." + l + ".", h, l);
+                }
+                finalNormName = "model.norm.weight";
+            }
             case Decoder d -> {
                 for (int l = 0; l < c.layers(); l++) {
                     LayerSpec spec = d.layers().get(l);
@@ -96,6 +102,19 @@ public final class ModelWeights implements AutoCloseable {
     /** Layer {@code l} of a decoder. */
     public DecoderLayer decoderLayer(int l) {
         return (DecoderLayer) layers[l]; // a decoder's layers are DecoderLayers by construction
+    }
+
+    /** The architecture as an attention / state-space hybrid; throws for any other. */
+    public HybridArch hybrid() {
+        if (arch instanceof HybridArch h) {
+            return h;
+        }
+        throw new IllegalArgumentException("not a hybrid model: " + arch);
+    }
+
+    /** Layer {@code l} of a hybrid model. */
+    public HybridLayer hybridLayer(int l) {
+        return (HybridLayer) layers[l];
     }
 
     /** The architecture as Qwen3-Next; throws for any other. */

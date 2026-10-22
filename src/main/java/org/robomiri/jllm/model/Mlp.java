@@ -7,7 +7,14 @@ public sealed interface Mlp permits Mlp.Dense, Mlp.Moe {
     enum Activation {
         SILU,
         /** {@code gelu_pytorch_tanh} (Gemma). */
-        GELU_TANH
+        GELU_TANH,
+        /** {@code relu(x)^2} (Nemotron-H): the MLP has no gate, {@code down(relu(up(x))^2)}. */
+        RELU2;
+
+        /** True if the MLP multiplies an activated gate with an up projection (all but {@link #RELU2}). */
+        public boolean gated() {
+            return this != RELU2;
+        }
     }
 
     /** A dense gated MLP of width {@code hidden}. */

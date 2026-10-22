@@ -101,6 +101,19 @@ public final class ArchSmoke {
         }
         return switch (a) {
             case MambaArch m -> m.dInner() % b == 0;
+            case org.robomiri.jllm.model.HybridArch h -> {
+                boolean ok = (h.attention() == null || h.attention().qDim() % b == 0)
+                        && (h.mamba2() == null || h.mamba2().dInner() % b == 0)
+                        && (h.mamba1() == null || h.mamba1().dInner() % b == 0);
+                for (org.robomiri.jllm.model.HybridArch.Layer l : h.layers()) {
+                    ok &= switch (l.ffn()) {
+                        case null -> true;
+                        case Mlp.Dense dense -> dense.hidden() % b == 0;
+                        case Mlp.Moe moe -> moe.moeDim() % b == 0 && (moe.shared() == null || moe.shared().hidden() % b == 0);
+                    };
+                }
+                yield ok;
+            }
             case Qwen3NextArch q -> {
                 boolean ok = q.attention().qDim() % b == 0 && q.deltaNet().valueWidth() % b == 0;
                 for (Mlp p : q.mlps()) {

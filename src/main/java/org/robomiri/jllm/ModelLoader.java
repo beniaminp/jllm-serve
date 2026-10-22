@@ -18,6 +18,7 @@ import org.robomiri.jllm.metal.Qwen3NextMetalBackend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.HybridArch;
 import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
@@ -268,7 +269,7 @@ public final class ModelLoader {
             return s.getInt("backend.batch");
         }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
-                || arch instanceof Qwen3NextArch q && q.anyMoe();
+                || arch instanceof Qwen3NextArch q && q.anyMoe() || arch instanceof HybridArch h && h.anyMoe();
         int auto = moe ? MOE_BATCH
                 : arch instanceof org.robomiri.jllm.model.Decoder && resolveBackend(s).equals("metal") ? METAL_DENSE_BATCH : DEFAULT_BATCH;
         if (arch.core().modelType().startsWith("gemma3")) {
@@ -524,6 +525,15 @@ public final class ModelLoader {
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         }
+        if (arch instanceof HybridArch) { // Granite 4 / Nemotron-H / Jamba: state-space states plus a KV cache for the attention layers
+            return switch (backendName) {
+                case "cpu" -> new org.robomiri.jllm.cpu.HybridCpuBackend(weights, ctx, batch,
+                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
+                        hybridInt8(s, weights, threads));
+                default -> throw new IllegalArgumentException("the " + backendName + " backend does not run " + arch.core().architecture()
+                        + " yet (cpu)");
+            };
+        }
         return switch (backendName) {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,
@@ -564,7 +574,8 @@ public final class ModelLoader {
         ModelWeights weights = p.weights();
         try {
             if (arch instanceof MambaArch || targetArch instanceof MambaArch
-                    || arch instanceof Qwen3NextArch || targetArch instanceof Qwen3NextArch) {
+                    || arch instanceof Qwen3NextArch || targetArch instanceof Qwen3NextArch
+                    || arch instanceof HybridArch || targetArch instanceof HybridArch) {
                 throw new IllegalArgumentException("engine.draft-model: speculation needs attention (KV cache) models");
             }
             System.err.println("Draft model: " + arch);

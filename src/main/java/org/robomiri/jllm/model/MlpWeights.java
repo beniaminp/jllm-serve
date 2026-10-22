@@ -28,7 +28,8 @@ public sealed interface MlpWeights permits MlpWeights.Dense, MlpWeights.Moe {
         }
 
         boolean matches(Mlp.Dense d, int dim) {
-            return gateUp.rows == 2 * d.hidden() && gateUp.cols == dim && down.rows == dim && down.cols == d.hidden();
+            return gateUp.rows == (d.act().gated() ? 2 : 1) * d.hidden() && gateUp.cols == dim && down.rows == dim
+                    && down.cols == d.hidden();
         }
 
         @Override
