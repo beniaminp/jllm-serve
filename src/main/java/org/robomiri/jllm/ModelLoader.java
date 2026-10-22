@@ -609,6 +609,15 @@ public final class ModelLoader {
             };
         }
         org.robomiri.jllm.kv.KvTierConfig tier = member && arch instanceof org.robomiri.jllm.model.Decoder ? tierConfig(s) : null;
+        if (tier != null && backendName.equals("metal") && tier.hotBytes() == 0 && !tier.plan()) {
+            // no budget given and no planner: the hot tier is the GPU's free share, as backend.ctx=auto reckons it (docs/10 §10.13)
+            long ws = org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib"));
+            if (ws > 0) {
+                long free = Math.max(0, ws - org.robomiri.jllm.metal.MetalMemory.residentBytes() - weights.byteSize()
+                        - Math.max(512L << 20, ws / 32));
+                tier = tier.withHotBytes((long) (ContextBudget.SHARE * free));
+            }
+        }
         boolean planned = tier != null && tier.plan() && tier.hotBytes() == 0 && backendName.equals("metal");
         boolean streamKv = tier != null && backendName.equals("metal") && (planned
                 ? tier.stream() != org.robomiri.jllm.kv.KvTierConfig.Stream.FORCE
