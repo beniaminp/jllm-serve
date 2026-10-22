@@ -307,6 +307,13 @@ public final class ModelLoader {
             }
             tok = ggufTokenizer(s, hub, gm);
             tokNanos = System.nanoTime() - t0;
+            String backendName = s.get("backend");
+            boolean cpu = backendName.equals("cpu") || backendName.equals("auto") && !Metal.available(s.opt("backend.metal.lib"));
+            java.util.Set<org.robomiri.jllm.gguf.GgmlType> requantized = gm.forBackend(cpu);
+            if (!requantized.isEmpty()) {
+                System.err.println("GGUF on the CPU backend: " + requantized + " matrices are requantized to Q8_0 at load (their decode is"
+                        + " faster on the Q8_0 kernels than in place; -Djllm.gguf.requantize=none reads them in place)");
+            }
             weights = gm.weights();
         } catch (Exception e) {
             gm.close();

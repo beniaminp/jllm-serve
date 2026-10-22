@@ -358,7 +358,7 @@ final class MetalKernels implements AutoCloseable {
         metal.dispatch(metal.pipeline(kernel), bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz, tx, ty, tz);
     }
 
-    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k / q6k, and q4g / q8g / q4k / q5k for GGUF tensors). */
+    /** Kernel name {@code base_<qt><suffix>} for a tensor's quantization type (q4 / q8 / q2k / q6k, and q4g / q8g / q4k / q5k / q41 / q50 / q51 / q3k / iq4nl / iq4xs / mxfp4 / f16w / bf16w for GGUF tensors). */
     static String kernel(String base, QType type, String suffix) {
         String qt = switch (type) {
             case Q4_0 -> "q4";
@@ -369,6 +369,15 @@ final class MetalKernels implements AutoCloseable {
             case Q4_K -> "q4k";
             case Q5_K -> "q5k";
             case Q6_K -> "q6k";
+            case Q4_1 -> "q41";
+            case Q5_0 -> "q50";
+            case Q5_1 -> "q51";
+            case Q3_K -> "q3k";
+            case IQ4_NL -> "iq4nl";
+            case IQ4_XS -> "iq4xs";
+            case MXFP4 -> "mxfp4";
+            case F16 -> "f16w";
+            case BF16 -> "bf16w";
         };
         return base + "_" + qt + suffix;
     }
@@ -405,8 +414,19 @@ final class MetalKernels implements AutoCloseable {
      * format has an MMA instantiation ({@code matmul_mma_q4/q8/q2k/q6k} and the GGUF ones).
      */
     private static boolean useMma(int n, QType type) {
-        return MMA_PREFILL && n >= MMA_MIN_TOKENS
+        return MMA_PREFILL && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
                 && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
+    }
+
+    /**
+     * Formats whose tiled prefill kernels ({@code matmul_pf} and its fused forms, chunks of {@link #PREFILL_MIN_TOKENS} to
+     * {@link #MMA_MIN_TOKENS} tokens) are 3 - 4x slower than the matrix-unit ones even for those short chunks (measured with
+     * {@code GgufMetalBench}, 1024 x 3072 matrix, 8 / 16 / 24 tokens: Q4_K 394 / 815 / 1081 us against 240 / 243 / 248 us on the
+     * matrix units; Q5_K, Q5_0 and Q3_K alike, the other formats are within 10% either way): the 32-weight unit decode of these
+     * bit-field formats is done per lane and per row in the tile kernel. They use the matrix units from 8 tokens on.
+     */
+    static boolean tiledIsSlow(QType t) {
+        return t == QType.Q4_K || t == QType.Q5_K || t == QType.Q5_0 || t == QType.Q3_K;
     }
 
     /** The MMA prefill families whose two forms ({@code <family>_mma}, {@code <family>_hmma}) are chosen per shape. */

@@ -8,9 +8,11 @@ package org.robomiri.jllm.model;
  *   {@code j+16} in the high nibble, value = (nibble - 8) * scale.</li>
  *   <li>{@code Q8_0}: 32 signed bytes per block, value = q * scale.</li>
  *   <li>{@code Q2_K}: llama.cpp's 2-bit K-quant, see {@link Q2K}.</li>
- *   <li>{@code Q4_0G}, {@code Q8_0G}, {@code Q4_K}, {@code Q5_K}: llama.cpp's own block layouts ({@link Ggml}),
- *   scales inside the block. They exist only as views of a GGUF file's tensors ({@link #gguf}); the engine
- *   never produces them, so they are not a valid {@code model.quant} and not stored in a cache.</li>
+ *   <li>{@code Q4_0G}, {@code Q8_0G}, {@code Q4_K}, {@code Q5_K}, {@code Q4_1}, {@code Q5_0}, {@code Q5_1},
+ *   {@code Q3_K}, {@code IQ4_NL}, {@code IQ4_XS}, {@code MXFP4}, {@code F16}, {@code BF16}: llama.cpp's own block
+ *   layouts ({@link Ggml}), scales inside the block (F16 / BF16: plain halves, grouped in "blocks" of 32). They exist
+ *   only as views of a GGUF file's tensors ({@link #gguf}); the engine never produces them, so they are not a valid
+ *   {@code model.quant} and not stored in a cache.</li>
  * </ul>
  */
 public enum QType {
@@ -27,7 +29,25 @@ public enum QType {
     /** ggml Q5_K: 176-byte super-blocks of 256 weights (5-bit quants, 6-bit scales and mins). */
     Q5_K(Ggml.Q5_K_BYTES, Ggml.QK_K, 0, true),
     /** llama.cpp Q6_K: 256-weight super-blocks of 210 bytes carrying their own int8 sub-block scales ({@link Q6K}). */
-    Q6_K(Q6K.BLOCK_BYTES, Q6K.BLOCK, 0);
+    Q6_K(Q6K.BLOCK_BYTES, Q6K.BLOCK, 0),
+    /** ggml Q4_1: 20-byte blocks of 32 weights, f16 scale d, f16 min m, 16 nibble bytes; w = q d + m. */
+    Q4_1(Ggml.Q4_1_BYTES, QType.BLOCK, 0, true),
+    /** ggml Q5_0: 22-byte blocks of 32 weights, f16 d, 32 high bits, 16 nibble bytes; w = (q5 - 16) d. */
+    Q5_0(Ggml.Q5_0_BYTES, QType.BLOCK, 0, true),
+    /** ggml Q5_1: 24-byte blocks of 32 weights, f16 d, f16 m, 32 high bits, 16 nibble bytes; w = q5 d + m. */
+    Q5_1(Ggml.Q5_1_BYTES, QType.BLOCK, 0, true),
+    /** ggml Q3_K: 110-byte super-blocks of 256 weights (2 bits + a high-bit mask, sixteen 6-bit scales). */
+    Q3_K(Ggml.Q3_K_BYTES, Ggml.QK_K, 0, true),
+    /** ggml IQ4_NL: 18-byte blocks of 32 weights, f16 d, 16 nibble bytes indexing a 16-entry table. */
+    IQ4_NL(Ggml.IQ4_NL_BYTES, QType.BLOCK, 0, true),
+    /** ggml IQ4_XS: 136-byte super-blocks of 256 weights, eight 32-weight sub-blocks with 6-bit scales, nibbles into the IQ4_NL table. */
+    IQ4_XS(Ggml.IQ4_XS_BYTES, Ggml.QK_K, 0, true),
+    /** ggml MXFP4: 17-byte blocks of 32 weights, an e8m0 exponent byte and 16 nibble bytes of e2m1 values. */
+    MXFP4(Ggml.MXFP4_BYTES, QType.BLOCK, 0, true),
+    /** f16 weights of a GGUF file, used as they are: "blocks" of 32 halves (64 bytes). */
+    F16(64, QType.BLOCK, 0, true),
+    /** bf16 weights of a GGUF file, used as they are: "blocks" of 32 bfloat16 (64 bytes). */
+    BF16(64, QType.BLOCK, 0, true);
 
     public static final int BLOCK = 32;
 

@@ -1509,3 +1509,45 @@ a draft can pay; at b = 0.1 a, α = 0.9 would choose k = 5 for 1.86x the plain r
 
 Emulator timings are not representative of a GPU (the emulator runs every GPU thread of a kernel as a fiber on the
 CPU), so the costs on a real Mac come from `scripts/mac-validate.sh` (§8.20).
+
+---
+
+## 8.26 GGUF block types on the GPU (`gg_unit`, `gg_new`)
+
+The ggml formats of a GGUF file ([16](16-gguf.md)) are read in place by the same kernels as the engine's own formats
+(kernel suffix `q4g q8g q4k q5k` and, since the types of [06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files),
+`q41 q50 q51 q3k iq4nl iq4xs mxfp4 f16w bf16w`; `QT` 20 … 32 in `kernels.metal`). One lane unit is 32 consecutive
+weights; the whole format is the function that turns a unit into 8 `float4`:
+
+```
+gg_unit<QT>(wq, grow, nb, u, w)      32 weights of unit u (nb units per row) of row grow -> w[0..8), natural order
+gg_half<QT>(wq, grow, nb, u, h, w)   weights 16 h .. 16 h + 15 (the *_hmma kernels: two threads share a unit)
+gg_new<QT, NV>(..., v0, w)           the decoder behind both for the nine newer types: NV float4 starting at float4 v0
+```
+
+Everything else is shared: `mm_row_gguf` (decode: lane `l` walks units `l, l + 32, ...`), `mm_tile_gguf` (tiled prefill),
+`GG_BLOCK_DOT` (the MoE kernels), `dequant_block` (the embedding lookup), `mma_core` / `hm_core` (matrix-unit prefill),
+so a format costs one branch of `gg_new` plus a row in `GG_INSTANTIATE`, `HM_INSTANTIATE` and `embed_token`. Block
+sizes of 22, 110, 18 and 17 bytes are not multiples of 4: those formats read their quants as `ushort`s (2-byte aligned) or
+byte by byte (MXFP4), as Q4_0 / Q8_0 already did; the 4-bit lookup tables (IQ4_NL, MXFP4: 16 values each) are
+program-scope `constexpr constant` arrays indexed per nibble (`gg_tab_iq4nl`, `gg_tab_mxfp4`; a first version packed the
+int8 values four to a `uint4` and extracted them with shifts, 15-20% slower on the decode matvec). The 256-weight
+formats (Q3_K, IQ4_XS) address unit `u` as sub-block `u & 7` of super-block `u >> 3`, like Q4_K.
+
+**What is compared and how.** `scripts/metal-emu/ggml_ref.py` holds numpy decoders of the new formats written from
+`ggml-quants.c` (and checked against it bit for bit by compiling that file and calling `dequantize_row_*` through
+`ctypes`); `kernel_tests.py` runs, for each of them, the decode `matmul`, the tiled `matmul_pf`, `matmul_swiglu`,
+`embed_token`, and the matrix-unit and half-weight families (`mma`, `hmma`: matmul, matmul3, swiglu, MoE up and down)
+on the emulator against a float64 reference (`python3 scripts/metal-emu/kernel_tests.py q41 q3k ...` runs chosen formats
+only); `GgufMetalCheck` does the same on the GPU through `MetalKernels` on weights at an odd offset of a mapped file.
+Compile cost: the Metal source grows by 9 x 27 = 243 kernel instantiations (from 310 to 553); `newLibraryWithSource` goes from 1.5 s to 2.8 s the
+first time a changed source is compiled (it is cached by the system afterwards, 0.1 s).
+
+The half-weight kernels round each dequantized weight to half. A weight of the non-linear formats is
+`d (ls - 32) kvalues[nibble]`, which has more than the 11 significant bits of a half, so on a random model with
+`|logit|` about 13 the CPU and the GPU differ by ~1e-3 where MetalTuner chose them (1e-6 with `-Djllm.metal.hmma=false`);
+the same holds for Q6_K and Q8_0, and the tuner's agreement check is the guard (8.21).
+
+**Short chunks.** `MetalKernels.tiledIsSlow` sends Q4_K, Q5_K, Q5_0 and Q3_K prefill chunks of 8 – 31 tokens to the matrix-unit kernels instead of
+the tiled `*_pf` ones, which decode a whole 32-weight unit per lane and row and are 3 – 4x slower for these bit-field formats
+(Q4_K_M prefill of a 413-token prompt: 750 → 1414 tok/s, same text; numbers in [16 §16.9.1](16-gguf.md)).

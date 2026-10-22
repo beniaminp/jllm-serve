@@ -8,9 +8,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 
 from emu import Emu, pack
+import ggml_ref
 
 E = Emu()
 failures = 0
+# python3 kernel_tests.py [fmt ...]: only the GGUF block-format tests of the listed formats (q41 q50 q51 q3k iq4nl iq4xs
+# mxfp4 f16w bf16w q4g q8g q4k q5k ...); no arguments: everything
+ONLY = sys.argv[1:]
 
 
 def check(ok, what):
@@ -131,24 +135,26 @@ def matmul(name, rows, cols, ntok, grid, threads=128, tgmem=0, bias=False, acc=F
                                                                ', accumulate' if acc else '', err))
 
 
-for cols in (128, 1024):
-    matmul('matmul_q4', 128, cols, 3, (128 // 4, 1))
-    matmul('matmul_pf_q4', 128, cols, 9, ((128 + 7) // 8, 2))
-    matmul('matmul_mma_q4', 128, cols, 40, (2, 2), threads=128, tgmem=0)
-matmul('matmul_q4', 128, 128, 3, (128 // 4, 1), bias=True, acc=True)
-matmul('matmul_pf_q4', 96, 128, 9, ((96 + 7) // 8, 2), bias=True)
-matmul('matmul_mma_q4', 96, 128, 40, (2, 2), threads=128, tgmem=0, bias=True, acc=True)
+if not ONLY:
+    for cols in (128, 1024):
+        matmul('matmul_q4', 128, cols, 3, (128 // 4, 1))
+        matmul('matmul_pf_q4', 128, cols, 9, ((128 + 7) // 8, 2))
+        matmul('matmul_mma_q4', 128, cols, 40, (2, 2), threads=128, tgmem=0)
+    matmul('matmul_q4', 128, 128, 3, (128 // 4, 1), bias=True, acc=True)
+    matmul('matmul_pf_q4', 96, 128, 9, ((96 + 7) // 8, 2), bias=True)
+    matmul('matmul_mma_q4', 96, 128, 40, (2, 2), threads=128, tgmem=0, bias=True, acc=True)
 
-attention('attention_g1_d64', 64)
-attention('attention_g1_d128', 128)
-attention('attention_g1_d256', 256)
-attention('attention', 96)
-attention('attention_g1_d128_q8', 128, q8=True)
-attention('attention_g1_d64_q8', 64, q8=True)
-attention('attention_q8', 96, q8=True)
-attention('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4, q8=True)
-kv_store_q8(128)
-kv_store_q8(64, n_kv=3)
+if not ONLY:
+    attention('attention_g1_d64', 64)
+    attention('attention_g1_d128', 128)
+    attention('attention_g1_d256', 256)
+    attention('attention', 96)
+    attention('attention_g1_d128_q8', 128, q8=True)
+    attention('attention_g1_d64_q8', 64, q8=True)
+    attention('attention_q8', 96, q8=True)
+    attention('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4, q8=True)
+    kv_store_q8(128)
+    kv_store_q8(64, n_kv=3)
 
 
 def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.0, half=False, q8=False, kind='fa'):
@@ -172,23 +178,24 @@ def flash(hd, n_heads=4, n_kv=2, pos0=37, ntok=45, ctx=128, window=0, softcap=0.
     check(err < 2e-5, '%s pos0=%d ntok=%d window=%d softcap=%g: max err %.2e' % (name, pos0, ntok, window, softcap, err))
 
 
-flash(64)
-flash(128)
-flash(128, half=True)
-flash(64, pos0=0, ntok=32)
-flash(128, window=20, pos0=60, ntok=40)
-flash(64, softcap=5.0)
-flash(128, n_heads=8, n_kv=1, ntok=7)
-flash(256, ntok=33)
-flash(128, q8=True)
-flash(64, window=20, pos0=60, ntok=40, q8=True)
-# attention_fb (K and V staged together, half staging for the f16 / q8 caches, padded rows): the same cases
-for kw in ({'hd': 64}, {'hd': 128}, {'hd': 128, 'half': True}, {'hd': 64, 'pos0': 0, 'ntok': 32},
-           {'hd': 128, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 64, 'softcap': 5.0},
-           {'hd': 128, 'n_heads': 8, 'n_kv': 1, 'ntok': 7}, {'hd': 256, 'ntok': 33}, {'hd': 256, 'ntok': 33, 'half': True},
-           {'hd': 64, 'half': True, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 128, 'q8': True},
-           {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9}):
-    flash(kind='fb', **kw)
+if not ONLY:
+    flash(64)
+    flash(128)
+    flash(128, half=True)
+    flash(64, pos0=0, ntok=32)
+    flash(128, window=20, pos0=60, ntok=40)
+    flash(64, softcap=5.0)
+    flash(128, n_heads=8, n_kv=1, ntok=7)
+    flash(256, ntok=33)
+    flash(128, q8=True)
+    flash(64, window=20, pos0=60, ntok=40, q8=True)
+    # attention_fb (K and V staged together, half staging for the f16 / q8 caches, padded rows): the same cases
+    for kw in ({'hd': 64}, {'hd': 128}, {'hd': 128, 'half': True}, {'hd': 64, 'pos0': 0, 'ntok': 32},
+               {'hd': 128, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 64, 'softcap': 5.0},
+               {'hd': 128, 'n_heads': 8, 'n_kv': 1, 'ntok': 7}, {'hd': 256, 'ntok': 33}, {'hd': 256, 'ntok': 33, 'half': True},
+               {'hd': 64, 'half': True, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 128, 'q8': True},
+               {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9}):
+        flash(kind='fb', **kw)
 
 
 def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
@@ -214,7 +221,8 @@ def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5):
     check(err < 1e-4, 'attention_split_q8 hd=%d, %d splits: max err %.2e' % (hd, n_split, err))
 
 
-split_q8(128)
+if not ONLY:
+    split_q8(128)
 
 
 def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
@@ -288,12 +296,13 @@ def gdn_norm_gate(nv=3, dv=40, ntok=4, eps=1e-6):
     check(err < 1e-5, 'gdn_norm_gate nv=%d dv=%d: max err %.2e' % (nv, dv, err))
 
 
-gdn_conv()
-gdn_conv(channels=70, kc=3, ntok=1, in_stride=80)
-gdn_rule()
-gdn_rule(nk=2, nv=2, dk=128, dv=32, ntok=3)
-gdn_rule(nk=1, nv=3, dk=32, dv=5, ntok=7)
-gdn_norm_gate()
+if not ONLY:
+    gdn_conv()
+    gdn_conv(channels=70, kc=3, ntok=1, in_stride=80)
+    gdn_rule()
+    gdn_rule(nk=2, nv=2, dk=128, dv=32, ntok=3)
+    gdn_rule(nk=1, nv=3, dk=32, dv=5, ntok=7)
+    gdn_norm_gate()
 # ---- half-weight MMA prefill kernels (*_hmma) in every weight format, against numpy.
 # Each format's bytes are random (with sane f16 / f32 scales) and decoded here following the block layouts of
 # kernels.metal (and llama.cpp for the GGUF ones); the established *_mma kernel is checked against the same decoder
@@ -308,6 +317,8 @@ def f16(rng, shape, lo, hi):
 def fmt_weights(fmt, rows, cols, rng):
     """(wq bytes, ws f32 scales or a dummy, w [rows, cols] f32 as the kernels dequantize it) of one tensor."""
     dummy = np.zeros(4, np.float32)
+    if fmt in ggml_ref.NEW:   # Q4_1 Q5_0 Q5_1 Q3_K IQ4_NL IQ4_XS MXFP4 F16 BF16: ggml_ref.py (checked against ggml-quants.c)
+        return ggml_ref.weights(fmt, rows, cols, rng)
     if fmt == 'q4':
         wq, ws, w = q4_weights(rows, cols, rng)
         return wq, ws, w
@@ -385,7 +396,8 @@ def fmt_weights(fmt, rows, cols, rng):
     return blk.reshape(-1).copy(), dummy, w.reshape(rows, cols)
 
 
-GGUF = ('q4g', 'q8g', 'q4k', 'q5k')
+GGUF = ('q4g', 'q8g', 'q4k', 'q5k') + ggml_ref.NEW
+KQ256 = ('q2k', 'q6k', 'q4k', 'q5k', 'q3k', 'iq4xs')  # formats of 256-weight super-blocks
 
 
 def rel_errs(out, w, x_ref_fn):
@@ -530,7 +542,7 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     # down: ys[s] = rw[s] * W_e h[s], rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
     h = rng.standard_normal((slots, m)).astype(np.float32)
     rw = rng.random(slots).astype(np.float32)
-    if fmt in GGUF and m % 256 != 0 and fmt in ('q4k', 'q5k'):
+    if fmt in GGUF and m % 256 != 0 and fmt in KQ256:
         return
     dq, ds, dw = fmt_weights(fmt, n_exp * dim, m, rng)
     dw = dw.reshape(n_exp, dim, m)
@@ -549,8 +561,48 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     check(ok, '%s dim=%d m=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), eh, ee))
 
 
-for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k'):
-    kq = fmt in ('q2k', 'q6k', 'q4k', 'q5k')  # 256-weight super-blocks
+def plain_test(fmt, rows=96, cols=None, ntok=3):
+    """matmul_<fmt> (the decode kernel, mm_row_gguf), matmul_pf_<fmt> (the tiled prefill kernel, mm_tile_gguf),
+    matmul_swiglu_<fmt> and the embedding lookup embed_token_<fmt>, which share gg_unit with the mma kernels but walk
+    the units differently."""
+    cols = cols or (256 if fmt in KQ256 else 128)
+    rng = np.random.default_rng(20)
+    wq, ws, w = fmt_weights(fmt, rows, cols, rng)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    ref = x.astype(np.float64) @ w.T.astype(np.float64)
+    for name, grid in (('matmul_' + fmt, (rows // 4, 1)), ('matmul_pf_' + fmt, ((rows + 7) // 8, (ntok + 7) // 8))):
+        out = np.zeros((ntok, rows), np.float32)
+        E.dispatch(name, [wq, ws, x, out, np.ones(cols, np.float32), np.zeros(rows, np.float32)],
+                   pack('iiiiffi', rows, cols, ntok, 0, 1e-6, 0.0, 0), grid, (128,))
+        err = np.abs(out - ref).max() / np.abs(ref).max()
+        check(err < 1e-5, '%s %dx%d, %d tokens: rel err %.2e' % (name, rows, cols, ntok, err))
+    hidden = 48
+    gq, _, gw = fmt_weights(fmt, hidden, cols, rng)
+    uq, _, uw = fmt_weights(fmt, hidden, cols, rng)
+    out = np.full((ntok, hidden), np.nan, np.float32)
+    E.dispatch('matmul_swiglu_' + fmt, [gq, uq, x, out, np.ones(cols, np.float32)], pack('iiifi', hidden, cols, ntok, 1e-6, 0),
+               ((hidden + 3) // 4, 1), (128,))
+    g = x.astype(np.float64) @ gw.T.astype(np.float64)
+    u = x.astype(np.float64) @ uw.T.astype(np.float64)
+    want = silu(g) * u
+    err = np.abs(out - want).max() / np.abs(want).max()
+    check(err < 1e-5, 'matmul_swiglu_%s hidden %d x %d, %d tokens: rel err %.2e' % (fmt, hidden, cols, ntok, err))
+    # the embedding row of token 5, scaled by 1.5: every unit of the row decoded by embed_token
+    tok = np.array([5], np.int32)
+    xo = np.zeros(cols, np.float32)
+    E.dispatch('embed_token_' + fmt, [wq, ws, tok, xo], pack('iif', cols, 0, 1.5), (1,), (128,))
+    err = np.abs(xo - 1.5 * w[5]).max() / np.abs(w[5]).max()
+    check(err < 1e-6, 'embed_token_%s row 5: rel err %.2e' % (fmt, err))
+
+
+for fmt in ggml_ref.NEW:
+    if not ONLY or fmt in ONLY:
+        plain_test(fmt)
+
+for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k') + ggml_ref.NEW:
+    if ONLY and fmt not in ONLY:
+        continue
+    kq = fmt in KQ256  # 256-weight super-blocks
     cols = 256 if kq else 128
     for kind in ('mma', 'hmma'):
         mm_test(fmt, kind, 96, cols, 37)                       # partial row and token tiles: staging epilogue
@@ -561,10 +613,11 @@ for fmt in ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k'):
         mm3_test(fmt, kind, (64, 32, 32), cols, 40, half=True)
         swiglu_test(fmt, kind, 48, cols, 37)
         moe_test(fmt, kind, 64 if not kq else 256, cols)
-mm_test('q4', 'hmma', 96, 256, 40, softcap=3.0)
-mm_test('q4', 'hmma', 64, 128, 7)                              # one 8-token block of the tile only
-swiglu_test('q8', 'hmma', 32, 128, 64, use_gelu=True)
-moe_test('q4', 'hmma', 96, 128, counts=(32, 32, 3), experts=(1, 3, 1))
+if not ONLY:
+    mm_test('q4', 'hmma', 96, 256, 40, softcap=3.0)
+    mm_test('q4', 'hmma', 64, 128, 7)                              # one 8-token block of the tile only
+    swiglu_test('q8', 'hmma', 32, 128, 64, use_gelu=True)
+    moe_test('q4', 'hmma', 96, 128, counts=(32, 32, 3), experts=(1, 3, 1))
 def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0):
     """attention_split with chunk = 0 (the keys per split derived in the kernel, as a recorded decode step passes it)
     gives the bytes of the explicit ceil(keys / nSplit)."""
@@ -591,8 +644,9 @@ def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0
           % (window, 'same bytes as' if np.array_equal(outs[0], outs[1]) else 'DIFFERENT from', err))
 
 
-split_chunk()
-split_chunk(window=50)
+if not ONLY:
+    split_chunk()
+    split_chunk(window=50)
 
 
 def rope_ref(h, cos, sin, pos, rot_off, rot_half, adjacent, w=None, eps=1e-6):
@@ -657,10 +711,11 @@ def rope_store_q8(hd, n_heads=4, n_kv=2, ntok=3, pos0=5, ctx=16, rot_half=None, 
           % ('il_' if adjacent else '', hd, rot_half, norm, 'same bytes as' if same else 'DIFFERENT from'))
 
 
-rope_store_q8(128)
-rope_store_q8(64, n_kv=1, n_heads=3)
-rope_store_q8(64, rot_half=16, adjacent=True, norm=False)
-rope_store_q8(96, rot_half=24, norm=False)
+if not ONLY:
+    rope_store_q8(128)
+    rope_store_q8(64, n_kv=1, n_heads=3)
+    rope_store_q8(64, rot_half=16, adjacent=True, norm=False)
+    rope_store_q8(96, rot_half=24, norm=False)
 
 
 def router_norm(ds=False, n_exp=16, dim=128, top_k=4, ntok=3, remap=False, method=2, sigmoid=1):
@@ -704,10 +759,11 @@ def router_norm(ds=False, n_exp=16, dim=128, top_k=4, ntok=3, remap=False, metho
                                                                       'router_ds' if ds else 'router'))
 
 
-router_norm()
-router_norm(remap=True, ntok=5)
-router_norm(ds=True)
-router_norm(ds=True, method=1, sigmoid=0, remap=True)
+if not ONLY:
+    router_norm()
+    router_norm(remap=True, ntok=5)
+    router_norm(ds=True)
+    router_norm(ds=True, method=1, sigmoid=0, remap=True)
 
 
 # ---------------------------------------------------------------------------------------------- audio.metal (Whisper)

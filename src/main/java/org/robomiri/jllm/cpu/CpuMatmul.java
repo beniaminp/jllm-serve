@@ -182,11 +182,12 @@ final class CpuMatmul {
 
     /**
      * The int8 path applies to the formats {@link Int8Kernels} has kernels for (Q4_0, Q8_0 and their ggml layouts
-     * Q4_0G, Q8_0G) and the K-quants of {@link KQuantKernels} (Q4_K, Q5_K, Q6_K); Q2_K stays on the float kernels.
+     * Q4_0G, Q8_0G), the K-quants of {@link KQuantKernels} (Q4_K, Q5_K, Q6_K) and the other ggml formats of
+     * {@link GgufInt8Kernels} (Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4, IQ4_XS, Q3_K); Q2_K, F16 and BF16 stay on the float kernels.
      */
     boolean useInt8(QTensor wt) {
         return int8 && ((wt.type == QType.Q4_0 || wt.type == QType.Q8_0 || wt.type == QType.Q4_0G || wt.type == QType.Q8_0G)
-                && wt.cols % QType.BLOCK == 0 || KQuantKernels.supports(wt));
+                && wt.cols % QType.BLOCK == 0 || KQuantKernels.supports(wt) || GgufInt8Kernels.supports(wt));
     }
 
     /** Whether the single-token int8 matmul of {@code wt} runs in the native library. */
@@ -209,6 +210,9 @@ final class CpuMatmul {
 
     /** Row {@code r} of {@code wt} (a {@link #useInt8} type) times the last {@link #quantizeInt8} activation from {@code xo}. */
     float int8Dot(QTensor wt, int r, short[] xq, float[] xs, int xo) {
+        if (GgufInt8Kernels.supports(wt)) {
+            return GgufInt8Kernels.dotRow(wt, r, xq, xs, xsum, xo);
+        }
         return KQuantKernels.supports(wt) ? KQuantKernels.dotRow(wt, r, xq, xs, xsum, xo) : Int8Kernels.dotRow(wt, r, xq, xs, xo);
     }
 

@@ -18,10 +18,11 @@ import java.util.regex.Pattern;
  * ({@code blk.N.attn_q.weight}, ...), and the tensors are handed over as follows.
  *
  * <ul>
- *   <li><b>Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K</b>: viewed in place, no copy ({@link QTensor#mapped}); the kernels read the
- *       file's pages.</li>
- *   <li><b>Q3_K, Q4_1, Q5_0, Q5_1, F16, BF16, F32 matrices</b>: dequantized row by row and quantized to Q8_0
- *       in memory at load; *       the float types are meant for small models, since an F16 model becomes a Q8_0 one in RAM.</li>
+ *   <li><b>Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16</b>: viewed in
+ *       place, no copy ({@link QTensor#mapped}); the kernels read the file's pages. {@code -Djllm.gguf.requantize=<types>}
+ *       turns that off for the listed types (see {@link GgmlCodec}).</li>
+ *   <li><b>F32 matrices</b> (and the types listed in {@code jllm.gguf.requantize}): dequantized row by row and quantized
+ *       to Q8_0 in memory at load.</li>
  *   <li><b>gate and up of a dense MLP</b> (separate tensors in a GGUF, one stacked {@code [2·hidden, dim]} matrix in
  *       the engine): both are viewed in place and joined as a {@linkplain QTensor#split split} tensor (the GPU
  *       kernels bind the two halves separately, the CPU kernels route each row). Only Q2_K, whose kernels read
@@ -42,6 +43,8 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     private final Arena arena = Arena.ofShared();
     private final Map<GgmlType, Integer> converted = new EnumMap<>(GgmlType.class);
     private long convertedBytes;
+    /** Bytes of memory the conversions allocated (the Q8_0 results, the copies of Q2_K tensors). */
+    private long residentBytes;
     private long viewedBytes;
 
     public GgufWeights(GgufFile gguf) {
@@ -151,7 +154,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
 
     private QTensor matrix(GgufFile.Tensor t, boolean count) {
         QType q = GgmlCodec.nativeType(t.type());
-        if (q != null) {
+        if (q != null && colsOf(t) % q.blockSize == 0) {
             viewedBytes += count ? t.size() : 0;
             return QTensor.mapped(q, rowsOf(t), colsOf(t), gguf.data(t));
         }
@@ -162,8 +165,8 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     private QTensor requantize(int rows, int cols, GgufFile.Tensor... parts) {
         for (GgufFile.Tensor t : parts) {
             if (!GgmlCodec.canDequantize(t.type())) {
-                throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported (supported: F32, F16,"
-                        + " BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)");
+                throw new IllegalArgumentException(t + ": ggml type " + t.type() + " is not supported (supported: "
+                        + GgmlCodec.SUPPORTED + ")");
             }
             converted.merge(t.type(), 1, Integer::sum);
             convertedBytes += t.size();
@@ -183,6 +186,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         for (int i = 0; i < parts.length; i++) {
             segs[i] = gguf.data(parts[i]);
         }
+        residentBytes += QTensor.byteSize(QType.Q8_0, rows, cols);
         return QTensor.quantize(arena, QType.Q8_0, rows, cols, (r, dst) -> {
             int i = 0;
             while (r >= starts[i + 1]) {
@@ -209,6 +213,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             MemorySegment.copy(gguf.data(gate), 0, dst, 0, gate.size());
             MemorySegment.copy(gguf.data(up), 0, dst, gate.size(), gate.size());
             convertedBytes += 2 * gate.size();
+            residentBytes += 2 * gate.size();
             return QTensor.mapped(q, 2 * rowsOf(gate), colsOf(gate), dst);
         }
         return requantize(2 * rowsOf(gate), colsOf(gate), gate, up);
@@ -242,6 +247,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
                 MemorySegment.copy(u, (long) e * m * rb, dst, ((long) e * 2 + 1) * m * rb, (long) m * rb);
             }
             convertedBytes += 2 * gate.size();
+            residentBytes += 2 * gate.size();
             return QTensor.mapped(q, 2 * experts * m, cols, dst);
         }
         // mixed or non-native types: interleave the rows through float
@@ -251,6 +257,7 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         converted.merge(gate.type(), 1, Integer::sum);
         converted.merge(up.type(), 1, Integer::sum);
         convertedBytes += gate.size() + up.size();
+        residentBytes += QTensor.byteSize(QType.Q8_0, 2 * experts * m, cols);
         MemorySegment g = gguf.data(gate);
         MemorySegment u = gguf.data(up);
         return QTensor.quantize(arena, QType.Q8_0, 2 * experts * m, cols, (r, dst) -> {
@@ -276,8 +283,9 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         }
         StringBuilder sb = new StringBuilder();
         converted.forEach((t, n) -> sb.append(sb.isEmpty() ? "" : ", ").append(n).append(" x ").append(t));
-        return String.format("%.0f MB of weights used in place, %.0f MB converted or copied at load%s",
-                viewedBytes / 1e6, convertedBytes / 1e6, sb.isEmpty() ? "" : " (requantized to Q8_0: " + sb + ")");
+        return String.format("%.0f MB of weights used in place, %.0f MB converted or copied at load (%.0f MB of memory)%s",
+                viewedBytes / 1e6, convertedBytes / 1e6, residentBytes / 1e6,
+                sb.isEmpty() ? "" : " (requantized to Q8_0: " + sb + ")");
     }
 
     @Override

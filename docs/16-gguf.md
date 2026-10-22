@@ -2,7 +2,8 @@
 
 Code: `gguf/GgufFile.java`, `gguf/GgmlType.java`, `gguf/GgufArchitecture.java`, `gguf/GgufWeights.java`,
 `gguf/GgmlCodec.java`, `gguf/GgufModel.java`, `model/Ggml.java`, `model/QType.java`, `model/QTensor.java`,
-`model/TensorSource.java`, `tokenizer/GgufTokenizer.java`, `cpu/GgufKernels.java`, the *GGUF block types* section
+`model/TensorSource.java`, `tokenizer/GgufTokenizer.java`, `cpu/GgufKernels.java`, `cpu/GgufInt8Kernels.java`,
+`cpu/KQuantKernels.java`, the native `src/main/native/jllm_cpu*.{c,inc}`, the two *GGUF block types* sections
 of `metal/kernels.metal`, `hub/HuggingFaceHub.java` (file selection), `Main.java`
 
 [03](03-safetensors.md) loads a Hugging Face checkpoint and **converts** it once into jllm's own quantized cache.
@@ -254,8 +255,51 @@ byte) and `qh[64]` the high 2 bits (four per byte) of 256 weights in two halves 
 the format that `Q4_K_M` files use for half of `attn_v`, half of `ffn_down` and the embedding. It is the engine's own
 `QType.Q6_K` (chapter 06), byte-compatible with the file, so these tensors are used in place too.
 
-The other llama.cpp formats that small or old files contain (Q4_1, Q5_0, Q5_1, Q3_K) have scalar dequantizers
-(`Ggml.dequantQ4_1` ...), used only to convert at load (16.6). IQ\*, TQ\* and MXFP4 are refused by name.
+The other formats real files mix in are read in place as well since 16.4.1: Q4_1, Q5_0, Q5_1 (legacy and mixed files:
+the Q4_0 file of Qwen3.8 has its `ffn_down` in Q4_1), Q3_K (`Q3_K_M/L`), IQ4_NL and IQ4_XS (imatrix quants), MXFP4
+(gpt-oss) and plain F16 / BF16 matrices. The other IQ\* types and TQ\* are refused by name.
+
+### 16.4.1 Every type at a glance
+
+`bits/weight` is the file's, `CPU` the kernels (V = Vector API float path, I = int8-activation path in Java,
+N = native `libjllm_cpu` on AArch64, [07](07-cpu-backend.md)), `Metal` the GPU kernels (decode matvec, tiled and
+matrix-unit prefill, the MoE expert kernels, the embedding lookup: all through `gg_unit`). The exact layouts and
+formulas of the types that are new here are in [06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files).
+
+| type | bytes / weights | bits/weight | used | CPU | Metal |
+|---|---|---|---|---|---|
+| F32 vectors (norms, biases, router) | 4 / 1 | 32 | copied into `float[]` | | |
+| F32 matrices | 4 / 1 | 32 | requantized to Q8_0 | | |
+| F16, BF16 | 2 / 1 | 16 | **in place** | V | yes |
+| Q8_0 | 34 / 32 | 8.5 | **in place** | V I N | yes |
+| Q6_K | 210 / 256 | 6.5625 | **in place** | V I N | yes |
+| Q5_1 | 24 / 32 | 6.0 | **in place** | V I N | yes |
+| Q5_K | 176 / 256 | 5.5 | **in place** | V I N | yes |
+| Q5_0 | 22 / 32 | 5.5 | **in place** | V I N | yes |
+| Q4_1 | 20 / 32 | 5.0 | **in place** | V I N | yes |
+| Q4_0 | 18 / 32 | 4.5 | **in place** | V I N | yes |
+| Q4_K | 144 / 256 | 4.5 | **in place** | V I N | yes |
+| IQ4_NL | 18 / 32 | 4.5 | **in place** | V I N | yes |
+| IQ4_XS | 136 / 256 | 4.25 | **in place** | V I N | yes |
+| MXFP4 | 17 / 32 | 4.25 | **in place** | V I N | yes |
+| Q3_K | 110 / 256 | 3.4375 | **in place** | V | yes |
+| Q2_K | 84 / 256 | 2.625 | **in place** | V | yes |
+| IQ1\*, IQ2\*, IQ3\*, TQ1_0, TQ2_0, Q8_K, Q8_1 | | | refused (named in the error) | | |
+
+`-Djllm.gguf.requantize=<types>` (ggml names separated by commas, `all`, or `none`) puts the listed types on the old
+path: dequantized row by row and requantized to Q8_0 at load (8.5 bits per weight: more memory, and on the GPU slower
+decode when decode is memory-bound). It is a switch for A/B comparisons (`scripts/mac-validate.sh --gguf-types DIR` runs both)
+and a fallback; the load line says what happened (`GGUF weights: ... (requantized to Q8_0: ...)`).
+
+**Default per backend.** The Metal backend reads every type in the table in place. The CPU backend requantizes **Q5_1,
+Q3_K, F16 and BF16** by default, because their in-place decode is more than 25% slower than the Q8_0 kernels' (16.9 has the
+measurements; F16 / BF16 would also read twice the bytes of Q8_0); the others (Q4_1, Q5_0, IQ4_NL, IQ4_XS, MXFP4 and the
+K-quants) stay in place on the CPU too. The load prints `GGUF on the CPU backend: [Q3_K] matrices are requantized ...` when a
+file has such tensors. An explicit `-Djllm.gguf.requantize=...` replaces the default, so `-Djllm.gguf.requantize=none` reads
+everything in place on the CPU as well (the choice for a model that only fits in memory that way), and
+`-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for those three types.
+Requantizing F16 / BF16 to Q8_0 is lossy (about 0.5% per weight): the CPU default trades that for speed and memory, and
+`-Djllm.gguf.requantize=none` keeps the full precision of the file.
 
 ---
 
@@ -336,14 +380,20 @@ engine's own Q8_0 in memory (`QTensor.quantize`, in parallel), and reported:
 
 | in the file | used |
 |---|---|
-| Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K | **in place** (zero copy, both backends) |
-| Q3_K, Q4_1, Q5_0, Q5_1 | requantized to Q8_0 in memory (rare: files mix them in for tensors whose row length is not a multiple of 256) |
-| F16, BF16, F32 matrices | quantized to Q8_0 in memory — meant for small models: a BF16 file becomes a Q8_0 model in RAM, and loading it costs a pass over all weights |
+| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16 | **in place** (zero copy, both backends); the table in 16.4.1 |
+| F32 matrices, and the types named in `-Djllm.gguf.requantize` | quantized to Q8_0 in memory at load (a pass over all weights; the F32 / BF16 file of a small model becomes a Q8_0 model in RAM) |
 | F32 vectors (norms, biases, router) | copied into `float[]` |
 
+**Mixed files.** Real files mix types (a `Q4_0` file has `ffn_down` in Q4_1, `ssm_out` in Q5_K, `output` in Q6_K; gpt-oss has
+MXFP4 experts and F32/BF16 elsewhere), and every kernel instantiation has one block format. The fused q/k/v dispatch
+falls back to one dispatch per projection when the three types differ (above); the dense gate|up pair and the
+experts' gate|up pair are split views of two tensors of the same type, and if the two differ the pair is requantized
+(`GGUF weights:` says so).
+
 The int8-activation CPU path (`backend.cpu.int8-activations`, [07](07-cpu-backend.md)) has kernels for Q4_0 and Q8_0
-and, for these files, `Q4_0G` and `Q8_0G`; `CpuMatmul.useInt8` excludes every other type (Q2_K, Q4_K, Q5_K), which
-stay on the float kernels.
+and, for these files, `Q4_0G` and `Q8_0G`, the K-quants Q4_K / Q5_K / Q6_K (`KQuantKernels`) and Q4_1, Q5_0, Q5_1, IQ4_NL,
+MXFP4, IQ4_XS (`GgufInt8Kernels`; native AArch64 versions in `libjllm_cpu`); `CpuMatmul.useInt8` excludes Q2_K,
+Q3_K, F16 and BF16, which stay on the float kernels.
 
 ---
 
@@ -465,13 +515,68 @@ fallback (176 MB of copies) accounted for the difference in resident memory and 
 used in place a `Q4_K_M` file is mapped entirely as it is (see the numbers re-measured below), and with a `Q8_0` file
 the load is dominated by the tokenizer.
 
+### 16.9.1 The newer block types in place (Apple M1 Pro, Qwen3-0.6B requantized with `llama-quantize`)
+
+Every file below is the Qwen3-0.6B `Q8_0` GGUF converted with `llama-quantize --allow-requantize --pure <TYPE>` (all matrices and the
+tied embedding in that type; Q3_K_M is the usual mix), so the weights are not the original model's, but the file is exactly what
+llama.cpp reads. Speeds are `./jllm bench` medians (413-token prompt, 5 rounds Metal / 3 rounds CPU, speculation off) under the heavy lock,
+**native** = read in place, **Q8_0** = the same file with `-Djllm.gguf.requantize` naming its type (the behaviour before these types existed:
+dequantized at load, requantized to Q8_0 in memory). Other jobs were running on the machine (load average 9 – 15), so differences of a few
+percent are noise.
+
+| type | file = in place | requantized (RAM) | Metal prefill tok/s native / Q8_0 | Metal decode tok/s native / Q8_0 | CPU decode tok/s native / Q8_0 | CPU default |
+|---|---|---|---|---|---|---|
+| Q4_1 | 379 MB | 670 MB | 1426 / 1489 | 101.0 / 99.9 | 83.7 / 92.2 (-9%) | in place |
+| Q5_0 | 416 MB | 670 MB | 1558 / 1466 | 103.3 / 103.4 | 85.6 / 91.8 (-7%) | in place |
+| Q5_1 | 453 MB | 670 MB | 1375 / 1469 | 105.1 / 102.8 | 66.2 / 91.9 (-28%) | **Q8_0** |
+| Q3_K | 262 MB | 670 MB | 1508 / 1469 | 101.5 / 105.1 | 58.0 / 92.4 (-37%) | **Q8_0** |
+| Q3_K_M (mix) | 347 MB | 297 MB | 1400 / 1371 | 90.7 / 89.5 | 69.7 / 90.1 (-23%) | Q3_K tensors Q8_0 |
+| IQ4_NL | 341 MB | 670 MB | 1356 / 1492 | 92.0 / 107.6 | 100.1 / 95.1 (+5%) | in place |
+| IQ4_XS | 323 MB | 670 MB | 1358 / 1493 | 93.0 / 107.8 | 115.3 / 93.6 (+23%) | in place |
+| MXFP4 | 323 MB | 670 MB | 1389 / 1467 | 92.0 / 102.8 | 120.9 / 92.7 (+30%) | in place |
+| F16 | 1198 MB | 670 MB | 1428 / 1468 | 81.2 / 102.9 | 22.4 / 91.7 (-76%) | **Q8_0** (lossy) |
+
+What the table says:
+
+* **Memory**: the in-place file is 1.5 – 2.6x smaller than the Q8_0 copy for every type but F16 (twice as big). This is what lets a
+  27B – 30B GGUF fit in 32 GB, and why Metal keeps everything in place. F16 / BF16 in place is exact but reads 16 bits per weight.
+* **Metal**: prefill is the same within noise; decode is the same for Q4_1 / Q5_x / Q3_K, 10 – 14% lower for IQ4_NL / IQ4_XS / MXFP4 (a
+  table lookup per weight; on this 0.6B model decode is not bandwidth-bound, a larger model would profit from the smaller weights) and
+  21% lower for F16. The raw kernel (`GgufMetalBench`, an 8192 x 4096 matrix, single token, µs): Q4_0 290, Q8_0 310, Q4_1 287, Q5_0 304,
+  Q5_1 302, Q3_K 372, IQ4_NL 348, IQ4_XS 338, MXFP4 343, F16 433.
+* **CPU** (int8 activations, native NEON dot-product kernels): IQ4_XS and MXFP4 are faster in place (4.25 bits per weight against
+  Q8_0's 8.5), Q4_1 / Q5_0 are 7 – 9% slower, Q5_1 (-28%), Q3_K (-37%) and F16 (-76%) are slower by more than the 25% the default
+  tolerates, so **the CPU backend requantizes Q5_1, Q3_K, F16 and BF16 by default** and `-Djllm.gguf.requantize=none` keeps them in
+  place. `-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for the legacy 4/5-bit formats on any backend. With
+  `-Djllm.cpu.native=false` (Java kernels only, e.g. x86-64): Q4_1 29 tok/s, IQ4_NL 68 (Q8_0: 26 – 29).
+* **The Metal prefill dip that was found on the way**: chunks of 8 – 31 tokens (the tail of every prompt) ran the tiled `matmul_pf`
+  kernels, 3 – 4x slower than the matrix-unit kernels for the bit-field formats Q5_0 and Q3_K *and for the existing Q4_K / Q5_K* (Q4_K,
+  1024 x 3072, 8 / 16 / 24 tokens: 394 / 815 / 1081 µs against 240 / 243 / 248 µs). `MetalKernels.tiledIsSlow` sends these four
+  formats to the matrix units from 8 tokens (`jllm.metal.prefillMinTokens`). End to end, **`Qwen3-0.6B-Q4_K_M.gguf` on Metal, 413-token
+  prompt: prefill 750 tok/s before (main) → 1414 – 1443 tok/s, decode 90 tok/s unchanged, and the greedy text is byte-identical** (md5 of
+  two raw 64-token completions and of the chat haiku, 3 alternating runs each): `Qwen3-0.6B-Q4_K_M` is mostly Q4_K, so the same
+  holds for any `Q4_K_M` file, including the Q5_K / Q6_K tensors of the Q4_0 file of Qwen3.8 (not run here: its architecture lands in another branch).
+
+**Exactness against llama.cpp.** Dequantization is bit-identical for all nine types (`GgufKernelsCheck`: 2048 – 12 288 weights per type
+from random blocks, gguf-py and `ggml-quants.c` compiled and called through ctypes: zero differing floats; the Metal kernels are checked
+against the same numpy decoders to 1e-5 – 1e-7 relative). Greedy generation of 32 tokens on two prompts ("The capital of France is",
+"def fibonacci(n):") against `llama-completion` (Homebrew 0.7.0, Metal): jllm on **Metal and on the CPU float path produced llama.cpp's text for
+every file** (Q4_1, Q5_0, Q5_1, Q3_K, Q3_K_M, IQ4_NL, IQ4_XS, an IQ4_XS mix, MXFP4, F16, BF16: 22 of 22 runs, the last character apart: llama.cpp prints a
+trailing newline). With int8 activations on the CPU the text agrees on 20 of 22 (Q4_1 prompt 1 and the IQ4_XS mix prompt 1 diverge
+after 6 – 7 characters at a near tie, the documented effect of rounding the activation). Reading the same files with the old
+requantize path changes the text in 3 of 22 runs on each backend (Q4_1 prompt 1 at once, Q3_K and the IQ4_XS mix or IQ4_XS later): the in-place kernels are
+closer to llama.cpp than Q8_0 requantization is. (Two first Metal runs died with `Impacting Interactivity`, the GPU watchdog, while other jobs were using the GPU; run
+alone they produced llama.cpp's text.)
+
 ---
 
 ## 16.10 Limits and what is next
 
 * **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe` only. Gemma 2/3, Phi-3, GLM-4, DeepSeek-2 and Mamba are
   supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are not mapped yet.
-* **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.
+* **Formats**: IQ1\*, IQ2\*, IQ3\* and the ternary TQ\* types are refused (the 16-entry-codebook IQ4 types are in place; the
+  others use 256-entry grids and are not done); Q2_K, Q3_K, F16 and BF16 have no int8-activation CPU kernel; the x86-64
+  native library has no kernels for the formats added in 16.4.1 (the Java int8 kernels serve them there).
 * **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
   variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
@@ -486,7 +591,7 @@ the load is dominated by the tokenizer.
 
 `mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
-Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
+Metal dispatch family; `GgufMetalBench` times them), `NativeCpuCheck` (the native int8 kernels against the Java ones), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
 permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
 selection, settings) and `GgufTokenizerTest` (three of llama.cpp's vocabulary fixtures and the stored llama.cpp ids of 29 generated
 vocabularies, 16.12). With the Qwen3-0.6B files downloaded by

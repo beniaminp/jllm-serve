@@ -333,6 +333,15 @@ public final class QTensor {
                 case Q8_0G -> Ggml.dequantQ8_0(data, row, cols, dst, off);
                 case Q4_K -> Ggml.dequantQ4_K(data, row, cols, dst, off);
                 case Q5_K -> Ggml.dequantQ5_K(data, row, cols, dst, off);
+                case Q4_1 -> Ggml.dequantQ4_1(data, row, cols, dst, off);
+                case Q5_0 -> Ggml.dequantQ5_0(data, row, cols, dst, off);
+                case Q5_1 -> Ggml.dequantQ5_1(data, row, cols, dst, off);
+                case Q3_K -> Ggml.dequantQ3_K(data, row, cols, dst, off);
+                case IQ4_NL -> Ggml.dequantIQ4_NL(data, row, cols, dst, off);
+                case IQ4_XS -> Ggml.dequantIQ4_XS(data, row, cols, dst, off);
+                case MXFP4 -> Ggml.dequantMXFP4(data, row, cols, dst, off);
+                case F16 -> Ggml.dequantF16(data, row, cols, dst, off);
+                case BF16 -> Ggml.dequantBF16(data, row, cols, dst, off);
                 default -> throw new IllegalStateException(type.name());
             }
             return;
