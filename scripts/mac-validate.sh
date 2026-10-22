@@ -15,6 +15,9 @@
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
 #   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png   plus the vision encoder rows (docs/20): encoding the
 #                                                            picture on the GPU (default) against the CPU, warm
+#   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png --vision-model text.gguf   ... and the whole answer to the picture
+#                                                            (prefill including the encoding), a Gemma 3 file also with
+#                                                            attention that runs both ways inside the picture on and off
 #   scripts/mac-validate.sh --audio speech.wav               plus the audio rows (Whisper small and OuteTTS: CPU, Metal encoder,
 #                                                            Metal decoder, half and float weight tiles; q8 and q4 speech model)
 #   scripts/mac-validate.sh --gguf-types DIR                 plus every .gguf in DIR (e.g. made with llama-quantize from one
@@ -42,6 +45,7 @@ LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
 VISION_MMPROJ=""
 VISION_IMAGE=""
+VISION_MODEL=""
 AUDIO=""
 GGUF_TYPES=""
 while [ $# -gt 0 ]; do
@@ -57,6 +61,7 @@ while [ $# -gt 0 ]; do
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
     --vision) VISION_MMPROJ="$2"; VISION_IMAGE="$3"; shift 3 ;;
+    --vision-model) VISION_MODEL="$2"; shift 2 ;;
     --audio) AUDIO="$2"; shift 2 ;;
     --gguf-types) GGUF_TYPES="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -188,6 +193,22 @@ if [ -n "$VISION_MMPROJ" ]; then
   echo "|---|---|---|---|"
   vision "on the GPU (vision.backend=metal, default)" metal
   vision "on the CPU (vision.backend=cpu)" cpu
+  if [ -n "$VISION_MODEL" ]; then
+    # the whole answer: ./jllm run with the picture; its last line has the prefill time (the encoding is before it) and the speed
+    answer() { # label java-opts
+      local label="$1" opts="$2"
+      JAVA_OPTS="$opts" JLLM_CONFIG=/dev/null ./jllm run --model "$VISION_MODEL" --mmproj "$VISION_MMPROJ" --image "$VISION_IMAGE" \
+        --prompt "Describe the picture." --temp 0 --max-tokens 16 --backend metal --ctx 1024 > "$OUT/answer.log" 2>&1 || {
+        echo "| $label | failed | | $(tail -1 "$OUT/answer.log") |"; return; }
+      echo "| $label | $(grep -o '[0-9]* ms to encode' "$OUT/answer.log" | head -1) | $(grep -o 'prefill [0-9]* ms' "$OUT/answer.log" | head -1) | $(grep -o '[0-9.]* tok/s' "$OUT/answer.log" | tail -1) |"
+    }
+    echo
+    echo "| whole answer, 16 tokens | encode | prefill | decode |"
+    echo "|---|---|---|---|"
+    answer "defaults" ""
+    # Gemma 3 only (other families have no picture attention of their own): a picture attends to itself both ways by default
+    answer "attention inside the picture causal (-Djllm.vision.causal=true)" "-Djllm.vision.causal=true"
+  fi
 fi
 # constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
 # with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
