@@ -575,3 +575,205 @@ on 29 vocabularies (`synthetic-llama-cpp.txt.gz`, 68 KB), so `mvn test` needs no
   leftmost. SentencePiece with special tokens not parsed: control tokens stay text here, llama.cpp merges them back.
 * `add_eos_token`, WordPiece (`bert`) and the pre values that are not regex lists (`kimi-k2`, `afmoe`, `tiny_aya`,
   `superbpe`, `chameleon`, `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`; `exaone-moe` would overflow the regex stack) are refused.
+
+---
+
+## 16.13 Qwen3.5 and Qwen3-Next as GGUF files
+
+Code: `gguf/GgufQwenNext.java` (the tensor mapping), `gguf/GgufArchitecture.java` (`hybrid`), `model/Qwen3NextArch.java`
+(`DeltaNet.tiled`), `model/Qwen3NextLayer.java` (`DeltaNet.z`, `.ba`), `cpu/Qwen3NextCpuBackend.java`,
+`metal/Qwen3NextMetalBackend.java`, `gdn_rule` in `kernels.metal`, `tokenizer/ChatTemplate.java` (`QWEN35`),
+`src/test/.../GgufQwenNextTest`, `GgufTinyWrite`, `GgufGreedy`, `GgufProfile`, `scripts/qwen35-llamacpp-check.sh`
+
+🧸 **The simple story.** Qwen3.5 is built like Qwen3-Next ([14.14](14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)):
+three layers out of four keep a *whiteboard* of fixed size (the Gated DeltaNet) and every fourth keeps a real *diary*
+(attention); every layer has an ordinary feed-forward block. The model is the same, only the **file** is new, and
+llama.cpp stores two things in an order jllm's own cache does not.
+
+First, the whiteboard has several *helpers* per label ("head 0's three helpers, then head 1's three helpers..."). The
+converter of llama.cpp lays them out the other way round ("every head's first helper, then every head's second
+helper..."), because that is how its tensor library repeats things. Putting a quantized matrix's columns in another
+order means unpacking and packing it again, which loses a little, so jllm does not: it keeps the file's order and just
+looks up *which label a helper belongs to* the other way (one flag, `tiled`). Second, the diary layer's *question* and
+its *door* (an output gate that can shut part of the answer) sit interleaved in one matrix; jllm splits them when it
+loads, copying only those compressed rows.
+
+📐 **What the file holds** (`qwen35`; `qwen3next` and `qwen35moe` differ where said). Notation: `dim` = `embedding_length`
+(5120), `nk` = `ssm.group_count` (16), `nv` = `ssm.time_step_rank` (48), `dk` = `ssm.state_size` (128, also the value
+head width), `r = nv / nk` (3), `H`, `hd` = `attention.head_count`, `key_length` (24, 256).
+
+| GGUF tensor (`blk.N.`) | shape (ggml order) | engine name | handling |
+|---|---|---|---|
+| `attn_norm`, `post_attention_norm` | `[dim]` f32 | `input_layernorm`, `post_attention_layernorm` | the converter already added the `1 +` of the zero-centred norms; the engine's cache holds them folded the same way |
+| `attn_q` | `[dim, 2·H·hd]` | `self_attn.q_proj` + `q_gate` | per head `hd` query rows then `hd` gate rows: **gathered** into two matrices (a copy of the compressed rows, page aligned for Metal) |
+| `attn_k`, `attn_v`, `attn_output`, `attn_q_norm`, `attn_k_norm` | | as Qwen3 | in place / f32 |
+| `attn_qkv` | `[dim, 2·nk·dk + nv·dk]` | `linear_attn.in_proj` | rows `[q (nk·dk) \| k (nk·dk) \| v (nv·dk)]`, **in place** |
+| `attn_gate` | `[dim, nv·dk]` | `linear_attn.in_proj_z` | the gate `z` of the gated norm, in place |
+| `ssm_beta`, `ssm_alpha` | `[dim, nv]` **f32** | `linear_attn.in_proj_ba` | rows `[b (nv) \| a (nv)]` as one small Q8_0 matrix (`qwen3next`: the fused `ssm_ba`, rows `[b a]` per key head, regrouped) |
+| `ssm_conv1d` | `[kernel, conv_dim]` f32 | `conv1d.weight` | channel-major `[conv_dim, kernel]`, as the engine wants |
+| `ssm_a` | `[nv]` | `A` | already `-exp(A_log)` |
+| `ssm_dt.bias`, `ssm_norm` | `[nv]`, `[dk]` | `dt_bias`, `norm.weight` | `ssm_norm` is *not* zero-centred |
+| `ssm_out` | `[nv·dk, dim]` | `out_proj` | in place (Q5_K in the unsloth Q4_0 file) |
+| `ffn_gate`, `ffn_up`, `ffn_down` | | `mlp.gate_up`, `mlp.down_proj` | a dense SwiGLU in every layer (`qwen35`); `qwen3next`, `qwen35moe`: `ffn_gate_inp` + `ffn_*_exps` + the shared expert `ffn_*_shexp` and `ffn_gate_inp_shexp` |
+| `nextn.*`, and the attention / FFN tensors of block `block_count - 1` | | | the multi-token-prediction layer, **not** a layer of the model (`block_count - nextn_predict_layers` layers): 16.14 |
+
+The input of a DeltaNet layer is therefore *not* one matrix as in jllm's cache (`[q k v | z | b a]` in one matmul): the
+file's `attn_qkv` and `attn_gate` are read in place (no copy of 2.3 GB for the 27B), `b | a` is f32 in the file and tiny, and
+three products go to three buffers. `DeltaNet.z` and `.ba` are null for a model loaded from the cache, which keeps the
+fused layout.
+
+### 16.13.1 Value heads: grouped or tiled
+
+Hugging Face's Qwen3-Next gives every key head `r` value heads: value head `j` reads key head `⌊j / r⌋` (**grouped**).
+llama.cpp (`convert_hf_to_gguf.py`, `_LinearAttentionVReorderBase`) writes Qwen3.5 with the value heads reordered so that
+position `p = i·nk + g` holds the old head `g·r + i` (**tiled**: head `p` reads key head `p mod nk`), which lets ggml
+broadcast q and k with one `repeat`. The reorder touches everything indexed by a value head: the `v` rows of `attn_qkv`,
+`attn_gate`, `ssm_beta` / `ssm_alpha`, the `v` channels of `ssm_conv1d`, `ssm_a`, `ssm_dt` and the **columns** of
+`ssm_out`. The columns of a Q5_K matrix come in blocks of 256 = two heads, so they cannot be moved without
+requantizing. jllm moves nothing: `Qwen3NextArch.DeltaNet.tiled` (set for `qwen35` and `qwen35moe`) makes the key head of
+value head `h` `h mod nk` instead of `h / r` (`keyHeadOf`) in the CPU recurrence and in `gdn_rule` (parameter `tiled`;
+checked against numpy in `kernel_tests.py`). `qwen3next` files are not reordered, so grouped.
+
+### 16.13.2 RoPE, tokenizer, chat template
+
+Only the first `rope.dimension_count` = 64 of the 256 dims of a head rotate (`partial_rotary_factor` 0.25) with
+`rope.freq_base` = 1e7. The file's `rope.dimension_sections = [11, 11, 10, 0]` are Qwen's multimodal RoPE (the temporal,
+height and width positions interleaved over the frequencies): for text all three position streams are the same
+number, so every dimension gets the angle of the ordinary rotate-half RoPE and nothing else is needed (the vision
+tower is not loaded).
+
+`tokenizer.ggml.pre = qwen35` is one of the pre-tokenizers of [16.12](#1612-tokenizer-pre-tokenizers-which-values-are-supported-and-how-they-were-checked)
+(Qwen2's regex with `[\p{L}\p{M}]+`, no normalization, as llama.cpp): the ids of the 27B file equal `llama-tokenize`'s on
+four test texts (English, code, accents / CJK / emoji / a combining mark / digits / tabs, and a chat prompt with special tokens).
+
+The chat template (`ChatTemplate.QWEN35`, model type `qwen3_5`, selected by `Qwen3NextArch` for a tiled model) follows the
+Jinja template stored in the file, without vision and tool calls: leading `system` / `developer` messages are merged
+into one system turn that starts with the line `Reasoning effort is set to xhigh. ...` while thinking is on; every
+assistant turn carries its `<think>` block; the generation prompt is `<|im_start|>assistant\n<think>\n`, or, with
+thinking off, `<think>\n\n</think>\n\n`. Stop tokens `<|im_end|>` and `<|endoftext|>`. It renders the same prompts as
+llama.cpp's Jinja engine does with the template of the 27B file on nine conversations (a system message, merged
+system / developer messages, whitespace to trim, assistants with and without reasoning, consecutive tool results:
+`GgufQwenNextTest`, `src/test/resources/gguf/qwen35-chat-*`).
+
+### 16.13.3 Memory on this machine
+
+The unsloth `Qwen3.8-27B-Q4_0.gguf` (16 056 MB: Q4_0 and Q5_K / Q6_K / Q8_0 for a few tensors, `ffn_down` of 8 layers Q4_1)
+loads in 1.4 s because nothing is read: **14 893 MB are used in place**; 1 142 MB are converted or copied at load (the 96
+f32 `b` / `a` matrices to Q8_0, the q / q-gate row copies of the 16 attention layers and of the head's block, and the 8 Q4_1
+`ffn_down` tensors requantized to Q8_0 until a native Q4_1 kernel exists). Metal's recommended working set on this machine
+is 26 800 MB; the model plus a 1024-token f32 KV cache and the scratch buffers fit with room to spare.
+
+### 16.13.4 Verification
+
+**The 27B file against llama.cpp 0.7.0 (build 11669, Metal, `llama-server` with `n_probs`)**, greedy, same file, same
+token ids (`GgufGreedy`, f16 KV cache, Metal):
+
+| prompt (32 greedy tokens) | greedy ids | log-probabilities of the first position, llama.cpp vs jllm |
+|---|---|---|
+| `The capital of France is` (raw) | 32 of 32 identical | ` Paris` −0.4861 / −0.4871, ` not` −3.2200 / −3.2204, ` a` −3.4227 / −3.4235, ` ______` −3.8898 / −3.8923, ` known` −3.9603 / −3.9594 |
+| a Python function head (raw, 27 tokens) | 32 of 32 | `    ` −0.0003 / −0.0004, `else` −9.2255 / −9.2278 |
+| chat, thinking off | 8 of 8 (ends at `<|im_end|>`) | `The` −0.1728 / −0.1729, `Paris` −1.8759 / −1.8759 |
+| chat, thinking on (the system turn with the effort line) | 32 of 32, through `</think>` | `We` −0.3132 / −0.3261, `The` −1.6865 / −1.6497, `User` −2.6181 / −2.5889 |
+
+The differences of 1e-3 to 4e-2 in log-probability come from the activations: llama.cpp quantizes them to Q8_0 for every
+matrix product, jllm's Metal kernels use floats. **Tiny hybrids against llama.cpp** (`scripts/qwen35-llamacpp-check.sh`,
+no download): `GgufTinyWrite` writes random Qwen3.5, Qwen3-Next and Qwen3.5-MoE models the way the converter does, with
+F32 tensors holding Q8_0-representable values, so both sides compute with the same weights and exact activations: the
+top-5 log-probabilities agree to 1e-3 (mostly 1e-4) and all 36 greedy ids per model are identical (CPU; Qwen3.5 also on Metal). In
+`mvn test`, `GgufQwenNextTest` loads the same models as a Hugging Face checkpoint through the converter and as GGUF
+(F32: logits equal to 3e-6; Q8_0 blocks in place against the same values requantized: 6e-6; CPU against Metal: 8e-6).
+
+### 16.13.5 Speed (Apple M1 Pro, 32 GB, under the heavy lock)
+
+`llama-bench -m Qwen3.8-27B-Q4_0.gguf -p 128,512 -n 32 -r 2 -ngl 99` (llama.cpp 0.7.0, build 11669, Metal + BLAS) and
+jllm on the same file (`GgufProfile` and `./jllm run --temp 0`, Metal, f32 KV cache, `-Xmx6g`):
+
+| | llama.cpp | jllm |
+|---|---|---|
+| prefill, 128 / 512 tokens | 77.8 / 78.1 tok/s | 40.6 / 40.5 tok/s |
+| prefill, 32 tokens | | 38.0 tok/s |
+| decode | 9.83 tok/s | 4.3 tok/s (231.6 ms per step, `GgufProfile`; 4.2-4.3 in `./jllm run`) |
+
+So decode runs at 44 % and prefill at 52 % of llama.cpp's speed, the same ~2x gap as on the small dense models
+([README](../README.md#beyond-a-plain-port-of-llamacpp)); the 16 GB file reads at about 70 GB/s against llama.cpp's 150. The
+Gated DeltaNet recurrence runs token by token in prefill on Metal (no chunked kernel there, 14.14.8), and the 8 Q4_1
+`ffn_down` tensors are requantized to Q8_0 (a native Q4_1 kernel is another agent's work). On the CPU the 27B is not
+usable (it was only run on tiny models).
+
+
+---
+
+## 16.14 Multi-token prediction: the model as its own draft model
+
+Code: `model/Qwen3NextMtp.java` (the weights), `model/MtpFeeder.java` (bookkeeping), the `Backend` methods `hasMtp`,
+`enableMtp`, `mtpReady`, `mtpDraft`, `checkpointState`, `rollbackState`, `cpu/Qwen3NextCpuBackend.java` and
+`metal/Qwen3NextMetalBackend.java` (`mtpRows`), `engine/Speculator.java` (`Mode.MTP`), `gdn_conv` / `gdn_rule` (the snapshot
+parameter), `src/test/.../GgufQwenNextTest` (`mtp`)
+
+🧸 Speculative decoding ([10.9](10-engine-and-server.md#109-speculative-decoding)) needs someone to guess the next word
+so the big model can check the guess and the word after it in the same pass. Usually that someone is a small second
+model. A Qwen3.5 file comes with its own tiny guesser: one extra layer, the **multi-token-prediction** layer (`nextn`),
+trained to look at what the big model was thinking and the word it just said, and guess the word *after* that. It costs
+about one layer per word, a sixtieth of the big model, and needs no second download. The only difficulty is the
+whiteboard layers: the big model's whiteboards are *written on* by every word it reads, so after a wrong guess they
+must be put back as they were after the last right word. jllm keeps a second copy of the whiteboards for that.
+
+📐 **The head** (`blk.<layers>.nextn.*` plus the layer's own attention and MLP tensors; llama.cpp `qwen35.cpp`,
+`graph_mtp`). With `h_t` the main model's hidden state after its final `output_norm` at position `t` and `x_{t+1}` the
+token chosen after it:
+
+```
+x   = eh_proj · [ rmsnorm(embedding(x_{t+1}), enorm) ; rmsnorm(h_t, hnorm) ]      [2·dim] -> [dim]
+x  += gated_attention(rmsnorm(x, attn_norm))     its own KV cache, RoPE at position t, q-gate as a main layer
+x  += swiglu(rmsnorm(x, post_attention_norm))
+logits = output_head · rmsnorm(x, shared_head_norm)                                the guess for x_{t+2}
+```
+
+`shared_head_norm`, `shared_head_head` and `embed_tokens` are the main model's own when the file has none (the unsloth
+file has none of the last two). Row `t` of the head needs `h_t` and `x_{t+1}`, so a pass that feeds
+`x_p .. x_{p+n-1}` completes the rows `p-1 .. p+n-2`; the last position's row waits for the next sampled token, and
+`mtpDraft(token)` runs exactly that row early and returns the guess (`MtpFeeder`).
+
+**One step with `engine.speculative=mtp`** (`Speculator`, one draft per step, `m = 1`):
+
+```
+tok  = sample(logits)                           # the target's own choice, to be fed at position pos
+d1   = argmax(head(h_{pos-1}, tok))             # the head's guess for the token after tok
+checkpoint                                      # arm: the pass saves the recurrent state after tok
+rows = forwardAll([tok, d1], pos)               # ONE pass; the head's rows for pos-1 and pos ride along
+s0   = verify(rows[0], d1)                      # greedy: d1 is kept iff it is the argmax
+if s0 == d1: emit d1, then sample(rows[1])      # two tokens for one pass
+else:        rollback(1); emit s0               # the state after tok only
+```
+
+The KV cache needs no undo (the next pass overwrites position `pos+1`), but the DeltaNet's recurrent state and conv state
+have run through `d1`. On Metal `gdn_conv` and `gdn_rule` take a snapshot parameter and write their state as it is after
+token 0 of the pass into a second set of buffers while they compute token 1 (48 layers x 3.1 MB); a rejection swaps the
+two sets (no replay, no copy). The CPU backend copies the state before the pass and replays the kept token on a
+rejection. The head's own KV rows beyond the kept position are recomputed by the next pass. Greedy output is the plain
+greedy output by construction (`GgufQwenNextTest`: an oracle head that is right two times out of three, so both paths run,
+and the real head, on CPU and Metal: identical ids). A model with a head uses this mode by default
+(`engine.speculative` left at its default); `--engine.speculative off` turns it off.
+
+**Checked against llama.cpp.** The tiny qwen35 file of `scripts/qwen35-llamacpp-check.sh` has a head and an output
+layer focused on four tokens, so guesses are often right: at each of 60 positions, whether llama.cpp's own head
+(`llama-server --spec-type draft-mtp --spec-draft-n-max 1`) guesses the next token is the same bit as jllm's, 60 of 60
+(16 hits). On the 27B file, jllm's head guesses the next token **111 times out of 124** (90 %) in greedy runs of four
+prompts (`GgufGreedy --mtp`: 31/31 and 28/31 on two raw prompts, 28/31 on a chat answer, 26/31 on a thinking trace).
+
+**Measured** (Apple M1 Pro, 32 GB, Qwen3.8-27B Q4_0, `./jllm run --temp 0 --ctx 1024`, Metal, under the heavy lock;
+the output text is identical with and without):
+
+| prompt | `engine.speculative off` | `mtp` | accepted |
+|---|---|---|---|
+| one-sentence answer (7 tokens) | 4.2 tok/s | 4.6 tok/s | 4 of 4 |
+| a Python function with a docstring (82 tokens) | 4.3 tok/s | 5.4 tok/s (**+26 %**) | 41 of 41 |
+
+**Where the time goes** (`GgufProfile`, median of 15, same machine): a plain step 231.6 ms (234.7 ms with the head on: one
+head row per step); the two-token verification pass 347 ms (353 ms with the head's two rows) -- **1.5 plain steps, not 1**:
+the multi-token matmul kernels (`matmul`, `TOK_TILE` tokens per simdgroup) dequantize each Q4_0 block's weights once but
+spend the dot products per token, so a second token adds half of the compute on a kernel that is not bandwidth-bound
+here (a reading of the kernel, not a measurement of it); the draft (one head row and the logits through the Q6_K output head, 1.5 GB of weights) 20 ms. With acceptance `a`
+a cycle takes `353 + 20` ms for `1 + a` tokens against 232 ms per token: break-even at `a = 0.61`, `+18 %` at the 90 %
+measured on the 27B (`1.9 / 373 ms = 5.1 tok/s`), `+26 %` at 100 % (the table). The lever is the cost of a two-token pass:
+the head is cheap, the verification is not yet.

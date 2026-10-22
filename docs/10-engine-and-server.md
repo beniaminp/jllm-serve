@@ -670,7 +670,9 @@ were refused by `Speculator.supported`; the MTP mode asks instead for `Backend.h
 greedy output and sampled output has the target's distribution. With acceptance `α` a step yields `1 + α` tokens for one
 two-position pass plus the head (about one layer and the output head) and one more head row for the KV of the position
 just verified; `GgufQwenNextTest` checks it with an oracle head (right two of three times) and the real head on CPU and
-Metal. [[10-measure]]
+Metal. On the Qwen3.8-27B (Q4_0, M1 Pro) the head guesses the next token 90 % of the time and the mode decodes a code answer
+at 5.4 tok/s against 4.3 without (the output is the same text); a two-token pass costs 1.5 plain steps there, which bounds
+the gain ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). A model with a head uses the mode by default.
 
 Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
