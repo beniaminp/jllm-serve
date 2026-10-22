@@ -30,6 +30,10 @@ public final class MetalConstants {
     public static final int ROW_THREADS = 256;
     /** Attention threadgroup (8 simdgroups). */
     public static final int ATT_THREADS = 256;
+    /** Simdgroups per attention_dec threadgroup (decode attention: each an independent worker). */
+    public static final int DEC_SG = 4;
+    /** attention_dec threadgroup (decode attention, 4 simdgroups). */
+    public static final int DEC_THREADS = 128;
     /** Tokens per attention dispatch: the scores scratch holds one row of ctx floats per (tile token, head). */
     public static final int ATT_TILE = 32;
     /** Widest absorbed MLA query / latent cache row in units of 32 lanes ({@code kv_lora_rank + rope <= 576}). */
@@ -69,6 +73,8 @@ public final class MetalConstants {
         m.put("MM_THREADS", (double) MM_THREADS);
         m.put("ROW_THREADS", (double) ROW_THREADS);
         m.put("ATT_THREADS", (double) ATT_THREADS);
+        m.put("DEC_SG", (double) DEC_SG);
+        m.put("DEC_THREADS", (double) DEC_THREADS);
         m.put("ATT_TILE", (double) ATT_TILE);
         m.put("MLA_MAX_PER", (double) MLA_MAX_PER);
         m.put("CHANNEL_THREADS", (double) CHANNEL_THREADS);

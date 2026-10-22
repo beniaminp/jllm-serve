@@ -87,6 +87,20 @@ bench "half-weight MMA prefill forced on" "$DENSE" "-Djllm.metal.hmma=true"
 bench "half-weight MMA prefill off (f32 MMA)" "$DENSE" "-Djllm.metal.hmma=false"
 bench "flash prefill form fa" "$DENSE" "-Djllm.metal.flashPrefillKernel=fa"
 bench "flash prefill form fb" "$DENSE" "-Djllm.metal.flashPrefillKernel=fb"
+# prefill chunk (backend.batch=auto is 256 for dense decoders on Metal; 64 was the default before)
+bench "64-token prefill chunks (the old default)" "$DENSE" "" --batch 64
+bench "512-token prefill chunks" "$DENSE" "" --batch 512
+# multi-row decode matvec (NR rows per simdgroup, bit-identical) against the one-row kernels, and the decode attention
+bench "decode matvec: one row per simdgroup (mvRows=1)" "$DENSE" "-Djllm.metal.mvRows=1"
+bench "decode matvec: 2 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=2"
+bench "decode matvec: 4 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=4"
+bench "decode matvec: 8 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=8"
+bench "decode attention off (attention_t)" "$DENSE" "-Djllm.metal.decodeAttention=false"
+bench "decode attention on (attention_dec)" "$DENSE" "-Djllm.metal.decodeAttention=true"
+bench "~1000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 100
+bench "~1000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 100
+bench "~3000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 300
+bench "~3000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 300
 bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200

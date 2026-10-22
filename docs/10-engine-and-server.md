@@ -742,7 +742,7 @@ cp src/main/resources/jllm.properties jllm.properties      # then edit backend.c
 ./jllm serve --ctx 1024 --server.port 9000                 # flags override the file
 ./jllm config --ctx 1024                                   # show every value and where it came from:
 #   backend.ctx   = 1024   (command line)
-#   backend.batch = 64     (default)
+#   backend.batch = auto   (default)
 ```
 
 The server uses `sampling.*` as the defaults for request fields that are absent (including `seed`) and

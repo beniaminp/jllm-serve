@@ -164,6 +164,94 @@ final class MetalTuner {
     }
 
     /**
+     * Whether the decode attention {@code attention_dec} runs on this device: it must agree with {@code attention_t}
+     * (relative error below 1e-3 of the output's magnitude, on synthetic data of the model's head shape) and be at least
+     * 3 % faster over a long context (2048 keys) and not slower over a short one (400). On the emulator (no meaningful
+     * timings) agreement alone decides. {@code -Djllm.metal.decodeAttention=true|false} forces it (an explicit
+     * {@code -Djllm.metal.flashDecode=true} turns it off: the user asked for the other split kernel). Cached per device,
+     * kernel source, head shape, cache type and chunk like the other decisions.
+     */
+    static boolean decodeAttention(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup) {
+        String forced = MetalKernels.DEC_ATTN_MODE;
+        if (!"auto".equals(forced)) {
+            return Boolean.parseBoolean(forced);
+        }
+        if ("true".equals(MetalKernels.FLASH_DECODE_MODE)) {
+            return false;
+        }
+        String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|decattn|hd" + g.headDim() + "|" + g.heads() + "x"
+                + g.kvHeads() + "|" + kv + "|c" + k.decChunk).replace(' ', '_').replace('=', '_').replace(':', '_');
+        Properties cache = load();
+        String cached = cache.getProperty(key);
+        if (cached != null) {
+            return cached.equals("1");
+        }
+        boolean use = false;
+        StringBuilder log = new StringBuilder();
+        boolean emu = Metal.EMULATOR;
+        int hd = g.headDim();
+        int heads = g.heads();
+        int kvHeads = g.kvHeads();
+        int kvDim = g.kvDim();
+        int qDim = g.qDim();
+        int keys = emu ? 600 : 2048;
+        try {
+            Random rnd = new Random(13);
+            Metal.Buffer q = k.scratch((long) qDim * 4);
+            int stride = kv.rowStride(kvDim, kvHeads);
+            Metal.Buffer kc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+            Metal.Buffer vc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+            fill(q.contents(), 1, KvDtype.F32, 1, qDim, rnd);
+            fill(kc.contents(), keys, kv, kvHeads, kvDim, rnd);
+            fill(vc.contents(), keys, kv, kvHeads, kvDim, rnd);
+            Metal.Buffer ref = k.scratch((long) qDim * 4);
+            Metal.Buffer cand = k.scratch((long) qDim * 4);
+            Metal.Buffer scores = k.scratch((long) heads * keys * 4);
+            Metal.Buffer part = k.scratch((long) heads * MetalConstants.FLASH_MAX_SPLITS * (hd + 2) * 4);
+            float scale = (float) (1 / Math.sqrt(hd));
+            double[] tRef = new double[2];
+            double[] tCand = new double[2];
+            float max = 0;
+            float diff = 0;
+            for (int pass = 0; pass < 2; pass++) { // pass 0: the long context, 1: a short one (400 keys)
+                int pos = pass == 0 ? keys - 1 : Math.min(keys, emu ? 100 : 400) - 1;
+                Runnable reference = () -> k.attention(attnKernel, attnGroup, q, kc, vc, ref, scores, heads, kvHeads, hd, hd,
+                        pos, keys, scale, qDim, stride, stride, qDim, 0, 0f, 1);
+                Runnable candidate = () -> k.decodeAttention(kv, q, 0, kc, vc, part, cand, 0, heads, kvHeads, hd, pos, keys,
+                        scale, stride, 0, 0f);
+                int reps = emu ? 1 : 20;
+                tRef[pass] = time(k, () -> {
+                    for (int i = 0; i < reps; i++) {
+                        reference.run();
+                    }
+                }, emu ? 1 : 5) / reps;
+                tCand[pass] = time(k, () -> {
+                    for (int i = 0; i < reps; i++) {
+                        candidate.run();
+                    }
+                }, emu ? 1 : 5) / reps;
+                for (int i = 0; i < qDim; i++) {
+                    float a = ref.contents().getAtIndex(ValueLayout.JAVA_FLOAT, i);
+                    float b = cand.contents().getAtIndex(ValueLayout.JAVA_FLOAT, i);
+                    max = Math.max(max, Math.abs(a));
+                    diff = Float.isNaN(b) ? Float.POSITIVE_INFINITY : Math.max(diff, Math.abs(a - b));
+                }
+            }
+            boolean correct = diff <= 1e-3f * max + 1e-5f;
+            use = correct && (emu || (tCand[0] < 0.97 * tRef[0] && tCand[1] <= 1.03 * tRef[1]));
+            log.append(String.format(java.util.Locale.ROOT, "decode attention %s, max diff %.1e%s", correct ? "agrees" : "DISAGREES",
+                    diff, emu ? "" : String.format(java.util.Locale.ROOT, ", %.3f vs %.3f ms (%d keys), %.3f vs %.3f ms (400 keys)",
+                            tCand[0], tRef[0], keys, tCand[1], tRef[1])));
+        } catch (RuntimeException e) { // a kernel the device cannot compile or run
+            log.append("decode attention failed (").append(e.getMessage()).append(")");
+        }
+        System.err.println("Metal decode attention: " + (use ? "on" : "off") + " (" + log + ")");
+        cache.setProperty(key, use ? "1" : "0");
+        store(cache);
+        return use;
+    }
+
+    /**
      * Threads per threadgroup for the plain single-token matmul ({@link MetalKernels#decodeThreads}): 64, 128 and 256
      * timed on the model's own matrix {@code t} (an output projection: the matrices this kernel serves). The results
      * are bit-identical for every size (checked), so only speed decides; the emulator keeps the default. Cached per

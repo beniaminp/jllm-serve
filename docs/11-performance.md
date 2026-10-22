@@ -313,8 +313,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.engine.batchWindowMicros` | 2000 | how long a batched decode step waits for the other slots' steps ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)) |
 | `jllm.metal.emulator` | false | run the Metal backend on the CPU emulator (with `jllm.metal.lib` = the emulator library; [18](18-metal-emulator.md)) |
 
-**Prefill chunk for MoE models.** Unless `backend.batch` is set, a mixture-of-experts model prefills in chunks
-of 256 tokens instead of 64. With 128 experts and top-8, a 64-token chunk gives each expert only about
+**Prefill chunk for MoE models.** With `backend.batch=auto` (the default), a mixture-of-experts model prefills in chunks
+of 256 tokens instead of 64 (dense models on Metal do too, [08 §8.26](08-metal-backend.md#826-the-prefill-chunk-backendbatchauto)). With 128 experts and top-8, a 64-token chunk gives each expert only about
 `64 · 8 / 128 = 4` tokens. An expert's weights are read once per chunk, and on the CPU each 4-row group is
 dequantized once, both for all its tokens, so that fixed cost is shared by only ~4 tokens. At 256 tokens it is
 shared by ~16. Measured on the CPU expert path (`cpu/MoeExperts`, one Qwen3-30B-A3B-shaped layer, Q4_0, 4 cores,

@@ -354,7 +354,7 @@ AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; 
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
 `engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
-the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
+the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides) and the `server.*` limits listed under Security below.
 
 Short flags:
 
@@ -366,7 +366,7 @@ Short flags:
 --gguf-quant LABEL    GGUF repository: the file whose name carries LABEL (Q4_K_M, Q8_0, ...); --gguf-file NAME: exact file name
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
---batch N             prefill chunk size (default 64)
+--batch N|auto       prefill chunk size (default auto: 256 on Metal and for MoE models, 64 on the CPU)
 --backend.kv-dtype f32|f16|q8   KV cache element type (no short alias)
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."

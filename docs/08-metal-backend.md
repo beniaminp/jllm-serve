@@ -923,7 +923,7 @@ Memory read for expert weights drops from `≈ n · topK` expert-matrix reads to
 `experts_used + n·topK / MMA_BT`). Q6_K weights now also have a simdgroup-matrix path, so GGUF `Q6_K` layers use it
 too. `-Djllm.metal.moeMma=false` keeps the per-slot kernels. Because the reuse grows with the tokens per expert
 (`n · topK / E`: 4 at a 64-token chunk with 128 experts and top-8, 16 at 256), MoE models prefill in 256-token
-chunks unless `backend.batch` is set ([12 §12.8](12-mixture-of-experts.md#128-why-decode-is-fast-and-prefill-is-not)).
+chunks unless `backend.batch` is set to a number ([12 §12.8](12-mixture-of-experts.md#128-why-decode-is-fast-and-prefill-is-not)).
 
 ---
 
@@ -1509,3 +1509,157 @@ a draft can pay; at b = 0.1 a, α = 0.9 would choose k = 5 for 1.86x the plain r
 
 Emulator timings are not representative of a GPU (the emulator runs every GPU thread of a kernel as a fiber on the
 CPU), so the costs on a real Mac come from `scripts/mac-validate.sh` (§8.20).
+
+---
+
+## 8.26 The prefill chunk (`backend.batch=auto`)
+
+🧸 Carrying shopping home in a tiny bag means many trips, and on each trip you walk the same road. A bigger bag
+means fewer trips; the only limit is the bag you can lift. The GPU is the shopper: a small chunk of prompt tokens
+does not give its sixteen cores enough to carry, so most of them stand idle while the weights are fetched again for the
+next small chunk.
+
+📐 A prefill chunk of `n` tokens runs every projection as a grid of `ceil(rows / 64) × ceil(n / 32)` MMA threadgroups
+([8.10](#810-the-tiled-prefill-matmuls)). Qwen3-0.6B's 1024-row `o_proj` at `n = 64` is 16 × 2 = **32 threadgroups**
+for 16 GPU cores, and the weights are read again for every chunk (413 tokens = 7 chunks of 64 = 7 passes over the
+452 MB, against 2 passes at 256). Measured on the M1 Pro (`./jllm bench --batch N`, 413-token prompt, median of 3):
+
+| `--batch` | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_0 cache, prefill tok/s | 1 426 | 1 612 | 2 012 | 2 058 |
+| decode tok/s (unchanged) | 110.5 | 110.9 | 112.8 | 113.1 |
+
+`backend.batch` is therefore `auto` by default (`ModelLoader.batch`): **256** for mixture-of-experts models (as before)
+and for plain decoders on Metal, 64 for the CPU backends, Mamba and the Qwen3-Next dense layers (not measured);
+`--batch N` or `backend.batch=N` still pins a number, and `-Djllm.metal.autoBatch=N` changes what `auto` means on Metal.
+512 gains only 2 % over 256 for twice the scratch, so 256 it is.
+
+What scales with the chunk: `x`, `xb` (`n · dim`), `q`, `att` (`n · qDim`), `hidden` (`n · ffn`: 3 MB at 256 for the
+0.6B model, 14 MB for a 8B model with a 14 336-wide MLP) and the f16/q8 staging rows. What does not: the attention
+`scores` scratch (tiles of 32 tokens), the logits (the last row only), the KV cache. The context length and the KV
+prefix reuse are untouched: the engine feeds `prompt[reused ..]` in chunks of `maxBatch` and every chunk starts at its
+absolute position. A cancelled request now stops within a 256-token chunk (127 ms at 2 012 tok/s) instead of a 64-token one (45 ms at
+1 426 tok/s), polled between chunks ([17 §17.6](17-agent-speedups.md#176-noticing-a-client-that-left)).
+
+**Numerics.** A 1 500-token prompt prefilled in chunks of 512, 256, 128 and 100 gives **bit-identical** logits (all
+151 936 of them compared), so the chunk size by itself does not change the result. Chunks of 64 differ from those in
+the last bits (largest difference 3.3e-5, same argmax) for a reason that has nothing to do with the 64: 1 500 =
+23 · 64 + 28 leaves a **tail of 28 tokens, below `MMA_MIN_TOKENS` = 32**, and a chunk that short runs the scalar tiled
+kernels, which sum in another order. That is the "result depends on history" caveat of `Backend.forward` and it was
+always there (any prompt length leaves some tail); a larger chunk just makes short tails rarer. Check with
+`ChunkCheck`-style runs: same prompt, `forward` in different chunk sizes, compare the logits bit for bit. The
+exactness gate (greedy text of a short prompt) is unaffected.
+
+---
+
+## 8.27 Several output rows per simdgroup in the decode matvec (`mv<NR>_*`)
+
+🧸 A shopper has a list of 1 024 things to look up for each of 4 096 customers. The old way sent one helper per
+customer, and every helper read the whole list again from the notice board. Now a helper serves two customers
+with the list in hand, so the notice board is read half as often — and half as many helpers have to read it out
+loud first (the rmsnorm every threadgroup of a fused kernel repeats).
+
+📐 `matmul`, `matmul3`, `matmul_swiglu` and their `_norm` variants give a simdgroup **one** output row: lane `l`
+walks the blocks `l, l+32, …` of the row and, for a 1 024-wide Q4_0 row, handles exactly one 32-weight block,
+reading 16 bytes of weights plus a 4-byte scale but 128 bytes of activations. The activation traffic (L1 and
+threadgroup memory) is therefore ~6× the weight traffic and a simdgroup has very little work per row. The kernels
+`mvr_matmul`, `mvr_matmul3` and `mvr_matmul_swiglu` (section 2a of `kernels.metal`, host names `mv<NR>_matmul…`,
+`NR` = 2, 4, 8) give a simdgroup `NR` **consecutive** rows (for swiglu `NR` units = `2·NR` rows, a gate row and its
+up row each) and run all of them over the lane's block before moving on:
+
+```
+for block b = lane, lane + 32, …:                      grid: (ceil(rows / (NR · sg)), ceil(ntok / 8)), 128 threads
+    for row r in 0 … NR-1:  load block b of row r (16 B + scale);  acc[r] += blockdot(block, x[b]) · scale
+simd_sum(acc[r]) for every r;  lane 0 writes row0 + r
+```
+
+so an activation block is fetched once for `NR` rows, a `_norm` kernel recomputes its rmsnorm once per
+`NR · 4` rows instead of once per 4 (at a 1 024-wide row the norm prologue is a larger share of a threadgroup's life
+than the rows it serves), and a lane has `NR` independent weight loads in flight. `matmul3`'s rows may straddle the q / k / v
+ranges (per-row pointers, as in the prefill tiles `mm_tile`); the bias, the half V row, the soft-cap and the residual
+accumulate are the epilogues of the one-row kernels; up to 8 tokens per threadgroup row are handled exactly like
+the one-row kernels' `TOK_TILE` (batched decode rows go through the same kernels as a single token, so a row computes
+what its own decode step does). Q2_K and Q6_K have another lane unit (16-weight sub-blocks): they call `mm_row` once per
+row, which gives them the grid and norm savings but no activation reuse. The GGUF types (`q4g`, `q8g`, `q4k`,
+`q5k`) use `gg_unit`, the same dequantization as their one-row kernels.
+
+**Bit-identity.** Each row is accumulated by the code of `mm_row`, so the same blocks are added in the same order
+and the result should be the same float. On a GPU "should" needs care. The first version loaded the 32 activations
+of a block into registers once, outside the per-row work, and its Q4_0 outputs differed from `mm_row`'s in the last
+bit in 70 % of the outputs (≤ 5e-7 relative to a 2.5 range, and the greedy tokens did not change): Metal compiles with
+fast-math, which lets it reassociate sums, and it did so differently in the new loop. The kernels now keep the
+structure of `mm_row` (the token loop of up to 8 with its runtime token count, the activations loaded inside it) and
+then agree to the byte ‹TBD›. Three checks keep it so: `kernel_tests.py` compares every kernel and format with its
+one-row twin byte for byte on the emulator (which cannot reassociate, so it tests the arithmetic written down), the
+logits of 48 decode steps after a 600-token prompt hash to the same value with `mvRows=1`, 2, 4, 8 ‹TBD›, and
+`-Djllm.metal.mvRows=1` brings the one-row kernels back. If a future driver reassociates differently, results change
+by an ulp, not by a bug: the invariants that matter (batched equals alone, replay equals encoded, pipelined equals
+plain) hold because they all use the same family.
+
+**Choosing NR.** Time of the matvecs of a whole token (28 layers + LM head, 28 distinct weight sets so nothing stays
+cached; `MvBench` in the review notes; M1 Pro, microseconds per layer):
+
+| kernel (Qwen3-0.6B Q4_0) | one row, 64 threads (tuned) | NR = 2 | NR = 4 | NR = 8 |
+|---|---|---|---|---|
+| q/k/v + norm (4 096 × 1 024) | ‹TBD› | ‹TBD› | ‹TBD› | ‹TBD› |
+| o_proj (1 024 × 2 048) | ‹TBD› | | | |
+| gate/up + swiglu + norm (6 144 × 1 024) | ‹TBD› | | | |
+| down (1 024 × 3 072) | ‹TBD› | | | |
+| LM head (151 936 × 1 024, Q8_0), µs | ‹TBD› | | | |
+| whole token, ms | ‹TBD› | | | |
+
+`NR = 8` is worse for the SwiGLU kernel (16 accumulators and 16 row pointers per lane spill registers), so the
+default is **2** and 4 stays available. `-Djllm.metal.mvRows=0|1|2|4|8`, `-Djllm.metal.mvThreads` (threads of the
+plain, non-norm variants; the fused ones need 128).
+
+---
+
+## 8.28 Decode attention (`attention_dec`)
+
+🧸 Sixteen readers each look for one answer in a very long book (the KV cache), and until now each reader read the whole
+book alone, one page at a time, shouting every page's score across the room into a notebook and reading the notebook
+back twice. Now the book's pages are handed out to many helpers; each helper reads a few pages, keeps a running tally in
+her head ("best so far, total so far, the answer so far") and writes one line at the end; one clerk adds the lines up.
+Two readers who look at the same pages (two query heads of one kv head) share the reading.
+
+📐 `attention_t` ([8.5](#85-the-kernels-one-by-one)) is a tile kernel: one threadgroup of 256 threads per (query head,
+token), eight simdgroups taking keys round-robin, **one key at a time** (a 128-byte coalesced row, four FMAs per lane,
+then a 5-step `simd_sum`), the scores parked in device memory between three passes separated by barriers, and, in a decode
+step, only `heads` = 16 threadgroups for a 16-core GPU. It streams a 413-position f32 cache at ~76 GB/s and a 3 000-position
+one at ~70 GB/s. `attention_dec<KV, G, D, W>` is written for decode (one token, section 4b of `kernels.metal`):
+
+* **A simdgroup is the unit of work.** It owns a slice of ≥ 32 keys (`chunk` = `ceil(keys / nSplit)` rounded up to 32) of
+  one group of `G` query heads that share a kv head (`G` = 2 for Qwen3-0.6B's 16/8 heads: each K and V row is read once for
+  two heads), keeps the online-softmax state `(m, l, o[D])` in registers, and writes its own unnormalised partial
+  `(o, m, l)`, the layout of `attention_split`; `attention_combine` merges the partials. There is no threadgroup memory
+  and no barrier. A decode step has `heads / G · nSplit` such workers; with `nSplit = ceil(keys / 32)` capped at 16
+  (`decChunk`, `decMaxSplits`) that is 16 · 8/… ‹TBD› workers at 413 keys.
+* **Eight lanes share a key, four keys run at once.** Lane `tx = lane & 7` loads the `W`-element chunks `tx, tx+8, …` of the
+  key's head row (8 lanes = 128 contiguous bytes per vector load) and multiplies them with the query held in registers;
+  `ty = lane >> 3` selects one of four keys. A block is 32 keys = 8 steps of 4 keys; the partial dot products of the 8 steps
+  are reduced over the 8 lanes by a **reduce-scatter** (halve the number of live values at each of three xor-shuffles:
+  4 + 2 + 1 = 7 shuffles for 8 sums, against 24 for 8 butterfly reductions), which leaves lane `tx` with the complete score
+  of the block's key `4·tx + ty`.
+* **The softmax is online, per 32-key block**: `m' = max(m, simd_max(s))`, `p = e^(s − m')`, `l = l·e^(m − m') + p`,
+  `o ← o·e^(m − m')`; scores never touch memory. P·V reuses the lane layout of K: the probability of step `j`'s key comes
+  from lane `(j, ty)` by one shuffle and the lane adds `p · v` for its chunks of the V row; at the end the four `ty` groups'
+  accumulators are added with two xor-shuffles.
+* **Cache types.** f32: 16-byte loads (`W` = 4 elements). f16: `W` = 8, i.e. one 16-byte load = 8 halves per lane chunk
+  (`-Djllm.metal.decWide=false` keeps 8-byte loads for an A/B). q8: 4 bytes per load (the int8 rows are only 4-byte
+  aligned: the scales follow the values) with the row scale applied once per key to the score or the probability, as in
+  `attention_t` (`kv_scale`). Sliding windows (`first`), the attention soft-cap and ALiBi-free Gemma layers use the same
+  code paths as `attention_t`; head widths 64, 128, 256 only (others keep `attention_t`).
+
+**Not bit-identical.** The scores are summed over 8 lanes in a different order, and the softmax sums per block, so the
+output agrees with `attention_t` to rounding (max |difference| 3e-8 on a 0.13 range at 413 keys, 2e-8 at 3 000). Like flash
+decoding it is therefore chosen by the **start-up self-check** ([8.14](#814-the-kernel-self-check-metaltuner),
+`MetalTuner.decodeAttention`): it must agree within `1e-3·max|ref| + 1e-5` on synthetic data of the model's head shape
+and be ≥ 3 % faster over 2 048 keys and not slower over 400, per cache type; on the emulator agreement alone decides.
+`-Djllm.metal.decodeAttention=true|false` forces it. It supersedes flash decoding when both are on (an explicit
+`-Djllm.metal.flashDecode=true` turns it off). Consistency is kept where it matters: every row of a verification pass or
+batched step of fewer than 16 tokens runs the same kernel at its own position (`forward` loops over the rows), so
+speculation and batched decoding still compute exactly what separate decode steps compute; chunks of 16+ tokens use the
+prefill kernels as before. A recorded decode step depends on the number of splits, which is part of its replay key
+(a new recording about every 32–64 tokens).
+
+‹TBD: numbers›
