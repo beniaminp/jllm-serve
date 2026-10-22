@@ -458,6 +458,17 @@ public final class Engine implements AutoCloseable {
         }
     }
 
+    /** The first {@code n} tokens of {@code prompt} followed by {@code emitted}: the tokens whose rows the cache holds. */
+    private static int[] historyOf(int[] prompt, List<Integer> emitted, int n) {
+        int[] all = new int[n];
+        int p = Math.min(prompt.length, n);
+        System.arraycopy(prompt, 0, all, 0, p);
+        for (int i = p; i < n; i++) {
+            all[i] = emitted.get(i - prompt.length);
+        }
+        return all;
+    }
+
     /** @param choices with {@code index}: told about the prefill and each token's logprob; may be null */
     private Result generateLocked(int[] prompt, SamplingParams p, Decoding d, TextSink sink, ChoiceSink choices,
                                   int index, BooleanSupplier cancelled) {
@@ -516,6 +527,12 @@ public final class Engine implements AutoCloseable {
         int pos = reuse;
         int batch = backend.maxBatch();
         while (pos < prompt.length) {
+            if (pos > reuse && promptLp == null && media == null) {
+                // a scheduler may pause the conversation between two chunks (docs/25); what could not be brought back is prefilled again
+                int[] fed = prompt;
+                int here = pos;
+                pos = backend.checkpoint(() -> java.util.Arrays.copyOf(fed, here), pos, cancelled);
+            }
             if (pos > reuse && cancelled.getAsBoolean()) {
                 // the client gave up during a long prefill: keep what is done, so that a retry of the same
                 // prompt (agents retry after a timeout) continues from here instead of starting over
@@ -600,6 +617,25 @@ public final class Engine implements AutoCloseable {
         long pipeLast = 0;        // when the last pipelined token arrived (the speculator's plain-step cost)
         try {
             while (o.out.size() < maxTokens) {
+                if (rIdx >= rLen && pipe == null && media == null && !ropeDirty) {
+                    // between two steps: a scheduler may pause this conversation here (docs/25), its blocks going back to the
+                    // pool for a while; the cache holds the prompt and the emitted tokens that were fed, up to pos
+                    int fedOut = pos - prompt.length;
+                    if (fedOut >= 0 && fedOut <= o.out.size()) {
+                        int[] pr = prompt;
+                        List<Integer> emitted = o.out;
+                        int upTo = pos;
+                        int valid = backend.checkpoint(() -> historyOf(pr, emitted, upTo), pos, cancelled);
+                        if (valid < pos) { // the rows that could not be brought back are computed again, from the tokens
+                            int[] history = historyOf(pr, emitted, upTo);
+                            for (int p0 = valid; p0 < pos; ) {
+                                int cnt = Math.min(batch, pos - p0);
+                                backend.forward(history, p0, cnt, p0, null);
+                                p0 += cnt;
+                            }
+                        }
+                    }
+                }
                 if (cancelled.getAsBoolean()) {
                     o.finish = "cancelled";
                     break;

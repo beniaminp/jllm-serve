@@ -232,6 +232,13 @@ public final class Settings {
                 "engine.prompt-cache-mb", "must be 0 (off) .. 1048576");
         require(get("backend.cpu.native").trim().matches("(?i)auto|true|false"),
                 "backend.cpu.native", "must be auto, true or false");
+        require(get("engine.scheduler").trim().matches("(?i)slots|mixed"), "engine.scheduler", "must be slots or mixed");
+        for (String k : new String[]{"engine.pass-budget", "engine.mixed-reserve", "engine.background-chunk-cap",
+                "engine.max-running", "engine.session-max-running"}) {
+            require(getInt(k) >= 0, k, "must be 0 or positive");
+        }
+        require(getLong("engine.age-promote-ms") >= 0, "engine.age-promote-ms", "must be 0 (no aging) or positive");
+        getBool("engine.preempt");
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "chat.thinking", "raw", "backend.kv-q8-rotate",

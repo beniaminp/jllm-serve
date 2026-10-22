@@ -238,6 +238,16 @@ public final class CpuBackend implements Backend {
         default boolean runRows(int layer, CpuBackend[] owners, int[] positions) {
             return false;
         }
+
+        /**
+         * A mixed pass ({@link #forwardMixed}): rows {@code [rowStart[s], rowStart[s] + counts[s])} of the projections belong
+         * to {@code owners[s]}, at positions {@code [positions[s], ..)} of its cache; each segment is rotated, stored and
+         * attended exactly as a {@link #run} of that many tokens would. False when the attention keeps no per-owner cache
+         * this way (MLA).
+         */
+        default boolean runSegments(int layer, CpuBackend[] owners, int[] rowStart, int[] counts, int[] positions) {
+            return false;
+        }
     }
 
     /**
@@ -335,6 +345,39 @@ public final class CpuBackend implements Backend {
                 o.kv.store(layer, pos, o.kStage, o.vStage, 1);
                 o.kv.attention(pool, layer, 1, pos, o.q, o.att, g.window(), g.scale(), g.softcap());
                 System.arraycopy(o.att, 0, att, t * outDim, outDim);
+            }
+            return true;
+        }
+
+        @Override
+        public boolean runSegments(int layer, CpuBackend[] owners, int[] rowStart, int[] counts, int[] positions) {
+            int rows = rowStart[owners.length - 1] + counts[owners.length - 1];
+            matmul(w.wq(), xb, q, 0, rows, false);
+            matmul(w.wk(), xb, kStage, 0, rows, false);
+            matmul(w.wv(), xb, vStage, 0, rows, false);
+            if (w.bq() != null) {
+                addBias(q, 0, w.bq(), rows);
+                addBias(kStage, 0, w.bk(), rows);
+                addBias(vStage, 0, w.bv(), rows);
+            }
+            int qDim = g.qDim();
+            int kvDim = g.kvDim();
+            int outDim = arch.attention().outDim();
+            for (int s = 0; s < owners.length; s++) {
+                // the segment at its own position, into its own cache, through this (the lender's) staging rows; the
+                // statements are those of run(n = counts[s]) on the segment's rows
+                CpuBackend o = owners[s];
+                int pos = positions[s];
+                int cnt = counts[s];
+                int r0 = rowStart[s];
+                normRope(q, r0 * qDim, qDim, g.heads(), w.qNorm(), cnt, pos);
+                normRope(kStage, r0 * kvDim, kvDim, g.kvHeads(), w.kNorm(), cnt, pos);
+                System.arraycopy(kStage, r0 * kvDim, mixK, 0, cnt * kvDim);
+                System.arraycopy(vStage, r0 * kvDim, mixV, 0, cnt * kvDim);
+                System.arraycopy(q, r0 * qDim, mixQ, 0, cnt * qDim);
+                o.kv.store(layer, pos, mixK, mixV, cnt);
+                o.kv.attention(pool, layer, cnt, pos, mixQ, mixAtt, g.window(), g.scale(), g.softcap());
+                System.arraycopy(mixAtt, 0, att, r0 * outDim, cnt * outDim);
             }
             return true;
         }
@@ -560,6 +603,122 @@ public final class CpuBackend implements Backend {
         lmHeadAll(n, all, vocab);
         for (int t = 0; t < n; t++) {
             System.arraycopy(all, t * vocab, logits[t], 0, Math.min(vocab, logits[t].length));
+        }
+        return true;
+    }
+
+    // staging of a mixed pass ({@link #forwardMixed}): one segment's rows, handed to its owner's cache; created by the first pass
+    private float[] mixQ;
+    private float[] mixK;
+    private float[] mixV;
+    private float[] mixAtt;
+    private float[] mixOut;
+
+    @Override
+    public boolean forwardMixed(Segment[] segs) {
+        int m = segs.length;
+        if (m < 1 || kv == null) {
+            return false;
+        }
+        CpuBackend[] owners = new CpuBackend[m];
+        int[] rowStart = new int[m];
+        int[] counts = new int[m];
+        int[] positions = new int[m];
+        int rows = 0;
+        int selected = 0;
+        for (int i = 0; i < m; i++) {
+            Segment sg = segs[i];
+            if (!(sg.owner() instanceof CpuBackend o) || o.w != w || o.kv == null || o.kv.getClass() != kv.getClass()
+                    || o.ropeCustomFrom != Integer.MAX_VALUE || sg.n() < 1 || sg.pos() < 0 || sg.pos() + sg.n() > o.ctx) {
+                return false;
+            }
+            for (int u = 0; u < i; u++) {
+                if (owners[u] == o) {
+                    return false; // one cache cannot take two segments of a pass
+                }
+            }
+            owners[i] = o;
+            rowStart[i] = rows;
+            counts[i] = sg.n();
+            positions[i] = sg.pos();
+            rows += sg.n();
+            selected += sg.stride() > 0 ? sg.n() : sg.logits() != null ? 1 : 0;
+        }
+        if (rows > maxBatch) {
+            return false;
+        }
+        for (int i = 0; i < m; i++) {
+            if (owners[i].seq != null) {
+                owners[i].seq.beginWrite(positions[i], counts[i]);
+            }
+        }
+        if (mixQ == null) {
+            Attention a = arch.attention();
+            mixQ = new float[maxBatch * a.qDim()];
+            mixK = new float[maxBatch * ((Attention.Gqa) a).kvDim()];
+            mixV = new float[maxBatch * ((Attention.Gqa) a).kvDim()];
+            mixAtt = new float[maxBatch * Math.max(a.qDim(), a.outDim())];
+        }
+        int dim = c.dim();
+        for (int i = 0; i < m; i++) {
+            Segment sg = segs[i];
+            for (int t = 0; t < sg.n(); t++) {
+                w.embed.dequantizeRow(sg.tokens()[sg.off() + t], x, (rowStart[i] + t) * dim);
+            }
+        }
+        if (c.embedScale() != 1f) {
+            float es = c.embedScale();
+            int total = rows;
+            pool.forRange(total, 1, (t0, t1) -> {
+                for (int i = t0 * dim, e = t1 * dim; i < e; i++) {
+                    x[i] *= es;
+                }
+            });
+        }
+        for (int l = 0; l < c.layers(); l++) {
+            LayerPlan p = plans[l];
+            DecoderLayer L = p.weights();
+            rmsnorm(x, xb, L.attnNorm(), rows, dim);
+            if (!p.attention().runSegments(l, owners, rowStart, counts, positions)) {
+                throw new IllegalStateException("layer " + l + " cannot attend per segment"); // kv != null: GQA only
+            }
+            p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), rows);
+            rmsnorm(x, xb, L.ffnNorm(), rows, dim);
+            p.ffn().run(rows);
+        }
+        if (selected > 0) {
+            // the final norm and the LM head over the rows whose logits are wanted only (a prefill chunk's other rows need none)
+            int headRows = w.lmHead.rows;
+            int j = 0;
+            for (int i = 0; i < m; i++) {
+                Segment sg = segs[i];
+                if (sg.stride() > 0) {
+                    for (int t = 0; t < sg.n(); t++) {
+                        rmsnormRow(x, (rowStart[i] + t) * dim, xb, j++ * dim, w.finalNorm, dim);
+                    }
+                } else if (sg.logits() != null) {
+                    rmsnormRow(x, (rowStart[i] + sg.n() - 1) * dim, xb, j++ * dim, w.finalNorm, dim);
+                }
+            }
+            if (mixOut == null || mixOut.length < selected * headRows) {
+                mixOut = new float[Math.max(selected, 16) * headRows];
+            }
+            mm.mul(w.lmHead, headRows, xb, mixOut, 0, selected, false);
+            j = 0;
+            for (int i = 0; i < m; i++) {
+                Segment sg = segs[i];
+                if (sg.stride() > 0) {
+                    int cols = Math.min(headRows, sg.stride());
+                    for (int t = 0; t < sg.n(); t++, j++) {
+                        System.arraycopy(mixOut, j * headRows, sg.logits(), t * sg.stride(), cols);
+                        softcap(sg.logits(), t * sg.stride(), cols);
+                    }
+                } else if (sg.logits() != null) {
+                    int cols = Math.min(headRows, sg.logits().length);
+                    System.arraycopy(mixOut, j++ * headRows, sg.logits(), 0, cols);
+                    softcap(sg.logits(), 0, cols);
+                }
+            }
         }
         return true;
     }

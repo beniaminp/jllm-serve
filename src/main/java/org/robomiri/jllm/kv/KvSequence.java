@@ -232,6 +232,83 @@ public final class KvSequence implements AutoCloseable {
         return copy;
     }
 
+    // ------------------------------------------------------------------ pausing a generation (docs/25)
+
+    /**
+     * What {@link #suspend} leaves of a paused sequence: the number of valid positions and the one block that cannot be
+     * found again through the tree, the partly filled last one (its reference is kept).
+     */
+    public static final class Suspended {
+        private final int positions;
+        private final int fullBlocks;
+        private final int tail;
+
+        private Suspended(int positions, int fullBlocks, int tail) {
+            this.positions = positions;
+            this.fullBlocks = fullBlocks;
+            this.tail = tail;
+        }
+
+        /** Positions that were valid. */
+        public int positions() {
+            return positions;
+        }
+    }
+
+    /**
+     * Whether {@link #suspend} can give the blocks back and {@link #resume} find them again: the sequence shares through
+     * the tree (rows that are a function of the tokens alone) and the pool has sharing on.
+     */
+    public boolean suspendable() {
+        return shareable && pool.sharing();
+    }
+
+    /**
+     * Pauses the sequence at {@code n} valid positions (tokens {@code tokens[0 .. n)}): its full blocks are published and
+     * released, so they are ordinary cached blocks that the pool may evict (and spill to disk) when it needs room, while
+     * another conversation runs; only the last partly filled block, at most {@code B - 1} rows, is kept. The table is empty
+     * afterwards; {@link #resume} brings the rows back.
+     */
+    public Suspended suspend(int[] tokens, int n) {
+        synchronized (pool) {
+            if (n > length) {
+                throw new IllegalArgumentException("cannot suspend " + n + " positions of a sequence with " + length);
+            }
+            truncate(n);
+            publish(tokens, n);
+            int full = n / B;
+            int tail = n % B != 0 ? table[full] : -1;
+            for (int i = 0; i < full; i++) {
+                pool.release(table[i]);
+            }
+            blocks = 0;
+            length = 0;
+            return new Suspended(n, full, tail);
+        }
+    }
+
+    /**
+     * Takes the rows of a {@link #suspend}ed sequence back: the full blocks come from the tree (reading spilled ones from
+     * disk) and the kept tail block is put after them.
+     *
+     * @return the positions valid now: {@code s.positions()} when everything came back, else fewer (a block was evicted
+     *         without a store, or the pool is full), and the caller computes the rest again from the tokens
+     */
+    public int resume(Suspended s, int[] tokens) {
+        synchronized (pool) {
+            int got = s.fullBlocks == 0 ? 0 : pool.adopt(this, tokens, s.fullBlocks * B);
+            if (got == s.fullBlocks * B && s.tail >= 0) {
+                put(s.fullBlocks, s.tail);
+                length = s.positions;
+                return length;
+            }
+            if (s.tail >= 0) {
+                pool.release(s.tail);
+            }
+            return got;
+        }
+    }
+
     // ------------------------------------------------------------------ used by KvPool (under its monitor)
 
     /** Sets logical block {@code i} (an existing entry or the next one), releasing what was there. */

@@ -238,6 +238,16 @@ public final class MetalBackend implements Backend {
          * cache store and attention once per row in that owner's cache.
          */
         void runRows(int layer, int n, MetalBackend[] owners, int[] positions);
+
+        /**
+         * A mixed pass ({@link #forwardMixed}): rows {@code [rowStart[s], rowStart[s] + counts[s])} of x are segment
+         * {@code s}, tokens at {@code positions[s] ..} of {@code owners[s]}'s paged cache. The projections run over all
+         * {@code rows}; RoPE, the cache store and attention once per segment, a single token as {@link #runRows} does and
+         * several as {@link #run} would for that many tokens alone.
+         */
+        default void runSegments(int layer, int rows, MetalBackend[] owners, int[] rowStart, int[] counts, int[] positions) {
+            throw new UnsupportedOperationException("mixed passes need grouped-query attention");
+        }
     }
 
     /** Reads {@code x} (normalizing it with the layer's MLP norm), adds the feed-forward output to {@link #x}. */
@@ -1122,6 +1132,153 @@ public final class MetalBackend implements Backend {
             k.rowScores(0);
             k.page(pageTbl, pageShift);
         }
+
+        /**
+         * A mixed pass over the paged cache (docs/25): the q, k and v of all {@code rows} in one projection (k and v to the
+         * f32 staging rows rowK / rowV), then per segment its rotary embedding (in place in the staging rows), the store
+         * through its owner's block table and attention over its owner's cache. A single-token segment runs the
+         * dispatches of {@link #runRows}; a longer one the ones {@link #run} dispatches for a chunk of that length at its
+         * position, with the activation rows starting at the segment's byte offset, so a prefill chunk computes what it
+         * would alone (the rows of other segments do not enter its attention: each sees only its owner's cache).
+         */
+        @Override
+        public void runSegments(int layer, int rows, MetalBackend[] owners, int[] rowStart, int[] counts, int[] positions) {
+            int dim = c.dim();
+            int kvDim = g.kvDim();
+            int hd = g.headDim();
+            int qDim = g.qDim();
+            int m = owners.length;
+            boolean q8 = kvDtype == KvDtype.Q8;
+            int stride = kvDtype.rowStride(kvDim, g.kvHeads());
+            k.rmsnorm(x, 0, attnNorm, xb, rows, dim);
+            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, rows);
+            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
+            boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
+            // the segments write apart (their own q rows and staging rows, their owner's blocks): each stage is issued for
+            // all of them before the next, as in runRows, so with the concurrent encoder they overlap
+            k.beginIndependent();
+            for (int s = 0; s < m; s++) {
+                long qOff = (long) rowStart[s] * qDim * 4;
+                long kvOff = (long) rowStart[s] * kvDim * 4;
+                if (counts[s] == 1) {
+                    k.ropeRow(adjacent, false, q, qOff, rowK, kvOff, rowK, kvOff, useNorm ? qNorm : null, useNorm ? kNorm : null,
+                            cos, sin, hd, qDim, kvDim, g.heads(), g.kvHeads(), positions[s], 0, rotHalf);
+                } else {
+                    k.ropeAt(adjacent, false, q, qOff, rowK, kvOff, rowK, kvOff, useNorm ? qNorm : null, useNorm ? kNorm : null,
+                            cos, sin, hd, qDim, kvDim, g.heads(), g.kvHeads(), positions[s], 0, rotHalf, counts[s]);
+                }
+            }
+            k.endIndependent();
+            k.beginIndependent();
+            for (int s = 0; s < m; s++) {
+                MetalBackend o = owners[s];
+                long qOff = (long) rowStart[s] * qDim * 4;
+                long kvOff = (long) rowStart[s] * kvDim * 4;
+                k.page(o.pageTbl, o.pageShift); // each segment stores through its owner's block table
+                if (counts[s] == 1) {
+                    if (q8Rot) {
+                        k.kvStoreQ8RotRow(rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], 0, q, qOff, hd,
+                                g.kvHeads(), g.heads(), positions[s]);
+                    } else if (q8) {
+                        k.kvStoreQ8Row(rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], 0, hd, g.kvHeads(),
+                                positions[s]);
+                    } else {
+                        k.kvStorePaged(kvHalf, rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], kvDim,
+                                positions[s], 1);
+                    }
+                } else if (q8Rot) {
+                    k.kvStoreQ8RotAt(rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], q, qOff, hd, g.kvHeads(),
+                            g.heads(), positions[s], counts[s]);
+                } else if (q8) {
+                    k.kvStoreQ8At(rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], hd, g.kvHeads(), positions[s],
+                            counts[s]);
+                } else {
+                    k.kvStorePaged(kvHalf, rowK, kvOff, rowV, kvOff, o.keyCache[layer], o.valCache[layer], kvDim, positions[s],
+                            counts[s]);
+                }
+            }
+            k.endIndependent();
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
+            // longer segments first, one after the other (their kernels share the scores / partial-result scratch)
+            for (int s = 0; s < m; s++) {
+                int n = counts[s];
+                if (n == 1) {
+                    continue;
+                }
+                MetalBackend o = owners[s];
+                Metal.Buffer kc = o.keyCache[layer];
+                Metal.Buffer vc = o.valCache[layer];
+                int pos = positions[s];
+                long qOff = (long) rowStart[s] * qDim * 4;
+                k.page(o.pageTbl, o.pageShift);
+                if (decodeAttn && n < MetalKernels.FLASH_PREFILL_MIN) {
+                    // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
+                    // token, so that every row is exactly what a decode step at its position computes (as in run())
+                    for (int t = 0; t < n; t++) {
+                        long qRow = qOff + (long) t * qDim * 4;
+                        k.decodeAttention(kvDtype, q, qRow, kc, vc, flashPart, att, qRow, g.heads(), g.kvHeads(), hd, pos + t,
+                                ctx, scale, stride, g.window(), g.softcap());
+                    }
+                } else if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
+                    k.flashPrefillAt(kvDtype, hd, q, qOff, kc, vc, att, qOff, g.heads(), g.kvHeads(), pos, n, scale, qDim,
+                            stride, qDim, g.window(), g.softcap());
+                } else {
+                    k.attentionAt(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd, hd,
+                            pos, ctx, scale, qDim, stride, stride, qDim, g.window(), g.softcap(), n);
+                }
+            }
+            int singles = 0;
+            for (int s = 0; s < m; s++) {
+                singles += counts[s] == 1 ? 1 : 0;
+            }
+            if (singles > 0) {
+                if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
+                    for (int s = 0; s < m; s++) {
+                        if (counts[s] != 1) {
+                            continue;
+                        }
+                        long qOff = (long) rowStart[s] * qDim * 4;
+                        k.page(owners[s].pageTbl, owners[s].pageShift);
+                        k.decodeAttention(kvDtype, q, qOff, owners[s].keyCache[layer], owners[s].valCache[layer], flashPart, att,
+                                qOff, g.heads(), g.kvHeads(), hd, positions[s], ctx, scale, stride, g.window(), g.softcap());
+                    }
+                } else {
+                    boolean anyFlash = false;
+                    for (int s = 0; s < m; s++) {
+                        anyFlash |= counts[s] == 1 && flashDecode && positions[s] + 1 >= k.flashMinLen;
+                    }
+                    int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
+                    int t = 0;
+                    for (int s = 0; s < m; s++) {
+                        if (counts[s] != 1) {
+                            continue;
+                        }
+                        Metal.Buffer kc = owners[s].keyCache[layer];
+                        Metal.Buffer vc = owners[s].valCache[layer];
+                        int pos = positions[s];
+                        long qOff = (long) rowStart[s] * qDim * 4;
+                        k.page(owners[s].pageTbl, owners[s].pageShift);
+                        if (anyFlash) {
+                            if (flashDecode && pos + 1 >= k.flashMinLen) {
+                                k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
+                                        hd, pos, ctx, scale, qDim, stride, g.window(), g.softcap());
+                                continue;
+                            }
+                        } else if (t % sliceRows == 0) {
+                            k.endIndependent();
+                            k.beginIndependent();
+                        }
+                        k.rowScores(anyFlash ? 0 : (long) (t++ % sliceRows) * g.heads() * ctx * 4);
+                        k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
+                                hd, pos, ctx, scale, qDim, stride, stride, qDim, g.window(), g.softcap());
+                    }
+                    k.endIndependent();
+                    k.rowScores(0);
+                }
+            }
+            k.page(pageTbl, pageShift);
+        }
     }
 
     /** Dense gated MLP: the fused norm + gate/up + activation kernel, then the down projection (post-normed for Glm4 / Gemma). */
@@ -1951,6 +2108,152 @@ public final class MetalBackend implements Backend {
         for (int t = 0; t < n; t++) {
             MemorySegment.copy(logitsAllBuf.contents(), ValueLayout.JAVA_FLOAT, (long) t * w.lmHead.rows * 4, logits[t], 0,
                     Math.min(w.lmHead.rows, logits[t].length));
+        }
+        return true;
+    }
+
+    /**
+     * A mixed pass (docs/25): the segments of several slots, a prefill chunk or a verification run of one and single decode
+     * tokens of others, in one command buffer on this backend's queue and activation buffers. The projections, the MLP and
+     * the LM head run over all rows at once (the weights are read once); rotary embedding, the cache store and attention
+     * per segment ({@code AttnStep.runSegments}) in the owner's paged cache. Only for the paged cache of dense or MoE
+     * grouped-query models (f32, f16, q8); false otherwise, with nothing done. The owners must be idle MetalBackends of the
+     * same weights and cache type, which {@link org.robomiri.jllm.engine.BatchGroup} guarantees by holding its device lock.
+     */
+    @Override
+    public boolean forwardMixed(Segment[] segs) {
+        int m = segs.length;
+        if (!BATCH_DECODE || closed || m < 1 || seq == null || mla != null || kvDtype == KvDtype.Q4
+                || !(arch.attention() instanceof Attention.Gqa g)) {
+            return false;
+        }
+        MetalBackend[] owners = new MetalBackend[m];
+        int[] rowStart = new int[m];
+        int[] lens = new int[m];
+        int[] positions = new int[m];
+        int rows = 0;
+        int selected = 0;
+        for (int i = 0; i < m; i++) {
+            Segment sg = segs[i];
+            if (!(sg.owner() instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed || o.seq == null
+                    || o.q8Rot != q8Rot || o.ropeCustomFrom != Integer.MAX_VALUE || sg.n() < 1 || sg.pos() < 0
+                    || sg.pos() + sg.n() > Math.min(ctx, o.ctx)) {
+                return false;
+            }
+            for (int u = 0; u < i; u++) {
+                if (owners[u] == o) {
+                    return false; // one cache cannot take two segments of a pass
+                }
+            }
+            owners[i] = o;
+            rowStart[i] = rows;
+            lens[i] = sg.n();
+            positions[i] = sg.pos();
+            rows += sg.n();
+            selected += sg.stride() > 0 ? sg.n() : sg.logits() != null ? 1 : 0;
+        }
+        if (rows > maxBatch) {
+            return false;
+        }
+        if (pipe != null) {
+            pipe.drain();
+        }
+        for (MetalBackend o : owners) {
+            if (o.pipe != null) {
+                o.pipe.drain(); // never interleave with pipelined steps (of any owner: the group lock is held)
+            }
+        }
+        for (int i = 0; i < m; i++) {
+            owners[i].seq.beginWrite(positions[i], lens[i]);
+        }
+        if (rowK == null) {
+            rowK = k.scratch((long) maxBatch * g.kvDim() * 4);
+            rowV = k.scratch((long) maxBatch * g.kvDim() * 4);
+        }
+        if (selected > 0 && (logitsAllBuf == null || logitsAllRows < selected)) {
+            logitsAllRows = Math.min(maxBatch, Math.max(selected, 16)); // lives until the backend closes: size once
+            logitsAllBuf = k.scratch((long) logitsAllRows * w.lmHead.rows * 4);
+        }
+        int dim = c.dim();
+        float[] row = new float[dim];
+        for (int i = 0; i < m; i++) {
+            Segment sg = segs[i];
+            for (int t = 0; t < sg.n(); t++) {
+                w.embed.dequantizeRow(sg.tokens()[sg.off() + t], row, 0);
+                if (c.embedScale() != 1f) {
+                    for (int e = 0; e < dim; e++) {
+                        row[e] *= c.embedScale();
+                    }
+                }
+                MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) (rowStart[i] + t) * dim * 4, dim);
+            }
+        }
+        countStep = counts != null && steps++ % COUNT_EVERY == 0;
+        watchThermal();
+        int encoder = k.concurrentMode();
+        if (MetalKernels.CONCURRENT_BATCH && m > 1 && k.metal.canRunConcurrent()) {
+            k.encoder(1); // the per-segment dispatches are independent: let them overlap
+        }
+        k.begin();
+        boolean committed = false;
+        try {
+            for (int l = 0; l < c.layers(); l++) {
+                LayerPlan L = plans[l];
+                L.attention().runSegments(l, rows, owners, rowStart, lens, positions);
+                if (L.postAttnNorm() != null) {
+                    k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, rows, false, null, 0f, L.woBias());
+                    k.rmsnormAdd(xb, L.postAttnNorm(), x, rows, dim);
+                } else {
+                    k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, rows, true, null, 0f, L.woBias());
+                }
+                L.ffn().run(l, rows, false);
+                if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
+                    k.commit();
+                }
+            }
+            if (selected > 0) {
+                // the final norm of the rows whose logits are wanted only, packed into the first rows of xb, then the LM head
+                int j = 0;
+                for (int i = 0; i < m; i++) {
+                    Segment sg = segs[i];
+                    if (sg.stride() > 0) {
+                        k.rmsnormTo(x, (long) rowStart[i] * dim * 4, finalNorm, xb, (long) j * dim * 4, sg.n(), dim);
+                        j += sg.n();
+                    } else if (sg.logits() != null) {
+                        k.rmsnormTo(x, (long) (rowStart[i] + sg.n() - 1) * dim * 4, finalNorm, xb, (long) j * dim * 4, 1, dim);
+                        j++;
+                    }
+                }
+                k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsAllBuf, 0, selected, false, null, c.finalSoftcap());
+            }
+            k.commitAndWait();
+            committed = true;
+        } finally {
+            if (!committed) {
+                k.abort();
+            }
+            k.encoder(encoder);
+        }
+        if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
+            rebalanceExperts();
+        } else if (counts != null && System.nanoTime() - lastStatsSave > STATS_SAVE_NANOS) {
+            saveExpertStats(true);
+        }
+        int j = 0;
+        int headRows = w.lmHead.rows;
+        for (int i = 0; i < m; i++) {
+            Segment sg = segs[i];
+            if (sg.stride() > 0) {
+                int cols = Math.min(headRows, sg.stride());
+                for (int t = 0; t < sg.n(); t++, j++) {
+                    MemorySegment.copy(logitsAllBuf.contents(), ValueLayout.JAVA_FLOAT, (long) j * headRows * 4, sg.logits(),
+                            t * sg.stride(), cols);
+                }
+            } else if (sg.logits() != null) {
+                MemorySegment.copy(logitsAllBuf.contents(), ValueLayout.JAVA_FLOAT, (long) j * headRows * 4, sg.logits(), 0,
+                        Math.min(headRows, sg.logits().length));
+                j++;
+            }
         }
         return true;
     }

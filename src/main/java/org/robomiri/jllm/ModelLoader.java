@@ -327,7 +327,7 @@ public final class ModelLoader {
      */
     private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int slots,
                                                       boolean metal) {
-        if (!s.getBool("backend.kv-paged")) {
+        if (!s.getBool("backend.kv-paged") && !mixedWanted(s, weights.arch)) { // the mixed scheduler runs on the paged cache
             return null;
         }
         int ctx = s.getInt("backend.ctx");
@@ -353,7 +353,30 @@ public final class ModelLoader {
     /** {@code backend} as a member of its weights' batch group, or as it is when batching is off. */
     private static Backend batched(Settings s, ModelWeights weights, Backend backend) {
         org.robomiri.jllm.engine.BatchGroup g = group(s, weights);
-        return g == null ? backend : g.join(backend);
+        if (g == null) {
+            return backend;
+        }
+        boolean wanted = mixedWanted(s, weights.arch);
+        if (wanted && backend.kvSequence() != null && !g.mixed()) {
+            g.enableMixed(mixedConfig(s));
+        }
+        return g.join(backend, wanted ? s.getInt("engine.mixed-reserve") : 0);
+    }
+
+    /**
+     * Whether {@code engine.scheduler=mixed} applies to this model (docs/25): grouped-query attention with a cache that can be
+     * paged (not q4), batched decoding on. Other models keep the slots scheduler.
+     */
+    static boolean mixedWanted(Settings s, Architecture arch) {
+        return "mixed".equalsIgnoreCase(s.get("engine.scheduler").trim()) && s.getBool("engine.batch-decode")
+                && arch instanceof org.robomiri.jllm.model.Decoder d && d.attention() instanceof org.robomiri.jllm.model.Attention.Gqa
+                && KvDtype.parse(s.get("backend.kv-dtype")) != KvDtype.Q4;
+    }
+
+    /** The mixed-pass settings of {@code s}. */
+    static org.robomiri.jllm.engine.BatchGroup.MixedConfig mixedConfig(Settings s) {
+        return new org.robomiri.jllm.engine.BatchGroup.MixedConfig(s.getInt("engine.pass-budget"), s.getInt("engine.mixed-reserve"),
+                16, s.getLong("engine.age-promote-ms") * 1_000_000L, s.getInt("engine.background-chunk-cap"));
     }
 
     /** The batch group of {@code weights}, or null with engine.batch-decode off. */
@@ -530,6 +553,9 @@ public final class ModelLoader {
             throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
+        if (member && mixedWanted(s, arch)) {
+            batch += s.getInt("engine.mixed-reserve"); // room for the tokens that ride with a full prefill chunk (BatchGroup.Member hides it)
+        }
         String backendName = resolveBackend(s);
         int threads = s.getInt("backend.threads");
         // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)

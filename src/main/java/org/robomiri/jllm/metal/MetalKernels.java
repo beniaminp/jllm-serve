@@ -1749,4 +1749,97 @@ final class MetalKernels implements AutoCloseable {
         mlaParams(m);
         dispatch("mla_lat_store" + kvSuffix(kv), 3, 0, 1, 1, 1, CHANNEL_THREADS, 1, 1);
     }
+
+    // ---------------------------------------------------------------- mixed passes (MetalBackend.forwardMixed)
+    // A mixed pass puts a prefill chunk of one conversation and the single tokens of others into one set of activation
+    // rows. The chunk's rotary embedding, cache store and attention are the single-sequence writers above, dispatched for
+    // n rows whose activation rows start at a byte offset instead of row 0.
+
+    /** {@link #rope} for n tokens whose q rows start at byte {@code qOff} of q. */
+    void ropeAt(boolean adjacent, boolean kHalf, Metal.Buffer q, long qOff, Metal.Buffer kSrc, long kSrcOff,
+                Metal.Buffer kOut, long kOutOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin,
+                int headDim, int qStride, int kvStride, int nHeads, int nKHeads, int pos, int rotOff, int rotHalf, int n) {
+        bind(0, q, qOff);
+        bind(1, kSrc, kSrcOff);
+        bindOrDummy(2, qw);
+        bindOrDummy(3, kw);
+        bind(4, cos, 0);
+        bind(5, sin, 0);
+        bind(6, kOut, kOutOff);
+        p.reset(KernelParams.ROPE).i(headDim).i(qStride).i(kvStride).i(nHeads).i(pos).f(eps).i(qw != null).i(rotOff).i(rotHalf);
+        dispatch((adjacent ? "rope_il" : "rope") + (kHalf && nKHeads > 0 ? "_h" : ""), 7, 0,
+                nHeads + nKHeads, n, 1, rotHalf, 1, 1);
+    }
+
+    /** {@link #kvStoreQ8} (paged cache) for n staging rows that start at bytes kOff / vOff. */
+    void kvStoreQ8At(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                     int headDim, int kvHeads, int pos, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, 0);
+        bind(3, vc, 0);
+        bindOrDummy(4, pageTbl);
+        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads))
+                .i(pos).i(pageShift);
+        dispatch("kv_store_q8", 5, 0, 2 * kvHeads, n, 1, 32, 1, 1);
+    }
+
+    /** {@link #kvStoreQ8Rot} (paged cache) for n staging rows that start at bytes kOff / vOff and query rows at qOff. */
+    void kvStoreQ8RotAt(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                        Metal.Buffer q, long qOff, int headDim, int kvHeads, int heads, int pos, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, 0);
+        bind(3, vc, 0);
+        bind(4, q, qOff);
+        bindOrDummy(5, pageTbl);
+        p.reset(KernelParams.KV_STORE_Q8R).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).i(pos).i(pageShift);
+        dispatch("kv_store_q8r", 6, 0, 2 * kvHeads + heads, n, 1, 32, 1, 1);
+    }
+
+    /** {@link #attention} for n tokens whose q rows start at byte qOff of q; the output rows start at byte outOff of out. */
+    void attentionAt(String kernel, int groups, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
+                     Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
+                     int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
+                     float softcap, int n) {
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, outOff);
+        bind(4, scores, 0);
+        bindOrDummy(5, pageTbl);
+        for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
+            p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx)
+                    .f(scale)
+                    .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap).i(pageShift);
+            dispatch(kernel, 6, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
+        }
+    }
+
+    /** {@link #flashPrefill} for n tokens whose q rows start at byte qOff of q; the output rows start at byte outOff of out. */
+    void flashPrefillAt(KvDtype kv, int headDim, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
+                        Metal.Buffer out, long outOff, int nHeads, int nKvHeads, int pos, int n, float scale, int qStride,
+                        int kStride, int oStride, int window, float softcap) {
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, out, outOff);
+        bindOrDummy(4, pageTbl);
+        p.reset(KernelParams.FLASH).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(kStride).i(oStride)
+                .i(window).f(softcap).i(pageShift);
+        dispatch(flashPrefillKernel + "_d" + headDim + kvSuffix(kv), 5, 0, nHeads,
+                (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
+    }
+
+    /** {@link #rmsnorm} of n rows read from byte inOff of in and written from byte outOff of out. */
+    void rmsnormTo(Metal.Buffer in, long inOff, Metal.Buffer weight, Metal.Buffer out, long outOff, int n, int width) {
+        bind(0, in, inOff);
+        bind(1, weight, 0);
+        bind(2, out, outOff);
+        p.reset(KernelParams.NORM).i(width).f(eps);
+        dispatch("rmsnorm", 3, 0, n, 1, 1, ROW_THREADS, 1, 1);
+    }
 }

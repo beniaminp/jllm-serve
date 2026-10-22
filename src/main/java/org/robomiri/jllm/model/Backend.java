@@ -128,6 +128,42 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
+     * One piece of one conversation in a {@link #forwardMixed mixed pass}: {@code n} tokens {@code tokens[off .. off+n)}
+     * at positions {@code [pos, pos+n)} of {@code owner}'s cache.
+     *
+     * @param logits receives the logits after the segment: with {@code stride == 0} the last row's (null = none wanted:
+     *               a prefill chunk that is not the prompt's last), with {@code stride > 0} every row's, row {@code i}
+     *               at {@code i * stride} (the verification of a speculative draft)
+     */
+    record Segment(Backend owner, int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    }
+
+    /**
+     * Runs several conversations' pieces in <em>one</em> forward pass: the projections, the MLP and the LM head go over all
+     * the rows at once (the weights are read once for the whole pass), while rotary embedding, the cache store and
+     * attention run per segment in its owner's cache, a multi-token segment exactly as {@link #forward} would run it alone
+     * and a single-token one as {@link #forwardBatch} runs a row. This is what lets a prefill chunk of one conversation
+     * carry the next decode token of every other one (docs/25). The owners must be distinct, idle backends of the same
+     * weights and cache type; {@code this} lends its activation buffers and need not be one of them; the total number of
+     * rows is at most {@link #maxBatch}. Returns false, having done nothing, when the backend cannot (the caller then
+     * runs the segments one by one).
+     */
+    default boolean forwardMixed(Segment[] segments) {
+        return false;
+    }
+
+    /**
+     * A point between two passes of one generation, where {@code n} positions of the cache hold the first {@code n} tokens
+     * of {@code tokens}: a scheduler may pause the conversation here (its blocks are given back to the pool, which may spill
+     * them while others run) and bring it back before returning. Returns the number of positions that are valid afterwards,
+     * {@code n} unless something could not be brought back, in which case the caller computes {@code [valid, n)} again.
+     * The default does nothing. {@code cancelled} is polled while paused, so that a client that went away is not waited for.
+     */
+    default int checkpoint(java.util.function.Supplier<int[]> tokens, int n, java.util.function.BooleanSupplier cancelled) {
+        return n;
+    }
+
+    /**
      * The machine's thermal state as the GPU driver reports it: 0 nominal, 1 fair, 2 serious (the GPU is being slowed
      * down), 3 critical; -1 when the backend cannot tell (the CPU backend, an old native library).
      */
