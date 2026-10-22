@@ -291,7 +291,61 @@ some ids equal to `forward(ids)`, and the Metal encoder and text backend against
 
 ## 20.11 Measured
 
-TBD
+Apple M1 Pro (10 cores, 16 GPU cores), JDK 26, `llama-mtmd-cli` build 11669 (Homebrew, Metal), all F16 projectors, the
+machine shared with other jobs (every timed run held the project's one-heavy-job lock, but other work was not stopped, so
+read differences below 10 % as noise). Pictures: `shapes.png` 640 × 480, `scene.png` 800 × 600 (scripts in the scratch area;
+the commands are `VisionDump <mmproj> <picture> <prefix>` with `-Djllm.vision.twice=true -Djllm.vision.reps=7` and
+`llama-mtmd-cli -m <text.gguf> --mmproj <mmproj> --image <picture> -p … -n 1 --no-warmup -ngl 99 -v`).
+
+**Encoding the picture on the GPU, weights resident** (jllm: the fastest of 7 runs; llama.cpp: the "mtmd batch encoding
+done" line of three process runs, which include its graph build):
+
+| Projector | Picture → tokens (patches) | jllm Metal | llama.cpp Metal | jllm CPU |
+|---|---|---|---|---|
+| SmolVLM-256M | 512 px tile + 512 px overview → 64 + 64 | 101 + 101 ms | 84–89 + 74–75 ms | 612 + 606 ms |
+| Qwen2.5-VL-3B | 812 × 588 → 609 (2 436) | 1 543 ms | 2 003–2 012 ms | 8 067 ms |
+| Qwen3-VL-2B | 800 × 608 → 475 (1 900) | 764 ms | 617–632 ms | 4 807 ms |
+| Gemma 3 4B | 896 × 896 → 256 (4 096) | 2 755 ms | 3 625–3 686 ms | 15 227 ms |
+| Qwen3.8-27B's projector | 800 × 608 → 475 (1 900) | 950 ms | (no matching text model for llama.cpp) | — |
+
+(One llama.cpp Qwen3-VL run printed 183 ms; it is faster than the GPU's arithmetic allows for this ViT and I do not
+understand it, so the table keeps the other two.) llama.cpp's own CPU path for the projector (`--no-mmproj-offload`) took
+5.7 s per SmolVLM tile and 107 s for the Qwen2.5-VL picture on this machine; I did not look for why (default threads),
+the jllm CPU encoder uses the Vector API on a thread pool and is 8–13 times faster in those runs.
+
+**Where the GPU time goes.** `AttnBench` and `GemmBench` (manual micro-benchmarks, 20 dispatches in one command buffer):
+
+| Kernel | Problem | Rate |
+|---|---|---|
+| `vit_gemm` | 1 900 × 1 024 → 4 096, 4 096 × 1 152 → 4 304 | 2 500 GFLOPS (half weights; the GPU's peak is ~5 300) |
+| `vit_attention_mma_d64` | 1 900 patches, 16 heads | 8.5 ms = 1 730 GFLOPS |
+| `vit_attention_mma_d72` | 4 096 patches, 16 heads (Gemma 3) | 45.5 ms = 1 700 GFLOPS |
+| `vit_attention_mma_d80` | 2 436 patches, 16 heads (Qwen2.5-VL, full-attention layers) | 17.5 ms = 1 740 GFLOPS |
+
+The first version of the attention kernel kept K, V and the probabilities in float, staged them with two barriers per
+block and walked eight softmax rows per simdgroup with `simd_max` reductions: 430 GFLOPS, which was 61 % of the Qwen3-VL
+encoding and 76 % of Gemma 3's (1 341 ms and 6 433 ms before, 764 ms and 2 755 ms now). The kernel now stages K and V as
+half in one barrier pair, shares a softmax row between 4 lanes (two shuffles instead of a simdgroup reduction), writes
+the probabilities as half and skips the diagonal rescale while no row's maximum moved. A variant with 16 query rows
+per simdgroup (more reuse of each K slice) ran at 640 GFLOPS because of its register use; 8 rows per simdgroup is the
+fast one. The price is the half-precision softmax input: the output differs from the float kernel by 5·10⁻⁴ … 1.3·10⁻³
+(`kernel_tests.py`), and the embeddings stay at the same few 10⁻³ from llama.cpp's.
+
+**A whole answer** (64 new tokens, temperature 0, one process each so the numbers include first use of the pipelines;
+the text model's own decode speed is the engine's, not the vision code's):
+
+| Model (text + projector), Metal | jllm: encode, prefill, decode, total | llama.cpp: encode, prefill, decode, total |
+|---|---|---|
+| SmolVLM-256M Q8_0, 149 tokens | 422 ms (cold), 119 ms, 251 tok/s, 819 ms | 161 ms, 198 ms (751 tok/s), 268 tok/s, 581 ms |
+| Qwen2.5-VL-3B Q4_K_M, 646 / 625 tokens | 1 743 ms, 3 761 ms (172 tok/s), 22.8 tok/s, 8 344 ms | 2 010 ms, 3 109 ms (201 tok/s), 59.9 tok/s, 5 181 ms |
+| Qwen3-VL-2B Q8_0, 491 tokens | 1 170 ms (cold), 1 481 ms, 39.6 tok/s, 4 293 ms | (not captured) |
+| SmolVLM-256M, CPU | 1 884 ms, 851 ms, 215 tok/s, 3 050 ms | 13.0 s (two tiles), 13.2 s, 183 tok/s, 13.8 s |
+| Qwen2.5-VL-3B, CPU | 9 328 ms, 14 494 ms, 20.4 tok/s, 26 987 ms | 107 s, 124 s, 18.9 tok/s, 130 s |
+
+The picture costs about as much as llama.cpp's on the GPU and a small model answers a picture in under a second; the
+remaining gap on Qwen2.5-VL is the text model: its Q4_K_M decode on Metal (22.8 against 59.9 tok/s) is the engine's K-quant
+speed (chapter 11), not something this chapter changed. Re-running the table is `scripts/mac-validate.sh --vision
+mmproj.gguf picture.png` (encoder, GPU and CPU) and the commands above.
 
 ## 20.12 Limits, and what differs from Hugging Face
 
