@@ -205,9 +205,10 @@ text only). A chat request carries a picture as an OpenAI `image_url` content pa
 the server fetches, never from private addresses unless `vision.allow-private-urls`); the web console's chat box
 attaches, pastes or drops pictures; a text-only model can use a loaded vision model through the `describe_image` tool.
 Put the picture before the question. Settings: `vision.*` in [`jllm.properties`](src/main/resources/jllm.properties);
-the chapter is [docs/20](docs/20-vision.md). Not yet end to end: Gemma 3 (the `gemma3` GGUF text architecture and its
-bidirectional attention inside a picture are not in this build; its projector is implemented and checked) and
-`unsloth/Qwen3.8-27B-GGUF` (its projector runs; the hybrid text architecture takes no embeddings yet).
+the chapter is [docs/20](docs/20-vision.md). `unsloth/Qwen3.8-27B-GGUF` (Qwen3.5, a Gated DeltaNet hybrid) sees pictures on CPU
+and Metal and matches llama.cpp's prompt ids, first-position log-probs and greedy answer. Gemma 3: the projector and the
+attention that runs both ways inside a picture are implemented and checked, but the `gemma3` GGUF text architecture is not in
+this build, so a Gemma 3 model cannot be loaded yet.
 
 ### API
 
