@@ -596,6 +596,13 @@ public final class KvPool implements AutoCloseable {
         return written;
     }
 
+    /** Moves everything the warm tier holds to the block files, so that it survives a restart. */
+    public void flushSpill() {
+        if (spill instanceof TieredSpill t) {
+            t.flush();
+        }
+    }
+
     // ------------------------------------------------------------------ statistics
 
     public synchronized Stats stats() {
