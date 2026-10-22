@@ -1,6 +1,7 @@
 package org.robomiri.jllm.server;
 
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.Priority;
 import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.JsonConstraint;
@@ -39,9 +40,10 @@ public final class OpenAiFeatures {
      * @param suffix      completions: text after the insertion point (fill-in-the-middle), or null
      * @param logitBias   dense bias by token id, or null
      * @param format      the JSON constraint of {@code response_format}, or null for text
+     * @param priority    {@code "priority"}: interactive (the default) or background (docs/10 section 10.14)
      */
     public record Options(int n, int bestOf, boolean logprobs, int topLogprobs, boolean echo, String suffix,
-                          float[] logitBias, JsonConstraint.Schema format) {
+                          float[] logitBias, JsonConstraint.Schema format, Priority priority) {
 
         /** How many sequences the engine generates. */
         public int count() {
@@ -59,7 +61,7 @@ public final class OpenAiFeatures {
             byte[][] table = f == null ? null : JsonConstraint.tokenTable(tok);
             Object masks = f == null ? null : JsonConstraint.newMaskCache(); // shared by the request's choices
             return new Engine.Decoding(logitBias, logprobs || bestOf > n, topLogprobs, echo && logprobs,
-                    f == null ? null : () -> new JsonConstraint(f, table, masks));
+                    f == null ? null : () -> new JsonConstraint(f, table, masks), priority);
         }
     }
 
@@ -117,7 +119,32 @@ public final class OpenAiFeatures {
             throw new IllegalArgumentException("'echo' and 'suffix' cannot be used together");
         }
         return new Options(n, bestOf, logprobs, top, Boolean.TRUE.equals(echo), (String) suffix,
-                logitBias(b, vocab), format(b));
+                logitBias(b, vocab), format(b), priority(b));
+    }
+
+    /** Name of the request header that sets the priority when the body has no {@code priority} field. */
+    public static final String PRIORITY_HEADER = "X-Jllm-Priority";
+
+    /**
+     * {@code "priority": "interactive" | "background"} (an extension of the OpenAI request): who gets the device first
+     * when requests contend for it ({@link Priority}); absent = interactive.
+     */
+    static Priority priority(Map<String, Object> b) {
+        Object p = b.get("priority");
+        if (p == null) {
+            return Priority.INTERACTIVE;
+        }
+        if (!(p instanceof String name)) {
+            throw new IllegalArgumentException("'priority' must be \"interactive\" or \"background\"");
+        }
+        return Priority.parse(name);
+    }
+
+    /** Puts the {@link #PRIORITY_HEADER} header's value into {@code body} unless the body names a priority itself. */
+    public static void headerPriority(Map<String, Object> body, String header) {
+        if (header != null && !header.isBlank() && body.get("priority") == null) {
+            body.put("priority", header.trim());
+        }
     }
 
     /** {@code logit_bias}: token id (as a string) to a bias in [-100, 100], as a dense array; null when absent. */

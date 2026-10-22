@@ -159,15 +159,15 @@ public final class ModelLoader {
         Architecture arch = p.arch();
         Tokenizer tok = p.tok();
         ModelWeights weights = p.weights();
-        int ctx = s.getInt("backend.ctx");
-        int batch = batch(s, arch);
         Speculator.Config spec = speculation(s, arch, weights);
+        int ctx = contextLength(s, arch, weights, slots, spec.mode() == Speculator.Mode.DRAFT);
+        int batch = batch(s, arch);
         // the draft model first, on the same device: it joins DeviceLedger before the target's backend plans its GPU
         // memory (backend.metal.cpu-moe), so the target's budget leaves room for the draft's weights and caches
-        DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch, weights) : null;
+        DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch, weights, ctx) : null;
         Backend backend;
         try {
-            backend = batched(s, weights, newBackend(s, arch, weights, slots, true));
+            backend = batched(s, weights, newBackend(s, arch, weights, ctx, slots, true));
         } catch (Exception e) {
             if (draft != null) {
                 draft.close();
@@ -245,6 +245,29 @@ public final class ModelLoader {
                 s.getInt("vision.cache-mb"), s.opt("backend.metal.lib"));
     }
 
+    /** True if {@code backend.ctx} holds a number (not {@code auto}). */
+    public static boolean explicitCtx(Settings s) {
+        return !"auto".equalsIgnoreCase(s.get("backend.ctx").trim());
+    }
+
+    /**
+     * The context length (positions per slot): {@code backend.ctx} when it is a number, otherwise
+     * {@link ContextBudget} sizes it from the memory free for the KV caches ({@code backend.ctx=auto}, the default), up
+     * to {@code backend.ctx-max}, and logs the choice and its arithmetic.
+     *
+     * @param slots engines that will run on these weights, each with a cache of this length
+     * @param draft a draft model shares the device
+     */
+    public static int contextLength(Settings s, Architecture arch, ModelWeights weights, int slots, boolean draft) {
+        if (explicitCtx(s)) {
+            return s.getInt("backend.ctx");
+        }
+        ContextBudget.Plan p = ContextBudget.forModel(s, arch, weights, Math.max(1, slots), draft);
+        System.err.println("Context: " + p.describe() + String.format(java.util.Locale.ROOT, "; KV cache %.2f GB per slot",
+                p.kvBytes() / 1e9));
+        return p.ctx();
+    }
+
     /** Gemma 3: the tokens of one picture (docs/20.12); {@code backend.batch} at its default is raised to this. */
     static final int GEMMA3_PICTURE_BATCH = 256;
 
@@ -289,9 +312,10 @@ public final class ModelLoader {
     }
 
     /**
-     * The speculation settings for this model: prompt lookup is the default, except for mixture-of-experts models,
-     * where a verification pass reads the experts of every drafted position and was measured not to pay
-     * (docs/11 §11.6), unless {@code engine.speculative} was set explicitly.
+     * The speculation settings for this model: prompt lookup is the default for every model, mixture-of-experts ones
+     * included (it was off for them until docs/11 section 11.11 measured it again on agent-like prompts: +68 % on a code
+     * edit, -10 % to -1 % on tool calls and prose on the 30B, because prompt lookup now pauses when its drafts do not pay).
+     * A model with a multi-token-prediction head drafts with it unless {@code engine.speculative} was set explicitly.
      */
     static Speculator.Config speculation(Settings s, Architecture arch, ModelWeights weights) {
         Speculator.Config spec = speculation(s, arch);
@@ -304,12 +328,7 @@ public final class ModelLoader {
     }
 
     static Speculator.Config speculation(Settings s, Architecture arch) {
-        Speculator.Config spec = s.speculation();
-        boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
-        if (moe && spec.mode() == Speculator.Mode.NGRAM && "default".equals(s.source("engine.speculative"))) {
-            return new Speculator.Config(Speculator.Mode.OFF, spec.k(), spec.ngramMax(), spec.ngramMin(), spec.window());
-        }
-        return spec;
+        return s.speculation();
     }
 
     /**
@@ -325,12 +344,11 @@ public final class ModelLoader {
      * The pool of KV blocks the CPU slots of {@code weights} share when {@code backend.kv-paged} is on (docs/24), made
      * by the first slot; null when the flat cache is wanted or the model cannot be paged.
      */
-    private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int slots,
+    private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int ctx, int slots,
                                                       boolean metal) {
         if (!s.getBool("backend.kv-paged") && !s.getBool("backend.kv-sparse")) {
             return null;
         }
-        int ctx = s.getInt("backend.ctx");
         int block = s.getInt("backend.kv-block");
         long tokens = s.getLong("backend.kv-pool-tokens");
         String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens
@@ -360,7 +378,7 @@ public final class ModelLoader {
     /** The batch group of {@code weights}, or null with engine.batch-decode off. */
     private static org.robomiri.jllm.engine.BatchGroup group(Settings s, ModelWeights weights) {
         return s.getBool("engine.batch-decode")
-                ? GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup()) : null;
+                ? GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup(s.getBool("engine.priority-order"))) : null;
     }
 
     /**
@@ -386,7 +404,8 @@ public final class ModelLoader {
 
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
-        Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1, true));
+        // the same context as the first slot's (backend.ctx=auto was decided once, for all the slots)
+        Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), first.backend().contextLength(), 1, true));
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
         constraints(s, e);
@@ -517,8 +536,13 @@ public final class ModelLoader {
     }
 
     public static Backend createBackend(Settings s, Architecture arch, ModelWeights weights) throws Exception {
+        return createBackend(s, arch, weights, contextLength(s, arch, weights, 1, false));
+    }
+
+    /** As above with the context length decided ({@code backend.ctx=auto} is resolved once per model, by {@link #contextLength}). */
+    public static Backend createBackend(Settings s, Architecture arch, ModelWeights weights, int ctx) throws Exception {
         try {
-            return newBackend(s, arch, weights, 1, false);
+            return newBackend(s, arch, weights, ctx, 1, false);
         } catch (Exception e) {
             weights.close();
             throw e;
@@ -540,9 +564,8 @@ public final class ModelLoader {
 
     /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
     /** {@code member}: the backend will join its weights' batch group (and share the group's CPU threads). */
-    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots, boolean member)
+    private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int ctx, int slots, boolean member)
             throws Exception {
-        int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
         String backendName = resolveBackend(s);
         int threads = s.getInt("backend.threads");
@@ -582,17 +605,17 @@ public final class ModelLoader {
                     : member && group(s, weights) != null // a group's slots share one pool: they never compute at once
                     ? new CpuBackend(weights, ctx, batch, group(s, weights).cpuPool(
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors()), kvDtype,
-                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, slots, false) : null)
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null)
                     : new CpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, slots, false) : null);
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null);
             case "metal" -> mamba
                     ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                     : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
                             new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
                                     threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
                                     int8(s, weights, threads), null, Math.max(1, slots)),
-                            member ? kvPool(s, weights, kvDtype, slots, true) : null);
+                            member ? kvPool(s, weights, kvDtype, ctx, slots, true) : null);
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }
@@ -602,7 +625,7 @@ public final class ModelLoader {
      * file, or a local {@code .gguf}) on the same backend type; it must share the target's tokenizer.
      */
     private static DraftModel loadDraft(Settings s, HuggingFaceHub hub, Tokenizer targetTok, Architecture targetArch,
-                                        ModelWeights targetWeights) throws Exception {
+                                        ModelWeights targetWeights, int ctx) throws Exception {
         String repo = s.get("engine.draft-model");
         Prepared p;
         try {
@@ -631,7 +654,7 @@ public final class ModelLoader {
         }
         Backend backend;
         try {
-            backend = createBackend(s, arch, weights); // closes the draft's weights if it fails
+            backend = createBackend(s, arch, weights, ctx); // closes the draft's weights if it fails
         } catch (Exception e) {
             targetWeights.close();
             throw e;
