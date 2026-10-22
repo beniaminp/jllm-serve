@@ -238,8 +238,7 @@ public final class ToolCallFormat {
         Supplier<TokenConstraint> c = constraint(body, engine.tokenizer(), answer,
                 thinking && engine.template().name().equals("chatml-qwen3"),
                 org.robomiri.jllm.web.chat.ReasoningSplitter.promptOpensThink(engine, prompt));
-        return c == null ? decoding : new Engine.Decoding(decoding.logitBias(), decoding.logprobs(),
-                decoding.topLogprobs(), decoding.promptLogprobs(), c);
+        return c == null ? decoding : decoding.withConstraint(c);
     }
 
     /** A message's text: a string, or the text parts of a multi-part content array. */

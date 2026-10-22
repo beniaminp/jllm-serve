@@ -110,6 +110,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- AgentDefaultsTest: backend.ctx=auto arithmetic, request priority parsing and the device queue order. -->
+                    <execution>
+                        <id>agent-defaults-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.AgentDefaultsTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- PromptCacheTest: cached prompt tokenization equals a full one (needs only the tokenizer). -->
                     <execution>
                         <id>prompt-cache-test</id>
@@ -126,6 +147,91 @@
                                 <argument>-cp</argument>
                                 <classpath/>
                                 <argument>org.robomiri.jllm.PromptCacheTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- KvPoolTest: the block pool, prefix tree, copy on write, eviction and spill store (no model). -->
+                    <execution>
+                        <id>kv-pool-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.KvPoolTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- PagedKvTest: the paged CPU cache equals the flat one bit for bit (no model). -->
+                    <execution>
+                        <id>paged-kv-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.PagedKvTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- LongContextTest: a million positions through the paged CPU cache (block offsets past 2^32 bytes). -->
+                    <execution>
+                        <id>long-context-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.LongContextTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- PagedEngineTest: paged vs flat through the engine; sharing, fork, eviction + spill, speculation, batched rows, saved caches. -->
+                    <execution>
+                        <id>paged-engine-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-Djllm.cpu.deterministic=true</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.PagedEngineTest</argument>
                                 <argument>${jllm.test.model}</argument>
                             </arguments>
                             <classpathScope>test</classpathScope>

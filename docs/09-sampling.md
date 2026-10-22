@@ -235,11 +235,33 @@ where temperature is applied, and that is harmless: top-k selects by logit, and 
 (HF sets discarded logits to −∞, which also gives them zero weight). For the default `top_k = 20`, outputs are
 distributed exactly as in `transformers`.
 
-With a constraint (`response_format`, [10 §10.6](10-engine-and-server.md#106-the-openai-compatible-api)),
-`sample(logits, allowed)` runs the same steps on the *allowed* tokens only: after penalties and bias it takes the
-256 most likely tokens, keeps those the constraint allows (testing them most likely first, scanning the whole
-vocabulary only when none is allowed), and greedy takes the first, sampling applies temperature, top-k, top-p and
-min-p to the allowed candidates, renormalized.
+### Sampling under a constraint
+
+With a constraint (`response_format`, tool calls: [10 §10.6](10-engine-and-server.md#106-the-openai-compatible-api),
+[17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)) the sampler may only return a token the
+constraint `allowed` accepts. `Sampler.sample(logits, allowed)` applies the penalties and bias as before and then:
+
+1. **greedy:** test the argmax; if it is allowed, that is the answer and nothing else runs (the usual case);
+2. otherwise take the 256 most likely tokens (`CONSTRAINED_POOL`) and keep the allowed ones, most likely first (for a
+   constraint that knows a small allowed list, `allowedTokens`, pick among that list instead); only if none of the 256
+   is allowed is the whole vocabulary searched;
+3. **greedy** returns the first allowed token; **sampling** applies temperature, top-k, top-p and min-p to the allowed
+   candidates, *renormalized over them*, and draws. When no token is allowed (a vocabulary without the bytes the constraint needs) it returns -1 and the engine ends the generation with finish reason `stop`.
+
+Worked example, `T = 1`, `top_k = 20`, logits by token `[3.0, 2.5, 2.0, 1.0, 0.5]` of which only tokens 1, 2 and 4 are allowed.
+The allowed logits 2.5, 2.0, 0.5 give weights `1, e^{−0.5} = 0.6065, e^{−2} = 0.1353` (relative to the best allowed), sum
+1.7418, probabilities **0.574, 0.348, 0.078**. With `top_p = 0.95` the cumulative sums are 0.574, 0.922, 1.000: all three stay;
+with `top_p = 0.9` the second sum already reaches 0.9, so only tokens 1 and 2 are drawn from (0.62 and 0.38 after
+renormalizing). Token 0, the model's favourite, is never returned.
+
+**Relaxed constraints** (`TokenConstraint.relaxed`, free text between two tool calls): nearly everything is allowed, so
+`sampleRelaxed` draws from the *plain* distribution and only falls back to the masked sample when the drawn token is not
+allowed. The result is distributed as the plain distribution restricted to the allowed tokens: with allowed mass
+`A = 0.8` and an allowed token `x` with `p(x) = 0.4`, `x` is drawn directly with probability 0.4, and with probability
+`1 − A = 0.2` a disallowed token is drawn and the masked sample returns `x` with probability `p(x)/A = 0.5`, so the total is
+`0.4 + 0.2 · 0.5 = 0.5 = p(x)/A`. Free text is therefore token for token the unconstrained text. The cost of masking
+(the trie walk, the memoized masks) and the forced runs of text that skip sampling altogether (jump-forward) are in
+[17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward), not repeated here.
 
 ---
 
@@ -247,10 +269,18 @@ min-p to the allowed candidates, renormalized.
 
 `Sampler.verify(logits, draft)` is the sampling step used by speculative decoding
 ([10 §10.9](10-engine-and-server.md#109-speculative-decoding)) for a draft token proposed deterministically (a
-one-hot proposal). It builds the same distribution `sample` draws from (penalties, temperature, top-k, top-p, min-p),
-accepts the draft with probability `p(draft)` and otherwise draws from that distribution with the draft's mass
-removed, so the returned token is distributed exactly like a plain `sample` result and equals the draft iff the
-draft was accepted. Greedy decoding returns the argmax.
+one-hot proposal): a token from prompt lookup, from a small draft model, or from the model's own multi-token-prediction
+head ([16 §16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)); in all three cases the proposal
+is one token, so the same rule applies. It builds the same distribution `sample` draws from (penalties, temperature,
+top-k, top-p, min-p), accepts the draft with probability `p(draft)` and otherwise draws from that distribution with the
+draft's mass removed, so the returned token is distributed exactly like a plain `sample` result and equals the draft iff
+the draft was accepted. Greedy decoding returns the argmax. Worked example with the numbers above (constrained, tokens 1,
+2, 4 allowed, `top_p = 0.95`): a draft of token 1 is accepted with probability 0.574; otherwise the draw is among tokens
+2 and 4 with weights 0.348 and 0.078 (0.817 and 0.183), so token 1 is returned with probability 0.574, token 2 with
+`0.426 · 0.817 = 0.348` and token 4 with `0.426 · 0.183 = 0.078`: exactly the plain constrained distribution. A draft the
+constraint does not allow is cut off before it is verified. `verify(logits, draft, allowed)` and `verifyRelaxed` are the
+constrained forms; the greedy result is the masked argmax whatever the draft ([17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)
+shows the speculation under a constraint end to end).
 
 ---
 

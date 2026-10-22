@@ -15,6 +15,9 @@
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
 #   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png   plus the vision encoder rows (docs/20): encoding the
 #                                                            picture on the GPU (default) against the CPU, warm
+#   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png --vision-model text.gguf   ... and the whole answer to the picture
+#                                                            (prefill including the encoding), a Gemma 3 file also with
+#                                                            attention that runs both ways inside the picture on and off
 #   scripts/mac-validate.sh --audio speech.wav               plus the audio rows (Whisper small and OuteTTS: CPU, Metal encoder,
 #                                                            Metal decoder, half and float weight tiles; q8 and q4 speech model)
 #   scripts/mac-validate.sh --gguf-types DIR                 plus every .gguf in DIR (e.g. made with llama-quantize from one
@@ -42,6 +45,7 @@ LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
 VISION_MMPROJ=""
 VISION_IMAGE=""
+VISION_MODEL=""
 AUDIO=""
 GGUF_TYPES=""
 while [ $# -gt 0 ]; do
@@ -57,6 +61,7 @@ while [ $# -gt 0 ]; do
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
     --vision) VISION_MMPROJ="$2"; VISION_IMAGE="$3"; shift 3 ;;
+    --vision-model) VISION_MODEL="$2"; shift 2 ;;
     --audio) AUDIO="$2"; shift 2 ;;
     --gguf-types) GGUF_TYPES="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -136,12 +141,24 @@ bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off
-bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
+bench "q8 KV cache (default: rotated keys, backend.kv-q8-rotate)" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
+bench "q8 KV cache, plain keys (backend.kv-q8-rotate false)" "$DENSE" "" --backend.kv-dtype q8 --backend.kv-q8-rotate false --engine.speculative off
 bench "q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off
+# the paged KV cache (docs/24): one pool of 16-token blocks and a block table per slot instead of a flat array, against the
+# flat cache on the same prompts (the flat rows are the defaults above; backend.kv-paged=false is the default)
+bench "paged KV cache (f32, 16-token blocks)" "$DENSE" "" --backend.kv-paged true --engine.speculative off
+bench "paged KV cache, f16" "$DENSE" "" --backend.kv-paged true --backend.kv-dtype f16 --engine.speculative off
+bench "paged KV cache, q8" "$DENSE" "" --backend.kv-paged true --backend.kv-dtype q8 --engine.speculative off
+bench "paged KV cache, 64-token blocks" "$DENSE" "" --backend.kv-paged true --backend.kv-block 64 --engine.speculative off
+bench "~3000-token prompt: flat KV cache" "$DENSE" "" --bench.prompt-repeat 300 --engine.speculative off
+bench "~3000-token prompt: paged KV cache" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
+bench "~3000-token prompt: paged KV cache, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
 bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 0 --engine.speculative off
 bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
 bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200
 bench "~2000-token prompt: q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off --bench.prompt-repeat 200
+bench "~2000-token prompt: q8 KV cache (rotated keys)" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off --bench.prompt-repeat 200
+bench "~2000-token prompt: q8 KV cache, plain keys" "$DENSE" "" --backend.kv-dtype q8 --backend.kv-q8-rotate false --engine.speculative off --bench.prompt-repeat 200
 # draft-model speculation on the GPU (the draft is the dense model itself: every draft is accepted, so this measures
 # what a pass of k drafts costs against k plain steps; a real draft is smaller and accepts less)
 bench "speculation off" "$DENSE" "" --engine.speculative off
@@ -172,6 +189,60 @@ mvn -q compile test-compile
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
 batch "3 slots generating together, concurrent encoder on" "-Djllm.metal.concurrent=true"
+
+# defaults for agent serving (docs/10 sections 10.13 and 10.14, docs/11 section 11.11)
+# 1. speculation on agent-like prompts: a code edit that resends a file, a JSON tool call, and prose (SpecAgentBench;
+#    the md5 of the text must be the same in every mode: greedy output does not depend on speculation)
+spec() { # label settings...
+  local label="$1"
+  shift
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.SpecAgentBench --rounds "$ROUNDS" "$@" > "$OUT/spec.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/spec.log") |"; return; }
+  grep '^SPEC scenario' "$OUT/spec.log" | sed -E "s/SPEC scenario=([a-z]+) .*decode_tok_s=([0-9.]+) .*drafted=([0-9]+) accepted=([0-9]+) md5=([0-9a-f]+)/| $label, \1 | \2 | \4 of \3 | \5 |/"
+}
+echo
+echo "| speculation on agent-like prompts | decode tok/s | accepted of drafted | md5 of the text |"
+echo "|---|---|---|---|"
+spec "$DENSE off" --model "$DENSE" --engine.speculative off
+spec "$DENSE ngram (default)" --model "$DENSE" --engine.speculative ngram
+# 2. the request priority: a background job (1500-token prompt, then 96 tokens) runs on one slot when a short interactive
+#    request arrives on another (PriorityBench); with engine.priority-order the job gives way at the device
+prio() { # label settings...
+  local label="$1"
+  shift
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.PriorityBench --rounds "$ROUNDS" "$@" > "$OUT/prio.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/prio.log") |"; return; }
+  grep '^PRIO job=' "$OUT/prio.log" | sed -E "s/PRIO job=([a-z]+) interactive request: first token ([0-9]+) ms.*whole request ([0-9]+) ms; the job took ([0-9]+) ms/| $label, the job is \1 | \2 | \3 | \4 |/"
+}
+echo
+echo "| request priority (a short interactive request while a long job runs) | first token ms | whole request ms | the job ms |"
+echo "|---|---|---|---|"
+prio "$DENSE, engine.priority-order=true (default)" --model "$DENSE" --engine.priority-order true
+prio "$DENSE, engine.priority-order=false" --model "$DENSE" --engine.priority-order false
+# 3. the context length backend.ctx=auto picks (the "Context:" line of the load log), and that a long context costs no speed
+ctxrow() { # label settings...
+  local label="$1"
+  shift
+  echo "| $label | $(./jllm run "$@" --max-tokens 1 --prompt hi 2>&1 | grep -m1 '^Context:' | sed 's/^Context: //') |"
+}
+echo
+echo "| context length | what backend.ctx=auto picks |"
+echo "|---|---|"
+ctxrow "$DENSE" --model "$DENSE"
+ctxrow "$DENSE, f16 KV cache" --model "$DENSE" --backend.kv-dtype f16
+JAVA_OPTS="-Djllm.metal.workingSetGb=2" ctxrow "$DENSE, Metal working set limited to 2 GB (-Djllm.metal.workingSetGb)" --model "$DENSE"
+[ -z "$QWEN35" ] || ctxrow "$QWEN35" --model "$QWEN35"
+[ -z "$MOE" ] || ctxrow "$MOE" --model "$MOE"
+[ -z "$MOE" ] || ctxrow "$MOE, f16 KV cache" --model "$MOE" --backend.kv-dtype f16
+echo
+echo "| context length and speed | prefill tok/s | decode tok/s | note |"
+echo "|---|---|---|---|"
+bench "$DENSE: backend.ctx=auto (default)" "$DENSE" ""
+bench "$DENSE: --ctx 4096 (the old default)" "$DENSE" "" --ctx 4096
 # the vision encoder (docs/20): the second encoding of a picture (weights resident, pipelines built) on the GPU against
 # the CPU encoder (vision.backend=cpu); VisionDump prints the time per chunk of the picture
 vision() { # label backend
@@ -188,6 +259,22 @@ if [ -n "$VISION_MMPROJ" ]; then
   echo "|---|---|---|---|"
   vision "on the GPU (vision.backend=metal, default)" metal
   vision "on the CPU (vision.backend=cpu)" cpu
+  if [ -n "$VISION_MODEL" ]; then
+    # the whole answer: ./jllm run with the picture; its last line has the prefill time (the encoding is before it) and the speed
+    answer() { # label java-opts
+      local label="$1" opts="$2"
+      JAVA_OPTS="$opts" JLLM_CONFIG=/dev/null ./jllm run --model "$VISION_MODEL" --mmproj "$VISION_MMPROJ" --image "$VISION_IMAGE" \
+        --prompt "Describe the picture." --temp 0 --max-tokens 16 --backend metal --ctx 1024 > "$OUT/answer.log" 2>&1 || {
+        echo "| $label | failed | | $(tail -1 "$OUT/answer.log") |"; return; }
+      echo "| $label | $(grep -o '[0-9]* ms to encode' "$OUT/answer.log" | head -1) | $(grep -o 'prefill [0-9]* ms' "$OUT/answer.log" | head -1) | $(grep -o '[0-9.]* tok/s' "$OUT/answer.log" | tail -1) |"
+    }
+    echo
+    echo "| whole answer, 16 tokens | encode | prefill | decode |"
+    echo "|---|---|---|---|"
+    answer "defaults" ""
+    # Gemma 3 only (other families have no picture attention of their own): a picture attends to itself both ways by default
+    answer "attention inside the picture causal (-Djllm.vision.causal=true)" "-Djllm.vision.causal=true"
+  fi
 fi
 # constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
 # with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
@@ -257,6 +344,13 @@ if [ -n "$MOE" ]; then
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
+  # speculation on agent-like prompts (see the dense rows above): MoE models run without it unless asked
+  echo
+  echo "| speculation on agent-like prompts, $MOE | decode tok/s | accepted of drafted | md5 of the text |"
+  echo "|---|---|---|---|"
+  spec "off" --model "$MOE" --engine.speculative off --ctx 6144
+  spec "ngram" --model "$MOE" --engine.speculative ngram --ctx 6144
+  spec "draft $DENSE" --model "$MOE" --engine.speculative draft --engine.draft-model "$DENSE" --ctx 6144
 fi
 # image generation (docs/22): Stable Diffusion on the GPU, each switch on and off (needs the diffusers folder of a model in
 # models/, default stabilityai/sd-turbo; IMAGE_MODEL=<folder> to choose another)

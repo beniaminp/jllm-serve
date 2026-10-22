@@ -341,6 +341,20 @@ final class MetalKernels implements AutoCloseable {
     private long replayed;
     private long recorded;
 
+    /**
+     * The block table of the paged KV cache the attention and cache-store launches below read through (docs/24): the
+     * kernels bind {@code pageTbl} (an int per logical block) and address position {@code s} at row
+     * {@code (tbl[s >> pageShift] << pageShift) | (s & (2^pageShift - 1))} of the pool buffers they are given; null / 0
+     * is the flat cache. Set by the backend before the launches of a layer and reset after.
+     */
+    private Metal.Buffer pageTbl;
+    private int pageShift;
+
+    void page(Metal.Buffer tbl, int shift) {
+        pageTbl = tbl;
+        pageShift = shift;
+    }
+
     /** Declares {@code b} a per-position cache: position p's row starts at byte {@code p * bytesPerRow}. */
     void rowIndexed(Metal.Buffer b, long bytesPerRow) {
         rowBytes.put(b, bytesPerRow);
@@ -891,6 +905,18 @@ final class MetalKernels implements AutoCloseable {
     void ropeStoreQ8(boolean adjacent, Metal.Buffer q, Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc,
                      Metal.Buffer vc, long cacheOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin,
                      int headDim, int qStride, int nHeads, int nKvHeads, int pos, int rotOff, int rotHalf, int n) {
+        ropeStoreQ8(adjacent, false, q, kStage, vStage, kc, vc, cacheOff, qw, kw, cos, sin, headDim, qStride, nHeads, nKvHeads,
+                pos, rotOff, rotHalf, n);
+    }
+
+    /**
+     * {@link #ropeStoreQ8}; with {@code rotate} ({@code rope_store_q8r}, a q8 cache of Hadamard-rotated keys) the k heads
+     * are rotated before they are quantized and the q heads are written rotated, so {@link #kvStoreQ8Rot} is not needed.
+     */
+    void ropeStoreQ8(boolean adjacent, boolean rotate, Metal.Buffer q, Metal.Buffer kStage, Metal.Buffer vStage,
+                     Metal.Buffer kc, Metal.Buffer vc, long cacheOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos,
+                     Metal.Buffer sin, int headDim, int qStride, int nHeads, int nKvHeads, int pos, int rotOff, int rotHalf,
+                     int n) {
         int kvDim = headDim * nKvHeads;
         bind(0, q, 0);
         bind(1, kStage, 0);
@@ -903,7 +929,8 @@ final class MetalKernels implements AutoCloseable {
         bind(8, vc, cacheOff);
         p.reset(KernelParams.ROPE_Q8).i(headDim).i(qStride).i(kvDim).i(nHeads).iv(DecodeProgram.VAR_POS, pos).f(eps)
                 .i(qw != null).i(rotOff).i(rotHalf).i(nKvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, nKvHeads));
-        dispatch(adjacent ? "rope_il_store_q8" : "rope_store_q8", 9, 0, nHeads + 2 * nKvHeads, n, 1, rotHalf, 1, 1);
+        dispatch((adjacent ? "rope_il_store_q8" : "rope_store_q8") + (rotate ? "r" : ""), 9, 0, nHeads + 2 * nKvHeads, n, 1,
+                rotHalf, 1, 1);
     }
 
     // ---------------------------------------------------------------- attention
@@ -921,11 +948,12 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, out, 0);
         bind(4, scores, 0);
+        bindOrDummy(5, pageTbl);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).iv(DecodeProgram.VAR_POS, pos).i(ctx)
                     .f(scale)
-                    .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap);
-            dispatch(kernel, 5, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
+                    .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap).i(pageShift);
+            dispatch(kernel, 6, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
     }
 
@@ -963,14 +991,51 @@ final class MetalKernels implements AutoCloseable {
      * byte offset {@code off} of kc / vc (row stride {@code kvDim + 4 * kvHeads}: int8 values, then a scale per head).
      */
     void kvStoreQ8(Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc, Metal.Buffer vc, long off, int headDim,
-                   int kvHeads, int n) {
+                   int kvHeads, int pos, int n) {
         int kvDim = headDim * kvHeads;
         bind(0, kStage, 0);
         bind(1, vStage, 0);
         bind(2, kc, off);
         bind(3, vc, off);
-        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads));
-        dispatch("kv_store_q8", 4, 0, 2 * kvHeads, n, 1, 32, 1, 1);
+        bindOrDummy(4, pageTbl);
+        // paged: the buffers are bound at row 0 (off == 0) and the rows of positions pos .. pos + n - 1 come from the table
+        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads))
+                .iv(DecodeProgram.VAR_POS, pos).i(pageShift);
+        dispatch("kv_store_q8", 5, 0, 2 * kvHeads, n, 1, 32, 1, 1);
+    }
+
+    /**
+     * {@code kv_store_pg}: the paged f32 / f16 cache's store of the n f32 staging rows of k and v ({@code [n, kvDim]},
+     * k already rotated) into the pool rows of positions pos .. pos + n - 1 (rounded to half for {@code half}). The
+     * staging rows are bound at bytes kOff / vOff.
+     */
+    void kvStorePaged(boolean half, Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc,
+                      Metal.Buffer vc, int kvDim, int pos, int n) {
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, 0);
+        bind(3, vc, 0);
+        bindOrDummy(4, pageTbl);
+        p.reset(KernelParams.KV_PAGED).i(kvDim).i(kvDim).iv(DecodeProgram.VAR_POS, pos).i(pageShift);
+        dispatch(half ? "kv_store_pg_h" : "kv_store_pg", 5, 0, 2 * channelGrid(kvDim), n, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /**
+     * {@code kv_store_q8r}: {@link #kvStoreQ8} for a q8 cache of rotated keys: k is Hadamard-rotated before it is
+     * quantized and the chunk's query rows ({@code q}, [n, heads * headDim]) are rotated in place.
+     */
+    void kvStoreQ8Rot(Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc, Metal.Buffer vc, long off, Metal.Buffer q,
+                      int headDim, int kvHeads, int heads, int pos, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, 0);
+        bind(1, vStage, 0);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, 0);
+        bindOrDummy(5, pageTbl);
+        p.reset(KernelParams.KV_STORE_Q8R).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).iv(DecodeProgram.VAR_POS, pos).i(pageShift);
+        dispatch("kv_store_q8r", 6, 0, 2 * kvHeads + heads, n, 1, 32, 1, 1);
     }
 
     /**
@@ -1085,9 +1150,10 @@ final class MetalKernels implements AutoCloseable {
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, out, 0);
+        bindOrDummy(4, pageTbl);
         p.reset(KernelParams.FLASH).i(nHeads).i(nKvHeads).i(pos).i(n).f(scale).i(qStride).i(kStride).i(oStride)
-                .i(window).f(softcap);
-        dispatch(flashPrefillKernel + "_d" + headDim + kvSuffix(kv), 4, 0, nHeads,
+                .i(window).f(softcap).i(pageShift);
+        dispatch(flashPrefillKernel + "_d" + headDim + kvSuffix(kv), 5, 0, nHeads,
                 (n + MetalConstants.FA_ROWS - 1) / MetalConstants.FA_ROWS, 1, MetalConstants.FA_THREADS, 1, 1);
     }
 
@@ -1112,11 +1178,12 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, scores, 0);
+        bindOrDummy(5, pageTbl);
         // chunk 0: the kernel derives the keys per split from the position, ceil(keys / nSplit), so a recorded decode
         // step stays valid while nSplit does (MetalBackend's step key)
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
-                .i(qStride).i(kvStride).i(window).f(softcap).i(nSplit).i(0);
-        dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+                .i(qStride).i(kvStride).i(window).f(softcap).i(nSplit).i(0).i(pageShift);
+        dispatch("attention_split" + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
@@ -1161,12 +1228,13 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, out, outOff);
+        bindOrDummy(5, pageTbl);
         // chunk 0: the kernel derives the keys per split from the position, so a recorded decode step stays valid while
         // nSplit does (MetalBackend's step key)
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
-                .i(nHeads * headDim).i(kvStride).i(window).f(softcap).i(nSplit).i(0);
+                .i(nHeads * headDim).i(kvStride).i(window).f(softcap).i(nSplit).i(0).i(pageShift);
         String suffix = kv == KvDtype.F16 && !DEC_WIDE ? "_h4" : kvSuffix(kv);
-        dispatch("attention_dec_g" + group + "_d" + headDim + suffix, 5, 0, nHeads / group, (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
+        dispatch("attention_dec_g" + group + "_d" + headDim + suffix, 6, 0, nHeads / group, (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
         if (nSplit > 1) {
             bind(0, part, 0);
             bind(1, out, outOff);
@@ -1549,9 +1617,10 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, out, outOff);
         bind(4, scores, rowScoresOff);
+        bindOrDummy(5, pageTbl);
         p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
-                .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(0).f(softcap);
-        dispatch(kernel, 5, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
+                .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(0).f(softcap).i(pageShift);
+        dispatch(kernel, 6, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
     }
 
     /** {@link #flashAttention} of the one token at pos whose q row starts at byte qOff; its output row goes to outOff. */
@@ -1568,9 +1637,10 @@ final class MetalKernels implements AutoCloseable {
         bind(2, vc, 0);
         bind(3, part, 0);
         bind(4, scores, 0);
+        bindOrDummy(5, pageTbl);
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
-                .i(window).f(softcap).i(nSplit).i(chunk);
-        dispatch("attention_split" + kvSuffix(kv), 5, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+                .i(window).f(softcap).i(nSplit).i(chunk).i(pageShift);
+        dispatch("attention_split" + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, outOff);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
@@ -1632,14 +1702,31 @@ final class MetalKernels implements AutoCloseable {
 
     /** {@link #kvStoreQ8} of one token: its f32 staging rows at bytes kOff / vOff, its cache rows at byte offset off. */
     void kvStoreQ8Row(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
-                      long off, int headDim, int kvHeads) {
+                      long off, int headDim, int kvHeads, int pos) {
         int kvDim = headDim * kvHeads;
         bind(0, kStage, kOff);
         bind(1, vStage, vOff);
         bind(2, kc, off);
         bind(3, vc, off);
-        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads));
-        dispatch("kv_store_q8", 4, 0, 2 * kvHeads, 1, 1, 32, 1, 1);
+        bindOrDummy(4, pageTbl);
+        p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).i(pos)
+                .i(pageShift);
+        dispatch("kv_store_q8", 5, 0, 2 * kvHeads, 1, 1, 32, 1, 1);
+    }
+
+    /** {@link #kvStoreQ8Rot} of one token: its staging rows at bytes kOff / vOff, its q row at byte qOff, its cache rows at off. */
+    void kvStoreQ8RotRow(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                         long off, Metal.Buffer q, long qOff, int headDim, int kvHeads, int heads, int pos) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, qOff);
+        bindOrDummy(5, pageTbl);
+        p.reset(KernelParams.KV_STORE_Q8R).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).i(pos).i(pageShift);
+        dispatch("kv_store_q8r", 6, 0, 2 * kvHeads + heads, 1, 1, 32, 1, 1);
     }
 
     /**

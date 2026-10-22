@@ -8,6 +8,8 @@ import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DecoderLayer;
+import org.robomiri.jllm.kv.KvPool;
+import org.robomiri.jllm.kv.KvSequence;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.LayerSpec;
@@ -53,7 +55,21 @@ public final class MetalBackend implements Backend {
     // latest rows as halves in a per-layer ring (q4Rings), which the *_q4 attention kernels read for recent keys
     private final KvDtype kvDtype;
     private MetalKernels.Q4Ring[] q4Rings;
+    /**
+     * q8 with Hadamard-rotated keys (backend.kv-q8-rotate, {@link KvQ4#block}): kv_store_q8r rotates k before it is
+     * quantized and the chunk's queries in place, and the score scale is divided by the block. The rows have q8's layout.
+     */
+    private final boolean q8Rot;
     private final boolean kvHalf;
+    /**
+     * The paged KV cache (backend.kv-paged, docs/24): this slot's block table over the K / V buffers every slot of the
+     * model shares ({@link MetalKvStorage}); null with the flat cache. k and v always go through f32 staging rows, then
+     * kv_store_pg / kv_store_q8 write them into the table's rows, and the attention kernels read through the table
+     * ({@code pageTbl}, a device copy of {@link KvSequence#table()} kept by the sequence's sink, and {@code pageShift}).
+     */
+    private final KvSequence seq;
+    private Metal.Buffer pageTbl;
+    private int pageShift;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
     private int[] windows;             // the distinct attention windows of the GQA layers (0 = none), for stepKey
@@ -243,7 +259,38 @@ public final class MetalBackend implements Backend {
 
     /** {@code split}: which MoE layers run their routed experts on the CPU (see {@link MoeSplit}). */
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, null);
+    }
+
+    /** With a paged KV cache over {@code kvPool} (from {@link #newKvPool}); null = the flat cache. */
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split,
+                        KvPool kvPool) {
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool);
+    }
+
+    /**
+     * A pool of KV blocks for the Metal slots of {@code w}, in buffers shared by all of them; null when the model's cache
+     * cannot be paged (latent attention, q4).
+     *
+     * @param poolTokens capacity in positions across all slots (0 = {@code slots} contexts and a spare block each)
+     */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   String metalLib) {
+        Decoder arch = w.decoder();
+        if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4 || blockTokens < 16
+                || Integer.bitCount(blockTokens) != 1) {
+            return null;
+        }
+        long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
+        long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
+        if (blocks > Integer.MAX_VALUE - 16) {
+            throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
+        }
+        MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks);
+        String format = "paged " + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && KvQ4.supports(g.headDim()) ? " rot" : "")
+                + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
+                + g.headDim() + " block=" + blockTokens;
+        return new KvPool(st, (int) blocks, format);
     }
 
     private static Metal open(Decoder d, String metalLib) {
@@ -274,7 +321,8 @@ public final class MetalBackend implements Backend {
     }
 
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
-    private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype, MoeSplit split) {
+    private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype, MoeSplit split,
+                         KvPool kvPool) {
         this.w = w;
         this.split = split;
         this.arch = w.decoder();
@@ -287,7 +335,12 @@ public final class MetalBackend implements Backend {
             kvDtype = KvDtype.Q8;
         }
         this.kvDtype = kvDtype;
+        // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
+        this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
+                && KvQ4.supports(ga.headDim());
         this.kvHalf = kvDtype == KvDtype.F16;
+        this.seq = kvPool != null && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4
+                ? kvPool.newSequence(ctx) : null;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -334,16 +387,28 @@ public final class MetalBackend implements Backend {
         keyCache = new Metal.Buffer[c.layers()];
         valCache = new Metal.Buffer[c.layers()];
         if (a instanceof Attention.Gqa g) { // DeepSeek: MlaMetal owns its latent cache
-            long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
-            for (int l = 0; l < c.layers(); l++) {
-                keyCache[l] = k.scratch(kvBytes);
-                valCache[l] = k.scratch(kvBytes);
-                k.rowIndexed(keyCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads())); // for decode replay
-                k.rowIndexed(valCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads()));
+            if (seq != null) { // the pool's buffers, shared by every slot; the rows are found through the block table
+                MetalKvStorage st = (MetalKvStorage) seq.pool().storage();
+                for (int l = 0; l < c.layers(); l++) {
+                    keyCache[l] = st.keys[l];
+                    valCache[l] = st.vals[l];
+                }
+                pageShift = Integer.numberOfTrailingZeros(seq.blockTokens());
+                pageTbl = k.scratch(4L * Math.max(1, seq.table().length));
+                MemorySegment table = pageTbl.contents();
+                seq.setSink((i, b) -> table.setAtIndex(ValueLayout.JAVA_INT, i, b));
+            } else {
+                long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+                for (int l = 0; l < c.layers(); l++) {
+                    keyCache[l] = k.scratch(kvBytes);
+                    valCache[l] = k.scratch(kvBytes);
+                    k.rowIndexed(keyCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads())); // for decode replay
+                    k.rowIndexed(valCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads()));
+                }
             }
-            // f32 k rows before RoPE (f16, q8, q4) and v rows before the quantization (q8, q4)
-            kStage = kvDtype != KvDtype.F32 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
-            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            // f32 k rows before RoPE (f16, q8, q4, paged) and v rows before the quantization / the paged store
+            kStage = kvDtype != KvDtype.F32 || seq != null ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 || seq != null ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
             int recent = Math.min(KvDtype.q4Recent(), ctx);
             if (kvDtype == KvDtype.Q4 && recent > 0) {
                 // recent + batch slots: a chunk never evicts a row one of its own queries reads (as KvCache.Q4)
@@ -388,6 +453,9 @@ public final class MetalBackend implements Backend {
             assign = null;
             routeWeight = null;
             moeHidden = null;
+        }
+        if (seq != null) {
+            k.page(pageTbl, pageShift); // after MetalTuner's self-checks, which run on flat test caches
         }
         mla = a instanceof Attention.Mla m ? new MlaMetal(this, w, m, ctx, maxBatch, kvDtype) : null;
         boolean[][] cold = coldExperts();
@@ -821,13 +889,15 @@ public final class MetalBackend implements Backend {
             int dim = c.dim();
             int kvDim = g.kvDim();
             boolean q4 = kvDtype == KvDtype.Q4;
+            boolean paged = seq != null;
             boolean q8 = kvDtype == KvDtype.Q8 || q4; // k and v through the f32 staging rows
+            boolean staged = q8 || paged;             // (the paged cache stages every type: its rows are scattered over blocks)
             int stride = kvDtype.rowStride(kvDim, g.kvHeads()); // cache row stride in elements (q8, q4: bytes)
-            long cacheOff = pos * kvDtype.rowBytes(kvDim, g.kvHeads());
-            Metal.Buffer kDst = kvDtype != KvDtype.F32 ? kStage : keyCache[layer];
-            long kOff = kvDtype != KvDtype.F32 ? 0 : cacheOff;
-            Metal.Buffer vDst = q8 ? vStage : valCache[layer];
-            long vOff = q8 ? 0 : cacheOff;
+            long cacheOff = paged ? 0 : pos * kvDtype.rowBytes(kvDim, g.kvHeads());
+            Metal.Buffer kDst = kvDtype != KvDtype.F32 || paged ? kStage : keyCache[layer];
+            long kOff = kvDtype != KvDtype.F32 || paged ? 0 : cacheOff;
+            Metal.Buffer vDst = staged ? vStage : valCache[layer];
+            long vOff = staged ? 0 : cacheOff;
             Metal.Buffer in = x;
             Metal.Buffer norm = attnNorm;
             if (!fuseNorm) {
@@ -835,7 +905,7 @@ public final class MetalBackend implements Backend {
                 in = xb;
                 norm = null;
             }
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vDst, vOff, kvHalf, bq, bk, bv, n);
+            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vDst, vOff, kvHalf && !paged, bq, bk, bv, n);
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
             // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
             // into the staging rows, which kv_store_q8 then quantizes together with v)
@@ -862,25 +932,39 @@ public final class MetalBackend implements Backend {
                 }
                 return;
             }
-            if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch
-                k.ropeStoreQ8(adjacent, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
+            if (paged) { // rotate in the staging rows, then store them into the rows of the block table
+                k.rope(adjacent, false, q, kStage, 0, kStage, 0, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
+                        hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
+                if (q8Rot) { // k rotated and quantized, the chunk's queries rotated in place
+                    k.kvStoreQ8Rot(kStage, vStage, keyCache[layer], valCache[layer], 0, q, hd, g.kvHeads(), g.heads(), pos, n);
+                } else if (q8) {
+                    k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], 0, hd, g.kvHeads(), pos, n);
+                } else {
+                    k.kvStorePaged(kvHalf, kStage, 0, vStage, 0, keyCache[layer], valCache[layer], kvDim, pos, n);
+                }
+            } else if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch (with q8Rot: also
+                // the Hadamard rotation of k before the quantization and of the queries, rope_store_q8r)
+                k.ropeStoreQ8(adjacent, q8Rot, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), g.heads(), g.kvHeads(), pos,
                         0, rotHalf, n);
             } else {
                 k.rope(adjacent, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer], q8 ? 0 : cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
-                if (q8) {
-                    k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
+                if (q8Rot) { // (unfused) k rotated and quantized, the chunk's queries rotated in place: (Hq)·(Hk) = B q·k
+                    k.kvStoreQ8Rot(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, hd, g.kvHeads(), g.heads(), pos, n);
+                } else if (q8) {
+                    k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), pos, n);
                 }
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
                 // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
                 // token, so that every row is exactly what a decode step at its position computes
                 for (int t = 0; t < n; t++) {
                     long qRow = (long) t * g.qDim() * 4;
                     k.decodeAttention(kvDtype, q, qRow, keyCache[layer], valCache[layer], flashPart, att, qRow, g.heads(),
-                            g.kvHeads(), hd, pos + t, ctx, g.scale(), stride, g.window(), g.softcap());
+                            g.kvHeads(), hd, pos + t, ctx, scale, stride, g.window(), g.softcap());
                 }
                 return;
             }
@@ -896,7 +980,7 @@ public final class MetalBackend implements Backend {
                     }
                     k.rowScores((long) (t % sliceRows) * g.heads() * ctx * 4);
                     k.attentionRow(attnKernel, attnGroup, q, qOff, keyCache[layer], valCache[layer], att, qOff, scores, g.heads(),
-                            g.kvHeads(), hd, hd, pos + n - 1, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
                 }
                 k.endIndependent();
                 k.rowScores(0);
@@ -904,16 +988,16 @@ public final class MetalBackend implements Backend {
             }
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                 return;
             }
             if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
                 k.flashPrefill(kvDtype, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
-                        g.scale(), g.qDim(), stride, g.qDim(), g.window(), g.softcap());
+                        scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                 return;
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
-                    pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
+                    pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
         }
 
         /**
@@ -930,6 +1014,7 @@ public final class MetalBackend implements Backend {
             int kvDim = g.kvDim();
             int hd = g.headDim();
             boolean q4 = kvDtype == KvDtype.Q4;
+            boolean paged = seq != null;
             boolean q8 = kvDtype == KvDtype.Q8;
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
@@ -946,10 +1031,10 @@ public final class MetalBackend implements Backend {
                 Metal.Buffer kc = owners[t].keyCache[layer];
                 long cacheOff = positions[t] * rowBytes;
                 long kvOff = (long) t * kvDim * 4;
-                k.ropeRow(adjacent, kvHalf, q, (long) t * g.qDim() * 4, rowK, kvOff, q8 || q4 ? rowK : kc,
-                        q8 || q4 ? kvOff : cacheOff, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(),
+                k.ropeRow(adjacent, kvHalf && !paged, q, (long) t * g.qDim() * 4, rowK, kvOff, q8 || q4 || paged ? rowK : kc,
+                        q8 || q4 || paged ? kvOff : cacheOff, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(),
                         kvDim, g.heads(), g.kvHeads(), positions[t], 0, rotHalf);
-                if (!q8 && !q4) { // (writes the cache's v rows: independent of the rope above, which writes q and the k rows)
+                if (!q8 && !q4 && !paged) { // (writes the cache's v rows: independent of the rope above, which writes q and the k rows)
                     k.kvPut(kvHalf, rowV, kvOff, owners[t].valCache[layer], cacheOff, kvDim);
                 }
             }
@@ -977,20 +1062,33 @@ public final class MetalBackend implements Backend {
                 }
                 return;
             }
-            if (q8) {
+            if (q8 || paged) {
                 k.beginIndependent();
                 for (int t = 0; t < n; t++) {
-                    k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
-                            owners[t].valCache[layer], positions[t] * rowBytes, hd, g.kvHeads());
+                    k.page(owners[t].pageTbl, owners[t].pageShift); // each row stores through its owner's block table
+                    if (q8Rot) { // also rotates the row's query in place
+                        k.kvStoreQ8RotRow(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], paged ? 0 : positions[t] * rowBytes, q, (long) t * g.qDim() * 4, hd,
+                                g.kvHeads(), g.heads(), positions[t]);
+                    } else if (q8) {
+                        k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], paged ? 0 : positions[t] * rowBytes, hd, g.kvHeads(), positions[t]);
+                    } else {
+                        k.kvStorePaged(kvHalf, rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], kvDim, positions[t], 1);
+                    }
                 }
                 k.endIndependent();
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
                 for (int t = 0; t < n; t++) {
+                    k.page(owners[t].pageTbl, owners[t].pageShift);
                     k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
-                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, g.scale(),
+                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, scale,
                             stride, g.window(), g.softcap());
                 }
+                k.page(pageTbl, pageShift);
                 return;
             }
             // attention: one slice of the scores scratch per row (it holds a tile's worth), so rows can overlap; the
@@ -1005,10 +1103,11 @@ public final class MetalBackend implements Backend {
                 Metal.Buffer vc = owners[t].valCache[layer];
                 int pos = positions[t];
                 long qOff = (long) t * g.qDim() * 4;
+                k.page(owners[t].pageTbl, owners[t].pageShift);
                 if (anyFlash) {
                     if (flashDecode && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
-                                hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                                hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
                     }
                 } else if (t % sliceRows == 0) {
@@ -1017,10 +1116,11 @@ public final class MetalBackend implements Backend {
                 }
                 k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
                 k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
             }
             k.endIndependent();
             k.rowScores(0);
+            k.page(pageTbl, pageShift);
         }
     }
 
@@ -1405,6 +1505,9 @@ public final class MetalBackend implements Backend {
             MemorySegment.copy(s, 0, ropeSin[t].contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, s.length);
         }
         ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        if (seq != null) {
+            seq.setShareable(ropeCustomFrom == Integer.MAX_VALUE); // rows rotated for picture positions are not a function of the tokens
+        }
         return true;
     }
 
@@ -1586,6 +1689,9 @@ public final class MetalBackend implements Backend {
                 }
                 ring.contents().setAtIndex(ValueLayout.JAVA_INT, slot, token);
             }
+            if (seq != null) {
+                seq.beginWrite(pos, 1); // before the step is encoded: the table is read by the GPU when it runs
+            }
             if (!open) {
                 k.begin();
                 open = true;
@@ -1653,6 +1759,9 @@ public final class MetalBackend implements Backend {
         }
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (seq != null) {
+            seq.beginWrite(pos, n); // blocks for [pos, pos + n), private; positions past it are forgotten
         }
         int dim = c.dim();
         if (embeds != null) { // image embeddings are the input as they are
@@ -1757,7 +1866,8 @@ public final class MetalBackend implements Backend {
         for (int t = 0; t < n; t++) {
             if (!(members[t] instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed
                     || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)
-                    || o.ropeCustomFrom != Integer.MAX_VALUE) { // its own rotary rows cannot share this backend's tables
+                    || o.ropeCustomFrom != Integer.MAX_VALUE // its own rotary rows cannot share this backend's tables
+                    || (o.seq == null) != (seq == null)) {
                 return false;
             }
             for (int u = 0; u < t; u++) {
@@ -1774,6 +1884,11 @@ public final class MetalBackend implements Backend {
         for (MetalBackend o : owners) {
             if (o.pipe != null) {
                 o.pipe.drain(); // never interleave with pipelined steps (of any member: the group lock is held)
+            }
+        }
+        for (int t = 0; t < n; t++) {
+            if (owners[t].seq != null) {
+                owners[t].seq.beginWrite(positions[t], 1);
             }
         }
         if (arch.attention() instanceof Attention.Gqa g && rowK == null) {
@@ -1951,7 +2066,7 @@ public final class MetalBackend implements Backend {
     @Override
     public String stateFormat() {
         if (arch.attention() instanceof Attention.Gqa g) {
-            return "kv " + kvDtype + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
+            return "kv " + kvDtype + (q8Rot ? " rot" : "") + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
                     + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
         }
         return mla != null && kvDtype != KvDtype.Q8 ? "mla " + mla.format() : null;
@@ -2033,6 +2148,43 @@ public final class MetalBackend implements Backend {
     }
 
     @Override
+    public KvSequence kvSequence() {
+        return seq;
+    }
+
+    /** The pool buffer row of position {@code s} of this backend's cache (paged: through the block table). */
+    private long rowOf(int s) {
+        return seq == null ? s : rowOf(seq, s);
+    }
+
+    private static long rowOf(KvSequence t, int s) {
+        int shift = Integer.numberOfTrailingZeros(t.blockTokens());
+        return ((long) t.block(s >> shift) << shift) | (s & (t.blockTokens() - 1));
+    }
+
+    @Override
+    public StateSnapshot snapshotState(int n) {
+        if (seq == null || stateFormat() == null) {
+            return null;
+        }
+        if (pipe != null) {
+            pipe.drain();
+        }
+        KvSequence snap = seq.snapshot(n); // retained blocks: this backend copies one before writing it
+        return new StateSnapshot() {
+            @Override
+            public void write(java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+                saveRows(n, out, s -> rowOf(snap, s));
+            }
+
+            @Override
+            public void close() {
+                snap.close();
+            }
+        };
+    }
+
+    @Override
     public void saveState(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
         if (pipe != null) {
             pipe.drain();
@@ -2042,7 +2194,7 @@ public final class MetalBackend implements Backend {
 
     @Override
     public boolean canSaveWhileServing() {
-        return stateFormat() != null;
+        return stateFormat() != null && seq == null; // (a paged cache is saved from a snapshot)
     }
 
     /** Copies rows {@code [0, n)} out of the shared buffers without touching the command queue or the pipe. */
@@ -2052,6 +2204,11 @@ public final class MetalBackend implements Backend {
     }
 
     private void saveRows(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+        saveRows(n, out, this::rowOf);
+    }
+
+    private void saveRows(int n, java.nio.channels.WritableByteChannel out, java.util.function.IntToLongFunction rowOf)
+            throws java.io.IOException {
         if (stateFormat() == null) {
             Backend.super.saveState(n, out);
             return;
@@ -2067,7 +2224,7 @@ public final class MetalBackend implements Backend {
                 int m = Math.min(rows, n - s0);
                 for (int r = 0; r < m; r++) {
                     for (int j = 0; j < segs; j++) {
-                        MemorySegment.copy(seg[j], (s0 + r) * row, b, ((long) segs * r + j) * row, row);
+                        MemorySegment.copy(seg[j], rowOf.applyAsLong(s0 + r) * row, b, ((long) segs * r + j) * row, row);
                     }
                 }
                 buf.clear().limit((int) (segs * m * row));
@@ -2100,6 +2257,9 @@ public final class MetalBackend implements Backend {
         if (n > stored) {
             throw new IllegalArgumentException(n + " positions requested, " + stored + " saved");
         }
+        if (seq != null) {
+            seq.beginWrite(0, n); // blocks for the rows about to be written
+        }
         long row = rowBytes();
         int segs = mla != null ? 1 : 2;
         int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (segs * row)));
@@ -2118,7 +2278,7 @@ public final class MetalBackend implements Backend {
                 // straight into the cache buffers: on unified memory they are the GPU's memory
                 for (int r = 0; r < m; r++) {
                     for (int j = 0; j < segs; j++) {
-                        MemorySegment.copy(b, ((long) segs * r + j) * row, seg[j], (s0 + r) * row, row);
+                        MemorySegment.copy(b, ((long) segs * r + j) * row, seg[j], rowOf(s0 + r) * row, row);
                     }
                 }
             }
@@ -2140,6 +2300,10 @@ public final class MetalBackend implements Backend {
         }
         if (o.pipe != null) {
             o.pipe.drain();
+        }
+        if (seq != null && o.seq != null) {
+            seq.shareFrom(o.seq, n); // the blocks themselves are shared; the first write to a shared one copies it
+            return;
         }
         long bytes = (long) n * rowBytes();
         for (int l = 0; l < c.layers(); l++) {
@@ -2176,6 +2340,9 @@ public final class MetalBackend implements Backend {
             } catch (RuntimeException ignored) {
                 // closing anyway
             }
+        }
+        if (seq != null) {
+            seq.close(); // the pool's buffers outlive this slot
         }
         try {
             saveExpertStats(false);

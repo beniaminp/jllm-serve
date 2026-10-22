@@ -274,7 +274,7 @@ head). Deep random networks amplify float32 rounding (at the 130m shape, 8 layer
   `use_conv_bias: false` is supported.
 - `state_size` above 64 or `conv_kernel` above 8; `hidden_act` other than `silu`.
 - `d_model` and `d_inner` must be multiples of 32 (quantization block): true for all `state-spaces/mamba-*-hf`.
-- A snapshot/rewind of the recurrent state (15.6), and the associative scan for long prefills (15.7).
+- A snapshot/rewind of the recurrent state (15.6; Qwen3-Next has one, 15.11), and the associative scan for long prefills (15.7).
 - `backend.kv-dtype` is ignored (there is no KV cache).
 
 The plain-text chat format (no template; messages joined with newlines, `<|endoftext|>` stops) lives in
@@ -302,3 +302,33 @@ the tokenizer gives the same ids on both prompts and all probes, the engine's Q8
 transformers ones at 0.998 – 0.999 (quantization noise of a 768-wide model) and at 1.000000 with the same model run
 on Q8_0-rounded weights (largest error 0.28 % of the largest logit); greedy decoding agrees for 16/16 ids on the code
 prompt and diverges on the prose prompt at step 6 on a 0.13-logit near tie.
+
+## 15.11 Mamba from a GGUF file, and the same idea in Qwen3-Next
+
+Code: `gguf/GgufFamilies.mamba` (the metadata), `gguf/GgufWeights.resolve` (the tensor names), `src/test/java/org/robomiri/jllm/GgufFamiliesCheck.java`, `HfToGguf.java`, `GgufArchSmoke.java`, `scripts/gguf-llamacpp-check.sh`.
+
+🧸 A Mamba model can also come packed in llama.cpp's single-file box ([16](16-gguf.md)). The model is the same; only the labels on the drawers and the order of some numbers differ, and one number is stored already prepared. The box says "block 12's memory-update matrix is `ssm_a`"; jllm reads it as the drawer called `mixer.A` of 15.4.
+
+📐 **Metadata and tensors.** The sizes come from the keys `mamba.embedding_length` (`d_model`), `mamba.block_count`, `mamba.ssm.inner_size` (`d_inner`), `mamba.ssm.state_size`, `mamba.ssm.conv_kernel`, `mamba.ssm.time_step_rank` (`dt_rank`) and `mamba.attention.layer_norm_rms_epsilon`; the vocabulary size is the row count of `token_embd.weight`. The tensors of a layer
+(the mamba-130m shapes of 15.4 in numpy order; GGUF lists the dimensions the other way round) and what jllm reads them as:
+
+| GGUF tensor (`blk.N.`) | shape | read as (15.4) | note |
+|---|---|---|---|
+| `attn_norm.weight` | `[768]` | `norm.weight` | the block's RMSNorm |
+| `ssm_in.weight` | `[3072, 768]` | `mixer.in_proj.weight` | quantized in place |
+| `ssm_conv1d.weight`, `.bias` | `[1536, 4]`, `[1536]` | `mixer.conv1d.weight` `[1536, 1, 4]`, bias | the Hugging Face tensor with its middle axis squeezed away; the bias exists or not (`use_conv_bias`) |
+| `ssm_x.weight` | `[80, 1536]` | `mixer.x_proj.weight` | `[dt_rank + 2·d_state, d_inner]` |
+| `ssm_dt.weight`, `.bias` | `[1536, 48]`, `[1536]` | `mixer.dt_proj` | 48 is not a multiple of the 32-wide quantization block, so the converter writes it as F16 |
+| `ssm_a` | `[1536, 16]` | `mixer.A` | **already `−exp(A_log)`**, as the cache stores it (no `.weight` suffix) |
+| `ssm_d` | `[1536]` | `mixer.D` | no `.weight` suffix |
+| `ssm_out.weight` | `[768, 1536]` | `mixer.out_proj.weight` | |
+| `token_embd.weight`, `output_norm.weight`, `output.weight` | | embeddings, `norm_f`, LM head | the converter drops `output.weight` when it equals the embedding: tied head (`tie_word_embeddings` = no `output.weight`) |
+
+Worked example of the prepared number: a channel with `A_log = ln 16 = 2.7726` has `A = −exp(A_log) = −16`, stored in the file as −16; with a step `Δ = 0.0625` the state decays by `exp(Δ·A) = exp(−1) = 0.368` per token (15.2). A file that stored `A_log` would need an `exp` per parameter at load; llama.cpp's converter does it once, jllm reads it as it is.
+The converter also writes `head_count 0`, `feed_forward_length 0` and a context length of 2²⁰ (Mamba has no hard limit, 15.5). **Refused with a message:** Falcon-Mamba (`mamba.ssm.dt_b_c_rms`, an RMS norm on `Δ`, `B` and `C`) and Mamba 2 (`mamba2`), as for safetensors (15.9).
+**Why this design.** Everything after the tensor names is the existing Mamba code (15.7); only the name table and the metadata reader are new, so both backends, the chunking invariance of 15.5 and the "no prefix rewind" rule of 15.6 apply to GGUF files unchanged. **Checked** (`GgufFamiliesCheck`, `scripts/gguf-llamacpp-check.sh`) on tiny random Mamba models written the way `convert_hf_to_gguf.py` writes them: the F32 GGUF gives the same logits as the safetensors load to 3·10⁻⁷ relative, jllm's logits equal llama.cpp's `llama-debug` on the same file to 7.5·10⁻⁷ and 1.1·10⁻⁶, and Metal equals CPU on the Q8_0 file (`GgufArchSmoke`: 8 greedy tokens).
+**Not done:** no real Mamba GGUF was used (no weights are downloaded for this work), so what is proved is the layout against llama.cpp's own loader, not a model's text.
+
+**The same idea, one family further: Gated DeltaNet in Qwen3-Next and Qwen3.5** ([14.14](14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe), [16.13](16-gguf.md#1613-qwen35-and-qwen3-next-as-gguf-files)). Three layers out of four of those models replace attention by a recurrent layer that keeps a fixed-size state, exactly the argument of 15.0 and 15.5: no KV cache for those layers, a memory of constant size, and `supportsPrefixReuse()` false for the same reason (15.6). The state is richer than Mamba's: per value head a matrix `S` (key width × value width) that the *gated delta rule* corrects rather than only decays: `S ← γ S` (forget a little), then `S ← S + k dᵀ` with `d = β (v − Sᵀk)` (write what should be there minus what is there under the key `k`), and `o = Sᵀ q` is the read-out (14.14.2),
+so a layer can overwrite what it remembers about a key instead of only fading it. What differs in practice: (1) the state of such a model **can** be saved to a file and copied between slots (`saveState`, `loadState`, `copyStateFrom`: the prompt cache files and prefix copies of chapters 10 and 17), which 15.6 lists as a possible extension for Mamba; (2) one step back can be undone — before a verification pass the backend `checkpointState`s the state after the first token, a rejected guess `rollbackState`s it — which is what makes the model's own multi-token-prediction head usable as a draft ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)); on Metal the kernels write the snapshot while they compute, so there is no replay.
+So 15.9's "a snapshot/rewind of the recurrent state" is still not implemented *for Mamba*; for Qwen3-Next the snapshot of one token and the save/load of whole states exist.

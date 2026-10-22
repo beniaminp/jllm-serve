@@ -15,6 +15,7 @@ import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.Mlp;
@@ -56,6 +57,9 @@ public final class ArchSmoke {
      * their rounding-level difference into a flipped 4-bit code (4e-3 on Phi3Mha); the default pass checks every q4 case.
      */
     private static final boolean Q4 = !"false".equals(System.getProperty("jllm.smoke.q4"));
+    /** -Djllm.smoke.paged=false leaves out the paged-vs-flat KV cache checks (the forced-MMA pass of arch-smoke.sh). */
+    private static final boolean PAGED = !"false".equals(System.getProperty("jllm.smoke.paged"));
+    private static final java.util.Set<String> pagedF16 = new java.util.HashSet<>();
 
     public static void main(String[] args) throws Exception {
         String lib = args[0].equals("-") ? null : args[0];
@@ -186,6 +190,11 @@ public final class ArchSmoke {
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
+            if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
+                boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
+                failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
+            }
             if (!metal) {
                 return failures;
             }
@@ -249,6 +258,25 @@ public final class ArchSmoke {
                 }
                 if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
                     failures += replayCheck(w, lib, cfg, KvDtype.F16);
+                }
+            }
+            // q8 with Hadamard-rotated keys (backend.kv-q8-rotate), where the attention is standard with whole groups of 32:
+            // CPU against Metal, decode replay (alone and batched), saved / copied caches; the batched decode and the draft
+            // speculation of the rotated cache are cases of batchCheck / draftCheck above
+            if (!mamba && !hybrid && cfg instanceof Decoder rd && rd.attention() instanceof Attention.Gqa rg
+                    && KvQ4.supports(rg.headDim()) && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                System.out.println("  --- q8 with rotated keys ---");
+                KvDtype.setQ8Rotate(true);
+                try {
+                    failures += q8Check(w, lib, cfg, cpu, KvDtype.Q8, 0);
+                    failures += replayCheck(w, lib, cfg, KvDtype.Q8);
+                    if (Q4) { // (the forced-MMA pass leaves it out, like q4's: a rotated int8 code flips between a batched pass and a lone step)
+                        failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
+                    }
+                    failures += kvStateChecks(w, lib, cfg, KvDtype.Q8);
+                    failures += replayStateCheck(w, lib, cfg, KvDtype.Q8);
+                } finally {
+                    KvDtype.setQ8Rotate(false);
                 }
             }
             if (!mamba && cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
@@ -561,7 +589,8 @@ public final class ArchSmoke {
             // CPU file's: both prefilled the prompt in their own float arithmetic, so a q4 value on a rounding edge of the
             // 4-bit grid lands one step (1/7.5 of its group's largest value) apart in the two caches, and a tiny random
             // model turns that into a logit difference a q8 edge flip (1/127) does not reach: 10x the tolerance for q4.
-            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 ? 1e-2f : 1e-3f) * scale + 1e-4f;
+            // q8 with rotated keys: the same kind of edge flip as q4's, 10x the tolerance (see q8Check)
+            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 || dt == KvDtype.Q8 && KvDtype.q8Rotate() ? 1e-2f : 1e-3f) * scale + 1e-4f;
             System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e, bytes %s)%n", a.stateFormat(),
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
                     sameFormat && crossOk ? "ok" : "MISMATCH", diff, sameBytes ? "unchanged" : "CHANGED");
@@ -711,9 +740,14 @@ public final class ArchSmoke {
                 drift16 = Math.max(drift16, Math.abs(f16[r][i] - f32[r][i]));
             }
         }
-        boolean agree = diff <= 1e-3f * scale + 1e-4f;
+        // q8 with rotated keys: the CPU and the Metal prefill compute k in float with rounding differences of ~1e-7, and
+        // an int8 code of the rotated row that sits on a rounding edge (one code in ~6000) lands one step apart: a flip
+        // in layer 0 of a tiny random model moves later layers' k and v codes too (counted on the Qwen2 checkpoint: one
+        // flip in layer 0, 71 of 6144 codes in all, with plain q8 none) and the logits by up to 1.5e-3 of the largest
+        // logit. The kernels themselves agree bit for bit on equal inputs (kernel_tests.py), so this is q4's case: 10x.
+        boolean agree = diff <= (dt == KvDtype.Q8 && KvDtype.q8Rotate() ? 1e-2f : 1e-3f) * scale + 1e-4f;
         boolean close = drift <= (dt == KvDtype.Q4 ? 3200 : 200) * drift16 + 1e-3f * scale;
-        String what = dt + (dt == KvDtype.Q4 ? " recent=" + recent : "");
+        String what = dt + (dt == KvDtype.Q4 ? " recent=" + recent : dt == KvDtype.Q8 && KvDtype.q8Rotate() ? " rotated keys" : "");
         System.out.printf("  kv %s: max|cpu-metal| = %.2e%s, max|%s-f32| = %.2e%s (f16: %.2e, ratio %.0f, max|logit| = %.2f)%n",
                 what, diff, agree ? "" : " MISMATCH", dt, drift, close ? "" : " TOO FAR", drift16, drift / drift16, scale);
         return (agree ? 0 : 1) + (close ? 0 : 1);
@@ -1307,6 +1341,10 @@ public final class ArchSmoke {
             }
             cases.add(new Object[]{dt.toString(), dt, MoeSplit.OFF});
         }
+        // (not in the forced-MMA pass: a batched pass and a lone step take different matmul kernels there, and a rotated int8 code flips)
+        if (Q4 && ((Decoder) cfg).attention() instanceof Attention.Gqa rg && KvQ4.supports(rg.headDim())) {
+            cases.add(new Object[]{"Q8, rotated keys", KvDtype.Q8, MoeSplit.OFF}); // backend.kv-q8-rotate: rows rotate their own q
+        }
         if (((Decoder) cfg).anyMoe()) {
             cases.add(new Object[]{"F32, experts of 1 layer on the cpu", KvDtype.F32, new MoeSplit(1, 4, false)});
         }
@@ -1317,6 +1355,7 @@ public final class ArchSmoke {
             for (Object[] c : cases) {
                 KvDtype dt = (KvDtype) c[1];
                 MoeSplit split = (MoeSplit) c[2];
+                KvDtype.setQ8Rotate(c[0].toString().contains("rotated"));
                 MetalBackend[] b = new MetalBackend[3];
                 try {
                     for (int i = 0; i < 3; i++) {
@@ -1392,6 +1431,7 @@ public final class ArchSmoke {
                 }
             }
         } finally {
+            KvDtype.setQ8Rotate(false);
             try (var files = Files.list(stats)) {
                 for (Path f : files.toList()) {
                     Files.delete(f);
@@ -1546,7 +1586,11 @@ public final class ArchSmoke {
         }
         int bad = 0;
         try {
-            for (KvDtype dt : KvDtype.values()) {
+            int rotRound = ((Decoder) cfg).attention() instanceof Attention.Gqa rg && KvQ4.supports(rg.headDim()) ? 1 : 0;
+            for (int round = 0; round < KvDtype.values().length + rotRound; round++) {
+                // the last round: q8 with rotated keys (backend.kv-q8-rotate); the rolled-back positions are re-stored rotated
+                KvDtype dt = round < KvDtype.values().length ? KvDtype.values()[round] : KvDtype.Q8;
+                KvDtype.setQ8Rotate(round >= KvDtype.values().length);
                 int[] plain;
                 try (org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(new MetalBackend(w, 64, 16, lib, dt),
                         tok, cfg, Set.of(), 0, fmt)) {
@@ -1586,11 +1630,12 @@ public final class ArchSmoke {
                     }
                     }
                 }
-                System.out.printf("  draft speculation, kv %s: %d tokens%s -> %s%n", dt, plain.length, line,
+                System.out.printf("  draft speculation, kv %s%s: %d tokens%s -> %s%n", dt, KvDtype.q8Rotate() ? " rotated keys" : "", plain.length, line,
                         ok ? "ok" : "SPECULATION MISMATCH");
                 bad += ok ? 0 : 1;
             }
         } finally {
+            KvDtype.setQ8Rotate(false);
             q2.close();
             if (other != null) {
                 other.close();

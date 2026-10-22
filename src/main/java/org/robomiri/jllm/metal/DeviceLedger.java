@@ -41,6 +41,21 @@ final class DeviceLedger {
         }
     }
 
+    /** GPU-resident bytes of every open backend: their buffers, and once per weights their GPU share. */
+    static long total() {
+        synchronized (LIVE) {
+            long b = 0;
+            Set<ModelWeights> counted = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (Resident o : LIVE) {
+                b += o.ownBytes();
+                if (counted.add(o.weights())) {
+                    b += o.gpuWeightBytes();
+                }
+            }
+            return b;
+        }
+    }
+
     /** GPU-resident bytes of every open backend but {@code self}: their buffers, and once per weights their GPU share. */
     static long others(Resident self) {
         synchronized (LIVE) {
