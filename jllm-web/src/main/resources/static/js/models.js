@@ -8,6 +8,10 @@ const Models = (() => {
     ['Qwen3 4B · GGUF Q4_K_M', 'unsloth/Qwen3-4B-GGUF:Q4_K_M'],
     ['Llama 3.2 1B Instruct', 'unsloth/Llama-3.2-1B-Instruct'],
     ['Qwen2.5 1.5B Instruct', 'Qwen/Qwen2.5-1.5B-Instruct'],
+    // images: begin
+    ['SD-Turbo · image (2.6 GB)', 'stabilityai/sd-turbo'],
+    ['SDXL-Turbo · image (7 GB)', 'stabilityai/sdxl-turbo'],
+    // images: end
   ];
   let lastLocal = 0;
 
@@ -18,6 +22,14 @@ const Models = (() => {
     form.querySelectorAll('.gguf-only').forEach(e => e.classList.toggle('hidden', !opts.gguf || !opts.ggufFiles?.length));
     form.querySelectorAll('.st-only').forEach(e => e.classList.toggle('hidden', !!opts.gguf));
     form.querySelectorAll('.dl-only').forEach(e => e.classList.toggle('hidden', !opts.download));
+    // images: begin
+    if (opts.image) {   // an image model: backend / precision of the image engine instead of the text-only fields
+      form.querySelectorAll('.img-only').forEach(e => e.classList.remove('hidden'));
+      for (const n of ['backend', 'backend.ctx', 'backend.kv-dtype', 'model.quant', 'backend.batch', 'backend.threads', 'engine.speculative', 'engine.draft-model', 'slots', 'model.low-disk', 'ggufFile'])
+        form.elements[n]?.closest('label')?.classList.add('hidden');
+      form.querySelector('.coding-preset')?.classList.add('hidden');
+    }
+    // images: end
     // vision: the multimodal projector of a GGUF vision-language model
     form.querySelectorAll('.mm-only').forEach(e => e.classList.toggle('hidden', !opts.gguf));
     form.mmprojChoice.innerHTML = '<option value="">auto (mmproj next to the model)</option><option value="__none__">none (text only)</option>'
@@ -79,11 +91,12 @@ const Models = (() => {
     out.innerHTML = '<p class="muted"><span class="spinner"></span> Looking up the repository…</p>';
     try {
       const info = await api('/api/hub/inspect?source=' + encodeURIComponent(source));
-      const total = info.files.reduce((a, f) => a + Math.max(0, f.size), 0);
-      out.innerHTML = `<p><strong>${esc(info.repo)}</strong> @ ${esc(info.revision)} · <span class="badge info">${info.gguf ? 'GGUF' : 'safetensors'}</span>
-        ${info.files.length} files, ${fmtBytes(total)} · <a href="https://huggingface.co/${esc(info.repo)}" target="_blank" rel="noopener">model card ↗</a></p>
-        ${info.gguf ? '' : '<p class="hint">Quantized once on first load into the model directory (Q4_0 by default), memory-mapped afterwards.</p>'}`;
-      out.appendChild(loadForm({source, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
+      const shown = info.diffusers && info.imageFiles ? info.imageFiles : info.files;   // images: only the files an image model downloads
+      const total = shown.reduce((a, f) => a + Math.max(0, f.size), 0);
+      out.innerHTML = `<p><strong>${esc(info.repo)}</strong> @ ${esc(info.revision)} · <span class="badge info">${info.diffusers ? 'image model' : info.gguf ? 'GGUF' : 'safetensors'}</span>
+        ${shown.length} files, ${fmtBytes(total)} · <a href="https://huggingface.co/${esc(info.repo)}" target="_blank" rel="noopener">model card ↗</a></p>
+        ${info.diffusers ? '<p class="hint">A diffusers repository: the fp16 files are downloaded and run as text-to-image / image-to-image / inpainting on the <a href="#images">Images</a> tab.</p>' : info.gguf ? '' : '<p class="hint">Quantized once on first load into the model directory (Q4_0 by default), memory-mapped afterwards.</p>'}`;
+      out.appendChild(loadForm({source, image: !!info.diffusers, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
         quant: info.quant, defaultId: info.defaultId, download: true,
         mmprojs: info.files.map(f => f.name).filter(n => /(^|\/)mmproj[^/]*\.gguf$/i.test(n))})); // vision
     } catch (e) { out.innerHTML = `<p class="error">${esc(e.message)}</p>`; }
@@ -101,6 +114,23 @@ const Models = (() => {
         <td class="small">${esc(m.backend)}</td><td>${fmtTok(m.contextLength)}${m.slots > 1 ? `<div class="hint">${m.slots} slots${m.busy ? ', ' + m.busy + ' busy' : ''}</div>` : ''}</td><td>${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)}</div></td>
         <td>${m.requests} req${m.active ? ` <span class="badge load">${m.active} active</span>` : ''}<div class="hint">${m.generatedTokens} tokens${m.lastTokensPerSecond ? ' · ' + m.lastTokensPerSecond + ' tok/s' : ''}</div></td>
         <td style="white-space:nowrap"><button class="small" data-chat="${esc(m.id)}">chat</button> <button class="small danger" data-unload="${esc(m.id)}">unload</button></td></tr>`).join('')}</table>`;
+    // images: begin
+    list.forEach((m, i) => {   // an image model: badge, defaults, memory and an "images" button instead of "chat"
+      if (m.kind !== 'image') return;
+      const tr = $$('tr', box)[i + 1];
+      if (!tr) return;
+      const d = m.defaults || {};
+      tr.cells[0].querySelector('strong').insertAdjacentHTML('afterend', ' <span class="badge info">image</span>');
+      const lh = tr.cells[0].querySelectorAll(':scope > .hint')[1];
+      if (lh) lh.textContent = `loaded ${fmtTime(m.loadedAt)} in ${m.loadSeconds.toFixed(1)} s`;
+      tr.cells[2].innerHTML = `${d.steps ?? '?'} step${d.steps === 1 ? '' : 's'} · ${d.size ?? '?'}×${d.size ?? '?'} · ${esc(d.scheduler || '')}<div class="hint">sizes in multiples of ${m.sizeMultiple}${d.distilled ? ' · distilled' : ''}</div>`;
+      tr.cells[3].innerHTML = `${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)} weights</div><div class="hint">${fmtBytes(m.memoryBytes)} in use</div>`;
+      tr.cells[4].innerHTML = `${m.requests} req${m.active ? ` <span class="badge load">${m.active} active</span>` : ''}<div class="hint">${m.generatedTokens} images</div>`;
+      const c = tr.querySelector('[data-chat]');
+      if (c) { c.textContent = 'images'; c.title = 'Open the Images tab with this model'; c.removeAttribute('data-chat'); c.dataset.images = m.id; }
+    });
+    $$('[data-images]', box).forEach(b => b.addEventListener('click', () => Images.selectModel(b.dataset.images)));
+    // images: end
     $$('[data-unload]', box).forEach(b => b.addEventListener('click', async () => {
       if (!confirm('Unload ' + b.dataset.unload + '? Running requests on it are cancelled.')) return;
       b.disabled = true;
@@ -156,7 +186,7 @@ const Models = (() => {
       const td = document.createElement('td');
       td.colSpan = 4;
       const gguf = m.format === 'gguf';
-      td.appendChild(loadForm({source: m.source, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
+      td.appendChild(loadForm({source: m.source, image: m.format === 'diffusers' /* images */, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
         modelDir: gguf && !m.ggufFile ? null : m.modelDir, mmprojs: m.mmprojs,
         defaultId: gguf && m.ggufFile ? m.source + ':' + m.ggufFile.replace(/\.gguf$/i, '').split('/').pop() : m.source}));
       tr.appendChild(td);

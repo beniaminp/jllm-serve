@@ -55,12 +55,15 @@ public class OpenAiController {
     private final ToolsConfig toolsConfig;
     private final AtomicLong counter = new AtomicLong();
     private final AtomicBoolean thinkingNoted = new AtomicBoolean();
+    private final org.robomiri.jllm.web.images.ImageService images;
 
-    public OpenAiController(ModelManager models, SettingsService settings, WebProperties props, ToolsConfig toolsConfig) {
+    public OpenAiController(ModelManager models, SettingsService settings, WebProperties props, ToolsConfig toolsConfig,
+                            org.robomiri.jllm.web.images.ImageService images) {
         this.models = models;
         this.settings = settings;
         this.props = props;
         this.toolsConfig = toolsConfig;
+        this.images = images;
     }
 
     // loaded speech-to-text / text-to-speech models are listed too (kind: "speech-to-text" / "text-to-speech")
@@ -72,6 +75,11 @@ public class OpenAiController {
         List<Object> data = new ArrayList<>();
         for (LoadedModel m : models.loaded()) {
             data.add(modelObject(m));
+        }
+        for (var m : images.loaded()) {
+            var v = m.view();
+            data.add(Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve", "kind", "image",
+                    "backend", v.backend(), "defaults", v.defaults(), "size_multiple", v.sizeMultiple(), "inpainting_unet", v.inpaintUnet()));
         }
         if (audio != null) {
             data.addAll(org.robomiri.jllm.audio.AudioApi.modelObjects(audio.models()));
@@ -93,7 +101,7 @@ public class OpenAiController {
 
     private static Map<String, Object> modelObject(LoadedModel m) {
         LoadedModel.View v = m.view();
-        return Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve",
+        return Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve", "kind", "text",
                 "context_length", v.contextLength(), "backend", v.backend(), "quant", v.quant());
     }
 

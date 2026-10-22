@@ -140,7 +140,7 @@ public final class Metal implements AutoCloseable {
         return create(explicitLib, defines, "kernels.metal");
     }
 
-    /** As above with another shader source of this package ({@code vision.metal}: the vision encoder's own context). */
+    /** As above with another shader source of this package ({@code vision.metal}: the vision encoder; {@code diffusion.metal}: image generation). */
     public static Metal create(String explicitLib, String defines, String resource) {
         Path lib = findLibrary(explicitLib);
         String src;

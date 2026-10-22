@@ -1,0 +1,19 @@
+{
+  "attention_dropout": 0.0,
+  "bos_token_id": 632,
+  "eos_token_id": 633,
+  "hidden_act": "gelu",
+  "hidden_size": 48,
+  "initializer_factor": 1.0,
+  "initializer_range": 0.02,
+  "intermediate_size": 96,
+  "layer_norm_eps": 1e-05,
+  "max_position_embeddings": 77,
+  "model_type": "clip_text_model",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 3,
+  "pad_token_id": 0,
+  "projection_dim": 40,
+  "transformers_version": "5.20.2",
+  "vocab_size": 634
+}
