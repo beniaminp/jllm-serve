@@ -161,7 +161,6 @@ public final class Speculator implements AutoCloseable {
         len = keep;
         misses = 0;
         cooldown = 0;
-        unprofitable = 0;
         if (gated) {
             cost.forgetAcceptance(); // a new request may copy where the last one did not (and the other way round)
         }
