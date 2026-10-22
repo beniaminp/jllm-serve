@@ -100,6 +100,12 @@ public final class VisionContext implements AutoCloseable {
             default -> "<|image_pad|>";
         };
         int id = tok.tokenId(padName);
+        if (id < 0 && clip.projector == ClipModel.Projector.GEMMA3) {
+            // the text-only vocabulary of a Gemma 3 GGUF stops before <image_soft_token> (id 262144); the placeholder is never
+            // looked up (the picture's rows are given), so any id will do: <pad>, as llama.cpp's batch of embeddings has none
+            id = tok.tokenId("<pad>");
+            id = id < 0 ? 0 : id;
+        }
         if (id < 0) {
             throw new IllegalArgumentException("the text model's vocabulary has no " + padName + " token, which "
                     + clip.projector.id + " pictures use as their placeholder");
@@ -223,7 +229,7 @@ public final class VisionContext implements AutoCloseable {
         }
         int[] tokens = java.util.Arrays.copyOf(out, n);
         RopePositions rope = mrope.isEmpty() ? null : ropePositions(tokens.length, spans, grids);
-        return new MediaPrompt(tokens, spans, rope, clip.projector == ClipModel.Projector.GEMMA3);
+        return new MediaPrompt(tokens, spans, rope, clip.projector == ClipModel.Projector.GEMMA3 && !Boolean.getBoolean("jllm.vision.causal")); // (the property: a comparison with causal attention)
     }
 
     /** M-RoPE: text counts up; a picture takes {@code (t, row, column)} from its start and advances by its larger side. */
@@ -310,6 +316,19 @@ public final class VisionContext implements AutoCloseable {
 
     private Chunk chunk(Preprocess.Pixels px, String hash, int index) {
         VisionEncoder.Encoded e = encoder.encode(px);
+        String inject = System.getProperty("jllm.vision.inject"); // debugging: another encoder's embeddings (f32 file) instead of ours
+        if (inject != null) {
+            try {
+                java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(java.nio.file.Files.readAllBytes(java.nio.file.Path.of(inject + "." + index + ".f32")))
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                float[] f = new float[bb.remaining() / 4];
+                bb.asFloatBuffer().get(f);
+                System.err.println("vision: embeddings of " + inject + "." + index + ".f32 (" + f.length + " values) instead of the encoder's " + e.embd().length);
+                e = new VisionEncoder.Encoded(f, e.tokens(), e.nx(), e.ny(), e.deepstack());
+            } catch (java.io.IOException ex) {
+                throw new IllegalStateException(ex);
+            }
+        }
         return new Chunk(e.embd(), e.tokens(), e.nx(), e.ny(), hash + "#" + index, e.deepstack());
     }
 
