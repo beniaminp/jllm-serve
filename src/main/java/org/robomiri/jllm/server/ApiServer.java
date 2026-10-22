@@ -133,6 +133,14 @@ public final class ApiServer implements AutoCloseable {
         return this;
     }
 
+    private volatile VideoHttp video;
+
+    /** Adds the video endpoints ({@code /v1/videos/*}) served by {@code video}; the text engine may be null (video only). */
+    public ApiServer withVideo(VideoHttp video) {
+        this.video = video;
+        return this;
+    }
+
     // ---- pictures in chat messages (docs/20)
     private long imageMaxBytes = 32L << 20;
     private long imageMaxPixels = org.robomiri.jllm.vision.ImageDecoder.MAX_PIXELS;
@@ -174,6 +182,10 @@ public final class ApiServer implements AutoCloseable {
         if (img != null && img.handle(path, req, res)) {
             return;
         }
+        VideoHttp vid = video;
+        if (vid != null && vid.handle(path, req, res)) {
+            return;
+        }
         AudioRoutes ar = audio;
         if (ar != null && ar.handle(path, req, res)) {
             return;
@@ -188,6 +200,9 @@ public final class ApiServer implements AutoCloseable {
                 }
                 if (img != null) {
                     data.add(img.modelObject());
+                }
+                if (vid != null) {
+                    data.add(vid.modelObject());
                 }
                 if (ar != null) {
                     data.addAll(ar.modelObjects());

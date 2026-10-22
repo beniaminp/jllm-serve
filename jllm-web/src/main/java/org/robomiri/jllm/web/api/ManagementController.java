@@ -43,6 +43,9 @@ public class ManagementController {
     private final org.robomiri.jllm.web.models.KvStore kvStore;
     private final org.robomiri.jllm.web.images.ImageService images;
 
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.video.VideoService videos;
+
     public ManagementController(ModelManager models, SettingsService settings, WebProperties props,
                                 org.robomiri.jllm.web.models.KvStore kvStore, org.robomiri.jllm.web.images.ImageService images) {
         this.models = models;
@@ -65,10 +68,17 @@ public class ManagementController {
         for (var m : images.loaded()) {
             weights += m.view().weightBytes();
         }
+        int videoModels = 0;
+        if (videos != null) {
+            for (var m : videos.loaded()) {
+                weights += m.view().weightBytes();
+                videoModels++;
+            }
+        }
         int running = (int) models.jobs().stream().filter(j -> j.state() == Job.State.RUNNING).count();
         return new Status(ManagementFactory.getRuntimeMXBean().getUptime(), Runtime.version().toString(),
                 rt.availableProcessors(), rt.totalMemory() - rt.freeMemory(), rt.maxMemory(), weights,
-                models.loaded().size() + images.loaded().size(), running, props.apiKeyRequired(), settings.file().toString(), thermal);
+                models.loaded().size() + images.loaded().size() + videoModels, running, props.apiKeyRequired(), settings.file().toString(), thermal);
     }
 
     // ------------------------------------------------------------------ models
@@ -77,6 +87,9 @@ public class ManagementController {
     public List<Object> loaded() { // text models ("kind": "text") and image models ("kind": "image")
         List<Object> out = new java.util.ArrayList<>(models.loaded().stream().map(LoadedModel::view).toList());
         images.loaded().forEach(m -> out.add(m.view()));
+        if (videos != null) {
+            videos.loaded().forEach(m -> out.add(m.view())); // "kind": "video"
+        }
         return out;
     }
 

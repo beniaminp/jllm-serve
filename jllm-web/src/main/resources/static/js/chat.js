@@ -115,7 +115,8 @@ const Chat = (() => {
       + `<span class="tc-args">${esc(short)}</span>${result?.ms != null ? `<span class="muted small">${result.ms} ms</span>` : ''}${icon}</summary>`
       + `<div class="tc-body"><div class="muted small">arguments</div><pre>${esc(args)}</pre>`
       + (result ? `<div class="muted small">result</div><pre>${esc(result.content)}</pre>` : '') + '</div></details>'
-      + (typeof Images !== 'undefined' ? Images.inlineHtml(result?.content) : '') /* images: pictures of the result, visible without expanding */;
+      + (typeof Images !== 'undefined' ? Images.inlineHtml(result?.content) : '') /* images: pictures of the result, visible without expanding */
+      + (typeof Video !== 'undefined' ? Video.inlineHtml(result?.content) : '') /* video: clips of the result */;
   }
 
   function statsLine(usage, extra) {
@@ -447,7 +448,7 @@ const Chat = (() => {
 
   function renderModelSelect(list) {
     const sel = $('#chat-model');
-    list = list.filter(m => m.kind !== 'image');   // images: image models are used on the Images tab
+    list = list.filter(m => m.kind !== 'image' && m.kind !== 'video');   // images / video: those models are used on their own tabs
     const want = sel.value || store.get('jllm.model', '');
     const html = list.length ? list.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('') : '<option value="">(no model loaded)</option>';
     if (sel.innerHTML !== html) sel.innerHTML = html;

@@ -104,6 +104,28 @@ public final class Imaging {
         return out.toByteArray();
     }
 
+    /** A JPEG of the picture at the given quality (0..1): the frame strips of the video editor use it, a PNG of a frame is much larger. */
+    public static byte[] jpeg(Image img, float quality) throws IOException {
+        BufferedImage bi = new BufferedImage(img.width(), img.height(), BufferedImage.TYPE_INT_RGB);
+        int[] px = new int[img.width() * img.height()];
+        for (int i = 0; i < px.length; i++) {
+            px[i] = ((img.rgb()[i * 3] & 255) << 16) | ((img.rgb()[i * 3 + 1] & 255) << 8) | (img.rgb()[i * 3 + 2] & 255);
+        }
+        bi.setRGB(0, 0, img.width(), img.height(), px, 0, img.width());
+        javax.imageio.ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next();
+        javax.imageio.ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionQuality(quality);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (javax.imageio.stream.ImageOutputStream ios = ImageIO.createImageOutputStream(out)) {
+            writer.setOutput(ios);
+            writer.write(null, new javax.imageio.IIOImage(bi, null, null), param);
+        } finally {
+            writer.dispose();
+        }
+        return out.toByteArray();
+    }
+
     // ------------------------------------------------------------------ resampling
 
     /**

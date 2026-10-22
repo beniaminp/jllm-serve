@@ -12,6 +12,9 @@ const Models = (() => {
     ['SD-Turbo · image (2.6 GB)', 'stabilityai/sd-turbo'],
     ['SDXL-Turbo · image (7 GB)', 'stabilityai/sdxl-turbo'],
     // images: end
+    // video: begin
+    ['AnimateDiff · video (1.8 GB + SD 1.5, 2.6 GB)', 'guoyww/animatediff-motion-adapter-v1-5-2'],
+    // video: end
   ];
   let lastLocal = 0;
 
@@ -30,6 +33,14 @@ const Models = (() => {
       form.querySelector('.coding-preset')?.classList.add('hidden');
     }
     // images: end
+    // video: begin
+    if (opts.video) {   // a video model (AnimateDiff motion adapter): the video engine's device and its base model
+      form.querySelectorAll('.vid-only').forEach(e => e.classList.remove('hidden'));
+      for (const n of ['backend', 'backend.ctx', 'backend.kv-dtype', 'model.quant', 'backend.batch', 'backend.threads', 'engine.speculative', 'engine.draft-model', 'slots', 'model.low-disk', 'ggufFile'])
+        form.elements[n]?.closest('label')?.classList.add('hidden');
+      form.querySelector('.coding-preset')?.classList.add('hidden');
+    }
+    // video: end
     // vision: the multimodal projector of a GGUF vision-language model
     form.querySelectorAll('.mm-only').forEach(e => e.classList.toggle('hidden', !opts.gguf));
     form.mmprojChoice.innerHTML = '<option value="">auto (mmproj next to the model)</option><option value="__none__">none (text only)</option>'
@@ -91,12 +102,13 @@ const Models = (() => {
     out.innerHTML = '<p class="muted"><span class="spinner"></span> Looking up the repository…</p>';
     try {
       const info = await api('/api/hub/inspect?source=' + encodeURIComponent(source));
-      const shown = info.diffusers && info.imageFiles ? info.imageFiles : info.files;   // images: only the files an image model downloads
+      const shown = (info.diffusers || info.video) && info.imageFiles ? info.imageFiles : info.files;   // images / video: only the files such a model downloads
       const total = shown.reduce((a, f) => a + Math.max(0, f.size), 0);
-      out.innerHTML = `<p><strong>${esc(info.repo)}</strong> @ ${esc(info.revision)} · <span class="badge info">${info.diffusers ? 'image model' : info.gguf ? 'GGUF' : 'safetensors'}</span>
+      out.innerHTML = `<p><strong>${esc(info.repo)}</strong> @ ${esc(info.revision)} · <span class="badge info">${info.video ? 'video model' : info.diffusers ? 'image model' : info.gguf ? 'GGUF' : 'safetensors'}</span>
         ${shown.length} files, ${fmtBytes(total)} · <a href="https://huggingface.co/${esc(info.repo)}" target="_blank" rel="noopener">model card ↗</a></p>
+        ${info.video ? '<p class="hint">An AnimateDiff motion adapter: loading it also downloads the Stable Diffusion 1.5 model it works with (<code>video.base-model</code>, fp16 files, about 2.6 GB, once). It makes short clips on the <a href="#video">Video</a> tab and on <code>/v1/videos/generations</code>.</p>' : ''}
         ${info.diffusers ? '<p class="hint">A diffusers repository: the fp16 files are downloaded and run as text-to-image / image-to-image / inpainting on the <a href="#images">Images</a> tab.</p>' : info.gguf ? '' : '<p class="hint">Quantized once on first load into the model directory (Q4_0 by default), memory-mapped afterwards.</p>'}`;
-      out.appendChild(loadForm({source, image: !!info.diffusers, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
+      out.appendChild(loadForm({source, image: !!info.diffusers, video: !!info.video /* video */, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
         quant: info.quant, defaultId: info.defaultId, download: true,
         mmprojs: info.files.map(f => f.name).filter(n => /(^|\/)mmproj[^/]*\.gguf$/i.test(n))})); // vision
     } catch (e) { out.innerHTML = `<p class="error">${esc(e.message)}</p>`; }
@@ -131,6 +143,23 @@ const Models = (() => {
     });
     $$('[data-images]', box).forEach(b => b.addEventListener('click', () => Images.selectModel(b.dataset.images)));
     // images: end
+    // video: begin
+    list.forEach((m, i) => {   // a video model: badge, defaults, memory and a "video" button instead of "chat"
+      if (m.kind !== 'video') return;
+      const tr = $$('tr', box)[i + 1];
+      if (!tr) return;
+      const d = m.defaults || {};
+      tr.cells[0].querySelector('strong').insertAdjacentHTML('afterend', ' <span class="badge info">video</span>');
+      const lh = tr.cells[0].querySelectorAll(':scope > .hint')[1];
+      if (lh) lh.textContent = `loaded ${fmtTime(m.loadedAt)} in ${m.loadSeconds.toFixed(1)} s`;
+      tr.cells[2].innerHTML = `${d.frames ?? '?'} frames at ${d.fps ?? '?'} fps · ${d.steps ?? '?'} steps · ${d.size ?? '?'}×${d.size ?? '?'} · ${esc(d.scheduler || '')}<div class="hint">at most ${d.max_frames ?? '?'} frames · sizes in multiples of ${m.sizeMultiple}</div>`;
+      tr.cells[3].innerHTML = `${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)} weights</div><div class="hint">${fmtBytes(m.memoryBytes)} in use</div>`;
+      tr.cells[4].innerHTML = `${m.requests} req${m.active ? ` <span class="badge load">${m.active} active</span>` : ''}<div class="hint">${m.generatedTokens} clips</div>`;
+      const c = tr.querySelector('[data-chat]');
+      if (c) { c.textContent = 'video'; c.title = 'Open the Video tab with this model'; c.removeAttribute('data-chat'); c.dataset.video = m.id; }
+    });
+    $$('[data-video]', box).forEach(b => b.addEventListener('click', () => Video.selectModel(b.dataset.video)));
+    // video: end
     $$('[data-unload]', box).forEach(b => b.addEventListener('click', async () => {
       if (!confirm('Unload ' + b.dataset.unload + '? Running requests on it are cancelled.')) return;
       b.disabled = true;
@@ -186,7 +215,7 @@ const Models = (() => {
       const td = document.createElement('td');
       td.colSpan = 4;
       const gguf = m.format === 'gguf';
-      td.appendChild(loadForm({source: m.source, image: m.format === 'diffusers' /* images */, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
+      td.appendChild(loadForm({source: m.source, image: m.format === 'diffusers' /* images */, video: m.format === 'video-adapter' /* video */, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
         modelDir: gguf && !m.ggufFile ? null : m.modelDir, mmprojs: m.mmprojs,
         defaultId: gguf && m.ggufFile ? m.source + ':' + m.ggufFile.replace(/\.gguf$/i, '').split('/').pop() : m.source}));
       tr.appendChild(td);

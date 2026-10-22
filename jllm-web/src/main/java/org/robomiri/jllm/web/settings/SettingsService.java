@@ -215,6 +215,10 @@ public class SettingsService {
         if (key.startsWith("image.")) { // the image model's device and VAE tiling apply at load; the rest belongs to "jllm image" / "jllm serve"
             return key.equals("image.backend") || key.equals("image.precision") || key.startsWith("image.vae-tile") ? Scope.LOAD : Scope.CLI;
         }
+        if (key.startsWith("video.")) { // the video model's device and base model apply at load; the format and switch are read per request
+            return key.equals("video.backend") || key.equals("video.precision") || key.equals("video.decode-chunk") || key.equals("video.base-model") ? Scope.LOAD
+                    : key.equals("video.ffmpeg") || key.equals("video.format") || key.equals("video.enabled") ? Scope.LIVE : Scope.CLI;
+        }
         if (key.equals("audio.stt-model") || key.equals("audio.tts-model")) {
             return Scope.CLI; // the models `jllm serve` loads at start; the console loads models from its Models page
         }

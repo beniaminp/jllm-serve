@@ -16,6 +16,11 @@ public interface Tool {
     /** {@code builtin}, or the MCP server's name. */
     String source();
 
+    /** The time limit of a call in seconds, given the configured one (a tool that is slow by nature, such as video generation, asks for more). */
+    default int timeoutSeconds(int configured) {
+        return configured;
+    }
+
     /** Runs the tool; the text goes back to the model. Throws with a message the model can read on failure. */
     String call(Map<String, Object> arguments) throws Exception;
 

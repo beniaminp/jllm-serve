@@ -181,6 +181,32 @@ public final class ImagePipeline implements AutoCloseable {
         return new Embeds(cat, pooled, t);
     }
 
+    // ------------------------------------------------------------------ parts, for the video pipeline built on the same networks
+
+    UNet unet() {
+        return unet;
+    }
+
+    Vae vae() {
+        return vae;
+    }
+
+    Devices devices() {
+        return devices;
+    }
+
+    Map<String, Object> schedulerConfig() {
+        return schedulerConfig;
+    }
+
+    /** The text embeddings {@code [B, 77, C]} of an SD 1.x / 2.x prompt ({@code B = 2} with guidance: negative, then positive); the caller frees them. */
+    Tn textEmbeddings(String prompt, String negative, boolean cfg, int clipSkip) {
+        if (xl) {
+            throw new IllegalStateException("video models are built on SD 1.x text encoders");
+        }
+        return embed(prompt, negative, cfg, 0, 0, clipSkip).encoder();
+    }
+
     // ------------------------------------------------------------------ generation
 
     /** Generates {@code n} images (image k from the random stream of {@code seed + k}). */
