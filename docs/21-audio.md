@@ -231,7 +231,7 @@ accumulate, LN, feed-forward ×2); the whole encoder, the cross-attention keys a
 nothing else form **one command buffer**. The weights are used where they are: an f16 checkpoint's tensors are wrapped as
 Metal buffers without a copy (`Metal.wrapRange`), an f32 checkpoint's are converted once to half (the default) or wrapped as
 they are (`-Djllm.audio.metalExact=true`: float weight tiles; the encoder output then agrees with the CPU's to `2e-3` on the tiny
-model, `3e-3` with half tiles). Attention products always use float tiles: scores are not rounded to half.
+model, `2.5e-3` with half tiles). Attention products always use float tiles: scores are not rounded to half.
 
 The **decoder** on the GPU (`audio.metal.decoder`; `auto` = models of `d_model ≥ 768`) is one command buffer per call of up to 64 tokens:
 embedding, then per layer 3 LNs, 5 projections (the cross-attention keys and values were made with the encoder), two batched attentions
@@ -436,13 +436,91 @@ package, `inflect`, MeCab, and `whisper-cpp` 1.9.5.
 | `wh_*` kernels (`kernel_tests.py`) | numpy float64 | gemm 4e-7 relative (all four variants, ragged shapes, batches), layernorm 1e-6, softmax 4e-7, patches / split / embedding exact |
 | synthesis, then transcription | Whisper small on the synthesized speech | "Hello, world. This is a test of the speech synthesis system." exactly |
 
-(The remaining rows — word error rates on real recordings, speed — are in 21.13.)
+(Word error rates on real recordings, the speech round trip and speed are in 21.13.)
 
 ---
 
 ## 21.13 Measurements
 
-(filled in below from `scripts/audio-bench.sh`)
+Machine: Apple M1 Pro, 32 GB, JDK 26, the bundled defaults, run alone on the machine (every number below was taken while holding
+the repository's heavy-job lock; a loaded machine makes them 2-3 times worse).
+
+🧸 A real-time factor (RTF) is "seconds of work per second of sound": 0.1 means a minute of speech is written down in six seconds,
+1.0 means the speaker and the computer take the same time. Lower is better for listening to a recording; for speaking, anything
+near 1 is already comfortable (the first words arrive right away when the text is read sentence by sentence, 21.10).
+
+📐 **Speech to text**, one 61.7 s clip (`long.wav`: a book passage read aloud, three 30 s windows), median of 2 runs after a warm-up,
+whole transcription (log-mel, encoder, decoding with timestamps, fallback on):
+
+```
+scripts/audio-bench.sh .sp/audio/clips/long.wav --stt "tiny base small large-v3-turbo" --ggml-dir .sp/audio/ggml --reps 2
+```
+
+| model | jllm CPU | jllm Metal, decoder on CPU | jllm Metal, decoder on GPU | whisper.cpp 1.9.5 GPU | whisper.cpp CPU | transformers CPU | transformers `mps` |
+|---|---|---|---|---|---|---|---|
+| tiny (39 M) | 1.56 s, RTF 0.025 | 0.99 s, 0.016 | 1.34 s, 0.022 | 1.02 s, 0.016 | 6.0 s, 0.097 | 24.1 s, 0.391 | 1.96 s, 0.032 |
+| base (74 M) | 2.59 s, 0.042 | 2.02 s, 0.033 | 2.84 s, 0.046 | 1.97 s, 0.031 | 9.8 s, 0.157 | 29.7 s, 0.481 | 3.95 s, 0.064 |
+| small (244 M) | 14.2 s, 0.230 | 7.61 s, 0.123 | **4.71 s, 0.076** | 2.75 s, 0.042 | 30.0 s, 0.485 | 54.2 s, 0.877 | 6.68 s, 0.108 |
+| large-v3-turbo (809 M) | not run (minutes) | 31.2 s, 0.506 | 26.6 s, 0.431 (see below) | not run | not run | not run | not run |
+
+(`auto` picks the column that is fastest for the model: the decoder on the GPU for `d_model ≥ 768`, i.e. small and larger; the
+whisper.cpp numbers are its own "total time" minus "load time", best of 2.) What the table says:
+
+* On the CPU the engine is 2-2.5 times faster than whisper.cpp's CPU path on the same machine (small: 14.2 s against 30.0 s) and
+  16-40 times faster than the transformers CPU path; the Vector API GEMM with a 4 × 4 register tile and 10 threads is the reason.
+* On the GPU it is between the Python reference (`mps`, 6.7 s for small) and whisper.cpp (2.75 s for small). whisper.cpp's Metal
+  kernels are better tuned than the one tiled simdgroup-matrix GEMM used here (`wh_gemm`), and it keeps the whole graph on the GPU;
+  for tiny and base both finish a minute of speech in about 1-2 s and the differences are a few hundred milliseconds.
+* Stages of one 30 s window (same run): log-mel 16-47 ms (CPU, all models); encoder plus the cross-attention keys and values: tiny 218 ms CPU
+  / 26 ms Metal, base 480 / 54 ms, small 2243 / 194 ms (an 11.6 times speed-up), turbo 1.07-1.28 s Metal; one decoder step with a
+  1500-frame cross-attention: tiny 2.0 ms, base 3.6 ms, small 12.2 ms CPU / 14.3 ms GPU (one isolated step; the GPU wins in a
+  whole transcription, 4.7 s against 7.6 s, because the CPU decoder's attention over the 1500-frame cross-attention and the growing
+  self-attention cache costs more than this isolated step shows).
+* **Why turbo is slower than its size suggests**: its last window (4.8 s of speech then silence) makes greedy decoding loop
+  (compression ratio 19.5, 220 tokens), and the fallback rule re-decodes that window at temperatures 0.2, 0.4 and 0.6 with five
+  samples each, as OpenAI's reference does: 41 s with the fallback, 9.5 s with `audio.stt.fallback=false`. The other six windows
+  take about 1.3 s each. The other models show no sign of a retry in their timings (about 255 decoder steps in 4.7 s for small).
+
+📐 **Text to speech** (OuteTTS 0.3 500M, voice `en_male_1`, the script's default text (134 characters); LM on Metal, codec on the CPU):
+
+(the same `audio-bench.sh` run: `--tts OuteAI/OuteTTS-0.3-500M` is its default, the q4 row is the second model line it prints.)
+
+| | audio produced | time | RTF |
+|---|---|---|---|
+| Q8_0 LM (`audio.tts.quant=q8`, default) | 7.56 s | 7.67 s | 1.01 |
+| Q4_0 LM (`q4`) | 8.65 s | 7.02 s | 0.81 |
+| WavTokenizer decoder alone (CPU, 750 frames) | 10.0 s | 0.50 s | 0.050 |
+| transformers on `mps` (LM only: 729 prompt tokens + 250 generated) | | 4.1 s, 61 tokens/s | |
+| transformers on the CPU (same) | | 24.0 s, 10.4 tokens/s | |
+
+The language model dominates (75 codec frames per second of sound, one token each, about 75 tokens/s on this GPU against 61 for the
+Python reference on the same GPU), so speaking is real-time on this machine and a long text is spoken as it is generated (21.10).
+Q4 is faster and, in the test below, not worse.
+
+📐 **Accuracy on real recordings**: 73 clips of LibriSpeech (dev, 481 s, one speaker per clip; `WER` after lower-casing and removing
+punctuation; transformers `generate` with its defaults as reference):
+
+| model | transformers WER | jllm CPU | jllm Metal | identical transcripts jllm vs transformers |
+|---|---|---|---|---|
+| tiny | 12.78 % | 12.61 % | 12.61 % | 72 of 73 (one differs by a word) |
+| base | 9.22 % | 9.22 % | 9.22 % | 73 of 73 (CPU and Metal) |
+| small | 7.39 % | 7.39 % | 7.39 % | 73 of 73 (CPU and Metal) |
+
+The 481 s are transcribed in 37 s on Metal with small (RTF 0.078). One tiny clip differs from transformers in a word because a
+float rounding tie is broken the other way (the logits of the two candidates differ by 1e-4).
+
+📐 **Speech round trip**: 12 sentences (151 words) spoken by OuteTTS and written down again by Whisper-small:
+
+| LM quantization | word error rate | errors | speech generated | time |
+|---|---|---|---|---|
+| Q8_0 (`audio.tts.quant=q8`, default) | 6.62 % | 10 in 151 words | 43.4 s | 49.3 s |
+| Q4_0 (`q4`) | 5.96 % | 9 in 151 words | 43.6 s | 47.0 s |
+
+(Same sentences, voice `en_male_1` and seeds in both; the two are within the noise of a 151-word test. The tongue twister about sea shells
+accounts for 6 errors in each. An earlier Q8 run had one silent output with 11 errors; that failure is what the engine now retries with another seed.)
+
+The synthesized speech is therefore as intelligible to Whisper-small as it should be for a 500M model; the errors are single words
+("frog" heard as "fraud").
 
 ---
 
