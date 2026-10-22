@@ -60,6 +60,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Stopping for a client that left | an agent that cancels a request frees its slot within one prefill chunk or one token, streaming or not, instead of generating to the end | [17 §17.6](docs/17-agent-speedups.md#176-noticing-a-client-that-left) |
 | Saving in the background, restoring part | a conversation is saved while the next turn already runs (the engine is held 0.3 ms instead of 3 s), and a saved file restores just the prefix a new prompt shares with it | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | q8 KV cache | `backend.kv-dtype=q8`: int8 keys and values with one scale per row of a kv head, half of f16 (59 KB vs 115 KB per token for Qwen3-0.6B), on both backends, files interchangeable | [07](docs/07-cpu-backend.md#q8-int8-values-and-a-scale-per-row-kvcacheq8), [08](docs/08-metal-backend.md#q8) |
+| q8 KV cache with rotated keys | `backend.kv-q8-rotate` (default `true`): the q8 cache's keys are Walsh–Hadamard rotated before they are quantized (the query is rotated too, so scores are unchanged), which cuts q8's perplexity cost against f16 from 0.028 to 0.003 nats per token and its KL divergence 15-55x, for the same memory and 1-2 % of speed; `false` keeps the previous format (saved q8 caches of the other setting are refused). Not for DeepSeek's latent cache | [07 §7.13](docs/07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate), [08 §8.29](docs/08-metal-backend.md#829-the-q8-kv-cache-with-rotated-keys-on-the-gpu-backendkv-q8-rotate), [11 §11.10](docs/11-performance.md#1110-the-q8-cache-with-rotated-keys-measured) |
 | q4 KV cache | `backend.kv-dtype=q4`: Hadamard-rotated keys (the query is rotated too, so scores are unchanged), 4-bit groups of 32 with a half scale, and the latest `backend.kv-q4-recent` positions also kept as halves; 31.5 KB per token for Qwen3-0.6B (f16 115 KB, q8 59 KB), on both backends, decode replay, batched decoding and saved files included. Measured against f16 on Qwen3-0.6B it is clearly less accurate than q8 (the keys need about 5 bits), so it is opt-in | [07](docs/07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4), [08 §8.27](docs/08-metal-backend.md#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4), [11 §11.9](docs/11-performance.md#119-the-q4-kv-cache-measured) |
 | int8 or float, measured | `backend.cpu.int8-activations=auto` times one token's matmuls both ways at load and keeps the faster (int8 on ARM, often float on AVX-512) | [07 §7.10.1](docs/07-cpu-backend.md#7101-auto-measure-dont-guess) |
 | Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
@@ -395,7 +396,8 @@ exit status 2. `prompt`, `raw` and `config` are command line flags only and are 
 Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, `q8`: int8 with a scale per row of a
 kv head, about a quarter of the f32 cache, or `q4`: Hadamard-rotated keys and 4-bit groups of 32 with a half scale,
 about an eighth, for long contexts), `backend.kv-q4-recent` (q4: the latest positions also kept in half precision,
-default 128, 0 = none), `backend.cpu.int8-activations`
+default 128, 0 = none), `backend.kv-q8-rotate` (q8: rotate the keys before the int8 quantization, default `true`,
+`false` = the previous format), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
 `false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
@@ -419,7 +421,7 @@ Short flags:
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N             prefill chunk size (default 64)
---backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N
+--backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N; --backend.kv-q8-rotate true|false
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)

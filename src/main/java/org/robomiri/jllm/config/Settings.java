@@ -215,7 +215,7 @@ public final class Settings {
                 "backend.cpu.native", "must be auto, true or false");
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
-        for (String k : new String[]{"model.low-disk", "chat.thinking", "raw",
+        for (String k : new String[]{"model.low-disk", "chat.thinking", "raw", "backend.kv-q8-rotate",
                 "engine.batch-decode", "engine.constrained-tools", "engine.jump-forward", "engine.constraint-masks"}) {
             if (has(k)) {
                 getBool(k);

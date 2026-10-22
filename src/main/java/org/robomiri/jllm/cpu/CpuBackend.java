@@ -122,7 +122,7 @@ public final class CpuBackend implements Backend {
         Attention a = arch.attention();
         switch (a) {
             case Attention.Gqa g -> {
-                kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
+                kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];
                 vStage = new float[maxBatch * g.kvDim()];

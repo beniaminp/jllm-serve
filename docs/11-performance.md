@@ -616,3 +616,35 @@ the quality gain per position of window is largest at the start (0 → 32 positi
 −0.64, → 512: −0.76), the cost grows with it (prefill at 2 000 tokens: window 0 −7.5 %, 128 −16 %, 512 −29 % against f16). The default stays 128: it takes the larger part of the gain at a cost
 of 16 % of prefill; raise `backend.kv-q4-recent` to 512 when answers matter more than prefill speed, set 0 to save the
 ring and lose only 7.5 % of prefill speed against f16 (accepting about 3× the error).
+
+## 11.10 The q8 cache with rotated keys, measured
+
+🧸 Shaking the keys before the one-byte shrink makes the answers much closer to the full-size shelf's, and it costs almost
+nothing: the same memory and, to within the noise of this machine, the same speed.
+
+📐 **Memory** is q8's (59 KB per token, 242 MB at `--ctx 4096` for Qwen3-0.6B): the rows and scales are the same, nothing is added.
+
+**Speed** (M1 Pro, Qwen3-0.6B Q4_0, Metal, `./jllm bench --model Qwen/Qwen3-0.6B --temp 0 --bench.rounds 3 --engine.speculative off
+--backend.kv-dtype f16|q8 [--backend.kv-q8-rotate true] [--bench.prompt-repeat 200]`, median of 3 rounds, run under the heavy lock
+as `r-speed.sh`, two passes alternating the configurations, shown as pass 1 / pass 2; 413 or 2 013 prompt tokens, decode 128 tokens):
+
+| configuration | prompt tokens | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| Metal, f16 | 413 | 1469.6 / 1454.0 | 119.8 / 116.2 |
+| Metal, q8 (plain keys) | 413 | 1456.8 / 1467.0 | 116.6 / 118.4 |
+| Metal, **q8, rotated keys** (fused `rope_store_q8r`) | 413 | 1453.4 / 1451.9 | 116.5 / 114.5 |
+| Metal, f16 | 2013 | 1025.5 / 1034.6 | 76.1 / 76.0 |
+| Metal, q8 (plain keys) | 2013 | 1049.9 / 1048.9 | 80.7 / 80.5 |
+| Metal, **q8, rotated keys** | 2013 | 1038.2 / 1040.8 | 80.3 / 80.3 |
+| *first version, rotation as a separate dispatch* (`rope` + `kv_store_q8r`) | | | |
+| Metal, q8 (plain keys) | 413 | 1473.3 / 1470.3 | 120.2 / 118.6 |
+| Metal, q8, rotated keys | 413 | 1440.9 / 1440.7 | 115.3 / 111.1 |
+| Metal, q8 (plain keys) | 2013 | 1050.0 / 1049.8 | 75.7 / 75.5 |
+| Metal, q8, rotated keys | 2013 | 1035.3 / 1039.4 | 73.8 / 73.7 |
+
+(The two blocks are two sessions: the 2 013-token q8 decode rates differ between them, 75.7 and 80.5, so differences below ~3 %
+mean nothing on this shared machine. Within a session the comparison is paired.) With the fused kernel the rotated cache is
+0.2–1 % slower than plain q8 in prefill and 0–3 % in decode (within the pass-to-pass spread); the separate-dispatch version cost 2 %
+and 3–6 %, which is why the rotation lives in `rope_store_q8r`. Accuracy: [07 §7.13](07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate).
+Commands for the accuracy and needle tables: `KvStudy accuracy … variants=f32,q8,q8r` and `KvStudy needle … lens=4096,8192,16384
+variants=f16,q8,q8r` (`src/test/java/org/robomiri/jllm/KvStudy.java`).

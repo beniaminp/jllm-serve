@@ -52,6 +52,11 @@ public final class MetalBackend implements Backend {
     // latest rows as halves in a per-layer ring (q4Rings), which the *_q4 attention kernels read for recent keys
     private final KvDtype kvDtype;
     private MetalKernels.Q4Ring[] q4Rings;
+    /**
+     * q8 with Hadamard-rotated keys (backend.kv-q8-rotate, {@link KvQ4#block}): kv_store_q8r rotates k before it is
+     * quantized and the chunk's queries in place, and the score scale is divided by the block. The rows have q8's layout.
+     */
+    private final boolean q8Rot;
     private final boolean kvHalf;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
@@ -286,6 +291,9 @@ public final class MetalBackend implements Backend {
             kvDtype = KvDtype.Q8;
         }
         this.kvDtype = kvDtype;
+        // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
+        this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
+                && KvQ4.supports(ga.headDim());
         this.kvHalf = kvDtype == KvDtype.F16;
         this.k = new MetalKernels(metal, c.normEps());
         try {
@@ -856,30 +864,34 @@ public final class MetalBackend implements Backend {
                 }
                 return;
             }
-            if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch
-                k.ropeStoreQ8(adjacent, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
+            if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch (with q8Rot: also
+                // the Hadamard rotation of k before the quantization and of the queries, rope_store_q8r)
+                k.ropeStoreQ8(adjacent, q8Rot, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), g.heads(), g.kvHeads(), pos,
                         0, rotHalf, n);
             } else {
                 k.rope(adjacent, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer], q8 ? 0 : cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
-                if (q8) {
+                if (q8Rot) { // (unfused) k rotated and quantized, the chunk's queries rotated in place: (Hq)·(Hk) = B q·k
+                    k.kvStoreQ8Rot(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, hd, g.kvHeads(), g.heads(), n);
+                } else if (q8) {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
                 }
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                 return;
             }
             if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
                 k.flashPrefill(kvDtype, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
-                        g.scale(), g.qDim(), stride, g.qDim(), g.window(), g.softcap());
+                        scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                 return;
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
-                    pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
+                    pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
         }
 
         /**
@@ -946,11 +958,18 @@ public final class MetalBackend implements Backend {
             if (q8) {
                 k.beginIndependent();
                 for (int t = 0; t < n; t++) {
-                    k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
-                            owners[t].valCache[layer], positions[t] * rowBytes, hd, g.kvHeads());
+                    if (q8Rot) { // also rotates the row's query in place
+                        k.kvStoreQ8RotRow(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], positions[t] * rowBytes, q, (long) t * g.qDim() * 4, hd, g.kvHeads(),
+                                g.heads());
+                    } else {
+                        k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], positions[t] * rowBytes, hd, g.kvHeads());
+                    }
                 }
                 k.endIndependent();
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             // attention: one slice of the scores scratch per row (it holds a tile's worth), so rows can overlap; the
             // flash form shares its partial-result buffer between rows and stays one after the other
             boolean anyFlash = false;
@@ -966,7 +985,7 @@ public final class MetalBackend implements Backend {
                 if (anyFlash) {
                     if (flashDecode && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
-                                hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                                hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
                     }
                 } else if (t % sliceRows == 0) {
@@ -975,7 +994,7 @@ public final class MetalBackend implements Backend {
                 }
                 k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
                 k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
             }
             k.endIndependent();
             k.rowScores(0);
@@ -1882,7 +1901,7 @@ public final class MetalBackend implements Backend {
     @Override
     public String stateFormat() {
         if (arch.attention() instanceof Attention.Gqa g) {
-            return "kv " + kvDtype + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
+            return "kv " + kvDtype + (q8Rot ? " rot" : "") + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
                     + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
         }
         return mla != null && kvDtype != KvDtype.Q8 ? "mla " + mla.format() : null;

@@ -1192,6 +1192,130 @@ kv_store_q4(256, n_kv=1, ntok=3)
 kv_store_q4(128, rotate=False)
 
 
+# ---- q8 KV cache with Hadamard-rotated keys (backend.kv-q8-rotate): kv_store_q8r and the q8 attention kernels on it
+
+
+def kv_store_q8r(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12):
+    """kv_store_q8r rotates k (and the queries, in place) and quantizes it with q8's one-scale-per-head-row rule, v as
+    kv_store_q8 does, all bit for bit as numpy (and KvCache.Q8 with rotate) does; the other cache rows stay."""
+    rng = np.random.default_rng(11)
+    kv_dim = n_kv * hd
+    k = (rng.standard_normal((ntok, kv_dim)) * rng.random((ntok, 1)) * 4).astype(np.float32)
+    k[:, 5] *= 20  # an outlier channel
+    k[1, :hd] = 0  # an all-zero row: scale 0, values 0
+    v = rng.standard_normal((ntok, kv_dim)).astype(np.float32)
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    q0 = q.copy()
+    stride = kv_dim + 4 * n_kv
+    kc = np.full((ctx, stride), 0x5A, np.uint8)
+    vc = np.full((ctx, stride), 0x5A, np.uint8)
+    kb = np.ascontiguousarray(kc[pos0:])
+    vb = np.ascontiguousarray(vc[pos0:])
+    # KvStoreQ8RParams: headDim kvDim nKvHeads qStride stride
+    E.dispatch('kv_store_q8r', [k, v, kb, vb, q], pack('iiiii', hd, kv_dim, n_kv, n_heads * hd, stride),
+               (2 * n_kv + n_heads, ntok), (32,))
+    krot = q4_rotate(k.reshape(ntok, n_kv, hd)).reshape(ntok, kv_dim)
+    want_k, kd = q8_rows(krot, n_kv, hd)
+    want_v, vd = q8_rows(v, n_kv, hd)
+    ok = (kb[:ntok] == want_k).all() and (vb[:ntok] == want_v).all() and (kb[ntok:] == 0x5A).all()
+    okq = (q == q4_rotate(q0.reshape(ntok, n_heads, hd)).reshape(ntok, -1)).all()
+    # the rotated row is within half a step (max|x| / 254) of the rotated key
+    err = np.abs(kd - krot).max() / (np.abs(krot).max() / 254)
+    check(ok and okq and err <= 1.0001, 'kv_store_q8r hd=%d: rows as numpy %s, queries rotated %s, max error %.3f of max|x| / 254'
+          % (hd, 'yes' if ok else 'NO', 'yes' if okq else 'NO', err))
+
+
+kv_store_q8r(128)
+kv_store_q8r(64, n_kv=3, n_heads=6)
+kv_store_q8r(96)
+kv_store_q8r(256, n_kv=1, ntok=3)
+
+
+def attention_q8_rot(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1):
+    """A q8 attention kernel over rotated key rows with rotated queries and the score scale divided by the Hadamard
+    block computes the attention of the original keys: against the f64 reference on the dequantized rotated rows to
+    rounding, against the unrotated f32 keys within the quantization error, and with keys that have an outlier channel
+    (like Qwen3's) clearly closer to them than the same kernel over plain q8 rows."""
+    rng = np.random.default_rng(12)
+    kv_dim = n_kv * hd
+    q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    kc = rng.standard_normal((ctx, kv_dim)).astype(np.float32)
+    kc[:, 3] *= 12  # outlier channels: one scale per row fits them, not the rest
+    kc[:, hd + 7] *= 12
+    vc = rng.standard_normal((ctx, kv_dim)).astype(np.float32)
+    B = hd & -hd
+    scale = np.float32(1 / np.sqrt(hd))
+    stride = kv_dim + 4 * n_kv
+    krot = q4_rotate(kc.reshape(ctx, n_kv, hd)).reshape(ctx, kv_dim)
+    (kb, kd), (vb, vd) = q8_rows(krot, n_kv, hd), q8_rows(vc, n_kv, hd)
+    qr = q4_rotate(q.reshape(ntok, n_heads, hd)).reshape(ntok, -1)
+    out = np.zeros((ntok, n_heads * hd), np.float32)
+    scores = np.zeros((ntok * n_heads * ctx,), np.float32)
+    # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap
+    p = pack('iiiiiifiiiiiif', n_heads, n_kv, hd, hd, pos0, ctx, scale / B, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0)
+    E.dispatch(name, [qr, kb, vb, out, scores], p, (n_heads // G, ntok), (256,))
+    ref_rot = attention_ref(qr, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale / B)
+    exact = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, ntok, scale)
+    # the same kernel over plain q8 rows of the unrotated keys
+    (pk, pkd) = q8_rows(kc, n_kv, hd)
+    out0 = np.zeros_like(out)
+    p0 = pack('iiiiiifiiiiiif', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0)
+    E.dispatch(name, [q, pk, vb, out0, scores.copy()], p0, (n_heads // G, ntok), (256,))
+    e_rot, e_plain = np.abs(out - exact).max(), np.abs(out0 - exact).max()
+    check(np.abs(out - ref_rot).max() < 1e-4 and e_rot < e_plain,
+          '%s hd=%d rotated keys: max err %.2e vs the kernel on the dequantized rows, %.2e vs f32 keys (plain q8 %.2e)'
+          % (name, hd, np.abs(out - ref_rot).max(), e_rot, e_plain))
+
+
+def rope_store_q8r(hd, n_heads=4, n_kv=2, ntok=3, pos0=5, ctx=16, rot_half=None, adjacent=False, norm=True):
+    """rope_store_q8r (rope, the Hadamard rotation in threadgroup memory and the q8 quantization of k in one dispatch)
+    writes the q rows and the cache rows byte for byte as rope followed by kv_store_q8r does."""
+    rot_half = rot_half or hd // 2
+    rng = np.random.default_rng(13)
+    q0 = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
+    k0 = (rng.standard_normal((ntok, n_kv * hd)) * 3).astype(np.float32)
+    k0[:, 5] *= 15
+    v = rng.standard_normal((ntok, n_kv * hd)).astype(np.float32)
+    v[1, hd:2 * hd] = 0
+    qw = (rng.random(hd) + 0.5).astype(np.float32)
+    kw = (rng.random(hd) + 0.5).astype(np.float32)
+    ang = rng.random((ctx, rot_half)).astype(np.float32) * 3
+    cos, sin = np.cos(ang).astype(np.float32).reshape(-1), np.sin(ang).astype(np.float32).reshape(-1)
+    kv_dim = n_kv * hd
+    stride = kv_dim + 4 * n_kv
+    eps = 1e-6
+    q_a, k_a = q0.copy(), k0.copy()
+    E.dispatch('rope_il' if adjacent else 'rope', [q_a, k_a, qw, kw, cos, sin, k_a],
+               pack('iiiiifiii', hd, n_heads * hd, kv_dim, n_heads, pos0, eps, int(norm), 0, rot_half),
+               (n_heads + n_kv, ntok), (rot_half,))
+    kc_a = np.full((ntok, stride), 0x5A, np.uint8)
+    vc_a = np.full((ntok, stride), 0x5A, np.uint8)
+    E.dispatch('kv_store_q8r', [k_a, v, kc_a, vc_a, q_a], pack('iiiii', hd, kv_dim, n_kv, n_heads * hd, stride),
+               (2 * n_kv + n_heads, ntok), (32,))
+    q_b, k_b = q0.copy(), k0.copy()
+    kc_b = np.full((ntok, stride), 0x5A, np.uint8)
+    vc_b = np.full((ntok, stride), 0x5A, np.uint8)
+    E.dispatch('rope_il_store_q8r' if adjacent else 'rope_store_q8r', [q_b, k_b, qw, kw, cos, sin, kc_b, v, vc_b],
+               pack('iiiiifiiiii', hd, n_heads * hd, kv_dim, n_heads, pos0, eps, int(norm), 0, rot_half, n_kv, stride),
+               (n_heads + 2 * n_kv, ntok), (rot_half,))
+    check(np.array_equal(q_a, q_b) and np.array_equal(kc_a, kc_b) and np.array_equal(vc_a, vc_b),
+          'rope_%sstore_q8r hd=%d rotHalf=%d norm=%s: same bytes (rotated queries, k and v rows) as rope + kv_store_q8r'
+          % ('il_' if adjacent else '', hd, rot_half, norm))
+
+
+rope_store_q8r(128)
+rope_store_q8r(64, n_kv=1, n_heads=3)
+rope_store_q8r(64, rot_half=16, adjacent=True, norm=False)
+rope_store_q8r(96, rot_half=24, norm=False)
+rope_store_q8r(256, n_kv=1)
+
+
+attention_q8_rot('attention_g1_d128_q8', 128)
+attention_q8_rot('attention_g1_d64_q8', 64)
+attention_q8_rot('attention_q8', 96)
+attention_q8_rot('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4)
+
+
 def ex_from(tags, cap, recent, p):
     """KvCache.Q4.exactFrom: the first key a query at p reads from the ring."""
     if recent == 0:
