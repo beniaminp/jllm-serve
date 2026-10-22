@@ -945,7 +945,7 @@ backend call drains it first. `-Djllm.metal.pipeline=false` turns it off.
 
 `MetalBackend.saveState` / `loadState` / `copyStateFrom` implement the backend-neutral cache file and the slot copy
 of [17 §17.2–17.3](17-agent-speedups.md#172-slots-that-share-a-prefix). The format string
-`kv f16 layers=L kvDim=K headDim=D` (or `f32`, `q8`) is the same the CPU backend writes; rows are written as per
+`kv f16 layers=L kvDim=K headDim=D` (or `f32`, `q8`, or `q4 recent=R …` with the recent window's rows after the cache rows, [8.27](#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4)) is the same the CPU backend writes; rows are written as per
 layer, per position, K then V, little-endian (q8: the row's `kvDim` int8 values, then its `kvHeads` f32 scales — the
 cache's own row layout, so saving is a copy here too). The cache buffers live in unified memory, so loading reads from the file
 straight into them, and a slot copy is a `memcpy` of `n` rows per layer between two engines' buffers.
@@ -1595,11 +1595,76 @@ only); `GgufMetalCheck` does the same on the GPU through `MetalKernels` on weigh
 Compile cost: the Metal source grows by 9 x 27 = 243 kernel instantiations (from 310 to 553); `newLibraryWithSource` goes from 1.5 s to 2.8 s the
 first time a changed source is compiled (it is cached by the system afterwards, 0.1 s).
 
-The half-weight kernels round each dequantized weight to half. A weight of the non-linear formats is
+The half-weight kernels of these formats round each dequantized weight to half. A weight of the non-linear formats is
 `d (ls - 32) kvalues[nibble]`, which has more than the 11 significant bits of a half, so on a random model with
-`|logit|` about 13 the CPU and the GPU differ by ~1e-3 where MetalTuner chose them (1e-6 with `-Djllm.metal.hmma=false`);
-the same holds for Q6_K and Q8_0, and the tuner's agreement check is the guard (8.21).
+`|logit|` about 13 the CPU and the GPU would differ by ~1e-3 (1e-6 with the f32 `*_mma` kernels). Like the K-quants'
+they therefore run only with `-Djllm.metal.hmmaKQuants=true`, and the start-up tuner never picks them; only Q4_0 / Q8_0
+have exact half-weight kernels (8.21).
 
 **Short chunks.** `MetalKernels.tiledIsSlow` sends Q4_K, Q5_K, Q5_0 and Q3_K prefill chunks of 8 – 31 tokens to the matrix-unit kernels instead of
 the tiled `*_pf` ones, which decode a whole 32-weight unit per lane and row and are 3 – 4x slower for these bit-field formats
 (Q4_K_M prefill of a 413-token prompt: 750 → 1414 tok/s, same text; numbers in [16 §16.9.1](16-gguf.md)).
+
+## 8.27 The q4 KV cache on the GPU (`backend.kv-dtype=q4`)
+
+### 🧸 In plain words
+
+The GPU keeps the same thumbnail shelf as the CPU ([07 §7.13](07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)):
+every new word's key and value are shrunk to 4 bits, the key first being "shaken" so no number sticks out, and the
+latest 128 words (the *window*) are also kept sharp. One small helper kernel does the shaking and shrinking when a word
+arrives; the attention kernels then read the thumbnails (and the sharp copies for the newest words) when a word asks
+its question. Everything that already speeds up a normal step — recording a step once and replaying it, putting several
+conversations in one pass, saving a conversation to disk — works with it too.
+
+### 📐 Design
+
+| step | q4 |
+|---|---|
+| 2 `matmul3` | the plain `float` variant: k into `kStage`, v into `vStage` (as q8) |
+| 3 `rope` | QK-norm + RoPE of q (in place) and of k, back into `kStage` (the q8 fusion `rope_store_q8` is not used: the rotation needs a whole head) |
+| 3b `kv_store_q4` | grid `(2·kvHeads + heads, n)`, one simdgroup per row: k head → Walsh–Hadamard in registers and shuffles (`q4_rotate`: strides < 32 by `simd_shuffle_xor`, the rest between registers; the same operations on the same operands as `KvQ4.rotate`, so the bytes are the CPU's), then `q4_code` (`simd_max`, the half scale, the 16 codes, two codes per byte through `simd_shuffle_down`); v head → quantized, not rotated; query head → rotated in place. With a ring the rotated k row and the v row also go to the ring slot `pos % ringCap` as halves and the slot's tag (the position) is written |
+| 4 attention | `attention_g1_d{64,128,256}_q4` / `attention_q4` (one threadgroup per (head, token), the phases of `attention_t`), flash decoding `attention_split_q4` + `attention_combine`, flash prefill `attention_fa_d{64,128,256}_q4` |
+
+The score scale handed to the attention kernels is `scale / B` (`KvQ4.scaleDivisor`), because the queries were
+rotated by `kv_store_q4`. Where a key is read from depends on the **ring tags**: `q4_held_from` scans the tags of the
+window with one simdgroup (32 positions per step) and returns the first position from which the ring holds every
+position up to the query's, so a query at `P` reads `[exactFrom(P), P]` from the ring (`kr`, `vr`, halves) and older keys
+from the 4-bit rows (`q4_value`: nibble, `− 7.5`, times the half scale). This is the CPU cache's rule, so both
+backends read the same values for every (query, key) pair. `attention_fa_q4` stages 4 096 / D keys per block
+dequantized from the 4-bit rows in threadgroup memory, computes `Q Kᵀ` on the 8×8 simdgroup matrices, and, for the
+blocks that contain keys some row of the tile reads exactly, corrects the scores and the product with the ring
+rows (`S += q · (k_ring − k_q4)` for the band, `O += P_band (V_ring − V_q4)`), so most blocks cost the same as the
+plain kernel and only the blocks of the window pay.
+
+**Decode replay.** `kv_store_q4`, `attention_q4`, and `attention_split_q4` take the step position as a patched variable
+(`DecodeProgram.VAR_POS`, like `attention_t`), and the cache bindings follow the position's row (the q4 caches are
+registered with `rowIndexed`). Flash decoding derives its keys per split inside the kernel (chunk 0 in `AttnSplitQ4Params`,
+as `attention_split`), so a recording stays valid while the number of splits does. The ring adds nothing to patch: the
+kernels read the tags at run time. `ArchSmoke.replayCheck` runs q4 with no window and with a 6-position window and
+requires the logits of 40 decode steps to be bit-identical to the unrecorded steps, and pipelined greedy decoding
+to give the same tokens.
+
+**Batched decoding.** `kvStoreQ4Row`, `attentionQ4Row` and `flashAttentionQ4Row` are the per-row forms
+(`MetalBackend.GqaStep.runRows`): the same kernels dispatched for one token with the row's q, k and v offsets and the
+*owner's* cache and ring, so a row computes exactly what its owner's own decode step would
+(`ArchSmoke.batchCheck`: q4 among the cache types, tokens equal to the slot's own and logits equal to rounding).
+
+**Saved caches.** The rows are the cache's own layout ([07 §7.13](07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)),
+so saving is a copy; `stateFormat()` is `kv q4 recent=R layers=… kvDim=… headDim=…` (the CPU backend's string), and the
+window's halves are written after the rows by `saveRecent` / read by `loadRecent` (the first `n` of `stored` positions
+keep the part of the window below `n`). `copyStateFrom` copies the rows and the ring slots the source still holds.
+`ArchSmoke.kvStateChecks` runs all of it for q4 as for the other types, including a CPU file in a Metal backend.
+
+**Tuner.** `MetalTuner` checks `attention_fa_d*_q4` and `attention_split_q4` against `attention_q4` on synthetic data
+of the model's shapes with a ring (window and chunk as configured, keys in both representations), under its own cache
+key (`|q4r<R>`); the second flash prefill form (`attention_fb`) has no q4 variant and is not tried for it.
+
+**Kernel tests** (`scripts/metal-emu/kernel_tests.py`): `kv_store_q4` bit for bit against a numpy rotation and
+quantization (head widths 64, 96, 128, 256; with and without rotation), the ring rows and tags, and the rotated
+queries; `attention_q4`, `attention_split_q4` and `attention_fa_q4` against a float64 reference with windows,
+lost ring slots and soft-capping.
+
+**Speed** (M1 Pro, Qwen3-0.6B, speculation off): see [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured).
+The window's corrections make prefill with q4 about 16 % slower than f16 at 2 000 tokens (window 128) and decode up to
+9 % slower (at 413 tokens; equal at 2 000, within noise); the cache is 3.6× smaller. Qwen3-Next's Metal backend and DeepSeek's latent cache have no q4 path and serve a
+q4 request as f16 / q8.

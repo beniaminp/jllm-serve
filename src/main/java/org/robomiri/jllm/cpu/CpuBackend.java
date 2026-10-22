@@ -122,14 +122,17 @@ public final class CpuBackend implements Backend {
         Attention a = arch.attention();
         switch (a) {
             case Attention.Gqa g -> {
-                kv = KvCache.create(kvDtype, c.layers(), g, ctx);
+                kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];
                 vStage = new float[maxBatch * g.kvDim()];
             }
             case Attention.Mla m -> {
                 kv = null;
-                mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype);
+                if (kvDtype == KvDtype.Q4) {
+                    System.err.println("note: backend.kv-dtype=q4 is not implemented for DeepSeek's latent cache, using q8");
+                }
+                mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype == KvDtype.Q4 ? KvDtype.Q8 : kvDtype);
                 kStage = null; // MLA keeps its own cache and staging
                 vStage = null;
             }

@@ -241,6 +241,7 @@ public final class Settings {
             throw new IllegalArgumentException("model.head-quant: " + e.getMessage());
         }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
+        require(getInt("backend.kv-q4-recent") >= 0, "backend.kv-q4-recent", "must be 0 (= none) or positive");
         try {
             org.robomiri.jllm.metal.MoeSplit.parseLayers(get("backend.metal.cpu-moe"));
         } catch (IllegalArgumentException e) {
