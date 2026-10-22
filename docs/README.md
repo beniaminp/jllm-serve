@@ -14,23 +14,23 @@ Suggested reading order:
 
 | # | Document | What you will learn (one line) |
 |---|---|---|
-| 0 | [Explained simply](00-explained-simply.md) | The whole project as stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
+| 0 | [Explained simply](00-explained-simply.md) | The whole project as stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE; and the newer capabilities: pictures in, speech in and out, pictures and video out, the model drafting for itself, smaller KV caches |
 | 0b | [From prompt to answer, on paper](00b-math-on-paper.md) | One question through a toy model (20 tokens, 4-wide vectors, two layers) with every number written down, from the template to the sampled token |
 | 1 | [Overview](01-overview.md) | What an LLM is, the pipeline from text to text, the map of every subsystem (GGUF, pictures, speech, diffusion, speculation, quantized caches) and how a request flows through them |
 | 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, fetching only the shards a model needs |
 | 3 | [Tensors and safetensors](03-safetensors.md) | The file layout byte by byte, bfloat16, memory mapping, jllm's quantized cache file, MLX 4-/8-bit, mxfp4 / mxfp8 and FP8 checkpoints |
-| 4 | [The tokenizer](04-tokenizer.md) | Byte-level BPE from scratch, regex pre-tokenization, the chat template, streaming UTF-8 |
+| 4 | [The tokenizer](04-tokenizer.md) | Byte-level BPE from scratch, regex pre-tokenization, the chat template, streaming UTF-8, and how a GGUF file carries its tokenizer (pre-tokenizer regex lists, greedy SentencePiece) |
 | 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU and the KV cache: every formula the code implements |
 | 6 | [Quantization (Q4/Q8 and the ggml formats)](06-quantization.md) | Why 4-bit weights work, the Q4_0 / Q8_0 block layouts and their error, and (§6.12) the byte layout and a worked dequantization of Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16 and BF16 |
 | 7 | [The CPU backend](07-cpu-backend.md) | SIMD with the Vector API, dot-product kernels, int8 activations and the native C kernels, prefill vs decode, and the f16 / q8 / q4 KV caches with rotated keys (§7.13) |
 | 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM, every compute kernel, flash attention, the start-up self-check, MoE, decode replay and batched rows, GGUF block types on the GPU, the q4 and rotated q8 caches, the prefill chunk, the multi-row matvec and the decode attention |
-| 9 | [Sampling](09-sampling.md) | Softmax, temperature, top-k, top-p, min-p, repetition penalties |
+| 9 | [Sampling](09-sampling.md) | Softmax, temperature, top-k, top-p, min-p, repetition penalties, constrained sampling and how speculative drafts are verified |
 | 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix cache, stop strings, HTTP/1.1, SSE, the OpenAI API, speculative decoding and batched decoding across slots |
 | 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers (Metal, CPU int8, f16 / q8 / q4 caches, q8 with rotated keys), and what to improve next |
-| 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), converting a 61 GB checkpoint on a 32 GB laptop, why prefill chunks of 256 pay, hot experts on the GPU and cold ones on the CPU |
+| 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), converting a 61 GB checkpoint on a 32 GB laptop, why prefill chunks of 256 pay, hot experts on the GPU and cold ones on the CPU; GGUF expert tensors and DeepSeek routing variants |
 | 13 | [Q2_K quantization](13-q2k-quantization.md) | 2-bit weights: sub-block scales and mins, the 84-byte super-block, the quantizer search, measured size / speed / quality |
 | 14 | [Model families](14-model-families.md) | Every supported family (Qwen, Llama, Mistral, GLM, Phi, Gemma, DeepSeek, Mamba, Qwen3-Next and more): what differs, the typed `Architecture`, how to add a family, comparison with transformers on real weights |
-| 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache |
+| 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, Mamba in a GGUF file and how Qwen3-Next's Gated DeltaNet relates |
 | 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format run in place: header and tensors byte by byte, block layouts, name mapping, the stored tokenizer and its pre-types, Qwen3.5 hybrids, multi-token prediction, Gemma / Phi / GLM / Mamba / DeepSeek / Mistral 3 |
 | 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup, shared prefixes, saved conversations, pipelined GPU decoding, cancellation, and constrained tool calls with jump-forward (§17.7) |
 | 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU (MSL → C++, fibers for GPU threads) to test them without a GPU, and what it cannot verify |
