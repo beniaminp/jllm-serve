@@ -402,7 +402,7 @@ public class ModelManager implements DisposableBean {
         }
         checkInterrupted();
         String base = s.get("video.base-model");
-        Path baseDir = repoDir(s, base);
+        Path baseDir = ImageModels.folder(s, base); // a Hub repository under model.dir, or a local diffusers folder
         if (!(DiffusersRepo.isDiffusersDir(baseDir) && DiffusersRepo.missingWeights(baseDir).isEmpty())) {
             List<HuggingFaceHub.RepoFile> listing = hub.listFiles(base, s.get("model.revision"));
             Files.createDirectories(baseDir);

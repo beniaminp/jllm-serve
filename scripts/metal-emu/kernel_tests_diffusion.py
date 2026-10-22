@@ -257,6 +257,7 @@ def run(E, check):
     for dt in (np.float32, np.float16):
         groupnorm_chunked(dt, 2, 150, 32, 4, True, 64)
         groupnorm_chunked(dt, 1, 97, 24, 3, False, 40)
+        groupnorm_chunked(dt, 2, 6 * 40, 32, 8, False, 70)    # a video clip: 6 frames of 40 pixels normalised together (AnimateDiff's temporal norm)
         groupnorm(dt, 2, 50, 64, 8, True)
         groupnorm(dt, 1, 33, 40, 5, False)
         layernorm(dt, 9, 320, True)
@@ -288,6 +289,19 @@ def run(E, check):
         cat = np.zeros((b, h, w, 16), dtype)
         E.dispatch('df_concat' + s, [a1, a2, cat], pack('qiiii', cat.size, 5, 11, 0, 0), ((cat.size + 255) // 256,), (256,))
         check(np.array_equal(cat, np.concatenate([a1, a2], axis=-1)), 'df_concat' + s)
+        # the video (AnimateDiff) layers: swap two middle axes ([B*F, P, C] <-> [B*P, F, C]) and the temporal position table
+        for outer, d1, d2, ch in ((2, 5, 7, 12), (1, 16, 33, 40), (3, 1, 9, 8)):
+            xs = rnd(dtype, outer, d1, d2, ch)
+            sw = np.zeros((outer, d2, d1, ch), dtype)
+            E.dispatch('df_swap_axes' + s, [xs, sw], pack('qiiii', sw.size, d1, d2, ch, 0), ((sw.size + 255) // 256,), (256,))
+            check(np.array_equal(sw, xs.transpose(0, 2, 1, 3)), 'df_swap_axes%s [%d,%d,%d,%d] -> [%d,%d,%d,%d]' % (s, outer, d1, d2, ch, outer, d2, d1, ch))
+        rows, ch, period = 70, 48, 16
+        xr = rnd(dtype, rows, ch)
+        table = rnd(np.float32, 32, ch)
+        outr = np.zeros_like(xr)
+        E.dispatch('df_add_rows' + s, [xr, table, outr], pack('qiiii', xr.size, ch, period, 0, 0), ((xr.size + 255) // 256,), (256,))
+        refr = xr.astype(np.float64) + table[np.arange(rows) % period]
+        check(np.abs(outr - refr).max() < tol(dtype, xr), 'df_add_rows%s rows=%d c=%d period=%d' % (s, rows, ch, period))
 
     ew(np.float32)
     ew(np.float16)

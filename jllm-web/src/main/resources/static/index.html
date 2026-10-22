@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b6cf6'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3Ej%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 <!-- images: begin --><link rel="stylesheet" href="images.css"><!-- images: end -->
+<!-- video: begin --><link rel="stylesheet" href="video.css"><!-- video: end -->
 <link rel="stylesheet" href="css/vision.css"> <!-- vision: pictures in the chat -->
 <!-- audio:begin --><link rel="stylesheet" href="audio.css"><!-- audio:end -->
 <script>try { const t = localStorage.getItem('jllm.theme'); if (t && t !== '"auto"') document.documentElement.dataset.theme = JSON.parse(t); } catch {}</script>
@@ -26,6 +27,9 @@
       <!-- images: begin -->
       <button data-tab="images"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 9"/></svg><span>Images</span></button>
       <!-- images: end -->
+      <!-- video: begin -->
+      <button data-tab="video"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="2"/><path d="m16 10 5-3v10l-5-3"/></svg><span>Video</span></button>
+      <!-- video: end -->
       <!-- audio:begin -->
       <button data-tab="audio"><svg viewBox="0 0 24 24"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 10v4M22 11v2"/></svg><span>Audio</span></button>
       <!-- audio:end -->
@@ -261,6 +265,9 @@
     <!-- images: begin -->
     <section id="tab-images" class="tab page"></section>
     <!-- images: end -->
+    <!-- video: begin -->
+    <section id="tab-video" class="tab page"></section>
+    <!-- video: end -->
     <!-- audio:begin -->
     <section id="tab-audio" class="tab page"></section>
     <!-- audio:end -->
@@ -279,6 +286,11 @@
       <label class="img-only hidden">Image backend <select name="image.backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
       <label class="img-only hidden">Image precision <select name="image.precision"><option value="">(default)</option><option>auto</option><option>f16</option><option>f32</option></select></label>
       <!-- images: end -->
+      <!-- video: begin -->
+      <label class="vid-only hidden">Video backend <select name="video.backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
+      <label class="vid-only hidden">Video precision <select name="video.precision"><option value="">(default)</option><option>auto</option><option>f16</option><option>f32</option></select></label>
+      <label class="vid-only hidden" title="the Stable Diffusion 1.x model the motion adapter is used with (a Hugging Face repository or folder)">Base model <input name="video.base-model" placeholder="stable-diffusion-v1-5/stable-diffusion-v1-5"></label>
+      <!-- video: end -->
       <label class="mm-only" title="vision-language models see pictures through a second file, the multimodal projector (mmproj-*.gguf)">Projector (mmproj) <select name="mmprojChoice"></select></label> <!-- vision -->
       <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
       <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
@@ -320,6 +332,10 @@
 <script src="js/images-editor.js"></script>
 <script src="js/images.js"></script>
 <!-- images: end -->
+<!-- video: begin -->
+<script src="js/video-store.js"></script>
+<script src="js/video.js"></script>
+<!-- video: end -->
 <script src="js/admin.js"></script>
 </body>
 </html>

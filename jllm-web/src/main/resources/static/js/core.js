@@ -63,7 +63,7 @@ async function copyText(text, el) {
 
 // ------------------------------------------------------------------ navigation
 
-const TABS = ['chat', 'models', 'tools', 'settings', 'logs', 'api', 'images' /* images */];
+const TABS = ['chat', 'models', 'tools', 'settings', 'logs', 'api', 'images' /* images */, 'video' /* video */];
 const onShow = {};  // tab -> callback when it becomes visible
 const onTick = {};  // tab -> callback polled while visible
 let activeTab = 'chat';
