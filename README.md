@@ -124,8 +124,9 @@ non-linear 4-bit IQ4_NL / IQ4_XS, MXFP4 (gpt-oss) and F16 / BF16 matrices are co
 mixed file such as the `Q4_0` of Qwen3.8 with `ffn_down` in Q4_1 stays at its 4.5-5 bits per weight instead of being
 widened to 8.5); on the CPU most of them use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11
 tok/s on 4 AVX-512 cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Only F32 matrices (and
-whatever `-Djllm.gguf.requantize=<types>` lists, to compare with the old behaviour) are requantized to Q8_0 in memory
-at load; IQ1-IQ3 and the ternary types are refused. See [docs/16](docs/16-gguf.md) for the file format, the type table
+whatever `-Djllm.gguf.requantize=<types>` lists, to compare with the old behaviour; the CPU backend requantizes
+Q5_1, Q3_K, F16 and BF16 by default because its in-place decode of those is more than 25% slower, `=none` keeps them in place) are
+requantized to Q8_0 in memory at load; IQ1-IQ3 and the ternary types are refused. See [docs/16](docs/16-gguf.md) for the file format, the type table
 (16.4.1), the llama q/k permutation, the zero-copy mapping and the verification.
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in

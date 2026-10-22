@@ -286,10 +286,18 @@ formulas of the types that are new here are in [06 §6.12](06-quantization.md#61
 | Q2_K | 84 / 256 | 2.625 | **in place** | V | yes |
 | IQ1\*, IQ2\*, IQ3\*, TQ1_0, TQ2_0, Q8_K, Q8_1 | | | refused (named in the error) | | |
 
-`-Djllm.gguf.requantize=<types>` (ggml names separated by commas, or `all`) puts the listed types back on the old
-path: dequantized row by row and requantized to Q8_0 at load (8.5 bits per weight, so more memory and slower decode,
-which is memory-bound). It exists for A/B comparisons (`scripts/mac-validate.sh --gguf-types DIR` runs both) and as a
-fallback; the load line says what happened (`GGUF weights: ... (requantized to Q8_0: ...)`).
+`-Djllm.gguf.requantize=<types>` (ggml names separated by commas, `all`, or `none`) puts the listed types on the old
+path: dequantized row by row and requantized to Q8_0 at load (8.5 bits per weight: more memory, and on the GPU slower
+decode when decode is memory-bound). It is a switch for A/B comparisons (`scripts/mac-validate.sh --gguf-types DIR` runs both)
+and a fallback; the load line says what happened (`GGUF weights: ... (requantized to Q8_0: ...)`).
+
+**Default per backend.** The Metal backend reads every type in the table in place. The CPU backend requantizes **Q5_1,
+Q3_K, F16 and BF16** by default, because their in-place decode is more than 25% slower than the Q8_0 kernels' (16.9 has the
+measurements; F16 / BF16 would also read twice the bytes of Q8_0); the others (Q4_1, Q5_0, IQ4_NL, IQ4_XS, MXFP4 and the
+K-quants) stay in place on the CPU too. The load prints `GGUF on the CPU backend: [Q3_K] matrices are requantized ...` when a
+file has such tensors. An explicit `-Djllm.gguf.requantize=...` replaces the default, so `-Djllm.gguf.requantize=none` reads
+everything in place on the CPU as well (the choice for a model that only fits in memory that way), and
+`-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for those three types.
 
 ---
 
