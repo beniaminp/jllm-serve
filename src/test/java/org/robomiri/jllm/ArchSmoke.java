@@ -1270,7 +1270,8 @@ public final class ArchSmoke {
             }
             cases.add(new Object[]{dt.toString(), dt, MoeSplit.OFF});
         }
-        if (((Decoder) cfg).attention() instanceof Attention.Gqa rg && KvQ4.supports(rg.headDim())) {
+        // (not in the forced-MMA pass: a batched pass and a lone step take different matmul kernels there, and a rotated int8 code flips)
+        if (Q4 && ((Decoder) cfg).attention() instanceof Attention.Gqa rg && KvQ4.supports(rg.headDim())) {
             cases.add(new Object[]{"Q8, rotated keys", KvDtype.Q8, MoeSplit.OFF}); // backend.kv-q8-rotate: rows rotate their own q
         }
         if (((Decoder) cfg).anyMoe()) {
