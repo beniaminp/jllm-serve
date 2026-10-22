@@ -19,6 +19,8 @@ public final class ModelWeights implements AutoCloseable {
     public final QTensor lmHead;
     public final LayerWeights[] layers;
     public final float[] finalNorm;
+    /** The multi-token-prediction head of a Qwen3.5 GGUF, null if the model has none. */
+    public final Qwen3NextMtp mtp;
     private final TensorSource file;
     private final AutoCloseable owner;
     private final long bytes;
@@ -71,6 +73,8 @@ public final class ModelWeights implements AutoCloseable {
             throw new IllegalArgumentException(finalNormName + " has " + finalNorm.length + " entries, expected "
                     + c.dim() + STALE_HINT);
         }
+        mtp = arch instanceof Qwen3NextArch q && file.has("model.layers." + c.layers() + ".nextn.eh_proj")
+                ? Qwen3NextMtp.load(file, "model.layers." + c.layers() + ".", q, embed, lmHead, finalNorm) : null;
     }
 
     /** The architecture as a decoder; throws for a Mamba model (a transformer backend was given the wrong model). */

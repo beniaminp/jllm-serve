@@ -237,15 +237,20 @@ def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
     ref = ref / (1 + np.exp(-ref))
     want_state = seq[-(kc - 1):].T
     s = state.copy()
-    E.dispatch('gdn_conv', [x, w, s, y], pack('iiiii', channels, kc, ntok, in_stride, channels),
+    snap = np.zeros_like(state)
+    snap_tok = ntok // 2
+    E.dispatch('gdn_conv', [x, w, s, y, snap], pack('iiiiii', channels, kc, ntok, in_stride, channels, snap_tok),
                ((channels + 63) // 64,), (64,))
-    err = max(np.abs(y - ref).max(), np.abs(s - want_state).max())
+    # the snapshot is the conv state after token snap_tok: the last kc - 1 inputs up to and including it
+    want_snap = seq[snap_tok + 1:snap_tok + kc].T
+    err = max(np.abs(y - ref).max(), np.abs(s - want_state).max(), np.abs(snap - want_snap).max())
     check(err < 1e-5, 'gdn_conv channels=%d kernel=%d ntok=%d: max err %.2e' % (channels, kc, ntok, err))
 
 
-def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5):
+def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5, tiled=0):
     """The gated delta rule: l2norm(q) / sqrt(dk), l2norm(k), beta = sigmoid(b), g = A softplus(a + dt_bias),
-    S = exp(g) S; S += k ((v - S^T k) beta)^T; o = S^T q, against a float64 loop (state stored [head][j][dk])."""
+    S = exp(g) S; S += k ((v - S^T k) beta)^T; o = S^T q, against a float64 loop (state stored [head][j][dk]).
+    tiled=1: value head h reads key head h % nk (Qwen3.5 GGUF order) instead of h // (nv // nk)."""
     rng = np.random.default_rng(5)
     kw = nk * dk
     conv = 2 * kw + nv * dv
@@ -262,7 +267,7 @@ def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5):
     b_off = conv + nv * dv
     for t in range(ntok):
         for h in range(nv):
-            kh = h // r
+            kh = h % nk if tiled else h // r
             q = qkv[t, kh * dk:(kh + 1) * dk].astype(np.float64)
             k = qkv[t, kw + kh * dk:kw + (kh + 1) * dk].astype(np.float64)
             v = qkv[t, 2 * kw + h * dv:2 * kw + (h + 1) * dv].astype(np.float64)
@@ -274,11 +279,17 @@ def gdn_rule(nk=2, nv=4, dk=64, dv=12, ntok=5):
             d = (v - S[h].T @ k) * beta
             S[h] += np.outer(k, d)
             ref[t, h] = S[h].T @ q
+        if t == ntok // 2:
+            S_snap = S.copy()
     st = S0.copy()
-    E.dispatch('gdn_rule', [qkv, proj, A, dtb, st, out],
-               pack('iiiiiiiif', nk, nv, dk, dv, ntok, conv, proj_stride, b_off, 1e-6), ((dv + 3) // 4, nv), (128,))
-    err = max(np.abs(out - ref.reshape(ntok, -1)).max(), np.abs(st - S.transpose(0, 2, 1)).max())
-    check(err < 1e-5, 'gdn_rule nk=%d nv=%d dk=%d dv=%d ntok=%d: max err %.2e' % (nk, nv, dk, dv, ntok, err))
+    snap = np.zeros_like(S0)
+    snap_tok = ntok // 2
+    E.dispatch('gdn_rule', [qkv, proj, A, dtb, st, out, snap],
+               pack('iiiiiiiifii', nk, nv, dk, dv, ntok, conv, proj_stride, b_off, 1e-6, tiled, snap_tok),
+               ((dv + 3) // 4, nv), (128,))
+    err = max(np.abs(out - ref.reshape(ntok, -1)).max(), np.abs(st - S.transpose(0, 2, 1)).max(),
+              np.abs(snap - S_snap.transpose(0, 2, 1)).max())
+    check(err < 1e-5, 'gdn_rule nk=%d nv=%d dk=%d dv=%d ntok=%d tiled=%d: max err %.2e' % (nk, nv, dk, dv, ntok, tiled, err))
 
 
 def gdn_norm_gate(nv=3, dv=40, ntok=4, eps=1e-6):
@@ -302,6 +313,8 @@ if not ONLY:
     gdn_rule()
     gdn_rule(nk=2, nv=2, dk=128, dv=32, ntok=3)
     gdn_rule(nk=1, nv=3, dk=32, dv=5, ntok=7)
+    gdn_rule(nk=2, nv=6, dk=64, dv=12, ntok=4, tiled=1)
+    gdn_rule(nk=4, nv=8, dk=32, dv=8, ntok=3, tiled=1)
     gdn_norm_gate()
 # ---- half-weight MMA prefill kernels (*_hmma) in every weight format, against numpy.
 # Each format's bytes are random (with sane f16 / f32 scales) and decoded here following the block layouts of

@@ -151,7 +151,7 @@ public final class GgufModel implements AutoCloseable {
         }
         String type = resolved.arch().core().modelType();
         String marker = switch (type) {
-            case "qwen2", "qwen3", "qwen3_moe" -> "<|im_start|>";
+            case "qwen2", "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5" -> "<|im_start|>";
             case "llama" -> "<|start_header_id|>";
             case "mistral" -> "[INST]";
             default -> null;

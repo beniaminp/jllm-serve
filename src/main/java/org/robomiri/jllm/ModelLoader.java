@@ -149,7 +149,7 @@ public final class ModelLoader {
         ModelWeights weights = p.weights();
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
-        Speculator.Config spec = speculation(s, arch);
+        Speculator.Config spec = speculation(s, arch, weights);
         // the draft model first, on the same device: it joins DeviceLedger before the target's backend plans its GPU
         // memory (backend.metal.cpu-moe), so the target's budget leaves room for the draft's weights and caches
         DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch, weights) : null;
@@ -176,8 +176,9 @@ public final class ModelLoader {
                 DraftModel d = draft;
                 draft = null; // the engine owns (and closes) it from here on
                 if (engine.enableSpeculation(spec, d)) {
-                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase() + ", up to " + spec.k()
-                            + " tokens per pass" + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
+                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase()
+                            + (spec.mode() == Speculator.Mode.MTP ? ", the model's own multi-token-prediction head, one draft token per pass"
+                            : ", up to " + spec.k() + " tokens per pass") + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
                 }
             }
             return new Loaded(weights, engine);
@@ -212,6 +213,16 @@ public final class ModelLoader {
      * where a verification pass reads the experts of every drafted position and was measured not to pay
      * (docs/11 §11.6), unless {@code engine.speculative} was set explicitly.
      */
+    static Speculator.Config speculation(Settings s, Architecture arch, ModelWeights weights) {
+        Speculator.Config spec = speculation(s, arch);
+        if (weights.mtp != null && "default".equals(s.source("engine.speculative"))) {
+            // a model that carries its own multi-token-prediction head drafts with it unless told otherwise (a hybrid
+            // cannot use prompt lookup: its state cannot be rewound by overwriting)
+            return new Speculator.Config(Speculator.Mode.MTP, spec.k(), spec.ngramMax(), spec.ngramMin(), spec.window());
+        }
+        return spec;
+    }
+
     static Speculator.Config speculation(Settings s, Architecture arch) {
         Speculator.Config spec = s.speculation();
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
@@ -258,8 +269,8 @@ public final class ModelLoader {
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
         constraints(s, e);
-        Speculator.Config spec = speculation(s, l.weights().arch);
-        if (spec.mode() == Speculator.Mode.NGRAM) {
+        Speculator.Config spec = speculation(s, l.weights().arch, l.weights());
+        if (spec.mode() == Speculator.Mode.NGRAM || spec.mode() == Speculator.Mode.MTP) {
             e.enableSpeculation(spec, null);
         }
         return e;

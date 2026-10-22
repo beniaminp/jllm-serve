@@ -91,6 +91,8 @@ public final class ChatTemplate {
         switch (t) {
             case "qwen3", "qwen3_moe", "qwen3_next":
                 return QWEN3;
+            case "qwen3_5": // Qwen3.5 (GGUF qwen35): the 248k vocabulary and a template of its own
+                return QWEN35;
             case "qwen2", "qwen2_5", "qwen2_moe":
                 return deepseekVocab ? DEEPSEEK : QWEN2;
             case "llama":
@@ -226,6 +228,76 @@ public final class ChatTemplate {
             if (!think) {
                 o.ctl("<think>\n\n</think>\n\n");
             }
+        }
+    }, "<|im_end|>", "<|endoftext|>");
+
+    /** The line the Qwen3.5 template puts into the system turn when thinking is on and no effort is given (xhigh). */
+    private static final String QWEN35_EFFORT = "Reasoning effort is set to xhigh. Please think carefully through the task,"
+            + " validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and"
+            + " clarity in the final answer.";
+
+    /**
+     * Qwen3.5 ChatML (the {@code chat_template} of the GGUF files, without vision and tool calls): leading
+     * {@code system} / {@code developer} messages are merged (trimmed, joined by a newline) into one system turn, which
+     * starts with the reasoning-effort line while thinking is on; every message's content is trimmed; every assistant
+     * turn carries its {@code <think>} block (the template's {@code preserve_thinking} defaults to true; the reasoning
+     * is what precedes {@code </think>} in the content, empty if none); the generation prompt opens the think block
+     * ({@code <think>\n}), or closes an empty one when thinking is off. A system message after the first turn is an error.
+     */
+    private static final Format QWEN35 = new Family("chatml-qwen35", (m, gen, think, o) -> {
+        int numSys = 0;
+        StringBuilder sys = new StringBuilder();
+        for (int i = 0; i < m.size(); i++) {
+            String r = m.get(i).role();
+            if (numSys == i && ("system".equals(r) || "developer".equals(r))) {
+                String c = pyTrim(content(m.get(i)));
+                if (!c.isEmpty()) {
+                    sys.append(sys.isEmpty() ? "" : "\n").append(c);
+                }
+                numSys++;
+            }
+        }
+        if (!sys.isEmpty() || think) {
+            o.ctl("<|im_start|>system\n");
+            if (think) {
+                o.ctl(QWEN35_EFFORT + (sys.isEmpty() ? "" : "\n\n"));
+            }
+            o.txt(sys.toString());
+            o.ctl("<|im_end|>\n");
+        }
+        for (int i = numSys; i < m.size(); i++) {
+            Message msg = m.get(i);
+            String role = msg.role();
+            if ("system".equals(role) || "developer".equals(role)) {
+                throw new IllegalArgumentException("System message must be at the beginning.");
+            }
+            String content = content(msg);
+            if (role.equals("assistant")) {
+                String reasoning = "";
+                int end = content.indexOf("</think>");
+                if (end >= 0) {
+                    String before = rstripNl(content.substring(0, end));
+                    int open = before.lastIndexOf("<think>");
+                    reasoning = lstripNl(open >= 0 ? before.substring(open + "<think>".length()) : before);
+                    content = lstripNl(content.substring(content.lastIndexOf("</think>") + "</think>".length()));
+                }
+                o.ctl("<|im_start|>assistant\n<think>\n");
+                o.txt(pyTrim(reasoning));
+                o.ctl("\n</think>\n\n");
+                o.txt(pyTrim(content));
+                o.ctl("<|im_end|>\n");
+            } else if (role.equals("tool")) {
+                toolResponse(m, i, o);
+            } else if (role.equals("user")) {
+                o.ctl("<|im_start|>user\n");
+                o.txt(pyTrim(content));
+                o.ctl("<|im_end|>\n");
+            } else {
+                throw new IllegalArgumentException("Unexpected message role.");
+            }
+        }
+        if (gen) {
+            o.ctl("<|im_start|>assistant\n" + (think ? "<think>\n" : "<think>\n\n</think>\n\n"));
         }
     }, "<|im_end|>", "<|endoftext|>");
 

@@ -1260,15 +1260,14 @@ python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
 
 ### 14.14.8 Not supported
 
-- **Multi-token prediction** (`mtp.*`, one extra layer that predicts the token after next from the last hidden state and
-  the next token's embedding): ignored, as transformers does for inference. It could serve as a built-in draft model
-  for speculative decoding, but speculation needs a rewindable state (the DeltaNet's is not, 14.14.5), so it would
-  also need state snapshots per drafted token.
-- **GGUF** (llama.cpp's `qwen3next` architecture): not mapped. The `gguf` package (0.19.0) lists for it both the
-  fused DeltaNet input `ssm_in` + `ssm_ba` and a split `attn_qkv` + `attn_gate`, besides `ssm_conv1d`, `ssm_a`, `ssm_dt`,
-  `ssm_norm` and `ssm_out`: the layout (which rows go where, which norms carry the `+ 1`, whether `A` is stored as
-  `−exp(A_log)`) is decided by llama.cpp's converter, has changed between versions, and could not be checked against a
-  real file here (the smallest is tens of GB), so it is not implemented rather than guessed.
+- **Multi-token prediction in the Hugging Face checkpoints** (`mtp.*`, one extra layer that predicts the token after
+  next from the last hidden state and the next token's embedding): ignored by the converter, as transformers does for
+  inference. A **Qwen3.5 GGUF** carries the same layer (`nextn.*` tensors) and *is* used, as a built-in draft for
+  speculative decoding: `engine.speculative=mtp`, [16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model).
+  The recurrent state cannot be rewound by overwriting, so that mode checkpoints it around each verification pass.
+- **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.13](16-gguf.md#1613-qwen35-and-qwen3next-as-gguf-files).
+  The `gguf` package lists both the fused DeltaNet input `ssm_in` + `ssm_ba` and the split `attn_qkv` + `attn_gate`; the
+  split one (what current converters write) is mapped (and `qwen35moe`, on tiny models only). The legacy fused `ssm_in` is not.
 - The chunked delta rule on Metal (prefill uses the token loop); a state snapshot to rewind to a shared prefix;
   `backend.metal.cpu-moe` (experts in CPU memory, 12.x) and flash-attention / flash decoding for the attention layers
   (they use `attention_t`); measured speed on real weights (an 80B checkpoint does not fit this machine).
