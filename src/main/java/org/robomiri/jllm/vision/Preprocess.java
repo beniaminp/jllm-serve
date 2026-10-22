@@ -139,7 +139,7 @@ public final class Preprocess {
             }
         } else {
             // files without the preprocessor size (and token limits given by the caller): the generic llava-uhd slicing
-            Size refined = Resize.calcSizePreservedRatio(orig, new SizeRule(tile, Math.max(0, minPx), Math.max(0, maxPx),
+            Size refined = Resize.calcSizePreservedRatio(orig, new SizeRule(tile, Math.max(0, minPx), maxPx > 0 ? maxPx : 16 * tile * tile, // (no budget given: at most 4 x 4 tiles)
                     m.imageLongestEdge));
             gridX = (refined.width() + tile - 1) / tile;
             gridY = (refined.height() + tile - 1) / tile;
