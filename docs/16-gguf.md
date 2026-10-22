@@ -298,6 +298,8 @@ K-quants) stay in place on the CPU too. The load prints `GGUF on the CPU backend
 file has such tensors. An explicit `-Djllm.gguf.requantize=...` replaces the default, so `-Djllm.gguf.requantize=none` reads
 everything in place on the CPU as well (the choice for a model that only fits in memory that way), and
 `-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for those three types.
+Requantizing F16 / BF16 to Q8_0 is lossy (about 0.5% per weight): the CPU default trades that for speed and memory, and
+`-Djllm.gguf.requantize=none` keeps the full precision of the file.
 
 ---
 
