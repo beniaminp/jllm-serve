@@ -50,6 +50,7 @@ def main():
     ap.add_argument('--adapter-variant', default=None)
     ap.add_argument('--clip-skip', type=int, default=None)
     ap.add_argument('--dump-steps', action='store_true')
+    ap.add_argument('--split-cfg', action='store_true', help='run the UNet on the negative and the prompt clip one after the other (same numbers, half the memory)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     dtype = getattr(torch, a.dtype)
@@ -84,6 +85,23 @@ def main():
         pe, npe = pipe.encode_prompt(a.prompt, a.device, 1, cfg, a.negative, **kwc)[:2]
         emb = torch.cat([npe, pe]) if cfg else pe
     save(a.out, 'text.f32', emb.float().cpu().numpy())
+
+    if a.split_cfg:  # the two guidance clips are independent in the batch: evaluating them separately gives the same numbers
+        orig_forward = pipe.unet.forward
+
+        def split_forward(sample, timestep, encoder_hidden_states=None, **kw):
+            if sample.shape[0] != 2:
+                return orig_forward(sample, timestep, encoder_hidden_states=encoder_hidden_states, **kw)
+            n = encoder_hidden_states.shape[0] // 2
+            outs = [orig_forward(sample[i:i + 1], timestep, encoder_hidden_states=encoder_hidden_states[i * n:(i + 1) * n], **kw).sample for i in range(2)]
+
+            class Out:
+                pass
+            o = Out()
+            o.sample = torch.cat(outs)
+            return o
+
+        pipe.unet.forward = split_forward
 
     # one UNet evaluation at the first timestep
     noise = Rng(a.seed).normal(4 * nf * lh * lw).reshape(1, 4, nf, lh, lw)
