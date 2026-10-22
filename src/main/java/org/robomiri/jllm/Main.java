@@ -56,7 +56,12 @@ public final class Main {
                 case "download" -> ModelLoader.download(s, hub, model);
                 case "chat" -> chat(ModelLoader.load(s, hub, model), s);
                 case "run" -> run(ModelLoader.load(s, hub, model), s);
-                case "serve" -> serve(ModelLoader.load(s, hub, model), model, s);
+                case "serve" -> serve(ModelLoader.load(s, hub, model), model, s, hub);
+                case "transcribe" -> org.robomiri.jllm.audio.AudioCli.transcribe(s, hub, model, cli(s, "audio"), cli(s, "language"),
+                        "true".equals(cli(s, "translate")), cli(s, "format") == null ? "text" : cli(s, "format"),
+                        "true".equals(cli(s, "words")));
+                case "speak" -> org.robomiri.jllm.audio.AudioCli.speak(s, hub, model, cli(s, "prompt"), cli(s, "voice"),
+                        cli(s, "speed") == null ? 1.0 : Double.parseDouble(cli(s, "speed")), cli(s, "out"));
                 case "bench" -> bench(ModelLoader.load(s, hub, model), s);
                 default -> {
                     System.err.println("unknown command: " + cmd);
@@ -195,20 +200,37 @@ public final class Main {
         }
     }
 
-    private static void serve(ModelLoader.Loaded l, String model, Settings s) throws Exception {
+    /** A flag only some commands take (--audio, --voice, ...), or null. */
+    private static String cli(Settings s, String key) {
+        return s.has(key) ? s.get(key) : null;
+    }
+
+    private static void serve(ModelLoader.Loaded l, String model, Settings s, HuggingFaceHub hub) throws Exception {
         int port = s.getInt("server.port");
         String host = s.get("server.host");
+        org.robomiri.jllm.audio.AudioSettings as = org.robomiri.jllm.audio.AudioSettings.of(s);
+        boolean audio = !as.sttModel().isEmpty() || !as.ttsModel().isEmpty();
         HttpServer.Options http = new HttpServer.Options(
                 s.getInt("server.read-timeout-ms"),
                 s.getInt("server.write-timeout-ms"),
                 s.getInt("server.max-connections"),
-                s.getLong("server.max-body-bytes"),
+                audio ? Math.max(s.getLong("server.max-body-bytes"), as.maxUploadBytes()) : s.getLong("server.max-body-bytes"),
                 s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         try (ModelWeights weights = l.weights(); Engine engine = l.engine();
+             org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels();
              ApiServer server = new ApiServer(engine, model, host, port, options).imageLimits(
                      s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
+            if (audio) {
+                for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
+                    if (!repo.isEmpty()) {
+                        System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
+                    }
+                }
+                server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
+                        new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+            }
             System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
             server.serve();
         }

@@ -146,6 +146,14 @@ public final class Metal implements AutoCloseable {
         return new Metal(lib, defines.isEmpty() ? src : defines + "#line 1\n" + src);
     }
 
+    /**
+     * As {@link #create(String)} but compiles {@code source} (a complete Metal source text) instead of the bundled
+     * {@code kernels.metal}: the audio models' own kernel library ({@code audio/audio.metal}).
+     */
+    public static Metal createFromSource(String explicitLib, String source) {
+        return new Metal(findLibrary(explicitLib), source);
+    }
+
     /** True if this looks like a machine where the Metal backend can work. */
     public static boolean available() {
         return available(null);

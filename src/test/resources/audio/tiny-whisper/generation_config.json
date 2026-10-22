@@ -1,0 +1,21 @@
+{
+ "decoder_start_token_id": 257,
+ "eos_token_id": 256,
+ "no_timestamps_token_id": 262,
+ "prev_sot_token_id": 260,
+ "max_initial_timestamp_index": 10,
+ "suppress_tokens": [],
+ "alignment_heads": [
+  [
+   1,
+   0
+  ],
+  [
+   1,
+   1
+  ]
+ ],
+ "pad_token_id": 256,
+ "bos_token_id": 256,
+ "max_length": 40
+}

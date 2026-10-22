@@ -150,8 +150,8 @@ public final class Engine implements AutoCloseable {
     private final ChatTemplate.Format template;
     private volatile PromptCache promptCache; // null = every prompt is tokenized in full
     private Speculator spec; // null = no speculative decoding
-    /** Jump-forward under constraints (docs/17 §17.7); {@code -Djllm.jump-forward=false} turns it off. */
-    private volatile boolean jumpForward = Boolean.parseBoolean(System.getProperty("jllm.jump-forward", "true"));
+    /** Jump-forward under constraints (docs/17 §17.7); {@code engine.jump-forward=false} turns it off. */
+    private volatile boolean jumpForward = true;
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
         this(backend, tokenizer, arch, eosIds, 0);

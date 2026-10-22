@@ -37,6 +37,7 @@ public class ToolRegistry {
         this.mcp = mcp;
         List<Tool> all = new ArrayList<>(BuiltinTools.all(config::general));
         all.add(new DescribeImageTool(models, settings, images, config::general)); // vision: lets a text model ask a vision model
+        all.addAll(AudioTools.all()); // transcribe_audio, speak
         this.builtins = List.copyOf(all);
     }
 

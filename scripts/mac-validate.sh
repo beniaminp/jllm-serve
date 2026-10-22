@@ -13,6 +13,8 @@
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
 #   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png   plus the vision encoder rows (docs/20): encoding the
 #                                                            picture on the GPU (default) against the CPU, warm
+#   scripts/mac-validate.sh --audio speech.wav               plus the audio rows (Whisper small and OuteTTS: CPU, Metal encoder,
+#                                                            Metal decoder, half and float weight tiles; q8 and q4 speech model)
 #
 # The llama.cpp comparison needs llama-bench (brew install llama.cpp, or LLAMA_BENCH=/path/to/llama-bench) and
 # python3. Both engines read the same .gguf file (default unsloth/Qwen3-0.6B-GGUF, Q4_0; --llama-quant to change),
@@ -34,6 +36,7 @@ LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
 VISION_MMPROJ=""
 VISION_IMAGE=""
+AUDIO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) DENSE="$2"; shift 2 ;;
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
     --vision) VISION_MMPROJ="$2"; VISION_IMAGE="$3"; shift 3 ;;
+    --audio) AUDIO="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -143,6 +147,59 @@ if [ -n "$VISION_MMPROJ" ]; then
   vision "on the GPU (vision.backend=metal, default)" metal
   vision "on the CPU (vision.backend=cpu)" cpu
 fi
+# constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
+# with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
+# the run when the tokens differ from speculation off; its decode time is the median of 5 generations.
+# ConstraintBench times the token mask (CPU, microseconds per token) with the masks on and off (engine.constraint-masks).
+echo
+echo "| constrained tool call (Qwen3-0.6B, greedy, 'required') | tokens | drafts accepted | decode ms | tokens vs speculation off |"
+echo "|---|---|---|---|---|"
+"$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+  -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+  org.robomiri.jllm.ToolCallCheck --backend metal --ctx 1024 --check-rounds 5 --check-table --check-max 48 \
+  --check-draft "$DENSE" > "$OUT/tc.log" 2>&1 \
+  && grep '^| .* | weather/required=true/' "$OUT/tc.log" \
+    | awk -F'|' '{printf "|%s %s|%s|%s|%s|%s|\n", $2, $3, $4, $5, $6, $7}' \
+  || { echo "| failed | | | | $(tail -1 "$OUT/tc.log") |"; }
+masks() { # label java-opts
+  # shellcheck disable=SC2086
+  "$JAVA" --add-modules jdk.incubator.vector $2 -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench \
+    "models/$(echo "$DENSE" | tr / _)" 10 > "$OUT/cb.log" 2>&1 || { echo "| $label | failed | | $(tail -1 "$OUT/cb.log") |"; return; }
+  local g d x
+  g=$(grep '^agree *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  d=$(grep '^distracted *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  x=$(grep '^disagree *greedy' "$OUT/cb.log" | grep -o '[0-9.]* us/token' | grep -o '^[0-9.]*')
+  echo "| $label | agree $g, distracted $d, disagree $x | | |"
+}
+echo
+echo "| token mask of constrained sampling (greedy, us per token) | agree, distracted, disagree | | |"
+echo "|---|---|---|---|"
+masks "masks on (default)" ""
+masks "masks on, shared memo (-Dwarm)" "-Dwarm=true"
+masks "masks off (engine.constraint-masks=false)" "-Djllm.constraint.masks=false"
+
+# audio (docs/21): the real-time factor (seconds of work per second of audio, lower is better) of one run of the command line
+# tools, each in a fresh JVM, so it includes warm-up; scripts/audio-bench.sh has the steady-state stages
+if [ -n "$AUDIO" ] && [ -z "$LLAMA_ONLY" ]; then
+  audio_row() { # label java-opts args...
+    local label="$1" opts="$2" rtf
+    shift 2
+    rtf=$(JAVA_OPTS="$opts" JLLM_CONFIG=/dev/null ./jllm "$@" 2>&1 >/dev/null | grep -o 'real-time factor [0-9.]*' | tail -1 | grep -o '[0-9.]*$' || true)
+    echo "| $label | ${rtf:-failed} |"
+  }
+  echo
+  echo "| audio | real-time factor |"
+  echo "|---|---|"
+  for k in cpu "metal --audio.metal.decoder off" "metal --audio.metal.decoder on"; do
+    # shellcheck disable=SC2086
+    audio_row "whisper-small, backend $k" "" transcribe --model openai/whisper-small --audio "$AUDIO" --audio.backend $k
+  done
+  audio_row "whisper-small, backend metal, float weight tiles" "-Djllm.audio.metalExact=true" transcribe --model openai/whisper-small \
+    --audio "$AUDIO" --audio.backend metal
+  audio_row "OuteTTS 0.3 500M, q8 language model" "" speak --model OuteAI/OuteTTS-0.3-500M --prompt "Speech synthesis is the artificial production of human speech." --out "$OUT/s8.wav"
+  audio_row "OuteTTS 0.3 500M, q4 language model" "" speak --model OuteAI/OuteTTS-0.3-500M --prompt "Speech synthesis is the artificial production of human speech." --audio.tts.quant q4 --out "$OUT/s4.wav"
+fi
+
 if [ -n "$MOE" ]; then
   bench "$MOE: defaults (256-token chunks)" "$MOE" ""
   bench "64-token chunks" "$MOE" "" --batch 64

@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b6cf6'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3Ej%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="css/vision.css"> <!-- vision: pictures in the chat -->
+<!-- audio:begin --><link rel="stylesheet" href="audio.css"><!-- audio:end -->
 <script>try { const t = localStorage.getItem('jllm.theme'); if (t && t !== '"auto"') document.documentElement.dataset.theme = JSON.parse(t); } catch {}</script>
 </head>
 <body>
@@ -21,6 +22,9 @@
       <button data-tab="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
       <button data-tab="logs"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg><span>Logs</span></button>
       <button data-tab="api"><svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Connect</span></button>
+      <!-- audio:begin -->
+      <button data-tab="audio"><svg viewBox="0 0 24 24"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 10v4M22 11v2"/></svg><span>Audio</span></button>
+      <!-- audio:end -->
     </nav>
     <div class="rail-foot">
       <div id="status" class="status"></div>
@@ -250,6 +254,9 @@
         <div class="row"><input id="api-key" type="password" placeholder="key"><button id="api-key-save" class="primary">Save</button></div>
       </div>
     </section>
+    <!-- audio:begin -->
+    <section id="tab-audio" class="tab page"></section>
+    <!-- audio:end -->
   </main>
 </div>
 
@@ -283,6 +290,13 @@
 </template>
 
 <script src="js/core.js"></script>
+<!-- audio:begin -->
+<script src="js/audio-edit.js"></script>
+<script src="js/audio-io.js"></script>
+<script src="js/audio-editor.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/audio-chat.js"></script>
+<!-- audio:end -->
 <script src="js/markdown.js"></script>
 <script src="js/vision.js"></script> <!-- vision -->
 <script src="js/chat.js"></script>
