@@ -72,6 +72,14 @@ public final class PagedKvTest {
                 }
                 scenario(one, dt, 64, 2, 2, 16, 0, 0f); // one thread: the single-threaded kernel paths
             }
+            for (int hd : new int[]{64, 128}) { // q8 with Hadamard-rotated keys
+                for (int[] shape : new int[][]{{2, 2}, {8, 2}, {1, 4}}) {
+                    for (int window : new int[]{0, 50}) {
+                        scenario(pool, KvDtype.Q8, hd, shape[0], shape[1], 16, window, 0f, true);
+                    }
+                }
+                scenario(pool, KvDtype.Q8, hd, 2, 2, 64, 0, 30f, true);
+            }
             sharing(pool);
         }
         System.out.println(checks + " checks");
@@ -92,6 +100,11 @@ public final class PagedKvTest {
 
     /** One run of stores and attention calls on the flat and the paged cache; every output must be identical. */
     static void scenario(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap) throws Exception {
+        scenario(pool, dt, hd, kvHeads, group, block, window, cap, false);
+    }
+
+    static void scenario(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap,
+                         boolean rot) throws Exception {
         // A kernel's first calls (interpreted, or compiled at a lower tier) can round differently from its later ones: the
         // flat cache then differs from itself on a repeat of the same call. A real paging error fails every attempt;
         // such a cold-start difference passes the next one.
@@ -99,7 +112,7 @@ public final class PagedKvTest {
             int f0 = failures;
             int c0 = checks;
             pending.clear();
-            scenario0(pool, dt, hd, kvHeads, group, block, window, cap);
+            scenario0(pool, dt, hd, kvHeads, group, block, window, cap, rot);
             if (failures == f0 || attempt == 3) {
                 pending.forEach(System.out::println);
                 return;
@@ -109,14 +122,15 @@ public final class PagedKvTest {
         }
     }
 
-    private static void scenario0(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap) throws Exception {
-        String what = dt + " hd=" + hd + " kvHeads=" + kvHeads + " group=" + group + " block=" + block + " window=" + window
+    private static void scenario0(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap,
+                                  boolean rot) throws Exception {
+        String what = dt + (rot ? " rotated keys" : "") + " hd=" + hd + " kvHeads=" + kvHeads + " group=" + group + " block=" + block + " window=" + window
                 + " cap=" + cap + " threads=" + pool.threads();
         int layers = 2;
         int ctx = 700;
         Attention.Gqa a = new Attention.Gqa(kvHeads * group, kvHeads, hd, window, 0, false, false, false, (float) (1 / Math.sqrt(hd)), cap);
-        KvCache flat = KvCache.create(dt, layers, a, ctx);
-        CpuKvStorage st = new CpuKvStorage(dt, layers, a, block);
+        KvCache flat = KvCache.create(dt, layers, a, ctx, 64, 128, rot);
+        CpuKvStorage st = new CpuKvStorage(dt, layers, a, block, rot);
         KvPool kp = new KvPool(st, 400, "t");
         KvSequence seq = kp.newSequence(ctx);
         PagedKv paged = new PagedKv(layers, a, ctx, st, seq);
@@ -164,7 +178,7 @@ public final class PagedKvTest {
         paged.write(end, Channels.newChannel(po));
         check(Arrays.equals(fo.toByteArray(), po.toByteArray()), what + ": saved bytes identical (" + po.size() + ")");
         // a saved flat cache loaded into a paged one attends the same
-        KvPool kp2 = new KvPool(new CpuKvStorage(dt, layers, a, block), 400, "t");
+        KvPool kp2 = new KvPool(new CpuKvStorage(dt, layers, a, block, rot), 400, "t");
         KvSequence seq2 = kp2.newSequence(ctx);
         PagedKv loaded = new PagedKv(layers, a, ctx, (CpuKvStorage) kp2.storage(), seq2);
         ReadableByteChannel in = Channels.newChannel(new java.io.ByteArrayInputStream(fo.toByteArray()));

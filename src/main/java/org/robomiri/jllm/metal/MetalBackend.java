@@ -55,6 +55,11 @@ public final class MetalBackend implements Backend {
     // latest rows as halves in a per-layer ring (q4Rings), which the *_q4 attention kernels read for recent keys
     private final KvDtype kvDtype;
     private MetalKernels.Q4Ring[] q4Rings;
+    /**
+     * q8 with Hadamard-rotated keys (backend.kv-q8-rotate, {@link KvQ4#block}): kv_store_q8r rotates k before it is
+     * quantized and the chunk's queries in place, and the score scale is divided by the block. The rows have q8's layout.
+     */
+    private final boolean q8Rot;
     private final boolean kvHalf;
     /**
      * The paged KV cache (backend.kv-paged, docs/24): this slot's block table over the K / V buffers every slot of the
@@ -282,7 +287,8 @@ public final class MetalBackend implements Backend {
             throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
         }
         MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks);
-        String format = "paged " + kvDtype + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
+        String format = "paged " + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && KvQ4.supports(g.headDim()) ? " rot" : "")
+                + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
                 + g.headDim() + " block=" + blockTokens;
         return new KvPool(st, (int) blocks, format);
     }
@@ -329,6 +335,9 @@ public final class MetalBackend implements Backend {
             kvDtype = KvDtype.Q8;
         }
         this.kvDtype = kvDtype;
+        // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
+        this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
+                && KvQ4.supports(ga.headDim());
         this.kvHalf = kvDtype == KvDtype.F16;
         this.seq = kvPool != null && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4
                 ? kvPool.newSequence(ctx) : null;
@@ -926,30 +935,36 @@ public final class MetalBackend implements Backend {
             if (paged) { // rotate in the staging rows, then store them into the rows of the block table
                 k.rope(adjacent, false, q, kStage, 0, kStage, 0, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
-                if (q8) {
+                if (q8Rot) { // k rotated and quantized, the chunk's queries rotated in place
+                    k.kvStoreQ8Rot(kStage, vStage, keyCache[layer], valCache[layer], 0, q, hd, g.kvHeads(), g.heads(), pos, n);
+                } else if (q8) {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], 0, hd, g.kvHeads(), pos, n);
                 } else {
                     k.kvStorePaged(kvHalf, kStage, 0, vStage, 0, keyCache[layer], valCache[layer], kvDim, pos, n);
                 }
-            } else if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch
-                k.ropeStoreQ8(adjacent, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
+            } else if (q8 && MetalKernels.FUSE) { // the rotation and the quantization of k and v in one dispatch (with q8Rot: also
+                // the Hadamard rotation of k before the quantization and of the queries, rope_store_q8r)
+                k.ropeStoreQ8(adjacent, q8Rot, q, kStage, vStage, keyCache[layer], valCache[layer], cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), g.heads(), g.kvHeads(), pos,
                         0, rotHalf, n);
             } else {
                 k.rope(adjacent, kvHalf, q, kDst, kOff, q8 ? kStage : keyCache[layer], q8 ? 0 : cacheOff,
                         useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
-                if (q8) {
+                if (q8Rot) { // (unfused) k rotated and quantized, the chunk's queries rotated in place: (Hq)·(Hk) = B q·k
+                    k.kvStoreQ8Rot(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, hd, g.kvHeads(), g.heads(), pos, n);
+                } else if (q8) {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), pos, n);
                 }
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
                 // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
                 // token, so that every row is exactly what a decode step at its position computes
                 for (int t = 0; t < n; t++) {
                     long qRow = (long) t * g.qDim() * 4;
                     k.decodeAttention(kvDtype, q, qRow, keyCache[layer], valCache[layer], flashPart, att, qRow, g.heads(),
-                            g.kvHeads(), hd, pos + t, ctx, g.scale(), stride, g.window(), g.softcap());
+                            g.kvHeads(), hd, pos + t, ctx, scale, stride, g.window(), g.softcap());
                 }
                 return;
             }
@@ -965,7 +980,7 @@ public final class MetalBackend implements Backend {
                     }
                     k.rowScores((long) (t % sliceRows) * g.heads() * ctx * 4);
                     k.attentionRow(attnKernel, attnGroup, q, qOff, keyCache[layer], valCache[layer], att, qOff, scores, g.heads(),
-                            g.kvHeads(), hd, hd, pos + n - 1, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
                 }
                 k.endIndependent();
                 k.rowScores(0);
@@ -973,16 +988,16 @@ public final class MetalBackend implements Backend {
             }
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                 return;
             }
             if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
                 k.flashPrefill(kvDtype, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
-                        g.scale(), g.qDim(), stride, g.qDim(), g.window(), g.softcap());
+                        scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                 return;
             }
             k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
-                    pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
+                    pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n);
         }
 
         /**
@@ -1051,7 +1066,11 @@ public final class MetalBackend implements Backend {
                 k.beginIndependent();
                 for (int t = 0; t < n; t++) {
                     k.page(owners[t].pageTbl, owners[t].pageShift); // each row stores through its owner's block table
-                    if (q8) {
+                    if (q8Rot) { // also rotates the row's query in place
+                        k.kvStoreQ8RotRow(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                                owners[t].valCache[layer], paged ? 0 : positions[t] * rowBytes, q, (long) t * g.qDim() * 4, hd,
+                                g.kvHeads(), g.heads(), positions[t]);
+                    } else if (q8) {
                         k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
                                 owners[t].valCache[layer], paged ? 0 : positions[t] * rowBytes, hd, g.kvHeads(), positions[t]);
                     } else {
@@ -1061,11 +1080,12 @@ public final class MetalBackend implements Backend {
                 }
                 k.endIndependent();
             }
+            float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
                 for (int t = 0; t < n; t++) {
                     k.page(owners[t].pageTbl, owners[t].pageShift);
                     k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
-                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, g.scale(),
+                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, scale,
                             stride, g.window(), g.softcap());
                 }
                 k.page(pageTbl, pageShift);
@@ -1087,7 +1107,7 @@ public final class MetalBackend implements Backend {
                 if (anyFlash) {
                     if (flashDecode && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
-                                hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                                hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
                     }
                 } else if (t % sliceRows == 0) {
@@ -1096,7 +1116,7 @@ public final class MetalBackend implements Backend {
                 }
                 k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
                 k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                        hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
             }
             k.endIndependent();
             k.rowScores(0);
@@ -2046,7 +2066,7 @@ public final class MetalBackend implements Backend {
     @Override
     public String stateFormat() {
         if (arch.attention() instanceof Attention.Gqa g) {
-            return "kv " + kvDtype + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
+            return "kv " + kvDtype + (q8Rot ? " rot" : "") + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
                     + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();
         }
         return mla != null && kvDtype != KvDtype.Q8 ? "mla " + mla.format() : null;

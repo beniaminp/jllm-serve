@@ -2080,7 +2080,11 @@ static inline char q8_value(float x, float s) {
     return s > 0.0f ? char(clamp(rint(x / s), -127.0f, 127.0f)) : char(0);
 }
 
-template <bool ADJACENT>
+// ROT (rope_store_q8r, backend.kv-q8-rotate): the rotated head is also Walsh-Hadamard transformed in threadgroup memory
+// (the butterflies (a, b) -> (a + b, a - b) of stride 1, 2, 4, ... within blocks of B = the largest power of two dividing
+// headDim, KvQ4.rotate's operations on the same operands) before it is used: a q head is written back transformed, a k
+// head is quantized transformed, so one dispatch does what rope + kv_store_q8r do (the same bytes); v heads are as before.
+template <bool ADJACENT, bool ROT>
 kernel void rope_store_q8(device float *q [[buffer(0)]],
                           device const float *k [[buffer(1)]],
                           device const float *qw [[buffer(2)]],
@@ -2132,7 +2136,7 @@ kernel void rope_store_q8(device float *q [[buffer(0)]],
     const float s = sinT[pos * p.rotHalf + tid];
     const float ra = a * c - b * s;
     const float rb = b * c + a * s;
-    if (isQ) {
+    if (isQ && !ROT) {
         q[off + i0] = ra;
         q[off + i1] = rb;
         return;
@@ -2146,14 +2150,36 @@ kernel void rope_store_q8(device float *q [[buffer(0)]],
             mx = max(mx, fabs(h[i]));
         }
     }
+    if (ROT) {
+        const int B = p.headDim & -p.headDim;
+        for (int hh = 1; hh < B; hh <<= 1) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int j = tid; j < p.headDim / 2; j += p.rotHalf) {
+                const int i = (j / hh) * 2 * hh + j % hh;
+                const float u = hv[i];
+                const float w2 = hv[i + hh];
+                hv[i] = u + w2;
+                hv[i + hh] = u - w2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (isQ) { // the rotated query, in place
+            for (int i = tid; i < p.headDim; i += p.rotHalf) q[off + i] = hv[i];
+            return;
+        }
+        mx = 0.0f;
+        for (int i = tid; i < p.headDim; i += p.rotHalf) mx = max(mx, fabs(hv[i]));
+    }
     const float sc = tg_max(mx, buf, sg, lane, nsg) / 127.0f; // its barriers also publish hv
     device char *row = kc + (ulong)tgp.y * p.stride;
     for (int i = tid; i < p.headDim; i += p.rotHalf) row[head * p.headDim + i] = q8_value(hv[i], sc);
     if (tid == 0) ((device float *)(row + kvDim))[head] = sc;
 }
 
-template [[host_name("rope_store_q8")]] kernel decltype(rope_store_q8<false>) rope_store_q8<false>;
-template [[host_name("rope_il_store_q8")]] kernel decltype(rope_store_q8<true>) rope_store_q8<true>;
+template [[host_name("rope_store_q8")]] kernel decltype(rope_store_q8<false, false>) rope_store_q8<false, false>;
+template [[host_name("rope_il_store_q8")]] kernel decltype(rope_store_q8<true, false>) rope_store_q8<true, false>;
+template [[host_name("rope_store_q8r")]] kernel decltype(rope_store_q8<false, true>) rope_store_q8<false, true>;
+template [[host_name("rope_il_store_q8r")]] kernel decltype(rope_store_q8<true, true>) rope_store_q8<true, true>;
 
 // kv_put<KV>: batched decoding across slots (MetalBackend.forwardBatch). The rows of a batched step belong to different
 // conversations, each with its own cache and position, so the projection writes every row's v to an f32 staging row
@@ -4780,6 +4806,57 @@ kernel void kv_store_q4(device const float *k [[buffer(0)]],
         for (int i = 0; i < MAX_PER; i++) if (i < per) rr[lane + i * 32] = half(r[i]);
         if (!isV && h == 0 && lane == 0) tags[slot] = p.pos0 + t;
     }
+}
+
+// kv_store_q8r: kv_store_q8 for a q8 cache of rotated keys (backend.kv-q8-rotate, Java: KvCache.Q8 with rotate). The same
+// row layout and quantization as kv_store_q8 (one scale per kv head row, scale = max|x| / 127, q = rint(x / scale)), but
+// k is first rotated like kv_store_q4's (q4_rotate, the unnormalized Hadamard transform in blocks of the largest power of
+// two dividing headDim) and the chunk's query rows are rotated in place the same way; the host divides the score scale by
+// the block, so (Hq).(Hk) / B = q.k. Grid: (2 * nKvHeads + nHeads, ntok), one simdgroup per row: x < nKvHeads is k head x,
+// x < 2 * nKvHeads v head x - nKvHeads (not rotated), the others query head x - 2 * nKvHeads. k / v are the f32 staging
+// rows [ntok, kvDim]; kc / vc are bound at the row of the chunk's first position; q at the chunk's first query row.
+struct KvStoreQ8RParams {
+    int headDim;
+    int kvDim;       // values per position (nKvHeads * headDim)
+    int nKvHeads;
+    int qStride;     // q row stride (nHeads * headDim)
+    int stride;      // bytes per cache position row: kvDim + 4 * nKvHeads
+    int pos;         // paged cache: position of the chunk's first row (the buffers are bound at row 0)
+    int pageShift;   // paged cache (see kv_row); 0 = flat, kc / vc bound at the chunk's first row
+};
+
+kernel void kv_store_q8r(device const float *k [[buffer(0)]],
+                         device const float *v [[buffer(1)]],
+                         device char *kc [[buffer(2)]],
+                         device char *vc [[buffer(3)]],
+                         device float *q [[buffer(4)]],
+                         device const int *tbl [[buffer(5)]],
+                         constant KvStoreQ8RParams &p [[buffer(6)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    const int x = int(tgp.x);
+    const int t = int(tgp.y);
+    const int per = p.headDim / 32;
+    const int B = p.headDim & -p.headDim;
+    float r[MAX_PER];
+    if (x >= 2 * p.nKvHeads) {
+        device float *qr = q + (ulong)t * p.qStride + (x - 2 * p.nKvHeads) * p.headDim;
+        for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? qr[lane + i * 32] : 0.0f;
+        q4_rotate(r, per, B, lane);
+        for (int i = 0; i < MAX_PER; i++) if (i < per) qr[lane + i * 32] = r[i];
+        return;
+    }
+    const bool isV = x >= p.nKvHeads;
+    const int h = isV ? x - p.nKvHeads : x;
+    device const float *src = (isV ? v : k) + (ulong)t * p.kvDim + h * p.headDim;
+    for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? src[lane + i * 32] : 0.0f;
+    if (!isV) q4_rotate(r, per, B, lane);
+    float mx = 0.0f;
+    for (int i = 0; i < MAX_PER; i++) if (i < per) mx = max(mx, fabs(r[i]));
+    const float s = simd_max(mx) / 127.0f;
+    device char *row = (isV ? vc : kc) + (p.pageShift == 0 ? ulong(t) : kv_row(tbl, p.pageShift, p.pos + t)) * p.stride;
+    for (int i = 0; i < MAX_PER; i++) if (i < per) row[h * p.headDim + lane + i * 32] = q8_value(r[i], s);
+    if (lane == 0) ((device float *)(row + p.kvDim))[h] = s;
 }
 
 // attention_q4_t<PER>: attention_t<KV, 1, PER, PER> over a q4 cache (head width PER * 32, or p.qkDim for PER = 0):

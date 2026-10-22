@@ -126,17 +126,23 @@ public final class CpuBackend implements Backend {
      * @param poolTokens capacity in positions across all sequences (0 = {@code slots} contexts and a spare)
      */
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens) {
+        return newKvPool(w, ctx, slots, kvDtype, blockTokens, poolTokens, KvDtype.q8Rotate());
+    }
+
+    /** {@link #newKvPool(ModelWeights, int, int, KvDtype, int, long)} with the q8 cache's rotated keys given ({@code backend.kv-q8-rotate}). */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   boolean rotateQ8) {
         Decoder arch = w.decoder();
         if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
             return null;
         }
-        CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens);
+        CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8);
         long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
         long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
         if (blocks > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
         }
-        String format = "paged " + kvDtype + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim()
+        String format = "paged " + kvDtype + (st.rotate ? " rot" : "") + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim()
                 + " block=" + blockTokens;
         return new KvPool(st, (int) blocks, format);
     }
@@ -166,7 +172,7 @@ public final class CpuBackend implements Backend {
                     kv = new PagedKv(c.layers(), g, ctx, (CpuKvStorage) kvPool.storage(), seq);
                 } else {
                     seq = null;
-                    kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
+                    kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
                 }
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];

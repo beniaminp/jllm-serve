@@ -176,7 +176,8 @@ public final class ModelLoader {
             throw e;
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype"))
-                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : ""));
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : "")
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q8 && s.getBool("backend.kv-q8-rotate") ? " rotated keys" : ""));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"),
                     chatFormat(p, arch, tok));
@@ -332,7 +333,7 @@ public final class ModelLoader {
         int ctx = s.getInt("backend.ctx");
         int block = s.getInt("backend.kv-block");
         long tokens = s.getLong("backend.kv-pool-tokens");
-        String key = (metal ? "metal|" : "cpu|") + kvDtype + "|" + block + "|" + ctx + "|" + tokens;
+        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens;
         org.robomiri.jllm.kv.KvPool pool = org.robomiri.jllm.kv.KvPools.get(weights, key,
                 () -> metal ? org.robomiri.jllm.metal.MetalBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens,
                         s.opt("backend.metal.lib")) : CpuBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens));
@@ -540,6 +541,7 @@ public final class ModelLoader {
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
+        KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
         boolean mamba = arch instanceof MambaArch;
         if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")

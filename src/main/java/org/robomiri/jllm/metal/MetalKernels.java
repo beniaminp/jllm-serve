@@ -905,6 +905,18 @@ final class MetalKernels implements AutoCloseable {
     void ropeStoreQ8(boolean adjacent, Metal.Buffer q, Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc,
                      Metal.Buffer vc, long cacheOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos, Metal.Buffer sin,
                      int headDim, int qStride, int nHeads, int nKvHeads, int pos, int rotOff, int rotHalf, int n) {
+        ropeStoreQ8(adjacent, false, q, kStage, vStage, kc, vc, cacheOff, qw, kw, cos, sin, headDim, qStride, nHeads, nKvHeads,
+                pos, rotOff, rotHalf, n);
+    }
+
+    /**
+     * {@link #ropeStoreQ8}; with {@code rotate} ({@code rope_store_q8r}, a q8 cache of Hadamard-rotated keys) the k heads
+     * are rotated before they are quantized and the q heads are written rotated, so {@link #kvStoreQ8Rot} is not needed.
+     */
+    void ropeStoreQ8(boolean adjacent, boolean rotate, Metal.Buffer q, Metal.Buffer kStage, Metal.Buffer vStage,
+                     Metal.Buffer kc, Metal.Buffer vc, long cacheOff, Metal.Buffer qw, Metal.Buffer kw, Metal.Buffer cos,
+                     Metal.Buffer sin, int headDim, int qStride, int nHeads, int nKvHeads, int pos, int rotOff, int rotHalf,
+                     int n) {
         int kvDim = headDim * nKvHeads;
         bind(0, q, 0);
         bind(1, kStage, 0);
@@ -917,7 +929,8 @@ final class MetalKernels implements AutoCloseable {
         bind(8, vc, cacheOff);
         p.reset(KernelParams.ROPE_Q8).i(headDim).i(qStride).i(kvDim).i(nHeads).iv(DecodeProgram.VAR_POS, pos).f(eps)
                 .i(qw != null).i(rotOff).i(rotHalf).i(nKvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, nKvHeads));
-        dispatch(adjacent ? "rope_il_store_q8" : "rope_store_q8", 9, 0, nHeads + 2 * nKvHeads, n, 1, rotHalf, 1, 1);
+        dispatch((adjacent ? "rope_il_store_q8" : "rope_store_q8") + (rotate ? "r" : ""), 9, 0, nHeads + 2 * nKvHeads, n, 1,
+                rotHalf, 1, 1);
     }
 
     // ---------------------------------------------------------------- attention
@@ -1005,6 +1018,24 @@ final class MetalKernels implements AutoCloseable {
         bindOrDummy(4, pageTbl);
         p.reset(KernelParams.KV_PAGED).i(kvDim).i(kvDim).iv(DecodeProgram.VAR_POS, pos).i(pageShift);
         dispatch(half ? "kv_store_pg_h" : "kv_store_pg", 5, 0, 2 * channelGrid(kvDim), n, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /**
+     * {@code kv_store_q8r}: {@link #kvStoreQ8} for a q8 cache of rotated keys: k is Hadamard-rotated before it is
+     * quantized and the chunk's query rows ({@code q}, [n, heads * headDim]) are rotated in place.
+     */
+    void kvStoreQ8Rot(Metal.Buffer kStage, Metal.Buffer vStage, Metal.Buffer kc, Metal.Buffer vc, long off, Metal.Buffer q,
+                      int headDim, int kvHeads, int heads, int pos, int n) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, 0);
+        bind(1, vStage, 0);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, 0);
+        bindOrDummy(5, pageTbl);
+        p.reset(KernelParams.KV_STORE_Q8R).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).iv(DecodeProgram.VAR_POS, pos).i(pageShift);
+        dispatch("kv_store_q8r", 6, 0, 2 * kvHeads + heads, n, 1, 32, 1, 1);
     }
 
     /**
@@ -1681,6 +1712,21 @@ final class MetalKernels implements AutoCloseable {
         p.reset(KernelParams.KV_STORE).i(headDim).i(kvDim).i(kvHeads).i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).i(pos)
                 .i(pageShift);
         dispatch("kv_store_q8", 5, 0, 2 * kvHeads, 1, 1, 32, 1, 1);
+    }
+
+    /** {@link #kvStoreQ8Rot} of one token: its staging rows at bytes kOff / vOff, its q row at byte qOff, its cache rows at off. */
+    void kvStoreQ8RotRow(Metal.Buffer kStage, long kOff, Metal.Buffer vStage, long vOff, Metal.Buffer kc, Metal.Buffer vc,
+                         long off, Metal.Buffer q, long qOff, int headDim, int kvHeads, int heads, int pos) {
+        int kvDim = headDim * kvHeads;
+        bind(0, kStage, kOff);
+        bind(1, vStage, vOff);
+        bind(2, kc, off);
+        bind(3, vc, off);
+        bind(4, q, qOff);
+        bindOrDummy(5, pageTbl);
+        p.reset(KernelParams.KV_STORE_Q8R).i(headDim).i(kvDim).i(kvHeads).i(heads * headDim)
+                .i((int) KvDtype.Q8.rowBytes(kvDim, kvHeads)).i(pos).i(pageShift);
+        dispatch("kv_store_q8r", 6, 0, 2 * kvHeads + heads, 1, 1, 32, 1, 1);
     }
 
     /**

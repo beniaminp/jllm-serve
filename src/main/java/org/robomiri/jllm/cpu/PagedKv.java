@@ -60,6 +60,14 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
     }
 
     @Override
+    boolean rotatedKeys() {
+        return st.rotate;
+    }
+
+    /** The rotated queries of the current {@link #attention} call (q8 with rotated keys). */
+    private float[] qRot = new float[0];
+
+    @Override
     public void store(int layer, int pos, float[] k, float[] v, int n) {
         for (int t = 0; t < n; t++) {
             int s = pos + t;
@@ -213,6 +221,18 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
     @Override
     public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                           float softcap) {
+        if (st.rotate) { // (Hq)·(Hk) = B q·k, and B is a power of two (as KvCache.Q8.attention)
+            int len = n * qDim;
+            if (qRot.length < len) {
+                qRot = new float[len];
+            }
+            System.arraycopy(q, 0, qRot, 0, len);
+            for (int o = 0; o < len; o += headDim) {
+                org.robomiri.jllm.model.KvQ4.rotate(qRot, o, headDim);
+            }
+            q = qRot;
+            scale /= org.robomiri.jllm.model.KvQ4.block(headDim);
+        }
         if (n == 1 && direct && vectorized()) {
             attentionDecodeDirect(pool, layer, pos, q, att, window, scale, softcap);
             return;

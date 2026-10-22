@@ -58,7 +58,7 @@ final class PagedKvChecks {
         this.dt = dt;
         this.arch = (Decoder) cfg;
         this.vocab = cfg.core().vocabSize();
-        this.name = (metal ? "metal" : "cpu") + " " + dt;
+        this.name = (metal ? "metal" : "cpu") + " " + dt + (dt == KvDtype.Q8 && KvDtype.q8Rotate() ? " rotated keys" : "");
         this.tokens = new int[CTX];
         for (int i = 0; i < CTX; i++) {
             tokens[i] = (i * 37 + 11) % Math.min(vocab, 600);
@@ -80,6 +80,17 @@ final class PagedKvChecks {
             failures += new PagedKvChecks(w, lib, false, dt, cfg).all();
             if (withMetal && d.attention().headDim() % 32 == 0) {
                 failures += new PagedKvChecks(w, lib, true, dt, cfg).all();
+            }
+        }
+        if (d.attention() instanceof Attention.Gqa g && org.robomiri.jllm.model.KvQ4.supports(g.headDim())) {
+            KvDtype.setQ8Rotate(true); // q8 with Hadamard-rotated keys (backend.kv-q8-rotate, the shipped default)
+            try {
+                failures += new PagedKvChecks(w, lib, false, KvDtype.Q8, cfg).all();
+                if (withMetal && g.headDim() % 32 == 0) {
+                    failures += new PagedKvChecks(w, lib, true, KvDtype.Q8, cfg).all();
+                }
+            } finally {
+                KvDtype.setQ8Rotate(false);
             }
         }
         return failures;

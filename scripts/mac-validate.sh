@@ -136,7 +136,8 @@ bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
 bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off
-bench "q8 KV cache" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
+bench "q8 KV cache (default: rotated keys, backend.kv-q8-rotate)" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
+bench "q8 KV cache, plain keys (backend.kv-q8-rotate false)" "$DENSE" "" --backend.kv-dtype q8 --backend.kv-q8-rotate false --engine.speculative off
 bench "q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off
 # the paged KV cache (docs/24): one pool of 16-token blocks and a block table per slot instead of a flat array, against the
 # flat cache on the same prompts (the flat rows are the defaults above; backend.kv-paged=false is the default)
@@ -151,6 +152,8 @@ bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backen
 bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
 bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200
 bench "~2000-token prompt: q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off --bench.prompt-repeat 200
+bench "~2000-token prompt: q8 KV cache (rotated keys)" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off --bench.prompt-repeat 200
+bench "~2000-token prompt: q8 KV cache, plain keys" "$DENSE" "" --backend.kv-dtype q8 --backend.kv-q8-rotate false --engine.speculative off --bench.prompt-repeat 200
 # draft-model speculation on the GPU (the draft is the dense model itself: every draft is accepted, so this measures
 # what a pass of k drafts costs against k plain steps; a real draft is smaller and accepts less)
 bench "speculation off" "$DENSE" "" --engine.speculative off

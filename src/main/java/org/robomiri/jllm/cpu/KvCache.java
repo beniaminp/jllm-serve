@@ -136,6 +136,15 @@ public abstract class KvCache {
         return create(dtype, layers, a, ctx, 64, KvDtype.q4Recent());
     }
 
+    /** {@link #create(KvDtype, int, Attention.Gqa, int, int, int)} with a q8 cache of rotated keys when {@code rotateQ8}. */
+    public static KvCache create(KvDtype dtype, int layers, Attention.Gqa a, int ctx, int chunk, int recent, boolean rotateQ8) {
+        KvCache c = create(dtype, layers, a, ctx, chunk, recent);
+        if (rotateQ8 && c instanceof Q8 q8) {
+            q8.rotate = KvQ4.supports(a.headDim());
+        }
+        return c;
+    }
+
     /**
      * @param chunk  most positions one {@link #store} call writes (the backend's batch): q4's recent window keeps
      *               {@code recent + chunk} rows so that a chunk never evicts a row one of its own queries reads
@@ -221,8 +230,14 @@ public abstract class KvCache {
     /** Layout of {@link #write}: the element type and the shape, so a file is only read into an equal cache. */
     public final String format() {
         RecentWindow w = window();
-        String type = storedType().toString() + (storedType() == KvDtype.Q4 && w != null ? " recent=" + w.windowSize() : "");
+        String type = storedType().toString() + (rotatedKeys() ? " rot" : "")
+                + (storedType() == KvDtype.Q4 && w != null ? " recent=" + w.windowSize() : "");
         return type + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
+    }
+
+    /** A q8 cache of Hadamard-rotated keys ({@code backend.kv-q8-rotate}); part of the saved-cache {@link #format}. */
+    boolean rotatedKeys() {
+        return this instanceof Q8 q8 && q8.rotate;
     }
 
     /** The element type a saved cache stores ({@link #format}); the paged cache reports its own. */
@@ -1291,6 +1306,14 @@ public abstract class KvCache {
         final float[][] keyScale;
         final byte[][] val;
         final float[][] valScale;
+        /**
+         * Keys are Walsh–Hadamard rotated before they are quantized ({@code backend.kv-q8-rotate}, {@link KvQ4#rotate}):
+         * the queries get the same rotation inside {@link #attention} and the score scale is divided by the block, as
+         * for {@link Q4}. Set right after construction, before any {@link #store}.
+         */
+        boolean rotate;
+        /** The rotated queries of the current {@link #attention} call. */
+        private float[] qRot = new float[0];
 
         Q8(int layers, Attention.Gqa a, int ctx) {
             super(layers, a, ctx);
@@ -1317,15 +1340,24 @@ public abstract class KvCache {
         public void store(int layer, int pos, float[] k, float[] v, int n) {
             byte[] kc = key[layer];
             byte[] vc = val[layer];
+            float[] row = rotate ? new float[headDim] : null;
             for (int t = 0; t < n; t++) {
                 int s = pos + t;
                 for (int g = 0; g < kvHeads; g++) {
                     int src = t * kvDim + g * headDim;
-                    float ks = KvDtype.q8Scale(maxAbs(k, src, headDim));
+                    float[] kx = k;
+                    int ko = src;
+                    if (rotate) { // the key row as the attention reads it: rotated, then quantized
+                        System.arraycopy(k, src, row, 0, headDim);
+                        KvQ4.rotate(row, 0, headDim);
+                        kx = row;
+                        ko = 0;
+                    }
+                    float ks = KvDtype.q8Scale(maxAbs(kx, ko, headDim));
                     keyScale[layer][keyScaleAt(g, s)] = ks;
                     int base = keyChunk(g, s / CHUNK) + s % CHUNK;
                     for (int i = 0; i < headDim; i++) {
-                        kc[base + i * CHUNK] = KvDtype.q8(k[src + i], ks);
+                        kc[base + i * CHUNK] = KvDtype.q8(kx[ko + i], ks);
                     }
                     float vs = KvDtype.q8Scale(maxAbs(v, src, headDim));
                     valScale[layer][s * kvHeads + g] = vs;
@@ -1458,6 +1490,18 @@ public abstract class KvCache {
         @Override
         public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                        float softcap) {
+            if (rotate) { // (Hq)·(Hk) = B q·k, and B is a power of two
+                int len = n * qDim;
+                if (qRot.length < len) {
+                    qRot = new float[len];
+                }
+                System.arraycopy(q, 0, qRot, 0, len);
+                for (int o = 0; o < len; o += headDim) {
+                    KvQ4.rotate(qRot, o, headDim);
+                }
+                q = qRot;
+                scale /= KvQ4.block(headDim);
+            }
             // with as many kv heads as threads the tiled kernel is already balanced and keeps a head's work on one core
             if (n == 1 && vectorized() && kvHeads < pool.threads()) {
                 attentionDecode(pool, layer, pos, q, att, window, scale, softcap);

@@ -57,7 +57,14 @@ final class CpuKvStorage implements KvStorage {
         return (x + 63) & ~63L;
     }
 
+    /** q8 with Hadamard-rotated keys ({@code backend.kv-q8-rotate}): {@link #storeRow} rotates a key head before it is quantized. */
+    final boolean rotate;
+
     CpuKvStorage(KvDtype dtype, int layers, Attention.Gqa a, int blockTokens) {
+        this(dtype, layers, a, blockTokens, false);
+    }
+
+    CpuKvStorage(KvDtype dtype, int layers, Attention.Gqa a, int blockTokens, boolean rotateQ8) {
         if (dtype == KvDtype.Q4) {
             throw new IllegalArgumentException("the paged CPU cache has no q4 blocks yet");
         }
@@ -65,6 +72,7 @@ final class CpuKvStorage implements KvStorage {
             throw new IllegalArgumentException("backend.kv-block must be a power of two of at least 16, got " + blockTokens);
         }
         this.dtype = dtype;
+        this.rotate = rotateQ8 && dtype == KvDtype.Q8 && org.robomiri.jllm.model.KvQ4.supports(a.headDim());
         this.layers = layers;
         this.kvHeads = a.kvHeads();
         this.headDim = a.headDim();
@@ -232,12 +240,21 @@ final class CpuKvStorage implements KvStorage {
                 }
             }
             default -> {
+                float[] row = rotate ? new float[headDim] : null;
                 for (int g = 0; g < kvHeads; g++) {
                     int o = src + g * headDim;
-                    float ks = KvDtype.q8Scale(maxAbs(k, o, headDim));
+                    float[] kx = k;
+                    int ko = o;
+                    if (rotate) { // the key row as the attention reads it: rotated, then quantized (as KvCache.Q8.store)
+                        System.arraycopy(k, o, row, 0, headDim);
+                        org.robomiri.jllm.model.KvQ4.rotate(row, 0, headDim);
+                        kx = row;
+                        ko = 0;
+                    }
+                    float ks = KvDtype.q8Scale(maxAbs(kx, ko, headDim));
                     seg.set(ValueLayout.JAVA_FLOAT, kb + kScaleOff + ((long) g * B + t) * 4, ks);
                     for (int i = 0; i < headDim; i++) {
-                        seg.set(ValueLayout.JAVA_BYTE, kb + ((long) g * headDim + i) * B + t, KvDtype.q8(k[o + i], ks));
+                        seg.set(ValueLayout.JAVA_BYTE, kb + ((long) g * headDim + i) * B + t, KvDtype.q8(kx[ko + i], ks));
                     }
                     float vs = KvDtype.q8Scale(maxAbs(v, o, headDim));
                     seg.set(ValueLayout.JAVA_FLOAT, vb + vScaleOff + ((long) t * kvHeads + g) * 4, vs);
