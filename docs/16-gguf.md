@@ -354,21 +354,27 @@ existing encoder ([04](04-tokenizer.md)), so there is one BPE implementation:
 
 * **`tokenizer.ggml.model = gpt2`**: byte-level BPE. `tokens` are the vocabulary and `merges` the merge list.
   `token_type` separates `CONTROL` tokens (added tokens flagged `special`: `<|im_start|>`, `<|endoftext|>`) and
-  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary. `tokenizer.ggml.pre` picks
-  the pre-tokenizer regex: `qwen2` (Qwen's, with an NFC normalizer as in its tokenizer.json), `llama-bpe` / `llama3`
-  (Llama 3's, with `ignore_merges`), `gpt-2`. Any other value is refused with its name; the loader then fetches the
+  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary; as in llama.cpp,
+  tokens it knows by name (`<|im_end|>`, `</s>`, the fill-in-the-middle markers...) are control tokens whatever the
+  file says. `tokenizer.ggml.pre` picks the pre-tokenizer: a list of regular expressions applied one after the other
+  plus `ignore_merges`, exactly llama.cpp's (81 values, 16.12; a missing key or `default` is llama.cpp's `default`,
+  which is **not** the GPT-2 regex). Any other value is refused with its name; the loader then fetches the
   original model's `tokenizer.json` from the repository named in `general.base_model.0.repo_url` /
   `general.source.url`, and fails clearly if the file names none.
-* **`tokenizer.ggml.model = llama`**: SentencePiece BPE (Llama 2, Mistral 7B, TinyLlama). The file has **scores**, not
-  merges, so — as `transformers` does when it converts such a model — every split of a token into two vocabulary
-  tokens becomes a merge, ranked by the merged token's score. Spaces become `▁`, a dummy `▁` is prepended (unlike
-  Metaspace it is added even if the text starts with a space), unknown characters fall back to the `<0xXX>` byte tokens.
+* **`tokenizer.ggml.model = llama`**: SentencePiece (Llama 2, Mistral 7B, TinyLlama, Gemma, Phi-3). The file has
+  **scores**, not merges, and llama.cpp segments with them directly: the characters are the first symbols, then the
+  adjacent pair whose concatenation is a token of the vocabulary (of any type) with the best score is merged, equal
+  scores leftmost first, until none is; a character that is no token becomes its `<0xXX>` byte tokens (`SpmGreedy`).
+  This differs from turning the scores into BPE merges, as `transformers` does, as soon as two scores are equal
+  (Gemma's are all 0). Spaces become `▁`; a `▁` is put in front of the text *and of the text after every special
+  token* when `add_space_prefix` (default true; Gemma: false).
 
-Checked two ways (`GgufTokenizerTest`): llama.cpp's own tokenizer tests (`ggml-vocab-llama-spm`, `-llama-bpe`,
-`-qwen2`, `-gpt-2`: 47 strings each, ids must equal llama.cpp's — **188 of 188**; `llama-spm` ships in
-`src/test/resources/gguf/vocab`), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python
-`tokenizers` package: **150 of 150** strings, the same decodings, and the **44** chat renders of
-`src/test/resources/tokenizers/qwen3.json`.
+Checked three ways (`GgufTokenizerTest`, `scripts/gguf-tokenizer-check.sh`): llama.cpp's own tokenizer tests
+(`ggml-vocab-llama-spm`, `-phi-3`, `-deepseek-coder`: 47 strings each, ids must equal llama.cpp's; the other 11
+fixtures are checked by hand), vocabularies generated for every pre value and compared with `llama-tokenize`
+(16.12), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python `tokenizers` package: **145 of
+145** strings, the same decodings, and the **44** chat renders of `src/test/resources/tokenizers/qwen3.json`; 5 more
+strings differ from the Hugging Face tokenizer by design, as llama.cpp does (16.12).
 
 ---
 
@@ -470,8 +476,9 @@ the load is dominated by the tokenizer.
   variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
   (Qwen2-MoE, DeepSeek) are not mapped.
-* **Tokenizer**: pre-tokenizers other than `qwen2`, `llama-bpe`, `gpt-2` need the original repository's
-  `tokenizer.json`.
+* **Tokenizer**: the pre-tokenizers that are not a list of regexes (`kimi-k2`, `afmoe`, `tiny_aya`, `superbpe`, `chameleon`,
+  the SPM-style BPE `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`) and `exaone-moe` need the original repository's
+  `tokenizer.json`; `tokenizer.ggml.add_eos_token` and the WordPiece (`bert`) vocabularies are not applied (16.12).
 
 ---
 
@@ -481,7 +488,8 @@ the load is dominated by the tokenizer.
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
 Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
 permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
-selection, settings) and `GgufTokenizerTest` on the `llama-spm` vocabulary. With the Qwen3-0.6B files downloaded by
+selection, settings) and `GgufTokenizerTest` (three of llama.cpp's vocabulary fixtures and the stored llama.cpp ids of 29 generated
+vocabularies, 16.12). With the Qwen3-0.6B files downloaded by
 `./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:
 
 ```sh
@@ -494,5 +502,68 @@ $J.GgufRealParity $G /tmp/parity
 $J.metal.GgufMetalReal $G                                             # Metal matmul of every tensor vs its dequantization
 $J.GgufTokenizerTest --gguf $G --hf models/Qwen_Qwen3-0.6B --fixture src/test/resources/tokenizers/qwen3.json
 $J.GgufTokenizerTest --vocab DIR       # llama.cpp's models/ggml-vocab-*.gguf with their .inp / .out files
+scripts/gguf-tokenizer-check.sh        # generated vocabularies for every pre value against llama-tokenize (16.12)
 ```
 
+---
+
+## 16.12 Tokenizer pre-tokenizers: which values are supported and how they were checked
+
+🧸 **Cut first, glue second.** A tokenizer does not look at a sentence all at once. First it cuts the text into little
+words with a cutting rule, then it glues the letters of each word into pieces it knows. Every family of models cuts a
+little differently: Llama 3 chops a long number into groups of three digits, Qwen takes the digits one at a time,
+DeepSeek also puts every Chinese phrase in a box of its own. The GGUF file only carries the *name* of the rule
+(`tokenizer.ggml.pre`); the rule itself is written out, character by character, inside llama.cpp. If we cut even one
+place differently, the model receives numbers it was never taught, and answers a little worse without telling anyone. So
+we copied llama.cpp's rule for every name, and then we checked, with over a million strings, that llama.cpp
+itself and jllm cut and glue them to exactly the same ids.
+
+📐 **What is implemented** (`GgufPre`, `GgufTokenizer`, `SpmGreedy`; reference: llama.cpp b11669, `llama-vocab.cpp`).
+
+* A pre value is a **list of regexes applied one after the other**, each cutting the pieces the previous one left (matches
+  *and* the text between them are kept: a Hugging Face `Sequence` of `Split`/`Isolated`), then GPT-2 byte-level spelling,
+  plus the flags `ignore_merges` (a piece that is a token is not merged) and the default of `add_bos_token`. The patterns
+  are llama.cpp's strings, with four changes so that `java.util.regex` does what llama.cpp's C++ does: `\p{Lu}`... are
+  "any letter" there; non-ASCII whitespace never matches a character class of a regex without `\p{..}` (it is
+  replaced by U+000B first); `$` is the end of the piece; the look-ahead groups of GPT-4o / Tekken are one class.
+* An absent key or `default` is llama.cpp's own default (4 regexes, digits in threes), **not** GPT-2's; an unknown value is refused.
+* Control tokens are found in the text by type and by name (`</s>`, `<|im_end|>`, the FIM markers: control even if the
+  file says normal), user-defined ones are found even in untrusted text (`encode(text, false)`), Phi-3 files
+  (`general.name`) swallow the ASCII whitespace after a special token. A BOS is added as llama.cpp does: the key if present, else
+  yes for SentencePiece, `llama-bpe` and `tekken`, no otherwise.
+* SentencePiece (`model = llama`) is llama.cpp's greedy merge by score, not BPE merges (`SpmGreedy`).
+
+| `tokenizer.ggml.pre` | cutting rules (llama.cpp `regex_exprs`) | flags | checked against |
+|---|---|---|---|
+| `llama-bpe`, `llama3`, `llama-v3`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` | Llama 3: `'s..`, `[^\r\n\p{L}\p{N}]?\p{L}+`, `\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n]*`, whitespace | ignore_merges, BOS | F llama-bpe 47/47 and 14 871/14 871; S 14 871/14 871 each |
+| `dbrx`, `smaug-bpe`, `chatglm-bpe`; `glm4`, `glm5` (+ ignore_merges) | the same regex | no BOS default | S 14 871/14 871 each |
+| `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open`, `grok-2` | Llama 3's with `\p{N}` (one digit) | | F qwen2 47/47 and 14 871/14 871 (+ Qwen3-0.6B Q8_0 and 2 795 doc paragraphs); S 14 871/14 871 each |
+| `qwen35` | the same with `[\p{L}\p{M}]+` | | F qwen35 51/51 and 14 871/14 871; S |
+| `gpt-2`, `phi-2`, `olmo`, `mpt`, `jais`, `trillion`, `granite-docling`, `exaone4`, `gigachat`, `a.x-4.0`, `mellum`, `modern-bert`, `roberta-bpe`, `jina-*` | GPT-2: `'s..`, ` ?\p{L}+`, ` ?\p{N}+`, ` ?[^\s\p{L}\p{N}]+`, `\s+(?!\S)` | | F gpt-2, mpt 47/47 and 14 871/14 871; S each |
+| `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva-7b`, `mellum2` | `\p{N}`, then GPT-2's | | F starcoder, refact, command-r 47/47 and 14 871/14 871; S each |
+| `default`, key absent (GPT-NeoX, Mamba) | `[\p{P}$+<=>^~\|]+`, GPT-2's, `\p{N}+`, `[0-9]{3}` | | F gpt-neox 14 871/14 871; S |
+| `falcon` | `[\p{P}$+<=>^~\|`]+`, GPT-2's, `[0-9]{3}` | | F falcon 47/47 and 14 871/14 871; S |
+| `deepseek-llm` / `deepseek-coder` | 6 / 5 rules: `[\r\n]`, letters / `\s?\p{L}+`, punctuation, `\s+$`, CJK ranges, `\p{N}+` / `\p{N}` | | F 47/47 and 14 871/14 871 each; S |
+| `deepseek-v3`, `hunyuan-dense`, `hy_v4`, `joyai-llm`, `spark2_5` | `\p{N}{1,3}`, CJK + kana, symbol-then-letters rule | | S 14 871/14 871 each |
+| `tekken`; `gpt-4o`, `llama4`, `kanana2`, `talkie`, `minimax-m2`; `granite-embed-multi-97m` | case-aware letters (look-ahead rewritten as classes), `\p{N}` / `\p{N}{1,3}` | tekken: ignore_merges, BOS | S 14 871/14 871 each |
+| `jais-2`, `youtu`, `poro-chat`, `bloom`, `gpt3-finnish`, `viking`, `bailingmoe`, `bailingmoe2`, `llada-moe`, `seed-coder`, `ufakzeka`, `laguna`, `minicpm5`, `k2-horizon` | as in `llama-vocab.cpp` | per the table in `GgufPre` | S 14 871/14 871 each |
+| SentencePiece (`model = llama`): Llama 2, Mistral 7B, Gemma 2/3, Phi-3 | greedy merge by score, `<0xXX>` bytes, `▁` prefix | Gemma: no prefix; Phi-3: rstrip | F llama-spm, phi-3 47/47 and 14 871/14 871; S 4 kinds (distinct scores, ties, Gemma-like, Phi-3-like) 14 871/14 871 each |
+
+**How it was checked.** `scripts/gguf-tokenizer-check.sh` writes a vocabulary-only GGUF per pre value with all 65 536
+merges of two byte symbols in a pseudo-random order (so a cut between two pieces shows as a pair that was not merged),
+a few merge chains, tokens without merges (to see `ignore_merges`) and control / user-defined tokens, and gives the same
+14 871 strings to `llama-tokenize` and to `GgufModel.tokenizer`: 191 hand-written (contractions in both cases, digit runs, CJK, accents,
+emoji, every kind of whitespace, code, special tokens in the text), 2 000 random over a Unicode alphabet and a sweep over
+code points (12 680 strings); for byte-level BPE also with `--no-parse-special` against `encode(text, false)`, and the BOS rules.
+F = llama.cpp's own `ggml-vocab-*.gguf`. S = generated vocabulary. Three other merge orders (seeds 1-3) give the same results. `GgufTokenizerTest` keeps the ids of 19 691 strings
+on 29 vocabularies (`synthetic-llama-cpp.txt.gz`, 68 KB), so `mvn test` needs no llama.cpp.
+
+**Differences that remain** (all deliberate or unreachable in real text):
+* Characters assigned after llama.cpp's Unicode tables (Unicode 14-17; 8 443 code points, e.g. Egyptian Hieroglyphs
+  Extended-A) are letters / marks here and "unassigned" there.
+* llama.cpp does not normalize to NFC (the previous qwen2 special case is gone) and makes `</s>` a control token, so
+  these two differ from the Hugging Face tokenizer.json of the same model (Qwen3: 5 of 150 fixture strings).
+* Two special tokens that overlap (`<|ab` and `b|c>x` in `<|ab|c>x`): llama.cpp takes the longer first, this scanner the
+  leftmost. SentencePiece with special tokens not parsed: control tokens stay text here, llama.cpp merges them back.
+* `add_eos_token`, WordPiece (`bert`) and the pre values that are not regex lists (`kimi-k2`, `afmoe`, `tiny_aya`,
+  `superbpe`, `chameleon`, `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`; `exaone-moe` would overflow the regex stack) are refused.
