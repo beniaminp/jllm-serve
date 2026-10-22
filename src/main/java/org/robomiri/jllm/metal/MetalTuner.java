@@ -193,6 +193,9 @@ final class MetalTuner {
         }
     }
 
+    /** The decode attention decisions of this process, by cache key. */
+    private static final java.util.Map<String, Boolean> DEC_DECISIONS = new java.util.concurrent.ConcurrentHashMap<>();
+
     /**
      * Whether the decode attention {@code attention_dec} runs on this device: it must agree with {@code attention_t}
      * (relative error below 1e-3 of the output's magnitude, on synthetic data of the model's head shape) and be at least
@@ -211,9 +214,14 @@ final class MetalTuner {
         }
         String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|decattn|hd" + g.headDim() + "|" + g.heads() + "x"
                 + g.kvHeads() + "|" + kv + "|c" + k.decChunk).replace(' ', '_').replace('=', '_').replace(':', '_');
+        Boolean known = DEC_DECISIONS.get(key);
+        if (known != null) {
+            return known; // one answer per process: backends that must agree bit for bit (a slot and its batch) never see two
+        }
         Properties cache = load();
         String cached = cache.getProperty(key);
         if (cached != null) {
+            DEC_DECISIONS.put(key, cached.equals("1"));
             return cached.equals("1");
         }
         boolean use = false;
@@ -278,6 +286,7 @@ final class MetalTuner {
         System.err.println("Metal decode attention: " + (use ? "on" : "off") + " (" + log + ")");
         cache.setProperty(key, use ? "1" : "0");
         store(cache);
+        DEC_DECISIONS.put(key, use);
         return use;
     }
 
