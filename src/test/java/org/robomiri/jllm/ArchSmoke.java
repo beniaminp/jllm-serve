@@ -230,7 +230,7 @@ public final class ArchSmoke {
             if (!mamba && cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
                 boolean latent = dec.attention() instanceof Attention.Mla;
                 for (KvDtype dt : KvDtype.values()) {
-                    if (!(latent && dt == KvDtype.Q8)) { // a q8 latent cache is not saved
+                    if (!(latent && (dt == KvDtype.Q8 || dt == KvDtype.Q4))) { // a q8 latent cache is not saved (q4 is served as q8 there)
                         failures += kvStateChecks(w, lib, cfg, dt);
                         failures += replayStateCheck(w, lib, cfg, dt);
                     }
@@ -523,6 +523,9 @@ public final class ArchSmoke {
             cpu.saveState(n, java.nio.channels.Channels.newChannel(cpuBytes));
             boolean sameFormat = cpu.stateFormat().equals(a.stateFormat()) && cpuBytes.size() == bytes.size();
             b.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+            var resaved = new java.io.ByteArrayOutputStream();
+            b.saveState(n, java.nio.channels.Channels.newChannel(resaved));
+            boolean sameBytes = Arrays.equals(resaved.toByteArray(), cpuBytes.toByteArray()); // rows (and window) taken in unchanged
             b.forward(next, 0, 1, n, got);
             float scale = 0;
             float diff = 0;
@@ -530,15 +533,24 @@ public final class ArchSmoke {
                 scale = Math.max(scale, Math.abs(want[i]));
                 diff = Math.max(diff, Math.abs(want[i] - got[i]));
             }
-            boolean crossOk = diff <= 1e-3f * scale + 1e-4f;
-            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e)%n", a.stateFormat(),
+            // The file's bytes must come back unchanged (sameBytes). Metal's own continuation (want) is compared with the
+            // CPU file's: both prefilled the prompt in their own float arithmetic, so a q4 value on a rounding edge of the
+            // 4-bit grid lands one step (1/7.5 of its group's largest value) apart in the two caches, and a tiny random
+            // model turns that into a logit difference a q8 edge flip (1/127) does not reach: 10x the tolerance for q4.
+            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 ? 1e-2f : 1e-3f) * scale + 1e-4f;
+            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e, bytes %s)%n", a.stateFormat(),
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
-                    sameFormat && crossOk ? "ok" : "MISMATCH", diff);
+                    sameFormat && crossOk ? "ok" : "MISMATCH", diff, sameBytes ? "unchanged" : "CHANGED");
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
             if (dt == KvDtype.Q4) { // the first n - 2 positions of a longer state: the ring keeps only the window below them
                 int m = n - 2;
-                b.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(bytes.toByteArray())));
+                b.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
                 cpu.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+                var bOut = new java.io.ByteArrayOutputStream();
+                var cOut = new java.io.ByteArrayOutputStream();
+                b.saveState(m, java.nio.channels.Channels.newChannel(bOut));
+                cpu.saveState(m, java.nio.channels.Channels.newChannel(cOut));
+                boolean sameWindow = Arrays.equals(bOut.toByteArray(), cOut.toByteArray()); // rows and the part of the window kept
                 b.forward(next, 0, 1, m, got);
                 float[] cpuLogits = new float[vocab];
                 cpu.forward(next, 0, 1, m, cpuLogits);
@@ -548,9 +560,9 @@ public final class ArchSmoke {
                     sc = Math.max(sc, Math.abs(cpuLogits[i]));
                     df = Math.max(df, Math.abs(cpuLogits[i] - got[i]));
                 }
-                boolean prefixOk = df <= 1e-3f * sc + 1e-4f;
-                System.out.printf("  kv %s: first %d of %d saved positions, cpu vs metal max diff %.1e -> %s%n", a.stateFormat(), m,
-                        n, df, prefixOk ? "ok" : "MISMATCH");
+                boolean prefixOk = sameWindow && df <= 1e-2f * sc + 1e-4f; // same file in both: only the new row's rounding differs
+                System.out.printf("  kv %s: first %d of %d saved positions, saved again %s on both, cpu vs metal max diff %.1e -> %s%n",
+                        a.stateFormat(), m, n, sameWindow ? "the same bytes" : "DIFFERENT bytes", df, prefixOk ? "ok" : "MISMATCH");
                 bad += prefixOk ? 0 : 1;
             }
         }
