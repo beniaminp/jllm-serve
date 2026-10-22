@@ -82,6 +82,8 @@ public final class VisionTest {
             ropePositions();
             tinyModel(dir);
             qwen3Vl(dir);
+            qwen35Vl(dir);
+            bidirectional(dir);
         } finally {
             try (var s = Files.list(dir)) {
                 for (Path p : s.toList()) {
@@ -418,8 +420,14 @@ public final class VisionTest {
             tokens[i] = "<unused" + i + ">";
             types[i] = 5;
         }
+        lastTokens = tokens;
+        lastTypes = types;
         return GgufTokenizer.build(new GgufTokenizer.Spec("gpt2", "default", tokens, types, null, new String[0], 256, 257, -1, false, true));
     }
+
+    /** The strings and types of the vocabulary the last {@link #tokenizer()} call built. */
+    private static String[] lastTokens;
+    private static long[] lastTypes;
 
     private static Rgb randomImage(long seed, int w, int h) {
         Random r = new Random(seed);
@@ -476,7 +484,7 @@ public final class VisionTest {
      * A Qwen3-VL style projector: LayerNorm ViT with fused qkv, a learned 3 x 3 position grid resized to the picture,
      * GELU, no windows, 2 x 2 merger, and a deepstack merger after block 0; 16 x 16 pixels, 4-pixel patches.
      */
-    private static void writeProjector3(Path p) throws Exception {
+    private static void writeProjector3(Path p, boolean withDeepstack) throws Exception {
         Random r = new Random(19);
         GgufWriter w = new GgufWriter().str("general.architecture", "clip").bool("clip.has_vision_encoder", true)
                 .str("clip.projector_type", "qwen3vl_merger").u32("clip.vision.embedding_length", V_E)
@@ -506,12 +514,14 @@ public final class VisionTest {
             vec(w, r, b + "ffn_down.bias", V_E, 0, 0.1);
         }
         String ds = "v.deepstack.0.";
-        vec(w, r, ds + "norm.weight", 4 * V_E, 1.0, 0.1);
-        vec(w, r, ds + "norm.bias", 4 * V_E, 0, 0.1);
-        mat(w, r, ds + "fc1.weight", 4 * V_E, 4 * V_E, true);
-        vec(w, r, ds + "fc1.bias", 4 * V_E, 0, 0.1);
-        mat(w, r, ds + "fc2.weight", DIM, 4 * V_E, true);
-        vec(w, r, ds + "fc2.bias", DIM, 0, 0.1);
+        if (withDeepstack) {
+            vec(w, r, ds + "norm.weight", 4 * V_E, 1.0, 0.1);
+            vec(w, r, ds + "norm.bias", 4 * V_E, 0, 0.1);
+            mat(w, r, ds + "fc1.weight", 4 * V_E, 4 * V_E, true);
+            vec(w, r, ds + "fc1.bias", 4 * V_E, 0, 0.1);
+            mat(w, r, ds + "fc2.weight", DIM, 4 * V_E, true);
+            vec(w, r, ds + "fc2.bias", DIM, 0, 0.1);
+        }
         vec(w, r, "v.post_ln.weight", V_E, 1.0, 0.1);
         vec(w, r, "v.post_ln.bias", V_E, 0, 0.1);
         mat(w, r, "mm.0.weight", 4 * V_E, 4 * V_E, true);
@@ -525,7 +535,7 @@ public final class VisionTest {
         Path text = dir.resolve("tiny-q3vl.gguf");
         Path proj = dir.resolve("mmproj-tiny-q3vl.gguf");
         writeText3(text);
-        writeProjector3(proj);
+        writeProjector3(proj, true);
         Tokenizer tok = tokenizer();
         ChatTemplate.Format fmt = ChatTemplate.forModelType("qwen3vl", tok);
         check(fmt.render(List.of(new ChatTemplate.Message("user", "hi")), true, false)
@@ -620,6 +630,218 @@ public final class VisionTest {
             }
             weights.close();
         }
+    }
+
+
+    // ------------------------------------------------------------------ Qwen3.5 (a hybrid) with pictures
+
+    /** A tiny Qwen3.5 (Gated DeltaNet + gated attention) GGUF with the Qwen-VL control tokens, and a Qwen3-VL style projector for it. */
+    private static void qwen35Vl(Path dir) throws Exception {
+        tokenizer(); // (the byte-level vocabulary with the Qwen control tokens of the other tiny model)
+        String[] names = lastTokens;
+        int[] types = Arrays.stream(lastTypes).mapToInt(x -> (int) x).toArray();
+        Path text = dir.resolve("tiny-q35vl.gguf");
+        Path proj = dir.resolve("mmproj-tiny-q35vl.gguf");
+        GgufQwenNextTest.withVocab = true;
+        GgufQwenNextTest.vocabNames = names;
+        GgufQwenNextTest.vocabTypes = types;
+        GgufQwenNextTest.VOCAB = names.length;
+        try {
+            GgufQwenNextTest.write(text, GgufQwenNextTest.tiny(false, 99), true, false, new LinkedHashMap<>(), false);
+        } finally {
+            GgufQwenNextTest.withVocab = false;
+            GgufQwenNextTest.vocabNames = null;
+            GgufQwenNextTest.vocabTypes = null;
+            GgufQwenNextTest.VOCAB = 96;
+        }
+        writeProjector3(proj, false);
+        boolean metal = Metal.available();
+        Rgb img = randomImage(5, 20, 12);
+        try (GgufModel gm = GgufModel.open(text)) {
+            org.robomiri.jllm.model.Qwen3NextArch arch = (org.robomiri.jllm.model.Qwen3NextArch) gm.architecture();
+            RopeTable rt = arch.rope();
+            check(rt.mrope().equals(List.of(3, 3, 2)) && rt.mropeInterleaved(), "qwen35 GGUF: interleaved rotary sections " + rt.mrope());
+            Tokenizer tok = gm.tokenizer();
+            int vocab = names.length;
+            int ctx = 64;
+            ModelWeights weights = gm.weights();
+            try (VisionContext vc = VisionContext.open(proj, tok, arch, new VisionContext.Options("cpu", 2, new Preprocess.Limits(0, 0), 16));
+                 Engine engine = new Engine(new org.robomiri.jllm.cpu.Qwen3NextCpuBackend(weights, ctx, 16, 2, KvDtype.F32), tok, arch, Set.of(2))) {
+                engine.setVision(vc, false);
+                Backend be = engine.backend();
+                check(be.supportsEmbeds(), "the hybrid CPU backend takes embeddings");
+                int[] ids = engine.preparePrompt(new int[]{5, 6, Tokenizer.IMAGE_MARK, 7, 8});
+                MediaPrompt mp = vc.build(ids, List.of(img));
+                MediaPrompt.Span span = mp.spans().getFirst();
+                RopePositions rp = mp.rope();
+                check(span.deepstack() == null && rp != null && rp.interleaved() && rp.e() != null, "qwen35 picture: interleaved positions, no deepstack");
+
+                // embeddings as input equal token ids; a text pass is the same through either door
+                int[] seq = {10, 20, 30, 40, 12, 13};
+                float[] want = new float[vocab];
+                float[] got = new float[vocab];
+                be.forward(seq, 0, seq.length, 0, want);
+                float[] rows = new float[seq.length * GgufQwenNextTest.DIM];
+                for (int i = 0; i < seq.length; i++) {
+                    weights.embed.dequantizeRow(seq[i], rows, i * GgufQwenNextTest.DIM);
+                }
+                be.forwardEmbeds(rows, 0, seq.length, 0, got);
+                check(Arrays.equals(want, got), "qwen35 CPU: forwardEmbeds with embedding rows equals forward(ids)");
+
+                // rotary positions: plain ones given explicitly change nothing, shifted ones do, and plain ones come back
+                int[] ident = new int[ctx];
+                for (int i = 0; i < ctx; i++) {
+                    ident[i] = i;
+                }
+                be.setRopePositions(0, new RopePositions(ident, ident, ident, ident, new int[]{3, 3, 2}, true, 0));
+                float[] same = new float[vocab];
+                be.forward(seq, 0, seq.length, 0, same);
+                check(Arrays.equals(want, same), "qwen35 CPU: explicit identity positions give the plain logits, bit for bit");
+                int[] shifted = new int[ctx];
+                for (int i = 0; i < ctx; i++) {
+                    shifted[i] = i < 2 ? i : i + 7;
+                }
+                be.setRopePositions(0, new RopePositions(shifted, shifted, shifted, shifted, new int[]{3, 3, 2}, true, -7));
+                float[] moved = new float[vocab];
+                be.forward(seq, 0, seq.length, 0, moved);
+                check(!Arrays.equals(want, moved) && be.ropePositionsCustom(), "qwen35 CPU: shifted positions change the logits and are reported");
+                be.setRopePositions(0, null);
+                float[] back = new float[vocab];
+                be.forward(seq, 0, seq.length, 0, back);
+                check(Arrays.equals(want, back) && !be.ropePositionsCustom(), "qwen35 CPU: plain positions restored");
+
+                // generation with a picture: deterministic; another picture, another answer distribution
+                SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1L, 8, List.of());
+                Engine.Result r1 = engine.generate(mp, greedy, null, () -> false);
+                Engine.Result r1b = engine.generate(mp, greedy, null, () -> false);
+                check(r1.tokens().length == 8 && Arrays.equals(r1.tokens(), r1b.tokens()), "qwen35: the same picture twice gives the same answer");
+                MediaPrompt other = vc.build(ids, List.of(randomImage(6, 20, 12)));
+                Engine.Decoding lp = new Engine.Decoding(null, true, 0, false, null);
+                SamplingParams one = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1L, 1, List.of());
+                double la = engine.generate(mp, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                double lb = engine.generate(other, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                check(Math.abs(la - lb) > 1e-6, "qwen35: another picture changes the next-token distribution: " + la + " vs " + lb);
+                Engine.Result t1 = engine.generate(new int[]{5, 6, 7, 8}, greedy, Engine.Decoding.NONE, 1, null, () -> false).getFirst();
+                try (Engine fresh = new Engine(new org.robomiri.jllm.cpu.Qwen3NextCpuBackend(weights, ctx, 16, 2, KvDtype.F32), tok, arch, Set.of(2))) {
+                    Engine.Result t2 = fresh.generate(new int[]{5, 6, 7, 8}, greedy, Engine.Decoding.NONE, 1, null, () -> false).getFirst();
+                    check(Arrays.equals(t1.tokens(), t2.tokens()), "qwen35: text after a picture request equals one on a fresh engine");
+                }
+
+                if (metal) {
+                    try (Engine me = new Engine(new org.robomiri.jllm.metal.Qwen3NextMetalBackend(weights, ctx, 16, (String) null, KvDtype.F32), tok, arch, Set.of(2))) {
+                        me.setVision(vc, false);
+                        Backend mb = me.backend();
+                        float[] mw = new float[vocab];
+                        float[] mg = new float[vocab];
+                        mb.forward(seq, 0, seq.length, 0, mw);
+                        mb.forwardEmbeds(rows, 0, seq.length, 0, mg);
+                        check(Arrays.equals(mw, mg), "qwen35 Metal: forwardEmbeds with embedding rows equals forward(ids)");
+                        mb.setRopePositions(0, new RopePositions(shifted, shifted, shifted, shifted, new int[]{3, 3, 2}, true, -7));
+                        float[] mm = new float[vocab];
+                        mb.forward(seq, 0, seq.length, 0, mm);
+                        mb.setRopePositions(0, null);
+                        float[] mp2 = new float[vocab];
+                        mb.forward(seq, 0, seq.length, 0, mp2);
+                        check(!Arrays.equals(mw, mm) && Arrays.equals(mw, mp2) && maxDiff(mm, moved) < 5e-3f,
+                                "qwen35 Metal: shifted positions change the logits as on the CPU (" + maxDiff(mm, moved) + "), plain ones restored");
+                        Engine.Result g1 = me.generate(mp, greedy, null, () -> false);
+                        check(Arrays.equals(g1.tokens(), r1.tokens()), "qwen35 Metal: the same answer for the same picture as the CPU backend");
+                        Engine.Result gt = me.generate(new int[]{5, 6, 7, 8}, greedy, Engine.Decoding.NONE, 1, null, () -> false).getFirst();
+                        check(Arrays.equals(gt.tokens(), t1.tokens()), "qwen35 Metal: text after a picture request is as on a fresh engine");
+                    }
+                }
+            }
+            weights.close();
+        }
+    }
+
+
+    // ------------------------------------------------------------------ a picture that attends to itself both ways (Gemma 3)
+
+    /**
+     * The 'set' oracle: give the n rows of a picture the same rotary position; with attention that runs both ways inside the
+     * picture, permuting the rows then cannot change what the text after it sees (attention is a weighted sum over a set of
+     * keys), while with causal attention it does.
+     */
+    private static void bidirectional(Path dir) throws Exception {
+        Path text = dir.resolve("tiny-bidir.gguf");
+        writeText(text);
+        boolean metal = Metal.available();
+        try (GgufModel gm = GgufModel.open(text)) {
+            ModelWeights weights = gm.weights();
+            int ctx = 256;
+            int n = 6;
+            Random r = new Random(3);
+            float[] rows = new float[n * DIM];
+            float[] reversed = new float[n * DIM];
+            for (int i = 0; i < rows.length; i++) {
+                rows[i] = (float) (r.nextGaussian() * 0.5);
+            }
+            for (int i = 0; i < n; i++) {
+                System.arraycopy(rows, i * DIM, reversed, (n - 1 - i) * DIM, DIM);
+            }
+            int[] pos = new int[ctx];
+            for (int i = 0; i < ctx; i++) {
+                pos[i] = i < 2 ? i : i < 2 + n ? 2 : i - n + 1; // the picture's rows share a position
+            }
+            RopePositions rp = new RopePositions(pos, pos, pos, new int[]{4, 6, 6}, false, 0);
+            for (String kind : metal ? new String[]{"cpu", "metal"} : new String[]{"cpu"}) {
+                try (Backend b = kind.equals("cpu") ? new CpuBackend(weights, ctx, 16, 2, KvDtype.F32, false)
+                        : new MetalBackend(weights, ctx, 16, (String) null)) {
+                    check(b.supportsBidirectionalSpan(), kind + ": the backend attends both ways inside a picture");
+                    float[] ca = after(b, rp, rows, n, true);
+                    float[] cb = after(b, rp, reversed, n, true);
+                    float[] ua = after(b, rp, rows, n, false);
+                    float[] ub = after(b, rp, reversed, n, false);
+                    check(maxDiff(ca, cb) < 1e-4f, kind + ": both ways, the order of a picture's rows does not matter (max diff " + maxDiff(ca, cb) + ")");
+                    check(maxDiff(ua, ub) > 1e-3f, kind + ": causal, it does (max diff " + maxDiff(ua, ub) + ")");
+                    check(maxDiff(ca, ua) > 1e-3f, kind + ": both ways is not causal attention (max diff " + maxDiff(ca, ua) + ")");
+                    if (kind.equals("cpu")) {
+                        cpuBidir = ca;
+                    } else {
+                        check(maxDiff(ca, cpuBidir) < 5e-3f, "Metal agrees with the CPU on a picture that attends both ways (max diff " + maxDiff(ca, cpuBidir) + ")");
+                    }
+                }
+            }
+            weights.close();
+        }
+    }
+
+    private static float[] cpuBidir;
+
+    /** The prompt through a backend by hand: the text before the picture, the picture (both ways or causal), the text after. */
+    private static float[] stage(Backend b, MediaPrompt m, MediaPrompt.Span sp, RopePositions rp, boolean bidir) {
+        b.setRopePositions(0, rp);
+        for (int at = 0; at < sp.start(); at += b.maxBatch()) {
+            b.forward(m.tokens(), at, Math.min(b.maxBatch(), sp.start() - at), at, null);
+        }
+        if (bidir) {
+            b.forwardEmbedsBidirectional(sp.embeds(), 0, sp.length(), sp.start(), null);
+        } else {
+            b.forwardEmbeds(sp.embeds(), 0, sp.length(), sp.start(), null);
+        }
+        float[] out = new float[VOCAB];
+        for (int at = sp.end(); at < m.length(); at += b.maxBatch()) {
+            int cnt = Math.min(b.maxBatch(), m.length() - at);
+            b.forward(m.tokens(), at, cnt, at, at + cnt == m.length() ? out : null);
+        }
+        b.setRopePositions(0, null);
+        return out;
+    }
+
+    /** The logits of a text token after [two ids, the picture rows at one shared position]. */
+    private static float[] after(Backend b, RopePositions rp, float[] rows, int n, boolean bidir) {
+        b.setRopePositions(0, rp);
+        b.forward(new int[]{3, 4}, 0, 2, 0, null);
+        if (bidir) {
+            b.forwardEmbedsBidirectional(rows, 0, n, 2, null);
+        } else {
+            b.forwardEmbeds(rows, 0, n, 2, null);
+        }
+        float[] out = new float[VOCAB];
+        b.forward(new int[]{9}, 0, 1, 2 + n, out);
+        b.setRopePositions(0, null);
+        return out;
     }
 
     private static void tinyModel(Path dir) throws Exception {
@@ -773,6 +995,29 @@ public final class VisionTest {
                 be.forward(seq, 0, n, 0, restored);
                 check(Arrays.equals(base, restored) && !be.ropePositionsCustom(), "plain positions restored: the plain logits again");
 
+                // --- a picture that attends to itself both ways (Gemma 3's flag), through the engine
+                // (a fresh engine: the cache is keyed by the picture, and rows computed causally must not stand in for these)
+                MediaPrompt nc = new MediaPrompt(mp.tokens(), mp.spans(), mp.rope(), true);
+                double lc;
+                Engine.Result rnc;
+                try (Engine e2 = new Engine(new CpuBackend(weights, 256, 16, 2, KvDtype.F32, false), tok, arch, Set.of(257))) {
+                    e2.setVision(vc, false);
+                    lc = e2.generate(nc, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                    check(Math.abs(lc - la) > 1e-7, "a non-causal picture changes the next-token distribution: " + lc + " vs " + la);
+                    rnc = e2.generate(nc, greedy, null, () -> false);
+                    check(Arrays.equals(rnc.tokens(), e2.generate(nc, greedy, null, () -> false).tokens()),
+                            "a non-causal picture gives a deterministic answer");
+                }
+                try (Engine small = new Engine(new CpuBackend(weights, 256, span.length() - 1, 2, KvDtype.F32, false), tok, arch, Set.of(257))) {
+                    small.setVision(vc, false);
+                    try {
+                        small.generate(nc, greedy, null, () -> false);
+                        check(false, "a picture longer than the batch is refused when it must attend to itself");
+                    } catch (IllegalArgumentException e) {
+                        check(e.getMessage().contains("backend.batch"), "a picture longer than the batch is refused, naming backend.batch: " + e.getMessage());
+                    }
+                }
+
                 // --- the same on Metal
                 if (metal) {
                     try (Engine me = new Engine(new MetalBackend(weights, 256, 16, (String) null), tok, arch, Set.of(257))) {
@@ -784,6 +1029,21 @@ public final class VisionTest {
                                 "Metal: the picture is cached by its hash too");
                         Engine.Result gt = me.generate(me.renderChat(plain, false), greedy, null, () -> false);
                         check(Arrays.equals(gt.tokens(), t1.tokens()), "Metal: text after a picture request is as on a fresh engine");
+                        try (Engine m2 = new Engine(new MetalBackend(weights, 256, 16, (String) null), tok, arch, Set.of(257))) {
+                            m2.setVision(vc, false);
+                            double lm = m2.generate(nc, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                            check(Math.abs(lm - lc) < 5e-3, "Metal: the first token's log-probability after a non-causal picture agrees with the CPU: " + lm + " vs " + lc);
+                            int[] mt = m2.generate(nc, greedy, null, () -> false).tokens();
+                            check(Arrays.equals(mt, rnc.tokens()),
+                                    "Metal: a non-causal picture gives the CPU's answer " + Arrays.toString(mt) + " vs " + Arrays.toString(rnc.tokens()));
+                        }
+                        for (boolean bi : new boolean[]{false, true}) { // the same by hand, with and without the picture's own rotary positions
+                            for (boolean custom : new boolean[]{false, true}) {
+                                float[] c1 = stage(be, mp, span, custom ? mp.rope() : null, bi);
+                                float[] m1 = stage(me.backend(), mp, span, custom ? mp.rope() : null, bi);
+                                check(maxDiff(c1, m1) < 5e-3f, "by hand, both ways=" + bi + ", picture positions=" + custom + ": CPU vs Metal " + maxDiff(c1, m1));
+                            }
+                        }
                         float[] mw = new float[VOCAB];
                         me.backend().forward(ids, 0, 4, 0, mw);
                         float[] mg = new float[VOCAB];

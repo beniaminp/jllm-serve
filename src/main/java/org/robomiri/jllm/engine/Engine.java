@@ -487,6 +487,12 @@ public final class Engine implements AutoCloseable {
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
         cachedLen = 0;
+        if (media != null && media.nonCausal()) { // a picture that attends both ways is fed whole, from its first token
+            MediaPrompt.Span inside = media.spanAt(reuse);
+            if (inside != null && reuse > inside.start()) {
+                reuse = inside.start();
+            }
+        }
         applyRopePositions(reuse);
         long t0 = System.nanoTime();
         int pos = reuse;
@@ -507,7 +513,21 @@ public final class Engine implements AutoCloseable {
             int n = Math.min(batch, prompt.length - pos);
             if (media != null) { // pictures are fed as embeddings, the text between them as ids
                 MediaPrompt.Span sp0 = media.spanAt(pos);
+                if (sp0 != null && media.nonCausal() && backend.supportsBidirectionalSpan()) {
+                    if (batch < sp0.length()) {
+                        throw new IllegalArgumentException("a picture of " + sp0.length() + " tokens attends to itself both ways and"
+                                + " must fit in one pass, but the batch is " + batch + ": set backend.batch to at least " + sp0.length());
+                    }
+                    backend.forwardEmbedsBidirectional(sp0.embeds(), 0, sp0.length(), sp0.start(),
+                            sp0.end() == prompt.length ? logits : null);
+                    pos = sp0.end();
+                    continue;
+                }
                 if (sp0 != null) {
+                    if (media.nonCausal()) {
+                        throw new IllegalArgumentException(backend.name() + " cannot attend both ways inside a picture, which this model"
+                                + " needs (Gemma 3)");
+                    }
                     int cnt = Math.min(batch, sp0.end() - pos);
                     backend.forwardEmbeds(sp0.embeds(), pos - sp0.start(), cnt, pos, sp0.deepstack(), pos + cnt == prompt.length ? logits : null);
                     pos += cnt;

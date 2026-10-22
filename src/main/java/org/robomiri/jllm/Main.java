@@ -7,6 +7,7 @@ import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
 import org.robomiri.jllm.server.HttpServer;
+import org.robomiri.jllm.server.ImageHttp;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 
 import java.io.BufferedReader;
@@ -53,10 +54,21 @@ public final class Main {
         try {
             switch (cmd) {
                 case "config" -> System.out.print(s.describe());
-                case "download" -> ModelLoader.download(s, hub, model);
+                case "download" -> {
+                    if (s.opt("image.model") != null) {
+                        System.out.println(org.robomiri.jllm.diffusion.ImageModels.resolve(s, hub, s.get("image.model")));
+                    } else if (s.opt("video.model") != null) {
+                        System.out.println(org.robomiri.jllm.diffusion.VideoModels.resolveAdapter(s, hub, s.get("video.model")));
+                        System.out.println(org.robomiri.jllm.diffusion.ImageModels.resolve(s, hub, s.get("video.base-model")));
+                    } else {
+                        ModelLoader.download(s, hub, model);
+                    }
+                }
                 case "chat" -> chat(ModelLoader.load(s, hub, model), s);
                 case "run" -> run(ModelLoader.load(s, hub, model), s);
-                case "serve" -> serve(ModelLoader.load(s, hub, model), model, s, hub);
+                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model), model, s, hub);
+                case "image" -> image(s, hub);
+                case "video" -> video(s, hub);
                 case "transcribe" -> org.robomiri.jllm.audio.AudioCli.transcribe(s, hub, model, cli(s, "audio"), cli(s, "language"),
                         "true".equals(cli(s, "translate")), cli(s, "format") == null ? "text" : cli(s, "format"),
                         "true".equals(cli(s, "words")));
@@ -81,7 +93,9 @@ public final class Main {
                   download   fetch the model from the Hugging Face Hub
                   chat       interactive chat in the terminal
                   run        single prompt completion (--prompt "...")
-                  serve      OpenAI-compatible HTTP server
+                  serve      OpenAI-compatible HTTP server (--image-model <repo> adds /v1/images; --model none: images only)
+                  image      generate a picture with a Stable Diffusion model (--image-model <repo|folder> --prompt "...")
+                  video      generate a clip with AnimateDiff (--video-model <motion adapter repo|folder> --prompt "..." --frames 16 --fps 8 --out clip.mp4)
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
@@ -151,14 +165,30 @@ public final class Main {
         double encodeMs = engine.vision().lastEncodeMs();
         System.err.printf("%d image(s) -> %d prompt tokens, %.0f ms to encode (%d new)%n", images.size(), mp.length(), encodeMs,
                 engine.vision().lastEncodedImages());
-        Engine.Result r = engine.generate(mp, s.sampling(), Engine.Decoding.NONE, 1, new Engine.ChoiceSink() {
-            @Override
-            public void text(int index, String t) {
-                System.out.print(t);
-                System.out.flush();
-            }
-        }, () -> false).getFirst();
+        boolean debug = Boolean.getBoolean("jllm.vision.debug"); // with it: the first position's top-5 log-probs and the token ids
+        Engine.Result r = engine.generate(mp, s.sampling(), debug ? new Engine.Decoding(null, true, 5, false, null) : Engine.Decoding.NONE, 1,
+                new Engine.ChoiceSink() {
+                    @Override
+                    public void text(int index, String t) {
+                        System.out.print(t);
+                        System.out.flush();
+                    }
+                }, () -> false).getFirst();
         System.out.println();
+        if (debug) {
+            org.robomiri.jllm.engine.TokenLogprob first = r.logprobs().getFirst();
+            StringBuilder sb = new StringBuilder("top5 at the first position:");
+            for (int i = 0; i < first.topTokens().length; i++) {
+                sb.append(String.format("%n  %d %.5f '%s'", first.topTokens()[i], first.topLogprobs()[i],
+                        engine.tokenizer().decode(new int[]{first.topTokens()[i]})));
+            }
+            System.err.println(sb);
+            StringBuilder ids = new StringBuilder("tokens:");
+            for (int t : r.tokens()) {
+                ids.append(' ').append(t);
+            }
+            System.err.println(ids);
+        }
         System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason() + ", total " + (System.nanoTime() - t0) / 1_000_000 + " ms");
     }
 
@@ -200,12 +230,45 @@ public final class Main {
         }
     }
 
+    /** {@code jllm image --image.model stabilityai/sd-turbo --prompt "..." [--out file.png] [--steps n] ...}: one picture from the command line. */
+    private static void image(Settings s, HuggingFaceHub hub) throws Exception {
+        String source = s.opt("image.model");
+        if (source == null) {
+            System.err.println("usage: jllm image --image.model <diffusers repo or folder> --prompt \"...\" [--out file.png]"
+                    + " [--steps n --guidance g --seed n --width w --height h --scheduler euler|euler_a|dpmpp_2m|dpmpp_2m_karras"
+                    + " --negative \"...\" --init picture.png [--mask mask.png] --strength s]");
+            System.exit(2);
+        }
+        org.robomiri.jllm.diffusion.ImageCli.run(s, hub, source);
+    }
+
+    /** {@code jllm video --video-model guoyww/animatediff-motion-adapter-v1-5-2 --prompt "..." [--out clip.mp4] [--frames n] ...}: one clip from the command line. */
+    private static void video(Settings s, HuggingFaceHub hub) throws Exception {
+        String source = s.opt("video.model");
+        if (source == null) {
+            System.err.println("usage: jllm video --video-model <motion adapter repo or folder> --prompt \"...\" [--out clip.mp4|clip.webp|clip.gif]"
+                    + " [--base-model <Stable Diffusion 1.x repo or folder> --frames n --fps n --steps n --guidance g --seed n --width w --height h"
+                    + " --scheduler ddim|euler|euler_a|dpmpp_2m|dpmpp_2m_karras --negative \"...\" --video-format auto|mp4|webp|gif]");
+            System.exit(2);
+        }
+        if (!s.getBool("video.enabled")) {
+            System.err.println("video generation is switched off (video.enabled=false)");
+            System.exit(2);
+        }
+        org.robomiri.jllm.diffusion.VideoCli.run(s, hub, source);
+    }
+
     /** A flag only some commands take (--audio, --voice, ...), or null. */
     private static String cli(Settings s, String key) {
         return s.has(key) ? s.get(key) : null;
     }
 
     private static void serve(ModelLoader.Loaded l, String model, Settings s, HuggingFaceHub hub) throws Exception {
+        String imageSource = s.opt("image.model");
+        String videoSource = s.getBool("video.enabled") ? s.opt("video.model") : null;
+        if (l == null && imageSource == null && videoSource == null) {
+            throw new IllegalArgumentException("--model none needs --image.model or --video.model");
+        }
         int port = s.getInt("server.port");
         String host = s.get("server.host");
         org.robomiri.jllm.audio.AudioSettings as = org.robomiri.jllm.audio.AudioSettings.of(s);
@@ -214,25 +277,58 @@ public final class Main {
                 s.getInt("server.read-timeout-ms"),
                 s.getInt("server.write-timeout-ms"),
                 s.getInt("server.max-connections"),
-                audio ? Math.max(s.getLong("server.max-body-bytes"), as.maxUploadBytes()) : s.getLong("server.max-body-bytes"),
+                Math.max(audio ? Math.max(s.getLong("server.max-body-bytes"), as.maxUploadBytes()) : s.getLong("server.max-body-bytes"),
+                        videoSource != null ? 64L << 20 : 0), // /v1/videos/encode takes the frames of a clip as base64 pictures
                 s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
-        try (ModelWeights weights = l.weights(); Engine engine = l.engine();
-             org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels();
-             ApiServer server = new ApiServer(engine, model, host, port, options).imageLimits(
-                     s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
-            if (audio) {
-                for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
-                    if (!repo.isEmpty()) {
-                        System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
-                    }
-                }
-                server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
-                        new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+        ModelWeights weights = l == null ? null : l.weights();
+        Engine engine = l == null ? null : l.engine();
+        org.robomiri.jllm.diffusion.ImagePipeline pipe = null;
+        org.robomiri.jllm.diffusion.VideoPipeline videoPipe = null;
+        try (org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels()) {
+            ImageHttp images = null;
+            if (imageSource != null) {
+                pipe = org.robomiri.jllm.diffusion.ImageModels.load(s, hub, imageSource);
+                images = new ImageHttp(pipe, org.robomiri.jllm.diffusion.ImageModels.defaultId(imageSource));
+                System.err.println("Image model " + images.modelId() + ": " + pipe.description());
             }
-            System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
-            server.serve();
+            org.robomiri.jllm.server.VideoHttp videos = null;
+            if (videoSource != null) {
+                videoPipe = org.robomiri.jllm.diffusion.VideoModels.load(s, hub, videoSource);
+                videos = new org.robomiri.jllm.server.VideoHttp(videoPipe, org.robomiri.jllm.diffusion.VideoModels.defaultId(videoSource),
+                        new org.robomiri.jllm.diffusion.VideoApi.Config(org.robomiri.jllm.diffusion.VideoEncoder.resolveFfmpeg(s.get("video.ffmpeg")),
+                                s.get("video.format")));
+                System.err.println("Video model " + videos.modelId() + ": " + videoPipe.description());
+            }
+            try (ApiServer server = new ApiServer(engine, model, host, port, options).withImages(images).withVideo(videos).imageLimits(
+                    s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
+                if (audio) {
+                    for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
+                        if (!repo.isEmpty()) {
+                            System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
+                        }
+                    }
+                    server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
+                            new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+                }
+                System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions"
+                        + (images != null ? ", /v1/images/generations" : "") + (videos != null ? ", /v1/videos/generations" : "") + ")");
+                server.serve();
+            }
+        } finally {
+            if (pipe != null) {
+                pipe.close();
+            }
+            if (videoPipe != null) {
+                videoPipe.close();
+            }
+            if (engine != null) {
+                engine.close();
+            }
+            if (weights != null) {
+                weights.close();
+            }
         }
     }
 

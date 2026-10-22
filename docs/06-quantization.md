@@ -393,7 +393,7 @@ All CPU matmuls go through `CpuMatmul.mul`, which picks the kernel by the number
   and the gain is about 4× decode speed on the CPU (13 → 54 tok/s in the A/B run of
   [11 §11.1](11-performance.md#111-measured); the current build decodes ~51 tok/s). Q2_K rows keep the float path.
 - **prefill** (`n > 1`: `VectorKernels.dequantRow` + `dot4x4` / `dot4`): expand 4 rows into a thread-local float
-  buffer, then reuse them for every token of the chunk (up to `backend.batch`, 64), four tokens at a time, so the
+  buffer, then reuse them for every token of the chunk (up to `backend.batch`, 64 on the CPU), four tokens at a time, so the
   unpacking cost is amortized. Prefill always uses float activations.
 - **Metal** (`block_dot<QT>` / `mm_row<QT>` in `kernels.metal`): same as float decode, one `uchar4` at a time;
   activations stay f32 on the GPU.

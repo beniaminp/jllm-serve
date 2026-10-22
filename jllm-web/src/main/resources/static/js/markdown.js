@@ -7,6 +7,20 @@ const Markdown = (() => {
   function inline(s) {
     const codes = [];
     s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+    const imgs = [];   // pictures and clips kept by the server (/v1/images/files/<hex>.png, /v1/videos/files/<hex>.<ext>) and nothing else
+    // images: begin
+    s = s.replace(/!\[([^\]\n]*)\]\((\/v1\/images\/files\/[0-9a-f]{8,64}\.png)\)/g, (_, alt, u) => {
+      imgs.push(`<a href="${u}" target="_blank" rel="noopener"><img class="md-img" src="${u}" alt="${alt.replace(/[*_`~]/g, '')}" loading="lazy"></a>`);
+      return `\u0001${imgs.length - 1}\u0001`;
+    });
+    // images: end
+    // video: begin
+    s = s.replace(/!\[([^\]\n]*)\]\((\/v1\/videos\/files\/[0-9a-f]{8,64}\.(?:mp4|webp|gif))\)/g, (_, alt, u) => {   // clips kept by the server
+      imgs.push(u.endsWith('.mp4') ? `<video class="md-vid" src="${u}" controls loop muted playsinline preload="metadata"></video>`
+        : `<a href="${u}" target="_blank" rel="noopener"><img class="md-vid" src="${u}" alt="${alt.replace(/[*_`~]/g, '')}" loading="lazy"></a>`);
+      return `\u0001${imgs.length - 1}\u0001`;
+    });
+    // video: end
     s = s
       .replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>')
       .replace(/__([^_\n]+?)__/g, '<strong>$1</strong>')
@@ -15,7 +29,7 @@ const Markdown = (() => {
       .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
       .replace(/(^|[\s(])(https?:\/\/[^\s<)]+[^\s<).,;:!?'"])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
-    return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`);
+    return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[+i]}</code>`).replace(/\u0001(\d+)\u0001/g, (_, i) => imgs[+i]) /* images */;
   }
 
   function table(rows) {

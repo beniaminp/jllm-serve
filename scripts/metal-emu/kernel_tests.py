@@ -225,6 +225,54 @@ if not ONLY:
     split_q8(128)
 
 
+def attention_dec(hd, G, kv='f32', n_heads=8, n_kv=2, pos0=100, n_split=1, window=0, softcap=0.0, ctx=320, wide=True):
+    """attention_dec (section 4b): one token over a cache, G query heads per threadgroup, n_split key ranges (merged by
+    attention_combine when n_split > 1) against a float64 numpy reference on the values the cache holds."""
+    rng = np.random.default_rng(6 + hd + G)
+    q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
+    k0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    v0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    suffix = ''
+    if kv == 'q8':
+        (kc, kd), (vc, vd), stride = q8_rows(k0, n_kv, hd), q8_rows(v0, n_kv, hd), n_kv * hd + 4 * n_kv
+        suffix = '_q8'
+    elif kv == 'f16':
+        kc, vc, stride = k0.astype(np.float16), v0.astype(np.float16), n_kv * hd
+        kd, vd = kc.astype(np.float32), vc.astype(np.float32)
+        suffix = '_h' if wide else '_h4'   # 16-byte loads (8 halves per lane chunk) or 8-byte ones
+    else:
+        kc, vc, stride, kd, vd = k0, v0, n_kv * hd, k0, v0
+    keys = pos0 + 1
+    first = max(0, keys - window) if window > 0 else 0
+    part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
+    out = np.zeros((1, n_heads * hd), np.float32)
+    scale = 1 / np.sqrt(hd)
+    # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk
+    E.dispatch('attention_dec_g%d_d%d%s' % (G, hd, suffix), [q, kc, vc, part, out],
+               pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, window, softcap, n_split,
+                    0), (n_heads // G, (n_split + 3) // 4), (128,))
+    if n_split > 1:
+        E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+    ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, 1, scale, window, softcap)
+    err = np.abs(out - ref).max()
+    check(err < 1e-4, 'attention_dec_g%d_d%d%s, %d keys, %d split(s)%s%s: max err %.2e'
+          % (G, hd, suffix, keys, n_split, ', window %d' % window if window else '', ', softcap' if softcap else '', err))
+
+
+for _hd in (64, 128, 256):
+    for _kv in ('f32', 'f16', 'q8'):
+        for _g in (1, 2) if _hd == 256 else (1, 2, 4):
+            attention_dec(_hd, _g, _kv)                               # 101 keys: three full blocks and a partial one
+            attention_dec(_hd, _g, _kv, pos0=300, n_split=3)          # merged partials
+attention_dec(128, 2, pos0=300, n_split=3, kv='f16', wide=False)       # the 4-element half variant
+attention_dec(64, 2, pos0=100, kv='f16', wide=False)
+attention_dec(128, 2, pos0=37)                                        # fewer keys than one block
+attention_dec(128, 2, pos0=0)                                         # one key
+attention_dec(128, 2, pos0=300, window=64)                            # sliding window
+attention_dec(64, 2, pos0=250, n_split=7, softcap=3.0)                # Gemma's soft-cap, a split count that is no multiple of 4
+attention_dec(128, 1, pos0=200, n_split=40)                           # splits with no keys at all
+
+
 def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
     """Qwen3-Next causal conv: y = silu(conv over (state, x)), the state advanced past the chunk."""
     rng = np.random.default_rng(4)
@@ -780,6 +828,115 @@ def router_norm(ds=False, n_exp=16, dim=128, top_k=4, ntok=3, remap=False, metho
                                                                       'router_ds' if ds else 'router'))
 
 
+# ---- multi-row single-row walk (section 2a of kernels.metal): mv<NR>_matmul / matmul3 / matmul_swiglu against numpy and,
+# byte for byte, against the one-row kernels (matmul / matmul3 / matmul_swiglu, plain and _norm) they stand in for.
+MV_FORMATS = ('q4', 'q8', 'q2k', 'q6k', 'q4g', 'q8g', 'q4k', 'q5k') + ggml_ref.NEW
+
+
+def mv_norm_ref(x, nw, eps=1e-6):
+    xd = x.astype(np.float64)
+    return xd * (1.0 / np.sqrt((xd * xd).mean() + eps)) * nw
+
+
+def mv_test(fmt, nr, rows, cols, ntok=1, norm=False, bias=False, acc=False, softcap=0.0):
+    rng = np.random.default_rng(30)
+    wq, ws, w = fmt_weights(fmt, rows, cols, rng)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    nw = (rng.random(cols) + 0.5).astype(np.float32)
+    b = rng.standard_normal(rows).astype(np.float32)
+    out0 = rng.standard_normal((ntok, rows)).astype(np.float32) if acc else np.zeros((ntok, rows), np.float32)
+    sfx = '_norm' if norm else ''
+    par = pack('iiiiffi', rows, cols, ntok, int(acc), 1e-6, softcap, int(bias))
+    tg = cols * 4 if norm else 16
+    tiles = (ntok + 7) // 8
+    old, new = out0.copy(), out0.copy()
+    E.dispatch('matmul_%s%s' % (fmt, sfx), [wq, ws, x, old, nw, b], par, ((rows + 3) // 4, tiles), (128,), tg)
+    E.dispatch('mv%d_matmul_%s%s' % (nr, fmt, sfx), [wq, ws, x, new, nw, b], par,
+               ((rows + 4 * nr - 1) // (4 * nr), tiles), (128,), tg)
+    xr = np.stack([mv_norm_ref(x[t], nw) for t in range(ntok)]) if norm else x.astype(np.float64)
+    ref = xr @ w.astype(np.float64).T + (b if bias else 0)
+    if softcap > 0:
+        ref = np.tanh(ref / softcap) * softcap
+    ref = ref + (out0 if acc else 0)
+    err = np.abs(new - ref).max() / np.abs(ref).max()
+    check(np.array_equal(old, new) and err < 1e-4, 'mv%d_matmul_%s%s %dx%d, %d token(s)%s%s%s: %s the one-row kernel, rel err %.1e'
+          % (nr, fmt, sfx, rows, cols, ntok, ', bias' if bias else '', ', acc' if acc else '', ', softcap' if softcap else '',
+             'same bytes as' if np.array_equal(old, new) else 'DIFFERENT from', err))
+
+
+def mv3_test(fmt, nr, rows, cols, ntok=1, norm=False, half=False, bias=False):
+    rng = np.random.default_rng(31)
+    ws_ = [fmt_weights(fmt, r, cols, rng) for r in rows]
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    nw = (rng.random(cols) + 0.5).astype(np.float32)
+    bs = [rng.standard_normal(r).astype(np.float32) for r in rows]
+    sfx = ('_norm' if norm else '') + ('_h' if half else '')
+    par = pack('iiiiifi', rows[0], rows[1], rows[2], cols, ntok, 1e-6, int(bias))
+    tg = cols * 4 if norm else 16
+    tiles = (ntok + 7) // 8
+    res = []
+    for name, per in (('matmul3_%s%s' % (fmt, sfx), 4), ('mv%d_matmul3_%s%s' % (nr, fmt, sfx), 4 * nr)):
+        outs = [np.full((ntok, rows[0]), np.nan, np.float32), np.full((ntok, rows[1]), np.nan, np.float32),
+                np.full((ntok, rows[2]), np.nan, np.float16 if half else np.float32)]
+        bufs = [ws_[0][0], ws_[0][1], ws_[1][0], ws_[1][1], ws_[2][0], ws_[2][1], x] + outs + [nw] + bs
+        E.dispatch(name, bufs, par, ((sum(rows) + per - 1) // per, tiles), (128,), tg)
+        res.append(outs)
+    same = all(a.tobytes() == c.tobytes() for a, c in zip(res[0], res[1]))
+    w = np.concatenate([t[2] for t in ws_])
+    xr = np.stack([mv_norm_ref(x[t], nw) for t in range(ntok)]) if norm else x.astype(np.float64)
+    ref = xr @ w.astype(np.float64).T + (np.concatenate(bs) if bias else 0)
+    out = np.concatenate([o.astype(np.float32) for o in res[1]], axis=1)
+    err = np.abs(out - ref).max() / np.abs(ref).max()
+    check(same and err < (2e-3 if half else 1e-4), 'mv%d_matmul3_%s%s %s, %d token(s)%s: %s the one-row kernel, rel err %.1e'
+          % (nr, fmt, sfx, rows, ntok, ', bias' if bias else '', 'same bytes as' if same else 'DIFFERENT from', err))
+
+
+def mv_swiglu_test(fmt, nr, hidden, cols, ntok=1, norm=False, use_gelu=False):
+    rng = np.random.default_rng(32)
+    x = rng.standard_normal((ntok, cols)).astype(np.float32)
+    nw = (rng.random(cols) + 0.5).astype(np.float32)
+    if fmt in GGUF:
+        gq, _, gw = fmt_weights(fmt, hidden, cols, rng)
+        uq, _, uw = fmt_weights(fmt, hidden, cols, rng)
+        wq, ws, w = gq, uq, np.concatenate([gw, uw])
+    else:
+        wq, ws, w = fmt_weights(fmt, 2 * hidden, cols, rng)
+    sfx = '_norm' if norm else ''
+    par = pack('iiifi', hidden, cols, ntok, 1e-6, int(use_gelu))
+    tg = cols * 4 if norm else 16
+    tiles = (ntok + 7) // 8
+    res = []
+    for name, per in (('matmul_swiglu_%s%s' % (fmt, sfx), 4), ('mv%d_matmul_swiglu_%s%s' % (nr, fmt, sfx), 4 * nr)):
+        out = np.full((ntok, hidden), np.nan, np.float32)
+        E.dispatch(name, [wq, ws, x, out, nw], par, ((hidden + per - 1) // per, tiles), (128,), tg)
+        res.append(out)
+    xr = np.stack([mv_norm_ref(x[t], nw) for t in range(ntok)]) if norm else x.astype(np.float64)
+    y = xr @ w.astype(np.float64).T
+    ref = (gelu if use_gelu else silu)(y[:, :hidden]) * y[:, hidden:]
+    err = np.abs(res[1] - ref).max() / np.abs(ref).max()
+    same = np.array_equal(res[0], res[1])
+    check(same and err < 1e-4, 'mv%d_matmul_swiglu_%s%s hidden %d x %d, %d token(s)%s: %s the one-row kernel, rel err %.1e'
+          % (nr, fmt, sfx, hidden, cols, ntok, ', gelu' if use_gelu else '', 'same bytes as' if same else 'DIFFERENT from', err))
+
+
+if not ONLY:
+    for _fmt in MV_FORMATS:
+        for _nr in (2, 4):
+            mv_test(_fmt, _nr, 37, 512)                                      # tail simdgroup: 37 rows is no multiple of NR
+            mv_test(_fmt, _nr, 64, 512, norm=True, bias=True, acc=True)
+            mv_test(_fmt, _nr, 21, 512, ntok=11, bias=True)                  # batched rows: two token tiles, the second partial
+            mv3_test(_fmt, _nr, (21, 11, 13), 512, bias=True)                # NR rows straddle the q / k / v ranges
+            mv3_test(_fmt, _nr, (24, 8, 8), 512, norm=True, half=True)
+            mv3_test(_fmt, _nr, (9, 5, 7), 512, ntok=3)
+            mv_swiglu_test(_fmt, _nr, 19, 512)
+            mv_swiglu_test(_fmt, _nr, 24, 512, norm=True, use_gelu=True)
+            mv_swiglu_test(_fmt, _nr, 13, 512, ntok=5)
+    for _nr in (2, 4):
+        mv_test('q4', _nr, 40, 3072, softcap=3.0)                            # 3 blocks per lane (Wdown's width)
+        mv_test('q8', _nr, 130, 1024, norm=True)
+        mv_test('q4g', _nr, 33, 1024, norm=True)
+
+
 if not ONLY:
     router_norm()
     router_norm(remap=True, ntok=5)
@@ -1316,6 +1473,49 @@ attention_q8_rot('attention_q8', 96)
 attention_q8_rot('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4)
 
 
+def attention_dec_rot(hd, G, n_heads=8, n_kv=2, pos0=300, n_split=3, ctx=320):
+    """attention_dec over a q8 cache of rotated keys (backend.kv-q8-rotate): the rotated query and scale / B, as the
+    host passes them; against the float64 reference on the dequantized rotated rows to rounding, and (keys with outlier
+    channels) closer to the attention of the original f32 keys than the same kernel over plain q8 rows."""
+    rng = np.random.default_rng(21 + hd + G)
+    q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
+    k0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    k0[:, 3] *= 12
+    k0[:, hd + 7] *= 12
+    v0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    B = hd & -hd
+    stride = n_kv * hd + 4 * n_kv
+    scale = np.float32(1 / np.sqrt(hd))
+    (vc, vd) = q8_rows(v0, n_kv, hd)
+
+    def run(qq, kk, sc):
+        kc, kd = q8_rows(kk, n_kv, hd)
+        part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
+        out = np.zeros((1, n_heads * hd), np.float32)
+        E.dispatch('attention_dec_g%d_d%d_q8' % (G, hd), [qq, kc, vc, part, out],
+                   pack('iiiiifiiifii', n_heads, n_kv, hd, pos0, ctx, sc, n_heads * hd, stride, 0, 0.0, n_split, 0),
+                   (n_heads // G, (n_split + 3) // 4), (128,))
+        if n_split > 1:
+            E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+        return out, kd
+    krot = q4_rotate(k0.reshape(ctx, n_kv, hd)).reshape(ctx, -1)
+    qr = q4_rotate(q.reshape(1, n_heads, hd)).reshape(1, -1)
+    out, kd = run(qr, krot, scale / B)
+    ref_rot = attention_ref(qr, kd, vd, n_heads, n_kv, hd, pos0, 1, scale / B)
+    exact = attention_ref(q, k0, v0, n_heads, n_kv, hd, pos0, 1, scale)
+    out0, _ = run(q, k0, scale)
+    e_rot, e_plain = np.abs(out - exact).max(), np.abs(out0 - exact).max()
+    check(np.abs(out - ref_rot).max() < 1e-4 and e_rot < e_plain,
+          'attention_dec_g%d_d%d_q8 rotated keys, %d split(s): max err %.2e vs the dequantized rows, %.2e vs f32 keys (plain q8 %.2e)'
+          % (G, hd, n_split, np.abs(out - ref_rot).max(), e_rot, e_plain))
+
+
+attention_dec_rot(128, 2)
+attention_dec_rot(64, 4, n_split=1, pos0=100)
+attention_dec_rot(256, 2)
+
+
+
 def ex_from(tags, cap, recent, p):
     """KvCache.Q4.exactFrom: the first key a query at p reads from the ring."""
     if recent == 0:
@@ -1453,4 +1653,9 @@ split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
+if not ONLY:
+    # the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout
+    import kernel_tests_diffusion
+
+    kernel_tests_diffusion.run(E, check)
 sys.exit(1 if failures else 0)

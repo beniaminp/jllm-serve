@@ -55,6 +55,22 @@ public final class Settings {
             Map.entry("draft-tokens", "engine.draft-tokens"),
             Map.entry("think", "chat.thinking"),
             Map.entry("system", "chat.system"),
+            Map.entry("image-model", "image.model"),
+            Map.entry("steps", "image.steps"),
+            Map.entry("guidance", "image.guidance"),
+            Map.entry("width", "image.width"),
+            Map.entry("height", "image.height"),
+            Map.entry("scheduler", "image.scheduler"),
+            Map.entry("negative", "image.negative"),
+            Map.entry("out", "image.out"),
+            Map.entry("init", "image.init"),
+            Map.entry("mask", "image.mask"),
+            Map.entry("strength", "image.strength"),
+            Map.entry("video-model", "video.model"),
+            Map.entry("base-model", "video.base-model"),
+            Map.entry("frames", "video.frames"),
+            Map.entry("fps", "video.fps"),
+            Map.entry("video-format", "video.format"),
             Map.entry("host", "server.host"),
             Map.entry("port", "server.port"));
 
@@ -194,9 +210,12 @@ public final class Settings {
      * @throws IllegalArgumentException naming the offending key and value
      */
     public Settings validate() {
-        for (String k : new String[]{"backend.ctx", "backend.batch", "bench.max-tokens", "bench.rounds",
+        for (String k : new String[]{"backend.ctx", "bench.max-tokens", "bench.rounds",
                 "bench.prompt-repeat", "server.max-connections"}) {
             require(getInt(k) >= 1, k, "must be at least 1");
+        }
+        if (!"auto".equalsIgnoreCase(get("backend.batch").trim())) {
+            require(getInt("backend.batch") >= 1, "backend.batch", "must be auto or at least 1");
         }
         require(getInt("backend.threads") >= 0, "backend.threads", "must be 0 (= all processors) or positive");
         require(getInt("server.port") >= 0 && getInt("server.port") <= 65535, "server.port", "must be 0..65535");
@@ -251,6 +270,30 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        require(get("image.backend").equals("cpu") || get("image.backend").equals("metal") || get("image.backend").equals("auto"),
+                "image.backend", "must be cpu, metal or auto");
+        require(get("image.precision").matches("auto|f16|f32"), "image.precision", "must be auto, f16 or f32");
+        require(getInt("image.steps") >= 0 && getInt("image.steps") <= 200, "image.steps", "must be 0 (model default) .. 200");
+        require(getInt("image.width") >= 0 && getInt("image.height") >= 0, "image.width", "and image.height must be 0 (model default) or positive");
+        require(getInt("image.count") >= 1 && getInt("image.count") <= 64, "image.count", "must be 1..64");
+        require(getFloat("image.strength") >= 0 && getFloat("image.strength") <= 1, "image.strength", "must be 0..1");
+        getLong("image.seed");
+        getFloat("image.guidance");
+        require(getInt("image.vae-tile") >= 8 && getInt("image.vae-tile") <= 512, "image.vae-tile", "must be 8..512");
+        require(getInt("image.vae-tile-overlap") >= 1 && getInt("image.vae-tile-overlap") < getInt("image.vae-tile"),
+                "image.vae-tile-overlap", "must be at least 1 and below image.vae-tile");
+        getBool("video.enabled");
+        require(get("video.backend").matches("cpu|metal|auto"), "video.backend", "must be cpu, metal or auto");
+        require(get("video.precision").matches("auto|f16|f32"), "video.precision", "must be auto, f16 or f32");
+        require(get("video.format").matches("(?i)auto|mp4|webp|gif"), "video.format", "must be auto, mp4, webp or gif");
+        require(!get("video.ffmpeg").trim().isEmpty(), "video.ffmpeg", "must be auto, off or a path");
+        require(getInt("video.frames") >= 1 && getInt("video.frames") <= 128, "video.frames", "must be 1..128");
+        require(getFloat("video.fps") > 0 && getFloat("video.fps") <= 60, "video.fps", "must be above 0 and at most 60");
+        require(getInt("video.steps") >= 0 && getInt("video.steps") <= 200, "video.steps", "must be 0 (model default) .. 200");
+        require(getInt("video.width") >= 0 && getInt("video.height") >= 0, "video.width", "and video.height must be 0 (model default) or positive");
+        require(getInt("video.decode-chunk") >= 1 && getInt("video.decode-chunk") <= 32, "video.decode-chunk", "must be 1..32");
+        getLong("video.seed");
+        getFloat("video.guidance");
         require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
         for (String k : new String[]{"vision.enabled", "vision.auto-download", "vision.allow-private-urls"}) {
             getBool(k);

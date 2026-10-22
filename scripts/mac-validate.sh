@@ -119,6 +119,19 @@ bench "GGUF $LLAMA_QUANT: half-weight MMA prefill off, --batch 256" "$LLAMA_DENS
   --gguf-quant "$LLAMA_QUANT" --batch 256
 bench "flash prefill form fa" "$DENSE" "-Djllm.metal.flashPrefillKernel=fa"
 bench "flash prefill form fb" "$DENSE" "-Djllm.metal.flashPrefillKernel=fb"
+# prefill chunk (backend.batch=auto is 256 for dense decoders on Metal; 64 was the default before)
+bench "64-token prefill chunks (the old default)" "$DENSE" "" --batch 64
+bench "512-token prefill chunks" "$DENSE" "" --batch 512
+# multi-row decode matvec (NR rows per simdgroup; mvRows=1 brings the one-row kernels back) and the decode attention
+bench "decode matvec: one row per simdgroup (mvRows=1)" "$DENSE" "-Djllm.metal.mvRows=1"
+bench "decode matvec: 2 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=2"
+bench "decode matvec: 4 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=4"
+bench "decode attention off (attention_t)" "$DENSE" "-Djllm.metal.decodeAttention=false"
+bench "decode attention on (attention_dec)" "$DENSE" "-Djllm.metal.decodeAttention=true"
+bench "~1000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 100
+bench "~1000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 100
+bench "~3000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 300
+bench "~3000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 300
 bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
@@ -194,6 +207,7 @@ echo "|---|---|---|---|---|"
     | awk -F'|' '{printf "|%s %s|%s|%s|%s|%s|\n", $2, $3, $4, $5, $6, $7}' \
   || { echo "| failed | | | | $(tail -1 "$OUT/tc.log") |"; }
 masks() { # label java-opts
+  local label="$1"
   # shellcheck disable=SC2086
   "$JAVA" --add-modules jdk.incubator.vector $2 -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench \
     "models/$(echo "$DENSE" | tr / _)" 10 > "$OUT/cb.log" 2>&1 || { echo "| $label | failed | | $(tail -1 "$OUT/cb.log") |"; return; }
@@ -246,6 +260,87 @@ if [ -n "$MOE" ]; then
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
+fi
+# image generation (docs/22): Stable Diffusion on the GPU, each switch on and off (needs the diffusers folder of a model in
+# models/, default stabilityai/sd-turbo; IMAGE_MODEL=<folder> to choose another)
+IMG="${IMAGE_MODEL:-models/stabilityai_sd-turbo}"
+if [ -f "$IMG/model_index.json" ]; then
+  imgbench() { # label java-opts backend precision steps
+    local label="$1" opts="$2" backend="$3" prec="$4" steps="$5"
+    # shellcheck disable=SC2086
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g $opts \
+      -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+      org.robomiri.jllm.diffusion.DiffusionBench "$IMG" "$backend" "$prec" "$steps" 512 512 3 > "$OUT/img.log" 2>&1 || {
+      echo "| $label | failed | | $(tail -1 "$OUT/img.log") |"; return; }
+    local line total unet vae
+    line=$(grep '^warm' "$OUT/img.log" | tail -1)
+    total=$(echo "$line" | sed 's/.*: \([0-9.]*\) s total.*/\1/')
+    unet=$(echo "$line" | sed 's/.*(\([0-9.]*\) s\/eval).*/\1/')
+    vae=$(echo "$line" | sed 's/.*+ vae \([0-9.]*\) .*/\1/')
+    echo "| $label | $total | $unet | $vae |"
+  }
+  echo
+  echo "| image generation, $(basename "$IMG") 512x512 | s per image | UNet s/eval | VAE s |"
+  echo "|---|---|---|---|"
+  imgbench "Metal f16, 1 step (defaults)" "" metal f16 1
+  imgbench "Metal f16, 4 steps" "" metal f16 4
+  imgbench "Metal f32, 4 steps" "" metal f32 4
+  imgbench "flash attention off (scores + softmax), 4 steps" "-Djllm.diffusion.flash=false" metal f16 4
+  imgbench "chunked group norm off, 4 steps" "-Djllm.diffusion.simpleNorm=true" metal f16 4
+  imgbench "CPU f32, 1 step" "" cpu f32 1
+fi
+# video generation (docs/23): AnimateDiff (motion adapter on Stable Diffusion 1.5) on the GPU, each switch on and off (needs the
+# folders of the base model and of the motion adapter in models/; VIDEO_BASE / VIDEO_ADAPTER choose others)
+VBASE="${VIDEO_BASE:-models/stable-diffusion-v1-5_stable-diffusion-v1-5}"
+VADAPT="${VIDEO_ADAPTER:-models/guoyww_animatediff-motion-adapter-v1-5-2}"
+if [ -f "$VBASE/model_index.json" ] && [ -f "$VADAPT/config.json" ]; then
+  vidbench() { # label java-opts backend precision steps size frames
+    local label="$1" opts="$2" backend="$3" prec="$4" steps="$5" size="$6" frames="$7"
+    # shellcheck disable=SC2086
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g $opts \
+      -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+      org.robomiri.jllm.diffusion.VideoBench "$VBASE" "$VADAPT" "$backend" "$prec" "$steps" "$size" "$size" "$frames" 2 > "$OUT/video.log" 2>&1 || {
+      echo "| $label | failed | | | $(tail -1 "$OUT/video.log") |"; return; }
+    local line total unet vae
+    line=$(grep '^warm' "$OUT/video.log" | tail -1)
+    total=$(echo "$line" | sed 's/.*: \([0-9.]*\) s total.*/\1/')
+    unet=$(echo "$line" | sed 's/.*(\([0-9.]*\) s\/step).*/\1/')
+    vae=$(echo "$line" | sed 's/.*(\([0-9.]*\) s\/frame).*/\1/')
+    echo "| $label | $total | $unet | $vae |"
+  }
+  echo
+  echo "| video generation, AnimateDiff on $(basename "$VBASE") | s per clip | UNet s/step | VAE s/frame |"
+  echo "|---|---|---|---|"
+  vidbench "Metal f16, 256x256, 16 frames, 4 steps (defaults)" "" metal f16 4 256 16
+  vidbench "Metal f32, 256x256, 16 frames, 4 steps" "" metal f32 4 256 16
+  vidbench "Metal f16, 512x512, 16 frames, 2 steps" "" metal f16 2 512 16
+  vidbench "flash attention off (scores + softmax), 256x256, 16 frames, 2 steps" "-Djllm.diffusion.flash=false" metal f16 2 256 16
+  vidbench "chunked group norm off, 256x256, 16 frames, 2 steps" "-Djllm.diffusion.simpleNorm=true" metal f16 2 256 16
+  vidbench "CPU f32, 128x128, 8 frames, 1 step" "" cpu f32 1 128 8
+fi
+# Wan 2.1 (docs/23 section 23.12): the transformer and the VAE decoder on random inputs (the text encoder is not needed for timing); needs the
+# transformer and vae folders of Wan-AI/Wan2.1-T2V-1.3B-Diffusers in models/ (WAN_MODEL=<folder> to choose another)
+WANM="${WAN_MODEL:-models/Wan-AI_Wan2.1-T2V-1.3B-Diffusers}"
+if [ -f "$WANM/transformer/config.json" ] && [ -f "$WANM/vae/config.json" ]; then
+  wanbench() { # label java-opts backend precision latent-frames h w
+    local label="$1" opts="$2" backend="$3" prec="$4" f="$5" h="$6" w="$7"
+    # shellcheck disable=SC2086
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g $opts \
+      -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+      org.robomiri.jllm.diffusion.WanBench "$WANM" "$backend" "$prec" "$f" "$h" "$w" 2 > "$OUT/wan.log" 2>&1 || {
+      echo "| $label | failed | | $(tail -1 "$OUT/wan.log") |"; return; }
+    local dit vae
+    dit=$(grep '^warm  transformer' "$OUT/wan.log" | sed 's/.*: \([0-9.]*\) s per.*/\1/')
+    vae=$(grep '^warm  vae' "$OUT/wan.log" | sed 's/.*: \([0-9.]*\) s$/\1/')
+    echo "| $label | $dit | $vae |"
+  }
+  echo
+  echo "| Wan 2.1 1.3B, 5 latent frames of 24 x 40 (1200 tokens; 17 frames of 192 x 320) | transformer s per evaluation | VAE decode s |"
+  echo "|---|---|---|"
+  wanbench "Metal f32 (defaults)" "" metal f32 5 24 40
+  wanbench "Metal f16" "" metal f16 5 24 40
+  wanbench "flash attention off (scores + softmax), f32" "-Djllm.diffusion.flash=false" metal f32 5 24 40
+  wanbench "chunked group norm off, f32" "-Djllm.diffusion.simpleNorm=true" metal f32 5 24 40
 fi
 # GGUF block types read in place against the old behaviour (dequantize at load, requantize to Q8_0): the same file, a
 # switch on the loader (-Djllm.gguf.requantize=all; a list of ggml type names limits it to those types)
@@ -318,7 +413,7 @@ if [ -n "$VS_LLAMA" ]; then
     echo; echo "python3 not found (xcode-select --install): it reads llama-bench's JSON"
   else
     echo
-    echo "llama.cpp: $("$LLAMA_BENCH" --version 2>&1 | head -1)"
+    echo "llama.cpp: $("$LLAMA_BENCH" --version 2>&1 | grep -m1 -i version)"
     echo
     echo "| model file | engine | prefill tok/s | decode tok/s | note |"
     echo "|---|---|---|---|---|"

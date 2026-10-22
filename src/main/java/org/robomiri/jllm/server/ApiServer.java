@@ -116,13 +116,29 @@ public final class ApiServer implements AutoCloseable {
         this.defaults = options.sampling();
         this.thinkingDefault = options.thinkingDefault();
         this.maxPromptBytes = options.maxPromptBytes() > 0
-                ? options.maxPromptBytes() : 16L * engine.backend().contextLength();
+                ? options.maxPromptBytes() : (engine == null ? 0 : 16L * engine.backend().contextLength());
         this.requestTimeoutMs = options.requestTimeoutMs();
         this.http = new HttpServer(host, port, options.http(), this::handle);
     }
 
     public int port() {
         return http.port();
+    }
+
+    private volatile ImageHttp images;
+
+    /** Adds the image endpoints ({@code /v1/images/*}) served by {@code images}; the text engine may be null (images only). */
+    public ApiServer withImages(ImageHttp images) {
+        this.images = images;
+        return this;
+    }
+
+    private volatile VideoHttp video;
+
+    /** Adds the video endpoints ({@code /v1/videos/*}) served by {@code video}; the text engine may be null (video only). */
+    public ApiServer withVideo(VideoHttp video) {
+        this.video = video;
+        return this;
     }
 
     // ---- pictures in chat messages (docs/20)
@@ -162,6 +178,14 @@ public final class ApiServer implements AutoCloseable {
             res.send(204, "text/plain", "");
             return;
         }
+        ImageHttp img = images;
+        if (img != null && img.handle(path, req, res)) {
+            return;
+        }
+        VideoHttp vid = video;
+        if (vid != null && vid.handle(path, req, res)) {
+            return;
+        }
         AudioRoutes ar = audio;
         if (ar != null && ar.handle(path, req, res)) {
             return;
@@ -170,8 +194,16 @@ public final class ApiServer implements AutoCloseable {
             case "/", "/index.html" -> res.send(200, "text/html; charset=utf-8", WebUi.HTML);
             case "/health" -> res.send(200, "application/json", Json.write(Json.obj("status", "ok", "model", modelId)));
             case "/v1/models" -> {
-                List<Object> data = new java.util.ArrayList<>();
-                data.add(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve"));
+                List<Object> data = new ArrayList<>();
+                if (engine != null) {
+                    data.add(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve", "kind", "text"));
+                }
+                if (img != null) {
+                    data.add(img.modelObject());
+                }
+                if (vid != null) {
+                    data.add(vid.modelObject());
+                }
                 if (ar != null) {
                     data.addAll(ar.modelObjects());
                 }
@@ -184,6 +216,10 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private void completion(HttpServer.Request req, HttpServer.Response res, boolean chat) throws Exception {
+        if (engine == null) {
+            res.send(404, "application/json", error("no text model is loaded (this server was started with --model none)"));
+            return;
+        }
         if (!req.method.equals("POST")) {
             res.send(405, "application/json", error("use POST"));
             return;

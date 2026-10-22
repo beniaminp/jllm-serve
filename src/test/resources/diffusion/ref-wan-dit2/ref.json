@@ -1,0 +1,11 @@
+{
+ "stage": "dit",
+ "frames": 2,
+ "height": 8,
+ "width": 4,
+ "seed": 5,
+ "t": 123.0,
+ "channels": 4,
+ "text_len": 11,
+ "text_dim": 32
+}

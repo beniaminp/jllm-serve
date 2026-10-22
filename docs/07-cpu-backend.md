@@ -1032,7 +1032,7 @@ backends. DeepSeek's latent cache `[c | k_pe]` has no per-head key to rotate (th
 latent row, which also carries the value) and stays plain q8, and so do head sizes that are not multiples of 32 and
 Qwen3-Next's CPU full-attention layers (its Metal backend serves q8 as f16). `KvCache.Q8` rotates in `store` and
 `attention` (a rotated copy of the chunk's queries); the Metal backend does it in `kv_store_q8r` / `rope_store_q8r`
-([08 §8.29](08-metal-backend.md#829-the-q8-kv-cache-with-rotated-keys-on-the-gpu-backendkv-q8-rotate)).
+([08 §8.32](08-metal-backend.md#832-the-q8-kv-cache-with-rotated-keys-on-the-gpu-backendkv-q8-rotate)).
 
 **Saved caches.** The format string gains a word: `kv q8 rot layers=… kvDim=… headDim=…` against `kv q8 layers=…`. A file
 saved with rotated keys is refused by a plain q8 backend and the other way round (`the saved cache has another layout`);
@@ -1084,7 +1084,9 @@ sign of accuracy: the rotated cache is the one that reproduces f16.
 **Speed** (Metal, M1 Pro, under the heavy lock): within 1–2 % of plain q8 in prefill and decode, see
 [11 §11.10](11-performance.md#1110-the-q8-cache-with-rotated-keys-measured). **Default:** `backend.kv-q8-rotate=true` in the shipped
 `jllm.properties` (q8 itself stays opt-in): the accuracy gain is large, the memory and speed are the same to 1–2 %, the
-only cost is that saved q8 caches of the old format are refused and have to be rebuilt. `false` restores the previous format;
+only cost is that saved q8 caches of the old format are refused and have to be rebuilt (**existing q8 users:** a saved q8
+cache file from before this default is refused with "the saved cache has another layout", the console deletes it and prefills
+afresh; set `backend.kv-q8-rotate=false` to keep the old format and keep using those files). `false` restores the previous format;
 code that builds a backend without the settings (tests, library use) gets the plain format (`KvDtype.Q8_ROTATE_DEFAULT`).
 
 ---

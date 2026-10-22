@@ -1,0 +1,16 @@
+{
+ "_class_name": "UniPCMultistepScheduler",
+ "beta_end": 0.02,
+ "beta_schedule": "linear",
+ "beta_start": 0.0001,
+ "flow_shift": 3.0,
+ "num_train_timesteps": 1000,
+ "prediction_type": "flow_prediction",
+ "use_flow_sigmas": true,
+ "solver_order": 2,
+ "timestep_spacing": "linspace",
+ "final_sigmas_type": "zero",
+ "lower_order_final": true,
+ "predict_x0": true,
+ "solver_type": "bh2"
+}

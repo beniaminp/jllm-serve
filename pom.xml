@@ -479,6 +479,72 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- DiffusionTest: image generation (UNet, VAE, CLIP, samplers, img2img, inpainting) on tiny random
+                         pipelines against diffusers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>diffusion-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.DiffusionTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- VideoTest: AnimateDiff video generation (motion adapter, DDIM, temporal layers, GIF / WebP / MP4 writers, API) on a
+                         tiny random pipeline against diffusers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>video-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.VideoTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- WanTest: Wan 2.1 video components (UMT5 encoder and tokenizer, diffusion transformer, causal 3-D VAE, flow sampler, pipeline) on
+                         a tiny random pipeline against diffusers' / transformers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>wan-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.WanTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
             <plugin>

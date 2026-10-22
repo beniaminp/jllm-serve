@@ -241,6 +241,19 @@ public final class CpuBackend implements Backend {
             normRope(q, 0, g.qDim(), g.heads(), w.qNorm(), n, pos);
             normRope(kStage, 0, g.kvDim(), g.kvHeads(), w.kNorm(), n, pos);
             kv.store(layer, pos, kStage, vStage, n);
+            if (bidirectional && n > 1) {
+                // every row attends to all rows of the picture: with all n keys stored, each is a "last row" at pos + n - 1
+                int qDim = g.qDim();
+                int outDim = arch.attention().outDim();
+                float[] qRow = new float[qDim];
+                float[] aRow = new float[outDim];
+                for (int t = 0; t < n; t++) {
+                    System.arraycopy(q, t * qDim, qRow, 0, qDim);
+                    kv.attention(pool, layer, 1, pos + n - 1, qRow, aRow, g.window(), g.scale(), g.softcap());
+                    System.arraycopy(aRow, 0, att, t * outDim, outDim);
+                }
+                return;
+            }
             kv.attention(pool, layer, n, pos, q, att, g.window(), g.scale(), g.softcap());
         }
 
@@ -405,6 +418,24 @@ public final class CpuBackend implements Backend {
 
     /** Qwen3-VL: per-layer features added to the hidden state after the first layers of the current {@link #run}. */
     private float[][] deepstack;
+
+    /** The current {@link #run} is a picture whose rows attend to each other both ways (Gemma 3). */
+    private boolean bidirectional;
+
+    @Override
+    public boolean supportsBidirectionalSpan() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbedsBidirectional(float[] embeds, int off, int n, int pos, float[] logits) {
+        bidirectional = true;
+        try {
+            forwardEmbeds(embeds, off, n, pos, null, logits);
+        } finally {
+            bidirectional = false;
+        }
+    }
 
     @Override
     public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {

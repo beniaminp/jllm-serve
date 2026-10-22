@@ -1,0 +1,373 @@
+"""Kernel tests of the image-generation kernels (src/main/resources/org/robomiri/jllm/metal/diffusion.metal) on the Metal
+emulator against float64 numpy references; run from kernel_tests.py (which passes its emulator and its check function).
+
+Every kernel is tested at its awkward sizes (rows / columns / k that are not multiples of the 64 x 64 x 32 tiles, a
+width of 40 or 77 keys) in float32 and in float16 (half inputs and outputs; the references see the float16-rounded
+inputs, the tolerance is the half rounding of the result)."""
+import struct
+
+import numpy as np
+
+SILU, GELU, QUICK, GELU_TANH = 1, 2, 3, 4
+
+
+def erf64(x):
+    from math import erf
+    return np.vectorize(erf)(x)
+
+
+def act_ref(v, act):
+    if act == SILU:
+        return v / (1 + np.exp(-v))
+    if act == GELU:
+        return 0.5 * v * (1 + erf64(v / np.sqrt(2)))
+    if act == QUICK:
+        return v / (1 + np.exp(-1.702 * v))
+    if act == GELU_TANH:
+        return 0.5 * v * (1 + np.tanh(0.7978845608028654 * (v + 0.044715 * v ** 3)))
+    return v
+
+
+def pack(fmt, *values):
+    return struct.pack('<' + fmt, *values)
+
+
+def run(E, check):
+    rng = np.random.default_rng(2024)
+
+    def tol(dtype, ref):
+        return (2e-5 if dtype == np.float32 else 1.2e-2) * max(1.0, float(np.abs(ref).max()))
+
+    def rnd(dtype, *shape, scale=1.0):
+        return (rng.standard_normal(shape) * scale).astype(dtype)
+
+    sfx = {np.float32: '_f', np.float16: '_h'}
+    tile_n = {np.float32: 32, np.float16: 64}   # columns of the output tile of the matrix kernels (DF_BNT)
+
+    # ---------------------------------------------------------------- df_gemm_nt: act(A W^T + bias) + res
+    def gemm(dtype, m, n, k, act=0, bias=True, res=True, vec=None, a_scale=1.0):
+        a, w = rnd(dtype, m, k, scale=a_scale), rnd(dtype, n, k, scale=0.3)
+        b = rnd(np.float32, n)
+        r = rnd(dtype, m, n)
+        out = np.zeros((m, n), dtype)
+        if vec is None:
+            vec = int(k % 8 == 0 and n % 8 == 0)
+        # GemmParams: m n k lda ldb ldc heads aSB aSH bSB bSH cSB cSH alpha hasBias hasRes act vec
+        p = pack('iiiiiiiiiiiiifiiii', m, n, k, k, k, n, 1, 0, 0, 0, 0, 0, 0, 1.0, int(bias), int(res), act, vec)
+        E.dispatch('df_gemm_nt' + sfx[dtype], [a, w, out, b, r], p, ((n + tile_n[dtype] - 1) // tile_n[dtype], (m + 63) // 64, 1), (128,))
+        ref = a.astype(np.float64) @ w.astype(np.float64).T
+        if bias:
+            ref = ref + b
+        ref = act_ref(ref, act)
+        if res:
+            ref = ref + r.astype(np.float64)
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_gemm_nt%s m=%d n=%d k=%d act=%d bias=%s res=%s vec=%d: max err %.2e'
+              % (sfx[dtype], m, n, k, act, bias, res, vec, err))
+
+    for dt in (np.float32, np.float16):
+        gemm(dt, 70, 45, 75)                      # nothing a multiple of a tile
+        gemm(dt, 64, 64, 64, act=SILU)
+        gemm(dt, 33, 130, 40, act=GELU, vec=0)    # k = 40: a 32-wide slice and an 8-wide tail; scalar loads
+        gemm(dt, 5, 72, 96, act=QUICK, res=False)
+        gemm(dt, 3, 20, 8, bias=False, res=False)
+        gemm(dt, 40, 72, 64, act=GELU_TANH)       # the feed-forward and text projection of the Wan transformer
+        gemm(dt, 24, 72, 64, act=GELU_TANH, a_scale=6.0)   # large inputs: tanh of a huge argument must be 1, not NaN (real Wan text embeddings)
+
+    # ---------------------------------------------------------------- scores, softmax, P V: naive attention, batched
+    def naive_attention(dtype, batch, heads, lq, lk, hd, causal):
+        dm = heads * hd
+        q, k, v = rnd(dtype, batch, lq, dm), rnd(dtype, batch, lk, dm), rnd(dtype, batch, lk, dm)
+        ld = (lk + 7) // 8 * 8
+        scale = 1 / np.sqrt(hd)
+        out = np.zeros((batch, lq, dm), dtype)
+        ref = np.zeros((batch, lq, dm), np.float64)
+        for b in range(batch):
+            for h in range(heads):
+                qh = q[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                kh = k[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                vh = v[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                s = qh @ kh.T * scale
+                if causal:
+                    s = np.where(np.arange(lk)[None, :] <= np.arange(lq)[:, None], s, -np.inf)
+                pr = np.exp(s - s.max(1, keepdims=True))
+                pr /= pr.sum(1, keepdims=True)
+                ref[b, :, h * hd:(h + 1) * hd] = pr @ vh
+        vec = int(dm % 8 == 0 and hd % 8 == 0 and ld % 8 == 0)
+        for b in range(batch):
+            scores = np.zeros((heads, lq, ld), np.float32)
+            qb, kb, vb = q[b].copy(), k[b].copy(), v[b].copy()
+            ob = np.zeros((lq, dm), dtype)
+            p = pack('iiiiiiiiiiiiifiiii', lq, lk, hd, dm, dm, ld, heads, 0, hd, 0, hd, 0, lq * ld, scale, 0, 0, 0, vec)
+            name = 'df_scores_h' if dtype == np.float16 else 'df_gemm_nt_f'
+            E.dispatch(name, [qb, kb, scores, scores, scores], p, ((lk + tile_n[dtype] - 1) // tile_n[dtype], (lq + 63) // 64, heads), (128,))
+            E.dispatch('df_softmax', [scores], pack('iiii', lk, ld, lq, int(causal)), (heads * lq,), (256,))
+            p = pack('iiiiiiiiiiiiifiiii', lq, hd, lk, ld, dm, dm, heads, 0, lq * ld, 0, hd, 0, hd, 1.0, 0, 0, 0, vec)
+            E.dispatch('df_pv' + sfx[dtype], [scores, vb, ob, ob, ob], p, ((hd + tile_n[dtype] - 1) // tile_n[dtype], (lq + 63) // 64, heads), (128,))
+            out[b] = ob
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref) * 0.5, 'naive attention%s b=%d h=%d lq=%d lk=%d hd=%d causal=%s: max err %.2e'
+              % (sfx[dtype], batch, heads, lq, lk, hd, causal, err))
+
+    for dt in (np.float32, np.float16):
+        naive_attention(dt, 2, 3, 37, 77, 40, False)
+        naive_attention(dt, 1, 2, 30, 30, 64, True)
+        naive_attention(dt, 1, 1, 20, 50, 100, False)   # a head that is not a flash width
+
+    # ---------------------------------------------------------------- df_flash_d{D}: flash attention
+    def flash(dtype, batch, heads, lq, lk, hd, causal):
+        dm = heads * hd
+        q, k, v = rnd(dtype, batch, lq, dm), rnd(dtype, batch, lk, dm), rnd(dtype, batch, lk, dm)
+        out = np.zeros((batch, lq, dm), dtype)
+        scale = 1 / np.sqrt(hd)
+        ref = np.zeros((batch, lq, dm), np.float64)
+        for b in range(batch):
+            for h in range(heads):
+                qh = q[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                kh = k[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                vh = v[b, :, h * hd:(h + 1) * hd].astype(np.float64)
+                s = qh @ kh.T * scale
+                if causal:
+                    s = np.where(np.arange(lk)[None, :] <= np.arange(lq)[:, None], s, -np.inf)
+                pr = np.exp(s - s.max(1, keepdims=True))
+                pr /= pr.sum(1, keepdims=True)
+                ref[b, :, h * hd:(h + 1) * hd] = pr @ vh
+        # FlashParams: heads lq lk qs ks vs os scale causal
+        p = pack('iiiiiiifi', heads, lq, lk, dm, dm, dm, dm, scale, int(causal))
+        E.dispatch('df_flash_d%d%s' % (hd, sfx[dtype]), [q, k, v, out], p, (heads, (lq + 31) // 32, batch), (128,))
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref) * 0.5, 'df_flash_d%d%s b=%d h=%d lq=%d lk=%d causal=%s: max err %.2e'
+              % (hd, sfx[dtype], batch, heads, lq, lk, causal, err))
+
+    for dt in (np.float32, np.float16):
+        flash(dt, 2, 2, 45, 77, 40, False)       # cross attention: 77 text tokens, 45 queries (a partial tile)
+        flash(dt, 1, 2, 40, 40, 64, True)        # causal self attention (the text encoder)
+        flash(dt, 1, 1, 33, 70, 8, False)
+    flash(np.float32, 1, 1, 32, 32, 160, False)
+
+    # ---------------------------------------------------------------- df_conv: implicit gemm convolution
+    def conv_ref(x, w, bias, chan, res, stride, pad_t, pad_l, ho, wo):
+        b, h, wd, ci = x.shape
+        co, kh, kw, _ = w.shape
+        xp = np.zeros((b, h + pad_t + kh + stride * ho, wd + pad_l + kw + stride * wo, ci), np.float64)
+        xp[:, pad_t:pad_t + h, pad_l:pad_l + wd] = x
+        out = np.zeros((b, ho, wo, co), np.float64)
+        for ky in range(kh):
+            for kx in range(kw):
+                patch = xp[:, ky:ky + stride * ho:stride, kx:kx + stride * wo:stride]
+                out += patch @ w[:, ky, kx, :].astype(np.float64).T
+        if bias is not None:
+            out += bias
+        if chan is not None:
+            out += chan.astype(np.float64)[:, None, None, :]
+        if res is not None:
+            out += res.astype(np.float64)
+        return out
+
+    def conv(dtype, b, h, wd, ci, co, kh, kw, stride, pad_t, pad_l, pad_b, pad_r, use_bias=True, use_chan=True, use_res=True, direct=False, ups=0):
+        """h, wd: the size of the (logical) input; with ups=1 the stored input is half as large and read through a nearest 2x upsampling."""
+        ho = (h + pad_t + pad_b - kh) // stride + 1
+        wo = (wd + pad_l + pad_r - kw) // stride + 1
+        x, w = rnd(dtype, b, h >> ups, wd >> ups, ci), rnd(dtype, co, kh, kw, ci, scale=0.2)
+        bias = rnd(np.float32, co)
+        chan = rnd(dtype, b, co)
+        res = rnd(dtype, b, ho, wo, co)
+        out = np.zeros((b, ho, wo, co), dtype)
+        # ConvParams: batch h w cin ho wo cout kh kw stride padT padL hasBias hasChan hasRes ups
+        p = pack('iiiiiiiiiiiiiiii', b, h, wd, ci, ho, wo, co, kh, kw, stride, pad_t, pad_l, int(use_bias), int(use_chan), int(use_res), ups)
+        m = b * ho * wo
+        if direct:
+            E.dispatch('df_conv_direct' + sfx[dtype], [x, w, out, bias, chan, res], p, ((m * co + 255) // 256,), (256,))
+        else:
+            E.dispatch('df_conv' + sfx[dtype], [x, w, out, bias, chan, res], p, ((co + tile_n[dtype] - 1) // tile_n[dtype], (m + 63) // 64, 1), (128,))
+        xl = x.astype(np.float64)
+        if ups:
+            xl = xl.repeat(2, axis=1).repeat(2, axis=2)
+        ref = conv_ref(xl, w, bias if use_bias else None, chan if use_chan else None,
+                       res if use_res else None, stride, pad_t, pad_l, ho, wo)
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_conv%s%s %dx%dx%d ci=%d co=%d k=%dx%d s=%d pad=%d,%d,%d,%d: max err %.2e'
+              % ('_direct' if direct else '', sfx[dtype], b, h, wd, ci, co, kh, kw, stride, pad_t, pad_l, pad_b, pad_r, err))
+
+    for dt in (np.float32, np.float16):
+        conv(dt, 2, 9, 7, 16, 24, 3, 3, 1, 1, 1, 1, 1)
+        conv(dt, 1, 10, 12, 8, 70, 3, 3, 2, 1, 1, 1, 1, use_res=False)       # the strided down-sampling convolution
+        conv(dt, 1, 8, 8, 16, 16, 3, 3, 2, 0, 0, 1, 1, use_chan=False)       # the VAE's asymmetric padding
+        conv(dt, 1, 5, 6, 24, 40, 1, 1, 1, 0, 0, 0, 0)
+        conv(dt, 1, 6, 5, 4, 3, 3, 3, 1, 1, 1, 1, 1, direct=True)           # first / last layers: 4 -> 3 channels
+        conv(dt, 2, 7, 7, 9, 8, 3, 3, 1, 1, 1, 1, 1, direct=True)           # an inpainting UNet's 9 input channels
+        conv(dt, 1, 12, 10, 16, 24, 3, 3, 1, 1, 1, 1, 1, use_chan=False, use_res=False, ups=1)    # up-sampling fused into the convolution
+        conv(dt, 1, 8, 6, 4, 5, 3, 3, 1, 1, 1, 1, 1, direct=True, ups=1)
+
+    # ---------------------------------------------------------------- normalisation
+    def groupnorm(dtype, b, hw, c, groups, silu):
+        x = rnd(dtype, b, hw, c, scale=2.0)
+        gamma, beta = rnd(np.float32, c), rnd(np.float32, c)
+        out = np.zeros_like(x)
+        eps = 1e-5
+        gs = c // groups
+        ref = np.zeros((b, hw, c), np.float64)
+        for bi in range(b):
+            for g in range(groups):
+                sl = x[bi, :, g * gs:(g + 1) * gs].astype(np.float64)
+                ref[bi, :, g * gs:(g + 1) * gs] = (sl - sl.mean()) / np.sqrt(sl.var() + eps)
+        ref = ref * gamma + beta
+        if silu:
+            ref = act_ref(ref, SILU)
+        # NormParams: c hw groups eps silu hasAffine
+        E.dispatch('df_groupnorm' + sfx[dtype], [x, gamma, beta, out], pack('iiifii', c, hw, groups, eps, int(silu), 0), (groups, b), (256,))
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_groupnorm%s b=%d hw=%d c=%d groups=%d silu=%s: max err %.2e' % (sfx[dtype], b, hw, c, groups, silu, err))
+
+    def layernorm(dtype, rows, c, affine):
+        x = rnd(dtype, rows, c, scale=3.0)
+        gamma, beta = rnd(np.float32, c), rnd(np.float32, c)
+        out = np.zeros_like(x)
+        xd = x.astype(np.float64)
+        ref = (xd - xd.mean(1, keepdims=True)) / np.sqrt(xd.var(1, keepdims=True) + 1e-5)
+        if affine:
+            ref = ref * gamma + beta
+        E.dispatch('df_layernorm' + sfx[dtype], [x, gamma, beta, out], pack('iiifii', c, rows, 1, 1e-5, 0, int(affine)), ((rows + 7) // 8,), (256,))
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_layernorm%s rows=%d c=%d affine=%s: max err %.2e' % (sfx[dtype], rows, c, affine, err))
+
+    def groupnorm_chunked(dtype, b, hw, c, groups, silu, chunk_pix):
+        """df_gn_stats + df_gn_combine + df_gn_apply (the form used for big tensors) against the same reference."""
+        x = rnd(dtype, b, hw, c, scale=2.0) + dtype(1.5)   # a mean away from zero
+        gamma, beta = rnd(np.float32, c), rnd(np.float32, c)
+        out = np.zeros_like(x)
+        eps = 1e-5
+        gs = c // groups
+        chunks = (hw + chunk_pix - 1) // chunk_pix
+        part = np.zeros((b * groups * chunks, 2), np.float32)
+        stats = np.zeros((b * groups, 2), np.float32)
+        # DfGnParams: c hw groups eps silu chunkPix chunks batch
+        p = pack('iiifiiii', c, hw, groups, eps, int(silu), chunk_pix, chunks, b)
+        E.dispatch('df_gn_stats' + sfx[dtype], [x, part], p, (chunks, groups, b), (256,))
+        E.dispatch('df_gn_combine', [part, stats], p, (groups, b), (1,))
+        E.dispatch('df_gn_apply' + sfx[dtype], [x, stats, gamma, beta, out], p, ((b * hw * c // 4 + 255) // 256,), (256,))
+        ref = np.zeros((b, hw, c), np.float64)
+        for bi in range(b):
+            for g in range(groups):
+                sl = x[bi, :, g * gs:(g + 1) * gs].astype(np.float64)
+                ref[bi, :, g * gs:(g + 1) * gs] = (sl - sl.mean()) / np.sqrt(sl.var() + eps)
+        ref = ref * gamma + beta
+        if silu:
+            ref = act_ref(ref, SILU)
+        err = np.abs(out - ref).max()
+        check(err < tol(dtype, ref), 'df_gn_stats/combine/apply%s b=%d hw=%d c=%d groups=%d chunkPix=%d (%d chunks, last partial) silu=%s: max err %.2e'
+              % (sfx[dtype], b, hw, c, groups, chunk_pix, chunks, silu, err))
+
+    for dt in (np.float32, np.float16):
+        groupnorm_chunked(dt, 2, 150, 32, 4, True, 64)
+        groupnorm_chunked(dt, 1, 97, 24, 3, False, 40)
+        groupnorm_chunked(dt, 2, 6 * 40, 32, 8, False, 70)    # a video clip: 6 frames of 40 pixels normalised together (AnimateDiff's temporal norm)
+        groupnorm(dt, 2, 50, 64, 8, True)
+        groupnorm(dt, 1, 33, 40, 5, False)
+        layernorm(dt, 9, 320, True)
+        layernorm(dt, 3, 77, False)
+
+    # ---------------------------------------------------------------- elementwise and layout
+    def ew(dtype):
+        n = 1001
+        x, y = rnd(dtype, n), rnd(dtype, n)
+        out = np.zeros(n, dtype)
+        s = sfx[dtype]
+        E.dispatch('df_add' + s, [x, y, out], pack('qiiii', n, 0, 0, 0, 0), ((n + 255) // 256,), (256,))
+        check(np.abs(out - (x.astype(np.float64) + y)).max() < tol(dtype, x), 'df_add' + s)
+        E.dispatch('df_silu' + s, [x, out], pack('qiiii', n, 0, 0, 0, 0), ((n + 255) // 256,), (256,))
+        check(np.abs(out - act_ref(x.astype(np.float64), SILU)).max() < tol(dtype, x), 'df_silu' + s)
+        rows, half = 7, 30
+        g = rnd(dtype, rows, 2 * half)
+        o2 = np.zeros((rows, half), dtype)
+        E.dispatch('df_geglu' + s, [g, o2], pack('qiiii', rows * half, half, 0, 0, 0), ((rows * half + 255) // 256,), (256,))
+        gd = g.astype(np.float64)
+        ref = gd[:, :half] * act_ref(gd[:, half:], GELU)
+        check(np.abs(o2 - ref).max() < tol(dtype, ref), 'df_geglu' + s)
+        b, h, w, c = 2, 3, 5, 8
+        im = rnd(dtype, b, h, w, c)
+        up = np.zeros((b, 2 * h, 2 * w, c), dtype)
+        E.dispatch('df_upsample2x' + s, [im, up], pack('qiiii', up.size, h, w, c, 0), ((up.size + 255) // 256,), (256,))
+        check(np.array_equal(up, im.repeat(2, axis=1).repeat(2, axis=2)), 'df_upsample2x' + s)
+        a1, a2 = rnd(dtype, b, h, w, 5), rnd(dtype, b, h, w, 11)
+        cat = np.zeros((b, h, w, 16), dtype)
+        E.dispatch('df_concat' + s, [a1, a2, cat], pack('qiiii', cat.size, 5, 11, 0, 0), ((cat.size + 255) // 256,), (256,))
+        check(np.array_equal(cat, np.concatenate([a1, a2], axis=-1)), 'df_concat' + s)
+        # the video (AnimateDiff) layers: swap two middle axes ([B*F, P, C] <-> [B*P, F, C]) and the temporal position table
+        for outer, d1, d2, ch in ((2, 5, 7, 12), (1, 16, 33, 40), (3, 1, 9, 8)):
+            xs = rnd(dtype, outer, d1, d2, ch)
+            sw = np.zeros((outer, d2, d1, ch), dtype)
+            E.dispatch('df_swap_axes' + s, [xs, sw], pack('qiiii', sw.size, d1, d2, ch, 0), ((sw.size + 255) // 256,), (256,))
+            check(np.array_equal(sw, xs.transpose(0, 2, 1, 3)), 'df_swap_axes%s [%d,%d,%d,%d] -> [%d,%d,%d,%d]' % (s, outer, d1, d2, ch, outer, d2, d1, ch))
+        rows, ch, period = 70, 48, 16
+        xr = rnd(dtype, rows, ch)
+        table = rnd(np.float32, 32, ch)
+        outr = np.zeros_like(xr)
+        E.dispatch('df_add_rows' + s, [xr, table, outr], pack('qiiii', xr.size, ch, period, 0, 0), ((xr.size + 255) // 256,), (256,))
+        refr = xr.astype(np.float64) + table[np.arange(rows) % period]
+        check(np.abs(outr - refr).max() < tol(dtype, xr), 'df_add_rows%s rows=%d c=%d period=%d' % (s, rows, ch, period))
+        # the Wan transformer's layers: RMS norm, rotary embedding, adaptive modulation with a gate, the causal frame shift of its VAE
+        rows, ch = 11, 70
+        xn = rnd(dtype, rows, ch, scale=2.0)
+        gam = rnd(np.float32, ch)
+        outn = np.zeros_like(xn)
+        xd = xn.astype(np.float64)
+        refn = xd / np.sqrt((xd ** 2).mean(1, keepdims=True) + 1e-6) * gam
+        E.dispatch('df_rmsnorm' + s, [xn, gam, outn], pack('iiifii', ch, rows, 1, 1e-6, 0, 1), ((rows + 7) // 8,), (256,))
+        check(np.abs(outn - refn).max() < tol(dtype, refn), 'df_rmsnorm%s rows=%d c=%d' % (s, rows, ch))
+        heads, half, period = 3, 8, 5
+        rrows = 12
+        xr2 = rnd(dtype, rrows, heads * 2 * half)
+        cs, sn = rnd(np.float32, period, half), rnd(np.float32, period, half)
+        outr2 = np.zeros_like(xr2)
+        E.dispatch('df_rope' + s, [xr2, cs, sn, outr2], pack('qiiii', rrows * heads * half, heads, half, period, 0), ((rrows * heads * half + 255) // 256,), (256,))
+        xv = xr2.astype(np.float64).reshape(rrows, heads, half, 2)
+        c_, s_ = cs[np.arange(rrows) % period][:, None, :], sn[np.arange(rrows) % period][:, None, :]
+        refr2 = np.stack([c_ * xv[..., 0] - s_ * xv[..., 1], s_ * xv[..., 0] + c_ * xv[..., 1]], -1).reshape(rrows, -1)
+        check(np.abs(outr2 - refr2).max() < tol(dtype, refr2), 'df_rope%s rows=%d heads=%d half=%d period=%d' % (s, rrows, heads, half, period))
+        batch, per, ch = 2, 5, 24
+        xm = rnd(dtype, batch * per, ch)
+        tp = rnd(dtype, batch, 6 * ch)
+        tab = rnd(np.float32, 6 * ch)
+        outm = np.zeros_like(xm)
+        # DfModParams: n c per tstride t1 t2 a1 a2 -- scale = chunk 1, shift = chunk 0 (as the self-attention modulation)
+        E.dispatch('df_modulate' + s, [xm, tp, tab, outm], pack('qiiiiiii', xm.size, ch, per, 6 * ch, ch, 0, ch, 0), ((xm.size + 255) // 256,), (256,))
+        b_ = np.arange(batch * per) // per
+        scale = tab[ch:2 * ch] + tp[b_, ch:2 * ch].astype(np.float64)
+        shift = tab[0:ch] + tp[b_, 0:ch].astype(np.float64)
+        refm = xm.astype(np.float64) * (1 + scale) + shift
+        check(np.abs(outm - refm).max() < tol(dtype, refm), 'df_modulate%s b=%d per=%d c=%d' % (s, batch, per, ch))
+        ym = rnd(dtype, batch * per, ch)
+        outg = np.zeros_like(xm)
+        E.dispatch('df_gated_add' + s, [xm, ym, tp, tab, outg], pack('qiiiiiii', xm.size, ch, per, 6 * ch, 2 * ch, 2 * ch, 0, 0), ((xm.size + 255) // 256,), (256,))
+        gate = tab[2 * ch:3 * ch] + tp[b_, 2 * ch:3 * ch].astype(np.float64)
+        refg = xm.astype(np.float64) + ym.astype(np.float64) * gate
+        check(np.abs(outg - refg).max() < tol(dtype, refg), 'df_gated_add%s b=%d per=%d c=%d' % (s, batch, per, ch))
+        fr, per_frame = 5, 3 * 4 * 6
+        xf = rnd(dtype, fr, 3, 4, 6)
+        for shift_ in (1, 2):
+            outf = np.zeros_like(xf)
+            E.dispatch('df_frame_shift' + s, [xf, outf], pack('qiiii', xf.size, per_frame, shift_, 0, 0), ((xf.size + 255) // 256,), (256,))
+            reff = np.concatenate([np.zeros((shift_,) + xf.shape[1:], dtype), xf[:-shift_]])
+            check(np.array_equal(outf, reff), 'df_frame_shift%s shift=%d' % (s, shift_))
+        outs = np.zeros((2, 3, 4, 6), dtype)
+        E.dispatch('df_rows' + s, [xf, outs], pack('qiiii', outs.size, per_frame, 2, 0, 0), ((outs.size + 255) // 256,), (256,))
+        check(np.array_equal(outs, xf[2:4]), 'df_rows%s' % s)
+        outk = np.zeros((fr + 2, 3, 4, 6), dtype)
+        xg = rnd(dtype, 2, 3, 4, 6)
+        E.dispatch('df_stack' + s, [xf, xg, outk], pack('qiiii', outk.size, xf.size, 0, 0, 0), ((outk.size + 255) // 256,), (256,))
+        check(np.array_equal(outk, np.concatenate([xf, xg])), 'df_stack%s' % s)
+
+    ew(np.float32)
+    ew(np.float16)
+
+    # the softmax kernel alone: rows of different lengths (causal), padding zeroed
+    lq, n, ld = 6, 13, 16
+    s = rnd(np.float32, 2 * lq, ld, scale=3.0)
+    want = np.zeros_like(s, dtype=np.float64)
+    for r in range(2 * lq):
+        k = min(n, r % lq + 1)
+        e = np.exp(s[r, :k].astype(np.float64) - s[r, :k].max())
+        want[r, :k] = e / e.sum()
+    E.dispatch('df_softmax', [s], pack('iiii', n, ld, lq, 1), (2 * lq,), (256,))
+    check(np.abs(s - want).max() < 1e-5, 'df_softmax causal rows with zeroed padding')

@@ -283,10 +283,10 @@ for the first sentence (17 tokens), after which the two take different words at 
 llama.cpp's by 10⁻³, as the half-precision encoder differs from its float one); the same happens between the CPU's
 int8-activation decode and the float one. Do not expect token-for-token identical long answers from any two engines.
 
-`VisionTest` (81 checks, in `mvn install`): the resize against Pillow's hashes, size rules, picture decoding and the
-refusal paths, the request parts and the SSRF rules, projector choice, the rotary positions, and two **tiny random
-vision-language models written as GGUF** (a Qwen2-VL text model with a Qwen2.5-VL style projector, and a Qwen3-VL one with
-deepstack and interleaved sections): the prompt layout, one hash identity per picture, deterministic answers, the cache
+`VisionTest` (113 checks, in `mvn install`): the resize against Pillow's hashes, size rules, picture decoding and the
+refusal paths, the request parts and the SSRF rules, projector choice, the rotary positions, and three **tiny random
+vision-language models written as GGUF** (a Qwen2-VL text model with a Qwen2.5-VL style projector, a Qwen3-VL one with
+deepstack and interleaved sections, and a Qwen3.5 hybrid with a Qwen3-VL style projector, 20.12): the prompt layout, one hash identity per picture, deterministic answers, the cache
 reused for the same picture and not for another, the rotary rows restored for text, `forwardEmbeds` with the rows of
 some ids equal to `forward(ids)`, and the Metal encoder and text backend against the CPU ones.
 
@@ -348,17 +348,82 @@ remaining gap on Qwen2.5-VL is the text model: its Q4_K_M decode on Metal (22.8 
 speed (chapter 11), not something this chapter changed. Re-running the table is `scripts/mac-validate.sh --vision
 mmproj.gguf picture.png` (encoder, GPU and CPU) and the commands above.
 
-## 20.12 Limits, and what differs from Hugging Face
+## 20.12 Qwen3.5 / "Qwen3.8": pictures for a hybrid model
 
-* **Gemma 3 text side.** The projector is verified (table above), but the `gemma3` *GGUF text architecture* is not
-  in this build (the GGUF loader refuses it), and Gemma 3 attends **bidirectionally inside a picture** (all 256
-  tokens see each other, llama.cpp feeds the whole span as one non-causal batch), which the engine's causal prefill does
-  not do yet (`MediaPrompt.nonCausal` is set for it and nothing reads it). So a Gemma 3 projector loads and encodes, and
-  the end-to-end path waits for both pieces; it is not claimed to work.
-* **Qwen3.5 / "Qwen3.8" (target: `unsloth/Qwen3.8-27B-GGUF`).** Its projector is `qwen3vl_merger` (27 layers, E = 1152,
-  16 heads of 72, projection 5120, no deepstack) and the encoder runs it on CPU and Metal (CPU and Metal agree to
-  1.5·10⁻³ on a picture); the text side is the hybrid Gated-DeltaNet architecture, whose backends do not take embeddings
-  or rotary position tables yet, so the pair cannot be used end to end until they do.
+🧸 Most of this model's layers do not look back at all: three of every four keep a *running summary* (a Gated DeltaNet,
+chapter 14) that they update word by word, like a person who reads and remembers the gist. Only every fourth layer is
+real attention. A picture-word goes into the summary like any other word; only the attention layers care *where* in the
+picture it was, so only they need the two-coordinate positions of 20.6.
+
+📐 What had to change for `Qwen3NextCpuBackend` and `Qwen3NextMetalBackend`, the same three things as for the dense backends:
+
+* **Embeddings as input.** `forwardEmbeds` copies the picture's rows into the residual stream instead of looking tokens up;
+  the layers are unchanged. (The multi-token-prediction head, if switched on, sees token 0 for these rows: it drafts a little
+  worse right after a picture and the verification keeps every answer exact.)
+* **The rotary table.** The GGUF's `rope.dimension_sections = [11, 11, 10, 0]` over the 32 pairs of the 64 rotating
+  dimensions (of 256 per head) is read into the `RopeTable` as interleaved M-RoPE (`Qwen3NextArch`, the same
+  `mrope_section` / `mrope_interleaved` keys as Qwen3-VL): pair `j` turns by `position_axis(j mod 3)` while
+  `j < 3 × section`, which for these sections uses every pair (11 + 11 + 10 = 32), so the fourth, "extra" axis is not needed.
+  `setRopePositions` rewrites the table rows of the picture's slots and restores them afterwards, exactly as 20.6.
+* **No deepstack.** Qwen3.5's projector has none; `forwardEmbeds` refuses deepstack features for this family.
+
+A recurrent state cannot be rewound, so the engine reuses the previous request only when the new prompt extends it
+exactly (the next turn of a conversation does: the picture's tokens carry the same hash). A request that changes anything
+before the end of the cached tokens, or the picture, prefills from the start.
+
+Checked against `llama-mtmd-cli`'s library (`libmtmd`, GPU) on `unsloth/Qwen3.8-27B-GGUF` (`Q4_0` text file, `mmproj-F16`),
+the 640 × 480 `shapes.png` and "What shapes and colors do you see in this picture?" with thinking off:
+the prompt is 25 text tokens around a 300-token picture (325 in all), **identical ids**; the first position's top-5 log-probabilities are
+
+| token | jllm | llama.cpp |
+|---|---|---|
+| `In` | −0.05444 | −0.05453 |
+| `I` | −3.15014 | −3.15053 |
+| `Based` | −4.63837 | −4.62878 |
+| `Here` | −8.23555 | −8.21890 |
+| `Hello` | −9.37048 | −9.33001 |
+
+and the 40 greedy tokens of the answer are **the same 40 ids** ("In this picture, I see three distinct geometric shapes on a
+solid blue background: 1. **A red circle** – Located on the left side of the image. 2. **…"). On a tiny random Qwen3.5 GGUF
+with a Qwen3-VL style projector (`VisionTest`), the CPU and Metal backends agree: embeddings equal ids bit for bit,
+explicit identity positions equal the plain ones bit for bit, shifted positions change the logits and are restored,
+the answers of the two backends are the same, and text after a picture request equals a fresh engine's.
+
+## 20.13 Gemma 3: attention that runs both ways inside a picture
+
+🧸 When you read a sentence you only know the words before the one you are on. A picture is not a sentence: you see all of it at
+once. Gemma 3 was trained that way: the 256 "picture words" of one picture may look at *each other*, forwards as well as
+backwards. The words before the picture and after it behave as usual.
+
+📐 The mask of ordinary (causal) attention lets row `i` see the keys `j ≤ i`. For the rows `S` of one picture Gemma 3 adds
+`M[i][j] = 1` for all `i, j ∈ S`. `Backend.forwardEmbedsBidirectional` does this without a new kernel: all `n` rows of the
+picture store their keys and values first (the projections, QK-norm and RoPE are per row, as always), then every row
+attends *as if it were the last row of the picture* (keys `[0, pos + n)`): on the CPU one `kv.attention` call per row, on
+Metal one single-row `attention_t` dispatch per row (`attentionRow`, the same kernels and the same numpy tests as decoding).
+Consequences:
+
+* The picture must go through the model in **one pass**: `n` ≤ the backend's batch. `backend.batch` at its default is raised
+  to 256 for a `gemma3` model (a picture is 256 tokens), a smaller explicit value is refused with a message naming the
+  setting, and the engine rounds a cache reuse that would end inside a picture back to the picture's first token.
+* A layer with a sliding window (Gemma's local layers, 1 024 keys) counts the window back from the picture's *last* row for
+  every row; it differs from counting from the row itself only if more than ~770 tokens of text precede the picture.
+* The prefix cache is keyed by the picture's hash, not by the attention mode; one model always uses one mode.
+* Cost: 256 rows × layers small attention dispatches instead of one; a one-time price per picture.
+
+Checked with a *set oracle* on a tiny model (`VisionTest.bidirectional`): give the n rows of a picture the same rotary
+position. Attention that runs both ways is then a weighted sum over a *set* of keys, so permuting the picture's rows must
+not change anything the text after it sees (max difference below 10⁻⁴ on the CPU and the GPU), while causal attention does
+change (> 10⁻³), and the CPU and Metal agree with each other (< 5·10⁻³) by hand and through the engine with M-RoPE positions.
+
+**Not checked end to end:** the `gemma3` GGUF text architecture is not part of this build (the GGUF loader refuses it), so
+a Gemma 3 model cannot be loaded yet and nothing here was compared with llama.cpp on a real Gemma 3 file; the projector
+itself was (20.10). The picture side is ready for it: `MediaPrompt.nonCausal` is set for the `gemma3` projector, the engine
+feeds the picture whole through `forwardEmbedsBidirectional`, and a backend that cannot do it refuses the request.
+
+## 20.14 Limits, and what differs from Hugging Face
+
+* **Gemma 3 end to end** waits for the `gemma3` GGUF text architecture (20.13); everything on the picture side is there.
+* **Qwen3.5 / "Qwen3.8"** works (20.12) on CPU and Metal; only the pictures' quality depends on the Q4_0 file.
 * Pictures only: no video (a second frame), no audio input.
 * One picture is encoded in one command buffer; a huge picture (`vision.image-max-tokens` large) needs
   `n × ffn × 4` bytes of activations (4 096 patches × 3 420 × 4 = 56 MB for Qwen2.5-VL), so the budget doubles as a memory limit.

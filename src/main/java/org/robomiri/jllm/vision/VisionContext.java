@@ -80,10 +80,11 @@ public final class VisionContext implements AutoCloseable {
         this.opts = opts;
         List<Integer> sections = List.of();
         boolean inter = false;
-        if (arch instanceof Decoder d && !d.ropeTables().isEmpty()) {
-            RopeTable t = d.ropeTables().getFirst();
-            sections = t.mrope();
-            inter = t.mropeInterleaved();
+        RopeTable table = arch instanceof Decoder d && !d.ropeTables().isEmpty() ? d.ropeTables().getFirst()
+                : arch instanceof org.robomiri.jllm.model.Qwen3NextArch h ? h.rope() : null; // (the hybrid's full-attention layers)
+        if (table != null) {
+            sections = table.mrope();
+            inter = table.mropeInterleaved();
         }
         this.mrope = sections;
         this.mropeInterleaved = inter;

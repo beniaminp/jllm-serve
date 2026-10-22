@@ -1,0 +1,22 @@
+{
+  "_class_name": "MotionAdapter",
+  "_diffusers_version": "0.41.0",
+  "block_out_channels": [
+    16,
+    32,
+    32
+  ],
+  "conv_in_channels": null,
+  "motion_layers_per_block": 1,
+  "motion_max_seq_length": 8,
+  "motion_mid_block_layers_per_block": 1,
+  "motion_norm_num_groups": 8,
+  "motion_num_attention_heads": 2,
+  "motion_transformer_layers_per_block": [
+    2,
+    1,
+    1
+  ],
+  "motion_transformer_layers_per_mid_block": 1,
+  "use_motion_mid_block": true
+}
