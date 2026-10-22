@@ -154,6 +154,11 @@ public final class CpuOps implements Ops {
             k = src.length / n; // a 1x1 convolution weight [O, I, 1, 1] is a linear weight
             shape = new int[]{n, k};
         }
+        return pack(rows, n, k, shape);
+    }
+
+    /** Packs {@code rows [n][k]} (k in the order the kernel walks it) into panels of {@link #NR} output columns. */
+    private Tn pack(float[] rows, int n, int k, int[] shape) {
         int npad = (n + NR - 1) / NR * NR;
         MemorySegment seg = arena.allocate((long) k * npad * 4L, 64);
         packed.addAndGet((long) k * npad * 4L);
@@ -277,6 +282,10 @@ public final class CpuOps implements Ops {
             case SILU -> silu(v);
             case GELU -> gelu(v);
             case QUICK_GELU -> v / (1f + (float) Math.exp(-1.702f * v));
+            case GELU_TANH -> {
+                float v3 = v * v * v;
+                yield 0.5f * v * (1f + (float) Math.tanh(0.7978845608028654f * (v + 0.044715f * v3)));
+            }
         };
     }
 
@@ -689,6 +698,136 @@ public final class CpuOps implements Ops {
                 out.a[r * c + j] = x.a[r * c + j] + t[to + j];
             }
         });
+        return out;
+    }
+
+    // ------------------------------------------------------------------ transformer layers (Wan)
+
+    @Override
+    public Tn rmsNorm(Tn xt, Tn gamma, float eps) {
+        T x = (T) xt;
+        int c = x.last();
+        float[] g = gamma == null ? null : ((T) gamma).a;
+        T out = (T) create(x.shape);
+        IntStream.range(0, x.rows()).parallel().forEach(r -> {
+            int o = r * c;
+            double q = 0;
+            for (int j = 0; j < c; j++) {
+                q += (double) x.a[o + j] * x.a[o + j];
+            }
+            float rstd = (float) (1.0 / Math.sqrt(q / c + eps));
+            for (int j = 0; j < c; j++) {
+                float v = x.a[o + j] * rstd;
+                out.a[o + j] = g == null ? v : v * g[j];
+            }
+        });
+        return out;
+    }
+
+    @Override
+    public Tn rope(Tn xt, Tn cos, Tn sin, int heads, int period) {
+        T x = (T) xt;
+        float[] ct = ((T) cos).a;
+        float[] st = ((T) sin).a;
+        int dm = x.last();
+        int hd = dm / heads;
+        int half = hd / 2;
+        T out = (T) create(x.shape);
+        IntStream.range(0, x.rows()).parallel().forEach(r -> {
+            int tr = (r % period) * half;
+            for (int h = 0; h < heads; h++) {
+                int o = r * dm + h * hd;
+                for (int i = 0; i < half; i++) {
+                    float c = ct[tr + i];
+                    float s = st[tr + i];
+                    float a = x.a[o + 2 * i];
+                    float b = x.a[o + 2 * i + 1];
+                    out.a[o + 2 * i] = c * a - s * b;
+                    out.a[o + 2 * i + 1] = s * a + c * b;
+                }
+            }
+        });
+        return out;
+    }
+
+    @Override
+    public Tn modulate(Tn xt, Tn tprojT, Tn tableT, int[] spec, int batch) {
+        T x = (T) xt;
+        float[] tp = ((T) tprojT).a;
+        float[] tab = ((T) tableT).a;
+        int c = x.last();
+        int per = x.rows() / batch;
+        T out = (T) create(x.shape);
+        IntStream.range(0, x.rows()).parallel().forEach(r -> {
+            int b = r / per;
+            for (int j = 0; j < c; j++) {
+                float sc = tab[spec[3] + j] + tp[b * spec[0] + spec[1] + j];
+                float sh = tab[spec[4] + j] + tp[b * spec[0] + spec[2] + j];
+                out.a[r * c + j] = x.a[r * c + j] * (1f + sc) + sh;
+            }
+        });
+        return out;
+    }
+
+    @Override
+    public Tn gatedAdd(Tn rt, Tn yt, Tn tprojT, Tn tableT, int tprojStride, int tprojOffset, int tableOffset, int batch) {
+        T res = (T) rt;
+        T y = (T) yt;
+        float[] tp = ((T) tprojT).a;
+        float[] tab = ((T) tableT).a;
+        int c = res.last();
+        int per = res.rows() / batch;
+        T out = (T) create(res.shape);
+        IntStream.range(0, res.rows()).parallel().forEach(r -> {
+            int b = r / per;
+            for (int j = 0; j < c; j++) {
+                float g = tab[tableOffset + j] + tp[b * tprojStride + tprojOffset + j];
+                out.a[r * c + j] = res.a[r * c + j] + y.a[r * c + j] * g;
+            }
+        });
+        return out;
+    }
+
+    @Override
+    public Tn matrix(float[] data, Kind kind, int... shape) {
+        if (kind == Kind.VECTOR) {
+            return new T(data.clone(), shape);
+        }
+        return pack(data, shape[0], data.length / shape[0], shape.clone());
+    }
+
+    @Override
+    public Tn frameShift(Tn xt, int shift) {
+        T x = (T) xt;
+        int t = x.dim(0);
+        int per = (int) (x.numel() / t);
+        T out = (T) create(x.shape);
+        for (int i = shift; i < t; i++) {
+            System.arraycopy(x.a, (i - shift) * per, out.a, i * per, per);
+        }
+        return out;
+    }
+
+    @Override
+    public Tn rows(Tn xt, int start, int count) {
+        T x = (T) xt;
+        int per = (int) (x.numel() / x.dim(0));
+        int[] shape = x.shape.clone();
+        shape[0] = count;
+        T out = (T) create(shape);
+        System.arraycopy(x.a, start * per, out.a, 0, count * per);
+        return out;
+    }
+
+    @Override
+    public Tn stack(Tn at, Tn bt) {
+        T a = (T) at;
+        T b = (T) bt;
+        int[] shape = a.shape.clone();
+        shape[0] = a.dim(0) + b.dim(0);
+        T out = (T) create(shape);
+        System.arraycopy(a.a, 0, out.a, 0, a.a.length);
+        System.arraycopy(b.a, 0, out.a, a.a.length, b.a.length);
         return out;
     }
 }

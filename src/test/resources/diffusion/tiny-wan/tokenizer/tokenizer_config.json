@@ -1,0 +1,1 @@
+{"tokenizer_class": "T5Tokenizer", "bos_token": "<s>", "eos_token": "</s>", "pad_token": "<pad>", "unk_token": "<unk>", "extra_ids": 0, "model_max_length": 512, "clean_up_tokenization_spaces": true}

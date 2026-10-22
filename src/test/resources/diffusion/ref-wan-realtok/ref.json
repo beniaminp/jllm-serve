@@ -1,0 +1,189 @@
+{
+ "stage": "tok",
+ "frames": 3,
+ "height": 4,
+ "width": 6,
+ "seed": 11,
+ "t": 700.0,
+ "cases": [
+  {
+   "text": "a red balloon floating over a green hill",
+   "ids": [
+    289,
+    4062,
+    123869,
+    518,
+    91787,
+    439,
+    702,
+    289,
+    13706,
+    71169,
+    1
+   ]
+  },
+  {
+   "text": "A  cat   sitting on the sofa, photo!",
+   "ids": [
+    320,
+    6283,
+    83267,
+    369,
+    312,
+    24315,
+    275,
+    7821,
+    332,
+    1
+   ]
+  },
+  {
+   "text": "waves and the blue sky",
+   "ids": [
+    40692,
+    281,
+    333,
+    312,
+    15258,
+    14024,
+    1
+   ]
+  },
+  {
+   "text": "xyz 123 \u00e9\u00e8 caf\u00e9 \u65e5\u672c\u8a9e",
+   "ids": [
+    273,
+    47098,
+    273,
+    277,
+    278,
+    282,
+    670,
+    1398,
+    12831,
+    91001,
+    1
+   ]
+  },
+  {
+   "text": "balloons running",
+   "ids": [
+    123869,
+    2231,
+    19429,
+    1
+   ]
+  },
+  {
+   "text": "",
+   "ids": [
+    1
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    273,
+    158759,
+    187042,
+    187042,
+    187042,
+    187042,
+    187042,
+    1
+   ]
+  },
+  {
+   "text": "the the the  cat",
+   "ids": [
+    312,
+    312,
+    312,
+    6283,
+    1
+   ]
+  },
+  {
+   "text": "A  cat \ud83d\ude00 caf\u00e9, sitting",
+   "ids": [
+    320,
+    6283,
+    30618,
+    12831,
+    275,
+    83267,
+    1
+   ]
+  },
+  {
+   "text": "Hello   world.",
+   "ids": [
+    23231,
+    3914,
+    274,
+    1
+   ]
+  },
+  {
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "ids": [
+    239438,
+    203234,
+    206203,
+    206203,
+    206203,
+    206203,
+    206203,
+    206203,
+    1
+   ]
+  },
+  {
+   "text": "a red balloon floating over a green hill, white clouds moving, photo",
+   "ids": [
+    289,
+    4062,
+    123869,
+    518,
+    91787,
+    439,
+    702,
+    289,
+    13706,
+    71169,
+    275,
+    10021,
+    20731,
+    281,
+    37651,
+    275,
+    7821,
+    1
+   ]
+  },
+  {
+   "text": "Ein Pferd l\u00e4uft \u00fcber die Wiese",
+   "ids": [
+    2216,
+    195883,
+    54805,
+    1380,
+    366,
+    3472,
+    526,
+    1
+   ]
+  },
+  {
+   "text": " leading and trailing  ",
+   "ids": [
+    22273,
+    333,
+    51600,
+    439,
+    273,
+    1
+   ]
+  }
+ ]
+}

@@ -8,7 +8,7 @@ import struct
 
 import numpy as np
 
-SILU, GELU, QUICK = 1, 2, 3
+SILU, GELU, QUICK, GELU_TANH = 1, 2, 3, 4
 
 
 def erf64(x):
@@ -23,6 +23,8 @@ def act_ref(v, act):
         return 0.5 * v * (1 + erf64(v / np.sqrt(2)))
     if act == QUICK:
         return v / (1 + np.exp(-1.702 * v))
+    if act == GELU_TANH:
+        return 0.5 * v * (1 + np.tanh(0.7978845608028654 * (v + 0.044715 * v ** 3)))
     return v
 
 
@@ -69,6 +71,7 @@ def run(E, check):
         gemm(dt, 33, 130, 40, act=GELU, vec=0)    # k = 40: a 32-wide slice and an 8-wide tail; scalar loads
         gemm(dt, 5, 72, 96, act=QUICK, res=False)
         gemm(dt, 3, 20, 8, bias=False, res=False)
+        gemm(dt, 40, 72, 64, act=GELU_TANH)       # the feed-forward and text projection of the Wan transformer
 
     # ---------------------------------------------------------------- scores, softmax, P V: naive attention, batched
     def naive_attention(dtype, batch, heads, lq, lk, hd, causal):
@@ -302,6 +305,57 @@ def run(E, check):
         E.dispatch('df_add_rows' + s, [xr, table, outr], pack('qiiii', xr.size, ch, period, 0, 0), ((xr.size + 255) // 256,), (256,))
         refr = xr.astype(np.float64) + table[np.arange(rows) % period]
         check(np.abs(outr - refr).max() < tol(dtype, xr), 'df_add_rows%s rows=%d c=%d period=%d' % (s, rows, ch, period))
+        # the Wan transformer's layers: RMS norm, rotary embedding, adaptive modulation with a gate, the causal frame shift of its VAE
+        rows, ch = 11, 70
+        xn = rnd(dtype, rows, ch, scale=2.0)
+        gam = rnd(np.float32, ch)
+        outn = np.zeros_like(xn)
+        xd = xn.astype(np.float64)
+        refn = xd / np.sqrt((xd ** 2).mean(1, keepdims=True) + 1e-6) * gam
+        E.dispatch('df_rmsnorm' + s, [xn, gam, outn], pack('iiifii', ch, rows, 1, 1e-6, 0, 1), ((rows + 7) // 8,), (256,))
+        check(np.abs(outn - refn).max() < tol(dtype, refn), 'df_rmsnorm%s rows=%d c=%d' % (s, rows, ch))
+        heads, half, period = 3, 8, 5
+        rrows = 12
+        xr2 = rnd(dtype, rrows, heads * 2 * half)
+        cs, sn = rnd(np.float32, period, half), rnd(np.float32, period, half)
+        outr2 = np.zeros_like(xr2)
+        E.dispatch('df_rope' + s, [xr2, cs, sn, outr2], pack('qiiii', rrows * heads * half, heads, half, period, 0), ((rrows * heads * half + 255) // 256,), (256,))
+        xv = xr2.astype(np.float64).reshape(rrows, heads, half, 2)
+        c_, s_ = cs[np.arange(rrows) % period][:, None, :], sn[np.arange(rrows) % period][:, None, :]
+        refr2 = np.stack([c_ * xv[..., 0] - s_ * xv[..., 1], s_ * xv[..., 0] + c_ * xv[..., 1]], -1).reshape(rrows, -1)
+        check(np.abs(outr2 - refr2).max() < tol(dtype, refr2), 'df_rope%s rows=%d heads=%d half=%d period=%d' % (s, rrows, heads, half, period))
+        batch, per, ch = 2, 5, 24
+        xm = rnd(dtype, batch * per, ch)
+        tp = rnd(dtype, batch, 6 * ch)
+        tab = rnd(np.float32, 6 * ch)
+        outm = np.zeros_like(xm)
+        # DfModParams: n c per tstride t1 t2 a1 a2 -- scale = chunk 1, shift = chunk 0 (as the self-attention modulation)
+        E.dispatch('df_modulate' + s, [xm, tp, tab, outm], pack('qiiiiiii', xm.size, ch, per, 6 * ch, ch, 0, ch, 0), ((xm.size + 255) // 256,), (256,))
+        b_ = np.arange(batch * per) // per
+        scale = tab[ch:2 * ch] + tp[b_, ch:2 * ch].astype(np.float64)
+        shift = tab[0:ch] + tp[b_, 0:ch].astype(np.float64)
+        refm = xm.astype(np.float64) * (1 + scale) + shift
+        check(np.abs(outm - refm).max() < tol(dtype, refm), 'df_modulate%s b=%d per=%d c=%d' % (s, batch, per, ch))
+        ym = rnd(dtype, batch * per, ch)
+        outg = np.zeros_like(xm)
+        E.dispatch('df_gated_add' + s, [xm, ym, tp, tab, outg], pack('qiiiiiii', xm.size, ch, per, 6 * ch, 2 * ch, 2 * ch, 0, 0), ((xm.size + 255) // 256,), (256,))
+        gate = tab[2 * ch:3 * ch] + tp[b_, 2 * ch:3 * ch].astype(np.float64)
+        refg = xm.astype(np.float64) + ym.astype(np.float64) * gate
+        check(np.abs(outg - refg).max() < tol(dtype, refg), 'df_gated_add%s b=%d per=%d c=%d' % (s, batch, per, ch))
+        fr, per_frame = 5, 3 * 4 * 6
+        xf = rnd(dtype, fr, 3, 4, 6)
+        for shift_ in (1, 2):
+            outf = np.zeros_like(xf)
+            E.dispatch('df_frame_shift' + s, [xf, outf], pack('qiiii', xf.size, per_frame, shift_, 0, 0), ((xf.size + 255) // 256,), (256,))
+            reff = np.concatenate([np.zeros((shift_,) + xf.shape[1:], dtype), xf[:-shift_]])
+            check(np.array_equal(outf, reff), 'df_frame_shift%s shift=%d' % (s, shift_))
+        outs = np.zeros((2, 3, 4, 6), dtype)
+        E.dispatch('df_rows' + s, [xf, outs], pack('qiiii', outs.size, per_frame, 2, 0, 0), ((outs.size + 255) // 256,), (256,))
+        check(np.array_equal(outs, xf[2:4]), 'df_rows%s' % s)
+        outk = np.zeros((fr + 2, 3, 4, 6), dtype)
+        xg = rnd(dtype, 2, 3, 4, 6)
+        E.dispatch('df_stack' + s, [xf, xg, outk], pack('qiiii', outk.size, xf.size, 0, 0, 0), ((outk.size + 255) // 256,), (256,))
+        check(np.array_equal(outk, np.concatenate([xf, xg])), 'df_stack%s' % s)
 
     ew(np.float32)
     ew(np.float16)

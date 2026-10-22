@@ -693,6 +693,96 @@ final class MetalOps implements Ops {
         return out;
     }
 
+    // ------------------------------------------------------------------ transformer layers (Wan)
+
+    @Override
+    public Tn rmsNorm(Tn x, Tn gamma, float eps) {
+        int c = x.last();
+        Tn out = create(x.shape);
+        int plen = p(DiffusionParams.NORM).i(c).i(x.rows()).i(1).f(eps).i(0).i(gamma != null ? 1 : 0).done();
+        Metal.Buffer o = buf(out);
+        run("df_rmsnorm" + sfx, cdiv(x.rows(), 8), 1, 1, 256, plen, buf(x), gamma != null ? buf(gamma) : o, o);
+        return out;
+    }
+
+    @Override
+    public Tn rope(Tn x, Tn cos, Tn sin, int heads, int period) {
+        int dm = x.last();
+        int half = dm / heads / 2;
+        Tn out = create(x.shape);
+        long pairs = out.numel() / 2;
+        int plen = p(DiffusionParams.EW).l(pairs).i(heads).i(half).i(period).i(0).done();
+        run("df_rope" + sfx, cdiv(pairs, 256), 1, 1, 256, plen, buf(x), buf(cos), buf(sin), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn modulate(Tn x, Tn tproj, Tn table, int[] spec, int batch) {
+        int c = x.last();
+        Tn out = create(x.shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.MOD).l(total).i(c).i(x.rows() / batch).i(spec[0]).i(spec[1]).i(spec[2]).i(spec[3]).i(spec[4]).done();
+        run("df_modulate" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(tproj), buf(table), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn gatedAdd(Tn res, Tn y, Tn tproj, Tn table, int tprojStride, int tprojOffset, int tableOffset, int batch) {
+        int c = res.last();
+        Tn out = create(res.shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.MOD).l(total).i(c).i(res.rows() / batch).i(tprojStride).i(tprojOffset).i(tableOffset).i(0).i(0).done();
+        run("df_gated_add" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(res), buf(y), buf(tproj), buf(table), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn matrix(float[] data, Kind kind, int... shape) {
+        boolean h = half && kind != Kind.VECTOR;
+        int wes = h ? 2 : 4;
+        long bytes = Math.max(16, data.length * (long) wes);
+        Metal.Buffer buf = gpu.metal.newBuffer(bytes, false);
+        gpu.liveBytes += bytes;
+        gpu.peakBytes = Math.max(gpu.peakBytes, gpu.liveBytes);
+        write(buf, data, h);
+        MT t = new MT(buf, h, true, bytes, shape);
+        weights.add(t);
+        return t;
+    }
+
+    @Override
+    public Tn frameShift(Tn x, int shift) {
+        int t = x.dim(0);
+        Tn out = create(x.shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.EW).l(total).i((int) (total / t)).i(shift).i(0).i(0).done();
+        run("df_frame_shift" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn rows(Tn x, int start, int count) {
+        long per = x.numel() / x.dim(0);
+        int[] shape = x.shape.clone();
+        shape[0] = count;
+        Tn out = create(shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.EW).l(total).i((int) per).i(start).i(0).i(0).done();
+        run("df_rows" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn stack(Tn a, Tn b) {
+        int[] shape = a.shape.clone();
+        shape[0] = a.dim(0) + b.dim(0);
+        Tn out = create(shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.EW).l(total).i((int) a.numel()).i(0).i(0).i(0).done();
+        run("df_stack" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(a), buf(b), buf(out));
+        return out;
+    }
+
     @Override
     public Tn swapAxes(Tn x, int outer, int d1, int d2, int... shape) {
         int c = x.last();
