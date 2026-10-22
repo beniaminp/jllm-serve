@@ -365,7 +365,10 @@ Y[m, co] = Σ_k A[m, k] · W[co, k]          A[m, (ky,kx,ci)] = x[b, oy·s − p
 
 so a 3 × 3 convolution from `Cin` to `Cout` channels is a `(B·Ho·Wo) × (9·Cin)` times `(9·Cin) × Cout` product, the same shape of
 problem as a linear layer. The CPU gathers the patches of a 32-row tile into a scratch buffer and runs the register-tiled
-micro-kernel (4 rows × 4 vectors of accumulators, weights packed in panels); the GPU **never builds the patch matrix**: its kernel
+micro-kernel (4 rows × 4 vectors of accumulators, weights packed in panels; each task copies the panel it needs from the
+off-heap store into a small thread-local array first: with the weights read straight from the off-heap segment, this loop ran at 0.3
+GFLOP/s on this JVM (JDK 26, Apple M1) instead of 66 per core with `fromArray`, although a plain sum over a segment is as fast as
+over an array; the copy costs a few percent); the GPU **never builds the patch matrix**: its kernel
 (`df_conv`) gathers the `A` slice it needs straight from the image while it stages it in threadgroup memory ("implicit GEMM").
 
 **The GPU kernels** (`src/main/resources/org/robomiri/jllm/metal/diffusion.metal`, a Metal library of its own, 900 lines; every
@@ -450,7 +453,41 @@ from jllm's stream, in the order the pipeline asks for them). `scripts/diffusion
 projections and an OpenCLIP-style encoder; SDXL with two encoders, `text_time` conditioning and two transformer blocks per layer;
 an inpainting UNet with 9 input channels).
 
-[[ACCURACY TABLE]]
+Relative error is `‖a − b‖ / ‖b‖` over the whole tensor, `b` being diffusers'. PSNR is on the final 8-bit image. Reproduce a row with
+`scripts/diffusion/reference.py <model> <out dir> …` and then `DiffusionCompare <model> <out dir> <cpu|metal> <f32|f16>`
+(the docstrings at the top of both files list the options).
+
+| Pipeline (weights) | Steps / sampler | jllm | First UNet call | Last latents | Final image |
+|---|---|---|---|---|---|
+| tiny SD 1.x, SD 2-style, SDXL, inpainting (random weights, committed fixtures) | 1 / 4 / 7, Euler, Euler-a, DPM++ 2M, DPM++ 2M Karras | CPU f32, Metal f32 | ~1·10⁻⁶ | ~1·10⁻⁶ | 130–137 dB |
+| the same | the same | Metal f16 | ~1·10⁻³ | ~1·10⁻³ | 65–77 dB |
+| `stabilityai/sd-turbo` 512 × 512 | 2, Euler, guidance 0 | Metal f32 | 5.1·10⁻⁶ (text encoder 1.7·10⁻⁶) | 4·10⁻⁵ | 108 dB (VAE decode alone 8·10⁻⁶) |
+| the same | the same | Metal f16 | 2.6·10⁻³ | — | 52.8 dB |
+| `stable-diffusion-v1-5` 512 × 512 | 6, DPM++ 2M Karras, guidance 7.5 | Metal f32 | 2.7·10⁻⁶ | — | 94 dB |
+| `stable-diffusion-v1-5` 512 × 512 | 4, Euler, guidance 7.5 | Metal f32 | 2.7·10⁻⁶ | 8.9·10⁻⁵ | 94 dB |
+| `stable-diffusion-v1-5` 512 × 512 | 5, DPM++ 2M, guidance 7.5 | Metal f32 | 2.3·10⁻⁶ | 1.8·10⁻³ | 73.9 dB |
+| `stable-diffusion-inpainting` (9-channel UNet) | 2, Euler, guidance 7.5 | Metal f32 | — | 1.2·10⁻⁴ | 96 dB |
+| `stabilityai/sdxl-turbo` 512 × 512 | 2, Euler, guidance 0, against diffusers on MPS in float16 | Metal f16 | 8.6·10⁻⁴ | — | 49.8 dB |
+
+The DPM++ 2M row is the weakest: its second-order extrapolation makes the sampler amplify the per-step float32 rounding
+differences (latent error 2·10⁻⁵ after the first step, 1.8·10⁻³ after the fifth, with guidance 7.5), where Euler's stay below 10⁻⁴.
+The first UNet call is as exact as in every other row, and the sampler arithmetic itself is bit-compatible on the tiny pipelines
+(130 dB for all four samplers), so this is conditioning, not a mistake; 74 dB is still far below what the eye can see.
+
+Two things this table taught, both fixed:
+
+- A scheduler config without `timestep_spacing` has the *class's* default in diffusers (`leading` for the PNDM / DDIM / DDPM
+  schedulers the Stable Diffusion 1.x repositories ship, which Euler and DPM++ inherit when they are made `from_config`), not the
+  Euler default. With the wrong default the inpainting run was off by a different set of sigmas; `Scheduler` now picks the default
+  from `_class_name`.
+- Decoding 1024 × 1024 in 64-pixel latent tiles differed from decoding in one piece by 29.7 dB PSNR: the VAE's group norms see
+  statistics of the tile, not of the image, so every tile came out about 3 % brighter or darker. The default tile is now 128
+  latent pixels (1024 image pixels), which means up to 1024 × 1024 is decoded in one piece; larger images are tiled with an 8-pixel
+  blended overlap (`image.vae-tile`, `image.vae-tile-overlap`).
+
+float16 is not "bit-identical": its error is the rounding of half-precision weights and activations (about 10⁻³ relative in a UNet,
+which is 50–55 dB in the picture, indistinguishable by eye). Everything below that is checked in float32 where a mismatch cannot hide
+behind rounding.
 
 ---
 

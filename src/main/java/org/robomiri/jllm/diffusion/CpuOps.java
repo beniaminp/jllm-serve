@@ -185,8 +185,8 @@ public final class CpuOps implements Ops {
 
     /**
      * The 4-row x NR-column register tile over one packed weight panel. The panel is a heap array (copied from the off-heap
-     * store by the caller): {@code FloatVector.fromMemorySegment} is not compiled to vector loads by this JVM (the loop ran
-     * at 0.3 GFLOP/s, a hundredth of {@code fromArray}), so the panel is staged through a small thread-local array instead.
+     * store by the caller): with {@code FloatVector.fromMemorySegment} in this loop (JDK 26, Apple M1) the loop ran at 0.3 GFLOP/s,
+     * a two-hundredth of the {@code fromArray} version, so the panel is staged through a small thread-local array instead.
      */
     private static void micro(float[] a, int o0, int o1, int o2, int o3, int k, float[] w, float[] tmp) {
         FloatVector c00 = FloatVector.zero(SP), c01 = c00, c02 = c00, c03 = c00;
