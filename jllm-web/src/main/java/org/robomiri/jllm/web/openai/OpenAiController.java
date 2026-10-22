@@ -129,6 +129,7 @@ public class OpenAiController {
             ChatSupport.send(res, 400, ChatSupport.error("invalid JSON: " + e.getMessage(), "invalid_request_error", null));
             return;
         }
+        OpenAiFeatures.headerPriority(body, req.getHeader(OpenAiFeatures.PRIORITY_HEADER));
         LoadedModel model;
         try {
             model = models.resolve(Json.str(body, "model", null));

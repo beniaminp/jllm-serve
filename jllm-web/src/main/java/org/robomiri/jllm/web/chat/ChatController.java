@@ -96,6 +96,7 @@ public class ChatController {
         List<Tool> offered;
         List<org.robomiri.jllm.vision.Rgb> images = List.of(); // the pictures of the conversation, in order (docs/20)
         boolean thinking = ChatSupport.thinking(body, s.getBool("chat.thinking"));
+        org.robomiri.jllm.engine.Priority priority; // "priority": "background" for a job that may wait behind a person
         try {
             conversation = new ArrayList<>(ChatSupport.messages(body, maxPromptBytes));
             if (org.robomiri.jllm.vision.ImageParts.hasImages(conversation)) {
@@ -111,6 +112,7 @@ public class ChatController {
             }
             offered = tools.select(names);
             ChatSupport.params(body, s.sampling(), Integer.MAX_VALUE); // validate the sampling fields up front
+            priority = org.robomiri.jllm.engine.Priority.parse(Json.str(body, "priority", null));
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));
             return;
@@ -158,8 +160,10 @@ public class ChatController {
                 Engine.TextSink sink = byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback;
                 java.util.function.BooleanSupplier cancelled = () -> failure[0] != null || sse.failed() || model.closing()
                         || deadline.getAsBoolean() || gone.getAsBoolean();
-                r = media == null ? slot.engine().generate(prompt, params, sink, cancelled)
-                        : slot.engine().generate(media, params, sink, cancelled);
+                try (org.robomiri.jllm.engine.Priority.Scope ignored = org.robomiri.jllm.engine.Priority.enter(priority)) {
+                    r = media == null ? slot.engine().generate(prompt, params, sink, cancelled)
+                            : slot.engine().generate(media, params, sink, cancelled);
+                }
             } catch (Exception e) {
                 emit(sse, failure, Json.obj("type", "error", "message", e instanceof Engine.OverloadedException
                         ? e.getMessage() : "generation failed: " + e.getMessage()));

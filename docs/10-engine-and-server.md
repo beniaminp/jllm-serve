@@ -569,8 +569,8 @@ cheap. After each answer it prints the token count and tok/s from the final `usa
 Decoding streams every weight once per token, so a token costs the same whether the pass computes one position or
 several. Speculative decoding exploits that: guess the next few tokens, feed *all* of them in one pass, and keep
 the guesses the model itself would have produced. Code: `engine/Speculator.java`, `engine/DraftModel.java`,
-`Sampler.verify`, `Backend.forwardAll`. Prompt lookup is on by default (`engine.speculative=ngram`; `off` disables
-it, measurements below and in [17](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents)).
+`Sampler.verify`, `Backend.forwardAll`. Prompt lookup is on by default for every model (`engine.speculative=ngram`; `off` disables
+it, measurements below, in [17](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) and in [11 §11.10](11-performance.md#1110-agent-defaults-measured)).
 
 ```
 tok  = sample(logits)                       # a normal step: the next token is always the target's own choice
@@ -677,6 +677,16 @@ the gain ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-dr
 Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
 
+**Prompt lookup pauses when it does not pay.** A pass that drafts and fails costs more than the steps it was meant to save,
+and how much more depends on the backend: about 0.4 of a step per extra position on a dense Metal model, 0.55 on an MoE
+model, and on the CPU a fixed 6 steps (its multi-token pass is the float prefill path, decode uses int8 dot products).
+So the lookup runs under the cost model that already chooses a draft model's length (`Speculator.CostModel`, used as a gate:
+the length stays what the text supports): it learns the acceptance rate of the request's passes (back to the prior at every
+request) and the cost of a pass, and while no draft length would beat plain decoding it takes 16 plain steps, trying a pass
+every fourth time to notice a change of text. Copying text is unaffected; free text and tool calls stop paying for failed
+passes (CPU, Qwen3-0.6B: −37 % on prose became +4 %). `-Djllm.engine.adaptiveNgram=false` drafts at every match,
+`-Djllm.engine.specDebug=true` traces the model. Measured in [11 §11.10](11-performance.md#1110-agent-defaults-measured).
+
 ---
 
 ## 10.9b Batched decoding across slots
@@ -749,8 +759,8 @@ consumes the next argument when that is a boolean literal (`true`/`false`, `yes`
 error instead of being ignored. Three flags are per-invocation inputs rather than settings: `--prompt`, `--raw`,
 `--config`. An unknown key is rejected (`unknown option --bogus`), also when it appears in the external file.
 
-**Validation happens before the model loads.** `Settings.validate()` parses every typed value once (positive
-`backend.ctx` / `backend.batch`, `server.port` in 0..65535, non-negative timeouts and byte limits, the
+**Validation happens before the model loads.** `Settings.validate()` parses every typed value once (`backend.ctx` auto or positive, positive
+`backend.batch`, `server.port` in 0..65535, non-negative timeouts and byte limits, the
 `sampling.*` ranges of [09 §9.10](09-sampling.md#910-where-each-setting-comes-from), the quantization, KV dtype and
 backend names) and `Main` prints the message and exits with status 2, instead of failing minutes later when a
 value is first used. Booleans are strict: `getBool` accepts `true/false`, `yes/no`, `on/off`, `1/0` and throws on
@@ -780,9 +790,11 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `server.queue-timeout-ms` | `60000` | how long a request waits for the engine before the 503, 0 = forever |
 | `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
 | `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
+| `backend.ctx` / `backend.ctx-max` | `auto` / `131072` | context length per slot; `auto` sizes it from the free memory ([10.13](#1013-the-default-context-length-backendctxauto)), a number overrides; the cap applies to `auto` only |
+| `engine.priority-order` | `true` | a request with `"priority": "background"` gives way to interactive ones at the device ([10.14](#1014-request-priority)) |
 | `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
 | `engine.prompt-cache-mb` | `64` | memory for the ids of recently rendered chat prompts: a resent conversation is tokenized only from where it is new, with the ids of a full tokenization ([17 §17.5](17-agent-speedups.md#175-tokenizing-only-what-is-new)); 0 = off |
-| `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. Left at the default, MoE models run without it |
+| `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. On for every model; prompt lookup pauses by itself while it does not pay ([11 §11.10](11-performance.md#1110-agent-defaults-measured)) |
 | `engine.draft-model` | empty | Hub repo of the draft model for `draft` (same tokenizer); flag `--draft-model` |
 | `engine.draft-tokens` | `16` | most tokens proposed per verification pass (prompt lookup adapts below it); flag `--draft-tokens` |
 | `engine.ngram-max` / `engine.ngram-min` / `engine.ngram-window` | `8` / `3` / `0` | prompt lookup: longest / shortest suffix matched, how many recent tokens may be copied from (0 = all) |
@@ -824,7 +836,117 @@ backend and weights closed again.
   web page, including `n`, `logprobs` (log-softmax of the raw logits), `logit_bias`, `echo`, `suffix` (fill in the
   middle), `best_of` and `response_format` (constrained decoding: a byte-level JSON automaton masks the sampler's
   candidates, most likely first).
-- Speculative decoding (off by default) proposes tokens by prompt lookup or with a small draft model, verifies them
+- Speculative decoding (prompt lookup by default, pausing when it does not pay) proposes tokens by prompt lookup or with a small draft model, verifies them
   in one multi-token pass (`Backend.forwardAll`) and keeps what the target would have produced: identical greedy
   output, the target's distribution when sampling; it pays only when a pass of n tokens is much cheaper than n steps.
 - Configuration is one properties file with three override layers and a `config` command to inspect them.
+
+---
+
+## 10.13 The default context length (`backend.ctx=auto`)
+
+🧸 The model keeps a notebook (the KV cache) where it writes down everything it has read in this conversation, so that
+it does not have to read it again. A longer notebook lets it remember more, but it takes room on the desk, which is the
+computer's memory. Until now every model got a notebook with 4 096 pages, however big the desk. Now we look at the
+desk first: how much room is left after the model's own books and the notebooks of the other models, and we give it
+the longest notebook that fits in a bit more than half of that, up to 131 072 pages and never more pages than the
+model learnt to read. If you say how many pages you want, you get exactly that many.
+
+📐 Setting `backend.ctx` (default `auto`; a number overrides, as before), capped by `backend.ctx-max` (default 131 072,
+what coding agents need without a runaway for models trained on 1M tokens). Code: `ContextBudget` (a pure function,
+tested without a device in `AgentDefaultsTest`), `ModelLoader.contextLength`, `MetalMemory`. The KV bytes of one position
+are `2 · layers · rowBytes(kvDim)` for attention models (`KvDtype.rowBytes`: 4 bytes a value at f32, 2 at f16, about 1
+at q8, about 0.56 at q4), `layers · rowBytes(kvLoraRank + rope)` for DeepSeek's latent cache, the full-attention layers
+only for the Qwen3-Next hybrids and 0 for Mamba. With `budget` the bytes the caches of all `slots` engines may take:
+
+```
+ctx = min( backend.ctx-max,  max(max_position_embeddings, 4096),  floor(budget / slots / bytesPerToken) )
+ctx rounded down to a multiple of 1024 (256 below 4096), at least 1024
+budget(Metal) = 0.6 · max(0, workingSet − other models − weights − reserve [+ 10 % of workingSet for an MoE model])
+budget(CPU)   = 0.6 · free old generation of the Java heap            (the CPU backends keep the cache on the heap)
+both:           min(budget, 0.6 · max(0, 0.75 · physical memory − weights))
+draft model:    budget / 2        (the draft keeps a cache of the same length)
+```
+
+`workingSet` is Metal's `recommendedMaxWorkingSetSize` (or `-Djllm.metal.workingSetGb`), `other models` what the open
+backends hold (`DeviceLedger`, so the second model loaded gets less than the first), `reserve` is
+`max(512 MB, workingSet / 32)` for activations and scratch. An MoE model whose experts may move to the CPU
+(`backend.metal.cpu-moe` not `off`) may displace up to 10 % of the working set of them to make room for the cache: the
+placement planner already counts the cache in its budget. The 60 % keeps the rest for activations, the operating system
+and the other programs; `-Djllm.ctx.share` changes it. A model trained on fewer than 4 096 positions keeps 4 096 as before
+(its RoPE positions beyond the training length are extrapolated, with the usual warning), and when even the floor does not fit,
+the load fails or warns as it did with a number that was too large. The choice and its arithmetic are logged at load:
+
+```
+Context: 18432 tokens (backend.ctx=auto: KV 197 KB/token, Metal working set 26.8 GB - weights 19.4 - other models 0.0
+- reserve 0.8 + 2.7 experts may move to the CPU = 9.2 GB free, 60% for the cache; limited by memory); KV cache 3.62 GB per slot
+```
+
+Every slot of a server gets the same context: `ModelLoader.load` decides it once, for `slots` engines, and
+`extraEngine` reuses the first engine's. The Metal caches are not zeroed, so a long context costs address space but only
+touches the pages that are written (measured below). Measured on the M1 Pro (32 GB, working set 26.8 GB; `./jllm run
+--max-tokens 1`, bundled settings):
+
+| model | cache | `backend.ctx=auto` picks | limited by | KV per slot |
+|---|---|---|---|---|
+| Qwen3-0.6B (Metal) | f32 | 40 960 | trained length | 9.4 GB |
+| Qwen3-0.6B (Metal) | f16 | 40 960 | trained length | 4.7 GB |
+| Qwen3-0.6B GGUF Q4_0 (Metal) | f32 | 40 960 | trained length | 9.4 GB |
+| Qwen3-0.6B (CPU, `-Xmx4g`) | f32 | 7 168 | the free heap | 1.6 GB |
+| Qwen3.8-27B GGUF Q4_0 (hybrid, Metal) | f32 | 44 032 | memory | 5.8 GB |
+| Qwen3-30B-A3B-Thinking-2507 (Metal) | f32 | 18 432 | memory | 3.6 GB |
+| Qwen3-30B-A3B-Thinking-2507 (Metal) | f16 | 37 888 | memory | 3.7 GB |
+| Qwen3-30B-A3B-Thinking-2507 (Metal) | q8 | 74 752 | memory | 3.8 GB |
+
+Qwen3-0.6B, 91 tokens decoded after a 413-token prompt (`./jllm bench --engine.speculative off`, 2 passes of 3 rounds, interleaved): decode
+130.0 – 134.4 tok/s with `auto` (40 960) against 134.3 – 136.8 with `--ctx 4096` (medians 133.7 and 135.3: about 1 % lower, the size of
+the run-to-run noise), prefill 1 891 – 2 086 against 1 915 – 2 106 tok/s. The f32 default of `backend.kv-dtype` is what makes 32k contexts expensive (the 30B at 32k
+would need 6.5 GB at f32 and 3.2 GB at f16): an agent that wants the long contexts of the 30B on this Mac sets
+`backend.kv-dtype=f16` (37 888) or `q8`, whose accuracy cost is measured in [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured)
+and docs/08. A weights-bound case is honest rather than clever: when the weights leave no room, `auto` returns the 1 024-token floor and
+the log says what limited it. Not yet counted: the CPU backends' cache moves off the Java heap with the paged KV cache
+(then the physical-memory bound is the only one), and a draft model's own cache is only accounted for by halving.
+
+---
+
+## 10.14 Request priority
+
+🧸 A pharmacy has one counter. A person waiting with a headache and someone dropping off a big pile of prescriptions
+for next week both stand in line. The fair line is first come, first served, but then the headache waits behind the
+whole pile. Now the pile carries a sticker, "background": whenever someone without the sticker steps up, the pile
+waits one turn. Nobody is thrown out of the middle of a prescription; the pharmacist just chooses who is next.
+
+📐 `"priority": "interactive" | "background"` is an extra field of `/v1/chat/completions` and `/v1/completions` (also the
+header `X-Jllm-Priority`, the body wins), a selector in the console's chat parameters and a property of
+`Engine.Decoding` (`Decoding.priority()`, default `INTERACTIVE`; `Priority` in `engine/`). `OpenAiFeatures.parse`
+validates it (a 400 for anything else), `Engine.generateChoices` makes it the thread's `Priority.current()` for the request,
+and the console's `/api/chat` does the same around its `generate` call. What it does today, and no more: it orders the wait
+for the device in `BatchGroup`, whose one lock every prefill chunk, verification pass, saved-cache access and decode batch
+takes (`engine.priority-order`, default true; `false` = the old behaviour, first come first served):
+
+- an interactive request counts itself as waiting while it queues for the lock or for a decode step;
+- a background request does not take the lock while that count is above zero: it polls (`tryLock` every 0.2 ms) instead
+  of joining the lock's queue, because a request already queued cannot be overtaken. It gives way for at most
+  `-Djllm.engine.backgroundMaxWaitMs` (2 000 ms), then queues, so a stream of interactive requests cannot starve it;
+- a decode step of a background request does not lead a batch while an interactive one waits (it may still ride in that
+  batch), and when more decode steps are queued than one pass takes, interactive ones are taken first.
+
+It does not preempt a pass that is running (a 256-token prefill chunk is about 125 ms for Qwen3-0.6B), does not choose the slot
+a request lands on and does nothing for a server whose model has a single slot and no concurrent requests. The scheduler
+of the agentic-serving plan (wip/NEXT-PROMPT.md, stage 1) is meant to read `Priority.current()` (or the `Decoding` field)
+for its priority classes, token budgets and pausing.
+
+Measured (`PriorityBench`, M1 Pro, Qwen3-0.6B, two slots, a background job of a ~1 500-token prompt and 96 generated tokens
+starts, 150 ms later a short interactive request arrives on the other slot; median of 5 rounds):
+
+| | interactive request: first token | whole request | the job |
+|---|---|---|---|
+| `engine.priority-order=true`, job background | 127 ms | 754 ms | 1 809 ms |
+| `engine.priority-order=false`, job background | 937 ms | 1 098 ms | 1 814 ms |
+| `engine.priority-order=true`, job also interactive | 118 ms | 1 086 ms | 1 746 ms |
+| `engine.priority-order=false`, job also interactive | 128 ms | 1 097 ms | 1 746 ms |
+
+Without ordering, the job's chunk loop releases the device and takes it again before the parked interactive thread wakes up
+(the lock is not fair), so the short request waits for most of the prompt; with the job marked background it waits for the
+chunk in flight (the first token comes 7x sooner) and the job loses nothing measurable. All-interactive traffic behaves
+exactly as before (rows 3 and 4: the same within noise). `AgentDefaultsTest` checks the order with a scripted backend.

@@ -205,10 +205,14 @@ public final class Settings {
      * @throws IllegalArgumentException naming the offending key and value
      */
     public Settings validate() {
-        for (String k : new String[]{"backend.ctx", "bench.max-tokens", "bench.rounds",
+        for (String k : new String[]{"bench.max-tokens", "bench.rounds",
                 "bench.prompt-repeat", "server.max-connections"}) {
             require(getInt(k) >= 1, k, "must be at least 1");
         }
+        if (!"auto".equalsIgnoreCase(get("backend.ctx").trim())) {
+            require(getInt("backend.ctx") >= 1, "backend.ctx", "must be auto or at least 1");
+        }
+        require(getInt("backend.ctx-max") >= 1024, "backend.ctx-max", "must be at least 1024");
         if (!"auto".equalsIgnoreCase(get("backend.batch").trim())) {
             require(getInt("backend.batch") >= 1, "backend.batch", "must be auto or at least 1");
         }
@@ -230,7 +234,7 @@ public final class Settings {
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "chat.thinking", "raw",
-                "engine.batch-decode", "engine.constrained-tools", "engine.jump-forward", "engine.constraint-masks"}) {
+                "engine.batch-decode", "engine.priority-order", "engine.constrained-tools", "engine.jump-forward", "engine.constraint-masks"}) {
             if (has(k)) {
                 getBool(k);
             }

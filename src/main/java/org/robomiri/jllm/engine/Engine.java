@@ -93,10 +93,32 @@ public final class Engine implements AutoCloseable {
      * @param promptLogprobs report the prompt tokens' log-probabilities too: the whole prompt is run through
      *                       {@link Backend#forwardAll} (no prefix cache, small chunks)
      * @param constraint     creates a fresh {@link TokenConstraint} for each sequence; null = unconstrained
+     * @param priority       how urgent the request is ({@link Priority}); orders the wait for the device
      */
     public record Decoding(float[] logitBias, boolean logprobs, int topLogprobs, boolean promptLogprobs,
-                           Supplier<TokenConstraint> constraint) {
+                           Supplier<TokenConstraint> constraint, Priority priority) {
         public static final Decoding NONE = new Decoding(null, false, 0, false, null);
+
+        public Decoding {
+            if (priority == null) {
+                priority = Priority.INTERACTIVE;
+            }
+        }
+
+        public Decoding(float[] logitBias, boolean logprobs, int topLogprobs, boolean promptLogprobs,
+                        Supplier<TokenConstraint> constraint) {
+            this(logitBias, logprobs, topLogprobs, promptLogprobs, constraint, Priority.INTERACTIVE);
+        }
+
+        /** The same options for a request of another priority. */
+        public Decoding withPriority(Priority p) {
+            return new Decoding(logitBias, logprobs, topLogprobs, promptLogprobs, constraint, p);
+        }
+
+        /** The same options with another constraint (null = unconstrained). */
+        public Decoding withConstraint(Supplier<TokenConstraint> c) {
+            return new Decoding(logitBias, logprobs, topLogprobs, promptLogprobs, c, priority);
+        }
 
         /**
          * Whether every step needs its own logits on the CPU (no speculation, no jump-forward, no pipelined greedy
@@ -388,13 +410,13 @@ public final class Engine implements AutoCloseable {
                                          ChoiceSink sink, BooleanSupplier cancelled) {
         acquire();
         media = mp;
-        try {
+        try (Priority.Scope ignored = Priority.enter(d.priority())) { // orders this request's waits for the device
             List<Result> results = new ArrayList<>(n);
             List<TokenLogprob> promptLp = null;
             for (int i = 0; i < n; i++) {
                 int c = i;
                 SamplingParams pi = i == 0 || p.seed() < 0 ? p : p.withSeed(p.seed() + i);
-                Decoding di = i == 0 ? d : new Decoding(d.logitBias(), d.logprobs(), d.topLogprobs(), false, d.constraint());
+                Decoding di = i == 0 ? d : new Decoding(d.logitBias(), d.logprobs(), d.topLogprobs(), false, d.constraint(), d.priority());
                 if (sink != null) {
                     sink.start(c);
                 }

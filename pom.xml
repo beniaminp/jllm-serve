@@ -131,6 +131,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- AgentDefaultsTest: backend.ctx=auto arithmetic, request priority parsing and the device queue order. -->
+                    <execution>
+                        <id>agent-defaults-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.AgentDefaultsTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- DraftSpecTest: greedy output with a draft model equals the output without speculation. -->
                     <execution>
                         <id>draft-spec-test</id>
