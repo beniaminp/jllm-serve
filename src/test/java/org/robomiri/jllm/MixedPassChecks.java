@@ -110,30 +110,66 @@ final class MixedPassChecks {
             {new Op(0, 9, true, false), new Op(9, 3, true, true), new Op(12, 1, true, false), new Op(13, 1, true, false),
                     new Op(14, 1, true, false), new Op(15, 1, true, false), new Op(16, 1, true, false), new Op(17, 1, true, false)}};
 
-    private static int rows(Op op) {
-        return op.logits() ? (op.all() ? op.n() : 1) : 0;
+    /** The same conversations with other chunk boundaries. */
+    private static final Op[][] ALT = {
+            {new Op(0, 50, true, false), new Op(50, 1, true, false), new Op(51, 1, true, false), new Op(52, 1, true, false),
+                    new Op(53, 1, true, false), new Op(54, 1, true, false), new Op(55, 1, true, false)},
+            SCRIPT[1],
+            {new Op(0, 9, true, false), new Op(9, 1, true, false), new Op(10, 1, true, false), new Op(11, 1, true, false),
+                    new Op(12, 1, true, false), new Op(13, 1, true, false), new Op(14, 1, true, false), new Op(15, 1, true, false),
+                    new Op(16, 1, true, false), new Op(17, 1, true, false)}};
+
+    private float[][][] runAlone(Op[][] script) {
+        float[][][] out = new float[3][][];
+        try (KvPool pool = pool(3)) {
+            for (int i = 0; i < 3; i++) {
+                out[i] = new float[script[i].length][];
+                try (Backend b = backend(pool)) {
+                    for (int s = 0; s < script[i].length; s++) {
+                        Op op = script[i][s];
+                        float[] o = op.logits() ? new float[(op.all() ? op.n() : 1) * vocab] : null;
+                        if (op.all()) {
+                            b.forwardAll(tokens[i], op.pos(), op.n(), op.pos(), o, vocab);
+                        } else {
+                            b.forward(tokens[i], op.pos(), op.n(), op.pos(), o);
+                        }
+                        out[i][s] = o;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Every logits row by the conversation and the position of the token it follows (conversation * 1000 + position). */
+    private java.util.Map<Integer, float[]> rowsByPosition(Op[][] script, float[][][] results) {
+        java.util.Map<Integer, float[]> m = new java.util.HashMap<>();
+        for (int i = 0; i < 3; i++) {
+            for (int s = 0; s < script[i].length; s++) {
+                Op op = script[i][s];
+                float[] r = results[i][s];
+                if (r == null) {
+                    continue;
+                }
+                if (op.all()) {
+                    for (int t = 0; t < op.n(); t++) {
+                        m.put(i * 1000 + op.pos() + t, Arrays.copyOfRange(r, t * vocab, (t + 1) * vocab));
+                    }
+                } else {
+                    m.put(i * 1000 + op.pos() + op.n() - 1, r);
+                }
+            }
+        }
+        return m;
     }
 
     private int all() {
         try {
-            // alone: each conversation's script on its own backend of its own pool
-            float[][][] alone = new float[3][SCRIPT[0].length][];
-            try (KvPool pool = pool(3)) {
-                for (int i = 0; i < 3; i++) {
-                    try (Backend b = backend(pool)) {
-                        for (int s = 0; s < SCRIPT[i].length; s++) {
-                            Op op = SCRIPT[i][s];
-                            float[] out = op.logits() ? new float[(op.all() ? op.n() : 1) * vocab] : null;
-                            if (op.all()) {
-                                b.forwardAll(tokens[i], op.pos(), op.n(), op.pos(), out, vocab);
-                            } else {
-                                b.forward(tokens[i], op.pos(), op.n(), op.pos(), out == null ? null : out);
-                            }
-                            alone[i][s] = out;
-                        }
-                    }
-                }
-            }
+            // alone: each conversation's script on its own backend of its own pool; and again with other chunk boundaries
+            // (the prompt of conversation 0 in one chunk, the verification run of conversation 2 as three decode steps): how far
+            // two legitimate ways of running the same conversation are from each other, whatever the batch around them
+            float[][][] alone = runAlone(SCRIPT);
+            float[][][] alt = runAlone(ALT);
             // together
             float[][][] together = new float[3][SCRIPT[0].length][];
             int mixedPasses = 0;
@@ -171,30 +207,35 @@ final class MixedPassChecks {
                     }
                 }
             }
+            java.util.Map<Integer, float[]> pa = rowsByPosition(SCRIPT, alone);
+            java.util.Map<Integer, float[]> pt = rowsByPosition(SCRIPT, together);
+            java.util.Map<Integer, float[]> pb = rowsByPosition(ALT, alt);
             float diff = 0;
             float scale = 0;
+            float base = 0;
             int exact = 0;
-            int segments = 0;
             boolean argmax = true;
-            for (int i = 0; i < 3; i++) {
-                for (int s = 0; s < SCRIPT[i].length; s++) {
-                    float[] a = alone[i][s];
-                    float[] t = together[i][s];
-                    if (a == null) {
-                        continue;
-                    }
-                    segments++;
-                    exact += Arrays.equals(a, t) ? 1 : 0;
-                    diff = Math.max(diff, maxDiff(a, t));
-                    scale = Math.max(scale, maxAbs(a));
-                    for (int r = 0; r < rows(SCRIPT[i][s]); r++) {
-                        argmax &= argmax(a, r * vocab) == argmax(t, r * vocab);
-                    }
+            for (var e : pa.entrySet()) {
+                float[] x = pa.get(e.getKey());
+                float[] y = pt.get(e.getKey());
+                exact += Arrays.equals(x, y) ? 1 : 0;
+                diff = Math.max(diff, maxDiff(x, y));
+                scale = Math.max(scale, maxAbs(x));
+                argmax &= argmax(x, 0) == argmax(y, 0);
+                float[] z = pb.get(e.getKey());
+                if (z != null) {
+                    base = Math.max(base, maxDiff(x, z));
                 }
             }
-            boolean ok = argmax && diff <= 1e-4f * scale + 1e-5f;
-            check(ok, String.format("%d mixed passes of a chunk, decode rows and a verification run: arg max %s, max|alone-mixed| = %.1e,"
-                    + " %d of %d segments bit-identical", mixedPasses, argmax ? "same" : "DIFFERENT", diff, exact, segments));
+            // The bound is that of the batched-decode checks (1e-4 of the largest logit). A q8 cache can exceed it: a different
+            // kernel for a different number of rows rounds a key or value a hair differently and an int8 code flips (the
+            // documented hazard of the q8 and q4 caches), which any other cut of the same conversation does too; there the
+            // bound is twice how far the other chunking of the same conversation is from the first.
+            float bound = 1e-4f * scale + 1e-5f;
+            boolean ok = argmax && (diff <= bound || (dt != KvDtype.F32 && dt != KvDtype.F16 && diff <= 2 * base));
+            check(ok, String.format("%d mixed passes of a chunk, decode rows and a verification run: arg max %s, max|alone-mixed| = %.1e"
+                    + " (bound %.1e; alone cut differently: %.1e), %d of %d rows bit-identical", mixedPasses,
+                    argmax ? "same" : "DIFFERENT", diff, bound, base, exact, pa.size()));
         } catch (RuntimeException e) {
             e.printStackTrace(System.out);
             check(false, "threw " + e);

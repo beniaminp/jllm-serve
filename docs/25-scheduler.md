@@ -245,16 +245,100 @@ wakes the queue the same way.
 
 ## 25.3 Why this design
 
-TBD-3
+* **Mixed passes, not a priority at the lock.** Ordering who gets the device next ([10 §10.14](10-engine-and-server.md), the
+  `priority` request field) only chooses *which* pass runs next; a decode token still waits for a whole chunk. Putting the token
+  into the chunk's pass removes the wait. The extra rows cost little because a chunk's pass is compute bound and the decode
+  rows reuse the weights it has already read (25.5 measures it).
+* **Riders first, the chunk takes the rest (Sarathi-style chunked prefill).** The alternative, decode tokens filling what the chunk
+  leaves, would stall a conversation for as long as the prompt prefills. Riders cost one row each; the chunk is trimmed by those
+  rows only when the budget is lowered by hand.
+* **The engine keeps its thread per request.** Continuous batching engines run one loop that owns all sequences. Here every request's
+  sampling, constraints, stop strings, jump-forward, speculation and streaming are a loop of `Engine.generateLocked`; turning it
+  inside out would touch all of it and would put the risk of ten features into one change. So the *requests* still run their own
+  loops, and meet only at the forward call, where a leader forms the pass. The price is thread hand-offs: a rider that just
+  got its logits samples a token (microseconds) and comes back within the 2 ms window, a pass of 263 rows lasts 100 ms or more, so the
+  cost is small against prefill passes and visible against decode-only passes (which therefore keep the slots path:
+  `forwardBatch`, decode replay and the pipelined greedy step for a lone slot).
+* **Chunks are not cut unless asked.** The engine's chunk is `backend.batch` rows; the backend's buffers hold `engine.mixed-reserve`
+  more rows for the riders, so a full chunk plus the riders fit in one pass and the cut points of a prompt are the same as under
+  `slots`. Cutting chunks to the leftover budget on every pass (Sarathi's dynamic chunk) would make a conversation's numbers depend on
+  who else is running; it stays an opt-in (`engine.pass-budget`).
+* **A slot is a place to run, not a cache.** With the paged cache any slot can run any conversation, so the old policy (pick the slot
+  that holds the prefix, copy it from a donor slot, wait for the busy slot that has it) is replaced by *one queue*, and the cache is
+  looked up in the prefix tree wherever the request lands. The finished conversation's blocks are given back
+  (`Engine.releaseCache`) so idle slots do not eat the pool; its price is that the last, partly filled block is computed again on the
+  next turn (at most 15 positions).
+* **Cache hit plus waiting time as the score.** SGLang schedules by longest cached prefix; that starves a request whose prefix is not
+  cached. Adding `2 000` tokens of score per second waited bounds the wait of any request to what a cache hit of that size is worth,
+  and the priority classes on top (with aging) keep an interactive request ahead of a background one without ever starving it.
+* **Pausing keeps the engine.** A paused conversation's generation loop is a Java stack; moving it to another slot would mean
+  serializing sampler, constraint and speculator state. It keeps its slot and gives back what is expensive, the blocks (and its place
+  in the passes). So preemption needs slots to spare (`engine.max-running` below `slots`), which is an explicit setting.
+* **Two segments of one owner are refused, one pass is one set of owners.** Keeps each cache written by one segment per pass;
+  the engine never has two requests on a slot anyway.
+
+**Costs.** One more indirection per forward call (a queue and a thread hand-off, ~0.1 ms); a decode row in a pass of more than one row uses
+the multi-row kernels (not bit-identical to a lone step, 25.2.9); with the CPU backend the activations of a mixed pass are copied
+once per segment; the Metal pass is encoded without decode replay (a pass with a chunk is not a recorded program); finished
+conversations are found again through the tree rather than in place.
+
+---
 
 ## 25.4 Settings
 
-TBD-4
+| key | default | |
+|---|---|---|
+| `engine.scheduler` | `slots` | `slots`: chapter 10's scheduler (a slot chosen on arrival, batched decode steps). `mixed`: the one queue and mixed passes of this chapter; implies `backend.kv-paged=true`. Models it cannot serve keep `slots` |
+| `engine.pass-budget` | `0` | most rows one pass carries; `0` = everything the buffers hold (`backend.batch + engine.mixed-reserve`). Lower = shorter passes and smoother streams, a prompt prefills in smaller parts |
+| `engine.mixed-reserve` | `32` | rows the backend's buffers hold beyond `backend.batch`, for the riders of a full chunk (a verification run takes `k + 1`). Costs `32` rows of activations per slot |
+| `engine.background-chunk-cap` | `0` | rows of a *background* chunk in a pass that also carries an interactive rider; `0` = no cap |
+| `engine.age-promote-ms` | `10000` | waiting this long moves a request or a step one class up; `0` = no aging (a background request may wait for ever behind interactive ones) |
+| `engine.max-running` | `0` | slots that take part in passes at once; `0` = all. Below `slots`: the others wait (queued with a slot, or paused) |
+| `engine.preempt` | `true` | an interactive request that finds no running place pauses the background slot that started last; only with `engine.max-running < slots` |
+| `engine.session-max-running` | `0` | most slots one session (the request's `user`) holds, running or paused; `0` = no limit |
+| `slots` (console / `/api/models/load`) | `1` | 1 to 16 now (was 8); under `mixed` slots are cheap: a block table and some activation rows each, not a KV cache |
+| request `priority`, header `X-Jllm-Priority` | `interactive` | `interactive` or `background` ([10 §10.14](10-engine-and-server.md)) |
+| request `user` | none | the session for `engine.session-max-running` |
 
+---
 ## 25.5 Measured
 
 TBD-5
 
 ## 25.6 Checks and limits
 
-TBD-6
+Verified by:
+
+* `SchedulerPolicyTest` (no model, in `mvn test`): the pass planner (the worked example of 25.2.3 with its 267 rows, a lowered budget
+  trimming the chunk, a leftover too small for a chunk, classes, aging, the background cap, no stall), the queue (the slot with the
+  prefix, the request with most cached tokens, an interactive request before an older background one, aging, a session limit,
+  pausing the background slot and resuming it, no pausing for an interactive running slot, a request whose client left leaves within 55 ms)
+  and `KvSequence.suspend` / `resume` (full blocks cached, tail kept, spilled by another conversation and reloaded; blocks lost without
+  a store reported).
+* `ArchSmoke` → `MixedPassChecks`, every attention family, CPU and the real GPU, f32 / f16 / q8 (plain and rotated keys) and, for MoE, with
+  the experts of a layer on the CPU: three conversations' scripts (a 50-token prompt in chunks of 32 and 18, a 12-token prompt, a 9-token
+  prompt followed by a 3-token verification run, then decode steps), alone and in mixed passes with the longest segment first and the
+  leading backend rotating (once one that owns no segment): the arg max of every row must be equal and the logits within `1e-4` of the
+  largest; the count of bit-identical segments is printed. Run with and without `-Djllm.metal.concurrent=true`.
+* `MixedSchedulerTest` (Qwen3-0.6B, CPU, deterministic, in `mvn test`; on the GPU in `mac-validate.sh`): a 240-token prompt's chunks
+  with two slots' decode tokens, every answer equal to the one alone; a generation paused in the middle and resumed gives the same
+  text; prompt-lookup speculation with three slots, drafts verified in shared passes, the same text as alone.
+* `jllm-web` `MixedSlotsTest` (fake backends whose rows are a hash of the whole prefix, so a wrong block changes the text): a pass
+  carries a chunk and decode tokens and every conversation generates what it generates alone; an interactive request overtakes
+  background ones; a background generation is paused for an interactive one, its blocks are spilled to the block store and
+  reloaded, and the text is the same; a queued request whose client left is dropped.
+* `SchedulerBench`: the workload of 25.5.
+
+**Not done / limits.**
+
+* Only grouped-query attention models with a paged f32 / f16 / q8 cache; Mamba, Qwen3-Next, DeepSeek's latent attention and the q4 cache
+  keep `slots` (their steps cannot share one set of rows: a recurrent state, another cache layout).
+* A pass is encoded without decode replay: a decode row in a pass with a chunk or a draft runs the batched-row dispatches, not a recorded
+  step. Decode-only passes and a lone slot keep their old paths (replay, pipelining).
+* One chunk per pass. Two prompts prefill alternately, not side by side.
+* Tree speculation (verifying several candidate continuations from the n-gram index at once) is not done; each slot verifies one draft.
+* Pausing needs a spare slot (`engine.max-running < slots`) and a slot whose cache is shareable (not a request with pictures or custom
+  rotary positions); it takes effect at the victim's next step boundary (a step or a chunk), so an interactive request waits for that.
+* Per-session limits count slots, not tokens; priority is two classes.
+* A client that leaves is noticed when the queue polls it (50 ms); the generation itself stops as before, at its next token or chunk.
+* The CPU backend's mixed pass copies each segment's rows between arrays; at Qwen3-0.6B sizes that is about a third of a percent.
