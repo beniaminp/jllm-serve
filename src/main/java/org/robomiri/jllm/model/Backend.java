@@ -75,6 +75,25 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
+     * Whether {@link #forwardEmbedsBidirectional} works: attention inside a picture that runs both ways (Gemma 3).
+     */
+    default boolean supportsBidirectionalSpan() {
+        return false;
+    }
+
+    /**
+     * {@link #forwardEmbeds(float[], int, int, int, float[])} for a picture whose {@code n} tokens attend to each other
+     * in both directions (Gemma 3: the 256 tokens of a picture see each other and everything before them; the text
+     * after them sees all of them as usual): the keys and values of all {@code n} rows are stored first, and every row
+     * attends to the keys {@code [0, pos + n)} (its sliding window, if the layer has one, counted back from the last
+     * row). The rows must be one pass: {@code n} is at most {@link #maxBatch}. Only when
+     * {@link #supportsBidirectionalSpan}.
+     */
+    default void forwardEmbedsBidirectional(float[] embeds, int off, int n, int pos, float[] logits) {
+        throw new UnsupportedOperationException(name() + " cannot attend both ways inside a picture");
+    }
+
+    /**
      * Replaces the rotary positions of cache slots {@code [from, contextLength)} with {@code p} (Qwen-VL's M-RoPE; see
      * {@link RopePositions}), or with the plain {@code slot} when {@code p} is null. Keys already in the cache keep
      * the rotation they were stored with. Returns false, changing nothing, when the backend cannot.

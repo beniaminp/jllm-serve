@@ -240,6 +240,9 @@ public final class ModelLoader {
                 s.getInt("vision.cache-mb"), s.opt("backend.metal.lib"));
     }
 
+    /** Gemma 3: the tokens of one picture (docs/20.12); {@code backend.batch} at its default is raised to this. */
+    static final int GEMMA3_PICTURE_BATCH = 256;
+
     /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
     static final int MOE_BATCH = 256;
 
@@ -253,6 +256,9 @@ public final class ModelLoader {
         int batch = s.getInt("backend.batch");
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe();
+        if (arch.core().modelType().startsWith("gemma3") && "default".equals(s.source("backend.batch"))) {
+            return Math.max(batch, GEMMA3_PICTURE_BATCH); // a picture's 256 tokens attend to each other and go through in one pass
+        }
         return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
     }
 

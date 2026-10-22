@@ -83,6 +83,7 @@ public final class VisionTest {
             tinyModel(dir);
             qwen3Vl(dir);
             qwen35Vl(dir);
+            bidirectional(dir);
         } finally {
             try (var s = Files.list(dir)) {
                 for (Path p : s.toList()) {
@@ -754,6 +755,95 @@ public final class VisionTest {
         }
     }
 
+
+    // ------------------------------------------------------------------ a picture that attends to itself both ways (Gemma 3)
+
+    /**
+     * The 'set' oracle: give the n rows of a picture the same rotary position; with attention that runs both ways inside the
+     * picture, permuting the rows then cannot change what the text after it sees (attention is a weighted sum over a set of
+     * keys), while with causal attention it does.
+     */
+    private static void bidirectional(Path dir) throws Exception {
+        Path text = dir.resolve("tiny-bidir.gguf");
+        writeText(text);
+        boolean metal = Metal.available();
+        try (GgufModel gm = GgufModel.open(text)) {
+            ModelWeights weights = gm.weights();
+            int ctx = 256;
+            int n = 6;
+            Random r = new Random(3);
+            float[] rows = new float[n * DIM];
+            float[] reversed = new float[n * DIM];
+            for (int i = 0; i < rows.length; i++) {
+                rows[i] = (float) (r.nextGaussian() * 0.5);
+            }
+            for (int i = 0; i < n; i++) {
+                System.arraycopy(rows, i * DIM, reversed, (n - 1 - i) * DIM, DIM);
+            }
+            int[] pos = new int[ctx];
+            for (int i = 0; i < ctx; i++) {
+                pos[i] = i < 2 ? i : i < 2 + n ? 2 : i - n + 1; // the picture's rows share a position
+            }
+            RopePositions rp = new RopePositions(pos, pos, pos, new int[]{4, 6, 6}, false, 0);
+            for (String kind : metal ? new String[]{"cpu", "metal"} : new String[]{"cpu"}) {
+                try (Backend b = kind.equals("cpu") ? new CpuBackend(weights, ctx, 16, 2, KvDtype.F32, false)
+                        : new MetalBackend(weights, ctx, 16, (String) null)) {
+                    check(b.supportsBidirectionalSpan(), kind + ": the backend attends both ways inside a picture");
+                    float[] ca = after(b, rp, rows, n, true);
+                    float[] cb = after(b, rp, reversed, n, true);
+                    float[] ua = after(b, rp, rows, n, false);
+                    float[] ub = after(b, rp, reversed, n, false);
+                    check(maxDiff(ca, cb) < 1e-4f, kind + ": both ways, the order of a picture's rows does not matter (max diff " + maxDiff(ca, cb) + ")");
+                    check(maxDiff(ua, ub) > 1e-3f, kind + ": causal, it does (max diff " + maxDiff(ua, ub) + ")");
+                    check(maxDiff(ca, ua) > 1e-3f, kind + ": both ways is not causal attention (max diff " + maxDiff(ca, ua) + ")");
+                    if (kind.equals("cpu")) {
+                        cpuBidir = ca;
+                    } else {
+                        check(maxDiff(ca, cpuBidir) < 5e-3f, "Metal agrees with the CPU on a picture that attends both ways (max diff " + maxDiff(ca, cpuBidir) + ")");
+                    }
+                }
+            }
+            weights.close();
+        }
+    }
+
+    private static float[] cpuBidir;
+
+    /** The prompt through a backend by hand: the text before the picture, the picture (both ways or causal), the text after. */
+    private static float[] stage(Backend b, MediaPrompt m, MediaPrompt.Span sp, RopePositions rp, boolean bidir) {
+        b.setRopePositions(0, rp);
+        for (int at = 0; at < sp.start(); at += b.maxBatch()) {
+            b.forward(m.tokens(), at, Math.min(b.maxBatch(), sp.start() - at), at, null);
+        }
+        if (bidir) {
+            b.forwardEmbedsBidirectional(sp.embeds(), 0, sp.length(), sp.start(), null);
+        } else {
+            b.forwardEmbeds(sp.embeds(), 0, sp.length(), sp.start(), null);
+        }
+        float[] out = new float[VOCAB];
+        for (int at = sp.end(); at < m.length(); at += b.maxBatch()) {
+            int cnt = Math.min(b.maxBatch(), m.length() - at);
+            b.forward(m.tokens(), at, cnt, at, at + cnt == m.length() ? out : null);
+        }
+        b.setRopePositions(0, null);
+        return out;
+    }
+
+    /** The logits of a text token after [two ids, the picture rows at one shared position]. */
+    private static float[] after(Backend b, RopePositions rp, float[] rows, int n, boolean bidir) {
+        b.setRopePositions(0, rp);
+        b.forward(new int[]{3, 4}, 0, 2, 0, null);
+        if (bidir) {
+            b.forwardEmbedsBidirectional(rows, 0, n, 2, null);
+        } else {
+            b.forwardEmbeds(rows, 0, n, 2, null);
+        }
+        float[] out = new float[VOCAB];
+        b.forward(new int[]{9}, 0, 1, 2 + n, out);
+        b.setRopePositions(0, null);
+        return out;
+    }
+
     private static void tinyModel(Path dir) throws Exception {
         Path text = dir.resolve("tiny-vl.gguf");
         Path proj = dir.resolve("mmproj-tiny-vl.gguf");
@@ -905,6 +995,29 @@ public final class VisionTest {
                 be.forward(seq, 0, n, 0, restored);
                 check(Arrays.equals(base, restored) && !be.ropePositionsCustom(), "plain positions restored: the plain logits again");
 
+                // --- a picture that attends to itself both ways (Gemma 3's flag), through the engine
+                // (a fresh engine: the cache is keyed by the picture, and rows computed causally must not stand in for these)
+                MediaPrompt nc = new MediaPrompt(mp.tokens(), mp.spans(), mp.rope(), true);
+                double lc;
+                Engine.Result rnc;
+                try (Engine e2 = new Engine(new CpuBackend(weights, 256, 16, 2, KvDtype.F32, false), tok, arch, Set.of(257))) {
+                    e2.setVision(vc, false);
+                    lc = e2.generate(nc, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                    check(Math.abs(lc - la) > 1e-7, "a non-causal picture changes the next-token distribution: " + lc + " vs " + la);
+                    rnc = e2.generate(nc, greedy, null, () -> false);
+                    check(Arrays.equals(rnc.tokens(), e2.generate(nc, greedy, null, () -> false).tokens()),
+                            "a non-causal picture gives a deterministic answer");
+                }
+                try (Engine small = new Engine(new CpuBackend(weights, 256, span.length() - 1, 2, KvDtype.F32, false), tok, arch, Set.of(257))) {
+                    small.setVision(vc, false);
+                    try {
+                        small.generate(nc, greedy, null, () -> false);
+                        check(false, "a picture longer than the batch is refused when it must attend to itself");
+                    } catch (IllegalArgumentException e) {
+                        check(e.getMessage().contains("backend.batch"), "a picture longer than the batch is refused, naming backend.batch: " + e.getMessage());
+                    }
+                }
+
                 // --- the same on Metal
                 if (metal) {
                     try (Engine me = new Engine(new MetalBackend(weights, 256, 16, (String) null), tok, arch, Set.of(257))) {
@@ -916,6 +1029,21 @@ public final class VisionTest {
                                 "Metal: the picture is cached by its hash too");
                         Engine.Result gt = me.generate(me.renderChat(plain, false), greedy, null, () -> false);
                         check(Arrays.equals(gt.tokens(), t1.tokens()), "Metal: text after a picture request is as on a fresh engine");
+                        try (Engine m2 = new Engine(new MetalBackend(weights, 256, 16, (String) null), tok, arch, Set.of(257))) {
+                            m2.setVision(vc, false);
+                            double lm = m2.generate(nc, one, lp, 1, null, () -> false).getFirst().logprobs().getFirst().logprob();
+                            check(Math.abs(lm - lc) < 5e-3, "Metal: the first token's log-probability after a non-causal picture agrees with the CPU: " + lm + " vs " + lc);
+                            int[] mt = m2.generate(nc, greedy, null, () -> false).tokens();
+                            check(Arrays.equals(mt, rnc.tokens()),
+                                    "Metal: a non-causal picture gives the CPU's answer " + Arrays.toString(mt) + " vs " + Arrays.toString(rnc.tokens()));
+                        }
+                        for (boolean bi : new boolean[]{false, true}) { // the same by hand, with and without the picture's own rotary positions
+                            for (boolean custom : new boolean[]{false, true}) {
+                                float[] c1 = stage(be, mp, span, custom ? mp.rope() : null, bi);
+                                float[] m1 = stage(me.backend(), mp, span, custom ? mp.rope() : null, bi);
+                                check(maxDiff(c1, m1) < 5e-3f, "by hand, both ways=" + bi + ", picture positions=" + custom + ": CPU vs Metal " + maxDiff(c1, m1));
+                            }
+                        }
                         float[] mw = new float[VOCAB];
                         me.backend().forward(ids, 0, 4, 0, mw);
                         float[] mg = new float[VOCAB];

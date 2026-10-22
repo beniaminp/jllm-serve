@@ -868,6 +868,24 @@ public final class MetalBackend implements Backend {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
                 }
             }
+            if (bidirectional && n > 1) {
+                // every row attends to all rows of the picture: with all n keys stored, each is a "last row" at pos + n - 1
+                // (the single-row attention of the batched step, one dispatch per row)
+                int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
+                for (int t = 0; t < n; t++) {
+                    long qOff = (long) t * g.qDim() * 4;
+                    if (t % sliceRows == 0) { // rows write disjoint slices of the scores scratch, so they may overlap
+                        k.endIndependent();
+                        k.beginIndependent();
+                    }
+                    k.rowScores((long) (t % sliceRows) * g.heads() * ctx * 4);
+                    k.attentionRow(attnKernel, attnGroup, q, qOff, keyCache[layer], valCache[layer], att, qOff, scores, g.heads(),
+                            g.kvHeads(), hd, hd, pos + n - 1, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                }
+                k.endIndependent();
+                k.rowScores(0);
+                return;
+            }
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
                         hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
@@ -1308,6 +1326,24 @@ public final class MetalBackend implements Backend {
             run(null, embeds, off, n, pos, logits, 0);
         } finally {
             this.deepstack = null;
+        }
+    }
+
+    /** The current pass is a picture whose rows attend to each other both ways (Gemma 3). */
+    private boolean bidirectional;
+
+    @Override
+    public boolean supportsBidirectionalSpan() {
+        return kvDtype != KvDtype.Q4; // (the q4 cache has its own attention path)
+    }
+
+    @Override
+    public void forwardEmbedsBidirectional(float[] embeds, int off, int n, int pos, float[] logits) {
+        bidirectional = true;
+        try {
+            forwardEmbeds(embeds, off, n, pos, null, logits);
+        } finally {
+            bidirectional = false;
         }
     }
 
