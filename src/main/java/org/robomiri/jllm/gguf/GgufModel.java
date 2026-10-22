@@ -94,7 +94,8 @@ public final class GgufModel implements AutoCloseable {
                 (int) file.num("tokenizer.ggml.unknown_token_id", -1),
                 file.get("tokenizer.ggml.add_bos_token") instanceof Boolean b ? b : null,
                 file.bool("tokenizer.ggml.add_space_prefix", true), bytes(file.longs("tokenizer.ggml.precompiled_charsmap")),
-                file.bool("tokenizer.ggml.remove_extra_whitespaces", false));
+                file.bool("tokenizer.ggml.remove_extra_whitespaces", false), file.str("general.name", null),
+                file.get("tokenizer.ggml.add_eos_token") instanceof Boolean e ? e : null);
         try {
             return GgufTokenizer.build(spec);
         } catch (GgufTokenizer.UnsupportedPreTokenizer e) {

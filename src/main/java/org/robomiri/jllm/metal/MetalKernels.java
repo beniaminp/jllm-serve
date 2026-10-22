@@ -1206,7 +1206,7 @@ final class MetalKernels implements AutoCloseable {
         int len = pos + 1;
         int first = window > 0 ? Math.max(0, len - window) : 0;
         int keys = len - first;
-        int nSplit = Math.min(FLASH_SPLITS, (keys + FLASH_CHUNK - 1) / FLASH_CHUNK);
+        int nSplit = flashSplits(pos, window); // the instance's chunk, as flashAttention uses
         int chunk = (keys + nSplit - 1) / nSplit;
         bind(0, q, qOff);
         bind(1, kc, 0);

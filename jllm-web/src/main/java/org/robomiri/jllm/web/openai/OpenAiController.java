@@ -58,11 +58,18 @@ public class OpenAiController {
         this.props = props;
     }
 
+    // loaded speech-to-text / text-to-speech models are listed too (kind: "speech-to-text" / "text-to-speech")
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
+
     @GetMapping(value = "/v1/models", produces = "application/json")
     public String listModels() {
         List<Object> data = new ArrayList<>();
         for (LoadedModel m : models.loaded()) {
             data.add(modelObject(m));
+        }
+        if (audio != null) {
+            data.addAll(org.robomiri.jllm.audio.AudioApi.modelObjects(audio.models()));
         }
         return Json.write(Json.obj("object", "list", "data", data));
     }
@@ -159,7 +166,11 @@ public class OpenAiController {
             }
             params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length, o.echo());
             // tool calls are constrained to the offered functions and their schemas (docs/17 §17.7)
-            decoding = chat ? ToolCallFormat.decoding(o.decoding(tok), body, engine, prompt, o.format(),
+            boolean constrainTools = chat && s.getBool("engine.constrained-tools");
+            if (chat && !constrainTools) {
+                ChatSupport.checkFormatWithoutToolConstraint(body); // the old behaviour: tools and response_format exclude each other
+            }
+            decoding = constrainTools ? ToolCallFormat.decoding(o.decoding(tok), body, engine, prompt, o.format(),
                     ChatSupport.thinking(body, s.getBool("chat.thinking")) && !o.json()) : o.decoding(tok);
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));

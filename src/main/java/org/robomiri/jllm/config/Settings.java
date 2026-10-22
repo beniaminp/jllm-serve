@@ -58,7 +58,8 @@ public final class Settings {
             Map.entry("port", "server.port"));
 
     /** Flags that are not properties: per-invocation inputs. */
-    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config");
+    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config", "audio", "out", "voice",
+            "language", "translate", "words", "format", "speed"); // the last seven: `transcribe` and `speak`
 
     private final Properties props = new Properties();
     private final Map<String, String> sources = new LinkedHashMap<>();
@@ -105,6 +106,15 @@ public final class Settings {
                 s.put(k, v, "command line");
             }
         });
+        return s;
+    }
+
+    /** A copy with some values replaced (a model loaded with its own context length, say); the keys must exist. */
+    public Settings with(Map<String, String> overrides) {
+        Settings s = new Settings();
+        s.props.putAll(props);
+        s.sources.putAll(sources);
+        overrides.forEach((k, v) -> s.put(k, v, "override"));
         return s;
     }
 
@@ -205,7 +215,7 @@ public final class Settings {
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "chat.thinking", "raw",
-                "engine.batch-decode"}) {
+                "engine.batch-decode", "engine.constrained-tools", "engine.jump-forward", "engine.constraint-masks"}) {
             if (has(k)) {
                 getBool(k);
             }
@@ -239,6 +249,7 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        org.robomiri.jllm.audio.AudioSettings.of(this); // audio.*: the messages name their keys
         return this;
     }
 

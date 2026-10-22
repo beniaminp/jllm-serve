@@ -453,7 +453,10 @@ little is forced; tool calls use a fixed layout and gain much more.
 name must be one of the tools and the arguments must match its `parameters` schema, compiled *leniently* (keywords
 the automaton cannot enforce, such as `pattern` or `minimum`, are ignored rather than refused, since the client did
 not write the schema for us). `tool_choice: "required"` or a named function forces the call; `response_format`
-together with `tools` is allowed and means "tool calls or that JSON answer". See
+together with `tools` is allowed and means "tool calls or that JSON answer". Three settings keep the old paths:
+`engine.constrained-tools=false` (tool calls are free text parsed afterwards; `response_format` and `tools` exclude
+each other again), `engine.jump-forward=false` (every token sampled) and `engine.constraint-masks=false` (candidates
+tested one by one, no trie masks). See
 [17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward).
 
 **`echo` (completions): the prompt in front.** `"echo": true` returns the prompt followed by the completion in
@@ -652,7 +655,7 @@ drafting for itself, once as loaded from the settings and once with a draft that
 and (plain Llama) from another random model. Greedy output equals the output without speculation in all of them.
 
 **The model's own draft head (`mtp`).** A Qwen3.5 GGUF carries a multi-token-prediction layer (`nextn`) that guesses the
-token after the one just sampled from the main model's last hidden state ([16.13](16-gguf.md#1613-multi-token-prediction-the-model-as-its-own-draft-model)).
+token after the one just sampled from the main model's last hidden state ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)).
 `engine.speculative=mtp` uses it as the proposer: one draft per step, verified in a two-position `forwardAll`.
 
 🧸 The big model reads the conversation on a whiteboard that every word scribbles on. To check a guess it must read
@@ -717,8 +720,9 @@ the CPU ([08 §8.24](08-metal-backend.md#824-batched-decoding-across-slots-metal
 the leader's command queue and activation buffers, and each row's RoPE, cache store and attention are dispatched
 against its own slot's cache buffers. Below 8 slots those kernels compute each row exactly as the slot's own step, so on
 Metal the batched logits were bit-identical to the alone ones in every family tested on the emulator (with experts on the
-CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba falls back
-to running the queued steps one after another.
+CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba and Qwen3-Next (recurrent
+states) fall back to running the queued steps one after another; they have no draft-model or prompt-lookup speculation
+either (a recurrent state cannot be rolled back).
 
 ## 10.10 Configuration
 

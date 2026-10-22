@@ -95,6 +95,11 @@ public class ModelManager implements DisposableBean {
         this.kvStore = kvStore;
     }
 
+    // --- audio (speech-to-text / text-to-speech models are held by AudioService; a downloaded Whisper or OuteTTS
+    // checkpoint is recognised after the download and loaded there instead of as a text model)
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
+
     @EventListener(ApplicationReadyEvent.class)
     public void autoload() {
         for (String spec : props.autoload()) {
@@ -144,6 +149,11 @@ public class ModelManager implements DisposableBean {
 
     /** Unloads a model: running requests on it are cancelled first. */
     public void unload(String id) throws InterruptedException {
+        if (audio != null && audio.has(id)) {
+            audio.unload(id);
+            System.err.println("Unloaded " + id);
+            return;
+        }
         LoadedModel m;
         synchronized (this) {
             m = loaded.get(id);
@@ -243,6 +253,13 @@ public class ModelManager implements DisposableBean {
             }
             checkInterrupted();
             job.phase = "loading";
+            if (audio != null && !t.local() && audio.isAudio(repoDir(s, t.model()))) { // audio model: AudioService holds it
+                System.err.println("Loading " + t.id() + " (" + t.model() + ") as an audio model");
+                org.robomiri.jllm.audio.AudioModels.Entry a = audio.load(s, t.id(), t.model(), repoDir(s, t.model()));
+                writeMarker(s, t);
+                System.err.println("Loaded " + t.id() + ": " + a.kind().label() + ", " + a.backend());
+                return;
+            }
             System.err.println("Loading " + t.id() + " (" + t.model() + ")");
             ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model(), slots); // budgets for every slot's cache
             if (Thread.currentThread().isInterrupted()) {
@@ -382,25 +399,57 @@ public class ModelManager implements DisposableBean {
     /**
      * A request that names no {@code model.dir} reads the model from the models folder that already holds it
      * ({@code model.dir} first, then {@code jllm.web.model-dirs}), so a model on disk is never downloaded again
-     * because it sits in another folder than the default one. Only when no folder has it does the download go to
-     * {@code model.dir}.
+     * because it sits in another folder than the default one. A folder where the model is usable (the quantized
+     * cache, every weight file, or the GGUF file) wins over one with only its metadata (what an interrupted
+     * download leaves); only when no folder has it does the download go to {@code model.dir}.
      */
     private void locate(Target t, Map<String, String> extra) {
         if (t.local() || extra.containsKey("model.dir")) {
             return;
         }
+        Settings s = settings.with(extra);
         String name = t.model().replace('/', '_');
+        Path partial = null;
         for (Path root : modelRoots()) {
             Path dir = root.resolve(name);
             try {
-                if (Files.isRegularFile(dir.resolve("config.json")) || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
+                boolean st = Files.isRegularFile(dir.resolve("config.json"));
+                List<String> gguf = HuggingFaceHub.localGgufNames(dir);
+                if (!st && gguf.isEmpty()) {
+                    continue;
+                }
+                boolean usable = t.file() != null ? Files.isRegularFile(dir.resolve(t.file()))
+                        : !gguf.isEmpty() && (t.quant() != null || !st)
+                        || st && (QuantFile.exists(dir, QType.parse(s.get("model.quant")), QType.parseHead(s.get("model.head-quant")))
+                                  || allWeights(dir));
+                if (usable) {
                     extra.put("model.dir", root.toString());
                     return;
+                }
+                if (partial == null) {
+                    partial = root;
                 }
             } catch (IOException | RuntimeException e) {
                 // unreadable: look further
             }
         }
+        if (partial != null) {
+            extra.put("model.dir", partial.toString()); // finish the download where it started
+        }
+    }
+
+    /** Every weight file the checkpoint's index (or the single-file name) lists is on disk. */
+    private static boolean allWeights(Path dir) throws IOException {
+        List<String> names = HuggingFaceHub.weightFileNames(dir);
+        if (names.isEmpty()) {
+            return false;
+        }
+        for (String n : names) {
+            if (!Files.isRegularFile(dir.resolve(n))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A safetensors checkpoint whose quantized cache for the requested format is already converted. */
@@ -524,6 +573,11 @@ public class ModelManager implements DisposableBean {
         Map<String, List<String>> users = new LinkedHashMap<>();
         for (LoadedModel m : loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+        }
+        if (audio != null) {
+            for (var a : audio.loaded()) {
+                users.computeIfAbsent(a.source(), k -> new ArrayList<>()).add(a.id());
+            }
         }
         List<LocalModel> out = new ArrayList<>();
         for (Path root : modelRoots()) {

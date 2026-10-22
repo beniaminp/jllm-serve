@@ -34,7 +34,8 @@ public class ToolRegistry {
     public ToolRegistry(ToolsConfig config, McpManager mcp) {
         this.config = config;
         this.mcp = mcp;
-        this.builtins = BuiltinTools.all(config::general);
+        this.builtins = new ArrayList<>(BuiltinTools.all(config::general));
+        this.builtins.addAll(AudioTools.all()); // transcribe_audio, speak
     }
 
     /** All tools, the switched-off built-ins included (marked). */

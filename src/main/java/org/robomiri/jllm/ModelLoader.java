@@ -166,6 +166,7 @@ public final class ModelLoader {
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
+            constraints(s, engine);
             long promptCacheMb = s.getLong("engine.prompt-cache-mb");
             if (promptCacheMb > 0) {
                 engine.setPromptCache(new org.robomiri.jllm.tokenizer.PromptCache(tok, promptCacheMb << 20));
@@ -230,6 +231,15 @@ public final class ModelLoader {
         return spec;
     }
 
+    /**
+     * The constrained decoding settings (docs/17 §17.7): {@code engine.jump-forward} for this engine and
+     * {@code engine.constraint-masks} for every constraint of the process.
+     */
+    static void constraints(Settings s, Engine engine) {
+        engine.setJumpForward(s.getBool("engine.jump-forward"));
+        org.robomiri.jllm.sampling.JsonConstraint.setFastMasks(s.getBool("engine.constraint-masks"));
+    }
+
     /** The batch group of each loaded model's weights (engine.batch-decode); weak: gone with the weights. */
     private static final java.util.Map<ModelWeights, org.robomiri.jllm.engine.BatchGroup> GROUPS =
             java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
@@ -257,6 +267,7 @@ public final class ModelLoader {
         Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1, true));
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
+        constraints(s, e);
         Speculator.Config spec = speculation(s, l.weights().arch, l.weights());
         if (spec.mode() == Speculator.Mode.NGRAM || spec.mode() == Speculator.Mode.MTP) {
             e.enableSpeculation(spec, null);

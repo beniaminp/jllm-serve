@@ -18,7 +18,7 @@ conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures and the hybrid 
 Qwen3-Next (`qwen3next`) ones, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
 place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)); a Qwen3.5 file's own
 multi-token-prediction layer can draft for speculative decoding (`--engine.speculative mtp`,
-[docs/16 §16.13](docs/16-gguf.md#1613-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
+[docs/16 §16.14](docs/16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
 (`mlx-community/*-4bit`, `-8bit`, and the `mxfp4` / `mxfp8` modes) and block-quantized **FP8** checkpoints are read too:
 dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 
@@ -45,6 +45,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Feature | What it does | Docs |
 |---|---|---|
 | Prompt lookup for agents | an n-gram index over the whole context drafts up to 16 tokens that the model verifies in one pass; 20 → 81 tok/s when rewriting code from the prompt, −4 % on free text | [17 §17.1](docs/17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) |
+| Constrained tool calls | inside `<tool_call>` the model can only write a known tool and arguments that match its schema, so a call always parses; the fixed parts of a call are appended in one pass without sampling (jump-forward), speculation checks its drafts against the constraint, and the token mask is computed with a byte trie and memoized (a 32-token call: 254 → 149 ms on an M1 Pro with jump-forward; the mask 60–170 µs per token where it was 190–510 µs; `engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks`) | [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward) |
 | Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
@@ -60,6 +61,9 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | q8 KV cache | `backend.kv-dtype=q8`: int8 keys and values with one scale per row of a kv head, half of f16 (59 KB vs 115 KB per token for Qwen3-0.6B), on both backends, files interchangeable | [07](docs/07-cpu-backend.md#q8-int8-values-and-a-scale-per-row-kvcacheq8), [08](docs/08-metal-backend.md#q8) |
 | int8 or float, measured | `backend.cpu.int8-activations=auto` times one token's matmuls both ways at load and keeps the faster (int8 on ARM, often float on AVX-512) | [07 §7.10.1](docs/07-cpu-backend.md#7101-auto-measure-dont-guess) |
 | Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
+| Speech-to-text (Whisper) | `openai/whisper-tiny … large-v3-turbo` from the Hub: log-mel exactly as `transformers` computes it, encoder + decoder with cross-attention on the CPU (4x4 register tiles) and on Metal (own `audio.metal` kernels, encoder and decoder on the GPU), the OpenAI decoding protocol (language detection, timestamps, 30 s windows, temperature fallback), word timestamps by DTW over the alignment heads; identical token ids to `transformers`; `POST /v1/audio/transcriptions` and `/translations` | [21](docs/21-audio.md) |
+| Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |
+| Audio tab and editor | record or upload, transcribe (SRT/VTT/JSON, word times), text to speech, a waveform editor (cut, fade, normalize, silence removal, mix, undo; transcribe or replace a selection, edit audio by editing its transcript), dictation and read-aloud in the chat, `transcribe_audio` / `speak` tools | [21](docs/21-audio.md) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
 
 The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
@@ -96,6 +100,19 @@ memory-map that file and are ready in milliseconds. The index records the conver
 repository, revision and commit the cache was made from: a cache from an older converter or another revision is
 reconverted automatically, and an interrupted conversion resumes where it stopped (`jllm-q4_0.partial.json`).
 Only the shards listed in the model's `model.safetensors.index.json` (or `model.safetensors`) are downloaded.
+
+### Audio
+
+```sh
+./jllm transcribe --model openai/whisper-small --audio talk.wav --format srt      # speech to text (Metal when available)
+./jllm speak --model OuteAI/OuteTTS-0.3-500M --prompt "Hello from jllm." --voice en_female_1 --out hello.wav
+./jllm serve --audio.stt-model openai/whisper-small --audio.tts-model OuteAI/OuteTTS-0.3-500M   # + /v1/audio/* endpoints
+curl localhost:8080/v1/audio/transcriptions -F file=@talk.wav -F response_format=verbose_json -F 'timestamp_granularities[]=word'
+curl localhost:8080/v1/audio/speech -H 'Content-Type: application/json' -d '{"input":"Hello.","voice":"en_male_1"}' -o hello.wav
+```
+
+Models load like text models (the console's Models page, `jllm.web.autoload`); WAV, AIFF and AU are read in pure Java, other formats through `ffmpeg` if installed
+(the console's Audio tab converts to WAV in the browser). Details, settings (`audio.*`) and measurements: [docs/21](docs/21-audio.md).
 
 ### Other models
 
@@ -157,7 +174,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
-`GET /health`, `GET /` (chat UI). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+`GET /health`, `GET /` (chat UI), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`, `logit_bias` (token id →
 −100…100, added to the logits). Also supported:
 
@@ -354,6 +371,7 @@ run in the small C library `libjllm_cpu` when it is found and passes its self-ch
 AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
 `scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
 
@@ -431,7 +449,7 @@ sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   
 REAL_PYTHON=<venv>/bin/python scripts/real-weights-check.sh Qwen/Qwen2.5-0.5B-Instruct   # engine vs transformers on real weights (docs/14.13)
 ```
 
-`mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
+`mvn test` also runs `ToolCallTest` (constrained tool calls, jump-forward and speculation under the constraint, on a scripted model and on Qwen3-0.6B) and `ConstraintBench` in its quick mode (the token masks against a brute-force oracle); `scripts/tool-call-check.sh` checks on the CPU and on Metal that the constrained greedy output is the same with speculation off, prompt lookup and draft models ([docs/17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)). `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
 against a fake backend (settings validation, bad requests, keep-alive, slow, stalled and disconnected clients). Two more checks are run by hand:
 
 ```sh
