@@ -581,6 +581,51 @@ int8 activations off; with the default `true`, CPU and Metal greedy outputs can 
 near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 `--backend.cpu.int8-activations false` whenever an exact CPU/Metal comparison is wanted.
 
+### The other GGUF formats (`GgufInt8Kernels`, native AArch64 kernels)
+
+Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4, IQ4_XS and Q3_K (layouts in [06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files)) have
+int8-activation kernels in the same scheme (`cpu/GgufInt8Kernels.java`; F16 / BF16 and Q2_K stay on the float kernels).
+Per 32 weights the exact integer product is scaled by `weight scale · activation scale` as everywhere else:
+
+- **Q4_1 / Q5_1**: `Σ (d q + m) x = d Σ q x + m Σ x`; `Σ x` over the block is the integer sum `blockSums` already computes for the
+  K-quants. **Q5_0**: `(q5 - 16)`. The fifth bit of weight `j` is bit `j` of `qh`: expanded in the byte domain (a constant
+  `rearrange` puts byte `j/8` of `qh` in lane `j`, a compare against `1 << (j % 8)` and a blend give 16 or 0), then the 32 bytes are
+  multiplied like Q8_0 bytes.
+- **IQ4_NL, MXFP4, IQ4_XS** (and the nibble tables in general): `nibble.selectFrom(table)` is one byte shuffle (`tbl`); the looked-up
+  signed bytes then go through the Q8_0 byte path. IQ4_XS multiplies each of its eight 32-weight sub-blocks by `d (ls - 32)`.
+- **Q3_K**: sixteen 6-bit scales, so each 16-weight half of a 32-weight unit has its own integer sum and scale; the weight
+  is `((qs >> 2j) & 3) - 4 + 4 hmask-bit`.
+
+**What the JIT forbids (measured, `T3`-style one-kernel timings).** Three things made these kernels 5 – 300 times slower than
+Q4_0's, all the cliff of 7.10 ("the loop must stay inside C2's inlining budget, else every vector becomes a heap object"):
+(1) **two scalar `MemorySegment` reads per loop iteration** (the f16 `d` and `m` of a Q4_1 block): 40 – 60 ms per 2048 x 1024
+matrix instead of 0.15 ms; reading both with one 32-bit (or 64-bit, for `d, m, qh` or IQ4_XS's `d, scales_h, scales_l`)
+load and splitting it in registers is as fast as one read; (2) **masked byte arithmetic** (`sub(x, mask)`), for which C2 has no
+intrinsic on every CPU; (3) **`ByteVector.toShuffle()`**, which validates the indexes with an exception path: use
+`indexes.selectFrom(table)` (836 µs → 201 µs). The Java Q5_0 / Q5_1 kernels are still ~6x slower than Q4_0's (bit expansion with a
+constant shuffle plus another vector operation tips the loop over the budget again); on AArch64 the native kernels below
+make that irrelevant.
+
+**Native** (`libjllm_cpu`, [7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu)): scalar, NEON and `sdot` kernels for all seven
+formats, on the natural-order activation: Q5's fifth bit comes from `vqtbl1q_u8(qh)` + `vtstq_u8` against `{1, 2, 4, ..., 128}`
++ a mask with 16, the IQ4 / MXFP4 tables from `vqtbl1q_s8`. There are no x86-64 versions (they could not be tested here); on
+x86-64 `NativeCpu.supports` is false for these formats (`jllm_cpu_has_type`) and the Java kernels above are used.
+
+One thread, 2048 x 1024 matrix, Apple M1 Pro (load average 60 – 70 from other jobs, `NativeCpuBench`, µs, best of 40):
+
+| format | Java int8 | native `neon` | native `neon-dotprod` | float (Vector API) |
+|---|---|---|---|---|
+| Q4_0G (reference) | 142 | 121 | 98 | 964 |
+| Q4_1 | 164 | 185 | 151 | 632 |
+| Q5_0 | 839 | 154 | 130 | 1 111 |
+| Q5_1 | 944 | 212 | 198 | 654 |
+| IQ4_NL | 163 | 119 | 101 | 1 386 |
+| IQ4_XS | 200 | 109 | 72 | 1 113 |
+| MXFP4 | 157 | 81 | 67 | 1 473 |
+| Q3_K | 1 648 | 279 | 246 | 1 534 |
+
+`NativeCpuCheck` compares every level against the Java kernels (bit for bit with unit scales, 3e-5 of `Σ|w x|` with random scales).
+
 ### 7.10.1 `auto`: measure, don't guess
 
 🧸 Two roads lead to the same town. On some machines the short road (int8) is faster, on others the wide road

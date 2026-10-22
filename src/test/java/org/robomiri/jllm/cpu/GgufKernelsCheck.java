@@ -67,17 +67,66 @@ public final class GgufKernelsCheck {
             native_(a, "Q5_K", QType.Q5_K);
             native_(a, "Q2_K", QType.Q2_K);
             native_(a, "Q6_K", QType.Q6_K);
-            // formats that are only converted to Q8_0 at load: scalar dequantizer == reference
-            scalarOnly(a, "Q4_1", Ggml::dequantQ4_1);
-            scalarOnly(a, "Q5_0", Ggml::dequantQ5_0);
-            scalarOnly(a, "Q5_1", Ggml::dequantQ5_1);
-            scalarOnly(a, "Q3_K", Ggml::dequantQ3_K);
+            native_(a, "Q4_1", QType.Q4_1);
+            native_(a, "Q5_0", QType.Q5_0);
+            native_(a, "Q5_1", QType.Q5_1);
+            native_(a, "Q3_K", QType.Q3_K);
+            native_(a, "IQ4_NL", QType.IQ4_NL);
+            native_(a, "IQ4_XS", QType.IQ4_XS);
+            native_(a, "MXFP4", QType.MXFP4);
             scalarOnly(a, "Q6_K", Ggml::dequantQ6_K); // the scalar definition used by the converting fallbacks
+            floatTypes(a);
         }
         halfConversion();
         System.out.println("ggml kernels: " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
             System.exit(1);
+        }
+    }
+
+    /** F16 / BF16 matrices used as they are: the dequantizers are the conversions, the SIMD kernels must agree with them. */
+    private static void floatTypes(Arena a) {
+        Random rnd = new Random(7);
+        for (QType qt : new QType[]{QType.F16, QType.BF16}) {
+            MemorySegment seg = a.allocate(ROWS * COLS * 2L + 2, 1).asSlice(1, ROWS * COLS * 2L);
+            float[] ref = new float[ROWS * COLS];
+            for (int i = 0; i < ref.length; i++) {
+                float v = (float) (rnd.nextGaussian() * (i % 11 == 0 ? 50 : 0.5));
+                if (qt == QType.F16) {
+                    short h = Float.floatToFloat16(v);
+                    seg.set(java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED, 2L * i, h);
+                    ref[i] = Float.float16ToFloat(h);
+                } else {
+                    short h = (short) (Float.floatToRawIntBits(v) >>> 16);
+                    seg.set(java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED, 2L * i, h);
+                    ref[i] = Float.intBitsToFloat((h & 0xFFFF) << 16);
+                }
+            }
+            QTensor t = QTensor.mapped(qt, ROWS, COLS, seg);
+            float[] x = new float[COLS + 4];
+            for (int i = 0; i < x.length; i++) {
+                x[i] = rnd.nextFloat() * 2 - 1;
+            }
+            float[] row = new float[COLS];
+            float[] simd = new float[COLS];
+            int bad = 0;
+            double worstDot = 0;
+            for (int r = 0; r < ROWS; r++) {
+                t.dequantizeRow(r, row, 0);
+                VectorKernels.dequantRow(t, r, simd, 0);
+                double want = 0;
+                double mag = 0;
+                for (int i = 0; i < COLS; i++) {
+                    float e = ref[r * COLS + i];
+                    bad += (row[i] == e ? 0 : 1) + (simd[i] == e ? 0 : 1);
+                    want += (double) e * x[4 + i];
+                    mag += Math.abs((double) e * x[4 + i]);
+                }
+                worstDot = Math.max(worstDot, Math.abs(VectorKernels.dotRow(t, r, x, 4) - want) / (mag + 1e-6));
+            }
+            check(bad == 0, qt + " scalar and SIMD dequantizers equal the conversion: " + bad + " differ");
+            check(worstDot < 1e-5, qt + " SIMD dot vs reference: " + worstDot);
+            System.out.printf("%-5s scalar and SIMD == conversion (%d differ), dot %.2e%n", qt, bad, worstDot);
         }
     }
 
@@ -169,6 +218,9 @@ public final class GgufKernelsCheck {
         if (qt == QType.Q4_K || qt == QType.Q5_K || qt == QType.Q6_K) {
             kquants(type, t, ref, java.util.Arrays.copyOfRange(x, 4, 4 + COLS));
         }
+        if (GgufInt8Kernels.supports(t)) {
+            otherInt8(type, t, ref, java.util.Arrays.copyOfRange(x, 4, 4 + COLS));
+        }
         check(worstScalar < 1e-5, type + " scalar dequantizer vs gguf.quants: max rel err " + worstScalar);
         check(worstSimd < 1e-5, type + " SIMD dequantizer vs gguf.quants: max rel err " + worstSimd);
         check(worstDot < 1e-5, type + " SIMD dot vs reference: max err relative to sum|w x| " + worstDot);
@@ -211,6 +263,37 @@ public final class GgufKernelsCheck {
         }
         check(wrong == 0, "vector half-to-float conversion: " + wrong + " of " + tested + " halves differ");
         System.out.printf("f16   vector half-to-float == Float.float16ToFloat for %d/%d finite halves%n", tested - wrong, tested);
+    }
+
+    /**
+     * {@link GgufInt8Kernels}: the int8-activation dot against the exact product of the reference weights with the
+     * dequantized int8 activation (only float summation order differs), and against the float dot (activation rounding).
+     */
+    private static void otherInt8(String type, QTensor t, float[] ref, float[] xa) {
+        short[] xq = new short[COLS];
+        float[] xs = new float[COLS / 32];
+        int[] sums = new int[COLS / 32];
+        Int8Kernels.quantize(xa, 0, COLS, xq, xs);
+        KQuantKernels.blockSums(xq, COLS, sums);
+        double worstExact = 0;
+        double worstFloat = 0;
+        for (int r = 0; r < ROWS; r++) {
+            double exact = 0;
+            double fl = 0;
+            double mag = 0;
+            for (int i = 0; i < COLS; i++) {
+                double w = ref[r * COLS + i];
+                exact += w * (double) xs[i / 32] * xq[(i / 32) * 32 + Int8Kernels.permutedIndex(i % 32)];
+                fl += w * xa[i];
+                mag += Math.abs(w * xa[i]);
+            }
+            float got = GgufInt8Kernels.dotRow(t, r, xq, xs, sums, 0);
+            worstExact = Math.max(worstExact, Math.abs(got - exact) / (mag + 1e-9));
+            worstFloat = Math.max(worstFloat, Math.abs(got - fl) / (mag + 1e-9));
+        }
+        check(worstExact < 1e-5, type + " int8 dot vs exact product with the quantized activation: " + worstExact);
+        check(worstFloat < 0.02, type + " int8 dot vs float dot (activation rounding): " + worstFloat);
+        System.out.printf("%-6s int8 activations: vs exact %.2e, vs float dot %.2e%n", type, worstExact, worstFloat);
     }
 
     /**

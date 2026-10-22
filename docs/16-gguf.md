@@ -2,7 +2,8 @@
 
 Code: `gguf/GgufFile.java`, `gguf/GgmlType.java`, `gguf/GgufArchitecture.java`, `gguf/GgufWeights.java`,
 `gguf/GgmlCodec.java`, `gguf/GgufModel.java`, `model/Ggml.java`, `model/QType.java`, `model/QTensor.java`,
-`model/TensorSource.java`, `tokenizer/GgufTokenizer.java`, `cpu/GgufKernels.java`, the *GGUF block types* section
+`model/TensorSource.java`, `tokenizer/GgufTokenizer.java`, `cpu/GgufKernels.java`, `cpu/GgufInt8Kernels.java`,
+`cpu/KQuantKernels.java`, the native `src/main/native/jllm_cpu*.{c,inc}`, the two *GGUF block types* sections
 of `metal/kernels.metal`, `hub/HuggingFaceHub.java` (file selection), `Main.java`
 
 [03](03-safetensors.md) loads a Hugging Face checkpoint and **converts** it once into jllm's own quantized cache.
@@ -254,8 +255,51 @@ byte) and `qh[64]` the high 2 bits (four per byte) of 256 weights in two halves 
 the format that `Q4_K_M` files use for half of `attn_v`, half of `ffn_down` and the embedding. It is the engine's own
 `QType.Q6_K` (chapter 06), byte-compatible with the file, so these tensors are used in place too.
 
-The other llama.cpp formats that small or old files contain (Q4_1, Q5_0, Q5_1, Q3_K) have scalar dequantizers
-(`Ggml.dequantQ4_1` ...), used only to convert at load (16.6). IQ\*, TQ\* and MXFP4 are refused by name.
+The other formats real files mix in are read in place as well since 16.4.1: Q4_1, Q5_0, Q5_1 (legacy and mixed files:
+the Q4_0 file of Qwen3.8 has its `ffn_down` in Q4_1), Q3_K (`Q3_K_M/L`), IQ4_NL and IQ4_XS (imatrix quants), MXFP4
+(gpt-oss) and plain F16 / BF16 matrices. The other IQ\* types and TQ\* are refused by name.
+
+### 16.4.1 Every type at a glance
+
+`bits/weight` is the file's, `CPU` the kernels (V = Vector API float path, I = int8-activation path in Java,
+N = native `libjllm_cpu` on AArch64, [07](07-cpu-backend.md)), `Metal` the GPU kernels (decode matvec, tiled and
+matrix-unit prefill, the MoE expert kernels, the embedding lookup: all through `gg_unit`). The exact layouts and
+formulas of the types that are new here are in [06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files).
+
+| type | bytes / weights | bits/weight | used | CPU | Metal |
+|---|---|---|---|---|---|
+| F32 vectors (norms, biases, router) | 4 / 1 | 32 | copied into `float[]` | | |
+| F32 matrices | 4 / 1 | 32 | requantized to Q8_0 | | |
+| F16, BF16 | 2 / 1 | 16 | **in place** | V | yes |
+| Q8_0 | 34 / 32 | 8.5 | **in place** | V I N | yes |
+| Q6_K | 210 / 256 | 6.5625 | **in place** | V I N | yes |
+| Q5_1 | 24 / 32 | 6.0 | **in place** | V I N | yes |
+| Q5_K | 176 / 256 | 5.5 | **in place** | V I N | yes |
+| Q5_0 | 22 / 32 | 5.5 | **in place** | V I N | yes |
+| Q4_1 | 20 / 32 | 5.0 | **in place** | V I N | yes |
+| Q4_0 | 18 / 32 | 4.5 | **in place** | V I N | yes |
+| Q4_K | 144 / 256 | 4.5 | **in place** | V I N | yes |
+| IQ4_NL | 18 / 32 | 4.5 | **in place** | V I N | yes |
+| IQ4_XS | 136 / 256 | 4.25 | **in place** | V I N | yes |
+| MXFP4 | 17 / 32 | 4.25 | **in place** | V I N | yes |
+| Q3_K | 110 / 256 | 3.4375 | **in place** | V | yes |
+| Q2_K | 84 / 256 | 2.625 | **in place** | V | yes |
+| IQ1\*, IQ2\*, IQ3\*, TQ1_0, TQ2_0, Q8_K, Q8_1 | | | refused (named in the error) | | |
+
+`-Djllm.gguf.requantize=<types>` (ggml names separated by commas, `all`, or `none`) puts the listed types on the old
+path: dequantized row by row and requantized to Q8_0 at load (8.5 bits per weight: more memory, and on the GPU slower
+decode when decode is memory-bound). It is a switch for A/B comparisons (`scripts/mac-validate.sh --gguf-types DIR` runs both)
+and a fallback; the load line says what happened (`GGUF weights: ... (requantized to Q8_0: ...)`).
+
+**Default per backend.** The Metal backend reads every type in the table in place. The CPU backend requantizes **Q5_1,
+Q3_K, F16 and BF16** by default, because their in-place decode is more than 25% slower than the Q8_0 kernels' (16.9 has the
+measurements; F16 / BF16 would also read twice the bytes of Q8_0); the others (Q4_1, Q5_0, IQ4_NL, IQ4_XS, MXFP4 and the
+K-quants) stay in place on the CPU too. The load prints `GGUF on the CPU backend: [Q3_K] matrices are requantized ...` when a
+file has such tensors. An explicit `-Djllm.gguf.requantize=...` replaces the default, so `-Djllm.gguf.requantize=none` reads
+everything in place on the CPU as well (the choice for a model that only fits in memory that way), and
+`-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for those three types.
+Requantizing F16 / BF16 to Q8_0 is lossy (about 0.5% per weight): the CPU default trades that for speed and memory, and
+`-Djllm.gguf.requantize=none` keeps the full precision of the file.
 
 ---
 
@@ -336,14 +380,20 @@ engine's own Q8_0 in memory (`QTensor.quantize`, in parallel), and reported:
 
 | in the file | used |
 |---|---|
-| Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K | **in place** (zero copy, both backends) |
-| Q3_K, Q4_1, Q5_0, Q5_1 | requantized to Q8_0 in memory (rare: files mix them in for tensors whose row length is not a multiple of 256) |
-| F16, BF16, F32 matrices | quantized to Q8_0 in memory — meant for small models: a BF16 file becomes a Q8_0 model in RAM, and loading it costs a pass over all weights |
+| Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16 | **in place** (zero copy, both backends); the table in 16.4.1 |
+| F32 matrices, and the types named in `-Djllm.gguf.requantize` | quantized to Q8_0 in memory at load (a pass over all weights; the F32 / BF16 file of a small model becomes a Q8_0 model in RAM) |
 | F32 vectors (norms, biases, router) | copied into `float[]` |
 
+**Mixed files.** Real files mix types (a `Q4_0` file has `ffn_down` in Q4_1, `ssm_out` in Q5_K, `output` in Q6_K; gpt-oss has
+MXFP4 experts and F32/BF16 elsewhere), and every kernel instantiation has one block format. The fused q/k/v dispatch
+falls back to one dispatch per projection when the three types differ (above); the dense gate|up pair and the
+experts' gate|up pair are split views of two tensors of the same type, and if the two differ the pair is requantized
+(`GGUF weights:` says so).
+
 The int8-activation CPU path (`backend.cpu.int8-activations`, [07](07-cpu-backend.md)) has kernels for Q4_0 and Q8_0
-and, for these files, `Q4_0G` and `Q8_0G`; `CpuMatmul.useInt8` excludes every other type (Q2_K, Q4_K, Q5_K), which
-stay on the float kernels.
+and, for these files, `Q4_0G` and `Q8_0G`, the K-quants Q4_K / Q5_K / Q6_K (`KQuantKernels`) and Q4_1, Q5_0, Q5_1, IQ4_NL,
+MXFP4, IQ4_XS (`GgufInt8Kernels`; native AArch64 versions in `libjllm_cpu`); `CpuMatmul.useInt8` excludes Q2_K,
+Q3_K, F16 and BF16, which stay on the float kernels.
 
 ---
 
@@ -354,21 +404,27 @@ existing encoder ([04](04-tokenizer.md)), so there is one BPE implementation:
 
 * **`tokenizer.ggml.model = gpt2`**: byte-level BPE. `tokens` are the vocabulary and `merges` the merge list.
   `token_type` separates `CONTROL` tokens (added tokens flagged `special`: `<|im_start|>`, `<|endoftext|>`) and
-  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary. `tokenizer.ggml.pre` picks
-  the pre-tokenizer regex: `qwen2` (Qwen's, with an NFC normalizer as in its tokenizer.json), `llama-bpe` / `llama3`
-  (Llama 3's, with `ignore_merges`), `gpt-2`. Any other value is refused with its name; the loader then fetches the
+  `USER_DEFINED` ones (added, *not* special: `<think>`, `<tool_call>`) from the vocabulary; as in llama.cpp,
+  tokens it knows by name (`<|im_end|>`, `</s>`, the fill-in-the-middle markers...) are control tokens whatever the
+  file says. `tokenizer.ggml.pre` picks the pre-tokenizer: a list of regular expressions applied one after the other
+  plus `ignore_merges`, exactly llama.cpp's (81 values, 16.12; a missing key or `default` is llama.cpp's `default`,
+  which is **not** the GPT-2 regex). Any other value is refused with its name; the loader then fetches the
   original model's `tokenizer.json` from the repository named in `general.base_model.0.repo_url` /
   `general.source.url`, and fails clearly if the file names none.
-* **`tokenizer.ggml.model = llama`**: SentencePiece BPE (Llama 2, Mistral 7B, TinyLlama). The file has **scores**, not
-  merges, so — as `transformers` does when it converts such a model — every split of a token into two vocabulary
-  tokens becomes a merge, ranked by the merged token's score. Spaces become `▁`, a dummy `▁` is prepended (unlike
-  Metaspace it is added even if the text starts with a space), unknown characters fall back to the `<0xXX>` byte tokens.
+* **`tokenizer.ggml.model = llama`**: SentencePiece (Llama 2, Mistral 7B, TinyLlama, Gemma, Phi-3). The file has
+  **scores**, not merges, and llama.cpp segments with them directly: the characters are the first symbols, then the
+  adjacent pair whose concatenation is a token of the vocabulary (of any type) with the best score is merged, equal
+  scores leftmost first, until none is; a character that is no token becomes its `<0xXX>` byte tokens (`SpmGreedy`).
+  This differs from turning the scores into BPE merges, as `transformers` does, as soon as two scores are equal
+  (Gemma's are all 0). Spaces become `▁`; a `▁` is put in front of the text *and of the text after every special
+  token* when `add_space_prefix` (default true; Gemma: false).
 
-Checked two ways (`GgufTokenizerTest`): llama.cpp's own tokenizer tests (`ggml-vocab-llama-spm`, `-llama-bpe`,
-`-qwen2`, `-gpt-2`: 47 strings each, ids must equal llama.cpp's — **188 of 188**; `llama-spm` ships in
-`src/test/resources/gguf/vocab`), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python
-`tokenizers` package: **150 of 150** strings, the same decodings, and the **44** chat renders of
-`src/test/resources/tokenizers/qwen3.json`.
+Checked three ways (`GgufTokenizerTest`, `scripts/gguf-tokenizer-check.sh`): llama.cpp's own tokenizer tests
+(`ggml-vocab-llama-spm`, `-phi-3`, `-deepseek-coder`: 47 strings each, ids must equal llama.cpp's; the other 11
+fixtures are checked by hand), vocabularies generated for every pre value and compared with `llama-tokenize`
+(16.12), and the Qwen3-0.6B GGUF against `tokenizer.json` and the fixture of the Python `tokenizers` package: **145 of
+145** strings, the same decodings, and the **44** chat renders of `src/test/resources/tokenizers/qwen3.json`; 5 more
+strings differ from the Hugging Face tokenizer by design, as llama.cpp does (16.12).
 
 ---
 
@@ -447,17 +503,62 @@ cache, 452 MB; Metal; the machine was shared with other jobs, load average 12-30
 | *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
 
 Before `QType.Q6_K` existed the 29 Q6_K tensors of this file were requantized to Q8_0 at load: 1.4 s to map, 510 MB
-RSS. The output is token for token the same (md5 `1a5dc189...` for the haiku prompt, Metal and CPU). With a file
-that holds Q3_K, Q4_1/Q5_x or float matrices those tensors are still converted (`GGUF weights:` reports it).
+RSS. The output is token for token the same (md5 `1a5dc189...` for the haiku prompt, Metal and CPU). Q4_1, Q5_0,
+Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16 and BF16 are now read in place too, except where a backend's default
+requantizes them (§16.4.1); `GGUF weights:` reports what was converted, and §16.9.1 has their numbers.
 
----|---|---|---|
-| converted q4 cache | 0.02 s | 1.7 s | ~230 MB |
-| *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
+### 16.9.1 The newer block types in place (Apple M1 Pro, Qwen3-0.6B requantized with `llama-quantize`)
 
-*Measured before `QType.Q6_K` was merged, when the 29 Q6_K tensors of this file were requantized to Q8_0 at load.* That
-fallback (176 MB of copies) accounted for the difference in resident memory and about a second of the load; with Q6_K
-used in place a `Q4_K_M` file is mapped entirely as it is (see the numbers re-measured below), and with a `Q8_0` file
-the load is dominated by the tokenizer.
+Every file below is the Qwen3-0.6B `Q8_0` GGUF converted with `llama-quantize --allow-requantize --pure <TYPE>` (all matrices and the
+tied embedding in that type; Q3_K_M is the usual mix), so the weights are not the original model's, but the file is exactly what
+llama.cpp reads. Speeds are `./jllm bench` medians (413-token prompt, 5 rounds Metal / 3 rounds CPU, speculation off) under the heavy lock,
+**native** = read in place, **Q8_0** = the same file with `-Djllm.gguf.requantize` naming its type (the behaviour before these types existed:
+dequantized at load, requantized to Q8_0 in memory). Other jobs were running on the machine (load average 9 – 15), so differences of a few
+percent are noise.
+
+| type | file = in place | requantized (RAM) | Metal prefill tok/s native / Q8_0 | Metal decode tok/s native / Q8_0 | CPU decode tok/s native / Q8_0 | CPU default |
+|---|---|---|---|---|---|---|
+| Q4_1 | 379 MB | 670 MB | 1426 / 1489 | 101.0 / 99.9 | 83.7 / 92.2 (-9%) | in place |
+| Q5_0 | 416 MB | 670 MB | 1558 / 1466 | 103.3 / 103.4 | 85.6 / 91.8 (-7%) | in place |
+| Q5_1 | 453 MB | 670 MB | 1375 / 1469 | 105.1 / 102.8 | 66.2 / 91.9 (-28%) | **Q8_0** |
+| Q3_K | 262 MB | 670 MB | 1508 / 1469 | 101.5 / 105.1 | 58.0 / 92.4 (-37%) | **Q8_0** |
+| Q3_K_M (mix) | 347 MB | 297 MB | 1400 / 1371 | 90.7 / 89.5 | 69.7 / 90.1 (-23%) | Q3_K tensors Q8_0 |
+| IQ4_NL | 341 MB | 670 MB | 1356 / 1492 | 92.0 / 107.6 | 100.1 / 95.1 (+5%) | in place |
+| IQ4_XS | 323 MB | 670 MB | 1358 / 1493 | 93.0 / 107.8 | 115.3 / 93.6 (+23%) | in place |
+| MXFP4 | 323 MB | 670 MB | 1389 / 1467 | 92.0 / 102.8 | 120.9 / 92.7 (+30%) | in place |
+| F16 | 1198 MB | 670 MB | 1428 / 1468 | 81.2 / 102.9 | 22.4 / 91.7 (-76%) | **Q8_0** (lossy) |
+
+What the table says:
+
+* **Memory**: the in-place file is 1.5 – 2.6x smaller than the Q8_0 copy for every type but F16 (twice as big). This is what lets a
+  27B – 30B GGUF fit in 32 GB, and why Metal keeps everything in place. F16 / BF16 in place is exact but reads 16 bits per weight.
+* **Metal**: prefill is the same within noise; decode is the same for Q4_1 / Q5_x / Q3_K, 10 – 14% lower for IQ4_NL / IQ4_XS / MXFP4 (a
+  table lookup per weight; on this 0.6B model decode is not bandwidth-bound, a larger model would profit from the smaller weights) and
+  21% lower for F16. The raw kernel (`GgufMetalBench`, an 8192 x 4096 matrix, single token, µs): Q4_0 290, Q8_0 310, Q4_1 287, Q5_0 304,
+  Q5_1 302, Q3_K 372, IQ4_NL 348, IQ4_XS 338, MXFP4 343, F16 433.
+* **CPU** (int8 activations, native NEON dot-product kernels): IQ4_XS and MXFP4 are faster in place (4.25 bits per weight against
+  Q8_0's 8.5), Q4_1 / Q5_0 are 7 – 9% slower, Q5_1 (-28%), Q3_K (-37%) and F16 (-76%) are slower by more than the 25% the default
+  tolerates, so **the CPU backend requantizes Q5_1, Q3_K, F16 and BF16 by default** and `-Djllm.gguf.requantize=none` keeps them in
+  place. `-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for the legacy 4/5-bit formats on any backend. With
+  `-Djllm.cpu.native=false` (Java kernels only, e.g. x86-64): Q4_1 29 tok/s, IQ4_NL 68 (Q8_0: 26 – 29).
+* **The Metal prefill dip that was found on the way**: chunks of 8 – 31 tokens (the tail of every prompt) ran the tiled `matmul_pf`
+  kernels, 3 – 4x slower than the matrix-unit kernels for the bit-field formats Q5_0 and Q3_K *and for the existing Q4_K / Q5_K* (Q4_K,
+  1024 x 3072, 8 / 16 / 24 tokens: 394 / 815 / 1081 µs against 240 / 243 / 248 µs). `MetalKernels.tiledIsSlow` sends these four
+  formats to the matrix units from 8 tokens (`jllm.metal.prefillMinTokens`). End to end, **`Qwen3-0.6B-Q4_K_M.gguf` on Metal, 413-token
+  prompt: prefill 750 tok/s before (main) → 1414 – 1443 tok/s, decode 90 tok/s unchanged, and the greedy text is byte-identical** (md5 of
+  two raw 64-token completions and of the chat haiku, 3 alternating runs each): `Qwen3-0.6B-Q4_K_M` is mostly Q4_K, so the same
+  holds for any `Q4_K_M` file, including the Q5_K / Q6_K tensors of the Q4_0 file of Qwen3.8 (not run here: its architecture lands in another branch).
+
+**Exactness against llama.cpp.** Dequantization is bit-identical for all nine types (`GgufKernelsCheck`: 2048 – 12 288 weights per type
+from random blocks, gguf-py and `ggml-quants.c` compiled and called through ctypes: zero differing floats; the Metal kernels are checked
+against the same numpy decoders to 1e-5 – 1e-7 relative). Greedy generation of 32 tokens on two prompts ("The capital of France is",
+"def fibonacci(n):") against `llama-completion` (Homebrew 0.7.0, Metal): jllm on **Metal and on the CPU float path produced llama.cpp's text for
+every file** (Q4_1, Q5_0, Q5_1, Q3_K, Q3_K_M, IQ4_NL, IQ4_XS, an IQ4_XS mix, MXFP4, F16, BF16: 22 of 22 runs, the last character apart: llama.cpp prints a
+trailing newline). With int8 activations on the CPU the text agrees on 20 of 22 (Q4_1 prompt 1 and the IQ4_XS mix prompt 1 diverge
+after 6 – 7 characters at a near tie, the documented effect of rounding the activation). Reading the same files with the old
+requantize path changes the text in 3 of 22 runs on each backend (Q4_1 prompt 1 at once, Q3_K and the IQ4_XS mix or IQ4_XS later): the in-place kernels are
+closer to llama.cpp than Q8_0 requantization is. (Two first Metal runs died with `Impacting Interactivity`, the GPU watchdog, while other jobs were using the GPU; run
+alone they produced llama.cpp's text.)
 
 ---
 
@@ -465,13 +566,16 @@ the load is dominated by the tokenizer.
 
 * **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe` only. Gemma 2/3, Phi-3, GLM-4, DeepSeek-2 and Mamba are
   supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are not mapped yet.
-* **Formats**: the IQ\* family, ternary TQ\* and MXFP4 are refused; Q4_K / Q5_K have no int8-activation CPU kernel.
+* **Formats**: IQ1\*, IQ2\*, IQ3\* and the ternary TQ\* types are refused (the 16-entry-codebook IQ4 types are in place; the
+  others use 256-entry grids and are not done); Q2_K, Q3_K, F16 and BF16 have no int8-activation CPU kernel; the x86-64
+  native library has no kernels for the formats added in 16.4.1 (the Java int8 kernels serve them there).
 * **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
   variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
   (Qwen2-MoE, DeepSeek) are not mapped.
-* **Tokenizer**: pre-tokenizers other than `qwen2`, `llama-bpe`, `gpt-2` need the original repository's
-  `tokenizer.json`.
+* **Tokenizer**: the pre-tokenizers that are not a list of regexes (`kimi-k2`, `afmoe`, `tiny_aya`, `superbpe`, `chameleon`,
+  the SPM-style BPE `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`) and `exaone-moe` need the original repository's
+  `tokenizer.json`; `tokenizer.ggml.add_eos_token` and the WordPiece (`bert`) vocabularies are not applied (16.12).
 
 ---
 
@@ -479,9 +583,10 @@ the load is dominated by the tokenizer.
 
 `mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
-Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
+Metal dispatch family; `GgufMetalBench` times them), `NativeCpuCheck` (the native int8 kernels against the Java ones), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
 permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
-selection, settings) and `GgufTokenizerTest` on the `llama-spm` vocabulary. With the Qwen3-0.6B files downloaded by
+selection, settings) and `GgufTokenizerTest` (three of llama.cpp's vocabulary fixtures and the stored llama.cpp ids of 29 generated
+vocabularies, 16.12). With the Qwen3-0.6B files downloaded by
 `./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:
 
 ```sh
@@ -494,5 +599,68 @@ $J.GgufRealParity $G /tmp/parity
 $J.metal.GgufMetalReal $G                                             # Metal matmul of every tensor vs its dequantization
 $J.GgufTokenizerTest --gguf $G --hf models/Qwen_Qwen3-0.6B --fixture src/test/resources/tokenizers/qwen3.json
 $J.GgufTokenizerTest --vocab DIR       # llama.cpp's models/ggml-vocab-*.gguf with their .inp / .out files
+scripts/gguf-tokenizer-check.sh        # generated vocabularies for every pre value against llama-tokenize (16.12)
 ```
 
+---
+
+## 16.12 Tokenizer pre-tokenizers: which values are supported and how they were checked
+
+🧸 **Cut first, glue second.** A tokenizer does not look at a sentence all at once. First it cuts the text into little
+words with a cutting rule, then it glues the letters of each word into pieces it knows. Every family of models cuts a
+little differently: Llama 3 chops a long number into groups of three digits, Qwen takes the digits one at a time,
+DeepSeek also puts every Chinese phrase in a box of its own. The GGUF file only carries the *name* of the rule
+(`tokenizer.ggml.pre`); the rule itself is written out, character by character, inside llama.cpp. If we cut even one
+place differently, the model receives numbers it was never taught, and answers a little worse without telling anyone. So
+we copied llama.cpp's rule for every name, and then we checked, with over a million strings, that llama.cpp
+itself and jllm cut and glue them to exactly the same ids.
+
+📐 **What is implemented** (`GgufPre`, `GgufTokenizer`, `SpmGreedy`; reference: llama.cpp b11669, `llama-vocab.cpp`).
+
+* A pre value is a **list of regexes applied one after the other**, each cutting the pieces the previous one left (matches
+  *and* the text between them are kept: a Hugging Face `Sequence` of `Split`/`Isolated`), then GPT-2 byte-level spelling,
+  plus the flags `ignore_merges` (a piece that is a token is not merged) and the default of `add_bos_token`. The patterns
+  are llama.cpp's strings, with four changes so that `java.util.regex` does what llama.cpp's C++ does: `\p{Lu}`... are
+  "any letter" there; non-ASCII whitespace never matches a character class of a regex without `\p{..}` (it is
+  replaced by U+000B first); `$` is the end of the piece; the look-ahead groups of GPT-4o / Tekken are one class.
+* An absent key or `default` is llama.cpp's own default (4 regexes, digits in threes), **not** GPT-2's; an unknown value is refused.
+* Control tokens are found in the text by type and by name (`</s>`, `<|im_end|>`, the FIM markers: control even if the
+  file says normal), user-defined ones are found even in untrusted text (`encode(text, false)`), Phi-3 files
+  (`general.name`) swallow the ASCII whitespace after a special token. A BOS is added as llama.cpp does: the key if present, else
+  yes for SentencePiece, `llama-bpe` and `tekken`, no otherwise.
+* SentencePiece (`model = llama`) is llama.cpp's greedy merge by score, not BPE merges (`SpmGreedy`).
+
+| `tokenizer.ggml.pre` | cutting rules (llama.cpp `regex_exprs`) | flags | checked against |
+|---|---|---|---|
+| `llama-bpe`, `llama3`, `llama-v3`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` | Llama 3: `'s..`, `[^\r\n\p{L}\p{N}]?\p{L}+`, `\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n]*`, whitespace | ignore_merges, BOS | F llama-bpe 47/47 and 14 871/14 871; S 14 871/14 871 each |
+| `dbrx`, `smaug-bpe`, `chatglm-bpe`; `glm4`, `glm5` (+ ignore_merges) | the same regex | no BOS default | S 14 871/14 871 each |
+| `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open`, `grok-2` | Llama 3's with `\p{N}` (one digit) | | F qwen2 47/47 and 14 871/14 871 (+ Qwen3-0.6B Q8_0 and 2 795 doc paragraphs); S 14 871/14 871 each |
+| `qwen35` | the same with `[\p{L}\p{M}]+` | | F qwen35 51/51 and 14 871/14 871; S |
+| `gpt-2`, `phi-2`, `olmo`, `mpt`, `jais`, `trillion`, `granite-docling`, `exaone4`, `gigachat`, `a.x-4.0`, `mellum`, `modern-bert`, `roberta-bpe`, `jina-*` | GPT-2: `'s..`, ` ?\p{L}+`, ` ?\p{N}+`, ` ?[^\s\p{L}\p{N}]+`, `\s+(?!\S)` | | F gpt-2, mpt 47/47 and 14 871/14 871; S each |
+| `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva-7b`, `mellum2` | `\p{N}`, then GPT-2's | | F starcoder, refact, command-r 47/47 and 14 871/14 871; S each |
+| `default`, key absent (GPT-NeoX, Mamba) | `[\p{P}$+<=>^~\|]+`, GPT-2's, `\p{N}+`, `[0-9]{3}` | | F gpt-neox 14 871/14 871; S |
+| `falcon` | `[\p{P}$+<=>^~\|`]+`, GPT-2's, `[0-9]{3}` | | F falcon 47/47 and 14 871/14 871; S |
+| `deepseek-llm` / `deepseek-coder` | 6 / 5 rules: `[\r\n]`, letters / `\s?\p{L}+`, punctuation, `\s+$`, CJK ranges, `\p{N}+` / `\p{N}` | | F 47/47 and 14 871/14 871 each; S |
+| `deepseek-v3`, `hunyuan-dense`, `hy_v4`, `joyai-llm`, `spark2_5` | `\p{N}{1,3}`, CJK + kana, symbol-then-letters rule | | S 14 871/14 871 each |
+| `tekken`; `gpt-4o`, `llama4`, `kanana2`, `talkie`, `minimax-m2`; `granite-embed-multi-97m` | case-aware letters (look-ahead rewritten as classes), `\p{N}` / `\p{N}{1,3}` | tekken: ignore_merges, BOS | S 14 871/14 871 each |
+| `jais-2`, `youtu`, `poro-chat`, `bloom`, `gpt3-finnish`, `viking`, `bailingmoe`, `bailingmoe2`, `llada-moe`, `seed-coder`, `ufakzeka`, `laguna`, `minicpm5`, `k2-horizon` | as in `llama-vocab.cpp` | per the table in `GgufPre` | S 14 871/14 871 each |
+| SentencePiece (`model = llama`): Llama 2, Mistral 7B, Gemma 2/3, Phi-3 | greedy merge by score, `<0xXX>` bytes, `▁` prefix | Gemma: no prefix; Phi-3: rstrip | F llama-spm, phi-3 47/47 and 14 871/14 871; S 4 kinds (distinct scores, ties, Gemma-like, Phi-3-like) 14 871/14 871 each |
+
+**How it was checked.** `scripts/gguf-tokenizer-check.sh` writes a vocabulary-only GGUF per pre value with all 65 536
+merges of two byte symbols in a pseudo-random order (so a cut between two pieces shows as a pair that was not merged),
+a few merge chains, tokens without merges (to see `ignore_merges`) and control / user-defined tokens, and gives the same
+14 871 strings to `llama-tokenize` and to `GgufModel.tokenizer`: 191 hand-written (contractions in both cases, digit runs, CJK, accents,
+emoji, every kind of whitespace, code, special tokens in the text), 2 000 random over a Unicode alphabet and a sweep over
+code points (12 680 strings); for byte-level BPE also with `--no-parse-special` against `encode(text, false)`, and the BOS rules.
+F = llama.cpp's own `ggml-vocab-*.gguf`. S = generated vocabulary. Three other merge orders (seeds 1-3) give the same results. `GgufTokenizerTest` keeps the ids of 19 691 strings
+on 29 vocabularies (`synthetic-llama-cpp.txt.gz`, 68 KB), so `mvn test` needs no llama.cpp.
+
+**Differences that remain** (all deliberate or unreachable in real text):
+* Characters assigned after llama.cpp's Unicode tables (Unicode 14-17; 8 443 code points, e.g. Egyptian Hieroglyphs
+  Extended-A) are letters / marks here and "unassigned" there.
+* llama.cpp does not normalize to NFC (the previous qwen2 special case is gone) and makes `</s>` a control token, so
+  these two differ from the Hugging Face tokenizer.json of the same model (Qwen3: 5 of 150 fixture strings).
+* Two special tokens that overlap (`<|ab` and `b|c>x` in `<|ab|c>x`): llama.cpp takes the longer first, this scanner the
+  leftmost. SentencePiece with special tokens not parsed: control tokens stay text here, llama.cpp merges them back.
+* `add_eos_token`, WordPiece (`bert`) and the pre values that are not regex lists (`kimi-k2`, `afmoe`, `tiny_aya`,
+  `superbpe`, `chameleon`, `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`; `exaone-moe` would overflow the regex stack) are refused.

@@ -94,7 +94,8 @@ public final class GgufModel implements AutoCloseable {
                 (int) file.num("tokenizer.ggml.unknown_token_id", -1),
                 file.get("tokenizer.ggml.add_bos_token") instanceof Boolean b ? b : null,
                 file.bool("tokenizer.ggml.add_space_prefix", true), bytes(file.longs("tokenizer.ggml.precompiled_charsmap")),
-                file.bool("tokenizer.ggml.remove_extra_whitespaces", false));
+                file.bool("tokenizer.ggml.remove_extra_whitespaces", false), file.str("general.name", null),
+                file.get("tokenizer.ggml.add_eos_token") instanceof Boolean e ? e : null);
         try {
             return GgufTokenizer.build(spec);
         } catch (GgufTokenizer.UnsupportedPreTokenizer e) {
@@ -160,6 +161,22 @@ public final class GgufModel implements AutoCloseable {
         }
         return "the chat template stored in the GGUF file does not contain " + marker + ", which the built-in '" + type
                 + "' template uses; the engine ignores the stored template and renders its own";
+    }
+
+    /**
+     * Chooses which formats the next {@link #weights()} reads in place for the backend they are loaded for (the CPU backend
+     * requantizes a few formats whose in-place kernels decode more than 25% slower than Q8_0; {@code -Djllm.gguf.requantize}
+     * overrides). Returns the formats of this file that the default requantizes, to report them.
+     */
+    public java.util.Set<GgmlType> forBackend(boolean cpu) {
+        java.util.Set<GgmlType> types = GgmlCodec.backendDefault(cpu);
+        java.util.Set<GgmlType> here = java.util.EnumSet.noneOf(GgmlType.class);
+        for (GgufFile.Tensor t : file.tensors().values()) {
+            if (t.dims().length >= 2 && types.contains(t.type())) {
+                here.add(t.type());
+            }
+        }
+        return here;
     }
 
     /**

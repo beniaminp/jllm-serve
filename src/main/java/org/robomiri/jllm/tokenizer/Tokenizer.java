@@ -94,6 +94,7 @@ public final class Tokenizer {
     private final Set<Integer> specialIds;
     private final Set<Integer> lstripIds = new HashSet<>();
     private final Set<Integer> rstripIds = new HashSet<>();
+    private final boolean stripAscii;
     private final AddedTokenTrie addedTrie;
     private static final IntPredicate ANY_TOKEN = id -> true;
     /** The content-path default: everything but the tokens flagged {@code special}. */
@@ -118,7 +119,7 @@ public final class Tokenizer {
     private final Map<String, int[]> cache = new ConcurrentHashMap<>();
 
     /** The {@code model.type}: the algorithm that turns one pre-tokenized piece into ids. */
-    private enum ModelType { BPE, UNIGRAM, WORDPIECE }
+    private enum ModelType { BPE, UNIGRAM, WORDPIECE, SPM }
 
     /**
      * How the decoder glues tokens when the first token is treated differently from the others: not at all
@@ -131,6 +132,8 @@ public final class Tokenizer {
     private final ModelType modelType;
     /** The unigram lattice, or null for other models. */
     private final Unigram unigram;
+    /** llama.cpp's greedy SentencePiece segmentation ({@code model.type = "LlamaSpm"}, written by GgufTokenizer), or null. */
+    private final SpmGreedy spm;
     /** WordPiece: {@code continuing_subword_prefix} and {@code max_input_chars_per_word}. */
     private final String wpPrefix;
     private final int wpMaxChars;
@@ -146,6 +149,7 @@ public final class Tokenizer {
             throw new IllegalArgumentException("tokenizer.json has no \"model\" object");
         }
         modelType = modelType(model);
+        stripAscii = Json.bool(json, "strip_ascii_whitespace", false);
         ignoreMerges = Json.bool(model, "ignore_merges", false);
         byteFallback = Json.bool(model, "byte_fallback", false);
         fuseUnk = Json.bool(model, "fuse_unk", false);
@@ -336,6 +340,7 @@ public final class Tokenizer {
             }
             unkId = (int) u;
             unigram = new Unigram(pieces, scores, vocab, unkId);
+            spm = null;
         } else {
             String unkToken = Json.str(model, "unk_token", null);
             if (unkToken == null && config != null) {
@@ -344,6 +349,7 @@ public final class Tokenizer {
             Integer unk = unkToken == null ? null : tokenIdOrNull(unkToken);
             unkId = unk == null ? -1 : unk;
             unigram = null;
+            spm = modelType == ModelType.SPM ? SpmGreedy.fromJson(model) : null;
         }
 
         // Leftmost-longest matching, so e.g. "<|im_start|>" wins over any shorter overlapping token.
@@ -738,9 +744,13 @@ public final class Tokenizer {
         return id != null ? id : vocab.get(token);
     }
 
-    /** Rust's {@code char::is_whitespace}, which decides what lstrip / rstrip tokens swallow. */
-    private static boolean isWhitespace(char c) {
-        return Normalizers.isWhiteSpace(c);
+    /**
+     * What lstrip / rstrip tokens swallow: Rust's {@code char::is_whitespace}, or, when tokenizer.json says
+     * {@code "strip_ascii_whitespace": true} (written for GGUF files: llama.cpp calls C's {@code isspace}), only
+     * space, tab, newline, vertical tab, form feed and carriage return.
+     */
+    private boolean isWhitespace(char c) {
+        return stripAscii ? c == ' ' || (c >= '\t' && c <= '\r') : Normalizers.isWhiteSpace(c);
     }
 
     private void encodeOrdinary(String text, IntList out, boolean first) {
@@ -759,6 +769,7 @@ public final class Tokenizer {
             cached = switch (modelType) {
                 case BPE -> byteLevel ? bpeUncached(piece) : bpeCharsUncached(piece);
                 case UNIGRAM -> unigram.encode(piece, vocab, byteFallback, byteTokenIds);
+                case SPM -> spm.encode(piece);
                 case WORDPIECE -> wordPiece(piece);
             };
             // Only short chunks are worth remembering (words, punctuation, short runs); long runs would let a
@@ -912,6 +923,7 @@ public final class Tokenizer {
             case "BPE" -> ModelType.BPE;
             case "Unigram" -> ModelType.UNIGRAM;
             case "WordPiece" -> ModelType.WORDPIECE;
+            case "LlamaSpm" -> ModelType.SPM;
             default -> throw new IllegalArgumentException("unsupported model.type=" + type
                     + " (supported: BPE, Unigram, WordPiece)");
         };
