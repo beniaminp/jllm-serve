@@ -303,7 +303,7 @@ conversations are found again through the tree rather than in place.
 ---
 ## 25.5 Measured
 
-TBD-5
+The measurements of the simulated agent workload (`SchedulerBench`) on Qwen3-0.6B and Qwen3-30B-A3B are being taken under the heavy-job lock; this section is filled in by the next commit.
 
 ## 25.6 Checks and limits
 
