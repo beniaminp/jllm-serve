@@ -80,6 +80,11 @@ public final class ModelLoader {
             return hub.download(model, s.get("model.revision"), src.dir());
         }
         System.err.println(src.gguf());
+        try { // a vision-language repository: its multimodal projector comes with the model (vision.auto-download)
+            org.robomiri.jllm.vision.Mmproj.locate(s, hub, model, src.gguf());
+        } catch (IOException e) {
+            System.err.println("note: " + e.getMessage());
+        }
         return src.gguf();
     }
 
@@ -131,7 +136,10 @@ public final class ModelLoader {
     }
 
     /** A model ready to run: architecture, tokenizer and weights, from a safetensors checkpoint or a GGUF file. */
-    public record Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) {
+    public record Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir, Path gguf) {
+        public Prepared(Architecture arch, Tokenizer tok, ModelWeights weights, Path dir) {
+            this(arch, tok, weights, dir, null);
+        }
     }
 
     public static Loaded load(Settings s, HuggingFaceHub hub, String model) throws Exception {
@@ -149,7 +157,7 @@ public final class ModelLoader {
         ModelWeights weights = p.weights();
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
-        Speculator.Config spec = speculation(s, arch);
+        Speculator.Config spec = speculation(s, arch, weights);
         // the draft model first, on the same device: it joins DeviceLedger before the target's backend plans its GPU
         // memory (backend.metal.cpu-moe), so the target's budget leaves room for the draft's weights and caches
         DraftModel draft = spec.mode() == Speculator.Mode.DRAFT ? loadDraft(s, hub, tok, arch, weights) : null;
@@ -163,9 +171,12 @@ public final class ModelLoader {
             weights.close();
             throw e;
         }
-        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype")));
+        System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype"))
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : ""));
         try {
-            Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"));
+            Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"),
+                    chatFormat(p, arch, tok));
+            constraints(s, engine);
             long promptCacheMb = s.getLong("engine.prompt-cache-mb");
             if (promptCacheMb > 0) {
                 engine.setPromptCache(new org.robomiri.jllm.tokenizer.PromptCache(tok, promptCacheMb << 20));
@@ -174,10 +185,12 @@ public final class ModelLoader {
                 DraftModel d = draft;
                 draft = null; // the engine owns (and closes) it from here on
                 if (engine.enableSpeculation(spec, d)) {
-                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase() + ", up to " + spec.k()
-                            + " tokens per pass" + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
+                    System.err.println("Speculative decoding: " + spec.mode().name().toLowerCase()
+                            + (spec.mode() == Speculator.Mode.MTP ? ", the model's own multi-token-prediction head, one draft token per pass"
+                            : ", up to " + spec.k() + " tokens per pass") + (d != null ? ", draft " + s.get("engine.draft-model") : ""));
                 }
             }
+            attachVision(s, hub, model, p, engine);
             return new Loaded(weights, engine);
         } catch (Exception e) { // e.g. a family without a chat template, or a bad generation_config.json
             if (draft != null) {
@@ -189,20 +202,85 @@ public final class ModelLoader {
         }
     }
 
-    /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
+    /**
+     * Gives {@code engine} eyes when its GGUF model has a multimodal projector next to it ({@code model.mmproj}, or an
+     * {@code mmproj*.gguf} in the same folder / repository; docs/20). A projector that was named explicitly and does not
+     * work is an error; one found automatically that does not fit the model is only reported.
+     */
+    private static void attachVision(Settings s, HuggingFaceHub hub, String model, Prepared p, Engine engine) throws Exception {
+        if (p.gguf() == null || !s.getBool("vision.enabled")) {
+            return;
+        }
+        Path mm = org.robomiri.jllm.vision.Mmproj.locate(s, hub, model, p.gguf());
+        if (mm == null) {
+            return;
+        }
+        try {
+            org.robomiri.jllm.vision.VisionContext vc = org.robomiri.jllm.vision.VisionContext.open(mm, p.tok(), p.arch(),
+                    visionOptions(s));
+            engine.setVision(vc, true);
+            System.err.println("Vision: " + vc.describe());
+        } catch (IOException | RuntimeException e) {
+            if (s.opt("model.mmproj") != null) {
+                throw e;
+            }
+            System.err.println("warning: the projector " + mm.getFileName() + " next to the model cannot be used, loading it as"
+                    + " a text model: " + e.getMessage());
+        }
+    }
+
+    /** The vision encoder options of the settings. */
+    public static org.robomiri.jllm.vision.VisionContext.Options visionOptions(Settings s) {
+        String backend = s.get("vision.backend");
+        if (backend.equals("auto")) {
+            backend = s.get("backend");
+        }
+        return new org.robomiri.jllm.vision.VisionContext.Options(backend, s.getInt("backend.threads"),
+                new org.robomiri.jllm.vision.Preprocess.Limits(s.getInt("vision.image-min-tokens"), s.getInt("vision.image-max-tokens")),
+                s.getInt("vision.cache-mb"), s.opt("backend.metal.lib"));
+    }
+
+    /** Gemma 3: the tokens of one picture (docs/20.12); {@code backend.batch} at its default is raised to this. */
+    static final int GEMMA3_PICTURE_BATCH = 256;
+
+    /** Prefill chunk of {@code backend.batch=auto} for mixture-of-experts models. */
     static final int MOE_BATCH = 256;
+    /** Prefill chunk of {@code backend.batch=auto} for dense decoders on Metal (measured, docs/11 §11.1). */
+    static final int METAL_DENSE_BATCH = Integer.getInteger("jllm.metal.autoBatch", 256);
+    /** Prefill chunk of {@code backend.batch=auto} everywhere else (the CPU backends, Mamba, dense Qwen3-Next). */
+    static final int DEFAULT_BATCH = 64;
+
+    /** True if {@code backend.batch} holds a number (not {@code auto}). */
+    public static boolean explicitBatch(Settings s) {
+        return !"auto".equalsIgnoreCase(s.get("backend.batch").trim());
+    }
 
     /**
-     * Tokens per prefill chunk: {@code backend.batch}, except that a mixture-of-experts model takes {@link #MOE_BATCH}
-     * unless the setting was given. A chunk reads each chosen expert's weights once for all its tokens (the grouped
-     * kernels on Metal, the dequantized row groups on the CPU), and with 128 experts and top-8 a 64-token chunk gives
-     * an expert only ~4 tokens: 256 tokens measured 1.6x faster per token for the CPU experts (docs/11).
+     * Tokens per prefill chunk: {@code backend.batch} when it is a number; with {@code auto} (the default) a
+     * mixture-of-experts model takes {@link #MOE_BATCH}, a dense decoder on Metal {@link #METAL_DENSE_BATCH}, anything
+     * else {@link #DEFAULT_BATCH}. A MoE chunk reads each chosen expert's weights once for all its tokens (the
+     * grouped kernels on Metal, the dequantized row groups on the CPU), and with 128 experts and top-8 a 64-token
+     * chunk gives an expert only ~4 tokens: 256 tokens measured 1.6x faster per token for the CPU experts (docs/11).
+     * A dense chunk of 64 tokens leaves the GPU under-filled (a 1024-row projection is 16 x 2 MMA threadgroups).
      */
     static int batch(Settings s, Architecture arch) {
-        int batch = s.getInt("backend.batch");
+        if (explicitBatch(s)) {
+            return s.getInt("backend.batch");
+        }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe();
-        return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
+        int auto = moe ? MOE_BATCH
+                : arch instanceof org.robomiri.jllm.model.Decoder && resolveBackend(s).equals("metal") ? METAL_DENSE_BATCH : DEFAULT_BATCH;
+        if (arch.core().modelType().startsWith("gemma3")) {
+            return Math.max(auto, GEMMA3_PICTURE_BATCH); // a picture's 256 tokens attend to each other and go through in one pass
+        }
+        return auto;
+    }
+
+    /** {@code backend}: cpu or metal, where auto means metal when the Metal library is available. */
+    static String resolveBackend(Settings s) {
+        String name = s.get("backend");
+        return name.equals("auto") ? (Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu") : name;
     }
 
     /**
@@ -210,6 +288,16 @@ public final class ModelLoader {
      * where a verification pass reads the experts of every drafted position and was measured not to pay
      * (docs/11 §11.6), unless {@code engine.speculative} was set explicitly.
      */
+    static Speculator.Config speculation(Settings s, Architecture arch, ModelWeights weights) {
+        Speculator.Config spec = speculation(s, arch);
+        if (weights.mtp != null && "default".equals(s.source("engine.speculative"))) {
+            // a model that carries its own multi-token-prediction head drafts with it unless told otherwise (a hybrid
+            // cannot use prompt lookup: its state cannot be rewound by overwriting)
+            return new Speculator.Config(Speculator.Mode.MTP, spec.k(), spec.ngramMax(), spec.ngramMin(), spec.window());
+        }
+        return spec;
+    }
+
     static Speculator.Config speculation(Settings s, Architecture arch) {
         Speculator.Config spec = s.speculation();
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe();
@@ -217,6 +305,15 @@ public final class ModelLoader {
             return new Speculator.Config(Speculator.Mode.OFF, spec.k(), spec.ngramMax(), spec.ngramMin(), spec.window());
         }
         return spec;
+    }
+
+    /**
+     * The constrained decoding settings (docs/17 §17.7): {@code engine.jump-forward} for this engine and
+     * {@code engine.constraint-masks} for every constraint of the process.
+     */
+    static void constraints(Settings s, Engine engine) {
+        engine.setJumpForward(s.getBool("engine.jump-forward"));
+        org.robomiri.jllm.sampling.JsonConstraint.setFastMasks(s.getBool("engine.constraint-masks"));
     }
 
     /** The batch group of each loaded model's weights (engine.batch-decode); weak: gone with the weights. */
@@ -241,15 +338,32 @@ public final class ModelLoader {
      * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
      * does not (it would need its own copy).
      */
+    /** The chat format of the model; a GGUF of a family whose model_type is shared with another one asks by its own name. */
+    private static org.robomiri.jllm.tokenizer.ChatTemplate.Format chatFormat(Prepared p, Architecture arch, Tokenizer tok) {
+        if (p.gguf() != null) {
+            try (org.robomiri.jllm.gguf.GgufFile f = org.robomiri.jllm.gguf.GgufFile.open(p.gguf())) {
+                String name = f.str("general.architecture", "");
+                if (name.equals("qwen3vl")) {
+                    return org.robomiri.jllm.tokenizer.ChatTemplate.forModelType(name, tok);
+                }
+            } catch (IOException | RuntimeException e) {
+                // fall through to the model type's format
+            }
+        }
+        return org.robomiri.jllm.tokenizer.ChatTemplate.forModelType(arch.core().modelType(), tok);
+    }
+
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
         Backend backend = batched(s, l.weights(), newBackend(s, l.weights().arch, l.weights(), 1, true));
         Engine e = new Engine(backend, first.tokenizer(), l.weights().arch, first.stopTokenIds(), first.queueTimeoutMs(),
                 first.template());
-        Speculator.Config spec = speculation(s, l.weights().arch);
-        if (spec.mode() == Speculator.Mode.NGRAM) {
+        constraints(s, e);
+        Speculator.Config spec = speculation(s, l.weights().arch, l.weights());
+        if (spec.mode() == Speculator.Mode.NGRAM || spec.mode() == Speculator.Mode.MTP) {
             e.enableSpeculation(spec, null);
         }
+        e.setVision(first.vision(), false); // the encoder is shared; the first engine closes it
         return e;
     }
 
@@ -296,6 +410,13 @@ public final class ModelLoader {
             }
             tok = ggufTokenizer(s, hub, gm);
             tokNanos = System.nanoTime() - t0;
+            String backendName = s.get("backend");
+            boolean cpu = backendName.equals("cpu") || backendName.equals("auto") && !Metal.available(s.opt("backend.metal.lib"));
+            java.util.Set<org.robomiri.jllm.gguf.GgmlType> requantized = gm.forBackend(cpu);
+            if (!requantized.isEmpty()) {
+                System.err.println("GGUF on the CPU backend: " + requantized + " matrices are requantized to Q8_0 at load (their decode is"
+                        + " faster on the Q8_0 kernels than in place; -Djllm.gguf.requantize=none reads them in place)");
+            }
             weights = gm.weights();
         } catch (Exception e) {
             gm.close();
@@ -303,7 +424,7 @@ public final class ModelLoader {
         }
         System.err.printf("Mapped %s weights (GGUF, %s, %.0f MB) in %.2fs (tokenizer %.2fs)%n", arch.core().architecture(),
                 weights.quant, weights.byteSize() / 1e6, (System.nanoTime() - t0) / 1e9, tokNanos / 1e9);
-        return new Prepared(arch, tok, weights, null);
+        return new Prepared(arch, tok, weights, null, src.gguf());
     }
 
     /** The tokenizer built from the file; when its pre-tokenizer is unknown, the tokenizer.json of the original repository. */
@@ -379,10 +500,7 @@ public final class ModelLoader {
             throws Exception {
         int ctx = s.getInt("backend.ctx");
         int batch = batch(s, arch);
-        String backendName = s.get("backend");
-        if (backendName.equals("auto")) {
-            backendName = Metal.available(s.opt("backend.metal.lib")) ? "metal" : "cpu";
-        }
+        String backendName = resolveBackend(s);
         int threads = s.getInt("backend.threads");
         // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)
         // (-Djllm.cpu.native, as the Docker image's JLLM_CPU_NATIVE sets it, stands in for an unset backend.cpu.native)
@@ -392,6 +510,7 @@ public final class ModelLoader {
         }
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
+        KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         boolean mamba = arch instanceof MambaArch;
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
@@ -400,7 +519,7 @@ public final class ModelLoader {
             return switch (backendName) {
                 case "cpu" -> new Qwen3NextCpuBackend(weights, ctx, batch,
                         threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                        s.getBool("backend.cpu.int8-activations"));
+                        hybridInt8(s, weights, threads));
                 case "metal" -> new Qwen3NextMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
@@ -501,6 +620,20 @@ public final class ModelLoader {
         // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
         // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
+    }
+
+    /**
+     * {@code backend.cpu.int8-activations} for a Gated DeltaNet hybrid: {@code auto} is the measurement of the dense
+     * backends when it can be taken on these weights, else the float path (which is what the checks compare with).
+     */
+    private static boolean hybridInt8(Settings s, org.robomiri.jllm.model.ModelWeights weights, int threads) {
+        try {
+            return int8(s, weights, threads);
+        } catch (IllegalArgumentException e) {
+            throw e; // a malformed setting
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /** {@code backend.cpu.int8-activations} for {@code weights} ({@code auto} measures both paths once per model). */

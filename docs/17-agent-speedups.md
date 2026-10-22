@@ -391,7 +391,7 @@ closing of a call is committed whole. Example on the Qwen3 vocabulary: after `<t
 `\n{"name": "` becomes `\n` `{"` `name` `":` (4 tokens in one pass) and ` "` is left to the model; after the
 arguments, `}\n</tool_call>` is `}\n` `</tool_call>`, both committed. The output always parses: it is accepted by the
 same automaton that defines a valid call. Jump-forward is off with `logprobs` (forced tokens have no distribution),
-and `Engine.setJumpForward(false)` / `-Djllm.jump-forward=false` turns it off for comparisons.
+and `engine.jump-forward=false` (`Engine.setJumpForward`) turns it off.
 
 **Speculation under the constraint** ([10 §10.9](10-engine-and-server.md#109-speculative-decoding)). Previously a JSON
 constraint switched speculation off. Now prompt-lookup or draft-model drafts are checked against copies of the
@@ -420,44 +420,128 @@ pass over 151 936 logits) and tested them; when none was allowed it tested the w
    memo marks it the first time), so one-off states never pay for it; string contents (most of the vocabulary
    allowed) are never walked.
 
-**Measured.** All on the shared 4-core test machine under heavy load from other jobs (load average 20–30), so treat
-the numbers as ±30 %.
+**Measured.** Apple M1 Pro (10 cores, 32 GB), JDK 26, under the machine-wide benchmark lock (no other job ran), the
+Qwen3-0.6B vocabulary (151 669 tokens).
 
-*Per-token cost of the mask* (`ConstraintBench`: the Qwen3 vocabulary, a teacher-forced 68-token tool-argument object
-with a closed schema, Gaussian-noise logits; µs per sampling call, best of 10–25 rounds; "warm" = the rounds share the
-mask memo, as the requests of an agent sharing a tool set do):
+*Per-token cost of the mask* (`ConstraintBench`: a teacher-forced 68-token tool-argument object with a closed schema
+and synthetic Gaussian-noise logits; microseconds per sampling call, best of 20 rounds; "warm" = the rounds share the
+mask memo, as the requests of an agent that sends the same tools every time do). Three code states, built from the
+revision history and measured one after the other in one lock hold: *before* is `96a221a`, the sampler before any of
+the constrained tool-call work (the 256 most likely tokens tested one by one, then the whole vocabulary); *trie masks*
+is `aebeb6e`, the first tool-call commit (argmax first, the trie walk, memoized bit masks); *now* adds the small
+allowed lists and the memo of walks that were not worth doing. *Masks off* is the current code with
+`engine.constraint-masks=false`.
 
-| logits | sampling | before | after, cold | after, warm |
+| logits | sampling | before | trie masks | now, cold | now, warm | masks off |
+|---|---|---|---|---|---|---|
+| model agrees (reference token on top) | greedy | 192 | 59 | 60 | 58 | 58 |
+| | T = 0.7 | 227 | 257 | 241 | 176 | 237 |
+| distracted (40 other tokens above it) | greedy | 190 | 149 | 152 | **85** | 156 |
+| | T = 0.7 | 222 | 230 | 317 | 176 | 336 |
+| disagrees (nothing allowed in the top 256 at structural positions) | greedy | 515 | 343 | **171** | **89** | 438 |
+| | T = 0.7 | 702 | 545 | **268** | **178** | 1 818 |
+| unconstrained (the floor: the same sampling without a constraint) | greedy | | | 57 | | |
+| | T = 0.7 | | | 1 967 | | |
+
+Commands (from the repository root with `J="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector"`; `base-A` and
+`base-B` are checkouts of `96a221a` and `aebeb6e` that got the same `ConstraintBench.java`, adapted to their API, and
+were built with `mvn -q -o test-compile`):
+
+```sh
+$J -cp base-A/target/classes:base-A/target/test-classes org.robomiri.jllm.ConstraintBench models/Qwen_Qwen3-0.6B 20   # before
+$J -Dwarm=true -cp base-B/target/classes:base-B/target/test-classes org.robomiri.jllm.ConstraintBench models/Qwen_Qwen3-0.6B 20
+$J -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench models/Qwen_Qwen3-0.6B 20                  # now, cold
+$J -Dwarm=true -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench models/Qwen_Qwen3-0.6B 20     # now, warm
+$J -Djllm.constraint.masks=false -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench models/Qwen_Qwen3-0.6B 20
+```
+
+(`scripts/mac-validate.sh` repeats the last three as its "token mask" rows.) What the table says. Greedy decoding with
+a model that agrees with the constraint costs one pass over the logits (the argmax, 58 µs, the same as unconstrained
+greedy) however the mask is computed; the masks matter when the model's favourite tokens are not allowed. There the
+worst case (a full-vocabulary search at a structural position) went from 515 µs (greedy) and 702 µs (T = 0.7) to 171
+and 268 µs cold and 89 and 178 µs warm; with the masks switched off the current code needs 438 and 1 818 µs (the
+second is slower than the first implementation's 702 µs, because the automaton's state grew and a copy of it per
+tested token costs more). Cold sampled decoding when the model's choice is allowed, or nearly so, got a little slower
+than with the trie masks alone (317 against 230 µs for "distracted"): the second visit of a state pays for its walk;
+warm, every row is faster than before. Sampled decoding under a constraint is far cheaper than the unconstrained draw
+(1 967 µs: a softmax and a sort over the whole vocabulary) because only the 256 most likely tokens are looked at. All
+of it is small next to a forward pass of Qwen3-0.6B (about 9 ms per token on this Mac's GPU at the default
+quantization, 25–40 ms on the CPU).
+
+`mvn install` runs the same class in a quick mode (`ConstraintBench <model> --quick`: two rounds, a few seconds) that
+checks the answers instead of timing them: each sampled token must be allowed, each greedy token must be the most
+likely allowed token as found by a brute-force pass over the whole vocabulary (feeding every token's bytes to the
+automaton, independent of the masks), the reference text must complete the constraint and a mask must cost a few
+hundred trie nodes, not the vocabulary.
+
+*Jump-forward and speculation under the constraint* (`scripts/tool-call-check.sh`, i.e. `ToolCallCheck`: Qwen3-0.6B
+at the default q4 quantization, a short prompt that describes two tools, greedy, `tool_choice` auto or `"required"`;
+the same machine and lock as above; median decode time of 5 generations on Metal and 3 on the CPU after one untimed
+warm-up). The first call is the 32-token
+`<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", "days": 3, "unit": "celsius"}}\n</tool_call>`, the
+second the 43-token `read_file` call with a list of line numbers. "Drafts" are accepted / proposed.
+
+| decode ms (tokens) | Metal, call 1 | Metal, call 2 | CPU, call 1 | CPU, call 2 |
 |---|---|---|---|---|
-| model agrees (reference token on top) | greedy | 420 | 95 | 106 |
-| | T = 0.7 | 436 | 545 | 300 |
-| distracted (40 other tokens above it) | greedy | 331 | 239 | 127 |
-| | T = 0.7 | 550 | 452 | 408 |
-| disagrees (nothing allowed in the top 256 at structural positions) | greedy | 1 422 | 350 | 144 |
-| | T = 0.7 | 2 414 | 545 | 292 |
+| every token sampled (`engine.jump-forward=false`, speculation off) | 254 (32) | 349 (43) | 295 | 399 |
+| + jump-forward | **149** (18 forced) | **288** (10 forced) | **222** | **358** |
+| prompt-lookup speculation, no jump-forward | 228 (8/9 drafts) | 260 (25/44) | 280 | 455 |
+| prompt lookup + jump-forward | 152 (14 forced, 4/4) | 260 (10 forced, 12/26) | 233 | 419 |
+| the model drafting for itself, no jump-forward | 336 (28/28) | 483 (38/38) | 488 | 675 |
+| the model drafting for itself + jump-forward | 301 (9 forced, 17/17) | 433 (6 forced, 31/31) | 437 | 632 |
 
-Greedy decoding costs a single argmax pass when the model agrees (the floor: unconstrained greedy pays the same pass)
-and at most a few hundred µs otherwise, against ~25–40 ms for a forward pass of Qwen3-0.6B; the worst case
-(a full-vocabulary search) dropped from 1.4–2.4 ms to 0.15–0.55 ms. Cold sampled decoding of agreeing logits got a
-little slower (the second visit of a state pays for its walk); warm it is faster everywhere.
+(Metal: ~8 ms per plain constrained step, 113 tok/s unconstrained greedy with the pipelined step the constraint
+turns off; CPU: native int8 kernels on 10 threads with `-Djllm.cpu.deterministic=true`, which is slower than the
+default kernels.) Jump-forward removes 18 of the 32 passes of the first call (the head, the name once unambiguous,
+the key and value openings, the closing): 1.7× on Metal, 1.3× on the CPU, where a pass of several tokens costs
+more relative to a single token than on the GPU. Prompt lookup helps when the call repeats text from the prompt (the
+second call, whose prompt contains a similar `read_file` call: 349 → 260 ms) and adds nothing on top of jump-forward
+when jump-forward already wrote what it would have drafted (call 1: 152 against 149 ms). A *self*-draft, which costs
+as much as the model it drafts for, is slower than plain steps here; it is in the table because every draft is
+accepted, which is the case that exercises long accepted runs, not because it is a good draft (a real draft is
+smaller: [10 §10.9](10-engine-and-server.md#109-speculative-decoding), [08 §8.25](08-metal-backend.md)).
 
-*Jump-forward and speculation* (`ToolCallTest`, Qwen3-0.6B Q8_0, CPU, 2 threads, a 76-token prompt, the 32-token
-call `<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris", "days": 3, "unit": "celsius"}}\n</tool_call>`
-with `tool_choice: "required"`, greedy):
+**Speculation does not change the constrained output.** The greedy tokens are identical with speculation off, with
+prompt lookup and with draft models, with and without jump-forward and for `auto` and `required`, on Metal and on the
+CPU. Every row of `ToolCallCheck` compares the tokens, not just the text, with the speculation-off run, and the script
+fails on any difference:
 
-| | forced tokens | decode time |
-|---|---|---|
-| constrained, every token sampled | 0 | 11.5 s |
-| + prompt-lookup speculation | 0 (10 of 14 drafts accepted) | 8.5 s |
-| + jump-forward | 18 of 32 | **4.6 s** |
-| + jump-forward and speculation | 18 (4 of 8 drafts accepted) | 5.5 s |
+```sh
+scripts/tool-call-check.sh            # CPU (deterministic kernels, int8 activations fixed) and Metal; add cpu or metal to pick one
+scripts/tool-call-check.sh metal --check-rounds 5 --check-max 48       # the same flags as java ... ToolCallCheck, then jllm's
+```
 
-The output is the same call in all four. Jump-forward removes 18 of the 32 passes (the head, the name once
-unambiguous, the key and value openings, the closing): 2.5× here; speculation adds nothing on top in this short call
-because the text it would have drafted is the text jump-forward already forced. On the scripted fake model the same
-holds for pass counts: 78 passes without either, 63 with speculation, 48 with jump-forward, for a 77-token reply with
-two calls. With deterministic CPU kernels (`-Djllm.cpu.deterministic=true`) the speculative constrained output equals
-the plain constrained output token for token, with and without jump-forward (`ToolCallTest`).
+or by hand, for the CPU,
+`java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Djllm.cpu.deterministic=true
+-Djllm.engine.adaptiveDraft=false -cp target/classes:target/test-classes org.robomiri.jllm.ToolCallCheck --backend cpu
+--ctx 1024 --backend.cpu.int8-activations true --check-draft Qwen/Qwen3-0.6B,hf-internal-testing/tiny-random-Qwen3MoeForCausalLM`.
+Two drafts are used, since they exercise different parts of the interaction: the model drafting for itself (every
+draft is right unless the constraint disagrees with it, so long runs are accepted, cut at the first token the
+constraint refuses, and the draft model's cache is rolled back to what the target kept), and a random tiny model of
+the same tokenizer (wrong almost every time: a rejection at the first position, then the target's constrained choice
+is used). The check pins the draft length to the doubling rule (`-Djllm.engine.adaptiveDraft=false`; the cost model
+would stop drafting when it measures speculation as not paying, and nothing would be checked) and, on the CPU, the
+int8 activations (`auto` times both ways at every load and may choose differently in two loads). The tiny draft cannot
+run on Metal (head size 16; the kernels need a multiple of 32), so Metal is checked with the self-draft only. Result
+of the last run: 40 comparisons with the speculation-off run (8 requests, each against prompt lookup and the drafts: 24 on the
+CPU, 16 on Metal), all identical.
+
+Two things cost the check some debugging, and are worth knowing. (1) On the CPU the very first generation of a JVM
+once wrote free text where every later one, and every other speculative setting, wrote the call: twice in five runs
+(once with `int8-activations=auto`, which can pick differently in two loads, once with it fixed), always the first
+generation of the process. The cause was not isolated; cold, interpreted code rounding a float reduction differently from
+the optimized code at a near-tie of the first token fits, and a generation before anything is recorded, which
+`ToolCallCheck` and `ToolCallTest` now do, removed it (three full runs since, no difference). (2) A GGUF Q4_K_M of the
+same model, as the draft, is refused ("does not share the target's tokenizer": its tokenizer, read from the file,
+encodes the probe text differently from `tokenizer.json`), so it is not among the drafts.
+
+Without a model, `ToolCallTest` (in `mvn install`, with the Qwen3-0.6B tokenizer and a scripted fake model whose
+logits depend on the whole cached history, and which is tempted to write tokens the constraint must mask) covers the
+same interaction: prompt lookup and two draft models (one writing the same script, whose proposals include the masked
+tokens and are cut; one writing another call, rejected at its first different token), with and without jump-forward,
+all giving the plain constrained tokens, in fewer passes (78 plain; 25 and 69 with the two drafts, 63 with prompt lookup;
+48 with jump-forward, 26 and 44 with jump-forward and the drafts); and the same tokens again with `engine.constraint-masks=false`. On Qwen3-0.6B with
+deterministic CPU kernels it compares the speculative and plain constrained output as well.
 
 *Reliability.* Every call the constrained engine writes parses and matches the schema subset: on the fake model that
 is tempted by line breaks and tabs inside the call (`ToolCallTest`, `ToolCallApiTest`) and on Qwen3-0.6B. What the
@@ -469,3 +553,16 @@ requests (it picks tokens the CPU never checks); `logprobs` turn jump-forward of
 Hermes / Qwen one; families whose own tool format differs (Llama 3's bare JSON, Mistral's `[TOOL_CALLS]`) are served
 through the same Hermes prompt, as before. The console's own chat (`/api/chat`) is not constrained yet; the `/v1`
 endpoints are.
+
+*Switches.* Three settings (bundled `jllm.properties`, any flag, the console's settings page) each keep the old path
+when `false` (with the last two the output is the same tokens as with them on; the first changes what the model may write):
+
+| setting | default | off |
+|---|---|---|
+| `engine.constrained-tools` | `true` | `tools` of `/v1/chat/completions` only go into the prompt; the reply is free text parsed afterwards (`ToolCallFormat.parse`), and `response_format` with `tools` is a 400 again. Read for every request |
+| `engine.jump-forward` | `true` | every token is sampled and takes a pass of its own, for tool calls and `response_format` alike |
+| `engine.constraint-masks` | `true` | no trie walk, no memo, no allowed lists: candidates are tested one by one, the 256 most likely first, then the whole vocabulary (applies to the process: it is set when a model loads) |
+
+`scripts/mac-validate.sh` has rows for the last two on a Mac: the decode time of a constrained tool call with jump-forward
+off and on and with each speculation mode, and the token mask in microseconds with the masks on, on with a shared memo,
+and off.

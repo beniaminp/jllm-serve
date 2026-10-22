@@ -192,6 +192,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- VisionTest: images as input (resize rules, request parts, a tiny vision-language model on CPU and Metal) -->
+                    <execution>
+                        <id>vision-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.VisionTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <execution>
                         <id>gguf-kernels-check</id>
                         <phase>test</phase>
@@ -329,6 +350,26 @@
                         </configuration>
                     </execution>
                     <execution>
+                        <id>gguf-qwen-next-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.GgufQwenNextTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <execution>
                         <id>gguf-hub-test</id>
                         <phase>test</phase>
                         <goals>
@@ -389,6 +430,73 @@
                                 <classpath/>
                                 <argument>org.robomiri.jllm.ToolCallTest</argument>
                                 <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- ConstraintBench in its quick mode: the token masks of constrained sampling on the real Qwen3 vocabulary checked
+                         against a brute-force oracle (a few seconds); the timed run is by hand (see the class comment) -->
+                    <execution>
+                        <id>constraint-bench</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.ConstraintBench</argument>
+                                <argument>${jllm.test.model}</argument>
+                                <argument>--quick</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- AudioTest: log-mel, a tiny random Whisper (CPU and Metal) against transformers, decoding protocol, audio
+                         files, resampling, OuteTTS text front end, API functions; the WavTokenizer check runs when its GGUF is on disk -->
+                    <execution>
+                        <id>audio-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.AudioTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- DiffusionTest: image generation (UNet, VAE, CLIP, samplers, img2img, inpainting) on tiny random
+                         pipelines against diffusers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>diffusion-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.DiffusionTest</argument>
                             </arguments>
                             <classpathScope>test</classpathScope>
                         </configuration>

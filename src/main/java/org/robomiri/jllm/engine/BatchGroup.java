@@ -255,8 +255,76 @@ public final class BatchGroup {
         }
 
         @Override
+        public boolean supportsEmbeds() {
+            return inner.supportsEmbeds();
+        }
+
+        @Override
+        public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+            locked(() -> inner.forwardEmbeds(embeds, off, n, pos, deepstack, logits));
+        }
+
+        @Override
+        public boolean supportsBidirectionalSpan() {
+            return inner.supportsBidirectionalSpan();
+        }
+
+        @Override
+        public void forwardEmbedsBidirectional(float[] embeds, int off, int n, int pos, float[] logits) {
+            locked(() -> inner.forwardEmbedsBidirectional(embeds, off, n, pos, logits));
+        }
+
+        @Override
+        public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+            boolean[] ok = new boolean[1];
+            locked(() -> ok[0] = inner.setRopePositions(from, p));
+            return ok[0];
+        }
+
+        @Override
+        public boolean ropePositionsCustom() {
+            return inner.ropePositionsCustom();
+        }
+
+        @Override
         public boolean supportsPrefixReuse() {
             return inner.supportsPrefixReuse();
+        }
+
+        // multi-token prediction (a Qwen3.5 GGUF): the head runs on the device like any pass, so under its lock
+        @Override
+        public boolean hasMtp() {
+            return inner.hasMtp();
+        }
+
+        @Override
+        public void enableMtp(boolean on) {
+            locked(() -> inner.enableMtp(on));
+        }
+
+        @Override
+        public boolean mtpReady() {
+            return inner.mtpReady();
+        }
+
+        @Override
+        public void mtpDraft(int token, float[] logits) {
+            locked(() -> inner.mtpDraft(token, logits));
+        }
+
+        @Override
+        public boolean supportsRollback() {
+            return inner.supportsRollback();
+        }
+
+        @Override
+        public void checkpointState() {
+            locked(inner::checkpointState);
+        }
+
+        @Override
+        public void rollbackState(int keep) {
+            locked(() -> inner.rollbackState(keep));
         }
 
         @Override

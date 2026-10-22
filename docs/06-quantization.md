@@ -393,7 +393,7 @@ All CPU matmuls go through `CpuMatmul.mul`, which picks the kernel by the number
   and the gain is about 4× decode speed on the CPU (13 → 54 tok/s in the A/B run of
   [11 §11.1](11-performance.md#111-measured); the current build decodes ~51 tok/s). Q2_K rows keep the float path.
 - **prefill** (`n > 1`: `VectorKernels.dequantRow` + `dot4x4` / `dot4`): expand 4 rows into a thread-local float
-  buffer, then reuse them for every token of the chunk (up to `backend.batch`, 64), four tokens at a time, so the
+  buffer, then reuse them for every token of the chunk (up to `backend.batch`, 64 on the CPU), four tokens at a time, so the
   unpacking cost is amortized. Prefill always uses float activations.
 - **Metal** (`block_dot<QT>` / `mm_row<QT>` in `kernels.metal`): same as float decode, one `uchar4` at a time;
   activations stay f32 on the GPU.
@@ -436,6 +436,7 @@ default and optionally f16 (`backend.kv-dtype`, [05 §5.9](05-transformer-math.m
 | **Q2_K** (llama.cpp "K-quant") | super-blocks of 256 with 4-bit sub-block scales *and mins*, 2.625 bits/weight | *done*: `--quant q2k`, see [13](13-q2k-quantization.md) (applied to every linear layer; pure Q2_K breaks a 0.6B model) |
 | **Q6_K** (llama.cpp "K-quant") | super-blocks of 256, 6-bit codes with int8 sub-block scales, 6.5625 bits/weight | *done*: `--head-quant q6k` for the embedding / LM head, `--quant q6k` for all layers (6.5.1) |
 | **Q4_K / Q5_K** (llama.cpp "K-quants") | super-blocks of 256 with 6-bit sub-scales and minimums, ~0.56–0.81 B/weight with lower error than Q4_0 | the engine does not *produce* them (the simplest format that works is Q4_0, [13 §13.8](13-q2k-quantization.md#138-what-the-other-k-quants-change) compares them), but it *reads* Q4_K and Q5_K from llama.cpp GGUF files in place, and Q6_K in place as well ([16](16-gguf.md)) |
+| **Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16** (llama.cpp) | affine and 5-bit legacy blocks, 3-bit K-quant, non-linear 4-bit codebooks, e2m1 floats with a power-of-two scale, plain halves | the engine does not produce them either, but it reads them in place from GGUF files on both backends: layouts and exact dequantization in [6.12](#612-the-other-ggml-block-formats-read-in-place-from-gguf-files) |
 | **GPTQ / AWQ** | choose the quantized values by minimizing the *output* error on calibration data, not per-weight rounding | needs calibration runs and a solver at conversion time |
 | **int8 activations** (Q8_0 for `x` too) | integer × integer dot products, twice the lanes per SIMD register and no byte→float conversions | *done* on the CPU decode path for Q4_0 / Q8_0 weights, `backend.cpu.int8-activations` ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) |
 | **fp8 / NF4** | 8-bit floats; 4-bit non-uniform "normal float" levels | GPU-oriented; no hardware fp8 on Apple M1 |
@@ -454,3 +455,117 @@ default and optionally f16 (`backend.kv-dtype`, [05 §5.9](05-transformer-math.m
   and used in place by both the CPU (Vector API, optionally with int8 activations) and the GPU (zero-copy Metal
   buffers).
 - Decode speed ∝ 1 / bytes, which is the whole reason to do this.
+
+---
+
+## 6.12 The other ggml block formats, read in place from GGUF files
+
+[16](16-gguf.md) runs llama.cpp's `.gguf` files without converting them, and those files hold more block formats than
+this chapter's two. The engine reads Q4_0, Q8_0, Q4_K, Q5_K, Q6_K and Q2_K directly (6.10); this section is the
+block layout and the exact dequantization of the rest it reads in place: **Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS,
+MXFP4** and the plain **F16 / BF16** matrices. All of them are byte-compatible with llama.cpp's `block_*` structs and
+decode to exactly the floats of its `dequantize_row_*` functions (`ggml-quants.c`; the checks compare bit for bit).
+Little endian everywhere, `d` and `m` are **f16**.
+
+### 🧸 The idea, with cups and rulers
+
+Think of a row of weights as a long shelf of cups, each filled to a different height. To save room we do not write
+every height down; we pack the cups in small **boxes** and put a ruler in each box. A weight is then just "which mark
+of the ruler".
+
+* **Q4_0** (6.3) is the ruler with 16 evenly spaced marks that always starts at the same place, so every box says only
+  how far apart the marks are (`d`).
+* **Q4_1** gives the box a second number, where the ruler *starts* (`m`). A box whose cups are all tall can then use
+  all its marks for the tall cups instead of wasting half of them on heights it never needs.
+* **Q5_0 / Q5_1** are the same rulers with 32 marks instead of 16: one extra bit per cup, which is kept in a separate
+  little strip of 32 bits so the nibbles stay where they were.
+* **IQ4_NL** keeps 16 marks but spaces them unevenly: close together near zero, where most cups are, and far apart at
+  the extremes. The mark numbers are looked up in a small fixed table instead of being counted.
+* **IQ4_XS** is IQ4_NL for big boxes of 256 cups divided into 8 rooms; each room has its own step size, itself stored
+  in 6 bits relative to one shared number, so the labels cost almost nothing.
+* **MXFP4** writes each cup as a tiny floating-point number (a sign, a 2-bit exponent and 1 mantissa bit: 0, 0.5, 1,
+  1.5, 2, 3, 4, 6) and the box's step is only a power of two, a single byte. It is what OpenAI's gpt-oss experts
+  are stored in.
+* **Q3_K** is the 3-bit cousin of the K-quants (13): 256 cups per box, 16 small rooms with their own 6-bit step sizes,
+  and each cup is 2 bits plus one "is it in the lower half" bit kept in a separate mask.
+* **F16 / BF16** are not boxes at all: every cup's height is simply written down with 16 bits.
+
+### 📐 Layouts and formulas
+
+`qs[j]` below is byte `j` of a block's nibble bytes: its low nibble is weight `j`, its high nibble weight `j + 16` (the
+Q4_0 convention), for every 32-weight block type.
+
+```
+type    bytes / weights  bits/w   layout (offset: field)                                        weight
+Q4_1    20 / 32          5.0      0: f16 d | 2: f16 m | 4: u8 qs[16]                            q d + m                q = nibble
+Q5_0    22 / 32          5.5      0: f16 d | 2: u8 qh[4] | 6: u8 qs[16]                         (q5 - 16) d            q5 = nibble | bit << 4
+Q5_1    24 / 32          6.0      0: f16 d | 2: f16 m | 4: u8 qh[4] | 8: u8 qs[16]              q5 d + m
+IQ4_NL  18 / 32          4.5      0: f16 d | 2: u8 qs[16]                                       d kvalues_iq4nl[nibble]
+MXFP4   17 / 32          4.25     0: u8 e (e8m0) | 1: u8 qs[16]                                 kvalues_mxfp4[nibble] 2^(e - 128)
+Q3_K    110 / 256        3.4375   0: u8 hmask[32] | 32: u8 qs[64] | 96: u8 scales[12] | 108: f16 d     d (sc_s - 32) (((qs >> 2j) & 3) - (hmask bit ? 0 : 4))
+IQ4_XS  136 / 256        4.25     0: f16 d | 2: u16 scales_h | 4: u8 scales_l[4] | 8: u8 qs[128]  d (ls_i - 32) kvalues_iq4nl[nibble]
+F16     2 / 1            16       the IEEE half                                                  itself
+BF16    2 / 1            16       the upper 16 bits of an f32                                    itself
+```
+
+**The fifth bit (Q5_0, Q5_1).** `qh` is a little-endian `u32`; weight `j < 16` (low nibble of `qs[j]`) takes bit `j` and
+weight `j + 16` (high nibble) takes bit `j + 16`: `q5 = nibble | (((qh >> bit) & 1) << 4)`. Because the low half of the
+weights uses `qh`'s low 16 bits and the high half its upper 16, a kernel that decodes one half of the block reads
+only 2 of the 4 bytes.
+
+**IQ4_NL.** The 16 levels are the signed bytes
+`kvalues_iq4nl = -127 -104 -83 -65 -49 -35 -22 -10 1 13 25 38 53 69 89 113`
+(denser around zero than a uniform grid); `w = d · kvalues[nibble]` and `d` is chosen at quantization time so the
+extreme level lands on the block's extreme value. Same nibble order as Q4_0.
+
+**IQ4_XS.** A 256-weight super-block of 8 sub-blocks of 32. Sub-block `i` has the 6-bit integer
+`ls_i = (scales_l[i/2] >> 4(i mod 2)) & 15 | ((scales_h >> 2i) & 3) << 4` and weights
+`d (ls_i - 32) kvalues_iq4nl[nibble]`, nibbles in the Q4_0 order within each 16 bytes of `qs`.
+
+**MXFP4.** The OCP microscaling FP4: each value is an `e2m1` number (sign, 2 exponent bits, 1 mantissa bit) with the
+nine magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6; llama.cpp stores them **doubled** as integers
+`kvalues_mxfp4 = 0 1 2 3 4 6 8 12 0 -1 -2 -3 -4 -6 -8 -12` (nibble 8 is "-0") so that the scale can be a bare
+exponent: `w = kvalues[nibble] · 2^(e - 128)`, where `2^(e-128)` is `2^(e-127)` (the shared e8m0 scale) times the
+factor 1/2 that undoes the doubling. The float with the bits `(e - 1) << 23` is that power of two for `e >= 2`; for
+`e = 0, 1` it is a subnormal (`0x00200000 << e`) which the GPU may flush to zero, a case no real model has.
+
+**Q3_K.** Sixteen 6-bit scales `sc_s` (`s = 0 … 15`, 16 weights each) are packed into 12 bytes: scale
+`s = 4g + i` takes its low four bits from byte `4 (g & 1) + i` (low nibble for `g < 2`, high nibble for `g >= 2`)
+and its upper two bits from bits `2g, 2g+1` of byte `8 + i`. The quantized value of weight `l` of the 32-weight
+unit `u = 4n + j` (`n = 0, 1` the 128-weight half, `j = 0 … 3` the bit pair) is
+`((qs[32 n + l] >> 2j) & 3) - (hmask[l] bit u ? 0 : 4)`, i.e. `-4 … 3`; the 16 weights `l < 16` use scale
+`sc_{2u}` and `l >= 16` use `sc_{2u+1}`.
+
+**Worked examples** (the first weights of a block, decoded by the same reference the tests use):
+
+```
+Q4_1    d = 0.5,  m = -1,  qs[0] = 0x73, qs[1] = 0xF0
+          w0  = 3 · 0.5 - 1   =  0.5      w1  =  0 · 0.5 - 1  = -1       (low nibbles of qs[0], qs[1])
+          w16 = 7 · 0.5 - 1   =  2.5      w17 = 15 · 0.5 - 1  =  6.5     (high nibbles)
+Q5_0    d = 0.25, qh = bit 0 and bit 16 set, qs[0] = 0x73
+          w0  = (3 + 16 - 16) · 0.25 = 0.75     w1 = (0 - 16) · 0.25 = -4  (its bit 1 is clear)
+          w16 = (7 + 16 - 16) · 0.25 = 1.75
+IQ4_NL  d = 0.01, qs[0] = 0x9F, qs[1] = 0x30
+          w0 = kvalues[15] d = 113 · 0.01 = 1.13      w1 = kvalues[0] d = -127 · 0.01 = -1.27
+          w16 = kvalues[9] d = 13 · 0.01 = 0.13       w17 = kvalues[3] d = -65 · 0.01 = -0.65
+MXFP4   e = 127 (2^-1), qs[0] = 0xA5, qs[1] = 0x7F
+          w0 = kvalues[5] · 0.5 = 6 · 0.5 = 3          w1 = kvalues[15] · 0.5 = -12 · 0.5 = -6
+          w16 = kvalues[10] · 0.5 = -2 · 0.5 = -1      w17 = kvalues[7] · 0.5 = 12 · 0.5 = 6
+```
+
+**Is the arithmetic exact?** Every product in these formulas is exactly representable in an f32 (`q`, `kvalues`, `sc`
+are integers of at most 7 bits and `d`, `m` have an 11-bit mantissa; IQ4_XS's `d (ls - 32) · kvalues` needs 24 bits,
+which just fits), so a fused multiply-add and a separate multiply and add give the same float. That is why the
+dequantizers of the Java reference (`model/Ggml.java`), the Vector API kernels, the numpy references of
+`scripts/metal-emu/ggml_ref.py` and llama.cpp's C code agree bit for bit
+(`GgufKernelsCheck`, `ggml_ref.py <libggmlq>`: 2048–12 288 random-block weights per type, zero differences), and why
+the GPU kernels can differ from them only in the order in which a dot product is summed.
+
+**Dot products.** On the CPU the float path dequantizes in registers like Q4_0 does (6.8); the int8-activation path
+(6.8, `cpu/GgufInt8Kernels.java`) multiplies the integer codes with the quantized activation and applies the scales
+per block: Q4_1 / Q5_1 use `Σ (d q + m) x = d Σ q x + m Σ x` with the activation block sum the K-quants already compute;
+the table formats look the nibbles up with a byte shuffle (`tbl`) and multiply them as Q8_0 bytes. On Metal each of
+these formats is one more branch of `gg_unit` (`kernels.metal`, "GGUF block types, second set"), which decodes 32
+consecutive weights into 8 `float4`, so every kernel family (decode matvec, tiled and matrix-unit prefill, the MoE
+expert kernels, the embedding lookup) has them without further code. Which type is used in place and which is converted
+is in [16.4](16-gguf.md#164-the-block-formats) and [16.6](16-gguf.md#166-zero-copy-how-the-kernels-read-the-files-pages).

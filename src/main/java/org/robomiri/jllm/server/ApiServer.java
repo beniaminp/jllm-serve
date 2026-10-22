@@ -92,6 +92,7 @@ public final class ApiServer implements AutoCloseable {
 
     private final Engine engine;
     private final String modelId;
+    private volatile AudioRoutes audio; // null: no /v1/audio endpoints
     private final HttpServer http;
     private final AtomicLong counter = new AtomicLong();
     private final AtomicBoolean thinkingNoted = new AtomicBoolean();
@@ -115,13 +116,39 @@ public final class ApiServer implements AutoCloseable {
         this.defaults = options.sampling();
         this.thinkingDefault = options.thinkingDefault();
         this.maxPromptBytes = options.maxPromptBytes() > 0
-                ? options.maxPromptBytes() : 16L * engine.backend().contextLength();
+                ? options.maxPromptBytes() : (engine == null ? 0 : 16L * engine.backend().contextLength());
         this.requestTimeoutMs = options.requestTimeoutMs();
         this.http = new HttpServer(host, port, options.http(), this::handle);
     }
 
     public int port() {
         return http.port();
+    }
+
+    private volatile ImageHttp images;
+
+    /** Adds the image endpoints ({@code /v1/images/*}) served by {@code images}; the text engine may be null (images only). */
+    public ApiServer withImages(ImageHttp images) {
+        this.images = images;
+        return this;
+    }
+
+    // ---- pictures in chat messages (docs/20)
+    private long imageMaxBytes = 32L << 20;
+    private long imageMaxPixels = org.robomiri.jllm.vision.ImageDecoder.MAX_PIXELS;
+    private boolean imageAllowPrivate;
+
+    /** Limits for the pictures of a request: file size, decoded pixels, and whether http(s) URLs on private networks may be fetched. */
+    public ApiServer imageLimits(long maxBytes, long maxPixels, boolean allowPrivateUrls) {
+        this.imageMaxBytes = maxBytes;
+        this.imageMaxPixels = maxPixels;
+        this.imageAllowPrivate = allowPrivateUrls;
+        return this;
+    }
+
+    /** Offers the OpenAI audio endpoints of {@code audio} (speech-to-text / text-to-speech models) as well. */
+    public void setAudio(AudioRoutes audio) {
+        this.audio = audio;
     }
 
     public void serve() {
@@ -143,12 +170,30 @@ public final class ApiServer implements AutoCloseable {
             res.send(204, "text/plain", "");
             return;
         }
+        ImageHttp img = images;
+        if (img != null && img.handle(path, req, res)) {
+            return;
+        }
+        AudioRoutes ar = audio;
+        if (ar != null && ar.handle(path, req, res)) {
+            return;
+        }
         switch (path) {
             case "/", "/index.html" -> res.send(200, "text/html; charset=utf-8", WebUi.HTML);
             case "/health" -> res.send(200, "application/json", Json.write(Json.obj("status", "ok", "model", modelId)));
-            case "/v1/models" -> res.send(200, "application/json", Json.write(Json.obj(
-                    "object", "list",
-                    "data", List.of(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve")))));
+            case "/v1/models" -> {
+                List<Object> data = new ArrayList<>();
+                if (engine != null) {
+                    data.add(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve", "kind", "text"));
+                }
+                if (img != null) {
+                    data.add(img.modelObject());
+                }
+                if (ar != null) {
+                    data.addAll(ar.modelObjects());
+                }
+                res.send(200, "application/json", Json.write(Json.obj("object", "list", "data", data)));
+            }
             case "/v1/chat/completions" -> completion(req, res, true);
             case "/v1/completions" -> completion(req, res, false);
             default -> res.send(404, "application/json", error("not found: " + path));
@@ -156,6 +201,10 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private void completion(HttpServer.Request req, HttpServer.Response res, boolean chat) throws Exception {
+        if (engine == null) {
+            res.send(404, "application/json", error("no text model is loaded (this server was started with --model none)"));
+            return;
+        }
         if (!req.method.equals("POST")) {
             res.send(405, "application/json", error("use POST"));
             return;
@@ -173,6 +222,7 @@ public final class ApiServer implements AutoCloseable {
         }
         Tokenizer tok = engine.tokenizer();
         int[] prompt;
+        org.robomiri.jllm.engine.MediaPrompt media = null;
         SamplingParams params;
         OpenAiFeatures.Options o;
         int echoFrom; // the prompt tokens an echo returns start here (after a BOS the engine put in front)
@@ -181,7 +231,20 @@ public final class ApiServer implements AutoCloseable {
             checkUnsupported(body, chat);
             o = OpenAiFeatures.parse(body, chat, tok.vocabSize());
             int[] ids;
+            List<org.robomiri.jllm.vision.Rgb> images = List.of();
             if (chat) {
+                List<Object> raw = Json.list(body, "messages");
+                if (raw != null && org.robomiri.jllm.vision.ImageParts.hasImages(raw)) {
+                    if (engine.vision() == null) {
+                        throw RequestError.invalid("this model cannot see images: it was loaded without a vision projector"
+                                + " (mmproj); see model.mmproj");
+                    }
+                    org.robomiri.jllm.vision.ImageParts.Extracted ex = org.robomiri.jllm.vision.ImageParts.extract(raw,
+                            new org.robomiri.jllm.vision.ImageFetcher(imageAllowPrivate, imageMaxBytes), imageMaxBytes, imageMaxPixels);
+                    body = new java.util.LinkedHashMap<>(body);
+                    body.put("messages", ex.messages());
+                    images = ex.images();
+                }
                 ids = chatPrompt(body, o.json());
             } else if (o.suffix() != null) {
                 checkPromptBytes(utf8Length(promptText(body)) + utf8Length(o.suffix()));
@@ -189,7 +252,11 @@ public final class ApiServer implements AutoCloseable {
             } else {
                 ids = rawPrompt(body);
             }
-            prompt = engine.preparePrompt(ids); // with the family BOS, if any
+            int[] prepared = engine.preparePrompt(ids); // with the family BOS, if any
+            if (!images.isEmpty()) {
+                media = engine.vision().build(prepared, images);
+            }
+            prompt = media != null ? media.identity() : prepared;
             echoFrom = prompt.length - ids.length;
             if (o.echo()) {
                 echoText = promptText(body);
@@ -218,12 +285,16 @@ public final class ApiServer implements AutoCloseable {
         long created = System.currentTimeMillis() / 1000;
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
         Engine.Decoding decoding = o.decoding(tok);
+        org.robomiri.jllm.engine.MediaPrompt mediaFinal = media;
 
         Deadline deadline = new Deadline(requestTimeoutMs);
         if (!stream) {
             List<Engine.Result> all;
             try {
-                all = engine.generate(prompt, params, decoding, o.count(), null,
+                all = mediaFinal == null
+                        ? engine.generate(prompt, params, decoding, o.count(), null,
+                        () -> req.clientGone() || deadline.getAsBoolean())
+                        : engine.generate(mediaFinal, params, decoding, o.count(), null,
                         () -> req.clientGone() || deadline.getAsBoolean());
             } catch (Engine.OverloadedException e) {
                 res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
@@ -342,8 +413,13 @@ public final class ApiServer implements AutoCloseable {
             }
         };
         try {
-            engine.generate(prompt, params, decoding, count, sink,
-                    () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
+            if (mediaFinal == null) {
+                engine.generate(prompt, params, decoding, count, sink,
+                        () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
+            } else {
+                engine.generate(mediaFinal, params, decoding, count, sink,
+                        () -> failure[0] != null || req.clientGone() || deadline.getAsBoolean());
+            }
         } catch (RuntimeException e) {
             if (res.started()) {
                 // The status line is long gone: tell the client in-band (OpenAI SDKs raise on an "error" event),

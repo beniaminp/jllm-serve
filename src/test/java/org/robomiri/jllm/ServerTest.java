@@ -80,7 +80,7 @@ public final class ServerTest {
         check(ok.getInt("backend.ctx") == 2048 && ok.getInt("server.port") == 9000, "settings: aliases and --key=value");
         for (String[] bad : new String[][]{{"--ctx", "abc"}, {"--ctx", "0"}, {"--backend", "gpu"}, {"--quant", "q3"},
                 {"--backend.kv-dtype", "f64"}, {"--hub.timeout-ms", "0"}, {"--top-p", "2"}, {"--temp", "x"},
-                {"--server.port", "70000"}}) {
+                {"--server.port", "70000"}, {"--batch", "0"}, {"--batch", "big"}}) {
             String[] args = {"serve", bad[0], bad[1]};
             String key = Settings.ALIASES.getOrDefault(bad[0].substring(2), bad[0].substring(2));
             try {
@@ -91,6 +91,11 @@ public final class ServerTest {
                         "settings: " + bad[0] + " " + bad[1] + " rejected up front: " + e.getMessage());
             }
         }
+        // backend.batch: auto (the default, resolved per model by ModelLoader.batch) or a positive number
+        check(Settings.load(new String[]{"serve"}).validate().get("backend.batch").equals("auto")
+                        && !ModelLoader.explicitBatch(Settings.load(new String[]{"serve"}))
+                        && ModelLoader.explicitBatch(Settings.load(new String[]{"serve", "--batch", "128"}).validate()),
+                "settings: backend.batch is auto by default and a number when given");
         // L10: --key=value for values that start with --, boolean flags, strict booleans, CLI-only keys in a file
         Settings s = Settings.load(new String[]{"run", "--system=--weird", "--raw", "--prompt", "hi", "--think", "no"}).validate();
         check(s.get("chat.system").equals("--weird") && s.getBool("raw") && s.get("prompt").equals("hi") && !s.getBool("chat.thinking"),
@@ -184,7 +189,7 @@ public final class ServerTest {
         // L8: unsupported request features
         r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
                 + "{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]}");
-        check(r.status == 400 && r.body.contains("image_url"), "image content part: 400");
+        check(r.status == 400 && r.body.contains("cannot see images"), "image content part without a vision projector: 400 (got " + r.status + ")");
         r = f.post("/v1/chat/completions", "{" + msgs + ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}");
         check(r.status == 400 && r.body.contains("not supported"), "tools: 400 (the web console's job)");
         // the OpenAI extras: invalid values are a 400 naming the field

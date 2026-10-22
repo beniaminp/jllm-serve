@@ -27,6 +27,8 @@ public sealed interface Architecture permits Decoder, MambaArch, Qwen3NextArch {
      * {@code 2i} with {@code 2i + 1} instead of {@code i} with {@code i + rotaryDim/2} (docs/16-gguf.md).
      */
     String GGUF_INTERLEAVED_ROPE = "jllm_gguf_interleaved_rope";
+    /** Config key set for a Qwen3.5 GGUF: its Gated DeltaNet value heads are in tiled, not grouped, order. */
+    String GGUF_TILED_VALUE_HEADS = "jllm_gguf_tiled_value_heads";
 
     Core core();
 

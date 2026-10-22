@@ -196,7 +196,7 @@ tokens of the chunk, and its weights are read (on the CPU: each group of 4 rows 
 The fixed cost per expert is shared by 4 tokens at `n = 64` and by 16 at `n = 256`. Both backends group the slots
 by expert: the CPU with a counting sort (12.4), Metal with `moe_sort` and the simdgroup-matrix tile kernels
 ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)). And MoE models prefill in **256-token chunks**
-unless `backend.batch` is set. Measured on the CPU expert path with one Qwen3-30B-A3B-shaped layer (Q4_0, 4
+unless `backend.batch` is set to a number. Measured on the CPU expert path with one Qwen3-30B-A3B-shaped layer (Q4_0, 4
 cores), that is 1.5–1.6× faster per token than 64-token chunks; on Metal it is not measured yet
 ([11](11-performance.md)).
 

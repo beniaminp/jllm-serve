@@ -212,8 +212,20 @@ public class SettingsService {
     }
 
     public static Scope scope(String key) {
+        if (key.startsWith("image.")) { // the image model's device and VAE tiling apply at load; the rest belongs to "jllm image" / "jllm serve"
+            return key.equals("image.backend") || key.equals("image.precision") || key.startsWith("image.vae-tile") ? Scope.LOAD : Scope.CLI;
+        }
+        if (key.equals("audio.stt-model") || key.equals("audio.tts-model")) {
+            return Scope.CLI; // the models `jllm serve` loads at start; the console loads models from its Models page
+        }
+        if (key.startsWith("audio.stt.") || key.equals("audio.ffmpeg") || key.equals("audio.max-seconds")
+                || key.equals("audio.max-upload-mb") || key.equals("audio.tts.max-chars")) {
+            return Scope.LIVE; // read per request
+        }
         if (key.startsWith("sampling.") || key.startsWith("chat.") || key.startsWith("hub.")
-                || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")) {
+                || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")
+                || key.equals("vision.max-image-bytes") || key.equals("vision.max-image-pixels")
+                || key.equals("engine.constrained-tools")) {
             return Scope.LIVE;
         }
         if (key.startsWith("bench.") || (key.startsWith("server.") && !key.equals("server.queue-timeout-ms"))) {

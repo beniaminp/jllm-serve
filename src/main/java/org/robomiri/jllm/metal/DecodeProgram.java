@@ -27,6 +27,8 @@ final class DecodeProgram {
     static final int OFF_TGMEM = 12;
     static final int OFF_GRID = 16;
     static final int OFF_THREADS = 28;
+    /** The concurrent encoder's group id of the command (0 = none): the first of the two padding words. */
+    static final int OFF_GROUP = 40;
     static final int OFF_BUFS = 48;
     static final int OFF_OFFS = 176;
     static final int OFF_PARAMS = 304;
@@ -83,6 +85,12 @@ final class DecodeProgram {
     /** Appends one dispatch; returns its index. {@code bufs} / {@code offs} hold at least {@code nbuf} entries. */
     int add(int pipe, String name, MemorySegment bufs, MemorySegment offs, int nbuf, MemorySegment params, int plen,
             int tgmem, int gx, int gy, int gz, int tx, int ty, int tz) {
+        return add(pipe, name, bufs, offs, nbuf, params, plen, tgmem, gx, gy, gz, tx, ty, tz, 0);
+    }
+
+    /** As above, in the independent group {@code group} (0 = none, see {@link Metal#group}). */
+    int add(int pipe, String name, MemorySegment bufs, MemorySegment offs, int nbuf, MemorySegment params, int plen,
+            int tgmem, int gx, int gy, int gz, int tx, int ty, int tz, int group) {
         if (nbuf > MAX_BUFS || plen > MAX_PARAMS) {
             throw new IllegalStateException(name + ": " + nbuf + " buffers / " + plen + " parameter bytes do not fit a command");
         }
@@ -102,6 +110,7 @@ final class DecodeProgram {
         cmds.set(ValueLayout.JAVA_INT, b + OFF_THREADS, tx);
         cmds.set(ValueLayout.JAVA_INT, b + OFF_THREADS + 4, ty);
         cmds.set(ValueLayout.JAVA_INT, b + OFF_THREADS + 8, tz);
+        cmds.set(ValueLayout.JAVA_INT, b + OFF_GROUP, group);
         MemorySegment.copy(bufs, 0, cmds, b + OFF_BUFS, (long) nbuf * 8);
         MemorySegment.copy(offs, 0, cmds, b + OFF_OFFS, (long) nbuf * 8);
         if (plen > 0) {

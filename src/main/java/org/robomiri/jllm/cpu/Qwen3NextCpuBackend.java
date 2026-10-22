@@ -8,8 +8,10 @@ import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
 import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.MtpFeeder;
 import org.robomiri.jllm.model.Qwen3NextArch;
 import org.robomiri.jllm.model.Qwen3NextLayer;
+import org.robomiri.jllm.model.Qwen3NextMtp;
 import org.robomiri.jllm.model.Rope;
 
 import java.io.IOException;
@@ -56,6 +58,17 @@ public final class Qwen3NextCpuBackend implements Backend {
     private final Rope rope;
     private final KvCache kv;
     private final MoeExperts experts;
+    /** The multi-token-prediction head (null without one): its KV layer is the one after the full-attention layers'. */
+    private final Qwen3NextMtp mtp;
+    private final MtpFeeder feeder;
+    private final float[] mtpIn;   // [rows, 2 * dim]: the normed token embedding then the normed hidden state of each head row
+    private final float[] hid;     // [n, dim]: the normed hidden states of the last pass
+    private float[][] ckConv;
+    private float[][] ckState;
+    private int ckPos;
+    private boolean armed;          // checkpointState() was called: the next pass is remembered to be replayed
+    private int[] armedTokens;
+    private int armedPos;
 
     private final float[][] convState;
     private final float[][] state;
@@ -67,6 +80,9 @@ public final class Qwen3NextCpuBackend implements Backend {
     private final float[] xb;
     // DeltaNet
     private final float[] proj;
+    /** Only for a GGUF model: z and b|a of {@link Qwen3NextLayer.DeltaNet#split()} layers. */
+    private final float[] projZ;
+    private final float[] projBa;
     private final float[] qkv;
     private final float[] o;
     private final float[] decay;   // [n, valueHeads]: log-space decay g = A * softplus(a + dt_bias)
@@ -104,13 +120,21 @@ public final class Qwen3NextCpuBackend implements Backend {
         this.pool = new ThreadPool(threads);
         Attention.Gqa g = arch.attention();
         rope = new Rope(arch.rope(), ctx);
-        kv = arch.fullLayers() > 0 ? KvCache.create(kvDtype, arch.fullLayers(), g, ctx) : null;
+        this.mtp = w.mtp;
+        kv = arch.fullLayers() > 0 || mtp != null
+                ? KvCache.create(kvDtype, arch.fullLayers() + (mtp != null ? 1 : 0), g, ctx) : null;
         convState = new float[arch.linearLayers()][dn.convStateSize()];
         state = new float[arch.linearLayers()][dn.stateSize()];
         int dim = c.dim();
         x = new float[maxBatch * dim];
         xb = new float[maxBatch * dim];
         proj = new float[maxBatch * dn.projDim()];
+        boolean splitProj = false;
+        for (int l = 0; l < c.layers(); l++) {
+            splitProj |= w.qwen3NextLayer(l).mixer() instanceof Qwen3NextLayer.DeltaNet d && d.split();
+        }
+        projZ = splitProj ? new float[maxBatch * dn.valueWidth()] : null;
+        projBa = splitProj ? new float[maxBatch * 2 * dn.valueHeads()] : null;
         qkv = new float[maxBatch * dn.convDim()];
         o = new float[maxBatch * dn.valueWidth()];
         decay = new float[maxBatch * dn.valueHeads()];
@@ -130,6 +154,9 @@ public final class Qwen3NextCpuBackend implements Backend {
         mm = new CpuMatmul(pool, int8Activations, CpuBackend.DETERMINISTIC, scratchLen);
         experts = arch.anyMoe()
                 ? new MoeExperts(pool, mm, dim, arch.maxExperts(), arch.maxTopK(), arch.maxMoeDim(), maxBatch) : null;
+        mtpIn = mtp != null ? new float[maxBatch * 2 * dim] : null;
+        hid = mtp != null ? new float[maxBatch * dim] : null;
+        feeder = mtp != null ? new MtpFeeder(dim, this::mtpRows) : null;
         setRecurrence(CHUNKED, CHUNK);
         if (ctx > c.maxPositions()) {
             System.err.println("warning: context " + ctx + " exceeds the model's max_position_embeddings ("
@@ -172,17 +199,56 @@ public final class Qwen3NextCpuBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
     }
 
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
     }
 
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    // ---- images (docs/20): the vision encoder feeds embeddings; Qwen3.5 has its own rotary positions (interleaved M-RoPE)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        if (deepstack != null) {
+            throw new UnsupportedOperationException("deepstack features belong to Qwen3-VL, not to the Qwen3-Next family");
+        }
+        run(null, embeds, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        rope.refill(arch.rope(), ctx, from, p);
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
+    }
+
+    /** {@code tokens} are looked up in the embedding table, or (null) the rows of {@code embeds} from row {@code off} are the input. */
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (armed && tokens == null) { // (only text passes are verification passes)
+            armed = false;
+        }
+        if (armed) { // a verification pass: its tokens are kept so that rollbackState can replay the first ones
+            armed = false;
+            armedTokens = Arrays.copyOfRange(tokens, off, off + n);
+            armedPos = pos;
         }
         if (pos == 0) {
             for (float[] s : convState) {
@@ -196,8 +262,12 @@ public final class Qwen3NextCpuBackend implements Backend {
         }
         statePos = -1;
         int dim = c.dim();
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+        if (embeds != null) {
+            System.arraycopy(embeds, off * dim, x, 0, n * dim);
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+            }
         }
         for (int l = 0; l < c.layers(); l++) {
             Qwen3NextLayer L = w.qwen3NextLayer(l);
@@ -207,25 +277,30 @@ public final class Qwen3NextCpuBackend implements Backend {
                 case Qwen3NextLayer.GatedAttention a -> attention(a, arch.kindIndex(l), n, pos);
             }
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
-            switch (L.mlp()) {
-                case MlpWeights.Dense d -> {
-                    int h = ((Mlp.Dense) arch.mlps().get(l)).hidden();
-                    mm.mul(d.gateUp(), xb, gateUp, 0, n, false);
-                    siluMul(n, h);
-                    mm.mul(d.down(), hidden, x, 0, n, true);
-                }
-                case MlpWeights.Moe m -> moe((Mlp.Moe) arch.mlps().get(l), m, L.sharedGate(), n);
-            }
+            mlp(L, arch.mlps().get(l), n);
         }
-        if (logits == null) {
+        boolean mtpOn = feeder != null && feeder.enabled();
+        if (logits == null && !mtpOn) {
             statePos = pos + n;
             return;
         }
-        if (stride == 0) {
-            VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim, c.normEps());
+        if (mtpOn) { // the head reads every row's normed hidden state
+            rmsnorm(x, xb, w.finalNorm, n, dim);
+            System.arraycopy(xb, 0, hid, 0, n * dim);
+        }
+        if (logits == null) {
+            statePos = pos + n;
+        } else if (stride == 0) {
+            if (mtpOn) {
+                System.arraycopy(hid, (n - 1) * dim, xb, 0, dim);
+            } else {
+                VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim, c.normEps());
+            }
             mm.mul(w.lmHead, Math.min(w.lmHead.rows, logits.length), xb, logits, 0, 1, false);
         } else {
-            rmsnorm(x, xb, w.finalNorm, n, dim);
+            if (!mtpOn) {
+                rmsnorm(x, xb, w.finalNorm, n, dim);
+            }
             int rows = Math.min(w.lmHead.rows, stride);
             float[] tmp = w.lmHead.rows == stride ? logits : new float[n * w.lmHead.rows];
             mm.mul(w.lmHead, rows, xb, tmp, 0, n, false);
@@ -236,6 +311,117 @@ public final class Qwen3NextCpuBackend implements Backend {
             }
         }
         statePos = pos + n;
+        if (mtpOn) {
+            // (a picture's rows have no token: the head sees token 0 there, which only costs it some draft quality)
+            feeder.afterPass(tokens != null ? tokens : new int[off + n], off, n, pos, hid);
+        }
+    }
+
+    /** The MLP of a layer (dense SwiGLU or experts plus the gated shared expert) on the normed rows of {@link #xb}, added to {@link #x}. */
+    private void mlp(Qwen3NextLayer L, Mlp spec, int n) {
+        switch (L.mlp()) {
+            case MlpWeights.Dense d -> {
+                mm.mul(d.gateUp(), xb, gateUp, 0, n, false);
+                siluMul(n, ((Mlp.Dense) spec).hidden());
+                mm.mul(d.down(), hidden, x, 0, n, true);
+            }
+            case MlpWeights.Moe m -> moe((Mlp.Moe) spec, m, L.sharedGate(), n);
+        }
+    }
+
+    // ------------------------------------------------------------------ multi-token prediction
+
+    /**
+     * The head on {@code n} rows (docs/16): {@code x = eh_proj [rmsnorm(embedding(token), enorm); rmsnorm(h, hnorm)]}, then
+     * the block as any layer (gated attention over the head's own KV cache, MLP), and for the last row the logits through
+     * {@code shared_head_norm} and the output head.
+     */
+    private void mtpRows(int[] tokens, float[] h, int n, int pos, float[] logits) {
+        int dim = c.dim();
+        float[] eps = {c.normEps()};
+        pool.forRange(n, 1, (t0, t1) -> {
+            float[] emb = new float[dim];
+            for (int t = t0; t < t1; t++) {
+                mtp.embed().dequantizeRow(tokens[t], emb, 0);
+                VectorKernels.rmsnormRow(emb, 0, mtpIn, t * 2 * dim, mtp.enorm(), dim, eps[0]);
+                VectorKernels.rmsnormRow(h, t * dim, mtpIn, t * 2 * dim + dim, mtp.hnorm(), dim, eps[0]);
+            }
+        });
+        mm.mul(mtp.ehProj(), mtpIn, x, 0, n, false);
+        Qwen3NextLayer L = mtp.layer();
+        rmsnorm(x, xb, L.attnNorm(), n, dim);
+        attention(L.attention(), arch.fullLayers(), n, pos);
+        rmsnorm(x, xb, L.ffnNorm(), n, dim);
+        mlp(L, arch.mlps().getLast(), n);
+        if (logits != null) {
+            VectorKernels.rmsnormRow(x, (n - 1) * dim, xb, 0, mtp.headNorm(), dim, c.normEps());
+            mm.mul(mtp.head(), Math.min(mtp.head().rows, logits.length), xb, logits, 0, 1, false);
+        }
+    }
+
+    @Override
+    public boolean hasMtp() {
+        return mtp != null;
+    }
+
+    @Override
+    public void enableMtp(boolean on) {
+        if (mtp == null) {
+            throw new UnsupportedOperationException(name() + ": the model has no multi-token-prediction head");
+        }
+        feeder.enable(on);
+    }
+
+    @Override
+    public boolean mtpReady() {
+        return feeder != null && feeder.ready(statePos);
+    }
+
+    @Override
+    public void mtpDraft(int token, float[] logits) {
+        if (!mtpReady()) {
+            throw new IllegalStateException("the multi-token-prediction head does not follow the state at " + statePos);
+        }
+        feeder.draft(token, logits);
+    }
+
+    @Override
+    public boolean supportsRollback() {
+        return true;
+    }
+
+    @Override
+    public void checkpointState() {
+        if (ckConv == null) {
+            ckConv = new float[convState.length][];
+            ckState = new float[state.length][];
+            for (int l = 0; l < convState.length; l++) {
+                ckConv[l] = new float[convState[l].length];
+                ckState[l] = new float[state[l].length];
+            }
+        }
+        for (int l = 0; l < convState.length; l++) {
+            System.arraycopy(convState[l], 0, ckConv[l], 0, convState[l].length);
+            System.arraycopy(state[l], 0, ckState[l], 0, state[l].length);
+        }
+        ckPos = statePos;
+        if (feeder != null) {
+            feeder.snapshot();
+        }
+        armed = true;
+    }
+
+    @Override
+    public void rollbackState(int keep) {
+        for (int l = 0; l < convState.length; l++) {
+            System.arraycopy(ckConv[l], 0, convState[l], 0, convState[l].length);
+            System.arraycopy(ckState[l], 0, state[l], 0, state[l].length);
+        }
+        statePos = ckPos;
+        if (feeder != null) {
+            feeder.restore();
+        }
+        run(armedTokens, null, 0, keep, armedPos, null, 0); // the first tokens again: the state after them, and the head's rows
     }
 
     // ------------------------------------------------------------------ Gated DeltaNet
@@ -258,19 +444,31 @@ public final class Qwen3NextCpuBackend implements Backend {
         int nk = dn.keyHeads();
         int dk = dn.keyDim();
         mm.mul(d.inProj(), xb, proj, 0, n, false);
+        // where the conv input, z and b | a of a token start: one fused row, or three separate products
+        boolean sp = d.split();
+        int ps = sp ? cd : pd;
+        float[] zArr = sp ? projZ : proj;
+        int zs = sp ? dn.valueWidth() : pd;
+        int zo0 = sp ? 0 : cd;
+        float[] baArr = sp ? projBa : proj;
+        int bas = sp ? 2 * nv : pd;
+        int bao = sp ? 0 : cd + dn.valueWidth();
+        if (sp) {
+            mm.mul(d.z(), xb, projZ, 0, n, false);
+            mm.mul(d.ba(), xb, projBa, 0, n, false);
+        }
         float[] cs = convState[li];
         float[] cw = d.conv();
         pool.forRange(cd, 32, (c0, c1) -> {
             for (int ch = c0; ch < c1; ch++) {
                 for (int t = 0; t < n; t++) {
-                    qkv[t * cd + ch] = MambaCpuBackend.convStep(cw, ch * kc, 0f, cs, ch * (kc - 1), kc, proj[t * pd + ch]);
+                    qkv[t * cd + ch] = MambaCpuBackend.convStep(cw, ch * kc, 0f, cs, ch * (kc - 1), kc, proj[t * ps + ch]);
                 }
             }
         });
         // q / k L2 normalization (q also scaled by keyDim^-0.5), beta and the decay of every token and head
         float qScale = (float) (1.0 / Math.sqrt(dk));
         int kw = dn.keyWidth();
-        int bOff = cd + dn.valueWidth();
         pool.forRange(n, 1, (t0, t1) -> {
             for (int t = t0; t < t1; t++) {
                 int r = t * cd;
@@ -279,8 +477,8 @@ public final class Qwen3NextCpuBackend implements Backend {
                     l2norm(qkv, r + kw + h * dk, dk, 1f);
                 }
                 for (int h = 0; h < nv; h++) {
-                    float b = proj[t * pd + bOff + h];
-                    float a = proj[t * pd + bOff + nv + h];
+                    float b = baArr[t * bas + bao + h];
+                    float a = baArr[t * bas + bao + nv + h];
                     beta[t * nv + h] = sigmoid(b);
                     decay[t * nv + h] = d.a()[h] * MambaCpuBackend.softplus(a + d.dtBias()[h]);
                 }
@@ -307,10 +505,10 @@ public final class Qwen3NextCpuBackend implements Backend {
                 int t = i / nv;
                 int h = i - t * nv;
                 int oo = t * vw + h * dv;
-                int zo = t * pd + cd + h * dv;
+                int zo = t * zs + zo0 + h * dv;
                 VectorKernels.rmsnormRow(o, oo, o, oo, nw, dv, c.normEps());
                 for (int j = 0; j < dv; j++) {
-                    o[oo + j] *= VectorKernels.silu(proj[zo + j]);
+                    o[oo + j] *= VectorKernels.silu(zArr[zo + j]);
                 }
             }
         });
@@ -340,14 +538,13 @@ public final class Qwen3NextCpuBackend implements Backend {
         int dv = dn.valueDim();
         int cd = dn.convDim();
         int kw = dn.keyWidth();
-        int group = dn.group();
         int vw = dn.valueWidth();
         pool.forRange(nv * dv, 8, (i0, i1) -> {
             for (int i = i0; i < i1; i++) {
                 int h = i / dv;
                 int j = i - h * dv;
                 int so = i * dk; // = (h * dv + j) * dk
-                int kh = h / group;
+                int kh = dn.keyHeadOf(h);
                 for (int t = 0; t < n; t++) {
                     recurrentStep(s, so, dk, qkv, t * cd + kw + kh * dk, qkv, t * cd + kh * dk,
                             qkv[t * cd + 2 * kw + h * dv + j], (float) Math.exp(decay[t * nv + h]), beta[t * nv + h],
@@ -408,7 +605,7 @@ public final class Qwen3NextCpuBackend implements Backend {
         int cd = dn.convDim();
         int kw = dn.keyWidth();
         int vw = dn.valueWidth();
-        int kh = h / dn.group();
+        int kh = dn.keyHeadOf(h);
         int sBase = h * dv * dk;
         float acc = 0;
         for (int u = 0; u < len; u++) {
@@ -641,6 +838,9 @@ public final class Qwen3NextCpuBackend implements Backend {
     @Override
     public void loadState(int n, ReadableByteChannel in) throws IOException {
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         if (kv != null) {
             kv.read(n, in);
         }
@@ -659,6 +859,9 @@ public final class Qwen3NextCpuBackend implements Backend {
         }
         o.checkPositions(n);
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         if (kv != null) {
             kv.copyFrom(o.kv, n);
         }

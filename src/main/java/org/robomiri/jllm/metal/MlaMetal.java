@@ -137,27 +137,39 @@ final class MlaMetal {
         int rd = m.rope();
         int kvl = m.kvLoraRank();
         int aw = m.latentDim();
+        // The q projection and the two latent ones read the same input and write apart; the norms of the q latent and
+        // of the kv latent, then the q up-projection and the k_pe rotation, then the q rotation and the cache store
+        // are pairs of the same kind: each group is issued together (the concurrent encoder overlaps them).
+        Metal.Buffer cos = mb.ropeCos[m.ropeTable()];
+        Metal.Buffer sin = mb.ropeSin[m.ropeTable()];
+        k.beginIndependent();
         switch (mw.query()) {
             case AttnWeights.Mla.Proj p -> k.matmul(p.w(), b.qProj, in, 0, mb.q, 0, n, false, norm, 0f);
-            case AttnWeights.Mla.Lora q -> {
-                k.matmul(q.a(), b.qA, in, 0, qa, 0, n, false, norm, 0f);
-                k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
-                k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
-            }
+            case AttnWeights.Mla.Lora q -> k.matmul(q.a(), b.qA, in, 0, qa, 0, n, false, norm, 0f);
         }
         k.matmul(mw.kvA(), b.kvA, in, 0, lat, 0, n, false, norm, 0f);
         k.matmul(mw.kPe(), b.kPe, in, 0, kpe, 0, n, false, norm, 0f);
-        k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
-
-        // interleaved rotation of the rd-wide slice after the nope part of every q head, and of the shared
-        // k_pe row, both in place through the q path of the rope kernel (no k heads)
-        Metal.Buffer cos = mb.ropeCos[m.ropeTable()];
-        Metal.Buffer sin = mb.ropeSin[m.ropeTable()];
+        k.endIndependent();
+        if (mw.query() instanceof AttnWeights.Mla.Lora q) {
+            k.beginIndependent();
+            k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
+            k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
+            k.endIndependent();
+            k.beginIndependent();
+            k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
+        } else {
+            k.beginIndependent();
+            k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
+        }
+        // interleaved rotation of the shared k_pe row, then of the rd-wide slice after the nope part of every q head,
+        // both in place through the q path of the rope kernel (no k heads)
+        k.rope(true, false, kpe, kpe, 0, kpe, 0, null, null, cos, sin, rd, rd, rd, 1, 0, pos, 0, rd / 2, n);
+        k.endIndependent();
+        k.beginIndependent();
         k.rope(true, false, mb.q, mb.q, 0, mb.q, 0, null, null, cos, sin, qk, heads * qk, heads * qk,
                 heads, 0, pos, nope, rd / 2, n);
-        k.rope(true, false, kpe, kpe, 0, kpe, 0, null, null, cos, sin, rd, rd, rd, 1, 0, pos, 0, rd / 2, n);
-
         k.mlaLatStore(kv, latNorm, kpe, cache[l], pos * kv.rowBytes(aw, 1), m, n);
+        k.endIndependent();
         k.mlaAbsorbQ(mb.q, b.wk, qAbs, m, n);
         // one kv head (the cache row) shared by all query heads; the value is the leading kvl of the key row
         int stride = kv.rowStride(aw, 1);
@@ -181,38 +193,59 @@ final class MlaMetal {
         int rd = m.rope();
         int kvl = m.kvLoraRank();
         int aw = m.latentDim();
+        k.beginIndependent(); // as in run(): the projections of one input, and the two norms, are independent
         switch (mw.query()) {
             case AttnWeights.Mla.Proj p -> k.matmul(p.w(), b.qProj, mb.xb, 0, mb.q, 0, n, false, null, 0f);
-            case AttnWeights.Mla.Lora q -> {
-                k.matmul(q.a(), b.qA, mb.xb, 0, qa, 0, n, false, null, 0f);
-                k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
-                k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
-            }
+            case AttnWeights.Mla.Lora q -> k.matmul(q.a(), b.qA, mb.xb, 0, qa, 0, n, false, null, 0f);
         }
         k.matmul(mw.kvA(), b.kvA, mb.xb, 0, lat, 0, n, false, null, 0f);
         k.matmul(mw.kPe(), b.kPe, mb.xb, 0, kpe, 0, n, false, null, 0f);
+        k.endIndependent();
+        k.beginIndependent();
+        if (mw.query() instanceof AttnWeights.Mla.Lora) {
+            k.rmsnorm(qa, 0, b.qALn, qaNorm, n, m.qLoraRank());
+        }
         k.rmsnorm(lat, 0, b.kvALn, latNorm, n, kvl);
+        k.endIndependent();
+        if (mw.query() instanceof AttnWeights.Mla.Lora q) {
+            k.matmul(q.b(), b.qB, qaNorm, 0, mb.q, 0, n, false, null, 0f);
+        }
         Metal.Buffer cos = mb.ropeCos[m.ropeTable()];
         Metal.Buffer sin = mb.ropeSin[m.ropeTable()];
+        // rows are independent of each other: one stage for all rows at a time (see MetalBackend's GqaStep.runRows)
+        k.beginIndependent();
         for (int t = 0; t < n; t++) {
-            int pos = positions[t];
             long qOff = (long) t * heads * qk * 4;
             long kpeOff = (long) t * rd * 4;
             k.ropeRow(true, false, mb.q, qOff, mb.q, qOff, mb.q, qOff, null, null, cos, sin, qk, heads * qk, heads * qk,
-                    heads, 0, pos, nope, rd / 2);
-            k.ropeRow(true, false, kpe, kpeOff, kpe, kpeOff, kpe, kpeOff, null, null, cos, sin, rd, rd, rd, 1, 0, pos, 0,
-                    rd / 2);
-            k.mlaLatStoreRow(kv, latNorm, (long) t * kvl * 4, kpe, kpeOff, owners[t].cache[l], pos * kv.rowBytes(aw, 1), m);
+                    heads, 0, positions[t], nope, rd / 2);
+            k.ropeRow(true, false, kpe, kpeOff, kpe, kpeOff, kpe, kpeOff, null, null, cos, sin, rd, rd, rd, 1, 0,
+                    positions[t], 0, rd / 2);
         }
+        k.endIndependent();
+        k.beginIndependent();
+        for (int t = 0; t < n; t++) {
+            k.mlaLatStoreRow(kv, latNorm, (long) t * kvl * 4, kpe, (long) t * rd * 4, owners[t].cache[l],
+                    positions[t] * kv.rowBytes(aw, 1), m);
+        }
+        k.endIndependent();
         k.mlaAbsorbQ(mb.q, b.wk, qAbs, m, n);
         int stride = kv.rowStride(aw, 1);
         String kernel = "attention_mla" + MetalKernels.kvSuffix(kv);
+        int sliceRows = Math.max(1, (int) (mb.scores.size() / ((long) heads * ctx * 4)));
         for (int t = 0; t < n; t++) {
             Metal.Buffer cache = owners[t].cache[l];
+            if (t % sliceRows == 0) {
+                k.endIndependent();
+                k.beginIndependent();
+            }
+            k.rowScores((long) (t % sliceRows) * heads * ctx * 4);
             k.attentionRow(kernel, 1, qAbs, (long) t * heads * aw * 4, cache, cache, oLat, (long) t * heads * kvl * 4,
                     mb.scores, heads, 1, aw, kvl, positions[t], ctx, m.scale(), heads * aw, stride, stride, heads * kvl,
                     0, 0f);
         }
+        k.endIndependent();
+        k.rowScores(0);
         k.mlaApplyV(oLat, b.wv, mb.att, m, n);
     }
 }

@@ -9,9 +9,11 @@ import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
 import org.robomiri.jllm.model.ModelWeights;
+import org.robomiri.jllm.model.MtpFeeder;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.Qwen3NextArch;
 import org.robomiri.jllm.model.Qwen3NextLayer;
+import org.robomiri.jllm.model.Qwen3NextMtp;
 import org.robomiri.jllm.model.Rope;
 
 import java.io.EOFException;
@@ -67,6 +69,9 @@ public final class Qwen3NextMetalBackend implements Backend {
     private Metal.Buffer x;
     private Metal.Buffer xb;
     private Metal.Buffer proj;
+    /** Only for a GGUF model ({@link Qwen3NextLayer.DeltaNet#split()}): the z and the b | a products. */
+    private Metal.Buffer projZ;
+    private Metal.Buffer projBa;
     private Metal.Buffer qkv;
     private Metal.Buffer o;
     private Metal.Buffer q;
@@ -83,12 +88,31 @@ public final class Qwen3NextMetalBackend implements Backend {
     private Metal.Buffer moeTiles;
     private Metal.Buffer moeOut;
     private Metal.Buffer logitsBuf;
+    // multi-token prediction (null mtp: the model has no head)
+    private final Qwen3NextMtp mtp;
+    private MtpFeeder feeder;
+    private LayerBufs mtpBufs;
+    private Metal.Buffer ehBuf;
+    private Metal.Buffer headBuf;
+    private Metal.Buffer headNorm;
+    private Metal.Buffer mtpIn;      // [rows, 2 * dim]: the normed token embedding then the normed hidden state
+    private float[] hid;             // [n, dim]: the normed hidden states of the last pass
+    private Metal.Buffer logitsAll;  // [rows, vocab] for forwardAll
+    private int logitsAllRows;
+    private Metal.Buffer[] ckConv;
+    private Metal.Buffer[] ckState;
+    private int ckPos;
+    private boolean armed;          // checkpointState(): the next pass of two tokens saves the state after its first token
+    private boolean captured;       // ... and did (ckConv / ckState hold it)
+    private int capturedPos;
 
     private static final class LayerBufs {
         Metal.Buffer attnNorm;
         Metal.Buffer ffnNorm;
         // DeltaNet
         Metal.Buffer inProj;
+        Metal.Buffer inProjZ;
+        Metal.Buffer inProjBa;
         Metal.Buffer conv;
         Metal.Buffer a;
         Metal.Buffer dtBias;
@@ -111,15 +135,30 @@ public final class Qwen3NextMetalBackend implements Backend {
         Metal.Buffer sharedGate;
     }
 
+    /**
+     * Selects the concurrent compute encoder (true: independent dispatches overlap, a barrier goes between dependent ones)
+     * or the serial one (false) for the passes that follow; the results are bit-identical. The default is
+     * {@code -Djllm.metal.concurrent} (docs/08 section 8.28).
+     */
+    public void concurrent(boolean on) {
+        k.concurrent(on ? MetalKernels.concurrentOn() : 0);
+    }
+
+    /** Memory barriers the concurrent encoder has inserted so far. */
+    public long barriers() {
+        return k.metal.barriers();
+    }
+
     public Qwen3NextMetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
         this.w = w;
+        this.mtp = w.mtp;
         this.arch = w.qwen3Next();
         this.c = arch.core();
         this.dn = arch.deltaNet();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
-        if (kvDtype == KvDtype.Q8) { // no q8 attention path for this family on Metal: its cache rows are f32 or f16
-            System.err.println("note: the Metal Qwen3-Next backend has no q8 KV cache, using f16");
+        if (kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4) { // no q8 / q4 attention path for this family on Metal: its cache rows are f32 or f16
+            System.err.println("note: the Metal Qwen3-Next backend has no " + kvDtype + " KV cache, using f16");
             kvDtype = KvDtype.F16;
         }
         this.kvHalf = kvDtype == KvDtype.F16;
@@ -163,8 +202,10 @@ public final class Qwen3NextMetalBackend implements Backend {
         ropeCos = k.upload(rope.cos);
         ropeSin = k.upload(rope.sin);
         layers = new LayerBufs[c.layers()];
-        keyCache = new Metal.Buffer[arch.fullLayers()];
-        valCache = new Metal.Buffer[arch.fullLayers()];
+        boolean splitProj = false;
+        int kvLayers = arch.fullLayers() + (mtp != null ? 1 : 0); // the head's block has the last KV slot
+        keyCache = new Metal.Buffer[kvLayers];
+        valCache = new Metal.Buffer[kvLayers];
         convState = new Metal.Buffer[arch.linearLayers()];
         state = new Metal.Buffer[arch.linearLayers()];
         long kvBytes = (long) ctx * g.kvDim() * kvDtype.bytes;
@@ -177,6 +218,11 @@ public final class Qwen3NextMetalBackend implements Backend {
             switch (L.mixer()) {
                 case Qwen3NextLayer.DeltaNet d -> {
                     b.inProj = k.wrap(d.inProj().data);
+                    if (d.split()) {
+                        b.inProjZ = k.wrap(d.z().data);
+                        b.inProjBa = k.wrap(d.ba().data);
+                        splitProj = true;
+                    }
                     b.conv = k.upload(d.conv());
                     b.a = k.upload(d.a());
                     b.dtBias = k.upload(d.dtBias());
@@ -215,10 +261,52 @@ public final class Qwen3NextMetalBackend implements Backend {
             }
             layers[l] = b;
         }
+        if (mtp != null) {
+            Qwen3NextLayer L = mtp.layer();
+            LayerBufs b = new LayerBufs();
+            b.attnNorm = k.upload(L.attnNorm());
+            b.ffnNorm = k.upload(L.ffnNorm());
+            Qwen3NextLayer.GatedAttention a = L.attention();
+            AttnWeights.Gqa wg = a.gqa();
+            b.wq = k.wrap(wg.wq().data);
+            b.wk = k.wrap(wg.wk().data);
+            b.wv = k.wrap(wg.wv().data);
+            b.wGate = k.wrap(a.gate().data);
+            b.wo = k.wrap(a.wo().data);
+            b.qNorm = k.upload(wg.qNorm());
+            b.kNorm = k.upload(wg.kNorm());
+            keyCache[kvLayers - 1] = k.scratch(kvBytes);
+            valCache[kvLayers - 1] = k.scratch(kvBytes);
+            switch (L.mlp()) {
+                case MlpWeights.Dense d -> {
+                    b.gateUp = k.wrap(d.gateUp().data);
+                    b.down = k.wrap(d.down().data);
+                }
+                case MlpWeights.Moe m -> {
+                    b.router = k.upload(m.router());
+                    b.expGateUp = k.wrap(m.expGateUp().data);
+                    b.expDown = k.wrap(m.expDown().data);
+                    b.gateUp = k.wrap(m.shared().gateUp().data);
+                    b.down = k.wrap(m.shared().down().data);
+                    b.sharedGate = k.upload(L.sharedGate());
+                }
+            }
+            mtpBufs = b;
+            ehBuf = k.wrap(mtp.ehProj().data);
+            headBuf = mtp.head() == w.lmHead ? lmHeadQ : k.wrap(mtp.head().data);
+            headNorm = k.upload(mtp.headNorm());
+            mtpIn = k.scratch((long) maxBatch * 2 * c.dim() * 4);
+            hid = new float[maxBatch * c.dim()];
+            feeder = new MtpFeeder(c.dim(), this::mtpRows);
+        }
         int dim = c.dim();
         x = k.scratch((long) maxBatch * dim * 4);
         xb = k.scratch((long) maxBatch * dim * 4);
         proj = k.scratch((long) maxBatch * dn.projDim() * 4);
+        if (splitProj) {
+            projZ = k.scratch((long) maxBatch * dn.valueWidth() * 4);
+            projBa = k.scratch((long) maxBatch * 2 * dn.valueHeads() * 4);
+        }
         qkv = k.scratch((long) maxBatch * dn.convDim() * 4);
         o = k.scratch((long) maxBatch * dn.valueWidth() * 4);
         q = k.scratch((long) maxBatch * g.qDim() * 4);
@@ -272,9 +360,69 @@ public final class Qwen3NextMetalBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
+        run(tokens, null, off, n, pos, logits, 0);
+    }
+
+    // ---- images (docs/20): the vision encoder feeds embeddings; Qwen3.5 has its own rotary positions (interleaved M-RoPE)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        if (deepstack != null) {
+            throw new UnsupportedOperationException("deepstack features belong to Qwen3-VL, not to the Qwen3-Next family");
+        }
+        run(null, embeds, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        int half = arch.rope().rotaryDim() / 2;
+        float[] cos = new float[(ctx - from) * half];
+        float[] sin = new float[(ctx - from) * half];
+        Rope.rows(arch.rope(), ctx, from, p, cos, sin);
+        // the tables are shared host memory the kernels read in place; no work is in flight (the engine is idle)
+        MemorySegment.copy(cos, 0, ropeCos.contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, cos.length);
+        MemorySegment.copy(sin, 0, ropeSin.contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, sin.length);
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
+    }
+
+    /** Logits of every row (the verification of drafts): at most {@link #MAX_ALL_ROWS} rows per call. */
+    @Override
+    public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
+        if (n > MAX_ALL_ROWS) {
+            Backend.super.forwardAll(tokens, off, n, pos, logitsOut, stride);
+            return;
+        }
+        run(tokens, null, off, n, pos, logitsOut, stride);
+    }
+
+    private static final int MAX_ALL_ROWS = 16;
+
+    /** This pass saves the DeltaNet states after its first token into {@link #ckConv} / {@link #ckState}. */
+    private boolean capture;
+
+    /** {@code stride == 0}: the logits of the last row into {@code logits}; else row i to {@code logits[i * stride ..)}. */
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
+        capture = armed && n == 2 && stride > 0 && tokens != null;
+        armed = false;
+        captured = capture;
+        capturedPos = pos;
         if (pos == 0) {
             for (int i = 0; i < state.length; i++) {
                 convState[i].contents().fill((byte) 0);
@@ -286,9 +434,13 @@ public final class Qwen3NextMetalBackend implements Backend {
         statePos = -1;
         int dim = c.dim();
         float[] row = new float[dim];
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], row, 0);
-            MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+        if (embeds != null) {
+            MemorySegment.copy(embeds, off * dim, x.contents(), ValueLayout.JAVA_FLOAT, 0, n * dim);
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], row, 0);
+                MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+            }
         }
         k.begin();
         boolean committed = false;
@@ -302,43 +454,206 @@ public final class Qwen3NextMetalBackend implements Backend {
                     case Qwen3NextLayer.GatedAttention a -> attention(a, b, arch.kindIndex(l), n, pos);
                 }
                 k.rmsnorm(x, 0, b.ffnNorm, xb, n, dim);
-                switch (L.mlp()) {
-                    case MlpWeights.Dense d -> {
-                        k.swiglu(d.gateUp(), b.gateUp, xb, null, hidden, false, n);
-                        k.matmul(d.down(), b.down, hidden, 0, x, 0, n, true, null, 0f);
-                    }
-                    case MlpWeights.Moe m -> moe((Mlp.Moe) arch.mlps().get(l), m, b, n);
-                }
+                mlp(L, b, arch.mlps().get(l), n);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit(); // the GPU starts on these layers while the next ones are encoded
                 }
             }
-            if (logits != null) {
+            boolean mtpOn = feeder != null && feeder.enabled();
+            if (stride > 0 && logits != null) { // every row's logits
+                if (logitsAll == null || logitsAllRows < n) {
+                    logitsAllRows = Math.max(n, 4);
+                    logitsAll = k.scratch((long) logitsAllRows * w.lmHead.rows * 4);
+                }
+                k.rmsnorm(x, 0, finalNorm, xb, n, dim);
+                k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsAll, 0, n, false, null, 0f);
+            } else if (mtpOn) { // the head reads every row's normed hidden state; the logits come from the last
+                k.rmsnorm(x, 0, finalNorm, xb, n, dim);
+                if (logits != null) {
+                    k.matmul(w.lmHead, lmHeadQ, xb, (long) (n - 1) * dim * 4, logitsBuf, 0, 1, false, null, 0f);
+                }
+            } else if (logits != null) {
                 k.rmsnorm(x, (long) (n - 1) * dim * 4, finalNorm, xb, 1, dim);
                 k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, 0f);
             }
             k.commitAndWait();
+            if (mtpOn) {
+                MemorySegment.copy(xb.contents(), ValueLayout.JAVA_FLOAT, 0, hid, 0, n * dim);
+            }
             committed = true;
         } finally {
             if (!committed) {
                 k.abort(); // an un-ended encoder would make Metal abort the process on release
             }
         }
-        if (logits != null) {
+        if (logits != null && stride > 0) {
+            int rows = Math.min(w.lmHead.rows, stride);
+            for (int i = 0; i < n; i++) {
+                MemorySegment.copy(logitsAll.contents(), ValueLayout.JAVA_FLOAT, (long) i * w.lmHead.rows * 4, logits,
+                        i * stride, rows);
+            }
+        } else if (logits != null) {
             MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
                     Math.min(w.lmHead.rows, logits.length));
         }
         statePos = pos + n;
+        if (feeder != null && feeder.enabled()) {
+            // (a picture's rows have no token: the head sees token 0 there, which only costs it some draft quality)
+            feeder.afterPass(tokens != null ? tokens : new int[off + n], off, n, pos, hid);
+        }
+    }
+
+    /** The MLP of a layer (dense SwiGLU, or experts plus the gated shared expert) on the normed rows of xb, added to x. */
+    private void mlp(Qwen3NextLayer L, LayerBufs b, Mlp spec, int n) {
+        switch (L.mlp()) {
+            case MlpWeights.Dense d -> {
+                k.swiglu(d.gateUp(), b.gateUp, xb, null, hidden, false, n);
+                k.matmul(d.down(), b.down, hidden, 0, x, 0, n, true, null, 0f);
+            }
+            case MlpWeights.Moe m -> moe((Mlp.Moe) spec, m, b, n);
+        }
+    }
+
+    // ------------------------------------------------------------------ multi-token prediction
+
+    /** {@link org.robomiri.jllm.cpu.Qwen3NextCpuBackend}'s head on {@code n} rows, the block on the GPU. */
+    private void mtpRows(int[] tokens, float[] h, int n, int pos, float[] logits) {
+        int dim = c.dim();
+        float[] emb = new float[dim];
+        float[] norm = new float[dim];
+        MemorySegment in = mtpIn.contents();
+        for (int t = 0; t < n; t++) {
+            mtp.embed().dequantizeRow(tokens[t], emb, 0);
+            rmsnormRow(emb, 0, norm, mtp.enorm(), dim);
+            MemorySegment.copy(norm, 0, in, ValueLayout.JAVA_FLOAT, (long) t * 2 * dim * 4, dim);
+            rmsnormRow(h, t * dim, norm, mtp.hnorm(), dim);
+            MemorySegment.copy(norm, 0, in, ValueLayout.JAVA_FLOAT, ((long) t * 2 * dim + dim) * 4, dim);
+        }
+        Qwen3NextLayer L = mtp.layer();
+        k.begin();
+        boolean committed = false;
+        try {
+            k.matmul(mtp.ehProj(), ehBuf, mtpIn, 0, x, 0, n, false, null, 0f);
+            k.rmsnorm(x, 0, mtpBufs.attnNorm, xb, n, dim);
+            attention(L.attention(), mtpBufs, arch.fullLayers(), n, pos);
+            k.rmsnorm(x, 0, mtpBufs.ffnNorm, xb, n, dim);
+            mlp(L, mtpBufs, arch.mlps().getLast(), n);
+            if (logits != null) {
+                k.rmsnorm(x, (long) (n - 1) * dim * 4, headNorm, xb, 1, dim);
+                k.matmul(mtp.head(), headBuf, xb, 0, logitsBuf, 0, 1, false, null, 0f);
+            }
+            k.commitAndWait();
+            committed = true;
+        } finally {
+            if (!committed) {
+                k.abort();
+            }
+        }
+        if (logits != null) {
+            MemorySegment.copy(logitsBuf.contents(), ValueLayout.JAVA_FLOAT, 0, logits, 0,
+                    Math.min(mtp.head().rows, logits.length));
+        }
+    }
+
+    /** {@code out = in * rsqrt(mean(in^2) + eps) * gain} (the plain RMSNorm of the head's two inputs). */
+    private void rmsnormRow(float[] in, int off, float[] out, float[] gain, int width) {
+        double ss = 0;
+        for (int i = 0; i < width; i++) {
+            ss += (double) in[off + i] * in[off + i];
+        }
+        float inv = (float) (1.0 / Math.sqrt(ss / width + c.normEps()));
+        for (int i = 0; i < width; i++) {
+            out[i] = in[off + i] * inv * gain[i];
+        }
+    }
+
+    @Override
+    public boolean hasMtp() {
+        return mtp != null;
+    }
+
+    @Override
+    public void enableMtp(boolean on) {
+        if (mtp == null) {
+            throw new UnsupportedOperationException(name() + ": the model has no multi-token-prediction head");
+        }
+        feeder.enable(on);
+    }
+
+    @Override
+    public boolean mtpReady() {
+        return feeder != null && feeder.ready(statePos);
+    }
+
+    @Override
+    public void mtpDraft(int token, float[] logits) {
+        if (!mtpReady()) {
+            throw new IllegalStateException("the multi-token-prediction head does not follow the state at " + statePos);
+        }
+        feeder.draft(token, logits);
+    }
+
+    @Override
+    public boolean supportsRollback() {
+        return true;
+    }
+
+    /**
+     * The next {@link #forwardAll} of two tokens writes the conv and recurrent states as they are after its first token
+     * to a second set of buffers while it computes the second ({@code gdn_conv} / {@code gdn_rule} snapshot parameter),
+     * so a rejected draft costs a swap of the two sets, not a replay.
+     */
+    @Override
+    public void checkpointState() {
+        if (ckConv == null) {
+            ckConv = new Metal.Buffer[state.length];
+            ckState = new Metal.Buffer[state.length];
+            for (int l = 0; l < state.length; l++) {
+                ckConv[l] = k.scratch((long) dn.convStateSize() * 4);
+                ckState[l] = k.scratch((long) dn.stateSize() * 4);
+            }
+        }
+        armed = true;
+        captured = false;
+    }
+
+    @Override
+    public void rollbackState(int keep) {
+        if (!captured || keep != 1) {
+            throw new IllegalStateException("no state was saved after " + keep + " tokens of the last pass");
+        }
+        for (int l = 0; l < state.length; l++) {
+            Metal.Buffer c = convState[l];
+            convState[l] = ckConv[l];
+            ckConv[l] = c;
+            Metal.Buffer s = state[l];
+            state[l] = ckState[l];
+            ckState[l] = s;
+        }
+        captured = false;
+        statePos = capturedPos + keep;
+        if (feeder != null) {
+            feeder.truncate(capturedPos, keep, hid);
+        }
     }
 
     private void deltaNet(Qwen3NextLayer.DeltaNet d, LayerBufs b, int li, int n) {
         int pd = dn.projDim();
         int cd = dn.convDim();
         k.matmul(d.inProj(), b.inProj, xb, 0, proj, 0, n, false, null, 0f);
-        k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n);
-        k.gdnRule(qkv, proj, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
-                cd, pd, cd + dn.valueWidth(), 1e-6f, n);
-        k.gdnNormGate(o, proj, b.gdnNorm, dn.valueDim(), dn.valueHeads(), pd, cd, n);
+        if (d.split()) { // q k v | z | b a are three products in three buffers
+            k.matmul(d.z(), b.inProjZ, xb, 0, projZ, 0, n, false, null, 0f);
+            k.matmul(d.ba(), b.inProjBa, xb, 0, projBa, 0, n, false, null, 0f);
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), cd, cd, n, capture ? ckConv[li] : null, 0);
+            k.gdnRule(qkv, projBa, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
+                    cd, 2 * dn.valueHeads(), 0, 1e-6f, dn.tiled(), n, capture ? ckState[li] : null, 0);
+            k.gdnNormGate(o, projZ, b.gdnNorm, dn.valueDim(), dn.valueHeads(), dn.valueWidth(), 0, n);
+        } else {
+            k.gdnConv(proj, b.conv, convState[li], qkv, cd, dn.convKernel(), pd, cd, n, capture ? ckConv[li] : null, 0);
+            k.gdnRule(qkv, proj, b.a, b.dtBias, state[li], o, dn.keyHeads(), dn.valueHeads(), dn.keyDim(), dn.valueDim(),
+                    cd, pd, cd + dn.valueWidth(), 1e-6f, dn.tiled(), n, capture ? ckState[li] : null, 0);
+            k.gdnNormGate(o, proj, b.gdnNorm, dn.valueDim(), dn.valueHeads(), pd, cd, n);
+        }
         k.matmul(d.outProj(), b.outProj, o, 0, x, 0, n, true, null, 0f);
     }
 
@@ -348,12 +663,16 @@ public final class Qwen3NextMetalBackend implements Backend {
         int hd = g.headDim();
         int kvDim = g.kvDim();
         long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
+        k.beginIndependent(); // the projections of xb write apart; so do the two norms below (concurrent encoder)
         k.matmul3(wg.wq(), b.wq, wg.wk(), b.wk, wg.wv(), b.wv, xb, null, q, kStage, 0, valCache[fi], cacheOff, kvHalf,
                 null, null, null, n);
         k.matmul(a.gate(), b.wGate, xb, 0, gate, 0, n, false, null, 0f);
+        k.endIndependent();
         // per-head q / k norms over the whole head (rows of headDim), then RoPE on the rotary slice only
+        k.beginIndependent();
         k.rmsnorm(q, 0, b.qNorm, q, n * g.heads(), hd);
         k.rmsnorm(kStage, 0, b.kNorm, kStage, n * g.kvHeads(), hd);
+        k.endIndependent();
         k.rope(false, kvHalf, q, kStage, 0, keyCache[fi], cacheOff, null, null, ropeCos, ropeSin, hd, g.qDim(), kvDim,
                 g.heads(), g.kvHeads(), pos, 0, arch.rope().rotaryDim() / 2, n);
         k.attention(attnKernel, 1, q, keyCache[fi], valCache[fi], att, scores, g.heads(), g.kvHeads(), hd, hd, pos, ctx,
@@ -364,18 +683,27 @@ public final class Qwen3NextMetalBackend implements Backend {
 
     private void moe(Mlp.Moe spec, MlpWeights.Moe m, LayerBufs b, int n) {
         int dim = c.dim();
-        k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
         QTensor gu = m.expGateUp();
         QTensor dw = m.expDown();
         if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+            k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
             k.moeGrouped(gu, b.expGateUp, dw, b.expDown, xb, assign, routeWeight, moeOrder, moeTiles, moeHidden, moeOut, x,
                     spec.experts(), spec.moeDim(), dim, spec.topK(), n);
+            k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
+            k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
         } else {
+            // the shared expert (up to sharedOut) and the routed ones read xb and write apart; the routed ones still add
+            // into x before the shared one does, as before
+            k.beginIndependent();
+            k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
+            k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
+            k.endIndependent();
+            k.beginIndependent();
             k.moeUp(gu, b.expGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
+            k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
+            k.endIndependent();
             k.moeDown(dw, b.expDown, moeHidden, assign, routeWeight, x, dim, spec.topK(), n);
         }
-        k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
-        k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
         k.sharedGateAdd(xb, b.sharedGate, sharedOut, x, dim, n);
     }
 
@@ -411,7 +739,7 @@ public final class Qwen3NextMetalBackend implements Backend {
         int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (2 * row)));
         ByteBuffer buf = ByteBuffer.allocateDirect((int) (rows * 2 * row));
         MemorySegment b = MemorySegment.ofBuffer(buf);
-        for (int l = 0; l < keyCache.length; l++) { // per layer, per position: the K row then the V row (KvCache.write)
+        for (int l = 0; l < arch.fullLayers(); l++) { // per layer, per position: the K row then the V row (KvCache.write)
             for (int s0 = 0; s0 < n; s0 += rows) {
                 int m = Math.min(rows, n - s0);
                 for (int r = 0; r < m; r++) {
@@ -436,11 +764,14 @@ public final class Qwen3NextMetalBackend implements Backend {
             throw new IOException("the saved state holds " + n + " positions, the context is " + ctx);
         }
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         long row = rowBytes();
         int rows = (int) Math.max(1, Math.min(n, (1 << 22) / (2 * row)));
         ByteBuffer buf = ByteBuffer.allocateDirect((int) (rows * 2 * row));
         MemorySegment b = MemorySegment.ofBuffer(buf);
-        for (int l = 0; l < keyCache.length; l++) {
+        for (int l = 0; l < arch.fullLayers(); l++) {
             for (int s0 = 0; s0 < n; s0 += rows) {
                 int m = Math.min(rows, n - s0);
                 buf.clear().limit((int) (2 * m * row));
@@ -470,8 +801,11 @@ public final class Qwen3NextMetalBackend implements Backend {
         }
         o.checkPositions(n);
         statePos = -1;
+        if (feeder != null) {
+            feeder.invalidate();
+        }
         long bytes = n * rowBytes();
-        for (int l = 0; l < keyCache.length; l++) {
+        for (int l = 0; l < arch.fullLayers(); l++) {
             MemorySegment.copy(o.keyCache[l].contents(), 0, keyCache[l].contents(), 0, bytes);
             MemorySegment.copy(o.valCache[l].contents(), 0, valCache[l].contents(), 0, bytes);
         }

@@ -91,11 +91,22 @@ public final class ChatTemplate {
         switch (t) {
             case "qwen3", "qwen3_moe", "qwen3_next":
                 return QWEN3;
+            case "qwen3_5": // Qwen3.5 (GGUF qwen35): the 248k vocabulary and a template of its own
+                return QWEN35;
             case "qwen2", "qwen2_5", "qwen2_moe":
                 return deepseekVocab ? DEEPSEEK : QWEN2;
+            case "smolvlm", "idefics3":
+                return SMOLVLM;
+            case "qwen2vl", "qwen2_vl", "qwen2_5_vl", "qwen25vl":
+                return QWEN2;
+            case "qwen3vl", "qwen3_vl":
+                return QWEN3VL;
             case "llama":
                 if (deepseekVocab) {
                     return DEEPSEEK;
+                }
+                if (tok != null && tok.tokenId("<end_of_utterance>") >= 0 && tok.tokenId("<fake_token_around_image>") >= 0) {
+                    return SMOLVLM; // SmolVLM / Idefics3: a Llama text model with its own turn format
                 }
                 if (tok != null && !tok.isByteLevel() && tok.tokenId("<|start_header_id|>") < 0) {
                     throw new IllegalArgumentException("model_type llama with a SentencePiece tokenizer (Llama 2) has no"
@@ -226,6 +237,97 @@ public final class ChatTemplate {
             if (!think) {
                 o.ctl("<think>\n\n</think>\n\n");
             }
+        }
+    }, "<|im_end|>", "<|endoftext|>");
+
+    /** The line the Qwen3.5 template puts into the system turn when thinking is on and no effort is given (xhigh). */
+    private static final String QWEN35_EFFORT = "Reasoning effort is set to xhigh. Please think carefully through the task,"
+            + " validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and"
+            + " clarity in the final answer.";
+
+    /**
+     * Qwen3.5 ChatML (the {@code chat_template} of the GGUF files, without vision and tool calls): leading
+     * {@code system} / {@code developer} messages are merged (trimmed, joined by a newline) into one system turn, which
+     * starts with the reasoning-effort line while thinking is on; every message's content is trimmed; every assistant
+     * turn carries its {@code <think>} block (the template's {@code preserve_thinking} defaults to true; the reasoning
+     * is what precedes {@code </think>} in the content, empty if none); the generation prompt opens the think block
+     * ({@code <think>\n}), or closes an empty one when thinking is off. A system message after the first turn is an error.
+     */
+    private static final Format QWEN35 = new Family("chatml-qwen35", (m, gen, think, o) -> {
+        int numSys = 0;
+        StringBuilder sys = new StringBuilder();
+        for (int i = 0; i < m.size(); i++) {
+            String r = m.get(i).role();
+            if (numSys == i && ("system".equals(r) || "developer".equals(r))) {
+                String c = pyTrim(content(m.get(i)));
+                if (!c.isEmpty()) {
+                    sys.append(sys.isEmpty() ? "" : "\n").append(c);
+                }
+                numSys++;
+            }
+        }
+        if (!sys.isEmpty() || think) {
+            o.ctl("<|im_start|>system\n");
+            if (think) {
+                o.ctl(QWEN35_EFFORT + (sys.isEmpty() ? "" : "\n\n"));
+            }
+            o.txt(sys.toString());
+            o.ctl("<|im_end|>\n");
+        }
+        for (int i = numSys; i < m.size(); i++) {
+            Message msg = m.get(i);
+            String role = msg.role();
+            if ("system".equals(role) || "developer".equals(role)) {
+                throw new IllegalArgumentException("System message must be at the beginning.");
+            }
+            String content = content(msg);
+            if (role.equals("assistant")) {
+                String reasoning = "";
+                int end = content.indexOf("</think>");
+                if (end >= 0) {
+                    String before = rstripNl(content.substring(0, end));
+                    int open = before.lastIndexOf("<think>");
+                    reasoning = lstripNl(open >= 0 ? before.substring(open + "<think>".length()) : before);
+                    content = lstripNl(content.substring(content.lastIndexOf("</think>") + "</think>".length()));
+                }
+                o.ctl("<|im_start|>assistant\n<think>\n");
+                o.txt(pyTrim(reasoning));
+                o.ctl("\n</think>\n\n");
+                o.txt(pyTrim(content));
+                o.ctl("<|im_end|>\n");
+            } else if (role.equals("tool")) {
+                toolResponse(m, i, o);
+            } else if (role.equals("user")) {
+                o.ctl("<|im_start|>user\n");
+                o.txt(pyTrim(content));
+                o.ctl("<|im_end|>\n");
+            } else {
+                throw new IllegalArgumentException("Unexpected message role.");
+            }
+        }
+        if (gen) {
+            o.ctl("<|im_start|>assistant\n" + (think ? "<think>\n" : "<think>\n\n</think>\n\n"));
+        }
+    }, "<|im_end|>", "<|endoftext|>");
+
+    /**
+     * Qwen3-VL (Instruct) ChatML: no default system prompt, no thinking blocks (the model's own template has none);
+     * pictures are placeholders in the user turn's text.
+     */
+    private static final Format QWEN3VL = new Family("chatml-qwen3vl", (m, gen, think, o) -> {
+        for (int i = 0; i < m.size(); i++) {
+            Message msg = m.get(i);
+            String role = role(msg, "system", "user", "assistant", "tool");
+            if (role.equals("tool")) {
+                toolResponse(m, i, o);
+                continue;
+            }
+            o.ctl("<|im_start|>" + role + "\n");
+            o.txt(content(msg));
+            o.ctl("<|im_end|>\n");
+        }
+        if (gen) {
+            o.ctl("<|im_start|>assistant\n");
         }
     }, "<|im_end|>", "<|endoftext|>");
 
@@ -441,6 +543,38 @@ public final class ChatTemplate {
         }
     }, "<|endoftext|>", "<|user|>", "<|observation|>");
 
+    /**
+     * SmolVLM / Idefics3 (a Llama text model): {@code <|im_start|>} (its BOS, not ChatML), then {@code User: text
+     * <end_of_utterance>} / {@code Assistant: text<end_of_utterance>} lines; a system message is its text and a blank
+     * line. This is llama.cpp's built-in {@code smolvlm} format (the Jinja template of the model differs in leaving
+     * out the space after {@code User:} when the message starts with an image).
+     */
+    private static final Format SMOLVLM = new Family("smolvlm", (m, gen, think, o) -> {
+        o.ctl("<|im_start|>");
+        for (Message msg : m) {
+            String role = role(msg, "system", "user", "assistant");
+            switch (role) {
+                case "system" -> {
+                    o.txt(content(msg));
+                    o.ctl("\n\n");
+                }
+                case "user" -> {
+                    o.ctl("User: ");
+                    o.txt(content(msg));
+                    o.ctl("<end_of_utterance>\n");
+                }
+                default -> {
+                    o.ctl("Assistant: ");
+                    o.txt(content(msg));
+                    o.ctl("<end_of_utterance>\n");
+                }
+            }
+        }
+        if (gen) {
+            o.ctl("Assistant:");
+        }
+    }, "<end_of_utterance>");
+
     /** Mamba / GPT-NeoX base models have no chat format: the message contents as plain text, one per line. */
     private static final Format MAMBA = new Family("plain", (m, gen, think, o) -> {
         for (int i = 0; i < m.size(); i++) {
@@ -464,8 +598,22 @@ public final class ChatTemplate {
         }
 
         void txt(String s) {
-            texts.add(s);
-            control.add(false);
+            // a picture in the message (U+FFFC) is a control piece of its own, so the content around it stays text
+            int i = s.indexOf(Tokenizer.IMAGE_MARK_TEXT);
+            while (i >= 0) {
+                if (i > 0) {
+                    texts.add(s.substring(0, i));
+                    control.add(false);
+                }
+                texts.add(Tokenizer.IMAGE_MARK_TEXT);
+                control.add(true);
+                s = s.substring(i + 1);
+                i = s.indexOf(Tokenizer.IMAGE_MARK_TEXT);
+            }
+            if (!s.isEmpty() || texts.isEmpty() || !texts.get(texts.size() - 1).equals(Tokenizer.IMAGE_MARK_TEXT)) {
+                texts.add(s);
+                control.add(false);
+            }
         }
     }
 

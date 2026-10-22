@@ -7,7 +7,9 @@ set -eu
 cd "$(dirname "$0")/.."
 OUT=target/native
 mkdir -p "$OUT/emu"
-python3 scripts/metal-emu/transpile.py src/main/resources/org/robomiri/jllm/metal/kernels.metal "$OUT/emu/kernels.cpp"
+python3 scripts/metal-emu/transpile.py src/main/resources/org/robomiri/jllm/metal/kernels.metal "$OUT/emu/kernels.cpp" \
+  src/main/resources/org/robomiri/jllm/metal/vision.metal src/main/resources/org/robomiri/jllm/audio/audio.metal \
+  src/main/resources/org/robomiri/jllm/metal/diffusion.metal
 EXT=so
 DEFS=""
 # macOS: the ucontext fiber calls need _XOPEN_SOURCE, and _DARWIN_C_SOURCE keeps the BSD extensions (MAP_ANON) visible

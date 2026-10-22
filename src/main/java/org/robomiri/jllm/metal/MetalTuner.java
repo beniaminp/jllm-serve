@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.AttnWeights;
 import org.robomiri.jllm.model.DecoderLayer;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.LayerWeights;
 import org.robomiri.jllm.model.MambaLayer;
 import org.robomiri.jllm.model.MlpWeights;
@@ -33,7 +34,9 @@ import java.util.Random;
  * in {@code ~/.cache/jllm/metal-tuning.properties}, so the check runs once (a few hundred milliseconds).
  *
  * <p>Candidates: {@code attention_fa} for prefill chunks (instead of {@code attention_t}) and flash decoding
- * ({@code attention_split} + {@code attention_combine}) for long decode steps. {@code -Djllm.metal.flashPrefill=
+ * ({@code attention_split} + {@code attention_combine}) for long decode steps, each in the variant of the cache type
+ * (a q4 cache with its recent window, so the band corrections of {@code attention_fa_q4} are checked too).
+ * {@code -Djllm.metal.flashPrefill=
  * true|false} and {@code -Djllm.metal.flashDecode=true|false} force a choice; on the CPU emulator (no meaningful
  * timings) correctness alone decides.
  */
@@ -52,9 +55,12 @@ final class MetalTuner {
      * Also sets {@link MetalKernels#flashPrefillKernel}: of the two flash prefill forms ({@code attention_fa}, and
      * {@code attention_fb} with K and V staged together) the faster of those that agree with {@code attention_t} (on the
      * emulator, where timings mean nothing, {@code attention_fb} when it agrees, so the newer kernel is the one exercised).
-     * {@code -Djllm.metal.flashPrefillKernel=fa|fb} forces the form.
+     * {@code -Djllm.metal.flashPrefillKernel=fa|fb} forces the form. A q4 cache has one flash prefill form of its own
+     * ({@code attention_fa_q4}), so {@code fb} is not tried for it.
+     *
+     * @param recent q4: the recent window ({@code backend.kv-q4-recent}), part of the cache key
      */
-    static Decision decide(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup) {
+    static Decision decide(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup, int recent) {
         String forcedPrefill = MetalKernels.FLASH_PREFILL;
         String forcedDecode = MetalKernels.FLASH_DECODE_MODE;
         String forcedForm = System.getProperty("jllm.metal.flashPrefillKernel", "auto");
@@ -65,7 +71,8 @@ final class MetalTuner {
                     "forced");
         }
         String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|hd" + g.headDim() + "|g"
-                + g.heads() / g.kvHeads() + "|" + kv).replace(' ', '_').replace('=', '_').replace(':', '_');
+                + g.heads() / g.kvHeads() + "|" + kv + (kv == KvDtype.Q4 ? "r" + recent : ""))
+                .replace(' ', '_').replace('=', '_').replace(':', '_');
         Properties cache = load();
         String cached = cache.getProperty(key);
         boolean[] got;
@@ -77,9 +84,10 @@ final class MetalTuner {
             note = "cached " + cached;
         } else {
             StringBuilder sb = new StringBuilder();
-            Result fa = prefillFits ? check(k, g, kv, attnKernel, attnGroup, true, "attention_fa", sb) : Result.NO;
-            Result fbr = prefillFits ? check(k, g, kv, attnKernel, attnGroup, true, "attention_fb", sb) : Result.NO;
-            got = new boolean[]{fa.use() || fbr.use(), check(k, g, kv, attnKernel, attnGroup, false, null, sb).use()};
+            Result fa = prefillFits ? check(k, g, kv, attnKernel, attnGroup, recent, true, "attention_fa", sb) : Result.NO;
+            Result fbr = prefillFits && kv != KvDtype.Q4 ? check(k, g, kv, attnKernel, attnGroup, recent, true, "attention_fb", sb)
+                    : Result.NO;
+            got = new boolean[]{fa.use() || fbr.use(), check(k, g, kv, attnKernel, attnGroup, recent, false, null, sb).use()};
             fb = fbr.use() && (!fa.use() || Metal.EMULATOR || fbr.ms() < fa.ms());
             note = sb.toString().trim();
             cache.setProperty(key, "flashPrefill=" + (got[0] ? 1 : 0) + ",flashDecode=" + (got[1] ? 1 : 0)
@@ -104,8 +112,8 @@ final class MetalTuner {
      * Runs candidate and reference on the same synthetic data. {@code faKernel}: the flash prefill form to check
      * ({@code attention_fa} / {@code attention_fb}; null for flash decoding).
      */
-    private static Result check(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup, boolean prefill,
-                                String faKernel, StringBuilder log) {
+    private static Result check(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup, int recent,
+                                boolean prefill, String faKernel, StringBuilder log) {
         boolean emu = Metal.EMULATOR;
         int hd = g.headDim();
         int heads = g.heads();
@@ -139,6 +147,28 @@ final class MetalTuner {
         if (prefill) {
             k.flashPrefillKernel = faKernel;
         }
+        if (kv == KvDtype.Q4) { // with a ring holding the latest positions, so that keys come from both
+            MetalKernels.Q4Ring ring = null;
+            int r = Math.min(recent, keys);
+            if (r > 0) {
+                int cap = Math.min(keys, r + n);
+                Metal.Buffer tags = k.scratch((long) cap * 4);
+                for (int s = keys - cap; s < keys; s++) {
+                    tags.contents().setAtIndex(ValueLayout.JAVA_INT, s % cap, s);
+                }
+                ring = new MetalKernels.Q4Ring(k.scratch((long) cap * kvDim * 2), k.scratch((long) cap * kvDim * 2), tags,
+                        r, cap);
+                fill(ring.k().contents(), cap, KvDtype.F16, kvHeads, kvDim, rnd);
+                fill(ring.v().contents(), cap, KvDtype.F16, kvHeads, kvDim, rnd);
+            }
+            MetalKernels.Q4Ring rg = ring;
+            reference = () -> k.attentionQ4(attnKernel, q, kc, vc, ref, scores, rg, heads, kvHeads, hd, pos, keys, scale,
+                    qDim, stride, qDim, 0, 0f, n);
+            candidate = prefill
+                    ? () -> k.flashPrefillQ4(hd, q, kc, vc, cand, rg, heads, kvHeads, pos, n, scale, qDim, stride, qDim, 0, 0f)
+                    : () -> k.flashAttentionQ4(q, kc, vc, part, scores, cand, rg, heads, kvHeads, hd, pos, keys, scale,
+                    qDim, stride, 0, 0f);
+        }
         try {
             double tRef = time(k, reference, emu ? 1 : 5);
             double tCand = time(k, candidate, emu ? 1 : 5);
@@ -161,6 +191,103 @@ final class MetalTuner {
         } finally {
             k.flashPrefillKernel = keep;
         }
+    }
+
+    /** The decode attention decisions of this process, by cache key. */
+    private static final java.util.Map<String, Boolean> DEC_DECISIONS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Whether the decode attention {@code attention_dec} runs on this device: it must agree with {@code attention_t}
+     * (relative error below 1e-3 of the output's magnitude, on synthetic data of the model's head shape) and be at least
+     * 3 % faster over a long context (2048 keys) and not slower over a short one (400). On the emulator (no meaningful
+     * timings) agreement alone decides. {@code -Djllm.metal.decodeAttention=true|false} forces it (an explicit
+     * {@code -Djllm.metal.flashDecode=true} turns it off: the user asked for the other split kernel). Cached per device,
+     * kernel source, head shape, cache type and chunk like the other decisions.
+     */
+    static boolean decodeAttention(MetalKernels k, Attention.Gqa g, KvDtype kv, String attnKernel, int attnGroup) {
+        String forced = MetalKernels.DEC_ATTN_MODE;
+        if (!"auto".equals(forced)) {
+            return Boolean.parseBoolean(forced);
+        }
+        if ("true".equals(MetalKernels.FLASH_DECODE_MODE)) {
+            return false;
+        }
+        String key = (k.metal.deviceName() + "|" + k.metal.sourceHash + "|decattn|hd" + g.headDim() + "|" + g.heads() + "x"
+                + g.kvHeads() + "|" + kv + "|c" + k.decChunk).replace(' ', '_').replace('=', '_').replace(':', '_');
+        Boolean known = DEC_DECISIONS.get(key);
+        if (known != null) {
+            return known; // one answer per process: backends that must agree bit for bit (a slot and its batch) never see two
+        }
+        Properties cache = load();
+        String cached = cache.getProperty(key);
+        if (cached != null) {
+            DEC_DECISIONS.put(key, cached.equals("1"));
+            return cached.equals("1");
+        }
+        boolean use = false;
+        StringBuilder log = new StringBuilder();
+        boolean emu = Metal.EMULATOR;
+        int hd = g.headDim();
+        int heads = g.heads();
+        int kvHeads = g.kvHeads();
+        int kvDim = g.kvDim();
+        int qDim = g.qDim();
+        int keys = emu ? 600 : 2048;
+        try {
+            Random rnd = new Random(13);
+            Metal.Buffer q = k.scratch((long) qDim * 4);
+            int stride = kv.rowStride(kvDim, kvHeads);
+            Metal.Buffer kc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+            Metal.Buffer vc = k.scratch((long) keys * kv.rowBytes(kvDim, kvHeads));
+            fill(q.contents(), 1, KvDtype.F32, 1, qDim, rnd);
+            fill(kc.contents(), keys, kv, kvHeads, kvDim, rnd);
+            fill(vc.contents(), keys, kv, kvHeads, kvDim, rnd);
+            Metal.Buffer ref = k.scratch((long) qDim * 4);
+            Metal.Buffer cand = k.scratch((long) qDim * 4);
+            Metal.Buffer scores = k.scratch((long) heads * keys * 4);
+            Metal.Buffer part = k.scratch((long) heads * MetalConstants.FLASH_MAX_SPLITS * (hd + 2) * 4);
+            float scale = (float) (1 / Math.sqrt(hd));
+            double[] tRef = new double[2];
+            double[] tCand = new double[2];
+            float max = 0;
+            float diff = 0;
+            for (int pass = 0; pass < 2; pass++) { // pass 0: the long context, 1: a short one (400 keys)
+                int pos = pass == 0 ? keys - 1 : Math.min(keys, emu ? 100 : 400) - 1;
+                Runnable reference = () -> k.attention(attnKernel, attnGroup, q, kc, vc, ref, scores, heads, kvHeads, hd, hd,
+                        pos, keys, scale, qDim, stride, stride, qDim, 0, 0f, 1);
+                Runnable candidate = () -> k.decodeAttention(kv, q, 0, kc, vc, part, cand, 0, heads, kvHeads, hd, pos, keys,
+                        scale, stride, 0, 0f);
+                int reps = emu ? 1 : 20;
+                tRef[pass] = time(k, () -> {
+                    for (int i = 0; i < reps; i++) {
+                        reference.run();
+                    }
+                }, emu ? 1 : 5) / reps;
+                tCand[pass] = time(k, () -> {
+                    for (int i = 0; i < reps; i++) {
+                        candidate.run();
+                    }
+                }, emu ? 1 : 5) / reps;
+                for (int i = 0; i < qDim; i++) {
+                    float a = ref.contents().getAtIndex(ValueLayout.JAVA_FLOAT, i);
+                    float b = cand.contents().getAtIndex(ValueLayout.JAVA_FLOAT, i);
+                    max = Math.max(max, Math.abs(a));
+                    diff = Float.isNaN(b) ? Float.POSITIVE_INFINITY : Math.max(diff, Math.abs(a - b));
+                }
+            }
+            boolean correct = diff <= 1e-3f * max + 1e-5f;
+            use = correct && (emu || (tCand[0] < 0.97 * tRef[0] && tCand[1] <= 1.03 * tRef[1]));
+            log.append(String.format(java.util.Locale.ROOT, "decode attention %s, max diff %.1e%s", correct ? "agrees" : "DISAGREES",
+                    diff, emu ? "" : String.format(java.util.Locale.ROOT, ", %.3f vs %.3f ms (%d keys), %.3f vs %.3f ms (400 keys)",
+                            tCand[0], tRef[0], keys, tCand[1], tRef[1])));
+        } catch (RuntimeException e) { // a kernel the device cannot compile or run
+            log.append("decode attention failed (").append(e.getMessage()).append(")");
+        }
+        System.err.println("Metal decode attention: " + (use ? "on" : "off") + " (" + log + ")");
+        cache.setProperty(key, use ? "1" : "0");
+        store(cache);
+        DEC_DECISIONS.put(key, use);
+        return use;
     }
 
     /**
@@ -253,7 +380,9 @@ final class MetalTuner {
                     .replace(' ', '_').replace('=', '_').replace(':', '_');
             String cached = cache.getProperty(ck);
             boolean use;
-            if (cached != null) {
+            if (!hmmaAllowed(pr)) { // the lossy K-quant kernels are opt-in (jllm.metal.hmmaKQuants), never chosen by timing
+                use = false;
+            } else if (cached != null) {
                 use = cached.equals("1");
             } else {
                 use = checkHmma(k, pr, log);
@@ -273,6 +402,19 @@ final class MetalTuner {
             System.err.println("Metal prefill matmuls: half-weight MMA for " + on + " of " + total + " shapes"
                     + (changed ? " (" + log.toString().trim() + ")" : " (cached)"));
         }
+    }
+
+    /** Whether the probe's formats have exact {@code *_hmma} kernels (or the lossy ones were asked for). */
+    private static boolean hmmaAllowed(Probe pr) {
+        if (MetalKernels.HMMA_KQUANTS) {
+            return true;
+        }
+        for (QTensor t : pr.t()) {
+            if (!MetalKernels.hmmaExact(t.type)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The distinct prefill matmul shapes of the model's layers. */
@@ -485,6 +627,14 @@ final class MetalTuner {
                     case F32 -> seg.set(ValueLayout.JAVA_FLOAT, o + 4L * i, v);
                     case F16 -> seg.set(ValueLayout.JAVA_SHORT, o + 2L * i, Float.floatToFloat16(v));
                     case Q8 -> seg.set(ValueLayout.JAVA_BYTE, o + i, (byte) Math.round(v * 127));
+                    case Q4 -> { // random codes, then scales between 0.5 / 8 and 1.5 / 8
+                        if (i < width / 2) {
+                            seg.set(ValueLayout.JAVA_BYTE, o + i, (byte) rnd.nextInt(256));
+                        } else if (i < width / 2 + width / KvQ4.GROUP) {
+                            seg.set(ValueLayout.JAVA_SHORT_UNALIGNED, o + width / 2 + 2L * (i - width / 2),
+                                    Float.floatToFloat16((0.5f + rnd.nextFloat()) / 8));
+                        }
+                    }
                 }
             }
             for (int h = 0; kv == KvDtype.Q8 && h < heads; h++) { // per-head scales between 0.5 / 127 and 1.5 / 127

@@ -41,13 +41,15 @@ public class ManagementController {
     private final SettingsService settings;
     private final WebProperties props;
     private final org.robomiri.jllm.web.models.KvStore kvStore;
+    private final org.robomiri.jllm.web.images.ImageService images;
 
     public ManagementController(ModelManager models, SettingsService settings, WebProperties props,
-                                org.robomiri.jllm.web.models.KvStore kvStore) {
+                                org.robomiri.jllm.web.models.KvStore kvStore, org.robomiri.jllm.web.images.ImageService images) {
         this.models = models;
         this.settings = settings;
         this.props = props;
         this.kvStore = kvStore;
+        this.images = images;
         LogBuffer.get().setCapacity(props.logLines());
     }
 
@@ -60,17 +62,22 @@ public class ManagementController {
             weights += m.view().weightBytes();
             thermal = Math.max(thermal, m.engine().backend().thermalState());
         }
+        for (var m : images.loaded()) {
+            weights += m.view().weightBytes();
+        }
         int running = (int) models.jobs().stream().filter(j -> j.state() == Job.State.RUNNING).count();
         return new Status(ManagementFactory.getRuntimeMXBean().getUptime(), Runtime.version().toString(),
                 rt.availableProcessors(), rt.totalMemory() - rt.freeMemory(), rt.maxMemory(), weights,
-                models.loaded().size(), running, props.apiKeyRequired(), settings.file().toString(), thermal);
+                models.loaded().size() + images.loaded().size(), running, props.apiKeyRequired(), settings.file().toString(), thermal);
     }
 
     // ------------------------------------------------------------------ models
 
     @GetMapping("/models/loaded")
-    public List<LoadedModel.View> loaded() {
-        return models.loaded().stream().map(LoadedModel::view).toList();
+    public List<Object> loaded() { // text models ("kind": "text") and image models ("kind": "image")
+        List<Object> out = new java.util.ArrayList<>(models.loaded().stream().map(LoadedModel::view).toList());
+        images.loaded().forEach(m -> out.add(m.view()));
+        return out;
     }
 
     @PostMapping("/models/load")

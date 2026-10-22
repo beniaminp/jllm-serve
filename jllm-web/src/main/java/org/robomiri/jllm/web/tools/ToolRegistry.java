@@ -31,10 +31,16 @@ public class ToolRegistry {
     private final List<Tool> builtins;
     private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
 
-    public ToolRegistry(ToolsConfig config, McpManager mcp) {
+    public ToolRegistry(ToolsConfig config, McpManager mcp, org.robomiri.jllm.web.models.ModelManager models,
+                        org.robomiri.jllm.web.settings.SettingsService settings, org.robomiri.jllm.web.chat.ImageStore chatImages,
+                        org.robomiri.jllm.web.images.ImageService images) {
         this.config = config;
         this.mcp = mcp;
-        this.builtins = BuiltinTools.all(config::general);
+        List<Tool> all = new ArrayList<>(BuiltinTools.all(config::general));
+        all.add(new DescribeImageTool(models, settings, chatImages, config::general)); // vision: lets a text model ask a vision model
+        all.addAll(AudioTools.all()); // transcribe_audio, speak
+        all.addAll(ImageToolSupport.all(images)); // generate_image, edit_image
+        this.builtins = List.copyOf(all);
     }
 
     /** All tools, the switched-off built-ins included (marked). */

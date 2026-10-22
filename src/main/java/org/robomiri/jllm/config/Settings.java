@@ -37,6 +37,7 @@ public final class Settings {
             Map.entry("low-disk", "model.low-disk"),
             Map.entry("gguf-file", "model.gguf-file"),
             Map.entry("gguf-quant", "model.gguf-quant"),
+            Map.entry("mmproj", "model.mmproj"),
             Map.entry("backend", "backend"),
             Map.entry("ctx", "backend.ctx"),
             Map.entry("batch", "backend.batch"),
@@ -54,11 +55,23 @@ public final class Settings {
             Map.entry("draft-tokens", "engine.draft-tokens"),
             Map.entry("think", "chat.thinking"),
             Map.entry("system", "chat.system"),
+            Map.entry("image-model", "image.model"),
+            Map.entry("steps", "image.steps"),
+            Map.entry("guidance", "image.guidance"),
+            Map.entry("width", "image.width"),
+            Map.entry("height", "image.height"),
+            Map.entry("scheduler", "image.scheduler"),
+            Map.entry("negative", "image.negative"),
+            Map.entry("out", "image.out"),
+            Map.entry("init", "image.init"),
+            Map.entry("mask", "image.mask"),
+            Map.entry("strength", "image.strength"),
             Map.entry("host", "server.host"),
             Map.entry("port", "server.port"));
 
     /** Flags that are not properties: per-invocation inputs. */
-    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config");
+    private static final java.util.Set<String> CLI_ONLY = java.util.Set.of("prompt", "raw", "config", "image", "audio", "out", "voice",
+            "language", "translate", "words", "format", "speed"); // the last seven: `transcribe` and `speak`
 
     private final Properties props = new Properties();
     private final Map<String, String> sources = new LinkedHashMap<>();
@@ -105,6 +118,15 @@ public final class Settings {
                 s.put(k, v, "command line");
             }
         });
+        return s;
+    }
+
+    /** A copy with some values replaced (a model loaded with its own context length, say); the keys must exist. */
+    public Settings with(Map<String, String> overrides) {
+        Settings s = new Settings();
+        s.props.putAll(props);
+        s.sources.putAll(sources);
+        overrides.forEach((k, v) -> s.put(k, v, "override"));
         return s;
     }
 
@@ -183,9 +205,12 @@ public final class Settings {
      * @throws IllegalArgumentException naming the offending key and value
      */
     public Settings validate() {
-        for (String k : new String[]{"backend.ctx", "backend.batch", "bench.max-tokens", "bench.rounds",
+        for (String k : new String[]{"backend.ctx", "bench.max-tokens", "bench.rounds",
                 "bench.prompt-repeat", "server.max-connections"}) {
             require(getInt(k) >= 1, k, "must be at least 1");
+        }
+        if (!"auto".equalsIgnoreCase(get("backend.batch").trim())) {
+            require(getInt("backend.batch") >= 1, "backend.batch", "must be auto or at least 1");
         }
         require(getInt("backend.threads") >= 0, "backend.threads", "must be 0 (= all processors) or positive");
         require(getInt("server.port") >= 0 && getInt("server.port") <= 65535, "server.port", "must be 0..65535");
@@ -205,7 +230,7 @@ public final class Settings {
         speculation(); // the messages name their keys
         require(getLong("hub.timeout-ms") > 0, "hub.timeout-ms", "must be positive");
         for (String k : new String[]{"model.low-disk", "chat.thinking", "raw",
-                "engine.batch-decode"}) {
+                "engine.batch-decode", "engine.constrained-tools", "engine.jump-forward", "engine.constraint-masks"}) {
             if (has(k)) {
                 getBool(k);
             }
@@ -231,6 +256,7 @@ public final class Settings {
             throw new IllegalArgumentException("model.head-quant: " + e.getMessage());
         }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
+        require(getInt("backend.kv-q4-recent") >= 0, "backend.kv-q4-recent", "must be 0 (= none) or positive");
         try {
             org.robomiri.jllm.metal.MoeSplit.parseLayers(get("backend.metal.cpu-moe"));
         } catch (IllegalArgumentException e) {
@@ -239,6 +265,29 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        require(get("image.backend").equals("cpu") || get("image.backend").equals("metal") || get("image.backend").equals("auto"),
+                "image.backend", "must be cpu, metal or auto");
+        require(get("image.precision").matches("auto|f16|f32"), "image.precision", "must be auto, f16 or f32");
+        require(getInt("image.steps") >= 0 && getInt("image.steps") <= 200, "image.steps", "must be 0 (model default) .. 200");
+        require(getInt("image.width") >= 0 && getInt("image.height") >= 0, "image.width", "and image.height must be 0 (model default) or positive");
+        require(getInt("image.count") >= 1 && getInt("image.count") <= 64, "image.count", "must be 1..64");
+        require(getFloat("image.strength") >= 0 && getFloat("image.strength") <= 1, "image.strength", "must be 0..1");
+        getLong("image.seed");
+        getFloat("image.guidance");
+        require(getInt("image.vae-tile") >= 8 && getInt("image.vae-tile") <= 512, "image.vae-tile", "must be 8..512");
+        require(getInt("image.vae-tile-overlap") >= 1 && getInt("image.vae-tile-overlap") < getInt("image.vae-tile"),
+                "image.vae-tile-overlap", "must be at least 1 and below image.vae-tile");
+        require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
+        for (String k : new String[]{"vision.enabled", "vision.auto-download", "vision.allow-private-urls"}) {
+            getBool(k);
+        }
+        for (String k : new String[]{"vision.image-min-tokens", "vision.image-max-tokens", "vision.cache-mb",
+                "vision.max-image-bytes", "vision.max-image-pixels"}) {
+            require(getLong(k) >= 0, k, "must be 0 or positive");
+        }
+        require(getInt("vision.image-max-tokens") == 0 || getInt("vision.image-min-tokens") <= getInt("vision.image-max-tokens"),
+                "vision.image-min-tokens", "must not exceed vision.image-max-tokens");
+        org.robomiri.jllm.audio.AudioSettings.of(this); // audio.*: the messages name their keys
         return this;
     }
 
