@@ -143,11 +143,15 @@ public final class Engine implements AutoCloseable {
 
     private volatile int[] cached = new int[0]; // tokens currently in the KV cache
     private volatile int cachedLen;
+    /** The pictures of the request being served, null for a text prompt (set and cleared under {@link #lock}). */
+    private MediaPrompt media;
+    /** Whether the backend's rotary rows hold Qwen-VL positions (an earlier request had pictures); under {@link #lock}. */
+    private boolean ropeDirty;
     private final ChatTemplate.Format template;
     private volatile PromptCache promptCache; // null = every prompt is tokenized in full
     private Speculator spec; // null = no speculative decoding
-    /** Jump-forward under constraints (docs/17 §17.7); {@code -Djllm.jump-forward=false} turns it off. */
-    private volatile boolean jumpForward = Boolean.parseBoolean(System.getProperty("jllm.jump-forward", "true"));
+    /** Jump-forward under constraints (docs/17 §17.7); {@code engine.jump-forward=false} turns it off. */
+    private volatile boolean jumpForward = true;
 
     public Engine(Backend backend, Tokenizer tokenizer, Architecture arch, Set<Integer> eosIds) {
         this(backend, tokenizer, arch, eosIds, 0);
@@ -201,8 +205,10 @@ public final class Engine implements AutoCloseable {
         if (cfg.mode() == Speculator.Mode.OFF) {
             return false;
         }
-        if (!Speculator.supported(backend)) {
-            System.err.println("note: engine.speculative is ignored: " + backend.name() + " cannot roll back its state");
+        if (!Speculator.supported(backend, cfg.mode())) {
+            System.err.println("note: engine.speculative=" + cfg.mode().name().toLowerCase() + " is ignored: " + backend.name()
+                    + (cfg.mode() == Speculator.Mode.MTP ? " has no multi-token-prediction head it can run"
+                    : " cannot roll back its state"));
             if (draft != null) {
                 draft.close();
             }
@@ -227,6 +233,26 @@ public final class Engine implements AutoCloseable {
 
     public Tokenizer tokenizer() {
         return tokenizer;
+    }
+
+    // ---- pictures (docs/20)
+
+    private volatile org.robomiri.jllm.vision.VisionContext vision;
+    private boolean ownsVision;
+
+    /**
+     * Gives the engine a vision encoder for its model: prompts may then contain pictures ({@link #vision()},
+     * {@link #generate(MediaPrompt, SamplingParams, Decoding, int, ChoiceSink, BooleanSupplier)}). Engines that run on
+     * the same weights share one encoder; the one that {@code owns} it closes it.
+     */
+    public void setVision(org.robomiri.jllm.vision.VisionContext v, boolean owns) {
+        this.vision = v;
+        this.ownsVision = owns;
+    }
+
+    /** The vision encoder, or null when the loaded model cannot see pictures. */
+    public org.robomiri.jllm.vision.VisionContext vision() {
+        return vision;
     }
 
     /** The model family's chat template. */
@@ -326,8 +352,42 @@ public final class Engine implements AutoCloseable {
      */
     public List<Result> generate(int[] promptTokens, SamplingParams p, Decoding d, int n, ChoiceSink sink,
                                  BooleanSupplier cancelled) {
-        int[] prompt = preparePrompt(promptTokens);
+        return generateChoices(preparePrompt(promptTokens), null, p, d, n, sink, cancelled);
+    }
+
+    /**
+     * {@link #generate(int[], SamplingParams, Decoding, int, ChoiceSink, BooleanSupplier)} for a prompt with pictures
+     * (docs/20): the spans are fed as embeddings, everything else as ids. The prompt must be prepared already (BOS in
+     * place): its {@link MediaPrompt#identity()} is what the prefix cache compares.
+     *
+     * @throws IllegalArgumentException when the backend cannot start from embeddings, or prompt logprobs are asked for
+     */
+    public List<Result> generate(MediaPrompt prompt, SamplingParams p, Decoding d, int n, ChoiceSink sink,
+                                 BooleanSupplier cancelled) {
+        if (!prompt.spans().isEmpty() && !backend.supportsEmbeds()) {
+            throw new IllegalArgumentException(backend.name() + " cannot take image embeddings");
+        }
+        if (d.promptLogprobs()) {
+            throw new IllegalArgumentException("prompt logprobs (echo) are not available for a prompt with images");
+        }
+        return generateChoices(prompt.identity(), prompt, p, d, n, sink, cancelled);
+    }
+
+    /** One completion of a prompt with pictures, streamed to {@code sink} (may be null). */
+    public Result generate(MediaPrompt prompt, SamplingParams p, TextSink sink, BooleanSupplier cancelled) {
+        ChoiceSink cs = sink == null ? null : new ChoiceSink() {
+            @Override
+            public void text(int index, String text) {
+                sink.accept(text);
+            }
+        };
+        return generate(prompt, p, Decoding.NONE, 1, cs, cancelled).getFirst();
+    }
+
+    private List<Result> generateChoices(int[] prompt, MediaPrompt mp, SamplingParams p, Decoding d, int n,
+                                         ChoiceSink sink, BooleanSupplier cancelled) {
         acquire();
+        media = mp;
         try {
             List<Result> results = new ArrayList<>(n);
             List<TokenLogprob> promptLp = null;
@@ -352,6 +412,7 @@ public final class Engine implements AutoCloseable {
             }
             return results;
         } finally {
+            media = null;
             lock.unlock();
         }
     }
@@ -404,7 +465,7 @@ public final class Engine implements AutoCloseable {
         }
         int vocab = Math.min(model.vocabSize(), tokenizer.vocabSize());
         float[] logits = new float[model.vocabSize()];
-        Sampler sampler = new Sampler(p, vocab, prompt, d.logitBias());
+        Sampler sampler = new Sampler(p, vocab, media == null ? prompt : media.tokens(), d.logitBias());
         // an end-of-sequence token is allowed exactly when the constrained output is complete (Sampler.sample)
         TokenConstraint con = d.constraint() == null ? null : d.constraint().get();
         List<TokenLogprob> promptLp = d.promptLogprobs() ? new ArrayList<>(prompt.length) : null;
@@ -426,6 +487,7 @@ public final class Engine implements AutoCloseable {
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
         cachedLen = 0;
+        applyRopePositions(reuse);
         long t0 = System.nanoTime();
         int pos = reuse;
         int batch = backend.maxBatch();
@@ -443,6 +505,16 @@ public final class Engine implements AutoCloseable {
                 continue;
             }
             int n = Math.min(batch, prompt.length - pos);
+            if (media != null) { // pictures are fed as embeddings, the text between them as ids
+                MediaPrompt.Span sp0 = media.spanAt(pos);
+                if (sp0 != null) {
+                    int cnt = Math.min(batch, sp0.end() - pos);
+                    backend.forwardEmbeds(sp0.embeds(), pos - sp0.start(), cnt, pos, sp0.deepstack(), pos + cnt == prompt.length ? logits : null);
+                    pos += cnt;
+                    continue;
+                }
+                n = Math.min(n, media.nextSpanStart(pos) - pos);
+            }
             boolean last = pos + n == prompt.length;
             backend.forward(prompt, pos, n, pos, last ? logits : null);
             pos += n;
@@ -471,7 +543,7 @@ public final class Engine implements AutoCloseable {
         int rLen = 0;
         int rPre = 0;
         if (sp != null) {
-            sp.begin(prompt);
+            sp.begin(media == null ? prompt : media.tokens());
             drafted0 = sp.drafted();
             accepted0 = sp.accepted();
         }
@@ -603,6 +675,22 @@ public final class Engine implements AutoCloseable {
         return new Result(text.toString(), tokens, finish, stats, lps, promptLp);
     }
 
+
+    /**
+     * Sets the backend's rotary positions for the slots a request is about to write ({@code reuse} on): the prompt's
+     * Qwen-VL positions when it has pictures, the plain ones when an earlier request left Qwen-VL positions behind.
+     * Slots before {@code reuse} keep what they were stored with: they are the same prefix.
+     */
+    private void applyRopePositions(int reuse) {
+        org.robomiri.jllm.model.RopePositions rp = media == null ? null : media.rope();
+        if (rp == null && !ropeDirty) {
+            return;
+        }
+        if (!backend.setRopePositions(reuse, rp)) {
+            throw new IllegalArgumentException(backend.name() + " cannot use multimodal rotary positions");
+        }
+        ropeDirty = rp != null;
+    }
 
     /** The output of one sequence as it is produced: tokens, streamed text, stop strings, logprobs. */
     private static final class Out {
@@ -1006,5 +1094,8 @@ public final class Engine implements AutoCloseable {
             spec.close();
         }
         backend.close();
+        if (ownsVision && vision != null) {
+            vision.close();
+        }
     }
 }

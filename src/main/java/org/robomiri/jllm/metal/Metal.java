@@ -48,6 +48,9 @@ public final class Metal implements AutoCloseable {
     private final MethodHandle waitPending; // null with a library built before jm_wait_pending existed
     private final MethodHandle thermal;     // null with a library built before jm_thermal_state existed
     private final MethodHandle run;         // null with a library built before jm_run existed
+    private final MethodHandle setConcurrent; // null with a library built before the concurrent encoder existed
+    private final MethodHandle setGroup;    // ditto
+    private final MethodHandle barriers;    // ditto
     private final MethodHandle destroy;
     private final MethodHandle deviceName;
     private final MethodHandle workingSet;
@@ -97,6 +100,12 @@ public final class Metal implements AutoCloseable {
                 .orElse(null);
         run = l.find("jm_run").map(a -> LINKER.downcallHandle(a, FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, JAVA_INT)))
                 .orElse(null);
+        setConcurrent = l.find("jm_set_concurrent").map(a -> LINKER.downcallHandle(a,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT))).orElse(null);
+        setGroup = l.find("jm_set_group").map(a -> LINKER.downcallHandle(a,
+                FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT))).orElse(null);
+        barriers = l.find("jm_barriers").map(a -> LINKER.downcallHandle(a,
+                FunctionDescriptor.of(JAVA_LONG, ADDRESS))).orElse(null);
         waitPending = l.find("jm_wait_pending").map(a -> LINKER.downcallHandle(a,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_INT))).orElse(null);
         try {
@@ -131,7 +140,7 @@ public final class Metal implements AutoCloseable {
         return create(explicitLib, defines, "kernels.metal");
     }
 
-    /** As above, compiling another shader resource of this package (the image-generation kernels, {@code diffusion.metal}). */
+    /** As above with another shader source of this package ({@code vision.metal}: the vision encoder; {@code diffusion.metal}: image generation). */
     public static Metal create(String explicitLib, String defines, String resource) {
         Path lib = findLibrary(explicitLib);
         String src;
@@ -144,6 +153,14 @@ public final class Metal implements AutoCloseable {
             throw new IllegalStateException(e);
         }
         return new Metal(lib, defines.isEmpty() ? src : defines + "#line 1\n" + src);
+    }
+
+    /**
+     * As {@link #create(String)} but compiles {@code source} (a complete Metal source text) instead of the bundled
+     * {@code kernels.metal}: the audio models' own kernel library ({@code audio/audio.metal}).
+     */
+    public static Metal createFromSource(String explicitLib, String source) {
+        return new Metal(findLibrary(explicitLib), source);
     }
 
     /** True if this looks like a machine where the Metal backend can work. */
@@ -384,6 +401,56 @@ public final class Metal implements AutoCloseable {
         dispatches += n;
         try {
             run.invokeExact(ctx, cmds, n);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** Whether the concurrent compute encoder is available (the native library is recent enough). */
+    public boolean canRunConcurrent() {
+        return setConcurrent != null && setGroup != null;
+    }
+
+    /**
+     * Selects the compute encoder of the command buffers opened from now on (between forward passes): 0 = serial (each
+     * dispatch waits for the one before), 1 = concurrent, the native side inserting a memory barrier before a dispatch
+     * that reads or overwrites what an earlier one in the same stretch writes, 2 = concurrent with a barrier before
+     * every dispatch (a measuring aid); add 4 for barriers that name the buffers instead of covering all of them.
+     */
+    public void concurrent(int mode) {
+        if (setConcurrent == null) {
+            if (mode != 0) {
+                throw new IllegalStateException("the native library has no concurrent encoder (rebuild it)");
+            }
+            return;
+        }
+        try {
+            int ignored = (int) setConcurrent.invokeExact(ctx, mode);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /**
+     * Declares the dispatches that follow, until {@code group(0)}, mutually independent (none reads what another writes,
+     * their writes do not overlap): in the concurrent modes they may overlap. Group ids of two adjacent groups differ.
+     */
+    public void group(int id) {
+        downcalls++;
+        try {
+            setGroup.invokeExact(ctx, id);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** Memory barriers the concurrent encoder inserted so far (0 when serial or unavailable). */
+    public long barriers() {
+        if (barriers == null) {
+            return 0;
+        }
+        try {
+            return (long) barriers.invokeExact(ctx);
         } catch (Throwable t) {
             throw rethrow(t);
         }

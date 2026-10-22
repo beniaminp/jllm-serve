@@ -4,6 +4,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.MediaPrompt;
 import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -11,6 +12,7 @@ import org.robomiri.jllm.server.OpenAiFeatures;
 import org.robomiri.jllm.tokenizer.Tokenizer;
 import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.chat.ChatSupport;
+import org.robomiri.jllm.web.chat.WebImages;
 import org.robomiri.jllm.web.chat.ClientGone;
 import org.robomiri.jllm.web.chat.ReasoningSplitter;
 import org.robomiri.jllm.web.chat.ChatSupport.RequestError;
@@ -18,6 +20,7 @@ import org.robomiri.jllm.web.models.LoadedModel;
 import org.robomiri.jllm.web.models.ModelManager;
 import org.robomiri.jllm.web.settings.SettingsService;
 import org.robomiri.jllm.web.tools.ToolCallFormat;
+import org.robomiri.jllm.web.tools.ToolsConfig;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -49,17 +52,23 @@ public class OpenAiController {
     private final ModelManager models;
     private final SettingsService settings;
     private final WebProperties props;
+    private final ToolsConfig toolsConfig;
     private final AtomicLong counter = new AtomicLong();
     private final AtomicBoolean thinkingNoted = new AtomicBoolean();
     private final org.robomiri.jllm.web.images.ImageService images;
 
-    public OpenAiController(ModelManager models, SettingsService settings, WebProperties props,
+    public OpenAiController(ModelManager models, SettingsService settings, WebProperties props, ToolsConfig toolsConfig,
                             org.robomiri.jllm.web.images.ImageService images) {
         this.models = models;
         this.settings = settings;
         this.props = props;
+        this.toolsConfig = toolsConfig;
         this.images = images;
     }
+
+    // loaded speech-to-text / text-to-speech models are listed too (kind: "speech-to-text" / "text-to-speech")
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
 
     @GetMapping(value = "/v1/models", produces = "application/json")
     public String listModels() {
@@ -71,6 +80,9 @@ public class OpenAiController {
             var v = m.view();
             data.add(Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve", "kind", "image",
                     "backend", v.backend(), "defaults", v.defaults(), "size_multiple", v.sizeMultiple(), "inpainting_unet", v.inpaintUnet()));
+        }
+        if (audio != null) {
+            data.addAll(org.robomiri.jllm.audio.AudioApi.modelObjects(audio.models()));
         }
         return Json.write(Json.obj("object", "list", "data", data));
     }
@@ -139,6 +151,8 @@ public class OpenAiController {
         Settings s = settings.current();
         String modelId = model.id();
         int[] prompt;
+        int[] textIds; // the prompt without the pictures' identities: what the text-side helpers read
+        MediaPrompt media = null; // the prompt with pictures in it (docs/20)
         SamplingParams params;
         OpenAiFeatures.Options o;
         Engine.Decoding decoding;
@@ -151,8 +165,17 @@ public class OpenAiController {
             long maxPromptBytes = s.getLong("engine.max-prompt-bytes") > 0
                     ? s.getLong("engine.max-prompt-bytes") : 16L * engine.backend().contextLength();
             int[] ids;
+            List<org.robomiri.jllm.vision.Rgb> images = List.of();
             if (chat) {
-                ids = chatPrompt(engine, body, s.getBool("chat.thinking"), o.json(), maxPromptBytes, toolNames);
+                List<Object> raw = Json.list(body, "messages");
+                Map<String, Object> chatBody = body;
+                if (raw != null && org.robomiri.jllm.vision.ImageParts.hasImages(raw)) {
+                    org.robomiri.jllm.vision.ImageParts.Extracted ex = WebImages.extract(raw, engine, s,
+                            toolsConfig.general().fetch().allowPrivateAddresses());
+                    chatBody = WebImages.withMessages(body, ex.messages());
+                    images = ex.images();
+                }
+                ids = chatPrompt(engine, chatBody, s.getBool("chat.thinking"), o.json(), maxPromptBytes, toolNames);
             } else if (o.suffix() != null) {
                 String text = rawText(body);
                 ChatSupport.checkPromptBytes(ChatSupport.utf8Length(text) + ChatSupport.utf8Length(o.suffix()), maxPromptBytes);
@@ -160,14 +183,26 @@ public class OpenAiController {
             } else {
                 ids = rawPrompt(engine, body, maxPromptBytes);
             }
-            prompt = ChatSupport.checkContext(engine, ids);
-            echoFrom = prompt.length - ids.length;
+            if (!images.isEmpty()) {
+                media = WebImages.prompt(engine, ids, images);
+                prompt = media.identity();
+                textIds = media.tokens();
+                echoFrom = 0;
+            } else {
+                prompt = ChatSupport.checkContext(engine, ids);
+                textIds = prompt;
+                echoFrom = prompt.length - ids.length;
+            }
             if (o.echo()) {
                 echoText = rawText(body);
             }
             params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length, o.echo());
             // tool calls are constrained to the offered functions and their schemas (docs/17 §17.7)
-            decoding = chat ? ToolCallFormat.decoding(o.decoding(tok), body, engine, prompt, o.format(),
+            boolean constrainTools = chat && s.getBool("engine.constrained-tools");
+            if (chat && !constrainTools) {
+                ChatSupport.checkFormatWithoutToolConstraint(body); // the old behaviour: tools and response_format exclude each other
+            }
+            decoding = constrainTools ? ToolCallFormat.decoding(o.decoding(tok), body, engine, textIds, o.format(),
                     ChatSupport.thinking(body, s.getBool("chat.thinking")) && !o.json()) : o.decoding(tok);
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));
@@ -187,7 +222,8 @@ public class OpenAiController {
         ChatSupport.Deadline deadline = new ChatSupport.Deadline(s.getLong("server.request-timeout-ms"));
         // the thinking block goes to reasoning_content unless the server or the request asks for it inline
         boolean splitReasoning = chat && !"none".equalsIgnoreCase(Json.str(body, "reasoning_format", props.reasoningFormat()));
-        boolean startsInThink = splitReasoning && ReasoningSplitter.promptOpensThink(engine, prompt);
+        boolean startsInThink = splitReasoning && ReasoningSplitter.promptOpensThink(engine, textIds);
+        MediaPrompt mediaPrompt = media;
         int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
         int count = o.count();
 
@@ -196,7 +232,10 @@ public class OpenAiController {
             if (!stream) {
                 List<Engine.Result> all;
                 try {
-                    all = e.generate(prompt, params, decoding, count, null,
+                    all = mediaPrompt == null
+                            ? e.generate(prompt, params, decoding, count, null,
+                            () -> model.closing() || deadline.getAsBoolean() || gone.getAsBoolean())
+                            : e.generate(mediaPrompt, params, decoding, count, null,
                             () -> model.closing() || deadline.getAsBoolean() || gone.getAsBoolean());
                 } catch (Engine.OverloadedException ex) {
                     ChatSupport.send(res, 503, ChatSupport.error(ex.getMessage(), "server_error", "overloaded"));
@@ -375,9 +414,15 @@ public class OpenAiController {
                 }
             };
             try (AutoCloseable alive = sse.keepAlive()) {
-                e.generate(prompt, params, decoding, count, sink,
-                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
-                                || gone.getAsBoolean());
+                if (mediaPrompt == null) {
+                    e.generate(prompt, params, decoding, count, sink,
+                            () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
+                                    || gone.getAsBoolean());
+                } else {
+                    e.generate(mediaPrompt, params, decoding, count, sink,
+                            () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
+                                    || gone.getAsBoolean());
+                }
             } catch (Engine.OverloadedException | IllegalArgumentException ex) {
                 sse.event(Json.obj("error", Json.obj("message", ex.getMessage(), "type",
                         ex instanceof Engine.OverloadedException ? "server_error" : "invalid_request_error",

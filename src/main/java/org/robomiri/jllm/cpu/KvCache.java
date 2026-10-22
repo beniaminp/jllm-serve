@@ -2,6 +2,7 @@ package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvQ4;
 
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
@@ -59,8 +60,19 @@ public abstract class KvCache {
     /** Per thread, grown on demand: [tile × group × span scores][headDim K row][headDim V row][tile × group 1/sum]. */
     final ThreadLocal<float[]> scratch;
 
+    /**
+     * Whether some keys of a query come from exact rows besides the stored ones ({@link Q4}'s recent window, see
+     * {@link #exactFrom}).
+     */
+    final boolean exactRows;
+
     /** @param a the head shape shared by every layer */
     KvCache(int layers, Attention.Gqa a, int ctx) {
+        this(layers, a, ctx, false);
+    }
+
+    KvCache(int layers, Attention.Gqa a, int ctx, boolean exactRows) {
+        this.exactRows = exactRows;
         this.layers = layers;
         this.ctx = ctx;
         this.kvDim = a.kvDim();
@@ -121,7 +133,21 @@ public abstract class KvCache {
     }
 
     public static KvCache create(KvDtype dtype, int layers, Attention.Gqa a, int ctx) {
-        long cacheLen = (long) ctx * a.kvDim();
+        return create(dtype, layers, a, ctx, 64, KvDtype.q4Recent());
+    }
+
+    /**
+     * @param chunk  most positions one {@link #store} call writes (the backend's batch): q4's recent window keeps
+     *               {@code recent + chunk} rows so that a chunk never evicts a row one of its own queries reads
+     * @param recent q4: positions kept exact besides their q4 rows ({@code backend.kv-q4-recent})
+     */
+    public static KvCache create(KvDtype dtype, int layers, Attention.Gqa a, int ctx, int chunk, int recent) {
+        if (dtype == KvDtype.Q4 && !KvQ4.supports(a.headDim())) {
+            System.err.println("note: backend.kv-dtype=q4 needs a head size that is a multiple of " + KvQ4.GROUP
+                    + " (this model: " + a.headDim() + "), using q8");
+            dtype = KvDtype.Q8;
+        }
+        long cacheLen = (long) ctx * a.kvDim() / (dtype == KvDtype.Q4 ? 2 : 1); // the longest array: elements per layer
         if (cacheLen > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("context " + ctx + " is too large for the CPU KV cache");
         }
@@ -130,6 +156,7 @@ public abstract class KvCache {
             case F32 -> new F32(layers, a, ctx);
             case F16 -> new F16(layers, a, ctx);
             case Q8 -> new Q8(layers, a, ctx);
+            case Q4 -> Boolean.getBoolean("q4.sim") ? new KvQ4Sim(layers, a, ctx) : new Q4(layers, a, ctx, chunk, recent);
         };
     }
 
@@ -168,6 +195,19 @@ public abstract class KvCache {
     /** Expands the {@code headDim} values of kv head slice {@code ko} of row {@code s} into {@code dst[d ..]}. */
     abstract void expand(int layer, boolean values, int s, int ko, float[] dst, int d);
 
+    /**
+     * With {@link #exactRows}: the first key that a query at position {@code p} reads from {@link #exactRow} rather than
+     * from the stored rows (the keys {@code [exactFrom(p), p]} are exact); {@code p + 1} when there is none.
+     */
+    int exactFrom(int layer, int p) {
+        return p + 1;
+    }
+
+    /** With {@link #exactRows}: the exact (in {@link Q4}: rotated K, f16) row of key {@code s}, kv head {@code g}. */
+    void exactRow(int layer, boolean values, int s, int g, float[] dst, int d) {
+        throw new UnsupportedOperationException();
+    }
+
     /** Chunks per kv head: the context rounded up to whole chunks. */
     final int chunks() {
         return (ctx + CHUNK - 1) / CHUNK;
@@ -180,7 +220,9 @@ public abstract class KvCache {
 
     /** Layout of {@link #write}: the element type and the shape, so a file is only read into an equal cache. */
     public final String format() {
-        return (this instanceof F16 ? "f16" : this instanceof Q8 ? "q8" : "f32") + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
+        String type = this instanceof F16 ? "f16" : this instanceof Q8 ? "q8"
+                : this instanceof Q4 q4 ? "q4" + (q4.recent > 0 ? " recent=" + q4.recent : "") : "f32";
+        return type + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
     }
 
     /** Positions {@code [0, n)} of every layer copied from {@code o}, a cache of the same {@link #format}. */
@@ -201,18 +243,20 @@ public abstract class KvCache {
 
     /** Bytes of one position's K (or V) row in {@link #write}'s format. */
     private int ioRowBytes() {
-        return (int) (this instanceof F16 ? KvDtype.F16 : this instanceof Q8 ? KvDtype.Q8 : KvDtype.F32)
-                .rowBytes(kvDim, kvHeads);
+        return (int) (this instanceof F16 ? KvDtype.F16 : this instanceof Q8 ? KvDtype.Q8
+                : this instanceof Q4 ? KvDtype.Q4 : KvDtype.F32).rowBytes(kvDim, kvHeads);
     }
 
     /**
      * Writes positions {@code [0, n)} of every layer: per layer, per position, the K row then the V row in natural
      * element order, little-endian, as f32 or f16, or for q8 the {@code kvDim} int8 values followed by the
-     * {@code kvHeads} f32 scales (the stored type, so nothing is rounded).
+     * {@code kvHeads} f32 scales, for q4 the {@link KvQ4} row layout (the stored type, so nothing is rounded); q4 with a
+     * recent window then adds, per layer, the exact rows of the window ({@link Q4#writeRecent}).
      */
     public final void write(int n, WritableByteChannel out) throws IOException {
         boolean half = this instanceof F16;
         Q8 q8 = this instanceof Q8 c ? c : null;
+        Q4 q4 = this instanceof Q4 c ? c : null;
         float[] row = new float[kvDim];
         ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * ioRowBytes()).order(ByteOrder.LITTLE_ENDIAN);
         for (int layer = 0; layer < layers; layer++) {
@@ -222,6 +266,10 @@ public abstract class KvCache {
                     for (int kind = 0; kind < 2; kind++) {
                         if (q8 != null) {
                             q8.writeRow(layer, kind == 1, s, buf);
+                            continue;
+                        }
+                        if (q4 != null) {
+                            q4.writeRow(layer, kind == 1, s, buf);
                             continue;
                         }
                         for (int g = 0; g < kvHeads; g++) {
@@ -241,6 +289,9 @@ public abstract class KvCache {
                     out.write(buf);
                 }
             }
+        }
+        for (int layer = 0; q4 != null && q4.recent > 0 && layer < layers; layer++) {
+            q4.writeRecent(layer, n, out);
         }
     }
 
@@ -262,6 +313,7 @@ public abstract class KvCache {
         }
         boolean half = this instanceof F16;
         Q8 q8 = this instanceof Q8 c ? c : null;
+        Q4 q4 = this instanceof Q4 c ? c : null;
         int rb = ioRowBytes();
         float[] k = new float[IO_ROWS * kvDim];
         float[] v = new float[IO_ROWS * kvDim];
@@ -283,6 +335,13 @@ public abstract class KvCache {
                     }
                     continue;
                 }
+                if (q4 != null) {
+                    for (int r = 0; r < m; r++) {
+                        q4.readRow(layer, false, s0 + r, buf);
+                        q4.readRow(layer, true, s0 + r, buf);
+                    }
+                    continue;
+                }
                 for (int r = 0; r < m; r++) {
                     for (int kind = 0; kind < 2; kind++) {
                         float[] dst = kind == 0 ? k : v;
@@ -294,6 +353,9 @@ public abstract class KvCache {
                 store(layer, s0, k, v, m);
             }
             org.robomiri.jllm.model.Backend.skipState(in, (long) (stored - n) * 2 * rb);
+        }
+        for (int layer = 0; q4 != null && q4.recent > 0 && layer < layers; layer++) {
+            q4.readRecent(layer, n, stored, in);
         }
     }
 
@@ -353,7 +415,8 @@ public abstract class KvCache {
                 Math.min(n, SCORE_BUDGET / (group * span))));
         int tiles = (n + tile - 1) / tile;
         int blkOff = tile * group * span;              // one block of K chunks or V rows, f32
-        int scratchLen = blkOff + KEY_BLOCK * hd;
+        int rowOff = blkOff + KEY_BLOCK * hd;          // one exact K or V row (exactRows)
+        int scratchLen = rowOff + (exactRows ? hd : 0);
         float[] kIn = keysInPlace(layer);
         float[] vIn = valuesInPlace(layer);
         boolean capped = softcap > 0 && !FASTMATH;
@@ -363,6 +426,7 @@ public abstract class KvCache {
             int[] rq = new int[tile * group];   // query offset of each row (token t, head h) of the tile
             int[] lo = new int[tile * group];   // its first visible key
             int[] hi = new int[tile * group];   // one past its last visible key
+            int[] ex = exactRows ? new int[tile * group] : hi; // its first exact key (exactRows), else hi
             for (int i = i0; i < i1; i++) {
                 int g = i % kvHeads;
                 int t0 = (tiles - 1 - i / kvHeads) * tile;
@@ -371,15 +435,27 @@ public abstract class KvCache {
                 int rows = (t1 - t0) * group;
                 for (int t = t0; t < t1; t++) {
                     int len = pos + t + 1;
+                    int first = window > 0 ? Math.max(0, len - window) : 0;
+                    int exact = exactRows ? Math.max(first, exactFrom(layer, len - 1)) : len;
                     for (int h = 0; h < group; h++) {
                         int r = (t - t0) * group + h;
                         rq[r] = t * qDim + (g * group + h) * hd;
-                        lo[r] = window > 0 ? Math.max(0, len - window) : 0;
+                        lo[r] = first;
                         hi[r] = len;
+                        ex[r] = exact;
                     }
                 }
                 int sMin = lo[0] / CHUNK * CHUNK;
                 int sMax = hi[rows - 1];
+                int eMin = sMax;     // the first key that some row reads exactly
+                int qMax = sMax;     // one past the last key that some row reads from the stored rows
+                if (exactRows) {
+                    qMax = 0;
+                    for (int r = 0; r < rows; r++) {
+                        eMin = Math.min(eMin, ex[r]);
+                        qMax = Math.max(qMax, ex[r]);
+                    }
+                }
 
                 // scores: sc[r * span + s] for the chunks holding visible keys of every row (others are ignored)
                 for (int b0 = sMin; b0 < sMax; b0 += KEY_BLOCK) {
@@ -415,6 +491,15 @@ public abstract class KvCache {
                         }
                     }
                 }
+                // exact keys: their scores replace the ones just computed from the stored rows
+                for (int s = eMin; s < sMax; s++) {
+                    exactRow(layer, false, s, g, sc, rowOff);
+                    for (int r = 0; r < rows; r++) {
+                        if (s >= ex[r] && s < hi[r]) {
+                            sc[r * span + s] = VectorKernels.dot(q, rq[r], sc, rowOff, hd) * scale;
+                        }
+                    }
+                }
                 for (int r = 0; r < rows; r++) {
                     int o = r * span;
                     if (capped) {
@@ -427,9 +512,10 @@ public abstract class KvCache {
                     Arrays.fill(att, rq[r], rq[r] + hd, 0f);
                 }
 
-                // outputs: att[row] += p(row, s) * v[s], ascending s, accumulated in registers within a block
-                for (int b0 = sMin; b0 < sMax; b0 += KEY_BLOCK) {
-                    int b1 = Math.min(sMax, b0 + KEY_BLOCK);
+                // outputs: att[row] += p(row, s) * v[s], ascending s, accumulated in registers within a block; the
+                // stored rows up to ex[row], then the exact ones
+                for (int b0 = sMin; b0 < qMax; b0 += KEY_BLOCK) {
+                    int b1 = Math.min(qMax, b0 + KEY_BLOCK);
                     float[] vArr = vIn != null ? vIn : sc;
                     int vBase;
                     int vStride;
@@ -443,15 +529,37 @@ public abstract class KvCache {
                     }
                     int r = 0;
                     for (; r + 3 < rows; r += 4) {
-                        accumulate4(sc, span, r, lo, hi, b0, b1, vArr, vBase, vStride, att, rq, hd);
+                        accumulate4(sc, span, r, lo, ex, b0, b1, vArr, vBase, vStride, att, rq, hd);
                     }
                     for (; r < rows; r++) {
-                        accumulate1(sc, span, r, Math.max(lo[r], b0), Math.min(hi[r], b1), b0, vArr, vBase, vStride,
+                        accumulate1(sc, span, r, Math.max(lo[r], b0), Math.min(ex[r], b1), b0, vArr, vBase, vStride,
                                 att, rq[r], hd);
+                    }
+                }
+                for (int s = eMin; s < sMax; s++) {
+                    exactRow(layer, true, s, g, sc, rowOff);
+                    for (int r = 0; r < rows; r++) {
+                        if (s >= ex[r] && s < hi[r]) {
+                            addRow(sc[r * span + s], sc, rowOff, att, rq[r], hd);
+                        }
                     }
                 }
             }
         });
+    }
+
+    /** {@code y[yo ..] += p · v[vo ..]} over {@code n} elements, one fused multiply-add per element (any vector width). */
+    static void addRow(float p, float[] v, int vo, float[] y, int yo, int n) {
+        var sp = VectorKernels.F;
+        int fl = VectorKernels.FL;
+        FloatVector w = FloatVector.broadcast(sp, p);
+        int i = 0;
+        for (; i + fl <= n; i += fl) {
+            FloatVector.fromArray(sp, v, vo + i).fma(w, FloatVector.fromArray(sp, y, yo + i)).intoArray(y, yo + i);
+        }
+        for (; i < n; i++) {
+            y[yo + i] = Math.fma(v[vo + i], p, y[yo + i]);
+        }
     }
 
     /** Decode scores of every query head over the context, shared by the tasks of one {@link #attentionDecode}. */
@@ -479,6 +587,7 @@ public abstract class KvCache {
         float[] vIn = valuesInPlace(layer);
         int c0 = first / CHUNK;
         int c1 = span / CHUNK;
+        int exact = exactRows ? Math.max(first, exactFrom(layer, pos)) : len; // keys [exact, len) are read exactly
         int want = 2 * pool.threads();
         int keyParts = Math.max(1, Math.min((want + kvHeads - 1) / kvHeads, (c1 - c0) / 4)); // >= 4 chunks per task
         pool.forRangeFine(kvHeads * keyParts, 1, (i0, i1) -> {
@@ -516,6 +625,19 @@ public abstract class KvCache {
                 }
             }
         });
+        if (exact < len) { // their scores replace the ones computed from the stored rows (as in attentionTiled)
+            pool.forRangeFine(kvHeads, 1, (g0, g1) -> {
+                float[] buf = scratch(hd);
+                for (int g = g0; g < g1; g++) {
+                    for (int s = exact; s < len; s++) {
+                        exactRow(layer, false, s, g, buf, 0);
+                        for (int h = g * group; h < (g + 1) * group; h++) {
+                            sc[h * span + s] = VectorKernels.dot(q, h * hd, buf, 0, hd) * scale;
+                        }
+                    }
+                }
+            });
+        }
         boolean capped = softcap > 0 && !FASTMATH;
         pool.forRangeFine(heads, 1, (h0, h1) -> {
             for (int h = h0; h < h1; h++) {
@@ -535,12 +657,12 @@ public abstract class KvCache {
         int slices = hd / slice;
         int sMin = first / CHUNK * CHUNK;
         pool.forRangeFine(kvHeads * slices, 1, (i0, i1) -> {
-            float[] buf = scratch(KEY_BLOCK * slice);
+            float[] buf = scratch(KEY_BLOCK * slice + (exact < len ? hd : 0));
             for (int i = i0; i < i1; i++) {
                 int g = i / slices;
                 int e0 = (i % slices) * slice;
-                for (int b0 = sMin; b0 < len; b0 += KEY_BLOCK) {
-                    int b1 = Math.min(len, b0 + KEY_BLOCK);
+                for (int b0 = sMin; b0 < exact; b0 += KEY_BLOCK) {
+                    int b1 = Math.min(exact, b0 + KEY_BLOCK);
                     float[] vArr;
                     int vBase;
                     int vStride;
@@ -558,6 +680,12 @@ public abstract class KvCache {
                         int h = g * group + r;
                         accumulate1(sc, span, h, Math.max(first, b0), b1, b0, vArr, vBase, vStride, att, h * hd + e0,
                                 slice);
+                    }
+                }
+                for (int s = exact; s < len; s++) {
+                    exactRow(layer, true, s, g, buf, KEY_BLOCK * slice);
+                    for (int h = g * group; h < (g + 1) * group; h++) {
+                        addRow(sc[h * span + s], buf, KEY_BLOCK * slice + e0, att, h * hd + e0, slice);
                     }
                 }
             }
@@ -794,7 +922,8 @@ public abstract class KvCache {
         int kOff = tile * group * span;
         int vOff = kOff + hd;
         int invOff = vOff + hd;
-        int scratchLen = invOff + tile * group;
+        int xOff = invOff + tile * group; // an exact row (exactRows)
+        int scratchLen = xOff + (exactRows ? hd : 0);
         // later tiles see more keys: hand them out first so the tail of the job is made of the light ones
         pool.forRangeFine(kvHeads * tiles, 1, (i0, i1) -> {
             float[] sc = scratch(scratchLen);
@@ -808,6 +937,9 @@ public abstract class KvCache {
                 // scores: row (t - t0) * group + h holds the keys of query head g * group + h of token t
                 for (int s = sMin; s < sMax; s++) {
                     expand(layer, false, s, ko, sc, kOff);
+                    if (exactRows) {
+                        exactRow(layer, false, s, g, sc, xOff);
+                    }
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
                         int first = window > 0 ? Math.max(0, len - window) : 0;
@@ -816,8 +948,9 @@ public abstract class KvCache {
                         }
                         int qo = t * qDim + g * group * hd;
                         int row = (t - t0) * group;
+                        int kRow = exactRows && s >= exactFrom(layer, len - 1) ? xOff : kOff;
                         for (int h = 0; h < group; h++) {
-                            float d = VectorKernels.dot(q, qo + h * hd, sc, kOff, hd) * scale;
+                            float d = VectorKernels.dot(q, qo + h * hd, sc, kRow, hd) * scale;
                             sc[(row + h) * span + s] = softcap > 0 && !FASTMATH ? (float) Math.tanh(d / softcap) * softcap : d;
                         }
                     }
@@ -835,6 +968,9 @@ public abstract class KvCache {
                 }
                 for (int s = sMin; s < sMax; s++) {
                     expand(layer, true, s, ko, sc, vOff);
+                    if (exactRows) {
+                        exactRow(layer, true, s, g, sc, xOff);
+                    }
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
                         int first = window > 0 ? Math.max(0, len - window) : 0;
@@ -843,8 +979,9 @@ public abstract class KvCache {
                         }
                         int qo = t * qDim + g * group * hd;
                         int row = (t - t0) * group;
+                        int vRow = exactRows && s >= exactFrom(layer, len - 1) ? xOff : vOff;
                         for (int h = 0; h < group; h++) {
-                            VectorKernels.axpy(sc[(row + h) * span + s] * sc[invOff + row + h], sc, vOff, att, qo + h * hd, hd);
+                            VectorKernels.axpy(sc[(row + h) * span + s] * sc[invOff + row + h], sc, vRow, att, qo + h * hd, hd);
                         }
                     }
                 }
@@ -1304,6 +1441,392 @@ public abstract class KvCache {
                 attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
             } else {
                 attentionTiled(pool, layer, n, pos, q, att, window, scale, softcap);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ q4
+
+    /**
+     * q4 ({@link KvQ4}): every K row Walsh–Hadamard rotated, then K and V in groups of 32 values with 4-bit codes and
+     * a half scale per group. K chunks are transposed like {@link Q8}'s, as nibble bytes {@code [hd/2][CHUNK]} per
+     * chunk (byte row {@code gi * 16 + j} holds elements {@code gi * 32 + j} (low nibble) and {@code + 16} (high) of
+     * the chunk's 32 keys) with the scales {@code [groups][CHUNK]} of a chunk side by side; V rows are
+     * {@code [ctx][kvDim / 2]} bytes in the row layout of {@link KvQ4} with scales {@code [ctx][kvDim / 32]}.
+     *
+     * <p><b>Recent window</b> ({@code backend.kv-q4-recent = R}): a ring of {@code R + chunk} slots also keeps the
+     * rotated K and V rows of the latest positions as halves, packed two to an {@code int} (element {@code p} in the
+     * low half, {@code p + hd/2} in the high half, so that {@link F16#lowHalf} / {@link F16#highHalf} give contiguous
+     * vectors), each slot tagged with its position. A query at position {@code P} reads the keys
+     * {@code [P - R + 1, P]} from the ring (those whose slot still holds them: after a rollback or a partial copy the
+     * oldest may be gone and come from the q4 rows instead), the older ones from the q4 rows. Which representation a
+     * (query, key) pair uses depends only on {@code P} and the ring, so prefill and decode still agree bit for bit.
+     * A chunk of up to {@code chunk} tokens stored at once cannot evict a slot a query of the same chunk needs.
+     */
+    static final class Q4 extends KvCache {
+        private static final VectorSpecies<Byte> B16 = VectorKernels.B16;
+        private static final VectorSpecies<Integer> I = IntVector.SPECIES_PREFERRED;
+        final int groups;      // per head
+        final int block;       // Hadamard block
+        final int recent;      // R, 0 = no ring
+        final int ringCap;     // ring slots
+        final byte[][] key;
+        final short[][] keyScale;
+        final byte[][] val;
+        final short[][] valScale;
+        final int[][] ringK;
+        final int[][] ringV;
+        final int[][] ringPos;
+        /** The rotated queries of the current {@link #attention} call. */
+        private float[] qRot = new float[0];
+        /** Per thread: the scales of one K chunk as floats ({@link #expandKeys}). */
+        private final ThreadLocal<float[]> scaleScratch;
+
+        Q4(int layers, Attention.Gqa a, int ctx, int chunk, int recent) {
+            super(layers, a, ctx, recent > 0);
+            if (!KvQ4.supports(headDim)) {
+                throw new IllegalArgumentException("q4 KV cache needs a head size that is a multiple of " + KvQ4.GROUP);
+            }
+            groups = headDim / KvQ4.GROUP;
+            block = KvQ4.block(headDim);
+            int scales = groups * CHUNK;
+            scaleScratch = ThreadLocal.withInitial(() -> new float[scales]);
+            this.recent = Math.min(recent, ctx);
+            ringCap = this.recent > 0 ? Math.min(ctx, this.recent + Math.max(1, chunk)) : 0;
+            key = new byte[layers][kvHeads * chunks() * headDim / 2 * CHUNK + 16];
+            keyScale = new short[layers][kvHeads * chunks() * groups * CHUNK];
+            val = new byte[layers][ctx * (kvDim / 2) + 16];
+            valScale = new short[layers][ctx * kvHeads * groups];
+            ringK = new int[ringCap > 0 ? layers : 0][ringCap * (kvDim / 2)];
+            ringV = new int[ringCap > 0 ? layers : 0][ringCap * (kvDim / 2)];
+            ringPos = new int[ringCap > 0 ? layers : 0][ringCap];
+            for (int[] p : ringPos) {
+                Arrays.fill(p, -1);
+            }
+        }
+
+        /** Offset of chunk {@code c} of kv head {@code g} in {@link #key}. */
+        private int keyByteChunk(int g, int c) {
+            return (g * chunks() + c) * headDim / 2 * CHUNK;
+        }
+
+        /** Offset of chunk {@code c} of kv head {@code g} in {@link #keyScale}. */
+        private int keyScaleChunk(int g, int c) {
+            return (g * chunks() + c) * groups * CHUNK;
+        }
+
+        @Override
+        public void store(int layer, int pos, float[] k, float[] v, int n) {
+            float[] row = new float[headDim];
+            byte[] nib = new byte[headDim / 2];
+            short[] sc = new short[groups];
+            for (int t = 0; t < n; t++) {
+                int s = pos + t;
+                int slot = ringCap > 0 ? s % ringCap : -1;
+                for (int g = 0; g < kvHeads; g++) {
+                    int src = t * kvDim + g * headDim;
+                    System.arraycopy(k, src, row, 0, headDim);
+                    if (KvQ4.ROTATE) {
+                        KvQ4.rotate(row, 0, headDim);
+                    }
+                    KvQ4.quantize(row, 0, headDim, nib, 0, sc, 0);
+                    int kb = keyByteChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim / 2; i++) {
+                        key[layer][kb + i * CHUNK] = nib[i];
+                    }
+                    int ks = keyScaleChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int gi = 0; gi < groups; gi++) {
+                        keyScale[layer][ks + gi * CHUNK] = sc[gi];
+                    }
+                    if (slot >= 0) {
+                        pack(row, 0, ringK[layer], slot * (kvDim / 2) + g * headDim / 2);
+                    }
+                    KvQ4.quantize(v, src, headDim, val[layer], s * (kvDim / 2) + g * (headDim / 2), valScale[layer],
+                            (s * kvHeads + g) * groups);
+                    if (slot >= 0) {
+                        pack(v, src, ringV[layer], slot * (kvDim / 2) + g * headDim / 2);
+                    }
+                }
+                if (slot >= 0) {
+                    ringPos[layer][slot] = s;
+                }
+            }
+        }
+
+        /** The {@code headDim} values {@code x[o ..]} as halves into {@code dst[d ..]}: element p low, p + hd/2 high. */
+        private void pack(float[] x, int o, int[] dst, int d) {
+            int h = headDim / 2;
+            for (int p = 0; p < h; p++) {
+                dst[d + p] = (Float.floatToFloat16(x[o + p]) & 0xFFFF) | Float.floatToFloat16(x[o + p + h]) << 16;
+            }
+        }
+
+        @Override
+        int exactFrom(int layer, int p) {
+            if (ringCap == 0) {
+                return p + 1;
+            }
+            int[] tags = ringPos[layer];
+            int lim = Math.max(0, p - recent + 1);
+            int s = p;
+            while (s >= lim && tags[s % ringCap] == s) {
+                s--;
+            }
+            return s + 1;
+        }
+
+        @Override
+        void exactRow(int layer, boolean values, int s, int g, float[] dst, int d) {
+            int[] src = values ? ringV[layer] : ringK[layer];
+            int o = (s % ringCap) * (kvDim / 2) + g * headDim / 2;
+            int h = headDim / 2;
+            int fl = VectorKernels.FL;
+            for (int p = 0; p < h; p += fl) {
+                IntVector x = IntVector.fromArray(I, src, o + p);
+                F16.lowHalf(x).intoArray(dst, d + p);
+                F16.highHalf(x).intoArray(dst, d + h + p);
+            }
+        }
+
+        /** Scalar {@link #exactRow}, for the saved-cache writer. */
+        private float exactValue(int layer, boolean values, int slot, int i) {
+            int[] src = values ? ringV[layer] : ringK[layer];
+            int h = kvDim / kvHeads / 2;
+            int g = i / headDim;
+            int e = i % headDim;
+            int w = src[slot * (kvDim / 2) + g * h + e % h];
+            return Float.float16ToFloat((short) (e < h ? w : w >>> 16));
+        }
+
+        @Override
+        public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
+                              float softcap) {
+            int len = n * qDim;
+            if (qRot.length < len) {
+                qRot = new float[len];
+            }
+            System.arraycopy(q, 0, qRot, 0, len);
+            for (int o = 0; KvQ4.ROTATE && o < len; o += headDim) {
+                KvQ4.rotate(qRot, o, headDim);
+            }
+            float s = scale / KvQ4.scaleDivisor(headDim); // (Hq)·(Hk) = B q·k, and B is a power of two
+            if (n == 1 && vectorized() && kvHeads < pool.threads()) {
+                attentionDecode(pool, layer, pos, qRot, att, window, s, softcap);
+            } else {
+                attentionTiled(pool, layer, n, pos, qRot, att, window, s, softcap);
+            }
+        }
+
+        /** The chunk's scales of group {@code gi} ({@code CHUNK} halves) as floats into {@code dst[d ..]}. */
+        private void scales(short[] sc, int o, float[] dst, int d, int count) {
+            for (int i = 0; i < count; i++) {
+                dst[d + i] = Float.float16ToFloat(sc[o + i]);
+            }
+        }
+
+        /** Codes of the first FL bytes at {@code a[i ..]}: low nibbles, or high nibbles, as floats minus 7.5 (the level of {@link KvQ4#value}). */
+        private static FloatVector codes(byte[] a, int i, boolean high) {
+            IntVector x = (IntVector) ByteVector.fromArray(B16, a, i).castShape(I, 0);
+            if (high) {
+                x = x.lanewise(VectorOperators.ASHR, 4);
+            }
+            return ((FloatVector) x.and(15).castShape(VectorKernels.F, 0)).sub(7.5f);
+        }
+
+        @Override
+        void expandKeys(int layer, int g, int c0, int c1, float[] dst, int d) {
+            byte[] kc = key[layer];
+            int fl = VectorKernels.FL;
+            int hd = headDim;
+            float[] sf = scaleScratch.get();
+            for (int c = c0; c < c1; c++) {
+                int src = keyByteChunk(g, c);
+                scales(keyScale[layer], keyScaleChunk(g, c), sf, 0, groups * CHUNK);
+                int o = d + (c - c0) * hd * CHUNK;
+                for (int gi = 0; gi < groups; gi++) {
+                    for (int v = 0; v < CHUNK; v += fl) {
+                        FloatVector sc = FloatVector.fromArray(VectorKernels.F, sf, gi * CHUNK + v); // FL keys' scales
+                        for (int j = 0; j < 16; j++) {
+                            int b = src + (gi * 16 + j) * CHUNK + v;
+                            codes(kc, b, false).mul(sc).intoArray(dst, o + (gi * 32 + j) * CHUNK + v);
+                            codes(kc, b, true).mul(sc).intoArray(dst, o + (gi * 32 + j + 16) * CHUNK + v);
+                        }
+                    }
+                }
+            }
+        }
+
+        @Override
+        void expandValues(int layer, int g, int s0, int s1, int i0, int i1, float[] dst, int d) {
+            byte[] vc = val[layer];
+            int fl = VectorKernels.FL;
+            int w = i1 - i0;
+            for (int s = s0; s < s1; s++) {
+                int src = s * (kvDim / 2) + g * (headDim / 2);
+                int so = (s * kvHeads + g) * groups;
+                int o = d + (s - s0) * w - i0;
+                for (int i = i0; i < i1; i += fl) {
+                    int gi = i / KvQ4.GROUP;
+                    int j = i % KvQ4.GROUP;
+                    float sc = Float.float16ToFloat(valScale[layer][so + gi]);
+                    codes(vc, src + gi * 16 + (j & 15), j >= 16).mul(sc).intoArray(dst, o + i);
+                }
+            }
+        }
+
+        @Override
+        void expand(int layer, boolean values, int s, int ko, float[] dst, int d) {
+            int g = ko / headDim;
+            if (values) {
+                KvQ4.dequantize(val[layer], s * (kvDim / 2) + ko / 2, valScale[layer], (s * kvHeads + g) * groups, headDim,
+                        dst, d);
+                return;
+            }
+            int kb = keyByteChunk(g, s / CHUNK) + s % CHUNK;
+            int ks = keyScaleChunk(g, s / CHUNK) + s % CHUNK;
+            for (int gi = 0; gi < groups; gi++) {
+                float sc = Float.float16ToFloat(keyScale[layer][ks + gi * CHUNK]);
+                for (int j = 0; j < 16; j++) {
+                    int b = key[layer][kb + (gi * 16 + j) * CHUNK] & 0xFF;
+                    dst[d + gi * 32 + j] = KvQ4.value(b & 15, sc);
+                    dst[d + gi * 32 + j + 16] = KvQ4.value(b >>> 4, sc);
+                }
+            }
+        }
+
+        @Override
+        float[] keysInPlace(int layer) {
+            return null;
+        }
+
+        @Override
+        float[] valuesInPlace(int layer) {
+            return null;
+        }
+
+        @Override
+        void copyLayer(KvCache o, int layer, int n, int chunksUsed) {
+            Q4 src = (Q4) o;
+            for (int g = 0; g < kvHeads; g++) {
+                System.arraycopy(src.key[layer], src.keyByteChunk(g, 0), key[layer], keyByteChunk(g, 0),
+                        chunksUsed * headDim / 2 * CHUNK);
+                System.arraycopy(src.keyScale[layer], src.keyScaleChunk(g, 0), keyScale[layer], keyScaleChunk(g, 0),
+                        chunksUsed * groups * CHUNK);
+            }
+            System.arraycopy(src.val[layer], 0, val[layer], 0, n * (kvDim / 2));
+            System.arraycopy(src.valScale[layer], 0, valScale[layer], 0, n * kvHeads * groups);
+            if (ringCap > 0) {
+                Arrays.fill(ringPos[layer], -1);
+                for (int s = Math.max(0, n - recent); s < n; s++) {
+                    if (src.ringPos[layer][s % src.ringCap] == s) {
+                        int a = (s % src.ringCap) * (kvDim / 2);
+                        int b = (s % ringCap) * (kvDim / 2);
+                        System.arraycopy(src.ringK[layer], a, ringK[layer], b, kvDim / 2);
+                        System.arraycopy(src.ringV[layer], a, ringV[layer], b, kvDim / 2);
+                        ringPos[layer][s % ringCap] = s;
+                    }
+                }
+            }
+        }
+
+        /** Puts row {@code s} (K or V) in the {@link KvQ4} row layout: the nibbles, then the scales. */
+        void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
+            for (int g = 0; g < kvHeads; g++) {
+                if (values) {
+                    buf.put(val[layer], s * (kvDim / 2) + g * (headDim / 2), headDim / 2);
+                } else {
+                    int kb = keyByteChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim / 2; i++) {
+                        buf.put(key[layer][kb + i * CHUNK]);
+                    }
+                }
+            }
+            for (int g = 0; g < kvHeads; g++) {
+                for (int gi = 0; gi < groups; gi++) {
+                    buf.putShort(values ? valScale[layer][(s * kvHeads + g) * groups + gi]
+                            : keyScale[layer][keyScaleChunk(g, s / CHUNK) + gi * CHUNK + s % CHUNK]);
+                }
+            }
+        }
+
+        /** Reads what {@link #writeRow} put into row {@code s}. */
+        void readRow(int layer, boolean values, int s, ByteBuffer buf) {
+            for (int g = 0; g < kvHeads; g++) {
+                if (values) {
+                    buf.get(val[layer], s * (kvDim / 2) + g * (headDim / 2), headDim / 2);
+                } else {
+                    int kb = keyByteChunk(g, s / CHUNK) + s % CHUNK;
+                    for (int i = 0; i < headDim / 2; i++) {
+                        key[layer][kb + i * CHUNK] = buf.get();
+                    }
+                }
+            }
+            for (int g = 0; g < kvHeads; g++) {
+                for (int gi = 0; gi < groups; gi++) {
+                    short sc = buf.getShort();
+                    if (values) {
+                        valScale[layer][(s * kvHeads + g) * groups + gi] = sc;
+                    } else {
+                        keyScale[layer][keyScaleChunk(g, s / CHUNK) + gi * CHUNK + s % CHUNK] = sc;
+                    }
+                }
+            }
+        }
+
+        /**
+         * The recent window of {@link #write}: for each of the positions {@code [max(0, n - R), n)} of a layer an int
+         * (1: the ring holds it, 0: not), then its K and V rows as {@code kvDim} halves each (zeros when absent).
+         */
+        void writeRecent(int layer, int n, WritableByteChannel out) throws IOException {
+            int first = Math.max(0, n - recent);
+            ByteBuffer buf = ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
+            for (int s = first; s < n; s++) {
+                boolean held = ringPos[layer][s % ringCap] == s;
+                buf.putInt(held ? 1 : 0);
+                for (int kind = 0; kind < 2; kind++) {
+                    for (int i = 0; i < kvDim; i++) {
+                        buf.putShort(held ? Float.floatToFloat16(exactValue(layer, kind == 1, s % ringCap, i)) : 0);
+                    }
+                }
+            }
+            buf.flip();
+            while (buf.hasRemaining()) {
+                out.write(buf);
+            }
+        }
+
+        /**
+         * Reads what {@link #writeRecent} wrote for {@code stored} positions into the ring of the first {@code n}
+         * ({@code n <= stored}): the window of the saved cache is {@code [stored - R, stored)}, so the rows of a shorter
+         * prefix keep only the part of it below {@code n}; older positions of the prefix's own window are then read from
+         * the q4 rows (the ring forgets them, as after a rollback).
+         */
+        void readRecent(int layer, int n, int stored, ReadableByteChannel in) throws IOException {
+            int first = Math.max(0, stored - recent);
+            ByteBuffer buf = ByteBuffer.allocate(Math.max(1, stored - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
+            buf.limit((stored - first) * (4 + 4 * kvDim));
+            while (buf.hasRemaining()) {
+                if (in.read(buf) < 0) {
+                    throw new EOFException("the saved cache file is truncated");
+                }
+            }
+            buf.flip();
+            Arrays.fill(ringPos[layer], -1);
+            float[] row = new float[kvDim];
+            for (int s = first; s < stored; s++) {
+                boolean held = buf.getInt() != 0 && s < n;
+                int slot = s % ringCap;
+                for (int kind = 0; kind < 2; kind++) {
+                    for (int i = 0; i < kvDim; i++) {
+                        row[i] = Float.float16ToFloat(buf.getShort());
+                    }
+                    for (int g = 0; held && g < kvHeads; g++) {
+                        pack(row, g * headDim, kind == 0 ? ringK[layer] : ringV[layer], slot * (kvDim / 2) + g * headDim / 2);
+                    }
+                }
+                if (held) {
+                    ringPos[layer][slot] = s;
+                }
             }
         }
     }

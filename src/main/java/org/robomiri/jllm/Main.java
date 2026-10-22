@@ -63,8 +63,13 @@ public final class Main {
                 }
                 case "chat" -> chat(ModelLoader.load(s, hub, model), s);
                 case "run" -> run(ModelLoader.load(s, hub, model), s);
-                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model), model, s);
+                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model), model, s, hub);
                 case "image" -> image(s, hub);
+                case "transcribe" -> org.robomiri.jllm.audio.AudioCli.transcribe(s, hub, model, cli(s, "audio"), cli(s, "language"),
+                        "true".equals(cli(s, "translate")), cli(s, "format") == null ? "text" : cli(s, "format"),
+                        "true".equals(cli(s, "words")));
+                case "speak" -> org.robomiri.jllm.audio.AudioCli.speak(s, hub, model, cli(s, "prompt"), cli(s, "voice"),
+                        cli(s, "speed") == null ? 1.0 : Double.parseDouble(cli(s, "speed")), cli(s, "out"));
                 case "bench" -> bench(ModelLoader.load(s, hub, model), s);
                 default -> {
                     System.err.println("unknown command: " + cmd);
@@ -102,6 +107,10 @@ public final class Main {
     private static void run(ModelLoader.Loaded l, Settings s) {
         try (ModelWeights weights = l.weights(); Engine engine = l.engine()) {
             String text = s.has("prompt") ? s.get("prompt") : "Hello";
+            if (s.has("image")) {
+                runWithImages(engine, s, text);
+                return;
+            }
             int[] prompt = s.has("raw") && s.getBool("raw")
                     ? engine.tokenizer().encode(text)
                     : engine.renderChat(List.of(new ChatTemplate.Message("user", text)), s.getBool("chat.thinking"));
@@ -112,6 +121,54 @@ public final class Main {
             System.out.println();
             System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason());
         }
+    }
+
+    /** {@code run --image a.png,b.jpg --prompt "..."}: the pictures come first in the message, in the order given. */
+    private static void runWithImages(Engine engine, Settings s, String text) {
+        List<org.robomiri.jllm.vision.Rgb> images = new ArrayList<>();
+        StringBuilder content = new StringBuilder();
+        for (String f : s.get("image").split(",")) {
+            if (f.isBlank()) {
+                continue;
+            }
+            try {
+                images.add(org.robomiri.jllm.vision.ImageDecoder.decode(java.nio.file.Files.readAllBytes(java.nio.file.Path.of(f.trim())),
+                        s.getLong("vision.max-image-pixels")));
+            } catch (java.io.IOException e) {
+                throw new IllegalArgumentException("--image " + f + ": " + e.getMessage(), e);
+            }
+            content.append(org.robomiri.jllm.vision.MediaChat.MARK);
+        }
+        content.append(org.robomiri.jllm.vision.MediaChat.stripMarks(text));
+        long t0 = System.nanoTime();
+        org.robomiri.jllm.engine.MediaPrompt mp = org.robomiri.jllm.vision.MediaChat.render(engine,
+                List.of(new ChatTemplate.Message("user", content.toString())), s.getBool("chat.thinking"), images);
+        if (Boolean.getBoolean("jllm.vision.debug")) { // the prompt ids with each picture as <image n>
+            StringBuilder sb = new StringBuilder();
+            int[] tk = mp.tokens();
+            for (int i = 0; i < tk.length; ) {
+                org.robomiri.jllm.engine.MediaPrompt.Span sp = mp.spanAt(i);
+                if (sp != null && sp.start() == i) {
+                    sb.append(" <image ").append(sp.length()).append(">");
+                    i += sp.length();
+                } else {
+                    sb.append(' ').append(tk[i++]);
+                }
+            }
+            System.err.println("prompt:" + sb);
+        }
+        double encodeMs = engine.vision().lastEncodeMs();
+        System.err.printf("%d image(s) -> %d prompt tokens, %.0f ms to encode (%d new)%n", images.size(), mp.length(), encodeMs,
+                engine.vision().lastEncodedImages());
+        Engine.Result r = engine.generate(mp, s.sampling(), Engine.Decoding.NONE, 1, new Engine.ChoiceSink() {
+            @Override
+            public void text(int index, String t) {
+                System.out.print(t);
+                System.out.flush();
+            }
+        }, () -> false).getFirst();
+        System.out.println();
+        System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason() + ", total " + (System.nanoTime() - t0) / 1_000_000 + " ms");
     }
 
     private static void chat(ModelLoader.Loaded l, Settings s) throws Exception {
@@ -164,32 +221,49 @@ public final class Main {
         org.robomiri.jllm.diffusion.ImageCli.run(s, hub, source);
     }
 
-    private static void serve(ModelLoader.Loaded l, String model, Settings s) throws Exception {
+    /** A flag only some commands take (--audio, --voice, ...), or null. */
+    private static String cli(Settings s, String key) {
+        return s.has(key) ? s.get(key) : null;
+    }
+
+    private static void serve(ModelLoader.Loaded l, String model, Settings s, HuggingFaceHub hub) throws Exception {
         String imageSource = s.opt("image.model");
         if (l == null && imageSource == null) {
             throw new IllegalArgumentException("--model none needs --image.model");
         }
         int port = s.getInt("server.port");
         String host = s.get("server.host");
+        org.robomiri.jllm.audio.AudioSettings as = org.robomiri.jllm.audio.AudioSettings.of(s);
+        boolean audio = !as.sttModel().isEmpty() || !as.ttsModel().isEmpty();
         HttpServer.Options http = new HttpServer.Options(
                 s.getInt("server.read-timeout-ms"),
                 s.getInt("server.write-timeout-ms"),
                 s.getInt("server.max-connections"),
-                s.getLong("server.max-body-bytes"),
+                audio ? Math.max(s.getLong("server.max-body-bytes"), as.maxUploadBytes()) : s.getLong("server.max-body-bytes"),
                 s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         ModelWeights weights = l == null ? null : l.weights();
         Engine engine = l == null ? null : l.engine();
         org.robomiri.jllm.diffusion.ImagePipeline pipe = null;
-        try {
+        try (org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels()) {
             ImageHttp images = null;
             if (imageSource != null) {
-                pipe = org.robomiri.jllm.diffusion.ImageModels.load(s, ModelLoader.hub(s), imageSource);
+                pipe = org.robomiri.jllm.diffusion.ImageModels.load(s, hub, imageSource);
                 images = new ImageHttp(pipe, org.robomiri.jllm.diffusion.ImageModels.defaultId(imageSource));
                 System.err.println("Image model " + images.modelId() + ": " + pipe.description());
             }
-            try (ApiServer server = new ApiServer(engine, model, host, port, options).withImages(images)) {
+            try (ApiServer server = new ApiServer(engine, model, host, port, options).withImages(images).imageLimits(
+                    s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
+                if (audio) {
+                    for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
+                        if (!repo.isEmpty()) {
+                            System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
+                        }
+                    }
+                    server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
+                            new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+                }
                 System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions"
                         + (images != null ? ", /v1/images/generations" : "") + ")");
                 server.serve();

@@ -397,6 +397,11 @@ public final class HuggingFaceHub {
         return commits.get(repo + "@" + revision);
     }
 
+    /** The listing {@link #listFiles} already fetched for {@code repo} at {@code revision}, or null (no request is made). */
+    public List<RepoFile> cachedListing(String repo, String revision) {
+        return listings.get(repo + "@" + revision);
+    }
+
     /** Lists the files of {@code repo} at {@code revision} (cached per repo/revision). */
     public List<RepoFile> listFiles(String repo, String revision) throws IOException, InterruptedException {
         String key = repo + "@" + revision;

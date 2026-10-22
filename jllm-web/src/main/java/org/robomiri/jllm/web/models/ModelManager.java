@@ -70,7 +70,8 @@ public class ModelManager implements DisposableBean {
      *                  is read where it is instead of being downloaded into the default folder
      */
     public record LocalModel(String name, String format, String source, String revision, String ggufFile,
-                             String path, long bytes, List<String> caches, List<String> loadedAs, String modelDir) {
+                             String path, long bytes, List<String> caches, List<String> loadedAs, String modelDir,
+                             List<String> mmprojs) {
     }
 
     /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
@@ -101,6 +102,11 @@ public class ModelManager implements DisposableBean {
         this.kvStore = kvStore;
         this.images = images;
     }
+
+    // --- audio (speech-to-text / text-to-speech models are held by AudioService; a downloaded Whisper or OuteTTS
+    // checkpoint is recognised after the download and loaded there instead of as a text model)
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
 
     @EventListener(ApplicationReadyEvent.class)
     public void autoload() {
@@ -153,6 +159,11 @@ public class ModelManager implements DisposableBean {
     public void unload(String id) throws InterruptedException {
         if (images.has(id)) {
             images.unload(id);
+            return;
+        }
+        if (audio != null && audio.has(id)) {
+            audio.unload(id);
+            System.err.println("Unloaded " + id);
             return;
         }
         LoadedModel m;
@@ -265,6 +276,13 @@ public class ModelManager implements DisposableBean {
             }
             checkInterrupted();
             job.phase = "loading";
+            if (audio != null && !t.local() && audio.isAudio(repoDir(s, t.model()))) { // audio model: AudioService holds it
+                System.err.println("Loading " + t.id() + " (" + t.model() + ") as an audio model");
+                org.robomiri.jllm.audio.AudioModels.Entry a = audio.load(s, t.id(), t.model(), repoDir(s, t.model()));
+                writeMarker(s, t);
+                System.err.println("Loaded " + t.id() + ": " + a.kind().label() + ", " + a.backend());
+                return;
+            }
             System.err.println("Loading " + t.id() + " (" + t.model() + ")");
             ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model(), slots); // budgets for every slot's cache
             if (Thread.currentThread().isInterrupted()) {
@@ -479,26 +497,58 @@ public class ModelManager implements DisposableBean {
     /**
      * A request that names no {@code model.dir} reads the model from the models folder that already holds it
      * ({@code model.dir} first, then {@code jllm.web.model-dirs}), so a model on disk is never downloaded again
-     * because it sits in another folder than the default one. Only when no folder has it does the download go to
-     * {@code model.dir}.
+     * because it sits in another folder than the default one. A folder where the model is usable (the quantized
+     * cache, every weight file, or the GGUF file) wins over one with only its metadata (what an interrupted
+     * download leaves); only when no folder has it does the download go to {@code model.dir}.
      */
     private void locate(Target t, Map<String, String> extra) {
         if (t.local() || extra.containsKey("model.dir")) {
             return;
         }
+        Settings s = settings.with(extra);
         String name = t.model().replace('/', '_');
+        Path partial = null;
         for (Path root : modelRoots()) {
             Path dir = root.resolve(name);
             try {
-                if (Files.isRegularFile(dir.resolve("config.json")) || Files.isRegularFile(dir.resolve("model_index.json"))
-                        || !HuggingFaceHub.localGgufNames(dir).isEmpty()) {
+                boolean st = Files.isRegularFile(dir.resolve("config.json"));
+                boolean diffusers = Files.isRegularFile(dir.resolve("model_index.json")); // an image model: usable as it is
+                List<String> gguf = HuggingFaceHub.localGgufNames(dir);
+                if (!st && !diffusers && gguf.isEmpty()) {
+                    continue;
+                }
+                boolean usable = diffusers || (t.file() != null ? Files.isRegularFile(dir.resolve(t.file()))
+                        : !gguf.isEmpty() && (t.quant() != null || !st)
+                        || st && (QuantFile.exists(dir, QType.parse(s.get("model.quant")), QType.parseHead(s.get("model.head-quant")))
+                                  || allWeights(dir)));
+                if (usable) {
                     extra.put("model.dir", root.toString());
                     return;
+                }
+                if (partial == null) {
+                    partial = root;
                 }
             } catch (IOException | RuntimeException e) {
                 // unreadable: look further
             }
         }
+        if (partial != null) {
+            extra.put("model.dir", partial.toString()); // finish the download where it started
+        }
+    }
+
+    /** Every weight file the checkpoint's index (or the single-file name) lists is on disk. */
+    private static boolean allWeights(Path dir) throws IOException {
+        List<String> names = HuggingFaceHub.weightFileNames(dir);
+        if (names.isEmpty()) {
+            return false;
+        }
+        for (String n : names) {
+            if (!Files.isRegularFile(dir.resolve(n))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A safetensors checkpoint whose quantized cache for the requested format is already converted. */
@@ -646,6 +696,11 @@ public class ModelManager implements DisposableBean {
         for (ImageService.Loaded m : images.loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
         }
+        if (audio != null) {
+            for (var a : audio.loaded()) {
+                users.computeIfAbsent(a.source(), k -> new ArrayList<>()).add(a.id());
+            }
+        }
         List<LocalModel> out = new ArrayList<>();
         for (Path root : modelRoots()) {
             listModels(root, users, out);
@@ -664,7 +719,7 @@ public class ModelManager implements DisposableBean {
             if (Files.isRegularFile(p) && isFirstGguf(name)) {
                 String abs = p.toString();
                 out.add(new LocalModel(name, "gguf", abs, null, null, abs, Files.size(p), List.of(),
-                        users.getOrDefault(abs, List.of()), rootName));
+                        users.getOrDefault(abs, List.of()), rootName, List.of()));
                 continue;
             }
             if (!Files.isDirectory(p) || name.equals("tokenizers") || name.startsWith(".")) {
@@ -674,7 +729,7 @@ public class ModelManager implements DisposableBean {
             String repo = repoRev[0];
             List<String> loadedAs = users.getOrDefault(repo, List.of());
             if (DiffusersRepo.isDiffusersDir(p)) {
-                out.add(new LocalModel(repo, "diffusers", repo, repoRev[1], null, p.toString(), dirSize(p), List.of(), loadedAs, rootName));
+                out.add(new LocalModel(repo, "diffusers", repo, repoRev[1], null, p.toString(), dirSize(p), List.of(), loadedAs, rootName, List.of()));
                 continue;
             }
             if (Files.isRegularFile(p.resolve("config.json"))) {
@@ -684,7 +739,12 @@ public class ModelManager implements DisposableBean {
                             .sorted().forEach(caches::add);
                 }
                 out.add(new LocalModel(repo, "safetensors", repo, repoRev[1], null, p.toString(), dirSize(p), caches, loadedAs,
-                        rootName));
+                        rootName, List.of()));
+            }
+            List<String> projectors = new ArrayList<>(); // multimodal projectors in the folder: a vision model uses one
+            try (Stream<Path> st = Files.list(p)) {
+                st.map(x -> x.getFileName().toString()).filter(n -> org.robomiri.jllm.vision.Mmproj.isMmproj(n) && !n.endsWith(".incomplete"))
+                        .sorted().forEach(projectors::add);
             }
             for (String g : HuggingFaceHub.localGgufNames(p)) {
                 if (!isFirstGguf(Path.of(g).getFileName().toString())) {
@@ -695,7 +755,7 @@ public class ModelManager implements DisposableBean {
                     bytes += Files.size(part);
                 }
                 out.add(new LocalModel(repo + " / " + g, "gguf", repo, repoRev[1], g, p.resolve(g).toString(), bytes,
-                        List.of(), loadedAs, rootName));
+                        List.of(), loadedAs, rootName, projectors));
             }
         }
     }

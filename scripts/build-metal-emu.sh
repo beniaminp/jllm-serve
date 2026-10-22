@@ -7,8 +7,8 @@ set -eu
 cd "$(dirname "$0")/.."
 OUT=target/native
 mkdir -p "$OUT/emu"
-# the language-model kernels and the image-generation kernels (diffusion.metal) in one library
 python3 scripts/metal-emu/transpile.py src/main/resources/org/robomiri/jllm/metal/kernels.metal "$OUT/emu/kernels.cpp" \
+  src/main/resources/org/robomiri/jllm/metal/vision.metal src/main/resources/org/robomiri/jllm/audio/audio.metal \
   src/main/resources/org/robomiri/jllm/metal/diffusion.metal
 EXT=so
 DEFS=""

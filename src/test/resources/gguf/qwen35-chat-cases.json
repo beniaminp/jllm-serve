@@ -1,0 +1,11 @@
+[
+ {"messages":[{"role":"user","content":"What is the capital of France?"}],"think":true},
+ {"messages":[{"role":"user","content":"What is the capital of France?"}],"think":false},
+ {"messages":[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}],"think":true},
+ {"messages":[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}],"think":false},
+ {"messages":[{"role":"system","content":"  A  "},{"role":"developer","content":"B\n"},{"role":"user","content":"  Hi \n"}],"think":true},
+ {"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!"},{"role":"user","content":"Bye"}],"think":true},
+ {"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!","reasoning_content":"say hello"},{"role":"user","content":"Bye"}],"think":false},
+ {"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!","reasoning_content":"say hello"},{"role":"user","content":"Hi again"}],"think":true},
+ {"messages":[{"role":"user","content":"Hi"},{"role":"assistant","content":"\n\nHello!  \n"},{"role":"tool","content":"42"},{"role":"tool","content":"43"},{"role":"user","content":"ok"}],"think":true}
+]

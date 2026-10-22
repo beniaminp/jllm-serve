@@ -177,6 +177,19 @@ public final class ChatSupport {
     }
 
     /**
+     * With {@code engine.constrained-tools} off, {@code response_format} cannot be combined with {@code tools}: the
+     * JSON constraint would keep the model from calling them (the constrained path lets the reply be either).
+     */
+    public static void checkFormatWithoutToolConstraint(Map<String, Object> b) {
+        Map<String, Object> format = Json.map(b, "response_format");
+        if (b.get("tools") instanceof List<?> l && !l.isEmpty() && !"none".equals(b.get("tool_choice")) && format != null
+                && !"text".equals(Json.str(format, "type", "text"))) {
+            throw RequestError.invalid("'response_format' cannot be combined with 'tools': the JSON constraint would"
+                    + " keep the model from calling them (engine.constrained-tools=false)");
+        }
+    }
+
+    /**
      * Rejects request features the engine cannot honour rather than silently ignoring them, and checks the tool
      * fields. The other OpenAI extras ({@code n}, {@code logprobs}, {@code response_format}, ...) are validated by
      * {@code OpenAiFeatures.parse}.
@@ -317,6 +330,21 @@ public final class ChatSupport {
         return extra != null ? Json.bool(extra, "enable_thinking", thinking) : thinking;
     }
 
+    /** A message's text for the size check: the text parts; picture parts have their own limits (vision.max-image-bytes). */
+    private static String textBytes(Object content) {
+        if (content instanceof List<?> parts) {
+            StringBuilder sb = new StringBuilder();
+            for (Object p : parts) {
+                if (p instanceof Map<?, ?> pm && ("image_url".equals(pm.get("type")) || "input_image".equals(pm.get("type")))) {
+                    continue;
+                }
+                sb.append(org.robomiri.jllm.web.tools.ToolCallFormat.text(List.of(p)));
+            }
+            return sb.toString();
+        }
+        return org.robomiri.jllm.web.tools.ToolCallFormat.text(content);
+    }
+
     /** Validates the messages array and its size in bytes (before tokenizing). */
     public static List<Object> messages(Map<String, Object> body, long maxPromptBytes) {
         List<Object> msgs = Json.list(body, "messages");
@@ -328,7 +356,7 @@ public final class ChatSupport {
             if (!(m instanceof Map<?, ?> mm)) {
                 throw RequestError.invalid("each message must be an object");
             }
-            bytes += utf8Length(String.valueOf(mm.get("role"))) + utf8Length(org.robomiri.jllm.web.tools.ToolCallFormat.text(mm.get("content")));
+            bytes += utf8Length(String.valueOf(mm.get("role"))) + utf8Length(textBytes(mm.get("content")));
             Object calls = mm.get("tool_calls");
             if (calls != null) {
                 bytes += utf8Length(Json.write(calls));

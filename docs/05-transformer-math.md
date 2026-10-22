@@ -847,8 +847,13 @@ and expanded back to f32 inside attention, so the arithmetic is unchanged and on
 precision (~3 significant decimal digits instead of ~7). That halves the cache — 470 MB instead of 940 MB at
 `ctx = 4096` for the 0.6B model — and the bytes attention reads per token; greedy outputs on the test prompts are
 unchanged. `backend.kv-dtype=q8` stores signed bytes with one f32 scale per row of a kv head (`scale = max|x| / 127`,
-error ≤ `max|x| / 254`): 242 MB at `ctx = 4096` ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
-[11 §11.3](11-performance.md#113-memory-footprint)).
+error ≤ `max|x| / 254`): 242 MB at `ctx = 4096`. `backend.kv-dtype=q4` goes to 4 bits: each key row is first multiplied by
+the Walsh–Hadamard matrix `H` (entries ±1, `Hᵀ H = B·I`, `B` = the largest power of two dividing `headDim`) and so is the
+query, which leaves the score unchanged, `(Hq)·(Hk) = B·(q·k)`, but spreads the keys' outlier channels over the whole row;
+then K and V are cut into groups of 32 values with a half scale each (`x̂ = (code − 7.5)·max|x|/7.5`), and the latest
+`backend.kv-q4-recent` positions are also kept as halves: 132 MB at `ctx = 4096`, less accurate than q8 on Qwen3-0.6B
+and therefore opt-in ([07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache), [08 §8.9](08-metal-backend.md#89-the-f16-kv-cache),
+[08 §8.27](08-metal-backend.md#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4), [11 §11.3](11-performance.md#113-memory-footprint)).
 
 **A smaller cache by design: DeepSeek's latent attention.** The cache above stores, per token and layer, a key
 and a value row for every KV head. DeepSeek's MLA instead caches one short *latent* row `[c_kv | k_pe]` of

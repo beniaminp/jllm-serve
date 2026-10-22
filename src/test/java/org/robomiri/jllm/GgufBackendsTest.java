@@ -16,7 +16,7 @@ import java.util.Random;
 
 /**
  * The CPU and Metal backends on tiny random GGUF models whose tensors are random blocks of the ggml formats read in
- * place (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
+ * place (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16) -- every dispatch of the forward pass (fused q/k/v, split gate|up, MoE experts, o_proj,
  * down, LM head) on every family, with all matrices of one format and with the formats mixed per tensor (which makes
  * the q/k/v dispatch and the gate|up pair mixed too) -- must give the same logits within float rounding. Skipped
  * when Metal is not available.
@@ -36,10 +36,20 @@ public final class GgufBackendsTest {
         }
     }
 
-    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K, GgmlType.Q6_K};
+    private static final GgmlType[] TYPES = {GgmlType.Q4_0, GgmlType.Q8_0, GgmlType.Q4_K, GgmlType.Q5_K, GgmlType.Q6_K,
+            GgmlType.Q4_1, GgmlType.Q5_0, GgmlType.Q5_1, GgmlType.Q3_K, GgmlType.IQ4_NL, GgmlType.IQ4_XS, GgmlType.MXFP4,
+            GgmlType.F16, GgmlType.BF16};
 
     /** Random valid blocks: random quant bytes, f16 scales small enough that the weights are about +-0.1. */
     static byte[] blocks(Random r, GgmlType t, long elements) {
+        if (t == GgmlType.F16 || t == GgmlType.BF16) {
+            ByteBuffer fb = ByteBuffer.allocate((int) elements * 2).order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < elements; i++) {
+                float v = (float) (0.1 * r.nextGaussian());
+                fb.putShort(2 * i, t == GgmlType.F16 ? Float.floatToFloat16(v) : (short) (Float.floatToRawIntBits(v) >>> 16));
+            }
+            return fb.array();
+        }
         int nb = (int) (elements / t.blockSize);
         byte[] b = new byte[nb * t.typeSize];
         r.nextBytes(b);
@@ -50,6 +60,10 @@ public final class GgufBackendsTest {
                 case Q4_0 -> bb.putShort(o, Float.floatToFloat16(0.004f + 0.012f * r.nextFloat()));
                 case Q8_0 -> bb.putShort(o, Float.floatToFloat16(0.0004f + 0.0012f * r.nextFloat()));
                 case Q6_K -> bb.putShort(o + 208, Float.floatToFloat16(0.00001f + 0.00004f * r.nextFloat()));
+                case Q5_0 -> bb.putShort(o, Float.floatToFloat16(0.004f + 0.012f * r.nextFloat()));
+                case IQ4_NL -> bb.putShort(o, Float.floatToFloat16(0.0004f + 0.0012f * r.nextFloat()));
+                case Q3_K -> bb.putShort(o + 108, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
+                case MXFP4 -> b[o] = (byte) (116 + r.nextInt(5)); // 2^-12 .. 2^-8 times the doubled e2m1 values
                 default -> {
                     bb.putShort(o, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
                     bb.putShort(o + 2, Float.floatToFloat16(0.00004f + 0.00012f * r.nextFloat()));
@@ -153,14 +167,20 @@ public final class GgufBackendsTest {
                 prompt[i] = 1 + (i * 37 + 11) % (VOCAB - 1);
             }
             for (String family : new String[]{"llama", "qwen2", "qwen3", "qwen3_moe"}) {
-                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "mixed"}) {
+                for (String mode : new String[]{"Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q4_1", "Q5_0", "Q5_1", "Q3_K", "IQ4_NL", "IQ4_XS",
+                        "MXFP4", "F16", "BF16", "mixed"}) {
                     Path p = dir.resolve(family + "-" + mode + ".gguf");
                     write(p, family, mode, 100 + family.hashCode() + mode.hashCode());
                     float[][] cpu;
+                    float[][] cpu8;
                     float[][] gpu;
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
                          CpuBackend b = new CpuBackend(w, 64, 40, 4, KvDtype.F32, false)) {
                         cpu = run(b, prompt);
+                    }
+                    try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
+                         CpuBackend b = new CpuBackend(w, 64, 40, 4, KvDtype.F32, true)) {
+                        cpu8 = run(b, prompt); // int8 activations: decode (and MoE) matmuls on the integer kernels, Java or native
                     }
                     try (GgufModel g = GgufModel.open(p); ModelWeights w = g.weights();
                          MetalBackend b = new MetalBackend(w, 64, 40, lib, KvDtype.F32)) {
@@ -178,9 +198,25 @@ public final class GgufBackendsTest {
                         }
                     }
                     check(!Double.isNaN(diff) && mag > 0 && mag < 1e6, family + "/" + mode + ": logits are finite (max |logit| " + mag + ")");
-                    check(diff < 1e-3, family + "/" + mode + ": CPU vs Metal max logit diff " + diff);
+                    // 1e-3, plus 2e-4 of the logit scale: where MetalTuner finds the half-weight matrix-unit prefill kernels (docs/08
+                    // 8.21) faster and in agreement, they round each dequantized weight to half (relative 2^-11), which the
+                    // non-linear IQ4 formats (d * ls * table value: 18 significant bits) feel at ~1e-4 of the logits;
+                    // -Djllm.metal.hmma=false brings every type to ~1e-6
+                    check(diff < 1e-3 + 2e-4 * mag, family + "/" + mode + ": CPU vs Metal max logit diff " + diff);
                     check(sameTokens, family + "/" + mode + ": same greedy tokens");
-                    System.out.printf("%-9s %-6s CPU vs Metal: max logit diff %.2e (max |logit| %.2f)%n", family, mode, diff, mag);
+                    // the activation rounding of the int8 path (~0.5% of each dot product's terms) against the float path
+                    // (greedy decode feeds each argmax back in: after the first step where the two paths pick different tokens
+                    // they no longer see the same input, so the comparison stops at that step)
+                    double diff8 = 0;
+                    for (int st = 0; st < cpu.length; st++) {
+                        diff8 = Math.max(diff8, GgufModelTest.maxDiff(new float[][]{cpu[st]}, new float[][]{cpu8[st]}));
+                        if (GgufModelTest.argmax(cpu[st]) != GgufModelTest.argmax(cpu8[st])) {
+                            break;
+                        }
+                    }
+                    check(diff8 < 0.05 * Math.max(1.0, mag), family + "/" + mode + ": CPU int8 activations vs float, max logit diff " + diff8);
+                    System.out.printf("%-9s %-6s CPU vs Metal: max logit diff %.2e (max |logit| %.2f); int8 activations vs float %.2e%n",
+                            family, mode, diff, mag, diff8);
                 }
             }
         } finally {

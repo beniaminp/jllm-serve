@@ -23,11 +23,11 @@ import java.util.NoSuchElementException;
  * {@link ImageApi}. The {@code model} field picks a loaded image model (the only one when it is omitted).
  */
 @RestController
-public class ImagesController {
+public class ImageGenerationController {
 
     private final ImageService images;
 
-    public ImagesController(ImageService images) {
+    public ImageGenerationController(ImageService images) {
         this.images = images;
     }
 

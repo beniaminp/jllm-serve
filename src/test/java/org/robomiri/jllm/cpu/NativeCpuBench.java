@@ -50,14 +50,19 @@ public final class NativeCpuBench {
                 QType t = type;
                 QTensor w = NativeCpu.randomTensor(arena, t, rows, cols, rnd, false, false);
                 boolean k = KQuantKernels.supports(w);
+                boolean g = GgufInt8Kernels.supports(w);
+                boolean int8 = k || g || t == QType.Q4_0 || t == QType.Q8_0 || t == QType.Q4_0G || t == QType.Q8_0G;
                 StringBuilder line = new StringBuilder(String.format("%-6s %dx%d 1 thread  ", t, rows, cols));
-                line.append(time("java-int8", rounds, () -> {
-                    for (int r = 0; r < rows; r++) {
-                        out[r] = k ? KQuantKernels.dotRow(w, r, xq, xs, sums, 0) : Int8Kernels.dotRow(w, r, xq, xs, 0);
-                    }
-                }));
+                if (int8) {
+                    line.append(time("java-int8", rounds, () -> {
+                        for (int r = 0; r < rows; r++) {
+                            out[r] = k ? KQuantKernels.dotRow(w, r, xq, xs, sums, 0) : g ? GgufInt8Kernels.dotRow(w, r, xq, xs, sums, 0)
+                                    : Int8Kernels.dotRow(w, r, xq, xs, 0);
+                        }
+                    }));
+                }
                 for (int level = 0; level <= detected; level++) {
-                    if (n.setLevel(level) == level) {
+                    if (n.setLevel(level) == level && n.hasKernelFor(t)) {
                         line.append(time(n.name(level), rounds, () -> n.dotRows(w, 0, rows, act, 0, out, 0, false)));
                     }
                 }

@@ -453,7 +453,10 @@ little is forced; tool calls use a fixed layout and gain much more.
 name must be one of the tools and the arguments must match its `parameters` schema, compiled *leniently* (keywords
 the automaton cannot enforce, such as `pattern` or `minimum`, are ignored rather than refused, since the client did
 not write the schema for us). `tool_choice: "required"` or a named function forces the call; `response_format`
-together with `tools` is allowed and means "tool calls or that JSON answer". See
+together with `tools` is allowed and means "tool calls or that JSON answer". Three settings keep the old paths:
+`engine.constrained-tools=false` (tool calls are free text parsed afterwards; `response_format` and `tools` exclude
+each other again), `engine.jump-forward=false` (every token sampled) and `engine.constraint-masks=false` (candidates
+tested one by one, no trie masks). See
 [17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward).
 
 **`echo` (completions): the prompt in front.** `"echo": true` returns the prompt followed by the completion in
@@ -651,6 +654,26 @@ drafting for itself, once as loaded from the settings and once with a draft that
 `ArchSmoke` on the Metal emulator with every attention family, f32 / f16 / q8 caches, drafting for itself, at Q2_K,
 and (plain Llama) from another random model. Greedy output equals the output without speculation in all of them.
 
+**The model's own draft head (`mtp`).** A Qwen3.5 GGUF carries a multi-token-prediction layer (`nextn`) that guesses the
+token after the one just sampled from the main model's last hidden state ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)).
+`engine.speculative=mtp` uses it as the proposer: one draft per step, verified in a two-position `forwardAll`.
+
+🧸 The big model reads the conversation on a whiteboard that every word scribbles on. To check a guess it must read
+the guessed word too, and if the guess was wrong, wipe the scribble. So before each check it takes a photo of the
+board's state (on the GPU: the layers write the photo themselves while they work, a second set of buffers), and a wrong
+guess just swaps the photo back in.
+
+📐 Models whose recurrent state cannot be rewound by overwriting (the Gated DeltaNet hybrids, [14.14.5](14-model-families.md))
+were refused by `Speculator.supported`; the MTP mode asks instead for `Backend.hasMtp() && supportsRollback()`. A step is
+`checkpointState(); forwardAll([tok, d1], pos); if (d1 rejected) rollbackState(1)`; the rule of acceptance is the same
+`Sampler.verify` as for the other proposers (the proposal is the head's argmax, one-hot), so greedy output is the plain
+greedy output and sampled output has the target's distribution. With acceptance `α` a step yields `1 + α` tokens for one
+two-position pass plus the head (about one layer and the output head) and one more head row for the KV of the position
+just verified; `GgufQwenNextTest` checks it with an oracle head (right two of three times) and the real head on CPU and
+Metal. On the Qwen3.8-27B (Q4_0, M1 Pro) the head guesses the next token 90 % of the time and the mode decodes a code answer
+at 5.4 tok/s against 4.3 without (the output is the same text); a two-token pass costs 1.5 plain steps there, which bounds
+the gain ([16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). A model with a head uses the mode by default.
+
 Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run`/`chat` and returned in the API
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
 
@@ -699,8 +722,9 @@ the CPU ([08 §8.24](08-metal-backend.md#824-batched-decoding-across-slots-metal
 the leader's command queue and activation buffers, and each row's RoPE, cache store and attention are dispatched
 against its own slot's cache buffers. Below 8 slots those kernels compute each row exactly as the slot's own step, so on
 Metal the batched logits were bit-identical to the alone ones in every family tested on the emulator (with experts on the
-CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba falls back
-to running the queued steps one after another.
+CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba and Qwen3-Next (recurrent
+states) fall back to running the queued steps one after another; they have no draft-model or prompt-lookup speculation
+either (a recurrent state cannot be rolled back).
 
 ## 10.10 Configuration
 

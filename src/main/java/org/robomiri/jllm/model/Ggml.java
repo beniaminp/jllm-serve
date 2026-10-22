@@ -6,7 +6,9 @@ import java.nio.ByteOrder;
 
 /**
  * The ggml block formats the engine computes with in place (byte-compatible with llama.cpp's {@code block_q4_0},
- * {@code block_q8_0}, {@code block_q4_K} and {@code block_q5_K}; {@link Q2K} is the fifth), with scalar reference
+ * {@code block_q8_0}, {@code block_q4_K}, {@code block_q5_K}, {@code block_q4_1}, {@code block_q5_0}, {@code block_q5_1},
+ * {@code block_q3_K}, {@code block_iq4_nl}, {@code block_iq4_xs} and {@code block_mxfp4}; {@link Q2K} and {@link Q6K}
+ * are the same for their formats), with scalar reference
  * dequantizers. They are the semantic definition the SIMD and Metal kernels are checked against, and the code
  * behind {@link QTensor#dequantizeRow} for these types. Layouts (all little endian, scales are f16):
  *
@@ -34,6 +36,18 @@ public final class Ggml {
     public static final int Q4_K_QS = 16;
     public static final int Q5_K_QH = 16;
     public static final int Q5_K_QS = 48;
+    public static final int Q4_1_BYTES = 20;
+    public static final int Q5_0_BYTES = 22;
+    public static final int Q5_1_BYTES = 24;
+    public static final int Q3_K_BYTES = 110;
+    public static final int IQ4_NL_BYTES = 18;
+    public static final int IQ4_XS_BYTES = 136;
+    public static final int MXFP4_BYTES = 17;
+
+    /** ggml's {@code kvalues_iq4nl}: the 16 non-linear levels of IQ4_NL / IQ4_XS (a nibble indexes this table). */
+    public static final byte[] KVALUES_IQ4NL = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    /** ggml's {@code kvalues_mxfp4}: the e2m1 values of MXFP4, doubled (the block scale carries the factor 1/2). */
+    public static final byte[] KVALUES_MXFP4 = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
     private static final ValueLayout.OfShort LE16 = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
     private static final ValueLayout.OfInt LE32 = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
@@ -138,7 +152,7 @@ public final class Ggml {
         }
     }
 
-    // ------------------------------------------------------------------ formats the engine only converts (to Q8_0)
+    // ------------------------------------------------------------------ the other legacy and K formats
 
     /** Q4_1: f16 d | f16 m | u8 qs[16] (20 B / 32 w), w = q d + m. */
     public static void dequantQ4_1(MemorySegment seg, long off, int cols, float[] dst, int o) {
@@ -247,6 +261,70 @@ public final class Ggml {
                     dst[y + l + 96] = d * seg.get(ValueLayout.JAVA_BYTE, sc + is + 6) * q4;
                 }
             }
+        }
+    }
+
+    /** IQ4_NL: f16 d | u8 qs[16] (18 B / 32 w), w[j] = d kvalues[lo(qs[j])], w[j+16] = d kvalues[hi(qs[j])]. */
+    public static void dequantIQ4_NL(MemorySegment seg, long off, int cols, float[] dst, int o) {
+        for (int b = 0; b < cols / 32; b++, off += IQ4_NL_BYTES, o += 32) {
+            float d = f16(seg, off);
+            for (int j = 0; j < 16; j++) {
+                int v = u8(seg, off + 2 + j);
+                dst[o + j] = d * KVALUES_IQ4NL[v & 0xF];
+                dst[o + j + 16] = d * KVALUES_IQ4NL[v >>> 4];
+            }
+        }
+    }
+
+    /**
+     * IQ4_XS: f16 d | u16 scales_h | u8 scales_l[4] | u8 qs[128] (136 B / 256 w). Eight 32-weight sub-blocks, each with
+     * a 6-bit scale {@code ls = lo4(scales_l[ib/2], ib%2) | 2 bits of scales_h << 4}, {@code w = d (ls - 32) kvalues[q]}.
+     */
+    public static void dequantIQ4_XS(MemorySegment seg, long off, int cols, float[] dst, int o) {
+        for (int b = 0; b < cols / QK_K; b++, off += IQ4_XS_BYTES) {
+            float d = f16(seg, off);
+            int sh = seg.get(LE16, off + 2) & 0xFFFF;
+            long qs = off + 8;
+            for (int ib = 0; ib < 8; ib++, qs += 16, o += 32) {
+                int ls = ((u8(seg, off + 4 + ib / 2) >>> (4 * (ib % 2))) & 0xF) | (((sh >>> (2 * ib)) & 3) << 4);
+                float dl = d * (ls - 32);
+                for (int j = 0; j < 16; j++) {
+                    int v = u8(seg, qs + j);
+                    dst[o + j] = dl * KVALUES_IQ4NL[v & 0xF];
+                    dst[o + j + 16] = dl * KVALUES_IQ4NL[v >>> 4];
+                }
+            }
+        }
+    }
+
+    /** ggml's {@code ggml_e8m0_to_fp32_half}: 2^(e - 128) (e8m0 is a bare exponent; the table values are doubled). */
+    public static float e8m0Half(int e) {
+        return Float.intBitsToFloat(e < 2 ? 0x00200000 << e : (e - 1) << 23);
+    }
+
+    /** MXFP4: u8 e | u8 qs[16] (17 B / 32 w), w[j] = kvalues[lo(qs[j])] 2^(e-128), w[j+16] = kvalues[hi(qs[j])] 2^(e-128). */
+    public static void dequantMXFP4(MemorySegment seg, long off, int cols, float[] dst, int o) {
+        for (int b = 0; b < cols / 32; b++, off += MXFP4_BYTES, o += 32) {
+            float d = e8m0Half(u8(seg, off));
+            for (int j = 0; j < 16; j++) {
+                int v = u8(seg, off + 1 + j);
+                dst[o + j] = KVALUES_MXFP4[v & 0xF] * d;
+                dst[o + j + 16] = KVALUES_MXFP4[v >>> 4] * d;
+            }
+        }
+    }
+
+    /** F16 matrix viewed as blocks of 32 halves (64 B / 32 w). */
+    public static void dequantF16(MemorySegment seg, long off, int cols, float[] dst, int o) {
+        for (int i = 0; i < cols; i++) {
+            dst[o + i] = f16(seg, off + 2L * i);
+        }
+    }
+
+    /** BF16 matrix viewed as blocks of 32 bfloat16 (64 B / 32 w). */
+    public static void dequantBF16(MemorySegment seg, long off, int cols, float[] dst, int o) {
+        for (int i = 0; i < cols; i++) {
+            dst[o + i] = bf16(seg, off + 2L * i);
         }
     }
 }

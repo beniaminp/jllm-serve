@@ -82,6 +82,16 @@ abstract class ByteConstraint implements TokenConstraint {
         }
     }
 
+    /**
+     * Whether allowed-token masks are computed and memoized ({@code engine.constraint-masks}); off, every candidate
+     * is checked by feeding its bytes to the automaton, as before the masks existed.
+     */
+    private static volatile boolean fastMasks = !"false".equals(System.getProperty("jllm.constraint.masks"));
+
+    static void setFastMasks(boolean on) {
+        fastMasks = on;
+    }
+
     /** Candidate checks in one state after which the full allowed set is computed (the sampler is searching wide). */
     static final int MASK_AFTER = 300;
     /** Longest forced text a jump-forward computes. */
@@ -120,7 +130,7 @@ abstract class ByteConstraint implements TokenConstraint {
         if (b == null) {
             return token >= 0 && token < tokens.length && state.allowsSpecial();
         }
-        if (mask == null) {
+        if (mask == null && fastMasks) {
             if (++checks == MASK_AFTER) {
                 masks(Integer.MAX_VALUE);
             } else if (checks == 1) {
@@ -148,7 +158,7 @@ abstract class ByteConstraint implements TokenConstraint {
      */
     @Override
     public int[] allowedTokens(boolean compute) {
-        if (state.relaxed() || (mask == null && state.wide())) {
+        if (!fastMasks || state.relaxed() || (mask == null && state.wide())) {
             return null;
         }
         if (mask == null && !tooBig) {
