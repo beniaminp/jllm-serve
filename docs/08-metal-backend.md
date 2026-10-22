@@ -1598,20 +1598,32 @@ their kernels; batched against alone already differs at rounding level by design
 logit in `ArchSmoke`).
 
 **Choosing NR.** Time of the matvecs of a whole token (28 layers + LM head, 28 distinct weight sets so nothing stays
-cached; `MvBench` in the review notes; M1 Pro, microseconds per layer):
+cached; a micro-benchmark that loads the model, `MvBench` in the review notes; M1 Pro, best of 9; µs per layer unless
+noted):
 
-| kernel (Qwen3-0.6B Q4_0) | one row, 64 threads (tuned) | NR = 2 | NR = 4 | NR = 8 |
-|---|---|---|---|---|
-| q/k/v + norm (4 096 × 1 024) | ‹TBD› | ‹TBD› | ‹TBD› | ‹TBD› |
-| o_proj (1 024 × 2 048) | ‹TBD› | | | |
-| gate/up + swiglu + norm (6 144 × 1 024) | ‹TBD› | | | |
-| down (1 024 × 3 072) | ‹TBD› | | | |
-| LM head (151 936 × 1 024, Q8_0), µs | ‹TBD› | | | |
-| whole token, ms | ‹TBD› | | | |
+| kernel (Qwen3-0.6B Q4_0 cache) | one row, 64 threads (the tuned default before) | NR = 2 | NR = 4 |
+|---|---|---|---|
+| q/k/v + norm (4 096 × 1 024) | 73 | 63 | 68 |
+| o_proj (1 024 × 2 048) | 28 | 24 | 23 |
+| gate/up + swiglu + norm (6 144 × 1 024) | 83 | 61 | 58 |
+| down (1 024 × 3 072) | 35 | 29 | 28 |
+| LM head (151 936 × 1 024, Q8_0), µs | 1 442 | 1 228 | 1 230 |
+| **whole token, ms** | **6.76** | **5.43** | 5.55 |
+| same, Qwen3-0.6B-Q4_0.gguf | 7.74 | 5.83 | 5.67 |
 
-`NR = 8` was tried and dropped (the SwiGLU kernel then holds 16 accumulators and 16 row pointers per lane and spills
-registers: 130 µs per layer against 61); the default is **2**, 4 stays available. `-Djllm.metal.mvRows=0|1|2|4|8`, `-Djllm.metal.mvThreads` (threads of the
-plain, non-norm variants; the fused ones need 128).
+−20 % of the matvec time for the safetensors cache and −25 % for the GGUF file (whose blocks cost more to unpack, see
+below). NR = 2 and 4 are within noise of each other; 2 is the default (fewer registers, and the 8-row tile of a
+SwiGLU simdgroup at NR = 4 is the first to spill on a wider model). A threadgroup of 64, 128 or 256 threads changes
+nothing (5.43 – 5.44 ms). `NR = 8` was tried and dropped: the SwiGLU kernel then holds 16 accumulators and 16 row
+pointers per lane and spills (130 µs per layer against 61). `-Djllm.metal.mvRows=0|1|2|4`, `-Djllm.metal.mvThreads`
+(threads of the plain, non-norm variants; the fused ones need 128).
+
+The kernels are still far from the memory roof: o_proj streams 1.25 MB in 24 µs (52 GB/s), the LM head 165 MB in
+1.23 ms (134 GB/s). A 1–3 MB matvec is a latency affair — launch, ramp-up, the norm prologue of the fused variants (the
+same kernel without the norm: qkv 39–50 µs, swiglu 39–54 µs, so the prologue is worth ~15–20 µs a layer) and the tail —
+which is why the lever left is fewer and overlapping dispatches ([08 §8.22](#822-decode-replay-one-native-call-per-token),
+the encoder), not another tile shape. GGUF Q4_0 stays ~7 % behind the own Q4_0 format (5.83 vs 5.43 ms) because its
+18-byte blocks are read as ushorts (2-byte aligned) and the weights are scaled before the dot instead of once after it.
 
 ---
 

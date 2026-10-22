@@ -103,7 +103,7 @@ final class MetalKernels implements AutoCloseable {
     /** Keys per attention_dec simdgroup (a split); a decode step over up to DEC_CHUNK keys runs one simdgroup per head group. */
     static final int DEC_CHUNK = Integer.getInteger("jllm.metal.decChunk", 32);
     /** Most splits (simdgroups per query-head group) of one attention_dec step: long contexts use bigger splits instead of more. */
-    static final int DEC_MAX_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.decMaxSplits", 16));
+    static final int DEC_MAX_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.decMaxSplits", 24));
     /** A half cache is read with 16-byte loads (8 elements per lane chunk); {@code -Djllm.metal.decWide=false}: 8-byte ones. */
     static final boolean DEC_WIDE = !"false".equals(System.getProperty("jllm.metal.decWide"));
     /** Query heads per attention_dec threadgroup; 0 = automatic (at most 2, 4 for 64-wide heads, dividing heads / kvHeads). */
@@ -494,16 +494,16 @@ final class MetalKernels implements AutoCloseable {
     int mvThreads = MV_THREADS;
 
     private static int mvRows() {
-        int n = Integer.getInteger("jllm.metal.mvRows", 2);
+        int n = Integer.getInteger("jllm.metal.mvRows", 4);
         if (n != 0 && n != 1 && n != 2 && n != 4) {
             throw new IllegalArgumentException("-Djllm.metal.mvRows must be 0, 1, 2 or 4, got " + n);
         }
         return n;
     }
 
-    /** True if a matmul / matmul3 / swiglu runs the multi-row kernels: a single token (2..7 batched rows keep the one-row tiles). */
+    /** True if a matmul / matmul3 / swiglu of fewer tokens than the prefill tiles take runs the multi-row kernels. */
     private boolean mv(int n) {
-        return mvRows > 1 && n == 1;
+        return mvRows > 1;
     }
 
     /** Threadgroups along the row axis of a multi-row kernel with {@code threads} threads per threadgroup. */
@@ -566,7 +566,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul"), t.type, norm != null ? "_norm" : ""), 6, normTgMem(norm, t.cols),
-                    mvGrid(t.rows, threads), 1, 1, threads, 1, 1);
+                    mvGrid(t.rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else if (norm == null && n == 1) {
             int sgs = decodeThreads / 32;
             dispatch(kernel("matmul", t.type, ""), 6, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
@@ -624,7 +624,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul3"), wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
-                    mvGrid(rows, threads), 1, 1, threads, 1, 1);
+                    mvGrid(rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
                     rowGrid(rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -669,7 +669,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul3"), w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
-                    mvGrid(w.rows, threads), 1, 1, threads, 1, 1);
+                    mvGrid(w.rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
                     rowGrid(w.rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -704,7 +704,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul_swiglu"), t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
-                    mvGrid(hidden, threads), 1, 1, threads, 1, 1);
+                    mvGrid(hidden, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(hidden), tokTiles(n), 1, MM_THREADS, 1, 1);

@@ -847,10 +847,13 @@ for _fmt in MV_FORMATS:
     for _nr in (2, 4):
         mv_test(_fmt, _nr, 37, 512)                                      # tail simdgroup: 37 rows is no multiple of NR
         mv_test(_fmt, _nr, 64, 512, norm=True, bias=True, acc=True)
+        mv_test(_fmt, _nr, 21, 512, ntok=11, bias=True)                  # batched rows: two token tiles, the second partial
         mv3_test(_fmt, _nr, (21, 11, 13), 512, bias=True)                # NR rows straddle the q / k / v ranges
         mv3_test(_fmt, _nr, (24, 8, 8), 512, norm=True, half=True)
+        mv3_test(_fmt, _nr, (9, 5, 7), 512, ntok=3)
         mv_swiglu_test(_fmt, _nr, 19, 512)
         mv_swiglu_test(_fmt, _nr, 24, 512, norm=True, use_gelu=True)
+        mv_swiglu_test(_fmt, _nr, 13, 512, ntok=5)
 for _nr in (2, 4):
     mv_test('q4', _nr, 40, 3072, softcap=3.0)                            # 3 blocks per lane (Wdown's width)
     mv_test('q8', _nr, 130, 1024, norm=True)
