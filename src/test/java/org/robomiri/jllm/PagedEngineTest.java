@@ -74,6 +74,14 @@ public final class PagedEngineTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
+        String repeat = System.getProperty("paged.repeat"); // -Dpaged.repeat=N:dtype runs only that check N times (diagnosis)
+        if (repeat != null) {
+            String[] r = repeat.split(":");
+            for (int i = 0; i < Integer.parseInt(r[0]); i++) {
+                sameAsFlat(dir, r[1]);
+            }
+            System.exit(failures > 0 ? 1 : 0);
+        }
         for (String dt : new String[]{"f32", "f16", "q8"}) {
             sameAsFlat(dir, dt);
         }
@@ -99,20 +107,19 @@ public final class PagedEngineTest {
             check(bf.stateFormat().equals(bp.stateFormat()), dt + ": the same saved-cache format " + bf.stateFormat());
             int[] ids = text(flat.engine(), 0, 150);
             int vocab = flat.weights().arch.core().vocabSize();
-            // The vector reductions of the kernels (reduceLanes) may add in another order in the interpreter, in C1 and in C2,
-            // so the same call can differ in the last bit while the JVM warms up, even on the flat cache. The script runs on
-            // the flat cache twice; once those two agree the JVM is warm for this code, and the paged run must equal them.
-            boolean same = false;
-            boolean warm = false;
-            for (int attempt = 0; attempt < 12 && !warm; attempt++) {
-                List<float[]> f1 = script(bf, ids, vocab);
-                List<float[]> f2 = script(bf, ids, vocab);
-                warm = sameLogits(f1, f2);
-                if (warm) {
-                    same = sameLogits(f1, script(bp, ids, vocab));
-                }
+            // One comparison, from a cold JVM: the lane sums of the kernels add in one fixed order in every JIT tier
+            // (VectorKernels.laneSum, JitStableKernelsTest), so the first call needs no warm-up. The flat cache runs
+            // twice only to name the cause if the answer ever differs: a flat cache that disagrees with itself is not a paging error.
+            List<float[]> f1 = script(bf, ids, vocab);
+            List<float[]> p1 = script(bp, ids, vocab);
+            List<float[]> f2 = script(bf, ids, vocab);
+            boolean same = sameLogits(f1, p1);
+            boolean stable = sameLogits(f1, f2);
+            if (!same || !stable) {
+                System.out.println("     (flat twice " + (stable ? "agree" : "differ at " + firstDifference(f1, f2))
+                        + ", paged vs flat " + (same ? "agree" : "differ at " + firstDifference(f1, p1)) + ")");
             }
-            check(warm && same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
+            check(same && stable, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
             int[] prompt = text(flat.engine(), 7, 100);
             Engine.Result rf = flat.engine().generate(prompt, GREEDY, null, () -> false);
             Engine.Result rp = paged.engine().generate(prompt, GREEDY, null, () -> false);
@@ -139,6 +146,21 @@ public final class PagedEngineTest {
         b.forward(Arrays.copyOfRange(ids, 20, 25), 0, 5, pos - 5, l);
         out.add(l.clone());
         return out;
+    }
+
+    /** "call i, index j: x vs y (max |diff| d)" of the first call whose logits differ. */
+    private static String firstDifference(List<float[]> a, List<float[]> b) {
+        for (int i = 0; i < a.size(); i++) {
+            int j = Arrays.mismatch(a.get(i), b.get(i));
+            if (j >= 0) {
+                float max = 0;
+                for (int k = 0; k < a.get(i).length; k++) {
+                    max = Math.max(max, Math.abs(a.get(i)[k] - b.get(i)[k]));
+                }
+                return "call " + i + ", index " + j + ": " + a.get(i)[j] + " vs " + b.get(i)[j] + " (max |diff| " + max + ")";
+            }
+        }
+        return "-";
     }
 
     private static boolean sameLogits(List<float[]> a, List<float[]> b) {

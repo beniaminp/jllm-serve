@@ -345,9 +345,25 @@ public final class ModelLoader {
      * The pool of KV blocks the CPU slots of {@code weights} share when {@code backend.kv-paged} is on (docs/24), made
      * by the first slot; null when the flat cache is wanted or the model cannot be paged.
      */
+    private static final java.util.Map<ModelWeights, Boolean> PAGED =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /**
+     * Whether the slots of {@code weights} use the paged KV cache: {@code backend.kv-paged} true / false as given; with
+     * {@code auto} (the default) when the model was loaded with two or more slots (the first call, {@link #load}, knows the
+     * slot count and decides for the model; {@link #extraEngine} finds the decision again), else the flat cache.
+     */
+    static boolean paged(Settings s, ModelWeights weights, int slots) {
+        String v = s.get("backend.kv-paged").trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.equals("true") || v.equals("false")) {
+            return v.equals("true");
+        }
+        return PAGED.computeIfAbsent(weights, w -> slots >= 2);
+    }
+
     private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int ctx, int slots,
                                                       boolean metal) {
-        if (!s.getBool("backend.kv-paged")) {
+        if (!paged(s, weights, slots)) {
             return null;
         }
         if (weights.arch instanceof org.robomiri.jllm.model.Decoder dec && CpuBackend.anySpecial(dec, ctx)) {
@@ -572,7 +588,7 @@ public final class ModelLoader {
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
         boolean mamba = arch instanceof MambaArch;
-        if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
+        if (member && s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && (mamba || arch instanceof Qwen3NextArch)) {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
                     + ": a recurrent state is a function of every earlier token and cannot be shared per block, so the flat cache is used");
         }

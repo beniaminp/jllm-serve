@@ -165,7 +165,7 @@ public final class Int8Kernels {
             float scale = Ggml.f16(seg, q) * xs[sb + b];
             acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum4(acc); // a fixed order in every JIT tier (docs 07 7.14)
     }
 
     /** {@link #dotRowQ8xQ8} for ggml's Q8_0 layout: 34-byte blocks, f16 scale then 32 int8, 16-byte halves at byte 2 and 18. */
@@ -186,7 +186,7 @@ public final class Int8Kernels {
             float scale = Ggml.f16(seg, blk) * xs[sb + (g >> 1)];
             acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum4(acc); // a fixed order in every JIT tier (docs 07 7.14)
     }
 
     /**
@@ -209,7 +209,7 @@ public final class Int8Kernels {
             float scale = seg.get(ValueLayout.JAVA_FLOAT, s + (long) b * 4) * xs[sb + b];
             acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum4(acc); // a fixed order in every JIT tier (docs 07 7.14)
     }
 
     /**
@@ -239,7 +239,7 @@ public final class Int8Kernels {
             float scale = seg.get(ValueLayout.JAVA_FLOAT, s + (long) b * 4) * xs[sb + b];
             acc = toFloat(isum, magic).fma(FloatVector.broadcast(F4, scale), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum4(acc); // a fixed order in every JIT tier (docs 07 7.14)
     }
 
     /** Exact integer dot product of one Q4_0 block (16 packed bytes as 8 shorts) with 32 activation shorts, as 4 int lanes. */

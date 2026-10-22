@@ -197,7 +197,7 @@ class PagedSlotsTest {
                 + tok.vocabSize() + ",\"eos_token_id\":" + tok.tokenId("<|im_end|>") + "}"));
         Path dir = Files.createTempDirectory("paged-slots");
         WebProperties props = new WebProperties("x", "", List.of(), 100, "y", "deepseek", false, dir.toString(), 1.0, 512, 0,
-                List.of(), spill, 1.0);
+                List.of(), spill, 1.0, 120);
         KvStore store = new KvStore(props);
         KvPool pool = new KvPool(new IntStorage(blocks), blocks, "int rows");
         Engine e0 = new Engine(new PagedBackend(pool), tok, cfg, Set.of(), 0, ChatTemplate.forModelType("qwen3"));
@@ -246,6 +246,46 @@ class PagedSlotsTest {
             int[] a2 = concat(s.e0().cachedTokens().length >= a.length ? s.e0().cachedTokens() : s.e1().cachedTokens(), tokens(r, 30));
             Engine.Stats s2 = request(s.model(), a2, null);
             assertTrue(s2.cachedTokens() >= a.length, "a retry/continuation reuses the whole conversation: " + s2.cachedTokens());
+        } finally {
+            cleanup(s);
+        }
+    }
+
+    @Test
+    void anIdleSlotGivesItsBlocksBackAndTheConversationIsStillFound() throws Exception {
+        Setup s = setup(600, false);
+        try {
+            Random r = new Random(21);
+            int[] a = tokens(r, 4100);
+            request(s.model(), a, null);
+            long held = s.pool().stats().usedBlocks();
+            assertTrue(held >= 256, "the slot holds its conversation: " + held + " blocks");
+            // a slot that has not been idle long enough keeps them; after the timeout (here 0) it releases them
+            assertTrue(!s.model().releaseIdle(60_000), "not idle for a minute yet");
+            assertEquals(held, s.pool().stats().usedBlocks());
+            assertTrue(s.model().releaseIdle(0), "idle: released");
+            KvPool.Stats st = s.pool().stats();
+            assertEquals(0, st.usedBlocks(), "no block is referenced any more");
+            assertTrue(st.cachedBlocks() >= 256, "the conversation's full blocks stay in the tree: " + st.cachedBlocks());
+            Engine.Stats back = request(s.model(), concat(a, tokens(r, 30)), null);
+            assertTrue(back.cachedTokens() >= 4080, "the next turn finds it through the tree: " + back.cachedTokens() + " tokens");
+        } finally {
+            cleanup(s);
+        }
+    }
+
+    @Test
+    void aFullPoolAsksIdleSlotsForTheirBlocks() throws Exception {
+        Setup s = setup(300, false); // room for one 4100-token conversation, not two
+        try {
+            s.model().enablePagedHousekeeping(0); // only the memory-pressure path
+            Random r = new Random(23);
+            int[] a = tokens(r, 4100);
+            int[] c = tokens(r, 4100);
+            request(s.model(), a, null);
+            Engine.Stats sc = request(s.model(), c, null); // runs on the other slot; without the reclaimer the pool would be exhausted
+            assertEquals(0, sc.cachedTokens());
+            assertTrue(s.pool().stats().residentBlocks() <= 300);
         } finally {
             cleanup(s);
         }

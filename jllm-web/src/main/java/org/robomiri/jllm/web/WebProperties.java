@@ -26,6 +26,8 @@ import java.util.List;
  * @param kvSpill            a model with a paged KV cache ({@code backend.kv-paged}) writes the blocks it evicts to
  *                           {@code <kv-cache-dir>/blocks} and reads them back when a prompt needs them (docs/24 §24.3)
  * @param kvSpillMaxGb       disk budget of those block files
+ * @param kvIdleReleaseSeconds a paged model's slot that has been idle this long gives its blocks back to the pool (the
+ *                           conversation stays findable in the prefix tree until evicted); 0 = never, only under memory pressure
  * @param modelDirs          more folders whose models the Models page lists and loads in place, besides
  *                           {@code model.dir} (default {@code ../models}: the repository's folder when the console runs
  *                           from {@code jllm-web/}); folders that do not exist are skipped
@@ -45,7 +47,8 @@ public record WebProperties(
         @DefaultValue("2000") long kvCacheSaveAfterMs,
         @DefaultValue("../models") List<String> modelDirs,
         @DefaultValue("true") boolean kvSpill,
-        @DefaultValue("10") double kvSpillMaxGb) {
+        @DefaultValue("10") double kvSpillMaxGb,
+        @DefaultValue("120") long kvIdleReleaseSeconds) {
 
     public WebProperties {
         if (!(kvCacheMaxGb >= 0)) {
