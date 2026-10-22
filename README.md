@@ -167,8 +167,9 @@ on the PATH (`video.ffmpeg`); without it clips are animated WebP (lossless) or G
 and the chat tool off. All `video.*` keys are in [`jllm.properties`](src/main/resources/jllm.properties); how it works, the API shape (OpenAI has no
 video endpoint: it follows `/v1/images/generations`), the editor, accuracy against diffusers and the measured speed: [docs/23](docs/23-video-generation.md).
 Quality note: the `v1-5-2` adapter on the plain Stable Diffusion 1.5 gives poor clips (the same ones diffusers makes: the tests compare the numbers, not
-the taste); point `video.base-model` at a fine-tuned SD 1.5 checkpoint in diffusers format for good ones. Wan 2.1 runs from a local folder with
-`./jllm video --video-model <folder>` but its 22.7 GB float32 text encoder was beyond this work's download budget, so only the components were verified.
+the taste); point `video.base-model` at a fine-tuned SD 1.5 checkpoint in diffusers format for good ones. Wan 2.1 is wired into
+`./jllm video --video-model <local folder>` (tested on a tiny random pipeline), but its 22.7 GB float32 text encoder was beyond this work's download budget, so only the
+transformer and the VAE were verified on the real weights.
 
 ### GGUF files
 
