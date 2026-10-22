@@ -9,13 +9,16 @@ Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
 **DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting), **Mamba** (`mamba`) and
-**Qwen3-Next** (`qwen3_next`: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
+**Qwen3-Next** (`qwen3_next`; also **Qwen3.5** from GGUF: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
 [docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
-conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
-place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)). Apple **MLX** quantized checkpoints
+conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures and the hybrid **Qwen3.5** (`qwen35`) and
+Qwen3-Next (`qwen3next`) ones, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
+place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)); a Qwen3.5 file's own
+multi-token-prediction layer can draft for speculative decoding (`--engine.speculative mtp`,
+[docs/16 §16.13](docs/16-gguf.md#1613-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
 (`mlx-community/*-4bit`, `-8bit`, and the `mxfp4` / `mxfp8` modes) and block-quantized **FP8** checkpoints are read too:
 dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 
