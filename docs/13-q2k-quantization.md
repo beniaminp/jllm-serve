@@ -529,9 +529,13 @@ The pattern: fewer code bits need *mins* (an affine grid) and smaller sub-blocks
 symmetric grid and spend their sub-scale budget on precision (6 or 8 bits) instead. Q4_K at 4.5 bits/weight is
 the usual sweet spot — Q4_0's size plus 0.125 bits, with roughly half its error because the per-32 scale no
 longer has to be a power-of-two-free f32 but a 6-bit code under a shared `d`, and because the min absorbs the
-asymmetry of each group. Implementing it in this project would reuse everything here (super-block
+asymmetry of each group. *Producing* Q4_K would reuse everything here (super-block
 `QType`, partial-block handling, the `Σx` dot) with a different `quantizeBlock`/`dequantizeBlock` pair and a
-different unpacking in the kernels.
+different unpacking in the kernels; the engine does not do that (it quantizes to Q4_0, Q8_0, Q2_K and Q6_K), but since
+the GGUF chapter it *reads* Q3_K, Q4_K, Q5_K and Q6_K blocks from llama.cpp's files in place, on both backends, with
+kernels of exactly this shape ([16 §16.4](16-gguf.md#164-the-block-formats); the Q3_K layout with a worked block is
+[06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files)). Q2_K itself is the one
+format that is both produced here and read from GGUF files, and the two blocks are byte-identical.
 
 ---
 
