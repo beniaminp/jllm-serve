@@ -138,6 +138,8 @@ public final class ChatTemplate {
                 return MAMBA;
             case "gpt_oss":
                 return HARMONY_TODAY;
+            case "llama4", "llama4_text":
+                return LLAMA4;
             default:
                 throw new IllegalArgumentException("no chat template for model_type \"" + modelType + "\"");
         }
@@ -240,6 +242,36 @@ public final class ChatTemplate {
     }
 
     // ------------------------------------------------------------------ the families
+
+    /**
+     * Llama 4 (plain chat; no tools, no images): {@code <|begin_of_text|>}, a trimmed system message as the system header
+     * if there is one, then {@code <|header_start|>role<|header_end|>\n\n} + the content (as it is) + {@code <|eot|>} per
+     * message, and the assistant header as the generation prompt.
+     */
+    private static final Format LLAMA4 = new Family("llama4", (m, gen, think, o) -> {
+        o.ctl("<|begin_of_text|>");
+        int first = 0;
+        if (!m.isEmpty() && "system".equals(m.get(0).role())) {
+            String system = pyTrim(content(m.get(0)));
+            first = 1;
+            if (!system.isEmpty()) {
+                o.ctl("<|header_start|>system<|header_end|>\n\n");
+                o.txt(system);
+                o.ctl("<|eot|>");
+            }
+        }
+        for (int i = first; i < m.size(); i++) {
+            if ("tool".equals(m.get(i).role()) || "ipython".equals(m.get(i).role())) {
+                throw new IllegalArgumentException("tool messages are not supported by the Llama 4 chat format here");
+            }
+            o.ctl("<|header_start|>" + m.get(i).role() + "<|header_end|>\n\n");
+            o.txt(content(m.get(i)));
+            o.ctl("<|eot|>");
+        }
+        if (gen) {
+            o.ctl("<|header_start|>assistant<|header_end|>\n\n");
+        }
+    }, "<|eot|>", "<|end_of_text|>", "<|eom|>");
 
     /**
      * Qwen3 ChatML with thinking. Assistant turns before the last user query drop their reasoning; those after it

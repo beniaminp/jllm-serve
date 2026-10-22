@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Architecture smoke test: Llama / Mistral / Qwen2 / Qwen3-MoE / GLM / Phi-3 / Gemma / Mamba / DeepSeek / Qwen3-Next pipeline on tiny random checkpoints.
+# Architecture smoke test: Llama / Mistral / Qwen2 / Qwen3-MoE / GLM / Phi-3 / Gemma / Mamba / DeepSeek / Qwen3-Next / gpt-oss / Llama 4 pipeline on tiny random checkpoints.
 #
 # For every model it converts to q4, q8, q2k and q6k (plus q4 with a q6k embedding / LM head), loads, generates 8 tokens greedily
 # on the CPU backend and on the Metal backend, and requires the two id sequences to be equal.
@@ -42,6 +42,15 @@
 #                                                         MoE with a gated shared expert); checked against qwen3next-ref.py
 #                                                         (Qwen3NextChecks: reference, chunked vs token loop, saved states)
 #                                                         and, like Mamba, for chunking invariance
+#   ...-GptOssForCausalLM / -GptOssMxfp4ForCausalLM       generated: gpt-oss (alternating sliding-window / full attention, attention
+#                                                         sinks, YaRN without truncation, 8 experts top 2 with a biased router,
+#                                                         expert biases and the clamped SwiGLU), the experts as float tensors or
+#                                                         as MXFP4 blocks (read in place on both backends); checked against
+#                                                         transformers by hf-arch-check.sh (see the end of this script)
+#   ...-Llama4ForCausalLM / -Llama4MixForCausalLM         generated: Llama 4 text (chunked attention on 3 of 4 layers, a NoPE layer
+#                                                         with attention temperature tuning, L2 q/k norm, interleaved llama3 RoPE,
+#                                                         top-1 sigmoid MoE with a shared expert; the second is dense / MoE
+#                                                         alternating in the multimodal wrapper layout)
 #   hf-internal-testing_tiny-random-GlmForCausalLM        generated: glm, q/k/v bias, fused gate_up, partial (0.5) interleaved rope
 #   hf-internal-testing_tiny-random-GlmEdgeForCausalLM    generated: glm, head_dim 64, full interleaved rope, tied
 #   hf-internal-testing_tiny-random-Glm4ForCausalLM       generated: glm4, four norms per layer, partial interleaved rope
@@ -114,6 +123,10 @@ gen deepseek_v2q DeepseekV2QLoraForCausalLM
 gen deepseek_v3 DeepseekV3ForCausalLM
 gen qwen3next Qwen3NextForCausalLM
 gen qwen3next2 Qwen3Next2ForCausalLM
+gen gptoss GptOssForCausalLM
+gen gptoss_mxfp4 GptOssMxfp4ForCausalLM
+gen llama4 Llama4ForCausalLM
+gen llama4mix Llama4MixForCausalLM
 gen llama LlamaDraftForCausalLM --seed 4321
 
 # DeepSeek: engine vs. the independent float64 reference (scripts/deepseek-ref.py) on Q8_0-rounded weights
@@ -155,7 +168,15 @@ done
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
   "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \
-  "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
+  "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM" \
+  "$M/${P}-GptOssForCausalLM" "$M/${P}-GptOssMxfp4ForCausalLM" "$M/${P}-Llama4ForCausalLM" "$M/${P}-Llama4MixForCausalLM"
+
+# gpt-oss and Llama 4 against Hugging Face transformers (tiny models of the real configs' shape, logits and greedy ids at
+# every position, CPU and Metal): only where a python with torch + transformers is named, e.g.
+#   REF_PYTHON=/path/to/venv/bin/python scripts/arch-smoke.sh
+if [ -n "${REF_PYTHON:-}" ]; then
+  REF_WORK="${REF_WORK:-$M/hf}" METAL_EMU="${METAL_EMU:-}" ./scripts/hf-arch-check.sh
+fi
 
 # Second pass: every dense and MoE prefill matmul through the half-weight MMA kernels (hmma=true, MMA from 2 tokens
 # on instead of 32 / 16), for the formats where they are exact (Q4_0, Q8_0): the same bounds as above must hold.
@@ -168,4 +189,5 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
-  "$M/${P}-Qwen3MoeForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" "$M/${P}-Qwen3NextForCausalLM"
+  "$M/${P}-Qwen3MoeForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" "$M/${P}-Qwen3NextForCausalLM" \
+  "$M/${P}-GptOssForCausalLM" "$M/${P}-GptOssMxfp4ForCausalLM" "$M/${P}-Llama4ForCausalLM"
