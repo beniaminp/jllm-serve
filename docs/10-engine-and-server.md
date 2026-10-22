@@ -884,7 +884,7 @@ rowBytes(w)       : f32 4w   f16 2w   q8 w + 4·kvHeads (one f32 scale per head 
 Metal : free   = workingSet − otherModels − weights − reserve  [+ 0.10·workingSet if an MoE model may spill experts to the CPU]
         budget = 0.6 · max(0, free)
 CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the flat CPU cache lives on the heap)
-CPU, backend.kv-paged=true (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
+CPU, a paged model (backend.kv-paged=true, or auto with 2+ slots; an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
         the paged pool (docs/24) is off-heap MemorySegment slabs, so -Xmx no longer bounds the cache, only the RAM does
 both  : budget = min(budget, 0.6 · max(0, 0.75 · physicalMemory − weights))   (weights are memory-mapped: they must fit in RAM too)
 a draft model (engine.speculative=draft) keeps a cache of the same length: budget = budget / 2
@@ -974,7 +974,7 @@ costs address space and only touches the pages that get written.
   and a `backend.ctx-max` below 1 024 rejected).
 - Not exact: the reserve is an estimate (activations grow with `backend.batch`); a draft model's cache is accounted for by halving; the
   Mamba / hybrid state buffers are not counted (small); on the CPU the flat cache lives on the Java heap, so the budget is the heap
-  (`JLLM_XMX`, default 4 g). With `backend.kv-paged=true` the CPU blocks are off-heap ([24 §24.2.6](24-paged-kv-cache.md#2426-the-cpu-backend)),
+  (`JLLM_XMX`, default 4 g). With a paged model (`backend.kv-paged=true`, or `auto` with two or more slots) the CPU blocks are off-heap ([24 §24.2.6](24-paged-kv-cache.md#2426-the-cpu-backend)),
   so `auto` counts the physical memory instead (`ContextBudget.pagedOffHeap`; the log says "paged KV cache, off the Java heap"): for
   Qwen3-0.6B at f32 on this 32 GB Mac that is `0.6 · (0.75 · 34.4 − 0.5) = 15.2 GB`, i.e. the trained 40 960 positions instead of the heap-bound
   7 168. The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
