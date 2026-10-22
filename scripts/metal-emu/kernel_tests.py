@@ -787,6 +787,175 @@ if not ONLY:
     router_norm(ds=True, method=1, sigmoid=0, remap=True)
 
 
+# ---------------------------------------------------------------------------------------------- vision encoder (vision.metal)
+
+
+def vit_act_ref(v, act):
+    v = v.astype(np.float64)
+    if act == 1:
+        return 0.5 * v * (1 + np.tanh(0.7978845608028654 * v * (1 + 0.044715 * v * v)))
+    if act == 2:
+        return v / (1 + np.exp(-v))
+    if act == 3:
+        return v / (1 + np.exp(-1.702 * v))
+    return v
+
+
+def vit_gemm(m, n, k, act=0, acc=False, bias=True, pad_x=0, pad_o=0):
+    """vit_gemm: out = act(x . W^T + bias) (+ out) with half weights; the reference rounds x to half as the kernel does
+    (its tiles are half), everything else in float64, so the tolerance only covers float32 accumulation order."""
+    rng = np.random.default_rng(m * 7 + n * 3 + k)
+    ldx, ldo = k + pad_x, n + pad_o
+    x = rng.standard_normal((m, ldx)).astype(np.float32)
+    w = (rng.standard_normal((n, k)) * 0.3).astype(np.float16)
+    b = (rng.standard_normal(n) * 0.5).astype(np.float32)
+    out = (rng.standard_normal((m, ldo)) * 2).astype(np.float32)
+    before = out.copy()
+    xh = x[:, :k].astype(np.float16).astype(np.float64)
+    ref = xh @ w.astype(np.float64).T
+    if bias:
+        ref = ref + b
+    ref = vit_act_ref(ref, act)
+    if acc:
+        ref = before[:, :n] + ref
+    E.dispatch('vit_gemm', [x, w, b, out], pack('iiiiiiii', m, n, k, ldx, ldo, act, int(acc), int(bias)),
+               ((n + 63) // 64, (m + 63) // 64), (128,))
+    err = np.abs(out[:, :n] - ref).max()
+    untouched = np.array_equal(out[:, n:], before[:, n:])
+    check(err < 2e-3 * max(1.0, np.abs(ref).max()) and untouched,
+          'vit_gemm %dx%dx%d act=%d acc=%s bias=%s: max err %.2e%s' % (m, n, k, act, acc, bias, err,
+                                                                      '' if untouched else ' (wrote outside the output)'))
+
+
+vit_gemm(64, 64, 32)
+vit_gemm(70, 100, 44, act=1, bias=True)
+vit_gemm(33, 130, 68, act=2, acc=True, pad_x=4, pad_o=6)
+vit_gemm(9, 17, 12, act=3, bias=False)
+
+
+def vit_norm(rows, cols, rms, has_w=True, has_b=True):
+    rng = np.random.default_rng(rows + cols)
+    x = (rng.standard_normal((rows, cols)) * 3 + 1).astype(np.float32)
+    w = (rng.random(cols) + 0.5).astype(np.float32)
+    b = rng.standard_normal(cols).astype(np.float32)
+    out = np.zeros((rows, cols), np.float32)
+    eps = 1e-6
+    E.dispatch('vit_norm', [x, out, w, b], pack('iiiifii', cols, int(rms), int(has_w), int(has_b), eps, cols, cols),
+               (rows,), (256,))
+    xd = x.astype(np.float64)
+    if rms:
+        ref = xd / np.sqrt((xd * xd).mean(1, keepdims=True) + eps)
+    else:
+        mu = xd.mean(1, keepdims=True)
+        ref = (xd - mu) / np.sqrt(((xd - mu) ** 2).mean(1, keepdims=True) + eps)
+    if has_w:
+        ref = ref * w
+    if has_b:
+        ref = ref + b
+    err = np.abs(out - ref).max()
+    check(err < 2e-5, 'vit_norm %s %dx%d: max err %.2e' % ('rms' if rms else 'layer', rows, cols, err))
+
+
+vit_norm(5, 768, False)
+vit_norm(3, 1280, True, has_b=False)
+vit_norm(2, 72, False, has_w=False, has_b=False)
+
+
+def vit_attention(t, heads, dh, windows):
+    """vit_attention: bidirectional attention, keys of row i in [lo[i], hi[i]) (windows: tokens regrouped in blocks)."""
+    rng = np.random.default_rng(t + heads + dh)
+    dim = heads * dh
+    q, k, v = (rng.standard_normal((t, dim)).astype(np.float32) for _ in range(3))
+    lo = np.zeros(t, np.int32)
+    hi = np.full(t, t, np.int32)
+    if windows:
+        for i in range(t):
+            lo[i] = (i // windows) * windows
+            hi[i] = min(t, lo[i] + windows)
+    out = np.zeros((t, dim), np.float32)
+    scale = 1 / np.sqrt(dh)
+    mma = dh in (64, 72, 80, 128)
+    if mma:
+        E.dispatch('vit_attention_mma_d%d' % dh, [q, k, v, out, lo, hi], pack('iiif', t, heads, dh, scale),
+                   (heads, (t + 31) // 32), (128,))
+        out2 = np.zeros_like(out)  # and the simple kernel must agree
+        E.dispatch('vit_attention', [q, k, v, out2, lo, hi], pack('iiif', t, heads, dh, scale), ((t + 15) // 16, heads), (128,))
+        check(np.abs(out - out2).max() < 3e-3, 'vit_attention_mma_d%d t=%d: agrees with vit_attention, which is float (%.1e; the mma kernel works in half)' % (dh, t, np.abs(out - out2).max()))
+    else:
+        E.dispatch('vit_attention', [q, k, v, out, lo, hi], pack('iiif', t, heads, dh, scale), ((t + 15) // 16, heads), (128,))
+    ref = np.zeros((t, dim))
+    for h in range(heads):
+        qh, kh, vh = (a[:, h * dh:(h + 1) * dh].astype(np.float64) for a in (q, k, v))
+        for i in range(t):
+            sc = kh[lo[i]:hi[i]] @ qh[i] * scale
+            e = np.exp(sc - sc.max())
+            ref[i, h * dh:(h + 1) * dh] = (e / e.sum()) @ vh[lo[i]:hi[i]]
+    err = np.abs(out - ref).max()
+    check(err < (3e-3 if mma else 2e-5), 'vit_attention t=%d heads=%d dh=%d windows=%s: max err %.2e' % (t, heads, dh, windows, err))
+
+
+vit_attention(21, 3, 64, 0)
+vit_attention(70, 2, 80, 16)
+vit_attention(37, 2, 80, 8)
+vit_attention(40, 1, 72, 0)
+vit_attention(10, 2, 72, 0)
+vit_attention(9, 1, 128, 4)
+
+
+def vit_rope(t, heads, dh):
+    rng = np.random.default_rng(t + dh)
+    x = rng.standard_normal((t, heads * dh)).astype(np.float32)
+    ang = rng.random((t, dh // 2)) * 6
+    cs = np.stack([np.cos(ang), np.sin(ang)], axis=2).astype(np.float32).reshape(t, dh)
+    cs = np.ascontiguousarray(cs)
+    want = x.astype(np.float64).reshape(t, heads, dh)
+    x0, x1 = want[:, :, :dh // 2], want[:, :, dh // 2:]
+    c, sn = np.cos(ang)[:, None, :], np.sin(ang)[:, None, :]
+    ref = np.concatenate([x0 * c - x1 * sn, x0 * sn + x1 * c], axis=2).reshape(t, heads * dh)
+    E.dispatch('vit_rope', [x, cs], pack('iii', t, heads, dh), ((dh // 2 + 7) // 8, heads, t), (8, 1, 1))
+    err = np.abs(x - ref).max()
+    check(err < 1e-5, 'vit_rope t=%d heads=%d dh=%d: max err %.2e' % (t, heads, dh, err))
+
+
+vit_rope(6, 2, 16)
+vit_rope(5, 3, 80)
+
+
+def vit_elementwise(n=1000):
+    rng = np.random.default_rng(n)
+    a = rng.standard_normal(n).astype(np.float32)
+    b = rng.standard_normal(n).astype(np.float32)
+    g = a.copy()
+    E.dispatch('vit_gated', [g, b], pack('ii', n, 2), ((n + 63) // 64,), (64,))
+    err1 = np.abs(g - vit_act_ref(a, 2) * b).max()
+    g = a.copy()
+    E.dispatch('vit_act', [g], pack('ii', n, 1), ((n + 63) // 64,), (64,))
+    err2 = np.abs(g - vit_act_ref(a, 1)).max()
+    g = a.copy()
+    E.dispatch('vit_add', [g, b], pack('ii', n, 0), ((n + 63) // 64,), (64,))
+    err3 = np.abs(g - (a + b)).max()
+    check(max(err1, err2, err3) < 2e-6, 'vit_gated / vit_act / vit_add: max err %.2e' % max(err1, err2, err3))
+
+
+vit_elementwise()
+
+
+def vit_gather(rows=7, width=37, src=11, group=1):
+    rng = np.random.default_rng(rows + width)
+    x = rng.standard_normal((src, width)).astype(np.float32)
+    idx = rng.integers(0, src, rows * group).astype(np.int32)
+    out = np.zeros((rows, width), np.float32)
+    E.dispatch('vit_gather_mean' if group > 1 else 'vit_gather', [x, out, idx], pack('iii', rows, width, group),
+               ((width + 15) // 16, (rows + 3) // 4), (16, 4))
+    ref = x[idx].reshape(rows, group, width).mean(1)
+    err = np.abs(out - ref).max()
+    check(err < 1e-6, 'vit_gather%s rows=%d width=%d group=%d: max err %.2e' % ('_mean' if group > 1 else '', rows, width, group, err))
+
+
+vit_gather()
+vit_gather(group=4)
+
+
 # ---------------------------------------------------------------------------------------------- audio.metal (Whisper)
 import math
 

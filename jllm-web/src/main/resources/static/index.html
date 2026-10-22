@@ -6,6 +6,7 @@
 <title>jllm console</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b6cf6'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3Ej%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="css/vision.css"> <!-- vision: pictures in the chat -->
 <!-- audio:begin --><link rel="stylesheet" href="audio.css"><!-- audio:end -->
 <script>try { const t = localStorage.getItem('jllm.theme'); if (t && t !== '"auto"') document.documentElement.dataset.theme = JSON.parse(t); } catch {}</script>
 </head>
@@ -267,6 +268,7 @@
       <label>Model id <input name="id" placeholder="(default)"></label>
       <label>Revision <input name="revision" placeholder="main"></label>
       <label class="gguf-only">GGUF file <select name="ggufFile"></select></label>
+      <label class="mm-only" title="vision-language models see pictures through a second file, the multimodal projector (mmproj-*.gguf)">Projector (mmproj) <select name="mmprojChoice"></select></label> <!-- vision -->
       <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
       <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
       <label>KV cache <select name="backend.kv-dtype"><option value="">(default)</option><option>f32</option><option>f16</option><option>q8</option><option>q4</option></select></label>
@@ -296,6 +298,7 @@
 <script src="js/audio-chat.js"></script>
 <!-- audio:end -->
 <script src="js/markdown.js"></script>
+<script src="js/vision.js"></script> <!-- vision -->
 <script src="js/chat.js"></script>
 <script src="js/models.js"></script>
 <script src="js/tools.js"></script>

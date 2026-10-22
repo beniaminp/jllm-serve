@@ -48,6 +48,50 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
+     * Whether {@link #forwardEmbeds} works: the backend can start a forward pass from embedding vectors (the output
+     * of a vision encoder) instead of token ids.
+     */
+    default boolean supportsEmbeds() {
+        return false;
+    }
+
+    /**
+     * Like {@link #forward} for {@code n} positions {@code [pos, pos+n)} whose input is not looked up in the embedding
+     * table but given: {@code embeds[(off + i) * dim ..]} is the residual-stream input of position {@code pos + i}
+     * ({@code dim} = the model's hidden size, used as it is: no embedding scale). Used for image tokens. Only when
+     * {@link #supportsEmbeds}.
+     */
+    default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
+        forwardEmbeds(embeds, off, n, pos, null, logits);
+    }
+
+    /**
+     * {@link #forwardEmbeds(float[], int, int, int, float[])} with Qwen3-VL's deepstack: {@code deepstack[l]} (the same
+     * layout as {@code embeds}, rows {@code off ..}) is added to the hidden state of these positions after layer
+     * {@code l}, for {@code l < deepstack.length}; null = none.
+     */
+    default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        throw new UnsupportedOperationException(name() + " cannot run from embeddings");
+    }
+
+    /**
+     * Replaces the rotary positions of cache slots {@code [from, contextLength)} with {@code p} (Qwen-VL's M-RoPE; see
+     * {@link RopePositions}), or with the plain {@code slot} when {@code p} is null. Keys already in the cache keep
+     * the rotation they were stored with. Returns false, changing nothing, when the backend cannot.
+     */
+    default boolean setRopePositions(int from, RopePositions p) {
+        return p == null;
+    }
+
+    /**
+     * Whether {@link #setRopePositions} has left non-plain rotary positions in some slots; such a backend cannot join
+     * {@link #forwardBatch} (the batch uses one backend's tables for all rows).
+     */
+    default boolean ropePositionsCustom() {
+        return false;
+    }
+
+    /**
      * Whether the state after tokens {@code [0, N)} can be rewound to an earlier position. A KV cache can (positions
      * past {@code pos} are simply overwritten); a recurrent state (Mamba) cannot, so the engine then reuses the
      * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.

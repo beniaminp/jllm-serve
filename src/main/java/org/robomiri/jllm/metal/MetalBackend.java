@@ -1282,12 +1282,75 @@ public final class MetalBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
     }
 
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
+    }
+
+    // ---- images (docs/20): embeddings as input, and Qwen-VL's rotary positions through the cos/sin tables
+
+    /** First slot whose rotary rows are not the plain ones; MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        this.deepstack = deepstack;
+        this.deepstackOff = off;
+        try {
+            run(null, embeds, off, n, pos, logits, 0);
+        } finally {
+            this.deepstack = null;
+        }
+    }
+
+    /** Qwen3-VL: per-layer features added to the hidden state after the first layers of the current pass (rows from {@code deepstackOff}). */
+    private float[][] deepstack;
+    private int deepstackOff;
+
+    /** x += the picture features of layer {@code l}; between two command buffers, as x is host-visible memory. */
+    private void addDeepstack(int l, int n) {
+        float[] ds = deepstack[l];
+        int dim = c.dim();
+        k.commitAndWait();
+        MemorySegment xs = x.contents();
+        long base = (long) deepstackOff * dim;
+        for (int i = 0; i < n * dim; i++) {
+            long o = 4L * i;
+            xs.set(ValueLayout.JAVA_FLOAT, o, xs.get(ValueLayout.JAVA_FLOAT, o) + ds[(int) (base + i)]);
+        }
+        k.begin();
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        if (pipe != null) {
+            pipe.drain();
+        }
+        for (int t = 0; t < ropeCos.length; t++) {
+            RopeTable rt = arch.ropeTables().get(t);
+            int half = rt.rotaryDim() / 2;
+            float[] c = new float[(ctx - from) * half];
+            float[] s = new float[(ctx - from) * half];
+            Rope.rows(rt, ctx, from, p, c, s);
+            // the tables are shared host memory the kernels read in place; no work is in flight (the engine is idle)
+            MemorySegment.copy(c, 0, ropeCos[t].contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, c.length);
+            MemorySegment.copy(s, 0, ropeSin[t].contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, s.length);
+        }
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
     }
 
     /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
@@ -1311,6 +1374,9 @@ public final class MetalBackend implements Backend {
                 k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
             }
             L.ffn().run(l, n, fuseNorm);
+            if (deepstack != null && l < deepstack.length) {
+                addDeepstack(l, n);
+            }
             if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                 k.commit(); // the GPU starts on these layers while the next ones are encoded
             }
@@ -1512,7 +1578,7 @@ public final class MetalBackend implements Backend {
         }
     }
 
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (pipe != null) {
             pipe.drain(); // never interleave with pipelined steps
         }
@@ -1520,16 +1586,20 @@ public final class MetalBackend implements Backend {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
         int dim = c.dim();
-        // embeddings are gathered on the CPU (tiny) and written straight into the shared buffer
-        float[] row = new float[dim];
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], row, 0);
-            if (c.embedScale() != 1f) {
-                for (int i = 0; i < dim; i++) {
-                    row[i] *= c.embedScale();
+        if (embeds != null) { // image embeddings are the input as they are
+            MemorySegment.copy(embeds, off * dim, x.contents(), ValueLayout.JAVA_FLOAT, 0, n * dim);
+        } else {
+            // embeddings are gathered on the CPU (tiny) and written straight into the shared buffer
+            float[] row = new float[dim];
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], row, 0);
+                if (c.embedScale() != 1f) {
+                    for (int i = 0; i < dim; i++) {
+                        row[i] *= c.embedScale();
+                    }
                 }
+                MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
             }
-            MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
         }
 
         countStep = counts != null && steps++ % COUNT_EVERY == 0;
@@ -1617,7 +1687,8 @@ public final class MetalBackend implements Backend {
         boolean self = false;
         for (int t = 0; t < n; t++) {
             if (!(members[t] instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed
-                    || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)) {
+                    || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)
+                    || o.ropeCustomFrom != Integer.MAX_VALUE) { // its own rotary rows cannot share this backend's tables
                 return false;
             }
             for (int u = 0; u < t; u++) {

@@ -94,9 +94,16 @@ public class ChatController {
                 ? s.getLong("engine.max-prompt-bytes") : 16L * engine.backend().contextLength();
         List<Object> conversation;
         List<Tool> offered;
+        List<org.robomiri.jllm.vision.Rgb> images = List.of(); // the pictures of the conversation, in order (docs/20)
         boolean thinking = ChatSupport.thinking(body, s.getBool("chat.thinking"));
         try {
             conversation = new ArrayList<>(ChatSupport.messages(body, maxPromptBytes));
+            if (org.robomiri.jllm.vision.ImageParts.hasImages(conversation)) {
+                org.robomiri.jllm.vision.ImageParts.Extracted ex = WebImages.extract(conversation, engine, s,
+                        toolsConfig.general().fetch().allowPrivateAddresses());
+                conversation = new ArrayList<>(ex.messages());
+                images = ex.images();
+            }
             List<String> names = new ArrayList<>();
             List<Object> requested = Json.list(body, "tools");
             if (requested != null) {
@@ -126,10 +133,16 @@ public class ChatController {
                 return;
             }
             int[] prompt;
+            org.robomiri.jllm.engine.MediaPrompt media = null;
             org.robomiri.jllm.sampling.SamplingParams params;
             try {
-                prompt = ChatSupport.checkContext(engine, engine.renderChat(
-                        ToolCallFormat.toTemplate(conversation, block, engine.template().name()), thinking));
+                int[] rendered = engine.renderChat(ToolCallFormat.toTemplate(conversation, block, engine.template().name()), thinking);
+                if (images.isEmpty()) {
+                    prompt = ChatSupport.checkContext(engine, rendered);
+                } else {
+                    media = WebImages.prompt(engine, rendered, images);
+                    prompt = media.identity();
+                }
                 params = ChatSupport.params(body, s.sampling(), engine.backend().contextLength() - prompt.length);
             } catch (RuntimeException e) {
                 emit(sse, failure, Json.obj("type", "error", "message", round == 0 ? e.getMessage()
@@ -142,9 +155,11 @@ public class ChatController {
             LoadedModel.Slot used;
             try (LoadedModel.Slot slot = model.pick(prompt); AutoCloseable alive = sse.keepAlive()) {
                 used = slot;
-                r = slot.engine().generate(prompt, params, byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback,
-                        () -> failure[0] != null || sse.failed() || model.closing() || deadline.getAsBoolean()
-                                || gone.getAsBoolean());
+                Engine.TextSink sink = byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback;
+                java.util.function.BooleanSupplier cancelled = () -> failure[0] != null || sse.failed() || model.closing()
+                        || deadline.getAsBoolean() || gone.getAsBoolean();
+                r = media == null ? slot.engine().generate(prompt, params, sink, cancelled)
+                        : slot.engine().generate(media, params, sink, cancelled);
             } catch (Exception e) {
                 emit(sse, failure, Json.obj("type", "error", "message", e instanceof Engine.OverloadedException
                         ? e.getMessage() : "generation failed: " + e.getMessage()));

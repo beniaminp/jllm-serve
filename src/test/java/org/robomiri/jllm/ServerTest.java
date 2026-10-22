@@ -184,7 +184,7 @@ public final class ServerTest {
         // L8: unsupported request features
         r = f.post("/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
                 + "{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}}]}]}");
-        check(r.status == 400 && r.body.contains("image_url"), "image content part: 400");
+        check(r.status == 400 && r.body.contains("cannot see images"), "image content part without a vision projector: 400 (got " + r.status + ")");
         r = f.post("/v1/chat/completions", "{" + msgs + ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}");
         check(r.status == 400 && r.body.contains("not supported"), "tools: 400 (the web console's job)");
         // the OpenAI extras: invalid values are a 400 naming the field

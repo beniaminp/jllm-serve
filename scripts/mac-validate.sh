@@ -13,6 +13,8 @@
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
 #   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
+#   scripts/mac-validate.sh --vision mmproj-X.gguf pic.png   plus the vision encoder rows (docs/20): encoding the
+#                                                            picture on the GPU (default) against the CPU, warm
 #   scripts/mac-validate.sh --audio speech.wav               plus the audio rows (Whisper small and OuteTTS: CPU, Metal encoder,
 #                                                            Metal decoder, half and float weight tiles; q8 and q4 speech model)
 #   scripts/mac-validate.sh --gguf-types DIR                 plus every .gguf in DIR (e.g. made with llama-quantize from one
@@ -38,6 +40,8 @@ LLAMA_ONLY=""
 LLAMA_DENSE=unsloth/Qwen3-0.6B-GGUF
 LLAMA_MOE=""
 LLAMA_QUANT=Q4_0
+VISION_MMPROJ=""
+VISION_IMAGE=""
 AUDIO=""
 GGUF_TYPES=""
 while [ $# -gt 0 ]; do
@@ -52,6 +56,7 @@ while [ $# -gt 0 ]; do
     --llama-model) LLAMA_DENSE="$2"; shift 2 ;;
     --llama-moe) LLAMA_MOE="$2"; shift 2 ;;
     --llama-quant) LLAMA_QUANT="$2"; shift 2 ;;
+    --vision) VISION_MMPROJ="$2"; VISION_IMAGE="$3"; shift 3 ;;
     --audio) AUDIO="$2"; shift 2 ;;
     --gguf-types) GGUF_TYPES="$2"; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -154,6 +159,23 @@ mvn -q compile test-compile
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
 batch "3 slots generating together, concurrent encoder on" "-Djllm.metal.concurrent=true"
+# the vision encoder (docs/20): the second encoding of a picture (weights resident, pipelines built) on the GPU against
+# the CPU encoder (vision.backend=cpu); VisionDump prints the time per chunk of the picture
+vision() { # label backend
+  local label="$1" backend="$2"
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx8g -Djllm.vision.backend="$backend" \
+    -Djllm.vision.twice=true -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.vision.VisionDump "$VISION_MMPROJ" "$VISION_IMAGE" "$OUT/vision" > "$OUT/vision.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/vision.log") |"; return; }
+  echo "| $label | $(grep '^chunk' "$OUT/vision.log" | sed 's/.* in \([0-9]*\) ms/\1 ms/' | paste -sd, -) | | $(grep -o '[0-9]* tokens' "$OUT/vision.log" | paste -sd, -) |"
+}
+if [ -n "$VISION_MMPROJ" ]; then
+  echo
+  echo "| vision encoder: $(basename "$VISION_MMPROJ"), $(basename "$VISION_IMAGE") | encode time per chunk | | tokens per chunk |"
+  echo "|---|---|---|---|"
+  vision "on the GPU (vision.backend=metal, default)" metal
+  vision "on the CPU (vision.backend=cpu)" cpu
+fi
 # constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
 # with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
 # the run when the tokens differ from speculation off; its decode time is the median of 5 generations.

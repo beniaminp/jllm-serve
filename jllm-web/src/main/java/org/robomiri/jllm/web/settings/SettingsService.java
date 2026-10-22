@@ -221,6 +221,7 @@ public class SettingsService {
         }
         if (key.startsWith("sampling.") || key.startsWith("chat.") || key.startsWith("hub.")
                 || key.equals("server.request-timeout-ms") || key.equals("engine.max-prompt-bytes")
+                || key.equals("vision.max-image-bytes") || key.equals("vision.max-image-pixels")
                 || key.equals("engine.constrained-tools")) {
             return Scope.LIVE;
         }

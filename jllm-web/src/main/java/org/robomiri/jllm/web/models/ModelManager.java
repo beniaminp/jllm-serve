@@ -66,7 +66,8 @@ public class ModelManager implements DisposableBean {
      *                  is read where it is instead of being downloaded into the default folder
      */
     public record LocalModel(String name, String format, String source, String revision, String ggufFile,
-                             String path, long bytes, List<String> caches, List<String> loadedAs, String modelDir) {
+                             String path, long bytes, List<String> caches, List<String> loadedAs, String modelDir,
+                             List<String> mmprojs) {
     }
 
     /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
@@ -597,7 +598,7 @@ public class ModelManager implements DisposableBean {
             if (Files.isRegularFile(p) && isFirstGguf(name)) {
                 String abs = p.toString();
                 out.add(new LocalModel(name, "gguf", abs, null, null, abs, Files.size(p), List.of(),
-                        users.getOrDefault(abs, List.of()), rootName));
+                        users.getOrDefault(abs, List.of()), rootName, List.of()));
                 continue;
             }
             if (!Files.isDirectory(p) || name.equals("tokenizers") || name.startsWith(".")) {
@@ -613,7 +614,12 @@ public class ModelManager implements DisposableBean {
                             .sorted().forEach(caches::add);
                 }
                 out.add(new LocalModel(repo, "safetensors", repo, repoRev[1], null, p.toString(), dirSize(p), caches, loadedAs,
-                        rootName));
+                        rootName, List.of()));
+            }
+            List<String> projectors = new ArrayList<>(); // multimodal projectors in the folder: a vision model uses one
+            try (Stream<Path> st = Files.list(p)) {
+                st.map(x -> x.getFileName().toString()).filter(n -> org.robomiri.jllm.vision.Mmproj.isMmproj(n) && !n.endsWith(".incomplete"))
+                        .sorted().forEach(projectors::add);
             }
             for (String g : HuggingFaceHub.localGgufNames(p)) {
                 if (!isFirstGguf(Path.of(g).getFileName().toString())) {
@@ -624,7 +630,7 @@ public class ModelManager implements DisposableBean {
                     bytes += Files.size(part);
                 }
                 out.add(new LocalModel(repo + " / " + g, "gguf", repo, repoRev[1], g, p.resolve(g).toString(), bytes,
-                        List.of(), loadedAs, rootName));
+                        List.of(), loadedAs, rootName, projectors));
             }
         }
     }

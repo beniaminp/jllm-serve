@@ -38,6 +38,36 @@ public final class Rope {
     }
 
     /**
+     * The cos/sin rows of slots {@code [from, ctx)}, laid out like {@link #cos} / {@link #sin} (row {@code i - from}
+     * at {@code (i - from) * half}), when the position of slot {@code i} pair {@code j} is {@code p.position(i, j)}
+     * instead of {@code i} ({@link RopePositions}); {@code p == null} gives the plain table's rows. A backend whose
+     * table sits in device memory copies these rows over its own.
+     */
+    public static void rows(RopeTable t, int ctx, int from, RopePositions p, float[] cos, float[] sin) {
+        int half = t.rotaryDim() / 2;
+        double[] inv = invFreq(t, ctx);
+        double amp = amplitude(t.scaling());
+        for (int i = from; i < ctx; i++) {
+            int o = (i - from) * half;
+            for (int j = 0; j < half; j++) {
+                double a = (double) (p == null ? i : p.position(i, j)) * inv[j];
+                cos[o + j] = (float) (Math.cos(a) * amp);
+                sin[o + j] = (float) (Math.sin(a) * amp);
+            }
+        }
+    }
+
+    /** Replaces the rows of slots {@code [from, ctx)} of this table ({@link #rows}); {@code ctx} is the table's context. */
+    public void refill(RopeTable t, int ctx, int from, RopePositions p) {
+        int half = t.rotaryDim() / 2;
+        float[] c = new float[(ctx - from) * half];
+        float[] s = new float[(ctx - from) * half];
+        rows(t, ctx, from, p, c, s);
+        System.arraycopy(c, 0, cos, from * half, c.length);
+        System.arraycopy(s, 0, sin, from * half, s.length);
+    }
+
+    /**
      * Multiplier of cos and sin (so of {@code q.k} squared): LongRoPE's {@link #attentionFactor}, YaRN's
      * {@code attention_factor} or else {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)}
      * (modeling_deepseek.py), 1 for every other scaling.

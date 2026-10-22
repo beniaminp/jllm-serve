@@ -67,6 +67,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |
 | Audio tab and editor | record or upload, transcribe (SRT/VTT/JSON, word times), text to speech, a waveform editor (cut, fade, normalize, silence removal, mix, undo; transcribe or replace a selection, edit audio by editing its transcript), dictation and read-aloud in the chat, `transcribe_audio` / `speak` tools | [21](docs/21-audio.md) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
+| Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL; the Gemma 3 projector) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
 
 The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
 batched decoding and draft speculation were merged after it and are verified on the emulator only) were verified for correctness on the emulator (every family, CPU == Metal) and on an M1 Pro
@@ -171,6 +172,24 @@ $JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=AL
      -cp target/classes org.robomiri.jllm.Main serve
 ```
 
+### Pictures (vision-language models)
+
+```sh
+./jllm run  --model ggml-org/SmolVLM-256M-Instruct-GGUF --gguf-quant Q8_0 --image photo.png --prompt "What is in this picture?"
+./jllm chat --model ggml-org/Qwen2.5-VL-3B-Instruct-GGUF --gguf-quant Q4_K_M --image a.png,b.jpg   # the pictures go with your first message
+./jllm serve --model ggml-org/Qwen3-VL-2B-Instruct-GGUF --gguf-quant Q8_0                          # image_url parts in /v1/chat/completions
+```
+
+A vision-language GGUF model is two files: the text model and its multimodal projector `mmproj-*.gguf` (found next to
+the model or in its Hub repository and downloaded with it, or named with `--mmproj`; `--vision.enabled false` loads
+text only). A chat request carries a picture as an OpenAI `image_url` content part (a `data:` URL, or an http(s) URL
+the server fetches, never from private addresses unless `vision.allow-private-urls`); the web console's chat box
+attaches, pastes or drops pictures; a text-only model can use a loaded vision model through the `describe_image` tool.
+Put the picture before the question. Settings: `vision.*` in [`jllm.properties`](src/main/resources/jllm.properties);
+the chapter is [docs/20](docs/20-vision.md). Not yet end to end: Gemma 3 (the `gemma3` GGUF text architecture and its
+bidirectional attention inside a picture are not in this build; its projector is implemented and checked) and
+`unsloth/Qwen3.8-27B-GGUF` (its projector runs; the hybrid text architecture takes no embeddings yet).
+
 ### API
 
 ```sh
@@ -232,9 +251,14 @@ repository by its launcher).
   by date, exportable as Markdown); edit a message and resend, regenerate, copy; Markdown with tables and code blocks;
   Qwen3 thinking toggle (the `<think>` part is collapsible); per-chat sampling parameters and system prompt; tokens/s
   and a context-usage meter; light / dark theme.
+- **Pictures**: with a vision-language GGUF model (SmolVLM, Qwen2.5-VL, Qwen3-VL; the projector is loaded with it,
+  the load form can name another or none) the chat box takes pictures: the attach button, paste and drag and drop;
+  thumbnails stay in the browser, the model list shows a *vision* badge, and `image_url` parts work on `/v1/chat/completions`
+  and `/api/chat`. The built-in `describe_image` tool lets a text-only model ask a loaded vision model about a picture
+  (URL, `data:` URL or an id from `POST /api/images`). [docs/20](docs/20-vision.md)
 - **Tools**: pick per chat which functions the model may call. Built in: `web_search` (DuckDuckGo with no key,
   or a SearXNG instance, or the Brave Search API), `fetch_url` (a page as readable text; private addresses refused
-  unless allowed), `calculator` and `current_time`. **MCP servers** add their tools: stdio commands
+  unless allowed), `calculator`, `current_time` and `describe_image`. **MCP servers** add their tools: stdio commands
   (`npx -y @modelcontextprotocol/server-filesystem ~/notes`, `uvx mcp-server-fetch`, ...), Streamable HTTP and
   legacy SSE servers, with headers / environment for credentials; Claude Desktop / Cursor `mcpServers` JSON can be
   pasted as it is. The server runs the calls, feeds the results back and lets the model continue (up to a set number
@@ -379,6 +403,7 @@ run in the small C library `libjllm_cpu` when it is found and passes its self-ch
 AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
 `scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`vision.*` (the multimodal projector, where the picture encoder runs, token budget, size limits: [docs/20](docs/20-vision.md#209-settings)),
 `engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: 64, or 256 for MoE models unless set) and the `server.*` limits listed under Security below.
@@ -467,6 +492,11 @@ $J.TokenizerFamiliesTest /tmp/jllm-tokenizers   # 4 239 checks: 14 tokenizer fam
 $J.ConverterTest --dir <scratch dir>            # converter, resume and cache-invalidation tests
 ```
 
+`VisionTest` (run by `mvn install`; plain `main`, no model download) checks pictures as input: resize against Pillow, request
+parts, the rotary positions, and tiny random Qwen2-VL / Qwen3-VL style models written as GGUF files (prompt layout,
+cache keyed by the picture, CPU == Metal). Comparing the encoders with llama.cpp needs a vision model and
+`libmtmd`; the numbers are in [docs/20.10](docs/20-vision.md#2010-verification).
+
 `TokenizerFamiliesTest` compares the tokenizers and chat templates of all families against fixtures generated
 with the reference `tokenizers`/`jinja2` libraries (`src/test/python/gen_tokenizer_fixtures.py`).
 `ConverterTest` deletes and rewrites cache files, so give it private copies of the models in a scratch directory
@@ -491,9 +521,11 @@ src/main/java/org/robomiri/jllm/
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
   engine/                generation loop, prefix cache, stop strings, KV cache files
+  vision/                pictures as input: preprocessing (Pillow-compatible resize), the vision transformer on CPU and Metal, chat-request parts, projector discovery
   server/                HTTP server, OpenAI-compatible API, web UI
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
+src/main/resources/org/robomiri/jllm/metal/vision.metal    GPU kernels of the vision encoder
 docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
