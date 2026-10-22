@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # The long-context families against Hugging Face transformers on tiny random models (docs/14 14.18 - 14.21).
 #
-# usage: scripts/hf-arch-check.sh [family ...]     (gptoss gptoss-mxfp4 llama4 llama4-mix; default: all four)
+# usage: scripts/hf-arch-check.sh [family ...]
+#        (gptoss gptoss-mxfp4 llama4 llama4-mix granite granite-rope nemotronh jamba; default: all eight)
 #
 # For every family scripts/hf-arch-ref.py builds a tiny random model with transformers (the real config's shape: sinks,
 # alternating windows, YaRN without truncation, clamped-SwiGLU MoE with biases and MXFP4 experts for gpt-oss; chunked
-# attention, NoPE layers with temperature tuning, L2 q/k norm, sigmoid top-1 MoE with a shared expert for Llama 4),
+# attention, NoPE layers with temperature tuning, L2 q/k norm, sigmoid top-1 MoE with a shared expert for Llama 4;
+# Mamba-2 + attention + MoE with the muP multipliers for Granite 4, Mamba-2 groups + ReLU-squared MLP for Nemotron-H,
+# Mamba-1 with dt/B/C norms + attention + MoE for Jamba),
 # saves it as a Hugging Face checkpoint and runs transformers on the prompt plus 12 greedy ids with the weights rounded
 # to Q8_0; ArchRefCheck then converts the checkpoint to q8 and compares the engine's logits at every position, the
 # argmax, the free-running greedy ids and the chunk-size invariance, on the CPU backend and (on a Mac) the Metal one.
@@ -19,7 +22,7 @@ export JAVA_HOME="${JAVA_HOME:?set JAVA_HOME to a JDK 26}"
 PY="${REF_PYTHON:-python3}"
 WORK="${REF_WORK:-/tmp/jllm-hf}"
 FAMILIES=("$@")
-[ ${#FAMILIES[@]} -gt 0 ] || FAMILIES=(gptoss gptoss-mxfp4 llama4 llama4-mix)
+[ ${#FAMILIES[@]} -gt 0 ] || FAMILIES=(gptoss gptoss-mxfp4 llama4 llama4-mix granite granite-rope nemotronh jamba)
 
 mvn -q compile test-compile
 LIB=""

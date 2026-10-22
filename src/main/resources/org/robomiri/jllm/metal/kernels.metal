@@ -5241,3 +5241,219 @@ kernel void attention_fa_q4(device const float *q [[buffer(0)]],
 template [[host_name("attention_fa_d64_q4")]] kernel decltype(attention_fa_q4<64>) attention_fa_q4<64>;
 template [[host_name("attention_fa_d128_q4")]] kernel decltype(attention_fa_q4<128>) attention_fa_q4<128>;
 template [[host_name("attention_fa_d256_q4")]] kernel decltype(attention_fa_q4<256>) attention_fa_q4<256>;
+
+// ---------------------------------------------------------------------------------------------- 15. attention / state-space hybrids
+// The pieces Granite 4, Nemotron-H and Jamba add to the kernels above (HybridMetalBackend; the CPU twin is HybridCpuBackend):
+// three element-wise kernels (x += s * y for the residual multipliers, zeroing, relu(x)^2 of Nemotron-H's MLP), the Mamba-2
+// conv, the SSD recurrence and its gated group norm, and Jamba's norms of the dt / B / C outputs of x_proj. Mamba-1 reuses
+// mamba_conv / mamba_scan (section 6).
+
+struct VecParams {
+    int n;
+    float s;
+};
+
+// x[i] += s * y[i]
+kernel void vec_axpy(device const float *y [[buffer(0)]],
+                     device float *x [[buffer(1)]],
+                     constant VecParams &p [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    x[gid] += p.s * y[gid];
+}
+
+// x[i] = 0
+kernel void vec_zero(device float *x [[buffer(0)]],
+                     constant VecParams &p [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    x[gid] = 0.0f;
+}
+
+// y[i] = relu(x[i])^2 (x and y may be the same buffer)
+kernel void relu2(device const float *x [[buffer(0)]],
+                  device float *y [[buffer(1)]],
+                  constant VecParams &p [[buffer(2)]],
+                  uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    const float v = max(x[gid], 0.0f);
+    y[gid] = v * v;
+}
+
+struct M2ConvParams {
+    int convDim;
+    int kernelWidth; // <= MAMBA_MAX_CONV
+    int ntok;
+    int projStride;  // floats per token row of the in_proj output
+    int projOff;     // where the conv channels [x | B | C] start in a row
+};
+
+// Mamba-2's depthwise causal conv + SiLU over the channels [x | B | C] of the in_proj output (the z part before and the dt
+// part after them are left alone), one thread per channel running the tokens in order; the state (the last width-1 inputs of
+// the channel, oldest first) is advanced past the chunk. The sum is taken in the CPU's order: bias, the taps over the state,
+// the tap of the new input.
+kernel void m2_conv(device const float *proj [[buffer(0)]],
+                    device const float *w [[buffer(1)]],
+                    device const float *bias [[buffer(2)]],
+                    device float *state [[buffer(3)]],
+                    device float *out [[buffer(4)]],
+                    constant M2ConvParams &p [[buffer(5)]],
+                    uint gid [[thread_position_in_grid]]) {
+    const int ch = int(gid);
+    if (ch >= p.convDim) return;
+    const int dc = p.kernelWidth;
+    device float *st = state + (ulong)ch * (dc - 1);
+    device const float *wc = w + (ulong)ch * dc;
+    float win[MAMBA_MAX_CONV - 1];
+    float wr[MAMBA_MAX_CONV];
+    for (int k = 0; k < dc - 1; k++) win[k] = st[k];
+    for (int k = 0; k < dc; k++) wr[k] = wc[k];
+    const float b = bias[ch];
+    for (int t = 0; t < p.ntok; t++) {
+        const float u = proj[(ulong)t * p.projStride + p.projOff + ch];
+        float sum = b;
+        for (int k = 0; k < dc - 1; k++) sum += wr[k] * win[k];
+        sum += wr[dc - 1] * u;
+        for (int k = 0; k + 1 < dc - 1; k++) win[k] = win[k + 1];
+        if (dc > 1) win[dc - 2] = u;
+        out[(ulong)t * p.convDim + ch] = sum / (1.0f + precise::exp(-sum));
+    }
+    for (int k = 0; k < dc - 1; k++) st[k] = win[k];
+}
+
+struct M2ScanParams {
+    int heads;
+    int headDim;
+    int groups;
+    int state;       // SSM states per (head, p)
+    int ntok;
+    int projStride;
+    int dtOff;       // where the heads' dt values start in an in_proj row
+    int convDim;
+    int dInner;
+    float dtMin;
+    float dtMax;
+};
+
+// log(1 + exp(x)), linear above 20 like torch's softplus; the small-argument series keeps the digits log(1 + e) would lose.
+static inline float softplus_f(float x) {
+    if (x > 20.0f) return x;
+    const float e = precise::exp(x);
+    return e < 1e-3f ? e * (1.0f - e * (0.5f - e * 0.33333334f)) : precise::log(1.0f + e);
+}
+
+// Mamba-2's recurrence (SSD in its token loop), one thread per (head, p) channel running the tokens in order with its row of
+// `state` values in device memory:
+//   dt = clamp(softplus(dt_raw + dt_bias[h]), dtMin, dtMax);  dA = exp(dt A[h])
+//   S[n] = dA S[n] + dt x B[g][n];   y = sum_n S[n] C[g][n] + D[h] x
+// x, B, C come from the conv output row [x (dInner) | B (groups * state) | C (groups * state)], g = h / (heads / groups).
+kernel void m2_scan(device const float *conv [[buffer(0)]],
+                    device const float *proj [[buffer(1)]],
+                    device const float *dtBias [[buffer(2)]],
+                    device const float *A [[buffer(3)]],
+                    device const float *D [[buffer(4)]],
+                    device float *state [[buffer(5)]],
+                    device float *y [[buffer(6)]],
+                    constant M2ScanParams &p [[buffer(7)]],
+                    uint gid [[thread_position_in_grid]]) {
+    const int hp = int(gid);
+    if (hp >= p.heads * p.headDim) return;
+    const int h = hp / p.headDim;
+    const int g = h / (p.heads / p.groups);
+    const int N = p.state;
+    device float *s = state + (ulong)hp * N;
+    const float a = A[h];
+    const float db = dtBias[h];
+    const float dd = D[h];
+    for (int t = 0; t < p.ntok; t++) {
+        float dt = softplus_f(proj[(ulong)t * p.projStride + p.dtOff + h] + db);
+        dt = min(max(dt, p.dtMin), p.dtMax);
+        const float dA = precise::exp(dt * a);
+        device const float *row = conv + (ulong)t * p.convDim;
+        const float xv = row[hp];
+        const float dtx = dt * xv;
+        device const float *B = row + p.dInner + g * N;
+        device const float *C = row + p.dInner + p.groups * N + g * N;
+        float acc = 0.0f;
+        for (int n = 0; n < N; n++) {
+            const float sv = s[n] * dA + dtx * B[n];
+            s[n] = sv;
+            acc += sv * C[n];
+        }
+        y[(ulong)t * p.dInner + hp] = acc + dd * xv;
+    }
+}
+
+struct M2NormParams {
+    int dInner;
+    int groupSize;   // channels one normalization covers (dInner / normGroups)
+    int ntok;
+    int projStride;
+    float eps;
+};
+
+// Mamba-2's gated RMSNorm in place: y' = w * rmsnorm(y * silu(z)) over each group of `groupSize` channels, z = the first
+// dInner values of the token's in_proj row. Grid: (groups, ntok), one threadgroup per (token, group).
+kernel void m2_gnorm(device float *y [[buffer(0)]],
+                     device const float *proj [[buffer(1)]],
+                     device const float *w [[buffer(2)]],
+                     constant M2NormParams &p [[buffer(3)]],
+                     uint2 tgp [[threadgroup_position_in_grid]],
+                     ushort2 tid2 [[thread_position_in_threadgroup]],
+                     ushort2 tpg2 [[threads_per_threadgroup]],
+                     ushort sg [[simdgroup_index_in_threadgroup]],
+                     ushort lane [[thread_index_in_simdgroup]],
+                     ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int g = int(tgp.x);
+    const int t = int(tgp.y);
+    device float *yr = y + (ulong)t * p.dInner + g * p.groupSize;
+    device const float *zr = proj + (ulong)t * p.projStride + g * p.groupSize;
+    float ss = 0.0f;
+    for (int j = tid; j < p.groupSize; j += tpg) {
+        const float z = zr[j];
+        const float v = yr[j] * (z / (1.0f + precise::exp(-z)));
+        yr[j] = v;
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float inv = 1.0f / sqrt(ss / float(p.groupSize) + p.eps);
+    device const float *wg = w + g * p.groupSize;
+    for (int j = tid; j < p.groupSize; j += tpg) yr[j] = wg[j] * (yr[j] * inv);
+}
+
+struct Rms3Params {
+    int rank;
+    int state;
+    int stride;      // floats per token row of x_proj's output: rank + 2 * state
+    int ntok;
+    float eps;
+};
+
+// Jamba's RMS norms of the three outputs of x_proj, in place: [dt (rank) | B (state) | C (state)] of every token row, with
+// the gains w = [dt_norm (rank) | b_norm (state) | c_norm (state)]. Grid: (3, ntok).
+kernel void rms3(device float *x [[buffer(0)]],
+                 device const float *w [[buffer(1)]],
+                 constant Rms3Params &p [[buffer(2)]],
+                 uint2 tgp [[threadgroup_position_in_grid]],
+                 ushort2 tid2 [[thread_position_in_threadgroup]],
+                 ushort2 tpg2 [[threads_per_threadgroup]],
+                 ushort sg [[simdgroup_index_in_threadgroup]],
+                 ushort lane [[thread_index_in_simdgroup]],
+                 ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int part = int(tgp.x);
+    const int off = part == 0 ? 0 : part == 1 ? p.rank : p.rank + p.state;
+    const int width = part == 0 ? p.rank : p.state;
+    device float *xr = x + (ulong)tgp.y * p.stride + off;
+    device const float *wr = w + off;
+    float ss = 0.0f;
+    for (int j = tid; j < width; j += tpg) ss += xr[j] * xr[j];
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float inv = 1.0f / sqrt(ss / float(width) + p.eps);
+    for (int j = tid; j < width; j += tpg) xr[j] = xr[j] * inv * wr[j];
+}

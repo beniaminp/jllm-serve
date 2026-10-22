@@ -3,7 +3,7 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N] [--attention-bias]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2 | gptoss | gptoss_mxfp4 | llama4 | llama4mix
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2 | gptoss | gptoss_mxfp4 | llama4 | llama4mix | granite | nemotronh | jamba
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
@@ -56,6 +56,13 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
              expert on every layer
   llama4mix  as llama4 with dense and MoE layers alternating (interleave_moe_layer_step 2), the wrapper layout
              (Llama4ForConditionalGeneration, text_config, language_model.* tensors, a dummy vision tensor)
+  granite    Granite 4 (GraniteMoeHybridForCausalLM, the released checkpoint's tensor names): 5 layers mamba / mamba /
+             attention / mamba / attention, Mamba-2 with 8 heads of 32, 2 groups, state 16, conv 4, 4 experts top 2 plus the
+             shared MLP in every layer, the muP multipliers, attention without RoPE, tied head
+  nemotronh  Nemotron-H (NemotronHForCausalLM): pattern "M-M*-M" (Mamba-2 with 2 groups, ReLU-squared MLP, attention),
+             one norm per layer, backbone.* names, untied head
+  jamba      Jamba (JambaForCausalLM): 4 layers, Mamba-1 with the dt / B / C norms in 0, 1 and 3, attention in layer 2, a MoE
+             (4 experts top 2, per-expert tensors) in layers 1 and 3 and a SwiGLU MLP in 0 and 2, untied head
 MLA head sizes are nope 32 + rope 32 = 64 for q/k and v 32, so the attention kernel's separate q/k and v widths
 are exercised.
 --attention-bias sets attention_bias: true on a llama / qwen3 / gemma config, which (as in transformers) gives
@@ -186,6 +193,27 @@ FAMILIES["llama4"] = dict(
     rope_scaling=dict(rope_type="llama3", factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
                       original_max_position_embeddings=16))
 FAMILIES["llama4mix"] = dict(FAMILIES["llama4"], interleave_moe_layer_step=2)
+FAMILIES["granite"] = dict(
+    architectures=["GraniteMoeHybridForCausalLM"], model_type="granitemoehybrid", hidden_size=128, intermediate_size=64,
+    shared_intermediate_size=96, num_hidden_layers=5, num_attention_heads=4, num_key_value_heads=2, vocab_size=1000,
+    max_position_embeddings=512, rms_norm_eps=1e-5, hidden_act="silu", attention_bias=False, tie_word_embeddings=True,
+    layer_types=["mamba", "mamba", "attention", "mamba", "attention"], mamba_n_heads=8, mamba_d_head=32, mamba_n_groups=2,
+    mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, mamba_conv_bias=True, mamba_proj_bias=False,
+    num_local_experts=4, num_experts_per_tok=2, position_embedding_type="nope", embedding_multiplier=2.0,
+    logits_scaling=4.0, residual_multiplier=0.5, attention_multiplier=0.2, bos_token_id=1, eos_token_id=2)
+FAMILIES["nemotronh"] = dict(
+    architectures=["NemotronHForCausalLM"], model_type="nemotron_h", hidden_size=128, intermediate_size=192,
+    hybrid_override_pattern="M-M*-M", num_hidden_layers=6, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+    vocab_size=1000, max_position_embeddings=512, layer_norm_epsilon=1e-5, mamba_num_heads=8, mamba_head_dim=32,
+    n_groups=2, ssm_state_size=16, conv_kernel=4, mamba_hidden_act="silu", mlp_hidden_act="relu2", use_bias=False,
+    use_conv_bias=True, mlp_bias=False, attention_bias=False, time_step_min=0.05, tie_word_embeddings=False,
+    bos_token_id=1, eos_token_id=2)
+FAMILIES["jamba"] = dict(
+    architectures=["JambaForCausalLM"], model_type="jamba", hidden_size=128, intermediate_size=192, num_hidden_layers=4,
+    num_attention_heads=4, num_key_value_heads=2, vocab_size=1000, max_position_embeddings=512, rms_norm_eps=1e-6,
+    hidden_act="silu", num_experts=4, num_experts_per_tok=2, attn_layer_period=4, attn_layer_offset=2,
+    expert_layer_period=2, expert_layer_offset=1, mamba_d_state=8, mamba_d_conv=4, mamba_expand=2, mamba_dt_rank=8,
+    mamba_conv_bias=True, mamba_proj_bias=False, tie_word_embeddings=False, bos_token_id=1, eos_token_id=2)
 TEXT_KEYS_EXCLUDED_IN_WRAPPER = ("architectures", "bos_token_id", "eos_token_id")
 
 
@@ -400,6 +428,112 @@ def llama4_wrapper(text):
                 vision_config=dict(model_type="llama4_vision_model", hidden_size=32, num_hidden_layers=1))
 
 
+def hybrid_tensors(cfg, rnd):
+    """Random weights of Granite 4 / Nemotron-H / Jamba under the released checkpoints' names (docs/14.22): Mamba-2 with
+    [z | x B C | dt] in_proj rows and a [heads] A_log / D / dt_bias, Mamba-1 with x_proj / dt_proj and the dt / B / C layer
+    norms, attention without positions, the MoE as input_linear / output_linear (Granite) or per-expert tensors (Jamba)."""
+    kind = cfg["model_type"]
+    d, vocab, n = cfg["hidden_size"], cfg["vocab_size"], cfg["num_hidden_layers"] if kind != "nemotron_h" else len(cfg["hybrid_override_pattern"])
+    tensors = {}
+
+    def mat(name, rows, cols, std=0.12):
+        tensors[name] = ([rows, cols], [rnd.gauss(0, std) for _ in range(rows * cols)])
+
+    def vec(name, size, base=0.0, std=0.2):
+        tensors[name] = ([size], [base + rnd.gauss(0, std) for _ in range(size)])
+
+    def mamba2(p):
+        h, hd, g, ns, k = (cfg.get("mamba_n_heads") or cfg.get("mamba_num_heads"), cfg.get("mamba_d_head") or cfg.get("mamba_head_dim"),
+                           cfg.get("mamba_n_groups") or cfg.get("n_groups"), cfg.get("mamba_d_state") or cfg.get("ssm_state_size"),
+                           cfg.get("mamba_d_conv") or cfg.get("conv_kernel"))
+        di = h * hd
+        cd = di + 2 * g * ns
+        mat(p + "in_proj.weight", di + cd + h, d)
+        tensors[p + "conv1d.weight"] = ([cd, 1, k], [rnd.gauss(0, 0.4) for _ in range(cd * k)])
+        vec(p + "conv1d.bias", cd)
+        vec(p + "dt_bias", h, -0.5, 0.8)
+        tensors[p + "A_log"] = ([h], [math.log(1 + 7 * rnd.random()) for _ in range(h)])
+        vec(p + "D", h, 1.0, 0.3)
+        vec(p + "norm.weight", di, 1.0)
+        mat(p + "out_proj.weight", d, di)
+
+    def attention(p):
+        heads, kv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg.get("head_dim", d // cfg["num_attention_heads"])
+        mat(p + "q_proj.weight", heads * hd, d)
+        mat(p + "k_proj.weight", kv * hd, d)
+        mat(p + "v_proj.weight", kv * hd, d)
+        mat(p + "o_proj.weight", d, heads * hd)
+
+    root = "backbone." if kind == "nemotron_h" else "model."
+    mat(root + ("embeddings.weight" if kind == "nemotron_h" else "embed_tokens.weight"), vocab, d, 1.0)
+    if kind == "granitemoehybrid":
+        e, m, s = cfg["num_local_experts"], cfg["intermediate_size"], cfg["shared_intermediate_size"]
+        for l in range(n):
+            p = "model.layers.%d." % l
+            vec(p + "input_layernorm.weight", d, 1.0)
+            vec(p + "post_attention_layernorm.weight", d, 1.0)
+            if cfg["layer_types"][l] == "mamba":
+                mamba2(p + "mamba.")
+            else:
+                attention(p + "self_attn.")
+            tensors[p + "block_sparse_moe.input_linear.weight"] = ([e, 2 * m, d], [rnd.gauss(0, 0.12) for _ in range(e * 2 * m * d)])
+            tensors[p + "block_sparse_moe.output_linear.weight"] = ([e, d, m], [rnd.gauss(0, 0.12) for _ in range(e * d * m)])
+            mat(p + "block_sparse_moe.router.layer.weight", e, d, 0.5)
+            mat(p + "shared_mlp.input_linear.weight", 2 * s, d)
+            mat(p + "shared_mlp.output_linear.weight", d, s)
+        vec("model.norm.weight", d, 1.0)
+    elif kind == "nemotron_h":
+        for l, ch in enumerate(cfg["hybrid_override_pattern"]):
+            p = "backbone.layers.%d." % l
+            vec(p + "norm.weight", d, 1.0)
+            if ch == "M":
+                mamba2(p + "mixer.")
+            elif ch == "*":
+                attention(p + "mixer.")
+            else:
+                mat(p + "mixer.up_proj.weight", cfg["intermediate_size"], d)
+                mat(p + "mixer.down_proj.weight", d, cfg["intermediate_size"])
+        vec("backbone.norm_f.weight", d, 1.0)
+    else:  # jamba
+        e, f = cfg["num_experts"], cfg["intermediate_size"]
+        di, ns, r, k = cfg["mamba_expand"] * d, cfg["mamba_d_state"], cfg["mamba_dt_rank"], cfg["mamba_d_conv"]
+        for l in range(n):
+            p = "model.layers.%d." % l
+            vec(p + "input_layernorm.weight", d, 1.0)
+            vec(p + "pre_ff_layernorm.weight", d, 1.0)
+            if l % cfg["attn_layer_period"] == cfg["attn_layer_offset"]:
+                attention(p + "self_attn.")
+            else:
+                q = p + "mamba."
+                mat(q + "in_proj.weight", 2 * di, d)
+                tensors[q + "conv1d.weight"] = ([di, 1, k], [rnd.gauss(0, 0.4) for _ in range(di * k)])
+                vec(q + "conv1d.bias", di)
+                mat(q + "x_proj.weight", r + 2 * ns, di)
+                mat(q + "dt_proj.weight", di, r, 0.5)
+                vec(q + "dt_proj.bias", di, -0.5, 0.8)
+                tensors[q + "A_log"] = ([di, ns], [math.log(1 + (i % ns)) + rnd.gauss(0, 0.05) for i in range(di * ns)])
+                vec(q + "D", di, 1.0, 0.3)
+                mat(q + "out_proj.weight", d, di)
+                vec(q + "dt_layernorm.weight", r, 1.0)
+                vec(q + "b_layernorm.weight", ns, 1.0)
+                vec(q + "c_layernorm.weight", ns, 1.0)
+            if l % cfg["expert_layer_period"] == cfg["expert_layer_offset"]:
+                mat(p + "feed_forward.router.weight", e, d, 0.5)
+                for i in range(e):
+                    ep = p + "feed_forward.experts.%d." % i
+                    mat(ep + "gate_proj.weight", f, d)
+                    mat(ep + "up_proj.weight", f, d)
+                    mat(ep + "down_proj.weight", d, f)
+            else:
+                mat(p + "feed_forward.gate_proj.weight", f, d)
+                mat(p + "feed_forward.up_proj.weight", f, d)
+                mat(p + "feed_forward.down_proj.weight", d, f)
+        vec("model.final_layernorm.weight", d, 1.0)
+    if not cfg.get("tie_word_embeddings"):
+        mat("lm_head.weight", vocab, d, 0.5)
+    return tensors
+
+
 def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
     hd = hidden // heads
     rot = int(hd * prf)
@@ -538,6 +672,9 @@ def main():
         return
     if cfg["model_type"] == "qwen3_next":
         write(out, fam, cfg, qwen3next_tensors(cfg, rnd))
+        return
+    if cfg["model_type"] in ("granitemoehybrid", "nemotron_h", "jamba"):
+        write(out, fam, cfg, hybrid_tensors(cfg, rnd))
         return
     if cfg["model_type"] == "gpt_oss":
         write(out, fam, cfg, gptoss_tensors(cfg, rnd, fam == "gptoss_mxfp4"))

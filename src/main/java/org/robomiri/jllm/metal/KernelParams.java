@@ -39,7 +39,12 @@ public enum KernelParams {
     GDN_CONV("GdnConvParams", "iiiiii"),
     GDN_RULE("GdnRuleParams", "iiiiiiiifii"),
     GDN_NORM("GdnNormParams", "iiiif"),
-    GATE("GateParams", "i");
+    GATE("GateParams", "i"),
+    VEC("VecParams", "if"),
+    M2_CONV("M2ConvParams", "iiiii"),
+    M2_SCAN("M2ScanParams", "iiiiiiiiiff"),
+    M2_NORM("M2NormParams", "iiiif"),
+    RMS3("Rms3Params", "iiiif");
 
     /** The struct's name in kernels.metal. */
     public final String struct;

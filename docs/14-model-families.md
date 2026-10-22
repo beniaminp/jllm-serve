@@ -61,6 +61,9 @@ The checkpoints each row was verified against:
 | `deepseek_v3` | DeepSeek-V3 / R1 (FP8 or bf16; too large to run here, 14.11.7) | config and header only; tiny random models |
 | `mamba` | `state-spaces/mamba-130m-hf` … `mamba-2.8b-hf` | chapter 15 |
 | `qwen3_next` | Qwen3-Next-80B-A3B Instruct / Thinking (14.13) | config, tensor index and safetensors headers of `Qwen/Qwen3-Next-80B-A3B-Instruct`; tiny random models against transformers 5.20 |
+| `gpt_oss` | gpt-oss-20b / 120b (14.18) | config, chat template, tokenizer of `openai/gpt-oss-20b`; tiny random models (bf16 and MXFP4 experts) against transformers 5.20 |
+| `llama4_text` (wrapper `Llama4ForConditionalGeneration`) | Llama-4-Scout / Maverick text (14.19) | config, chat template, tokenizer of Scout; tiny random models against transformers 5.20 |
+| `granitemoehybrid`, `nemotron_h`, `jamba` | Granite 4.0-H, Nemotron-H 8B, Jamba (14.22) | configs (and Granite's chat template / tokenizer); tiny random models against transformers 5.20 |
 
 A different `model_type`, a `hidden_act` other than `silu` (Gemma reads `hidden_activation`, which must be
 `gelu_pytorch_tanh`), `mlp_bias: true`, `attention_bias: true` for `mistral`, `phi3` or DeepSeek (transformers ignores
@@ -1273,3 +1276,332 @@ python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
   (they use `attention_t`); measured speed on real weights (an 80B checkpoint does not fit this machine).
 - `attention_bias: true`; `rope_scaling` types other than those of 14.1 (the released models use none); a
   `linear_key_head_dim` that is not a multiple of 32 or above 256, or a conv kernel above 8, on Metal.
+
+## 14.18 gpt-oss (attention sinks, clamped-SwiGLU experts with biases, MXFP4)
+
+Code: `Families.gptOss`, `Attention.Gqa` (`sinks`, `window`), `AttnWeights.Gqa.sinks`, `Mlp.ExpertSpec`, `Router.TopLogits`,
+`ModelConverter` (`topLogitsRules`, `mxfp4()`, `transposedExperts`), `cpu/KvCache` (sink-aware softmax), `cpu/MoeExperts`,
+`kernels.metal` (`attention_t` with the `ext` buffer, `moe_act` / `moe_out` in the `moe_*` kernels, `router_ds` method 3),
+`ChatTemplate.harmony`, `scripts/hf-arch-ref.py` (`gptoss`, `gptoss-mxfp4`)
+
+`GptOssForCausalLM` (`model_type: gpt_oss`; `openai/gpt-oss-20b`, `openai/gpt-oss-120b`) is a GQA transformer with five
+differences from the Llama-style layer: a learned **sink** per attention head, **alternating** full and 128-token
+sliding-window layers, a **YaRN** rotary table, a mixture of experts whose activation is a **clamped SwiGLU with
+biases**, and experts stored as **MXFP4**. The 20B has 24 layers, 32 experts with 4 active, hidden size 2880, 64
+heads of 64 over 8 KV heads; the 120B has 36 layers and 128 experts.
+
+### 14.18.0 🧸 The simple story
+
+Attention is a vote: the current word asks every earlier word "how much should I listen to you?", and the answers are
+turned into percentages that add up to 100. That has a flaw: even when nothing earlier is useful, the percentages must
+still add up to 100, so the word is forced to listen to somebody. gpt-oss gives every head a **made-up extra listener**,
+the *sink*, that says nothing: a head with nothing to hear can park its percentage there. The sink has no value to
+read, it only takes a share of the 100.
+
+Half the layers look only at the last 128 words (a short-sighted reading lamp), the other half see everything. The
+experts are 32 small specialists of which 4 are asked about each word; their answers are mixed with the weights the
+router gave them. And the specialists' weights are stored in a very compact 4-bit code, 32 numbers sharing one scale,
+which the engine reads **as stored**, without ever widening them.
+
+### 14.18.1 📐 The pieces
+
+**Sinks.** Per head `h` a learned scalar `s_h`. The attention scores `z_j = q·k_j · scale` of the visible keys are
+soft-maxed together with `s_h`: `p_j = exp(z_j - m) / (exp(s_h - m) + Σ_i exp(z_i - m))`, `m = max(s_h, max z)`. The
+output is `Σ p_j v_j`; the sink's share is dropped. Implemented as one extra term of the softmax denominator, on the CPU
+in `KvCache` (`softmaxInv`), on Metal in `attention_t` through the `ext` buffer (buffer 5: chunk, `hasSinks`, temperature
+floor, temperature scale, then the per-head sinks). The flash and decode attention kernels do not know the sinks, so
+layers that have them take the generic kernel.
+
+**Windows.** `layer_types` alternates `sliding_attention` (`sliding_window: 128`) and `full_attention`, starting with
+the sliding one; the window mask is the usual `j > i - 128`.
+
+**YaRN.** `rope_scaling {rope_type: yarn, factor: 32, original_max_position_embeddings: 4096, beta_fast: 32,
+beta_slow: 1, truncate: false}`, `rope_theta: 150000`. `truncate: false` keeps the correction-range bounds
+fractional instead of rounding them to integers (`Rope.yarnInvFreq` has the overload); the attention factor
+`0.1 ln(factor) + 1` multiplies cos and sin as for every YaRN model (14.11.2).
+
+**Experts.** The router is `softmax(top4(W x + b))`: the logits are picked first, the softmax runs over the 4 picked
+ones (`Router.TopLogits`; Granite's MoE uses the same rule). An expert is, with `g` and `u` the gate and up
+projections (both with bias),
+
+```
+g' = min(g, limit)              u' = clamp(u, -limit, limit)          limit = 7
+out = (u' + 1) · g' · sigmoid(1.702 · g')            then the down projection (with bias)
+```
+
+`Mlp.ExpertSpec(clampLimit, alpha, bias, weightInput, interleaved)` carries these numbers. In the checkpoint gate and up
+rows are **interleaved** (row `2i` is gate `i`, row `2i+1` up `i`); the converter separates them. The attention has bias
+on q, k, v and o (`attention_bias: true`).
+
+**MXFP4.** Expert weights are stored as `*_blocks` (uint8, two 4-bit values per byte) and `*_scales` (uint8, an
+exponent: `2^(s-127)`) per 32 values. The 4-bit code is E2M1: the magnitudes `0, .5, 1, 1.5, 2, 3, 4, 6` and a sign. HF
+packs value `2j` in the low nibble and `2j+1` in the high nibble of byte `j`; ggml's `MXFP4` block (17 bytes: the
+exponent, then 16 bytes) puts value `j` in the low nibble and value `j+16` in the high nibble. The converter (`mxfp4()`)
+repacks the nibbles; the matrix kernels (`QType.MXFP4`, both backends, the GGUF path too) then read it in place: a
+120B model's experts stay at 4.25 bits per weight. The expert tensors are `[E, in, out]` in the checkpoint (transposed
+with respect to a Linear), so they are re-laid out per expert; a bf16 checkpoint is quantized to Q4_0 / Q8_0 per
+expert the same way.
+
+**Chat format.** The harmony format (`ChatTemplate.harmony(date)`): a system message with the knowledge cutoff, the
+current date, `Reasoning: <effort>` and the channel list, then the turns as `<|start|>role<|message|>…<|end|>`; the
+assistant's reply begins with `<|channel|>final<|message|>` or an `analysis` channel first. `enable_thinking` true maps
+to medium reasoning, false to low with the final channel pre-filled. Stop tokens: `<|return|>`, `<|call|>`,
+`<|endoftext|>`. Rendered text equals the model's Jinja template on 36 conversations
+(`TokenizerFamiliesTest`, with the date pinned to 2025-08-05 in the fixtures).
+
+### 14.18.2 Verification
+
+Against transformers 5.20 on tiny random `GptOssForCausalLM` models, weights rounded to Q8_0 in the reference
+(`scripts/hf-arch-check.sh gptoss gptoss-mxfp4`), the 52 logit rows (prompt plus 12 greedy ids), as the largest
+difference over the largest logit:
+
+| model | CPU | Metal | greedy ids | argmax |
+|---|---|---|---|---|
+| gptoss (sinks, 4 experts top 2 with clamp 3, window 4 on alternate layers, YaRN) | 6.4e-6 | 7.6e-6 | 12 of 12 equal | equal at all 52 positions |
+| gptoss-mxfp4 (experts MXFP4 read in place) | 9.1e-6 | 6.5e-6 | 12 of 12 equal | equal at all 52 |
+
+Chunk sizes 7 and 1 give the same logits as one call (≤ 4e-6 on the CPU, 0 for most Metal runs); the Metal f16 KV cache
+stays within 4e-3 of the reference. `kernel_tests.py` covers the sink, window and temperature variants of the attention
+kernels, the clamped-SwiGLU / bias / weight-on-input variants of the MoE kernels in q4 / q8 / MXFP4 (matrix and
+simdgroup-matrix forms) and `router_ds` method 3, against numpy. `SmokeTest.kvCacheAttention` checks sink and chunk
+masks in all four cache dtypes.
+
+### 14.18.3 Not supported
+
+- q4 KV cache: with sinks (and with the chunked attention of 14.19) the cache is served as q8 instead (a note is printed;
+  the saved-cache format then matches Metal's).
+- Metal flash / flash-decoding attention for layers with sinks (they use the generic `attention_t`; slower at long context).
+- Real-weight validation (the 20B is 13 GB; no weights are downloaded for these checks, only the config, tokenizer and
+  chat template were read from the Hub). Tool calling and the `analysis` channel's separation into `reasoning_content`
+  are not wired; the harmony render covers plain chats.
+
+## 14.19 Llama 4 text (chunked attention, NoPE layers, temperature tuning, sigmoid MoE)
+
+Code: `Families.llama4` (`Llama4ForConditionalGeneration` wrapper and `llama4_text`), `Attention.Gqa` (`chunk`, `l2Norm`,
+`tempFloor`, `tempScale`), `Scaling.Identity`, `Mlp.ExpertSpec.weightInput`, `Router.TopLogits(sigmoid)`,
+`cpu/KvCache`, `kernels.metal` (`attention_t` chunk and temperature, `moe_*` weight-on-input),
+`ChatTemplate.LLAMA4`, `scripts/hf-arch-ref.py` (`llama4`, `llama4-mix`)
+
+`meta-llama/Llama-4-Scout-17B-16E-Instruct` and `-Maverick-17B-128E-Instruct` (text tower only; the vision tower and
+projector are ignored). The layers come in groups of four ("iRoPE"): three layers use **RoPE with chunked attention**
+(a token sees only its own 8192-token chunk), the fourth uses **no positional encoding** at all (NoPE) and attends to
+everything, with a **temperature** on the queries that grows with the position. Scout's MLP is a 16-expert MoE with one
+shared expert in every layer, Maverick alternates dense and MoE layers with 128 experts.
+
+### 14.19.0 🧸 The simple story
+
+Imagine a very long book. Three out of four readers (layers) read it **chapter by chapter**: they know where they are
+inside the chapter and never look into another chapter. The fourth reader skims the **whole book at once** but does not
+know page numbers at all, so she asks "what is this about?" rather than "where is it?". When the book is very long her
+questions get a bit louder (the temperature), so that a faint match among a million pages is still heard.
+
+The experts: each word goes to **one** specialist only, chosen by the router, and the router's confidence is applied
+to the word **before** the specialist reads it (so a doubtful router whispers). A second, always-on "shared" specialist
+reads every word too.
+
+### 14.19.1 📐 The pieces
+
+**Chunked attention.** With chunk size `C` (`attention_chunk_size`), token `i` attends to keys `j` with `j ≤ i` and
+`⌊j/C⌋ = ⌊i/C⌋`. One more mask next to the window of 14.10: `KvCache` computes the first visible key as
+`max(window start, ⌊i/C⌋·C)`.
+
+**NoPE layers** (`no_rope_layers` 0, i.e. every `nope_layer_interval`-th layer) use `Scaling.Identity`, a rotary table
+of cos 1 and sin 0, so the same code path serves them (on Metal the rope kernel simply copies k into the cache). Their
+attention is global; the RoPE layers use `llama3` scaling (`factor 8`, `low_freq_factor 1`, `high_freq_factor 4`,
+`original_max_position_embeddings 8192`; when low equals high the interpolation degenerates to a step, handled).
+
+**Temperature tuning** (`attn_temperature_tuning`, NoPE layers only): the query of position `p` is multiplied by
+`1 + attn_scale · ln(⌊(p+1)/floor_scale⌋ + 1)`, `attn_scale 0.1`, `floor_scale 8192`. It is zero below 8192 tokens, so
+short prompts never see it. `tempFactor(p)` in `Attention.Gqa`, a pair of values in the attention kernels' `ext` buffer.
+
+**L2 qk norm** (`use_qk_norm`, RoPE layers only): after the rotation, q and k are divided by their RMS (no weight, no
+epsilon-free division: `x / sqrt(mean(x²) + eps)`). Implemented as the existing qk-norm with a weight vector of ones
+(`AttnWeights.Gqa.ones`). A subtlety: the head is rotated with the *interleaved* pairing, so on Metal the L2 norm must
+run on the rotated head; `fullRotation` keeps that order when the whole head rotates.
+
+**MoE.** `Router.TopLogits(sigmoid=true)`: top-1 of the router logits, the weight is `sigmoid(logit)`, and
+`ExpertSpec.weightInput` multiplies the **input** of the expert by it (`down(act(gate(w·x)) · up(w·x))`) instead of its
+output. The shared expert is a plain SwiGLU MLP added to the result. Experts are stored `[E, in, out]` fused
+`gate_up_proj` / `down_proj` (transposed like gpt-oss'), the converter splits and transposes them.
+`interleave_moe_layer_step` selects the MoE layers (Maverick 2: alternating); the other layers use `intermediate_size_mlp`.
+
+**Chat format** (`ChatTemplate.LLAMA4`): `<|begin_of_text|><|header_start|>role<|header_end|>\n\ncontent<|eot|>…`; stop
+tokens `<|eot|>`, `<|end_of_text|>`, `<|eom|>`. Equal to the Jinja template on 18 conversations.
+
+### 14.19.2 Verification
+
+Transformers 5.20, tiny random `Llama4ForCausalLM` (`llama4`: chunk 8, NoPE every 4th layer with temperature floor 8,
+so tuning is active in the 52 positions, L2 norm, 4 experts top 1 sigmoid plus shared, dense layers in between) and the
+`Llama4ForConditionalGeneration` wrapper layout (`llama4-mix`):
+
+| model | CPU | Metal | greedy ids | argmax |
+|---|---|---|---|---|
+| llama4 | 1.5e-6 | 1.7e-6 | equal | equal at all 52 |
+| llama4-mix (wrapper names, MoE every other layer) | 1.7e-6 | 1.7e-6 | equal | equal at all 52 |
+
+Chunk sizes 7 and 1 agree; f16 cache within 4e-3. The kernel tests include chunk and temperature variants of
+`attention_t`.
+
+### 14.19.3 Not supported
+
+The vision tower (images), q4 KV (served as q8), Metal flash attention for chunked / NoPE-tuned layers, real-weight
+validation (Scout is 109B).
+
+## 14.20 Dual Chunk Attention for Qwen2.5-1M: design, not implemented
+
+`Qwen/Qwen2.5-7B-Instruct-1M` and `-14B-Instruct-1M` load as ordinary `qwen2` models (their config is a plain Qwen2.5
+with `rope_theta 10000000` and `max_position_embeddings 1010000`), so prompts up to the length the position table covers
+run, but the quality beyond the 262144 tokens of the training length would need what the config calls
+`dual_chunk_attention_config`: `{chunk_size: 262144, local_size: 8192, original_max_position_embeddings: 262144}`.
+
+**Why it is not implemented.** Dual Chunk Attention (An et al., *Training-Free Long-Context Scaling of Large Language
+Models*) has no transformers reference: the `Qwen2` class of transformers ignores the key, and the only implementation
+is vLLM's custom attention backend. A port could not be checked against an independent model on a tiny random
+checkpoint, which this project's rule for a new family requires; and it changes the position ids that the cache
+stores keys at (keys must be re-rotated per query chunk), which touches the KV cache layout of every backend. It is left
+as a documented design.
+
+**The idea** (from the paper; the exact position assignments of vLLM's kernel are the thing a reference would have to
+confirm, which is the point of the paragraph above). Full attention is run, but the relative distance between query and key is never allowed to exceed what the
+model saw in training. The sequence is split into chunks of `c = chunk_size - local_size` tokens and each (query, key)
+pair is scored with one of three position assignments:
+
+| pair | query position | key position | relative distance |
+|---|---|---|---|
+| same chunk (**intra**) | `i mod c` | `j mod c` | `(i-j)`, at most `c` |
+| an earlier chunk (**inter**) | a constant `c` | `j mod c` | between `1` and `c`, so a distant key looks "recently seen, somewhere in the last chunk" |
+| the previous chunk, near the boundary (**successive**) | `i mod c + c` | `j mod c` | exact for the last `local_size` tokens, so neighbours across a chunk boundary keep their true distance |
+
+The three score matrices are merged by the softmax denominator over all keys (not three separate softmaxes). Keys are
+cached **unrotated** (or rotated at `j mod c`); only queries are rotated three times (three rotary tables, one per
+case), and for decode the per-chunk running maxima and sums are combined as in flash decoding.
+
+**What an implementation here would need**, in order: (1) a `DualChunk` option on `Attention.Gqa` (chunk, local size)
+parsed from `dual_chunk_attention_config`; (2) the KV cache stores keys rotated at `j mod c` (one rotation, so prefill
+and decode stay as they are) and the queries are rotated with the three tables; (3) the generic attention kernel
+(`attention_t`) and `KvCache` get a three-way score selection per key, with the intra / successive / inter ranges
+computed from `i` and `j`; the `ext` buffer of 14.18 is where the sizes go; (4) a reference: the vLLM implementation on a
+tiny random Qwen2 (the only way to check it, so it needs a vLLM install this project does not have); (5) the sparse
+variant of the 1M models (`sparse_attention_config`, MInference-style vertical-slash patterns) is a separate
+approximation and not needed for correctness at moderate length. Until then the 1M models are best run at up to 262144
+tokens, where DCA is equal to ordinary attention (a single chunk: every pair is intra).
+
+## 14.21 Checking the new families against transformers on tiny random models
+
+`scripts/hf-arch-check.sh [family ...]` (families `gptoss gptoss-mxfp4 llama4 llama4-mix granite granite-rope nemotronh
+jamba`; needs a Python with torch and transformers: `REF_PYTHON`) is the reusable form of the checks in 14.18, 14.19 and
+14.22:
+
+1. `scripts/hf-arch-ref.py <family> <dir>` builds a tiny random model with the real config's shape through
+   transformers, **rounds every matrix to the Q8_0 grid** (the engine's q8 format; biases, router weights, `dt` and `A`
+   stay exact), saves it as a Hugging Face checkpoint (`save_pretrained`), and runs the model on a prompt of 40 ids plus
+   12 greedy continuation ids, writing the logits of all 52 positions.
+2. `ArchRefCheck <dir> <metal-lib|-> q8` converts the checkpoint with the engine's own converter, runs the CPU backend
+   and the Metal one on the same ids, and reports the largest `|logit - reference|` (and relative to the largest logit),
+   argmax disagreements, whether free-running greedy decoding gives the reference's 12 ids, and the difference between
+   one call, chunks of 7 and one token at a time.
+
+The Q8_0 rounding in the reference has to match the engine's `Math.round` (half away from zero), not `torch.round`
+(half to even): they differ on exact ties, which made the first runs look like 1e-2 errors. `METAL_EMU=1` runs the
+Metal side on the numpy-checked CPU emulator of the kernels.
+
+## 14.22 Attention / state-space hybrids: Granite 4, Nemotron-H, Jamba
+
+Code: `model/HybridArch` (the layer list), `model/HybridParsers`, `model/HybridLayer` (weights), `ModelConverter.planHybrid`,
+`cpu/HybridCpuBackend`, `metal/HybridMetalBackend`, `kernels.metal` section 15 (`m2_conv`, `m2_scan`, `m2_gnorm`, `rms3`,
+`relu2`, `vec_axpy`, `vec_zero`) plus the Mamba-1 kernels of [chapter 15](15-mamba.md), `Mlp.Activation.RELU2`
+
+Three open families interleave **state-space layers** with attention layers and an MLP or MoE, in the same decoder
+stack: **IBM Granite 4.0** (`granitemoehybrid`; `granite-4.0-h-tiny`, `-small`, `-micro` (dense)), **NVIDIA Nemotron-H**
+(`nemotron_h`; the 8B `Nemotron-H-8B-Base-8K` / `-Reasoning-128K` configs were read) and **AI21 Jamba** (`jamba`; v0.1, 1.5, 1.6 Mini and Large). They reuse the Mamba
+machinery of [chapter 15](15-mamba.md) and the hybrid state handling of Qwen3-Next (14.14.5): the recurrent state lives
+in the backend, a call at `pos == 0` resets it, and a call at a position other than the one it holds is refused.
+
+| | mixer | feed-forward | positions | notes |
+|---|---|---|---|---|
+| Granite 4 | `layer_types` `mamba` (Mamba-2) / `attention` (the `-h-tiny` has 4 attention layers in 40) | shared SwiGLU MLP, plus a 64-expert top-6 MoE in `-h-tiny` and `-h-small` | `nope` (the released ones) or `rope` | muP multipliers |
+| Nemotron-H | pattern string `M` Mamba-2, `*` attention, `-` ReLU² MLP, `E` MoE | only in `-` layers | none | one norm per layer, the layer is `x + mixer(norm x)`; `time_step_min` clamps `dt` |
+| Jamba | Mamba-1 in 7 of 8 layers, attention in the 5th | every second layer is a 16-expert top-2 MoE | none | RMS norms on `dt`, `B`, `C` inside the Mamba layer |
+
+### 14.22.0 🧸 The simple story
+
+Chapter 15's Mamba reads a text like a person with a **notepad of fixed size**: for every new word the notepad's old
+lines fade a little and a new note is added, and the layer's answer is read off the notepad. Attention is the opposite
+habit: re-read the whole text each time. These models alternate the two: mostly cheap notepad layers, and now and then
+a full re-read, so the cache that grows with the text (the KV cache) is needed in only one layer out of 4 to 10.
+
+Mamba-2 (Granite, Nemotron-H) is Mamba with a **simpler notepad** (one fade rate per head instead of one per
+channel), which lets many channels share work and is faster on a GPU. Jamba uses the older Mamba-1 notepad and adds
+a safety measure: the three signals that steer the notepad (the speed, what to write and what to read) are
+renormalised.
+
+### 14.22.1 📐 Mamba-2
+
+Per layer, `in_proj` makes `[z | x B C | dt]` with `z, x ∈ ℝ^{d_inner}`, `B, C ∈ ℝ^{groups·state}`, `dt ∈ ℝ^{heads}`
+(`d_inner = heads · head_dim`). A causal depthwise convolution of width `k` (4) with bias runs over the `[x B C]` channels
+(the last `k-1` inputs are the conv state), followed by SiLU. Per head `h` (group `g = h / (heads/groups)`), with
+`dt_h = clamp(softplus(dt_h + dt_bias_h), dt_min, dt_max)` and the scalar `A_h = -exp(A_log_h)`:
+
+```
+S_h ← exp(dt_h · A_h) · S_h + dt_h · x_h ⊗ B_g           S_h ∈ ℝ^{head_dim × state}
+y_h = S_h · C_g + D_h · x_h
+```
+
+then `y ← y · silu(z)`, a **grouped RMS norm** (`norm_groups` groups, weight `norm.weight`) and `out_proj`. The model
+is the state-space-duality form (SSD) of the Mamba-2 paper; this engine runs the recurrence token by token inside a
+chunk (the "chunked SSD" matrix form speeds up prefill on long inputs, but is not needed for correctness): `m2_scan`
+gives each thread one row of `S_h` (`head_dim × heads` threads) and steps through the chunk's tokens, keeping `state`
+values per thread; `m2_conv` handles the width-`k` window with the saved state; `m2_gnorm` is one threadgroup per
+(group, token).
+
+Conventions that differ between the families: Granite clamps nothing (`dt_min` 0, `dt_max` ∞; the tiny config has 1 group, 48
+heads of 64, state 128), Nemotron-H clamps with `time_step_min` (0.001 on the 8B) and `time_step_max` (0.1; 8 groups, 128 heads of 64,
+state 128).
+
+### 14.22.2 📐 Mamba-1 with Jamba's norms
+
+Chapter 15's layer with one addition. After `x_proj` makes `[dt_low | B | C]` (rank `dt_rank`, then `state`, `state`),
+each of the three parts is RMS-normalised with its own weight (`dt_layernorm`, `b_layernorm`, `c_layernorm`, epsilon from
+`rms_norm_eps`) before `dt_proj` and the scan. One kernel, `rms3`, does the three parts in one dispatch.
+
+### 14.22.3 📐 Granite's muP multipliers and the layer shape
+
+`embedding_multiplier` scales the embedding output, `attention_multiplier` **replaces** `1/√head_dim` as the attention
+scale, `residual_multiplier` scales each branch (mixer and feed-forward) before it is added, and `logits_scaling`
+divides the final logits. With `position_embedding_type: "nope"` the attention layers use no rotary table (the identity
+table of 14.19 again). Every layer's feed-forward is the shared SwiGLU MLP (`shared_mlp.input_linear`, a fused gate/up
+matrix) plus, in the models that have it, a MoE (`block_sparse_moe.input_linear` is `[E, 2·m, d]` fused gate/up per expert,
+`output_linear` `[E, d, m]`; router `softmax(top-k(logits))`, i.e. `Router.TopLogits`) added to it. A Granite layer
+is `x ← x + r·mixer(norm1 x)`; `x ← x + r·(moe(norm2 x) + shared(norm2 x))`.
+
+### 14.22.4 Verification
+
+Transformers 5.20, tiny random models with the real configs' structure (`scripts/hf-arch-check.sh granite
+granite-rope nemotronh jamba`), as in 14.21 (largest difference over the largest logit):
+
+| model | CPU | Metal | greedy ids | argmax |
+|---|---|---|---|---|
+| granite (3 Mamba-2 + 2 attention layers without RoPE, MoE 4 experts top 2 plus shared MLP, muP multipliers, tied head) | 1.9e-6 | 1.4e-6 | equal | equal at all 52 |
+| granite-rope (dense, RoPE attention, no MoE) | 9.0e-7 | 9.5e-7 | equal | equal |
+| nemotronh (`M-M*-M`, 2 groups, ReLU² MLP, `time_step_min`) | 2.0e-6 | 3.7e-6 | equal | equal |
+| jamba (Mamba-1 with dt/B/C norms, attention, MoE) | 7.7e-6 | 6.9e-6 | equal | equal |
+
+Chunking (one call, chunks of 7, one token at a time) agrees to ≤ 4e-6 on the CPU and ≤ 3e-5 on Metal (f16 KV). In
+`scripts/arch-smoke.sh` the three tiny models run the Mamba-style state checks (chunk invariance, wrong-position refusal,
+`supportsPrefixReuse` false) on both backends and `CPU == Metal` on the final logits. `kernel_tests.py` checks
+`m2_conv` + `m2_scan` + `m2_gnorm` against a float64 numpy Mamba-2 over two chunks (so the carried states are exercised;
+three shape configurations including a clamped `dt` and `groups ≠ 1`, relative error ≤ 3e-7), `rms3`, `relu2`, `vec_axpy`.
+
+### 14.22.5 Not supported
+
+- **Nemotron-H's MoE layers** (`E` in the pattern; the 8B is dense): rejected with an explicit error.
+- State save/restore, prefix reuse, rollback, replay and continuous batching for the hybrids (the same limits as
+  Mamba, chapter 15): every request starts from position 0.
+- The Mamba-2 chunked SSD matrix form (the token loop is used for prefill), the q8 / q4 KV cache (f32 or f16),
+  `backend.metal.cpu-moe`, speculative decoding with a hybrid as the target.
+- Chat formats for Nemotron-H and Jamba (no `ChatTemplate` entry: format the prompt yourself or use `/v1/completions`).
+  Granite has one (`ChatTemplate.GRANITE`: `<|start_of_role|>role<|end_of_role|>…<|end_of_text|>\n`, the default system
+  message when none is given, no tools or documents), equal to the Jinja template on 18 conversations
+  (`TokenizerFamiliesTest`).
+- GGUF files of `granitehybrid`, `nemotron_h`, `jamba` (llama.cpp's names).
+- Real-weight validation (Granite-4.0-H-Tiny is 7B in total: a download this task did not do; its config, chat template and tokenizer were read).

@@ -1502,6 +1502,79 @@ final class MetalKernels implements AutoCloseable {
         dispatch("mamba_scan", 9, 0, channelGrid(dInner), 1, 1, CHANNEL_THREADS, 1, 1);
     }
 
+    // ---------------------------------------------------------------- attention / state-space hybrids
+
+    /** x[i] += s * y[i] for i < n (vec_axpy). */
+    void vecAxpy(Metal.Buffer y, Metal.Buffer x, int n, float s) {
+        bind(0, y, 0);
+        bind(1, x, 0);
+        p.reset(KernelParams.VEC).i(n).f(s);
+        dispatch("vec_axpy", 2, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** x[i] = 0 for i < n (vec_zero). */
+    void vecZero(Metal.Buffer x, int n) {
+        bind(0, x, 0);
+        p.reset(KernelParams.VEC).i(n).f(0f);
+        dispatch("vec_zero", 1, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** y[i] = relu(x[i])^2 for i < n (relu2; x and y may be one buffer). */
+    void relu2(Metal.Buffer x, Metal.Buffer y, int n) {
+        bind(0, x, 0);
+        bind(1, y, 0);
+        p.reset(KernelParams.VEC).i(n).f(0f);
+        dispatch("relu2", 2, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * Mamba-2's causal conv + SiLU over the channels that start at float {@code projOff} of every row of {@code proj} (rows
+     * of {@code projStride} floats), with the carried conv state; the result goes to {@code out} ({@code [n, convDim]}).
+     */
+    void m2Conv(Metal.Buffer proj, Metal.Buffer w, Metal.Buffer bias, Metal.Buffer state, Metal.Buffer out, int convDim,
+                int kernelWidth, int projStride, int projOff, int n) {
+        bind(0, proj, 0);
+        bind(1, w, 0);
+        bind(2, bias, 0);
+        bind(3, state, 0);
+        bind(4, out, 0);
+        p.reset(KernelParams.M2_CONV).i(convDim).i(kernelWidth).i(n).i(projStride).i(projOff);
+        dispatch("m2_conv", 5, 0, channelGrid(convDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** Mamba-2's recurrence over the n tokens (m2_scan); y is {@code [n, dInner]}. */
+    void m2Scan(Metal.Buffer conv, Metal.Buffer proj, Metal.Buffer dtBias, Metal.Buffer a, Metal.Buffer d,
+                Metal.Buffer state, Metal.Buffer y, int heads, int headDim, int groups, int ssmState, int projStride,
+                int dtOff, int convDim, int dInner, float dtMin, float dtMax, int n) {
+        bind(0, conv, 0);
+        bind(1, proj, 0);
+        bind(2, dtBias, 0);
+        bind(3, a, 0);
+        bind(4, d, 0);
+        bind(5, state, 0);
+        bind(6, y, 0);
+        p.reset(KernelParams.M2_SCAN).i(heads).i(headDim).i(groups).i(ssmState).i(n).i(projStride).i(dtOff).i(convDim)
+                .i(dInner).f(dtMin).f(dtMax);
+        dispatch("m2_scan", 7, 0, channelGrid(heads * headDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** Mamba-2's gated group RMSNorm of y in place (m2_gnorm); z is read from the rows of {@code proj}. */
+    void m2Gnorm(Metal.Buffer y, Metal.Buffer proj, Metal.Buffer w, int dInner, int groupSize, int projStride, float eps, int n) {
+        bind(0, y, 0);
+        bind(1, proj, 0);
+        bind(2, w, 0);
+        p.reset(KernelParams.M2_NORM).i(dInner).i(groupSize).i(n).i(projStride).f(eps);
+        dispatch("m2_gnorm", 3, 0, dInner / groupSize, n, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** Jamba's norms of dt, B and C in the rows of x_proj's output, in place (rms3); w = [dt | B | C] gains. */
+    void rms3(Metal.Buffer x, Metal.Buffer w, int rank, int state, float eps, int n) {
+        bind(0, x, 0);
+        bind(1, w, 0);
+        p.reset(KernelParams.RMS3).i(rank).i(state).i(rank + 2 * state).i(n).f(eps);
+        dispatch("rms3", 2, 0, 3, n, 1, ROW_THREADS, 1, 1);
+    }
+
     // ---------------------------------------------------------------- Qwen3-Next
 
     /** Gated DeltaNet conv state width per gdn_rule threadgroup (GDN_COLS) and the widest key head (32 * GDN_MAX_PER). */

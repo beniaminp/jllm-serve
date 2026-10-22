@@ -530,8 +530,8 @@ public final class ModelLoader {
                 case "cpu" -> new org.robomiri.jllm.cpu.HybridCpuBackend(weights, ctx, batch,
                         threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
                         hybridInt8(s, weights, threads));
-                default -> throw new IllegalArgumentException("the " + backendName + " backend does not run " + arch.core().architecture()
-                        + " yet (cpu)");
+                case "metal" -> new org.robomiri.jllm.metal.HybridMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         }
         return switch (backendName) {

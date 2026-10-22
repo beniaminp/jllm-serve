@@ -31,7 +31,8 @@ public final class TokenizerFamiliesTest {
             {"qwen3", "qwen3"}, {"qwen2", "qwen2"}, {"llama3", "llama"}, {"mistral", "mistral"},
             {"gemma3", "gemma3_text"}, {"gemma2", "gemma2"}, {"phi3", "phi3"}, {"phi4", "phi3"},
             {"glmedge", "glm"}, {"glm4", "glm4"}, {"dsr1", "qwen2"}, {"mamba", "mamba"}, {"dsv2", "deepseek_v2"},
-            {"phi4_14b", "phi3"}, {"gptoss", "gpt_oss"}, {"llama4", "llama4_text"}};
+            {"phi4_14b", "phi3"}, {"gptoss", "gpt_oss"}, {"llama4", "llama4_text"},
+            {"granite", "granitemoehybrid"}};
 
     /**
      * Tokenizers of other model types that no supported family uses (Unigram: t5, albert, xlmr; WordPiece: bert,
@@ -232,6 +233,7 @@ public final class TokenizerFamiliesTest {
         expectStops("phi4_14b", 100265, 100257);
         expectStops("gptoss", 200002, 200012, 199999); // <|return|>, <|call|>, <|endoftext|>
         expectStops("llama4", 200008, 200001, 200007); // <|eot|>, <|end_of_text|>, <|eom|>
+        expectStops("granite", 100257); // <|end_of_text|>
 
         // BOS / EOS information, never added inside encode()
         expectBos("llama3", 128000, true);

@@ -1159,12 +1159,12 @@ public final class MetalBackend implements Backend {
                     yield (n, counted) -> {
                         if (MetalKernels.FUSE) {
                             k.routerDsNorm(x, ffnNorm, xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1,
-                                    t.sigmoid(), 3, false, 1f, counted ? map : null, counted ? gassign : null,
+                                    t.sigmoid(), bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null,
                                     counted ? counts : null, n);
                         } else {
                             k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
-                            k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1, t.sigmoid(), 3,
-                                    false, 1f, counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                            k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1, t.sigmoid(),
+                                    bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
                         }
                     };
                 }

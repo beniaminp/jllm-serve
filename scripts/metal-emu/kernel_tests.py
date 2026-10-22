@@ -1568,6 +1568,109 @@ split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
+# ---- attention / state-space hybrids (section 15 of kernels.metal): Granite 4, Nemotron-H, Jamba
+def softplus_np(x):
+    return np.where(x > 20, x, np.log1p(np.exp(np.minimum(x, 20))))
+
+
+def vec_tests():
+    rng = np.random.default_rng(40)
+    n = 777
+    y = rng.standard_normal(n).astype(np.float32)
+    x = rng.standard_normal(n).astype(np.float32)
+    x0 = x.copy()
+    E.dispatch('vec_axpy', [y, x], pack('if', n, 0.22), ((n + 255) // 256,), (256,))
+    check(np.abs(x - (x0 + np.float32(0.22) * y)).max() < 1e-6, 'vec_axpy x += s y')
+    E.dispatch('vec_zero', [x], pack('if', n, 0.0), ((n + 255) // 256,), (256,))
+    check(not x.any(), 'vec_zero')
+    out = np.zeros(n, np.float32)
+    E.dispatch('relu2', [y, out], pack('if', n, 0.0), ((n + 255) // 256,), (256,))
+    check(np.abs(out - np.maximum(y, 0) ** 2).max() < 1e-6, 'relu2 y = relu(x)^2')
+
+
+def m2_pieces(heads=8, head_dim=32, groups=2, state=16, kern=4, ntok=11, norm_groups=2, dt_min=0.0, dt_max=np.inf, seed=41):
+    """m2_conv, m2_scan and m2_gnorm against a float64 numpy Mamba-2 on random in_proj rows, over two chunks so that the
+    carried conv and SSM states are exercised."""
+    rng = np.random.default_rng(seed)
+    di = heads * head_dim
+    cd = di + 2 * groups * state
+    pw = di + cd + heads
+    w = (rng.standard_normal((cd, kern)) * 0.4).astype(np.float32)
+    bias = (rng.standard_normal(cd) * 0.2).astype(np.float32)
+    dtb = (rng.standard_normal(heads) * 0.8 - 0.5).astype(np.float32)
+    A = -np.exp(np.log(1 + 7 * rng.random(heads))).astype(np.float32)
+    D = (1 + 0.3 * rng.standard_normal(heads)).astype(np.float32)
+    nw = (1 + 0.2 * rng.standard_normal(di)).astype(np.float32)
+    proj = rng.standard_normal((2 * ntok, pw)).astype(np.float32)
+    cst = np.zeros((cd, kern - 1), np.float32)
+    sst = np.zeros((heads * head_dim, state), np.float32)
+    got = []
+    for c0 in (0, ntok):
+        pr = np.ascontiguousarray(proj[c0:c0 + ntok])
+        conv = np.zeros((ntok, cd), np.float32)
+        y = np.zeros((ntok, di), np.float32)
+        E.dispatch('m2_conv', [pr, w, bias, cst, conv], pack('iiiii', cd, kern, ntok, pw, di), ((cd + 63) // 64,), (64,))
+        E.dispatch('m2_scan', [conv, pr, dtb, A, D, sst, y], pack('iiiiiiiiiff', heads, head_dim, groups, state, ntok, pw,
+                                                                  di + cd, cd, di, dt_min, dt_max),
+                   ((heads * head_dim + 63) // 64,), (64,))
+        gs = di // norm_groups
+        E.dispatch('m2_gnorm', [y, pr, nw], pack('iiiif', di, gs, ntok, pw, 1e-5), (norm_groups, ntok), (256,))
+        got.append(y.copy())
+    # float64 reference
+    cs = np.zeros((cd, kern - 1))
+    ss = np.zeros((heads, head_dim, state))
+    ref = []
+    for t in range(2 * ntok):
+        u = proj[t, di:di + cd].astype(np.float64)
+        win = np.concatenate([cs, u[:, None]], axis=1)  # [cd, kern]
+        s = (w * win).sum(1) + bias
+        cs = win[:, 1:]
+        xbc = s / (1 + np.exp(-s))
+        xh = xbc[:di].reshape(heads, head_dim)
+        B = xbc[di:di + groups * state].reshape(groups, state)
+        C = xbc[di + groups * state:].reshape(groups, state)
+        dt = np.clip(softplus_np(proj[t, di + cd:].astype(np.float64) + dtb), dt_min, dt_max)
+        yh = np.zeros((heads, head_dim))
+        for h in range(heads):
+            g = h // (heads // groups)
+            ss[h] = ss[h] * np.exp(dt[h] * A[h]) + dt[h] * xh[h][:, None] * B[g][None, :]
+            yh[h] = ss[h] @ C[g] + D[h] * xh[h]
+        v = yh.reshape(-1) * (lambda z: z / (1 + np.exp(-z)))(proj[t, :di].astype(np.float64))
+        gs = di // norm_groups
+        out = np.zeros(di)
+        for g in range(norm_groups):
+            seg = v[g * gs:(g + 1) * gs]
+            out[g * gs:(g + 1) * gs] = nw[g * gs:(g + 1) * gs] * seg / np.sqrt((seg * seg).mean() + 1e-5)
+        ref.append(out)
+    ref = np.array(ref)
+    got = np.concatenate(got)
+    err = np.abs(got - ref).max() / np.abs(ref).max()
+    check(err < 1e-5, 'm2_conv + m2_scan + m2_gnorm heads=%d x %d groups=%d state=%d conv=%d normGroups=%d dt in [%g, %g]: '
+          'rel err %.1e over 2 chunks' % (heads, head_dim, groups, state, kern, norm_groups, dt_min, dt_max, err))
+
+
+def rms3_test(rank=8, state=16, ntok=5):
+    rng = np.random.default_rng(42)
+    stride = rank + 2 * state
+    x = rng.standard_normal((ntok, stride)).astype(np.float32)
+    w = (1 + 0.3 * rng.standard_normal(stride)).astype(np.float32)
+    x0 = x.astype(np.float64)
+    E.dispatch('rms3', [x, w], pack('iiiif', rank, state, stride, ntok, 1e-6), (3, ntok), (256,))
+    ref = x0.copy()
+    for off, width in ((0, rank), (rank, state), (rank + state, state)):
+        seg = x0[:, off:off + width]
+        ref[:, off:off + width] = seg / np.sqrt((seg * seg).mean(1, keepdims=True) + 1e-6) * w[off:off + width]
+    check(np.abs(x - ref).max() < 1e-5, 'rms3 (Jamba dt / B / C norms) rank=%d state=%d' % (rank, state))
+
+
+if not ONLY:
+    vec_tests()
+    m2_pieces()
+    m2_pieces(heads=4, head_dim=64, groups=1, state=128, kern=3, norm_groups=1, dt_min=0.05, seed=43)
+    m2_pieces(heads=12, head_dim=16, groups=3, state=8, kern=4, norm_groups=3, ntok=1, seed=44)
+    rms3_test()
+    rms3_test(rank=256, state=64, ntok=3)
+
 if not ONLY:
     # the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout
     import kernel_tests_diffusion

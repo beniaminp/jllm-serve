@@ -21,7 +21,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
 NAMES = ["qwen3", "qwen2", "llama3", "mistral", "gemma3", "gemma2", "phi3", "phi4", "glmedge", "glm4", "dsr1", "mamba",
-         "dsv2", "phi4_14b", "gptoss", "llama4"]
+         "dsv2", "phi4_14b", "gptoss", "llama4", "granite"]
 # tokenizers of other model types (Unigram, WordPiece) that no supported model family uses; no chat template.
 # They get the EXTRA strings too. Generate only these with: ... <out dir> 60 other
 OTHER_NAMES = ["t5", "albert", "xlmr", "bert", "mbert"]

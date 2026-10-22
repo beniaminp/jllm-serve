@@ -140,6 +140,8 @@ public final class ChatTemplate {
                 return HARMONY_TODAY;
             case "llama4", "llama4_text":
                 return LLAMA4;
+            case "granitemoehybrid", "granite":
+                return GRANITE;
             default:
                 throw new IllegalArgumentException("no chat template for model_type \"" + modelType + "\"");
         }
@@ -272,6 +274,38 @@ public final class ChatTemplate {
             o.ctl("<|header_start|>assistant<|header_end|>\n\n");
         }
     }, "<|eot|>", "<|end_of_text|>", "<|eom|>");
+
+    /**
+     * IBM Granite 4 (plain chat; no tools or documents): every message is {@code <|start_of_role|>role<|end_of_role|>}
+     * + content + {@code <|end_of_text|>\n}; the first message, if it is a system message, becomes the system turn (the
+     * model's default system message when there is none), and the assistant header is the generation prompt. No BOS.
+     */
+    private static final Format GRANITE = new Family("granite", (m, gen, think, o) -> {
+        int first = 0;
+        String system = "You are a helpful assistant. Please ensure responses are professional, accurate, and safe.";
+        if (!m.isEmpty() && "system".equals(m.get(0).role())) {
+            first = 1;
+            if (!content(m.get(0)).isEmpty()) {
+                system = content(m.get(0));
+            }
+        }
+        o.ctl("<|start_of_role|>system<|end_of_role|>");
+        o.txt(system);
+        o.ctl("<|end_of_text|>");
+        o.txt("\n");
+        for (int i = first; i < m.size(); i++) {
+            if ("tool".equals(m.get(i).role())) {
+                throw new IllegalArgumentException("tool messages are not supported by the Granite chat format here");
+            }
+            o.ctl("<|start_of_role|>" + m.get(i).role() + "<|end_of_role|>");
+            o.txt(content(m.get(i)));
+            o.ctl("<|end_of_text|>");
+            o.txt("\n");
+        }
+        if (gen) {
+            o.ctl("<|start_of_role|>assistant<|end_of_role|>");
+        }
+    }, "<|end_of_text|>");
 
     /**
      * Qwen3 ChatML with thinking. Assistant turns before the last user query drop their reasoning; those after it
