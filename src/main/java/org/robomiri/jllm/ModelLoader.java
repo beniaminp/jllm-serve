@@ -581,7 +581,7 @@ public final class ModelLoader {
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
         org.robomiri.jllm.model.KvSparse.set(sparse(s));
         boolean mamba = arch instanceof MambaArch;
-        if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
+        if (member && (s.getBool("backend.kv-paged") || s.getBool("backend.kv-sparse")) && (mamba || arch instanceof Qwen3NextArch)) {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
                     + ": a recurrent state is a function of every earlier token and cannot be shared per block, so the flat cache is used");
         }

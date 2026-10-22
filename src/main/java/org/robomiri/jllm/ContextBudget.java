@@ -108,6 +108,10 @@ public final class ContextBudget {
                          int slots, boolean draft) {
         KvDtype kv = KvDtype.parse(s.get("backend.kv-dtype"));
         long per = bytesPerToken(arch, kv);
+        if (s.getBool("backend.kv-sparse") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa g) {
+            // sparse decode attention (docs/26): every block also keeps a min / max key summary of halves per layer and kv head
+            per += (long) d.core().layers() * g.kvHeads() * 2 * g.headDim() * 2 / s.getInt("backend.kv-block");
+        }
         long weights = w.byteSize();
         long ram = physicalMemory();
         long budget;
@@ -160,7 +164,7 @@ public final class ContextBudget {
 
     /** Whether this model's CPU KV cache is the paged, off-heap pool: {@code backend.kv-paged} on an attention model with f32 / f16 / q8. */
     static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
-        return s.getBool("backend.kv-paged") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa
+        return (s.getBool("backend.kv-paged") || s.getBool("backend.kv-sparse")) && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa
                 && kv != KvDtype.Q4;
     }
 

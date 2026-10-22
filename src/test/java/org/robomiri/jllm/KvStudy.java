@@ -79,7 +79,9 @@ public final class KvStudy {
         try (ModelLoader.Loaded l = ModelLoader.load(s, ModelLoader.hub(s), dir.getFileName().toString().replaceFirst("_", "/"))) {
             Study study = new Study(l, backend, o.get("lib"), ctx, batch);
             study.tail = mode.equals("needle") ? Integer.parseInt(o.getOrDefault("tail", "0")) : 0;
-            if (mode.equals("decodeppl")) {
+            if (mode.equals("sparsecheck")) {
+                study.sparseCheck(o.get("text"), Integer.parseInt(o.getOrDefault("len", "3000")), variants[0]);
+            } else if (mode.equals("decodeppl")) {
                 String[] lens = o.getOrDefault("lens", "8192").split(",");
                 for (String len : lens) {
                     study.decodePpl(variants, Integer.parseInt(len), o.get("text"), Integer.parseInt(o.getOrDefault("tail", "512")));
@@ -105,7 +107,7 @@ public final class KvStudy {
         final Engine engine;
         final ModelWeights w;
         final Tokenizer tok;
-        final String backendName;
+        String backendName;
         final String lib;
         final int ctx;
         final int batch;
@@ -167,7 +169,7 @@ public final class KvStudy {
             try {
                 if (backendName.equals("metal")) {
                     lastPool = MetalBackend.newKvPool(w, ctx, 1, dt, 16, 0, lib);
-                    return new MetalBackend(w, ctx, batch, lib, dt, null, lastPool);
+                    return new MetalBackend(w, ctx, batch, lib, dt, org.robomiri.jllm.metal.MoeSplit.OFF, lastPool);
                 }
                 lastPool = CpuBackend.newKvPool(w, ctx, 1, dt, 16, 0, rot);
                 return new CpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), dt, false, lastPool);
@@ -200,6 +202,78 @@ public final class KvStudy {
             for (int i = chunked; i < prompt.length; i++) {
                 b.forward(prompt, i, 1, i, i == prompt.length - 1 ? logits : null);
             }
+        }
+
+        /**
+         * Consistency of sparse decode attention (docs/26) on the real model, {@code len} tokens of context, variant {@code v}
+         * (e.g. {@code f16+s16:16:64:2}): (1) CPU against Metal, logits of 24 teacher-forced decode steps; (2) Metal with decode
+         * replay on against off, bit for bit; (3) Metal: a verification chunk of 8 rows against 8 decode steps, bit for bit.
+         */
+        void sparseCheck(String textFile, int len, String v) throws Exception {
+            int[] all = tok.encode(Files.readString(Path.of(textFile)));
+            int[] text = java.util.Arrays.copyOf(all, len + 40);
+            String saved = backendName;
+            int steps = 24;
+            float[][][] logits = new float[3][steps][vocab];
+            String[] names = {"cpu", "metal", "metal"};
+            for (int run = 0; run < 3; run++) {
+                backendName = names[run];
+                try (Backend b = open(v)) {
+                    if (run == 2 && b instanceof MetalBackend mb) {
+                        mb.replay(false);
+                    }
+                    float[] lg = new float[vocab];
+                    int[] head = java.util.Arrays.copyOf(text, len);
+                    prefill(b, head, lg);
+                    for (int t = 0; t < steps; t++) {
+                        System.arraycopy(lg, 0, logits[run][t], 0, vocab);
+                        b.forward(text, len + t, 1, len + t, lg);
+                    }
+                }
+            }
+            double worst = 0;
+            int agree = 0;
+            double top = 0;
+            for (int t = 0; t < steps; t++) {
+                for (int i = 0; i < vocab; i++) {
+                    worst = Math.max(worst, Math.abs(logits[0][t][i] - logits[1][t][i]));
+                    top = Math.max(top, Math.abs(logits[0][t][i]));
+                }
+                agree += argmax(logits[0][t]) == argmax(logits[1][t]) ? 1 : 0;
+            }
+            boolean replaySame = true;
+            for (int t = 0; t < steps; t++) {
+                replaySame &= java.util.Arrays.equals(logits[1][t], logits[2][t]);
+            }
+            System.out.printf(Locale.ROOT, "# sparse check %s, %d tokens: CPU vs Metal max |logit difference| %.4f (largest logit %.2f), arg max equal %d/%d;"
+                    + " Metal with decode replay on = off bit for bit: %s%n", v, len, worst, top, agree, steps, replaySame);
+            backendName = "metal";
+            String dense = v.substring(0, v.indexOf('+')) + "+p";
+            System.out.printf(Locale.ROOT, "# sparse check: a verification chunk of 8 rows against 8 decode steps (Metal), largest logit difference:"
+                    + " sparse %s %.2e, dense %s %.2e (the 8-row projections round differently from one-row ones)%n", v,
+                    chunkVsSteps(text, len, v), dense, chunkVsSteps(text, len, dense));
+            backendName = saved;
+        }
+
+        double chunkVsSteps(int[] text, int len, String v) {
+            float[] one = new float[vocab];
+            float[] rows = new float[8 * vocab];
+            float[] step = new float[vocab];
+            double worst = 0;
+            try (Backend b = open(v)) {
+                prefill(b, java.util.Arrays.copyOf(text, len), one);
+                b.forwardAll(text, len, 8, len, rows, vocab);
+            }
+            try (Backend b = open(v)) {
+                prefill(b, java.util.Arrays.copyOf(text, len), one);
+                for (int t = 0; t < 8; t++) {
+                    b.forward(text, len + t, 1, len + t, step);
+                    for (int i = 0; i < vocab; i++) {
+                        worst = Math.max(worst, Math.abs(step[i] - rows[t * vocab + i]));
+                    }
+                }
+            }
+            return worst;
         }
 
         /** Teacher-forced decode perplexity: see the class comment ({@code decodeppl}). */
