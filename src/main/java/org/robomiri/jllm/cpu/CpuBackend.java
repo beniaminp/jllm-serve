@@ -136,7 +136,8 @@ public final class CpuBackend implements Backend {
         if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
             return null;
         }
-        CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8);
+        CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8,
+                org.robomiri.jllm.model.KvSparse.get().enabled());
         long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
         long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
         if (blocks > Integer.MAX_VALUE - 16) {

@@ -1,12 +1,15 @@
 package org.robomiri.jllm.cpu;
 
 import org.robomiri.jllm.kv.KvSequence;
+import org.robomiri.jllm.kv.KvSummary;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvSparse;
 
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
 import java.lang.foreign.MemorySegment;
@@ -40,6 +43,8 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
     private final KvDtype dtype;
     private final int B;
     private final int pairs;
+    /** Sparse decode attention (docs/26); {@link KvSparse#OFF} unless the pool keeps key summaries. */
+    private final KvSparse sparse;
 
     PagedKv(int layers, Attention.Gqa a, int ctx, CpuKvStorage st, KvSequence seq) {
         super(layers, a, ctx);
@@ -48,6 +53,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         this.dtype = st.dtype;
         this.B = st.B;
         this.pairs = st.pairs;
+        this.sparse = st.summaries ? KvSparse.get() : KvSparse.OFF;
         this.direct = dtype == KvDtype.F32 && B % (2 * VectorKernels.FL) == 0 && !Boolean.getBoolean("jllm.cpu.pagedGather");
         if (B % VectorKernels.FL != 0 || B % 2 != 0) {
             throw new IllegalArgumentException("backend.kv-block " + B + " must be a multiple of the vector length " + VectorKernels.FL);
@@ -72,6 +78,12 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         for (int t = 0; t < n; t++) {
             int s = pos + t;
             st.storeRow(layer, seq.block(s / B), s % B, k, v, t * kvDim);
+        }
+        if (sparse.layer(layer)) { // the touched blocks' summaries, from their valid rows (exact after a rewind too)
+            int end = pos + n;
+            for (int j = pos / B; j * B < end; j++) {
+                st.updateSummary(layer, seq.block(j), Math.min(B, end - j * B));
+            }
         }
     }
 
@@ -213,6 +225,9 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
     @Override
     public void readRow(int layer, boolean values, int s, ByteBuffer buf) {
         st.getRow(layer, seq.block(s / B), s % B, values, buf);
+        if (!values && sparse.layer(layer)) { // a saved cache is read in ascending positions: grow the block's summary row by row
+            st.mergeSummaryRow(layer, seq.block(s / B), s % B);
+        }
     }
 
     /** Decode over f32 blocks without the gather ({@code -Djllm.cpu.pagedGather=true} turns it off, for comparisons). */
@@ -233,6 +248,16 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
             q = qRot;
             scale /= org.robomiri.jllm.model.KvQ4.block(headDim);
         }
+        if (sparse.layer(layer) && window == 0 && n < KvSparse.MAX_ROWS && vectorized() && (pos + n - 1) / B + 1 > sparse.budget(B)) {
+            attentionSparseRows(pool, layer, n, pos, q, att, scale, softcap);
+            return;
+        }
+        attentionDense(pool, layer, n, pos, q, att, window, scale, softcap);
+    }
+
+    /** {@link #attention} after the queries are rotated. */
+    private void attentionDense(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
+                                float softcap) {
         if (n == 1 && direct && vectorized()) {
             attentionDecodeDirect(pool, layer, pos, q, att, window, scale, softcap);
             return;
@@ -458,6 +483,303 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
                         .fma(FloatVector.broadcast(F, sc[p + s]), x);
             }
             x.intoArray(att, qo + c);
+        }
+    }
+
+    // ------------------------------------------------------------------ sparse decode attention (docs/26)
+
+    /** Set by tests and studies: {@link #lastSelection} receives the blocks each kv head attended in the last sparse row. */
+    boolean recordSelection;
+    int[][] lastSelection;
+    /** Rows attended sparsely so far (a counter for tests and studies). */
+    long sparseRows;
+
+    /** What one kv head's task of a sparse row needs; reused between calls (one task per kv head, so no sharing). */
+    private static final class SparseScratch {
+        float[] bound = new float[0];  // the upper bound of each candidate block
+        float[] qe = new float[0];     // the group's queries, even channels then odd channels: [group][2][pairs]
+        float[] sc = new float[0];     // scores of the selected keys: [group][keys rounded up to B]
+        float[] kt = new float[0];     // one block's keys, [headDim][B]
+        float[] vt = new float[0];     // one block's values, [B][headDim]
+    }
+
+    private SparseScratch[] sparseScratch;
+
+    /**
+     * Rows {@code pos .. pos + n - 1} (a decode step, or a verification chunk) one at a time, each attending the blocks
+     * its own position selects; a row whose context still fits the budget takes the dense kernel, so every row is what a
+     * decode step at that position computes.
+     */
+    private void attentionSparseRows(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, float scale,
+                                     float softcap) {
+        for (int t = 0; t < n; t++) {
+            int p = pos + t;
+            if (p / B + 1 > sparse.budget(B)) {
+                attentionSparseRow(pool, layer, p, q, t * qDim, att, t * qDim, scale, softcap);
+            } else {
+                float[] q1 = Arrays.copyOfRange(q, t * qDim, (t + 1) * qDim);
+                float[] a1 = new float[qDim];
+                attentionDense(pool, layer, 1, p, q1, a1, 0, scale, softcap);
+                System.arraycopy(a1, 0, att, t * qDim, qDim);
+            }
+        }
+    }
+
+    private void attentionSparseRow(ThreadPool pool, int layer, int p, float[] q, int qo, float[] att, int ao, float scale,
+                                    float softcap) {
+        if (sparseScratch == null) {
+            sparseScratch = new SparseScratch[kvHeads];
+            for (int g = 0; g < kvHeads; g++) {
+                sparseScratch[g] = new SparseScratch();
+            }
+        }
+        if (recordSelection && lastSelection == null) {
+            lastSelection = new int[kvHeads][];
+        }
+        sparseRows++;
+        pool.forRangeFine(kvHeads, 1, (g0, g1) -> {
+            for (int g = g0; g < g1; g++) {
+                sparseHead(sparseScratch[g], g, layer, p, q, qo, att, ao, scale, softcap);
+            }
+        });
+    }
+
+    /**
+     * Kv head {@code g} of the sparse row at position {@code p}: score the summaries of the candidate blocks (all but the
+     * sinks and the window) with the group's queries, keep the best {@link KvSparse#blocks()}, and attend exactly over
+     * sinks + those + window, which are ascending block numbers ending with the block that holds {@code p}.
+     */
+    private void sparseHead(SparseScratch s, int g, int layer, int p, float[] q, int qo, float[] att, int ao, float scale,
+                            float softcap) {
+        int hd = headDim;
+        int nBlocks = p / B + 1;
+        int sink = sparse.sinkBlocks(B);
+        int win = sparse.windowBlocks(B);
+        int cand1 = nBlocks - win;
+        int m = cand1 - sink;
+        int nSel = sink + sparse.blocks() + win;
+        int keys = (nSel - 1) * B + (p % B + 1);
+        int kpad = nSel * B;
+        if (s.bound.length < m) {
+            s.bound = new float[Math.max(m, 2 * s.bound.length)];
+        }
+        if (s.qe.length < group * 2 * pairs) {
+            s.qe = new float[group * 2 * pairs];
+        }
+        if (s.sc.length < group * kpad) {
+            s.sc = new float[group * kpad];
+        }
+        if (s.kt.length < hd * B) {
+            s.kt = new float[hd * B];
+            s.vt = new float[hd * B];
+        }
+        // 1. the group's queries split into even and odd channels, the order the summaries are packed in
+        for (int r = 0; r < group; r++) {
+            int qb = qo + (g * group + r) * hd;
+            for (int pp = 0; pp < pairs; pp++) {
+                s.qe[(r * 2) * pairs + pp] = q[qb + 2 * pp];
+                s.qe[(r * 2 + 1) * pairs + pp] = 2 * pp + 1 < hd ? q[qb + 2 * pp + 1] : 0f;
+            }
+        }
+        // 2. the bound of each candidate block: the largest over the group's heads
+        for (int j = 0; j < m; j++) {
+            int id = seq.block(sink + j);
+            MemorySegment seg = st.slab(id);
+            long sb = st.sumBase(id, layer) + (long) g * 2 * pairs * 4;
+            float best = Float.NEGATIVE_INFINITY;
+            for (int r = 0; r < group; r++) {
+                best = Math.max(best, blockBound(seg, sb, s.qe, r * 2 * pairs));
+            }
+            s.bound[j] = best;
+        }
+        int[] top = KvSummary.top(s.bound, sink, m, sparse.blocks());
+        int[] sel = new int[nSel];
+        int c = 0;
+        for (int j = 0; j < sink; j++) {
+            sel[c++] = j;
+        }
+        for (int j : top) {
+            sel[c++] = j;
+        }
+        for (int j = cand1; j < nBlocks; j++) {
+            sel[c++] = j;
+        }
+        if (recordSelection) {
+            lastSelection[g] = sel.clone();
+        }
+        // 3. exact attention over the selected keys: scores, softmax, values
+        for (int mi = 0; mi < nSel; mi++) {
+            gatherKeys(layer, g, seq.block(sel[mi]), s.kt);
+            for (int r = 0; r < group; r++) {
+                blockScores(s.kt, q, qo + (g * group + r) * hd, s.sc, r * kpad + mi * B, scale);
+            }
+        }
+        boolean capped = softcap > 0 && !VectorKernels.FASTMATH;
+        for (int r = 0; r < group; r++) {
+            int o = r * kpad;
+            if (capped) {
+                for (int i = 0; i < keys; i++) {
+                    s.sc[o + i] = (float) Math.tanh(s.sc[o + i] / softcap) * softcap;
+                }
+            }
+            float inv = 1f / softmax(s.sc, o, keys, softcap);
+            VectorKernels.scale(s.sc, o, keys, inv);
+            Arrays.fill(att, ao + (g * group + r) * hd, ao + (g * group + r + 1) * hd, 0f);
+        }
+        for (int mi = 0; mi < nSel; mi++) {
+            gatherValues(layer, g, seq.block(sel[mi]), s.vt);
+            int rows = mi == nSel - 1 ? p % B + 1 : B;
+            for (int r = 0; r < group; r++) {
+                accumulateRows(s.sc, r * kpad + mi * B, s.vt, rows, att, ao + (g * group + r) * hd);
+            }
+        }
+    }
+
+    /** {@code Σ_i max(q_i lo_i, q_i hi_i)} for the summary at byte {@code sb} of {@code seg}, the query at {@code qe[qb ..]} (even channels, then odd). */
+    private float blockBound(MemorySegment seg, long sb, float[] qe, int qb) {
+        int fl = VectorKernels.FL;
+        FloatVector acc = FloatVector.zero(F);
+        int pp = 0;
+        for (; pp + fl <= pairs; pp += fl) {
+            IntVector lo = IntVector.fromMemorySegment(I, seg, sb + pp * 4L, ORDER);
+            IntVector hi = IntVector.fromMemorySegment(I, seg, sb + (pairs + pp) * 4L, ORDER);
+            FloatVector e = FloatVector.fromArray(F, qe, qb + pp);
+            FloatVector o = FloatVector.fromArray(F, qe, qb + pairs + pp);
+            FloatVector loE = F16.lowHalf(lo);
+            FloatVector hiE = F16.lowHalf(hi);
+            FloatVector loO = F16.highHalf(lo);
+            FloatVector hiO = F16.highHalf(hi);
+            acc = acc.add(e.mul(loE).max(e.mul(hiE))).add(o.mul(loO).max(o.mul(hiO)));
+        }
+        float sum = acc.reduceLanes(VectorOperators.ADD);
+        for (; pp < pairs; pp++) {
+            int lo = seg.get(ValueLayout.JAVA_INT, sb + pp * 4L);
+            int hi = seg.get(ValueLayout.JAVA_INT, sb + (pairs + pp) * 4L);
+            float e = qe[qb + pp];
+            float o = qe[qb + pairs + pp];
+            sum += Math.max(e * Float.float16ToFloat(CpuKvStorage.half(lo, false)), e * Float.float16ToFloat(CpuKvStorage.half(hi, false)));
+            sum += Math.max(o * Float.float16ToFloat(CpuKvStorage.half(lo, true)), o * Float.float16ToFloat(CpuKvStorage.half(hi, true)));
+        }
+        return sum;
+    }
+
+    /** All {@code B} keys of kv head {@code g} of block {@code id} as f32, {@code [headDim][B]}, into {@code dst}. */
+    private void gatherKeys(int layer, int g, int id, float[] dst) {
+        int fl = VectorKernels.FL;
+        int hd = headDim;
+        MemorySegment seg = st.slab(id);
+        long kb = st.base(id, layer);
+        switch (dtype) {
+            case F32 -> {
+                for (int i = 0; i < hd; i++) {
+                    long a = kb + ((long) g * hd + i) * B * 4;
+                    for (int v = 0; v < B; v += fl) {
+                        FloatVector.fromMemorySegment(F, seg, a + v * 4L, ORDER).intoArray(dst, i * B + v);
+                    }
+                }
+            }
+            case F16 -> {
+                for (int p = 0; p < pairs; p++) {
+                    long a = kb + ((long) g * pairs + p) * B * 4;
+                    for (int v = 0; v < B; v += fl) {
+                        IntVector x = IntVector.fromMemorySegment(I, seg, a + v * 4L, ORDER);
+                        F16.lowHalf(x).intoArray(dst, 2 * p * B + v);
+                        if (2 * p + 1 < hd) {
+                            F16.highHalf(x).intoArray(dst, (2 * p + 1) * B + v);
+                        }
+                    }
+                }
+            }
+            default -> {
+                for (int v = 0; v < B; v += fl) {
+                    FloatVector sc = FloatVector.fromMemorySegment(F, seg, kb + st.kScaleOff + ((long) g * B + v) * 4, ORDER);
+                    for (int i = 0; i < hd; i++) {
+                        widen(seg, kb + ((long) g * hd + i) * B + v).mul(sc).intoArray(dst, i * B + v);
+                    }
+                }
+            }
+        }
+    }
+
+    /** All {@code B} value rows of kv head {@code g} of block {@code id} as f32, {@code [B][headDim]}, into {@code dst}. */
+    private void gatherValues(int layer, int g, int id, float[] dst) {
+        int fl = VectorKernels.FL;
+        int hd = headDim;
+        MemorySegment seg = st.slab(id);
+        long vb = st.base(id, layer) + st.kBytes;
+        switch (dtype) {
+            case F32 -> {
+                for (int t = 0; t < B; t++) {
+                    long a = vb + ((long) t * kvDim + g * hd) * 4;
+                    for (int e = 0; e < hd; e += fl) {
+                        FloatVector.fromMemorySegment(F, seg, a + e * 4L, ORDER).intoArray(dst, t * hd + e);
+                    }
+                }
+            }
+            case F16 -> {
+                for (int t = 0; t < B; t += 2) {
+                    long a = vb + ((long) (t >> 1) * kvDim + g * hd) * 4;
+                    for (int e = 0; e < hd; e += fl) {
+                        IntVector x = IntVector.fromMemorySegment(I, seg, a + e * 4L, ORDER);
+                        F16.lowHalf(x).intoArray(dst, t * hd + e);
+                        F16.highHalf(x).intoArray(dst, (t + 1) * hd + e);
+                    }
+                }
+            }
+            default -> {
+                for (int t = 0; t < B; t++) {
+                    float sc = seg.get(ValueLayout.JAVA_FLOAT, vb + st.vScaleOff + ((long) t * kvHeads + g) * 4);
+                    long a = vb + (long) t * kvDim + g * hd;
+                    for (int e = 0; e < hd; e += fl) {
+                        widen(seg, a + e).mul(sc).intoArray(dst, t * hd + e);
+                    }
+                }
+            }
+        }
+    }
+
+    /** The scores of one query head against the {@code B} gathered keys {@code kt} ({@code [headDim][B]}): {@code scale · q·k} into {@code sc[so ..]}. */
+    private void blockScores(float[] kt, float[] q, int qb, float[] sc, int so, float scale) {
+        int fl = VectorKernels.FL;
+        int hd = headDim;
+        for (int v = 0; v < B; v += fl) {
+            FloatVector a = FloatVector.zero(F);
+            for (int i = 0; i < hd; i++) {
+                a = FloatVector.fromArray(F, kt, i * B + v).fma(FloatVector.broadcast(F, q[qb + i]), a);
+            }
+            a.mul(scale).intoArray(sc, so + v);
+        }
+    }
+
+    /** {@code att[ao ..] += Σ_t sc[so + t] · vt[t]} over the first {@code rows} gathered value rows, in ascending order. */
+    private void accumulateRows(float[] sc, int so, float[] vt, int rows, float[] att, int ao) {
+        int fl = VectorKernels.FL;
+        int hd = headDim;
+        int c = 0;
+        for (; c + 4 * fl <= hd; c += 4 * fl) {
+            FloatVector x0 = FloatVector.fromArray(F, att, ao + c);
+            FloatVector x1 = FloatVector.fromArray(F, att, ao + c + fl);
+            FloatVector x2 = FloatVector.fromArray(F, att, ao + c + 2 * fl);
+            FloatVector x3 = FloatVector.fromArray(F, att, ao + c + 3 * fl);
+            for (int t = 0; t < rows; t++) {
+                FloatVector w = FloatVector.broadcast(F, sc[so + t]);
+                int vo = t * hd + c;
+                x0 = FloatVector.fromArray(F, vt, vo).fma(w, x0);
+                x1 = FloatVector.fromArray(F, vt, vo + fl).fma(w, x1);
+                x2 = FloatVector.fromArray(F, vt, vo + 2 * fl).fma(w, x2);
+                x3 = FloatVector.fromArray(F, vt, vo + 3 * fl).fma(w, x3);
+            }
+            x0.intoArray(att, ao + c);
+            x1.intoArray(att, ao + c + fl);
+            x2.intoArray(att, ao + c + 2 * fl);
+            x3.intoArray(att, ao + c + 3 * fl);
+        }
+        for (; c < hd; c += fl) {
+            FloatVector x = FloatVector.fromArray(F, att, ao + c);
+            for (int t = 0; t < rows; t++) {
+                x = FloatVector.fromArray(F, vt, t * hd + c).fma(FloatVector.broadcast(F, sc[so + t]), x);
+            }
+            x.intoArray(att, ao + c);
         }
     }
 }

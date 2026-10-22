@@ -263,6 +263,11 @@ public final class Settings {
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
         require(getInt("backend.kv-q4-recent") >= 0, "backend.kv-q4-recent", "must be 0 (= none) or positive");
         getBool("backend.kv-paged");
+        getBool("backend.kv-sparse");
+        require(getInt("backend.kv-sparse-blocks") >= 1, "backend.kv-sparse-blocks", "must be at least 1");
+        require(getInt("backend.kv-sparse-sink") >= 0, "backend.kv-sparse-sink", "must be 0 or positive");
+        require(getInt("backend.kv-sparse-window") >= 0, "backend.kv-sparse-window", "must be 0 or positive");
+        require(getInt("backend.kv-sparse-dense-layers") >= 0, "backend.kv-sparse-dense-layers", "must be 0 or positive");
         getBool("backend.kv-prefix-share");
         require(getInt("backend.kv-block") >= 16 && Integer.bitCount(getInt("backend.kv-block")) == 1, "backend.kv-block",
                 "must be a power of two of at least 16");

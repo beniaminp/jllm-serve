@@ -327,13 +327,14 @@ public final class ModelLoader {
      */
     private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int slots,
                                                       boolean metal) {
-        if (!s.getBool("backend.kv-paged")) {
+        if (!s.getBool("backend.kv-paged") && !s.getBool("backend.kv-sparse")) {
             return null;
         }
         int ctx = s.getInt("backend.ctx");
         int block = s.getInt("backend.kv-block");
         long tokens = s.getLong("backend.kv-pool-tokens");
-        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens;
+        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens
+                + (org.robomiri.jllm.model.KvSparse.get().enabled() ? "|sparse" : "");
         org.robomiri.jllm.kv.KvPool pool = org.robomiri.jllm.kv.KvPools.get(weights, key,
                 () -> metal ? org.robomiri.jllm.metal.MetalBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens,
                         s.opt("backend.metal.lib")) : CpuBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens));
@@ -524,6 +525,19 @@ public final class ModelLoader {
         }
     }
 
+    /** The sparse decode attention settings (docs/26); the switch also needs the paged cache, which it turns on. */
+    static org.robomiri.jllm.model.KvSparse sparse(Settings s) {
+        boolean on = s.getBool("backend.kv-sparse");
+        if (on && !s.getBool("backend.kv-paged") && !sparseNoted) {
+            sparseNoted = true;
+            System.err.println("note: backend.kv-sparse needs the paged KV cache, which it turns on (backend.kv-paged)");
+        }
+        return new org.robomiri.jllm.model.KvSparse(on, s.getInt("backend.kv-sparse-blocks"), s.getInt("backend.kv-sparse-sink"),
+                s.getInt("backend.kv-sparse-window"), s.getInt("backend.kv-sparse-dense-layers"));
+    }
+
+    private static volatile boolean sparseNoted;
+
     /** A backend on {@code weights}, which stay open whatever happens (they may be shared). */
     /** {@code member}: the backend will join its weights' batch group (and share the group's CPU threads). */
     private static Backend newBackend(Settings s, Architecture arch, ModelWeights weights, int slots, boolean member)
@@ -542,6 +556,7 @@ public final class ModelLoader {
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
+        org.robomiri.jllm.model.KvSparse.set(sparse(s));
         boolean mamba = arch instanceof MambaArch;
         if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
