@@ -1326,6 +1326,9 @@ public final class ArchSmoke {
                 fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab, meet)));
             }
             boolean same = true;
+            for (int i = 0; i < b.length; i++) {
+                same &= Arrays.equals(fs.get(i).get(), alone[i]);
+            }
             long[] st = g.stats();
             boolean ok = same && (batchable ? st[1] > 0 : st[1] == 0);
             System.out.printf("  batch group, 3 threads: tokens %s, %d decode steps in shared passes (%d passes) -> %s%n",
