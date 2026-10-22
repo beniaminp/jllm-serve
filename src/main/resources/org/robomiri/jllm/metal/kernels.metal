@@ -308,6 +308,9 @@ static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x,
                                thread float *acc, ushort lane);
 template <int QT>
 static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w);
+#define GG_NEW 24   // first QT of the second set of GGUF block types (Q4_1 ...), decoded by gg_new at the end of the file
+template <int QT, int NV>
+static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int v0, thread float4 *w);
 static inline void q6k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w);
 template <int QT, int NR, int TT>
 static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
@@ -839,6 +842,11 @@ static inline void mma_core_rows(device const uchar *rwq, device const float *rw
             device const char4 *q = (device const char4 *)(rwq + rgrow * nb * 32 + b * 32 + h * 16);
             const float s = rws[rgrow * nb + b];
             for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = float4(q[k]) * s;
+        } else if (QT >= GG_NEW) {
+            // the newer GGUF types decode only their own 16 weights (their decoders cost more than Q4_0's: bit fields, tables)
+            float4 w[4];
+            gg_new<QT, 4>(rwq, rgrow, nb, b, 4 * h, w);
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[k];
         } else if (QT >= GG_FIRST) {
             // GGUF types: the 32-weight unit b of the row, both threads of the row decode it and store their half
             float4 w[8];
@@ -2659,7 +2667,6 @@ template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 // Block sizes 22, 110, 18 and 17 are not multiples of 4: Q5_0 / Q3_K / IQ4_NL read their quants as ushorts (2-byte
 // aligned), MXFP4 byte by byte (17 B blocks are only 1-byte aligned). The 4-bit tables sit in constant memory.
 
-#define GG_NEW 24
 #define GG_Q4_1 24
 #define GG_Q5_0 25
 #define GG_Q5_1 26
