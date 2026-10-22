@@ -40,6 +40,7 @@ public final class GgufInt8Kernels {
     private static final VectorSpecies<Float> F4 = FloatVector.SPECIES_128;
     private static final ByteOrder LE = ByteOrder.LITTLE_ENDIAN;
     private static final ValueLayout.OfInt LE32 = ValueLayout.JAVA_INT_UNALIGNED.withOrder(LE);
+    private static final ValueLayout.OfShort LE16 = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(LE);
     private static final ValueLayout.OfLong LE64 = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(LE);
     private static final float MAGIC = 12582912f; // 1.5 * 2^23
     private static final int MAGIC_BITS = Float.floatToRawIntBits(MAGIC);
@@ -60,7 +61,7 @@ public final class GgufInt8Kernels {
         }
         return switch (w.type) {
             case Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4 -> w.cols % QType.BLOCK == 0;
-            case IQ4_XS -> w.cols % Ggml.QK_K == 0;
+            case IQ4_XS, Q3_K -> w.cols % Ggml.QK_K == 0;
             default -> false;
         };
     }
@@ -93,6 +94,7 @@ public final class GgufInt8Kernels {
             case IQ4_NL -> dotTab(seg, q, nb, xq, xs, xo, xb, false);
             case MXFP4 -> dotTab(seg, q, nb, xq, xs, xo, xb, true);
             case IQ4_XS -> dotIQ4XS(seg, q, nb, xq, xs, xo, xb);
+            case Q3_K -> dotQ3K(seg, q, nb, xq, xs, xo, xb);
             default -> throw new IllegalArgumentException(w.type.name());
         };
     }
@@ -183,6 +185,52 @@ public final class GgufInt8Kernels {
                     v.lanewise(VectorOperators.LSHR, 4).selectFrom(tab), xq, xo + b * QType.BLOCK);
             float d = fp4 ? Ggml.e8m0Half(seg.get(ValueLayout.JAVA_BYTE, q) & 0xFF) : Ggml.f16(seg, q);
             acc = toFloat(isum).fma(FloatVector.broadcast(F4, d * xs[sb + b]), acc);
+        }
+        return acc.reduceLanes(VectorOperators.ADD);
+    }
+
+    /** The integer product of 16 signed byte weights (natural order) with the 16 permuted activation shorts at {@code x}. */
+    private static IntVector dot16(ByteVector w, short[] xq, int x) {
+        ShortVector v = w.reinterpretAsShorts();
+        return widenSum(v.lanewise(VectorOperators.LSHL, 8).lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, x))
+                .add(v.lanewise(VectorOperators.ASHR, 8).mul(ShortVector.fromArray(S8, xq, x + 8))));
+    }
+
+    /** Q3_K weights of one half of unit u: {@code ((qs >> 2 (u & 3)) & 3) - 4 + 4 (hmask bit u)}. */
+    private static ByteVector q3kHalf(ByteVector qs, ByteVector hm, int u) {
+        return qs.lanewise(VectorOperators.LSHR, 2 * (u & 3)).and((byte) 3).sub((byte) 4)
+                .add(hm.lanewise(VectorOperators.LSHR, u).and((byte) 1).lanewise(VectorOperators.LSHL, 2));
+    }
+
+    /** Q3_K (110 B per 256 weights): sixteen 6-bit scales, one per 16 weights (llama.cpp's kmask1 / kmask2 shuffle). */
+    private static float dotQ3K(MemorySegment seg, long q, int nb, short[] xq, float[] xs, int xo, int sb) {
+        FloatVector acc = FloatVector.zero(F4);
+        for (int s = 0; s < nb; s++, q += Ggml.Q3_K_BYTES) {
+            long a = seg.get(LE64, q + 96);
+            int a0 = (int) a;
+            int a1 = (int) (a >>> 32);
+            int t = seg.get(LE32, q + 104);
+            float d = Float.float16ToFloat(seg.get(LE16, q + 108));
+            ByteVector h0 = ByteVector.fromMemorySegment(B16, seg, q, LE);
+            ByteVector h1 = ByteVector.fromMemorySegment(B16, seg, q + 16, LE);
+            for (int g = 0; g < 4; g++) {
+                int word = switch (g) {
+                    case 0 -> (a0 & 0x0f0f0f0f) | ((t & 0x03030303) << 4);
+                    case 1 -> (a1 & 0x0f0f0f0f) | (((t >>> 2) & 0x03030303) << 4);
+                    case 2 -> ((a0 >>> 4) & 0x0f0f0f0f) | (((t >>> 4) & 0x03030303) << 4);
+                    default -> ((a1 >>> 4) & 0x0f0f0f0f) | (((t >>> 6) & 0x03030303) << 4);
+                };
+                for (int h = 0; h < 2; h++) {
+                    int u = 2 * g + h;
+                    int blk = s * 8 + u;
+                    long qs = q + 32 + 32L * (u >> 2);
+                    float xd = xs[sb + blk];
+                    IntVector i0 = dot16(q3kHalf(ByteVector.fromMemorySegment(B16, seg, qs, LE), h0, u), xq, xo + blk * QType.BLOCK);
+                    IntVector i1 = dot16(q3kHalf(ByteVector.fromMemorySegment(B16, seg, qs + 16, LE), h1, u), xq, xo + blk * QType.BLOCK + 16);
+                    acc = toFloat(i0).fma(FloatVector.broadcast(F4, d * (((word >>> (16 * h)) & 0xFF) - 32) * xd), acc);
+                    acc = toFloat(i1).fma(FloatVector.broadcast(F4, d * (((word >>> (16 * h + 8)) & 0xFF) - 32) * xd), acc);
+                }
+            }
         }
         return acc.reduceLanes(VectorOperators.ADD);
     }

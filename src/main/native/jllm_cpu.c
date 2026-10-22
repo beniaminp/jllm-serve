@@ -40,7 +40,7 @@
 
 enum {
     T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6,
-    T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12, T_COUNT = 13
+    T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12, T_Q3_K = 13, T_COUNT = 14
 };
 
 enum {
@@ -63,6 +63,7 @@ static const char *LEVEL_NAMES[L_COUNT] = {"scalar", "neon", "neon-dotprod", "av
 #define IQ4_NL_BYTES 18
 #define MXFP4_BYTES 17
 #define IQ4_XS_BYTES 136
+#define Q3_K_BYTES 110
 
 /* ggml's kvalues_iq4nl and kvalues_mxfp4 (the latter doubled: the block scale carries the factor 1/2) */
 static const int8_t KV_IQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -322,6 +323,41 @@ static float dot_tab_scalar(const uint8_t *q, int nb, const int8_t *x, const flo
     return sum;
 }
 
+/* The sixteen 6-bit scales (minus 32) of a Q3_K block: scale s takes its low 4 bits from byte 4 (g & 1) + i of the 12 scale
+ * bytes (low nibble for g < 2, high for g >= 2) and its top 2 bits from bits 2g.. of byte 8 + i, with g = s >> 2, i = s & 3. */
+static inline void q3k_scales(const uint8_t *q, int *sc) {
+    const uint8_t *s = q + 96;
+    for (int k = 0; k < 16; k++) {
+        int g = k >> 2, i = k & 3;
+        int lowb = s[4 * (g & 1) + i];
+        int lo = g < 2 ? (lowb & 15) : (lowb >> 4);
+        sc[k] = (lo | (((s[8 + i] >> (2 * g)) & 3) << 4)) - 32;
+    }
+}
+
+/* Q3_K: w = d (sc - 32) (((qs[32 n + l] >> 2j) & 3) - 4 + 4 hmask[l] bit u), unit u = 4 n + j, two 16-weight runs with their own scale */
+static float dot_q3_k_scalar(const uint8_t *q, int nsb, const int8_t *x, const float *xd) {
+    float sum = 0;
+    int sc[16];
+    for (int sb = 0; sb < nsb; sb++, q += Q3_K_BYTES) {
+        float d = f16_to_f32(q + 108);
+        q3k_scales(q, sc);
+        for (int u = 0; u < 8; u++) {
+            int n = u >> 2, j = u & 3, blk = sb * 8 + u;
+            const uint8_t *qs = q + 32 + 32 * n;
+            const int8_t *xb = x + blk * QK;
+            int32_t i0 = 0, i1 = 0;
+            for (int l = 0; l < 16; l++) {
+                i0 += (((qs[l] >> (2 * j)) & 3) - 4 + 4 * ((q[l] >> u) & 1)) * xb[l];
+                i1 += (((qs[16 + l] >> (2 * j)) & 3) - 4 + 4 * ((q[16 + l] >> u) & 1)) * xb[16 + l];
+            }
+            sum += (float) i0 * (d * (float) sc[2 * u] * xd[blk]);
+            sum += (float) i1 * (d * (float) sc[2 * u + 1] * xd[blk]);
+        }
+    }
+    return sum;
+}
+
 /* IQ4_XS: eight IQ4_NL-style 32-weight sub-blocks per 256 with their own 6-bit scales */
 static float dot_iq4_xs_scalar(const uint8_t *q, int nsb, const int8_t *x, const float *xd) {
     float sum = 0;
@@ -451,6 +487,15 @@ DEFINE_ROWS(scalar, )
         (void) xs;                                                                                                     \
         for (int32_t r = r0; r < r1; r++)                                                                              \
             store(out, r - r0, JCAT(dot_tab, SFX)(w + r * rb, NB32, xq, xd, 1), acc);                                 \
+    }                                                                                                                  \
+    ATTR static void JCAT(rows_q3_k, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,        \
+                                         const int8_t *xq, const float *xd, const int32_t *xs, float *out,             \
+                                         int32_t acc) {                                                                \
+        size_t rb = (size_t) NBK * Q3_K_BYTES;                                                                         \
+        (void) soff;                                                                                                   \
+        (void) xs;                                                                                                     \
+        for (int32_t r = r0; r < r1; r++)                                                                              \
+            store(out, r - r0, JCAT(dot_q3_k, SFX)(w + r * rb, NBK, xq, xd), acc);                                    \
     }                                                                                                                  \
     ATTR static void JCAT(rows_iq4_xs, SFX)(const uint8_t *w, int64_t soff, int32_t r0, int32_t r1, int32_t cols,      \
                                            const int8_t *xq, const float *xd, const int32_t *xs, float *out,           \
@@ -624,7 +669,8 @@ static int active = L_SCALAR;
     TABLE[L][T_Q5_1] = JCAT(rows_q5_1, SFX);                                                                           \
     TABLE[L][T_IQ4_NL] = JCAT(rows_iq4_nl, SFX);                                                                       \
     TABLE[L][T_MXFP4] = JCAT(rows_mxfp4, SFX);                                                                         \
-    TABLE[L][T_IQ4_XS] = JCAT(rows_iq4_xs, SFX);
+    TABLE[L][T_IQ4_XS] = JCAT(rows_iq4_xs, SFX);                                                                       \
+    TABLE[L][T_Q3_K] = JCAT(rows_q3_k, SFX);
 
 static void init(void) {
     if (detected >= 0) {

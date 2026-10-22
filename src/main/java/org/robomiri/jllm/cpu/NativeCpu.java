@@ -46,7 +46,7 @@ public final class NativeCpu {
 
     /** Type ids of the C interface. */
     static final int T_Q4_0 = 0, T_Q8_0 = 1, T_Q4_0G = 2, T_Q8_0G = 3, T_Q4_K = 4, T_Q5_K = 5, T_Q6_K = 6,
-            T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12;
+            T_Q4_1 = 7, T_Q5_0 = 8, T_Q5_1 = 9, T_IQ4_NL = 10, T_MXFP4 = 11, T_IQ4_XS = 12, T_Q3_K = 13;
 
     private static final int ABI = 1;
     private static final Linker LINKER = Linker.nativeLinker();
@@ -260,6 +260,7 @@ public final class NativeCpu {
             case IQ4_NL -> T_IQ4_NL;
             case MXFP4 -> T_MXFP4;
             case IQ4_XS -> T_IQ4_XS;
+            case Q3_K -> T_Q3_K;
             default -> -1;
         };
     }
@@ -291,7 +292,7 @@ public final class NativeCpu {
         if (t < 0 || !hasKernel(t)) {
             return false;
         }
-        return t == T_Q4_K || t == T_Q5_K || t == T_Q6_K || t == T_IQ4_XS ? w.cols % Ggml.QK_K == 0 : w.cols % QType.BLOCK == 0;
+        return t == T_Q4_K || t == T_Q5_K || t == T_Q6_K || t == T_IQ4_XS || t == T_Q3_K ? w.cols % Ggml.QK_K == 0 : w.cols % QType.BLOCK == 0;
     }
 
     /**
@@ -404,7 +405,7 @@ public final class NativeCpu {
                 return q;
             }
             for (QType t : new QType[]{QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K,
-                    QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS}) {
+                    QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS, QType.Q3_K}) {
                 if (!hasKernel(typeId(t))) {
                     continue;
                 }
@@ -565,7 +566,17 @@ public final class NativeCpu {
                     seg.set(f16, blk + 2, dmin);
                 }
                 case Q5_0, IQ4_NL -> seg.set(f16, blk, d);
-                case Q3_K -> seg.set(f16, blk + 108, d);
+                case Q3_K -> {
+                    seg.set(f16, blk + 108, d);
+                    if (unit && !randomSub) { // every scale ls - 32 = 1: low nibbles 1, top two bits 2
+                        for (int j = 0; j < 8; j++) {
+                            seg.set(ValueLayout.JAVA_BYTE, blk + 96 + j, (byte) 0x11);
+                        }
+                        for (int j = 8; j < 12; j++) {
+                            seg.set(ValueLayout.JAVA_BYTE, blk + 96 + j, (byte) 0xAA);
+                        }
+                    }
+                }
                 case F16, BF16 -> { // random bits are often NaN / inf: use small random halves
                     for (int i = 0; i < 32; i++) {
                         short h = type == QType.F16 ? Float.floatToFloat16((float) rnd.nextGaussian() * 0.1f)

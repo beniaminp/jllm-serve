@@ -70,7 +70,7 @@ public final class NativeCpuCheck {
     }
 
     private static final QType[] TYPES = {QType.Q4_0, QType.Q8_0, QType.Q4_0G, QType.Q8_0G, QType.Q4_K, QType.Q5_K, QType.Q6_K,
-            QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS};
+            QType.Q4_1, QType.Q5_0, QType.Q5_1, QType.IQ4_NL, QType.MXFP4, QType.IQ4_XS, QType.Q3_K};
 
     /** The Java int8 kernel for {@code w}: what the native one must agree with. */
     private static float javaDot(QTensor w, int r, short[] xq, float[] xs, int[] sums, int xo) {

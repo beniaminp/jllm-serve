@@ -261,4 +261,32 @@ TGT static inline float F(dot_iq4_xs)(const uint8_t *q, int nsb, const int8_t *x
     return vaddvq_f32(acc);
 }
 
+
+/* Q3_K: unit u = 4 n + j is the 32 bytes qs[32 n ..] shifted by 2 j, minus 4 where hmask bit u is clear (as unsigned bytes mod 256). */
+TGT static inline float F(dot_q3_k)(const uint8_t *q, int nsb, const int8_t *x, const float *xd) {
+    const uint8x16_t m3 = vdupq_n_u8(3), one = vdupq_n_u8(1), c4 = vdupq_n_u8(4);
+    float32x4_t acc = vdupq_n_f32(0);
+    int sc[16];
+    for (int sb = 0; sb < nsb; sb++, q += Q3_K_BYTES) {
+        float d = f16_to_f32(q + 108);
+        q3k_scales(q, sc);
+        uint8x16_t h0 = vld1q_u8(q), h1 = vld1q_u8(q + 16);
+        for (int u = 0; u < 8; u++) {
+            int n = u >> 2, j = u & 3, blk = sb * 8 + u;
+            const uint8_t *qs = q + 32 + 32 * n;
+            int8x16_t cnt = vdupq_n_s8((int8_t) (-2 * j)), hcnt = vdupq_n_s8((int8_t) -u);
+            uint8x16_t c0 = vandq_u8(vshlq_u8(vld1q_u8(qs), cnt), m3), c1 = vandq_u8(vshlq_u8(vld1q_u8(qs + 16), cnt), m3);
+            uint8x16_t b0 = vshlq_n_u8(vandq_u8(vshlq_u8(h0, hcnt), one), 2), b1 = vshlq_n_u8(vandq_u8(vshlq_u8(h1, hcnt), one), 2);
+            int8x16_t w0 = vreinterpretq_s8_u8(vaddq_u8(vsubq_u8(c0, c4), b0));
+            int8x16_t w1 = vreinterpretq_s8_u8(vaddq_u8(vsubq_u8(c1, c4), b1));
+            const int8_t *xb = x + blk * QK;
+            int32x4_t p0 = F(dot16)(vdupq_n_s32(0), w0, vld1q_s8(xb));
+            int32x4_t p1 = F(dot16)(vdupq_n_s32(0), w1, vld1q_s8(xb + 16));
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p0), d * (float) sc[2 * u] * xd[blk]);
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p1), d * (float) sc[2 * u + 1] * xd[blk]);
+        }
+    }
+    return vaddvq_f32(acc);
+}
+
 #undef F
