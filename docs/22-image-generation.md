@@ -493,7 +493,53 @@ behind rounding.
 
 ## 22.14 Measured speed and memory
 
-[[SPEED TABLE]]
+Measured on an Apple M1 Pro (16-core GPU, 32 GB), JDK 26, with `stabilityai/sd-turbo` (guidance 0, one image, prompt "a photo of an
+astronaut riding a horse on the moon"), seconds per image *after* warm-up, the machine otherwise idle (the benchmarks ran inside the
+project's heavy-job lock). Reproduce with
+
+```
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/classes:target/test-classes \
+     org.robomiri.jllm.diffusion.DiffusionBench MODEL_DIR metal|cpu f16|f32 STEPS WIDTH HEIGHT REPS
+python -I scripts/diffusion/bench_diffusers.py MODEL_DIR --device mps|cpu --dtype float16|float32 --steps 1,4,20
+```
+
+| 512 × 512 | jllm 1 step | 4 steps | 20 steps | diffusers 1 step | 4 steps | 20 steps |
+|---|---|---|---|---|---|---|
+| Metal, float16 (sd-turbo) | 1.68 | 2.92 | 9.63 | 0.78 | 1.43 | 5.03 |
+| Metal, float32 (sd-turbo) | 2.38 | 4.14 | — | 0.92 | 1.73 | — |
+| CPU, float32 (sd-turbo) | 12.2 | 24.3 | — | 5.02 | 7.76 | — |
+| Metal, float16 (sdxl-turbo) | 2.70 | 4.70 | — | 1.13 | 2.47 | — |
+
+(diffusers: 0.41 / PyTorch 2.14 on the `mps` device or the CPU, same weights.) A 1024 × 1024 sd-turbo image in float16 takes
+16 s for 4 steps (UNet 2.4 s per call, VAE 5.4–6.2 s). A step costs 0.42 s (UNet) on SD 1.x / 2.x at 512², 0.72 s on SDXL; the fixed cost
+of an image is the VAE decode, 1.2 s at 512² (2.5 TFLOP), plus 0.05 s for the text encoder. So a 1-step Turbo image is dominated by the
+decoder and a 20-step image by the UNet.
+
+*Where the time goes* (`-Djllm.diffusion.profile=true`, one step, float16): convolutions 65 % (1.35 s of 2.1 s with every dispatch
+waited for), linear layers 16 %, flash attention 5 %, group norms 10 %. The convolution and matrix kernels reach 2.3–2.7 TFLOP/s in
+isolation (`KernelBench`), about half of the chip's 5.3 TFLOP/s; flash attention 1.5. Padding the threadgroup tiles and 16-byte
+loads (`-Djllm.diffusion.defines`, `DF_PAD_BYTES` / `DF_LOAD16B`) were tried as four variants back to back, three rounds: the
+differences are within noise (±3 %), so they stay off.
+
+*Against diffusers.* On the GPU jllm needs about 2.1 × the time of PyTorch's MPS backend at one step and 1.9 × at twenty, in float16 as
+in float32. MPS has the better convolution: a 3.3 TFLOP image in 0.78 s is 4.2 TFLOP/s "effective", which the chip's 5.3 peak makes
+believable only if it does fewer multiplications than a plain implicit GEMM (Winograd-style; inferred, not inspected). That is the
+obvious next step for the kernels and is not done. On the CPU jllm is 2.4–3.1 × slower than PyTorch's CPU path (a 4 × 4 register tile at about
+390 GFLOP/s on the ten cores against PyTorch's own kernels).
+
+*Memory* (512², peak, after the first image):
+
+| | weights | GPU buffers (pool included) | Java heap in use |
+|---|---|---|---|
+| jllm Metal f16, sd-turbo | 2.6 GB (as in the file) | 3.2 GB | < 2 GB |
+| jllm Metal f32, sd-turbo | 4.3 GB (widened) | 5.0 GB, peak 6.5 GB while loading | < 2 GB |
+| jllm Metal f16, sdxl-turbo | 6.9 GB | 6.9 GB, peak 8.3 GB | ~1 GB |
+| diffusers MPS fp16, sd-turbo | | 2.6 GB allocated, 4.7 GB driver | |
+| diffusers MPS fp32, sd-turbo | | 5.2 GB allocated, 7.9 GB driver | |
+| diffusers MPS fp16, sdxl-turbo | | 7.0 GB allocated, 10.0 GB driver | |
+| jllm CPU f32, sd-turbo | 4.3 GB outside the heap | — | 2–2.7 GB |
+
+The scratch-buffer pool is trimmed after every image (`Ops.trim`), so a server holding an image model idles at the weights' size.
 
 ---
 
