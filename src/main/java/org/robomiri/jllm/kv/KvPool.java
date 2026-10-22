@@ -35,7 +35,8 @@ public final class KvPool implements AutoCloseable {
     /** Counters for the console and the tests. */
     public record Stats(int blockTokens, int maxBlocks, int residentBlocks, int usedBlocks, int cachedBlocks,
                         int freeBlocks, long residentBytes, long evictions, long spills, long reloads, long copiesOnWrite,
-                        long dedups, int spillFiles, long spillBytes) {
+                        long dedups, int spillFiles, long spillBytes, int hotCap, int committedBlocks, long committedBytes,
+                        long prefetchHints) {
     }
 
     /** What {@link #match} found: {@code tokens} leading tokens in the tree, of which {@code spilled} are on disk. */
@@ -99,6 +100,8 @@ public final class KvPool implements AutoCloseable {
     private final KvStorage storage;
     private final int B;
     private final int maxBlocks;
+    /** Most blocks that may be committed at once (the hot tier's budget, {@link #setHotCap}); at most maxBlocks. */
+    private volatile int hotCap;
     private final int[] refs;
     private final Node[] owner;
     private int highWater;
@@ -120,6 +123,8 @@ public final class KvPool implements AutoCloseable {
     private long reloads;
     private long cows;
     private long dedups;
+    private long prefetchHints;
+    private volatile boolean prefetch = true;
     private final String format;
 
     /**
@@ -134,6 +139,7 @@ public final class KvPool implements AutoCloseable {
         this.storage = storage;
         this.B = storage.blockTokens();
         this.maxBlocks = maxBlocks;
+        this.hotCap = maxBlocks;
         this.refs = new int[maxBlocks];
         this.owner = new Node[maxBlocks];
         this.format = format;
@@ -159,6 +165,30 @@ public final class KvPool implements AutoCloseable {
     /** A sequence (block table) for positions {@code [0, maxPositions)}. */
     public KvSequence newSequence(int maxPositions) {
         return new KvSequence(this, maxPositions);
+    }
+
+    /**
+     * Limits the blocks that are ever committed in the storage to {@code blocks} (the hot tier's budget): beyond it
+     * {@link #alloc} evicts a cached block, which goes down to the warm and cold tiers, instead of growing. Blocks
+     * already committed stay (their memory cannot be given back), so lowering the cap below the high-water mark only
+     * stops further growth; raising it lets the pool grow again, up to {@link #maxBlocks()}.
+     */
+    public synchronized void setHotCap(int blocks) {
+        this.hotCap = Math.max(1, Math.min(blocks, maxBlocks));
+    }
+
+    public int hotCap() {
+        return hotCap;
+    }
+
+    /** Whether {@link #match} asks the spill store to prefetch the blocks a prompt will adopt. */
+    public void setPrefetch(boolean on) {
+        this.prefetch = on;
+    }
+
+    /** Blocks committed in the storage so far (the high-water mark of ids ever handed out). */
+    public synchronized int committedBlocks() {
+        return highWater;
     }
 
     /** Where evicted blocks go; null = they are dropped. */
@@ -203,14 +233,15 @@ public final class KvPool implements AutoCloseable {
         int b;
         if (freeCount > 0) {
             b = free[--freeCount];
-        } else if (highWater < maxBlocks) {
+        } else if (highWater < hotCap) {
             b = highWater++;
             storage.grow(highWater);
         } else {
             b = evictOne();
             if (b < 0) {
-                throw new KvPoolExhausted("the KV pool is full: all " + maxBlocks + " blocks of " + B + " positions are in"
-                        + " use by running sequences; raise backend.kv-pool-tokens or lower the context / slots");
+                throw new KvPoolExhausted("the KV pool is full: all " + hotCap + " blocks of " + B + " positions are in"
+                        + " use by running sequences; raise " + (hotCap < maxBlocks ? "backend.kv-hot-mb" : "backend.kv-pool-tokens")
+                        + " or lower the context / slots");
             }
         }
         refs[b] = 1;
@@ -337,10 +368,15 @@ public final class KvPool implements AutoCloseable {
         int spilled = 0;
         if (sp != null) {
             long h = node.hash;
+            boolean hint = prefetch;
             while (i + B <= max) {
                 long ph = pathHash(h, tokens, i, B);
                 if (!sp.has(ph)) {
                     break;
+                }
+                if (hint) { // the prompt that asked will adopt this block next: have the store bring it closer
+                    sp.prefetch(ph, Arrays.copyOfRange(tokens, i, i + B), storage.spillBytes());
+                    prefetchHints++;
                 }
                 h = ph;
                 i += B;
@@ -526,12 +562,47 @@ public final class KvPool implements AutoCloseable {
         }
     }
 
+    /**
+     * Writes the blocks of the tree path of {@code tokens[0 .. n)} that the spill store does not hold yet, keeping them
+     * resident: a saved session in the block files' format (docs/26 §26.2.5). Reloading it needs no file of its own: the
+     * tokens find the blocks by their path hashes ({@link #match}, {@link #adopt}). Blocks beyond the first one the tree
+     * (or the store) lacks are not written.
+     *
+     * @return the number of blocks written
+     */
+    public synchronized int persist(int[] tokens, int n) {
+        KvSpill sp = spill;
+        if (sp == null || !sharing) {
+            return 0;
+        }
+        Node node = root;
+        int written = 0;
+        for (int i = 0; i + B <= n; i += B) {
+            Node c = node.find(tokens, i);
+            if (c == null) {
+                break;
+            }
+            if (!sp.has(c.hash)) {
+                ByteBuffer buf = spillBuffer();
+                storage.save(c.block, buf);
+                buf.flip();
+                if (sp.put(c.hash, c.tokens, buf)) {
+                    written++;
+                    spills++;
+                }
+            }
+            node = c;
+        }
+        return written;
+    }
+
     // ------------------------------------------------------------------ statistics
 
     public synchronized Stats stats() {
         KvSpill sp = spill;
         return new Stats(B, maxBlocks, highWater - freeCount, used, cached, freeCount, (long) (highWater - freeCount) * storage.residentBytes(),
-                evictions, spills, reloads, cows, dedups, sp == null ? 0 : sp.files(), sp == null ? 0 : sp.bytes());
+                evictions, spills, reloads, cows, dedups, sp == null ? 0 : sp.files(), sp == null ? 0 : sp.bytes(), hotCap,
+                highWater, (long) highWater * storage.residentBytes(), prefetchHints);
     }
 
     /** Blocks in memory that hold data (referenced or cached). */
