@@ -95,6 +95,11 @@ public class ModelManager implements DisposableBean {
         this.kvStore = kvStore;
     }
 
+    // --- audio (speech-to-text / text-to-speech models are held by AudioService; a downloaded Whisper or OuteTTS
+    // checkpoint is recognised after the download and loaded there instead of as a text model)
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
+
     @EventListener(ApplicationReadyEvent.class)
     public void autoload() {
         for (String spec : props.autoload()) {
@@ -144,6 +149,11 @@ public class ModelManager implements DisposableBean {
 
     /** Unloads a model: running requests on it are cancelled first. */
     public void unload(String id) throws InterruptedException {
+        if (audio != null && audio.has(id)) {
+            audio.unload(id);
+            System.err.println("Unloaded " + id);
+            return;
+        }
         LoadedModel m;
         synchronized (this) {
             m = loaded.get(id);
@@ -243,6 +253,13 @@ public class ModelManager implements DisposableBean {
             }
             checkInterrupted();
             job.phase = "loading";
+            if (audio != null && !t.local() && audio.isAudio(repoDir(s, t.model()))) { // audio model: AudioService holds it
+                System.err.println("Loading " + t.id() + " (" + t.model() + ") as an audio model");
+                org.robomiri.jllm.audio.AudioModels.Entry a = audio.load(s, t.id(), t.model(), repoDir(s, t.model()));
+                writeMarker(s, t);
+                System.err.println("Loaded " + t.id() + ": " + a.kind().label() + ", " + a.backend());
+                return;
+            }
             System.err.println("Loading " + t.id() + " (" + t.model() + ")");
             ModelLoader.Loaded l = ModelLoader.load(s, hub, t.model(), slots); // budgets for every slot's cache
             if (Thread.currentThread().isInterrupted()) {
@@ -556,6 +573,11 @@ public class ModelManager implements DisposableBean {
         Map<String, List<String>> users = new LinkedHashMap<>();
         for (LoadedModel m : loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+        }
+        if (audio != null) {
+            for (var a : audio.loaded()) {
+                users.computeIfAbsent(a.source(), k -> new ArrayList<>()).add(a.id());
+            }
         }
         List<LocalModel> out = new ArrayList<>();
         for (Path root : modelRoots()) {

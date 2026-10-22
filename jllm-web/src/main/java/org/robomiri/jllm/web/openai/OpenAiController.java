@@ -58,11 +58,18 @@ public class OpenAiController {
         this.props = props;
     }
 
+    // loaded speech-to-text / text-to-speech models are listed too (kind: "speech-to-text" / "text-to-speech")
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.audio.AudioService audio;
+
     @GetMapping(value = "/v1/models", produces = "application/json")
     public String listModels() {
         List<Object> data = new ArrayList<>();
         for (LoadedModel m : models.loaded()) {
             data.add(modelObject(m));
+        }
+        if (audio != null) {
+            data.addAll(org.robomiri.jllm.audio.AudioApi.modelObjects(audio.models()));
         }
         return Json.write(Json.obj("object", "list", "data", data));
     }

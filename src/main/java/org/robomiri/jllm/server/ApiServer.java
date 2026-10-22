@@ -92,6 +92,7 @@ public final class ApiServer implements AutoCloseable {
 
     private final Engine engine;
     private final String modelId;
+    private volatile AudioRoutes audio; // null: no /v1/audio endpoints
     private final HttpServer http;
     private final AtomicLong counter = new AtomicLong();
     private final AtomicBoolean thinkingNoted = new AtomicBoolean();
@@ -124,6 +125,11 @@ public final class ApiServer implements AutoCloseable {
         return http.port();
     }
 
+    /** Offers the OpenAI audio endpoints of {@code audio} (speech-to-text / text-to-speech models) as well. */
+    public void setAudio(AudioRoutes audio) {
+        this.audio = audio;
+    }
+
     public void serve() {
         http.serve();
     }
@@ -143,12 +149,21 @@ public final class ApiServer implements AutoCloseable {
             res.send(204, "text/plain", "");
             return;
         }
+        AudioRoutes ar = audio;
+        if (ar != null && ar.handle(path, req, res)) {
+            return;
+        }
         switch (path) {
             case "/", "/index.html" -> res.send(200, "text/html; charset=utf-8", WebUi.HTML);
             case "/health" -> res.send(200, "application/json", Json.write(Json.obj("status", "ok", "model", modelId)));
-            case "/v1/models" -> res.send(200, "application/json", Json.write(Json.obj(
-                    "object", "list",
-                    "data", List.of(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve")))));
+            case "/v1/models" -> {
+                List<Object> data = new java.util.ArrayList<>();
+                data.add(Json.obj("id", modelId, "object", "model", "owned_by", "jllm-serve"));
+                if (ar != null) {
+                    data.addAll(ar.modelObjects());
+                }
+                res.send(200, "application/json", Json.write(Json.obj("object", "list", "data", data)));
+            }
             case "/v1/chat/completions" -> completion(req, res, true);
             case "/v1/completions" -> completion(req, res, false);
             default -> res.send(404, "application/json", error("not found: " + path));

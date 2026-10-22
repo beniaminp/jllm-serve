@@ -708,4 +708,158 @@ router_norm()
 router_norm(remap=True, ntok=5)
 router_norm(ds=True)
 router_norm(ds=True, method=1, sigmoid=0, remap=True)
+
+
+# ---------------------------------------------------------------------------------------------- audio.metal (Whisper)
+import math
+
+
+def np_gelu(v):
+    return 0.5 * v * (1.0 + np.vectorize(math.erf)(v / math.sqrt(2.0)))
+
+
+def wh_gemm(variant, rows, cols, ntok, batch=1, bias=True, gelu=False, acc=False, ld_pad=0):
+    """wh_gemm_<w><t>: out[t][r] (+)= act(bias[r] + x[t] . w[r]) against float64 numpy on the (half-rounded) operands,
+    batched over z with strides, for shapes that are not multiples of the 64 x 32 x 32 tiles."""
+    rng = np.random.default_rng(11)
+    half_w = variant[0] == 'h'
+    half_tile = variant[1] == 'h'
+    ldw = cols + ld_pad
+    w32 = rng.standard_normal((batch, rows, ldw)).astype(np.float32) * 0.3
+    w = w32.astype(np.float16) if half_w else w32
+    x = rng.standard_normal((batch, ntok, cols)).astype(np.float32)
+    b = rng.standard_normal(rows).astype(np.float32)
+    out0 = rng.standard_normal((batch, ntok, rows)).astype(np.float32)
+    out = out0.copy() if acc else np.zeros_like(out0)
+    flags = (1 if bias else 0) | (2 if gelu else 0) | (4 if acc else 0)
+    p = pack('iiiiiiiiii', rows, cols, ntok, ldw, cols, rows, flags, rows * ldw, ntok * cols, ntok * rows)
+    E.dispatch('wh_gemm_' + variant, [w, x, out, b], p, ((rows + 63) // 64, (ntok + 31) // 32, batch), (128,))
+    wd = w.astype(np.float64)
+    if half_tile and not half_w:
+        wd = w32.astype(np.float16).astype(np.float64)       # the float weight is rounded to half in the tile
+    ref = np.einsum('btk,brk->btr', x.astype(np.float64), wd[:, :, :cols])
+    if bias:
+        ref = ref + b[None, None, :]
+    if gelu:
+        ref = np_gelu(ref)
+    if acc:
+        ref = ref + out0
+    err = np.abs(out - ref).max() / max(1.0, np.abs(ref).max())
+    check(err < 2e-5, 'wh_gemm_%s rows=%d cols=%d ntok=%d batch=%d bias=%s gelu=%s acc=%s: max rel err %.2e'
+          % (variant, rows, cols, ntok, batch, bias, gelu, acc, err))
+
+
+for v in ('hh', 'hf', 'fh', 'ff'):
+    wh_gemm(v, 70, 100, 37)
+wh_gemm('hh', 64, 32, 32, bias=False)
+wh_gemm('ff', 128, 96, 64, gelu=True)
+wh_gemm('hh', 100, 80, 5, acc=True, gelu=True)
+wh_gemm('ff', 75, 33, 40, batch=3, bias=False)
+wh_gemm('ff', 64, 70, 33, batch=2, bias=False, ld_pad=26)
+
+
+def wh_layernorm(n, d):
+    rng = np.random.default_rng(12)
+    x = (rng.standard_normal((n, d)) * 3 + 1).astype(np.float32)
+    g = rng.standard_normal(d).astype(np.float32)
+    bt = rng.standard_normal(d).astype(np.float32)
+    out = np.zeros_like(x)
+    E.dispatch('wh_layernorm', [x, out, g, bt], pack('ifi', d, 1e-5, 1), (n,), (256,))
+    xd = x.astype(np.float64)
+    ref = (xd - xd.mean(1, keepdims=True)) / np.sqrt(xd.var(1, keepdims=True) + 1e-5) * g + bt
+    err = np.abs(out - ref).max()
+    check(err < 3e-5, 'wh_layernorm n=%d d=%d: max err %.2e' % (n, d, err))
+    inplace = x.copy()
+    E.dispatch('wh_layernorm', [inplace, inplace, g, bt], pack('ifi', d, 1e-5, 1), (n,), (256,))
+    check(np.array_equal(inplace, out), 'wh_layernorm in place gives the same bytes')
+
+
+wh_layernorm(5, 384)
+wh_layernorm(3, 1280)
+
+
+def wh_im2col():
+    rng = np.random.default_rng(13)
+    c, t = 5, 11
+    mel = rng.standard_normal((c, t)).astype(np.float32)
+    col = np.zeros((t, c * 3), np.float32)
+    E.dispatch('wh_im2col_mel', [mel, col], pack('iii', t, c, t), ((t * c * 3 + 255) // 256,), (256,))
+    ref = np.zeros((t, c * 3), np.float32)
+    for tt in range(t):
+        for ch in range(c):
+            for k in range(3):
+                i = tt + k - 1
+                ref[tt, ch * 3 + k] = mel[ch, i] if 0 <= i < t else 0
+    check(np.array_equal(col, ref), 'wh_im2col_mel: patches of the first convolution')
+    tin, t2 = 12, 6
+    h = rng.standard_normal((tin, c)).astype(np.float32)
+    col2 = np.zeros((t2, c * 3), np.float32)
+    E.dispatch('wh_im2col_s2', [h, col2], pack('iii', t2, c, tin), ((t2 * c * 3 + 255) // 256,), (256,))
+    ref2 = np.zeros((t2, c * 3), np.float32)
+    for tt in range(t2):
+        for ch in range(c):
+            for k in range(3):
+                i = 2 * tt + k - 1
+                ref2[tt, ch * 3 + k] = h[i, ch] if 0 <= i < tin else 0
+    check(np.array_equal(col2, ref2), 'wh_im2col_s2: patches of the stride-2 convolution')
+
+
+wh_im2col()
+
+
+def wh_split_heads(n=7, heads=3, hd=8, cap=12, pos0=2):
+    rng = np.random.default_rng(14)
+    d = heads * hd
+    q, k, v = [rng.standard_normal((n, d)).astype(np.float32) for _ in range(3)]
+    qh = np.zeros((heads, n, hd), np.float32)
+    kh = np.full((heads, cap, hd), 7, np.float32)
+    vt = np.full((heads, hd, cap), 7, np.float32)
+    scale = 0.125
+    E.dispatch('wh_split_heads', [q, k, v, qh, kh, vt], pack('iiiiifii', n, heads, hd, cap, pos0, scale, 1, 1),
+               ((n * d + 255) // 256,), (256,))
+    rq = (q * np.float32(scale)).reshape(n, heads, hd).transpose(1, 0, 2)
+    rk = np.full((heads, cap, hd), 7, np.float32)
+    rk[:, pos0:pos0 + n, :] = k.reshape(n, heads, hd).transpose(1, 0, 2)
+    rv = np.full((heads, hd, cap), 7, np.float32)
+    rv[:, :, pos0:pos0 + n] = v.reshape(n, heads, hd).transpose(1, 2, 0)
+    check(np.array_equal(qh, rq) and np.array_equal(kh, rk) and np.array_equal(vt, rv),
+          'wh_split_heads: q scaled, k rows and v columns at position %d, the rest untouched' % pos0)
+
+
+wh_split_heads()
+
+
+def wh_softmax(n=9, heads=2, length=70, causal=True, pos0=3):
+    rng = np.random.default_rng(15)
+    s = (rng.standard_normal((heads, n, length)) * 4).astype(np.float32)
+    got = s.copy()
+    E.dispatch('wh_softmax', [got], pack('iiii', n, length, int(causal), pos0), (n, heads), (256,))
+    ref = np.zeros_like(s, np.float64)
+    for h in range(heads):
+        for t in range(n):
+            vis = min(length, pos0 + t + 1) if causal else length
+            e = np.exp(s[h, t, :vis].astype(np.float64) - s[h, t, :vis].max())
+            ref[h, t, :vis] = e / e.sum()
+    err = np.abs(got - ref).max()
+    check(err < 1e-6, 'wh_softmax n=%d len=%d causal=%s: max err %.2e, masked tail zero %s'
+          % (n, length, causal, err, (got[:, 0, min(length, pos0 + 1):] == 0).all() if causal else True))
+
+
+wh_softmax()
+wh_softmax(causal=False, length=300)
+
+
+def wh_embed(half_table, n=5, d=40, vocab=30, pos0=3):
+    rng = np.random.default_rng(16)
+    table = rng.standard_normal((vocab, d)).astype(np.float16 if half_table else np.float32)
+    pos = rng.standard_normal((20, d)).astype(np.float32)
+    tok = rng.integers(0, vocab, n).astype(np.int32)
+    x = np.zeros((n, d), np.float32)
+    E.dispatch('wh_embed_' + ('h' if half_table else 'f'), [table, pos, tok, x], pack('iii', n, d, pos0), ((n * d + 255) // 256,), (256,))
+    ref = table[tok].astype(np.float32) + pos[pos0:pos0 + n]
+    check(np.array_equal(x, ref), 'wh_embed_%s: token embedding plus learned position %d.., exact' % ('h' if half_table else 'f', pos0))
+
+
+wh_embed(True)
+wh_embed(False)
 sys.exit(1 if failures else 0)

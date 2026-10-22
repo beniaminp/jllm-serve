@@ -32,5 +32,6 @@ Suggested reading order:
 | 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding, tokenizing only what is new, noticing a client that left, constrained tool calls with jump-forward and speculation under the constraint (§17.7) — measured |
 | 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
 | 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push to Docker Hub, run; the /data volume, the API key, memory sizing, proxies, what was verified |
+| 21 | [Audio](21-audio.md) | Speech-to-text and text-to-speech: the log-mel spectrogram, Whisper's encoder, decoder and cross-attention, the special-token protocol, timestamps and word timestamps (DTW), Whisper on Metal; OuteTTS (a Qwen2 language model that writes audio-codec tokens) and the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT); the API, the Audio tab with its waveform editor, the chat tools; checked against transformers and the Python packages, measured against whisper.cpp |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

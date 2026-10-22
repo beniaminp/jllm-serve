@@ -416,6 +416,28 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- AudioTest: log-mel, a tiny random Whisper (CPU and Metal) against transformers, decoding protocol, audio
+                         files, resampling, OuteTTS text front end, API functions; the WavTokenizer check runs when its GGUF is on disk -->
+                    <execution>
+                        <id>audio-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.AudioTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
             <plugin>

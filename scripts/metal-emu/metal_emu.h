@@ -37,6 +37,7 @@ EMU_VEC(ulong)
 typedef uchar4 packed_uchar4;
 typedef char4 packed_char4;
 typedef float4 packed_float4;
+typedef half4 packed_half4;
 
 // ---- constructors: mk_float4(scalar) splats, mk_float4(a, b, c, d) composes, mk_float4(vector) converts
 template <typename V> struct emu_elem;
