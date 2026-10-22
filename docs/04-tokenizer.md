@@ -242,7 +242,7 @@ decode to the same text but would be out-of-distribution for the model and hurt 
 The same `Tokenizer` class loads the tokenizers of Llama 3, Mistral, Gemma 2/3, Phi-3 / Phi-4-mini / phi-4,
 GLM-4 / GLM-Edge, DeepSeek-V2 / DeepSeek-R1-Distill and Mamba (GPT-NeoX). All of them are
 `"model": {"type": "BPE"}`. (The Unigram and WordPiece models are implemented too, for tokenizers outside these
-families; see 4.12.) What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
+families; see 4.12. A GGUF file carries its tokenizer as lists in its metadata instead of a `tokenizer.json`; see 4.13.) What differs is the pipeline around the merge loop, which is read from `tokenizer.json`:
 
 | Family | normalizer | pre-tokenizer | model flags | decoder |
 |---|---|---|---|---|
@@ -544,3 +544,72 @@ The pipeline around it:
 
 The BOS of these tokenizers comes from their `TemplateProcessing` post-processor as before: `[CLS]` for BERT and
 ALBERT, `<s>` for XLM-R, none for T5; `encode` never adds it (nor the trailing `[SEP]` / `</s>`).
+
+## 4.13 How a GGUF file carries its tokenizer
+
+🧸 **A box with a word list and a name tag.** A GGUF file ([chapter 16](16-gguf.md)) is one box that holds everything about a model. The tokenizer travels in the box as plain lists: all the puzzle pieces of the vocabulary, a score or a "which pieces glue first" list for each, and a label on every piece saying whether it is an ordinary piece, a
+special signal such as "the turn ends here", or a raw byte. What the box does **not** hold is the instruction for *cutting the sentence into words before gluing*: it holds only a name tag for that instruction (`llama-bpe`, `qwen2`, `deepseek-llm` ...), and the instruction itself is written out inside llama.cpp. Each family cuts differently:
+Llama 3 chops a long number into groups of three digits, Qwen takes digits one at a time, GPT-2 keeps a whole number together. If jllm cut even one place differently from llama.cpp, the model would be fed pieces it was never taught and answer a little worse without any error. So jllm has the same instruction for every name tag, and refuses a tag it does not know.
+
+📐 **What the file stores.** All keys start with `tokenizer.ggml.`:
+
+| key | holds | used for |
+|---|---|---|
+| `model` | `gpt2` (byte-level BPE), `llama` (SentencePiece), `t5` (SentencePiece unigram; see 4.12) | which kind of tokenizer to build |
+| `tokens` | the vocabulary, a string for each id | the vocabulary |
+| `token_type` | per id: 1 normal, 2 unknown, 3 control, 4 user-defined, 5 unused, 6 byte | special tokens, byte fallback |
+| `merges` | `"a b"` strings in merge order (byte-level BPE only) | the merge loop of 4.6 |
+| `scores` | a log-probability per piece (`llama` and `t5`) | SentencePiece segmentation |
+| `pre` | the name tag of the cutting instruction | the pre-tokenizer of 4.5 |
+| `bos_token_id`, `eos_token_id`, `unknown_token_id`, `add_bos_token`, `add_eos_token` | ids and flags | the BOS rule (below) |
+| `add_space_prefix`, `remove_extra_whitespaces`, `precompiled_charsmap` | SentencePiece normalization | the `▁` prefix and, for `t5`, the normalization table |
+| `tokenizer.chat_template` (no `ggml.`), `general.name` | the Jinja chat template; the model's name | the chat template of 4.9; Phi-3's whitespace rule |
+
+**How jllm uses it.** `GgufTokenizer.build` does not contain a second tokenizer. It writes, in memory, the `tokenizer.json` that the same model has in the Hugging Face world and loads it with the `Tokenizer` of this chapter:
+
+```
+ GGUF metadata                                         tokenizer.json built in memory                          the Tokenizer of 4.2-4.9
+ tokens, merges, token_type (normal / user / control) ► model {type BPE, vocab, merges, ignore_merges}   ┐
+ pre = "qwen2"  ───────────────────────────────────►  pre_tokenizer Sequence [ Split(regex 1, Isolated),   │  the same merge loop,
+                                                                              Split(regex 2, Isolated) …,  ├  the same added-token scan,
+                                                                              ByteLevel ]                  │  the same decoder
+ control / user-defined tokens ───────────────────►  added_tokens (special: true / false, rstrip for Phi-3) ┘
+ model = llama: tokens, scores ───────────────────►  model {type LlamaSpm, spm_tokens, spm_scores, byte_fallback}, normalizer Prepend ▁ + Replace " " → ▁
+```
+
+**The pre-tokenizer is a list of regular expressions** applied one after the other; each cuts the pieces the previous one left, keeping the matches *and* the text between them (a Hugging Face `Sequence` of `Split` with `Isolated`), and then GPT-2's byte spelling follows. Two flags come with the name tag: `ignore_merges` (a piece that is already a token is not merged further) and the default for the BOS. The same sentence cut by five name tags (the regexes of `GgufPre` applied
+in order; a leading space belongs to the word after it, written here with `␣`):
+
+```
+text:  "I have 12345 cats, don't panic!"
+gpt-2 (1 regex, digits stay together):     I | ␣have | ␣12345 | ␣cats | , | ␣don | 't | ␣panic | !
+llama-bpe (1 regex, digits in threes):     I | ␣have | ␣ | 123 | 45 | ␣cats | , | ␣don | 't | ␣panic | !        ignore_merges, BOS added
+qwen2 (1 regex, one digit at a time):      I | ␣have | ␣ | 1 | 2 | 3 | 4 | 5 | ␣cats | , | ␣don | 't | ␣panic | !
+deepseek-llm (6 regexes, digits together): I | ␣have | ␣ | 12345 | ␣cats | , | ␣don | ' | t | ␣panic | !
+default / key absent (4 regexes):          I | ␣have | ␣ | 123 | 45 | ␣cats | , | ␣don | ' | t | ␣panic | !         llama.cpp's default, not GPT-2's
+```
+
+(`llama-bpe` and `qwen2` end each digit group alone after a lone space piece because their expression for numbers does not take the leading space.) After cutting, each piece goes through the merge loop of 4.6 on its own. A missing key or `default` is llama.cpp's own default (the last line), **not** GPT-2's; a value jllm does not know is refused with its name, and the loader then looks for the original model's `tokenizer.json` named in the file's `general.base_model.0.repo_url` / `general.source.url`
+([16.7](16-gguf.md#167-the-tokenizer-in-the-file)). [16.12](16-gguf.md#1612-tokenizer-pre-tokenizers-which-values-are-supported-and-how-they-were-checked) has the table of all name tags and how each was checked.
+
+**SentencePiece is not BPE.** For `model = llama` (Llama 2, Mistral 7B, Gemma, Phi-3) the file has scores, not merges, and llama.cpp segments greedily: the characters are the first symbols; then, over and over, the adjacent pair whose concatenation is a token of the vocabulary and has the **best score** is merged (equal scores: the leftmost pair); a character that is no token becomes its `<0xXX>` byte tokens (`SpmGreedy`). A toy vocabulary
+(scores invented; the code was run on it) for `▁hello`:
+
+```
+symbols  ▁ h e l l o            pairs that are tokens (score):  ▁h −3.0, he −2.0, el −5.0, ll −1.5, lo −4.0         → merge ll (best, −1.5)
+symbols  ▁ h e ll o            new pairs: ell −6.0, llo −2.5; he −2.0 is still the best                                → merge he
+symbols  ▁ he ll o             new pairs: ▁he −3.5, hell −2.2; llo −2.5                                                → merge hell
+symbols  ▁ hell o              new pairs: ▁hell −4.0, hello −1.0                                                       → merge hello
+symbols  ▁ hello               ▁hello −0.5                                                                             → merge ▁hello       result: one token
+"▁helloé": the é is no token and becomes its UTF-8 bytes <0xC3> <0xA9>      →  ▁hello <0xC3> <0xA9>
+```
+
+Turning the same scores into BPE merge ranks (as `transformers` does) gives a different result as soon as two scores are equal, which is why jllm follows llama.cpp here: Gemma's scores are all 0, so every pair ties and the leftmost wins.
+
+**Special tokens and BOS.** Tokens of type control (`<|im_start|>`, `<|endoftext|>`) and user-defined (`<think>`, `<tool_call>`) are found in the text before anything else, as the *added tokens* of 4.7; llama.cpp also treats some tokens as control by their **name** whatever the file says (`<|im_end|>`, `</s>`, the fill-in-the-middle markers), and so does jllm. Control tokens are recognised in the text when special tokens are parsed (a chat prompt); user-defined ones are recognised even in untrusted text (`encode(text, false)`), as in llama.cpp. Phi-3 files (`general.name`) make special tokens swallow the whitespace that follows them. A BOS is added when `add_bos_token` says so; when the key is absent: yes for SentencePiece, `llama-bpe` and `tekken`, no otherwise.
+
+**Why this design.** The alternative to rebuilding a Hugging Face tokenizer is a second, llama.cpp-shaped encoder next to the first; this way there is one merge loop to keep fast and correct and only the *translation* is new. The costs: the translation must reproduce llama.cpp's behaviour, which differs from the Hugging Face tokenizer of the same model in a few places (no NFC normalization, `</s>` a control token: on Qwen3, 5 of the 150 fixture strings), and
+every name tag needs its regexes copied from llama.cpp (four small changes so `java.util.regex` acts like C++; see [16.12](16-gguf.md#1612-tokenizer-pre-tokenizers-which-values-are-supported-and-how-they-were-checked)).
+**Settings.** None: the tokenizer follows the file. If a name tag is unknown the load fails with the tag in the message, or falls back to the original `tokenizer.json` when the file names its source repository.
+**Checked.** Against `llama-tokenize` on 14 871 strings per name tag, llama.cpp's own `ggml-vocab-*.gguf` files (47 strings each), and Qwen3-0.6B's GGUF against its `tokenizer.json` (145 of 145 strings): [16.7](16-gguf.md#167-the-tokenizer-in-the-file) and [16.12](16-gguf.md#1612-tokenizer-pre-tokenizers-which-values-are-supported-and-how-they-were-checked) have the numbers and the commands (`scripts/gguf-tokenizer-check.sh`, `GgufTokenizerTest`).
+**Limits.** WordPiece (`bert`), `add_eos_token`, and the name tags that are not regex lists are refused; characters assigned in Unicode 14-17 differ from llama.cpp's older tables; two overlapping special tokens resolve leftmost here and longest in llama.cpp ([16.12](16-gguf.md#1612-tokenizer-pre-tokenizers-which-values-are-supported-and-how-they-were-checked) lists every deliberate difference).
