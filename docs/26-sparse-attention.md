@@ -260,10 +260,63 @@ The values are the model loader's (`ModelLoader.sparse`); a pool is created for 
 
 ## 26.5 Measured
 
-MEASURED_PLACEHOLDER
+Machine: Apple M1 Pro, 10 cores, 32 GB, macOS, 2026-10-22, Qwen3-0.6B (Q4_0 weights), shared with other jobs (the speed rows are taken under the heavy-job lock).
+Tool: `src/test/java/org/robomiri/jllm/KvStudy.java` (`needle`, `decodeppl`, `sparsecheck`) and `./jllm bench`.
+
+### 26.5.1 What was checked first: the sparse step against the dense one
+
+`KvStudy sparsecheck` (3 000 tokens of context, 16 chosen blocks, 64-token window, 24 teacher-forced decode steps, `ctx=4096 batch=256`), Metal:
+
+| cache | decode replay on = off | verification chunk of 8 rows vs 8 steps, largest logit difference (sparse / dense) | CPU vs Metal sparse, largest logit difference (largest logit) |
+|---|---|---|---|
+| f32 | bit for bit | 9.5e-6 / 9.3e-6 | 0.44 (21.6), arg max 24/24 |
+| f16 | bit for bit | 2.4e-3 / 2.6e-3 | 1.30 (21.6), arg max 24/24 |
+| q8, rotated keys | bit for bit | 3.4e-1 / 1.2e-1 | 2.81 (22.2), arg max 23/24 |
+
+Replay and chunks behave as they do with dense attention (the verification difference is the 8-row projections' rounding, equal for dense and sparse in f32 and f16). CPU and Metal add the bound's terms in a different order, which can put a block on the other side of the cut; the follow-up measurements count the selections that differ and give the dense CPU-vs-Metal difference for comparison (`KvStudy sparsecheck` prints both).
+
+### 26.5.2 Retrieval, perplexity, speed
+
+The needle-in-a-haystack, decode perplexity and decode speed tables (8k / 16k / 32k tokens) are being measured under the shared GPU lock and are added in a follow-up commit; the commands are:
+
+```sh
+JAVA="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Djllm.metal.lib=target/native/libjllm_metal.dylib"
+$JAVA -cp target/classes:target/test-classes org.robomiri.jllm.KvStudy needle model=models/Qwen_Qwen3-0.6B backend=metal ctx=33280 batch=256 \
+    lens=8192,16384,32000 trials=3 depths=3 tail=0 variants=f16,f16+s128,f16+s64,f16+s32,f16+s16,q8r,q8r+s64
+$JAVA -cp target/classes:target/test-classes org.robomiri.jllm.KvStudy decodeppl model=models/Qwen_Qwen3-0.6B backend=metal ctx=33280 batch=256 \
+    lens=8192,16384,32768 tail=512 text=<a long document> variants=f16,f16+p,f16+s128,f16+s64,f16+s32,f16+s16,q8r,q8r+s64
+./jllm bench --backend metal --ctx 40960 --batch 256 --bench.prompt-repeat 3200 --bench.max-tokens 128 --bench.rounds 3 --engine.speculative off \
+    --backend.kv-dtype f16 --backend.kv-sparse true            # against --backend.kv-paged true (dense) and the flat default
+```
+
 
 ---
 
 ## 26.6 Checks and limits
 
-LIMITS_PLACEHOLDER
+Verified by (all in `mvn -o install`, `scripts/metal-emu/kernel_tests.py` and the studies of 26.5):
+
+* `cpu/SparseKvTest` (no model, 1 405 checks, `mvn -o install`): the outward rounding of halves; the stored summary of every block is
+  bit for bit the outward-rounded min / max of the dequantized valid rows, for f32, f16, q8 and q8 with rotated keys, head widths 64 and 128, group sizes
+  1…4, block sizes 16 and 32; the bound is never below the best score of any key of a block; the selected blocks are the sinks, the window and candidates that
+  bound no lower than any rejected one; a planted key is always found; the output equals a float64 attention over exactly the selected keys (soft-cap too);
+  a verification chunk of 12 rows straddling the budget equals 12 decode steps **bit for bit**; a pool without the switch has no summary region.
+* `scripts/metal-emu/kernel_tests.py` (numpy references; emulator and, with the same kernels, the GPU): `kv_summary` bit for bit (f32 / f16 / q8 / rotated q8, head
+  widths 64 / 128 / 256, blocks of 8 … 64, chunks that start inside a block, a value beyond the largest half); `sparse_score_d*` (groups of 1 … 8 query heads, one block, 800
+  positions); `sparse_select` (random, tied, all-equal and wide-range scores, 40 … 5 000 blocks, top 1 … 64, no sink, no window: the set, the order and the physical ids equal numpy's); `attention_dec_sp`
+  for f32 / f16 / q8 at 1, 3, 5 splits, soft-cap, the token in the first and last row of its block; and the four kernels in a row against a numpy implementation of the whole step with a planted key.
+* `MetalParamsTest`: the four new parameter structs against `KernelParams`.
+* `KvStudy sparsecheck` on Qwen3-0.6B: CPU and Metal logits of 24 decode steps at 3 000 tokens, decode replay on against off, a verification chunk against decode steps (26.5.4).
+* Off means off: with `backend.kv-sparse=false` no summary region is allocated, no kernel is dispatched and no code path of the paged cache differs (the md5 gate and `PagedKvTest` are unchanged).
+
+**Not done / limits.**
+
+* **The scan of the summaries is linear in the context** (a quarter to a sixteenth of the key traffic, 26.2.2). At a million tokens it is 7.5 GB per token for Qwen3-0.6B; a two-level scheme (a summary of 64 blocks scored first) would make it sub-linear. Not built.
+* **No tiered storage yet:** the blocks a step does not select stay in memory. Sparse attention is the first half of "read less"; moving cold blocks out of RAM / VRAM (the next item of `wip/NEXT-PROMPT.md` Stage 2) needs the selection to run ahead of the read.
+* **Prefill is dense**, including the part of a long prompt that runs in chunks of 16 or more; only steps of fewer than 16 tokens select. Sparse prefill is its own item.
+* **Per kv head, shared by the query-head group:** a head that needs a block its group mates do not still gets it (the group's maximum), at the price of reading blocks one head wanted for all.
+* **Metal: head sizes 64, 128, 256 only** (the dec kernels'), f32 / f16 / q8 paged caches; `attention_dec` is forced on for a sparse run (the start-up check that normally decides it is skipped for the dense rows).
+* **Models:** grouped-query attention with full causal layers. Layers with a sliding window (Gemma) stay dense, Mamba / Qwen3-Next / DeepSeek's latent cache / q4 caches have no paged cache and are dense.
+* **Summaries are halves:** keys beyond ±65 504 (none in the models we run) are clamped, which would make the bound approximate for that block.
+* **Long-context models:** the studies stop at what the model supports: Qwen3-0.6B has 40 960 positions (no RoPE scaling configured), measured to 32 000. The only larger model in `models/` that supports 128k+ is Qwen3-30B-A3B-Thinking-2507 (262 144 positions); it was **not** run at 128k: its q4 weights (19.4 GB) plus a 128k cache (6.7 GB in q8, 12.9 GB in f16) do not fit next to the other jobs of a 32 GB Mac, so the long-context studies stop at Qwen3-0.6B's 32 000 tokens.
+

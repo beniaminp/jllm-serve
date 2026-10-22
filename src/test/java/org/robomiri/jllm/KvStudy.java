@@ -215,6 +215,7 @@ public final class KvStudy {
             String saved = backendName;
             int steps = 24;
             float[][][] logits = new float[3][steps][vocab];
+            int[][][][] picked = new int[2][steps][][];
             String[] names = {"cpu", "metal", "metal"};
             for (int run = 0; run < 3; run++) {
                 backendName = names[run];
@@ -222,12 +223,19 @@ public final class KvStudy {
                     if (run == 2 && b instanceof MetalBackend mb) {
                         mb.replay(false);
                     }
+                    if (b instanceof CpuBackend cb) {
+                        cb.recordSparseSelection();
+                    }
                     float[] lg = new float[vocab];
                     int[] head = java.util.Arrays.copyOf(text, len);
                     prefill(b, head, lg);
                     for (int t = 0; t < steps; t++) {
                         System.arraycopy(lg, 0, logits[run][t], 0, vocab);
                         b.forward(text, len + t, 1, len + t, lg);
+                        if (run < 2) {
+                            int[][] sel = b instanceof CpuBackend cb ? cb.lastSparseSelection() : ((MetalBackend) b).lastSparseSelection();
+                            picked[run][t] = sel == null ? null : java.util.Arrays.stream(sel).map(int[]::clone).toArray(int[][]::new);
+                        }
                     }
                 }
             }
@@ -241,12 +249,52 @@ public final class KvStudy {
                 }
                 agree += argmax(logits[0][t]) == argmax(logits[1][t]) ? 1 : 0;
             }
+            int selDiffer = 0;
+            int blocksDiffer = 0;
+            int total = 0;
+            for (int t = 0; t < steps; t++) {
+                for (int g = 0; picked[0][t] != null && picked[1][t] != null && g < picked[0][t].length; g++) {
+                    java.util.Set<Integer> a = new java.util.HashSet<>();
+                    for (int x : picked[0][t][g]) {
+                        a.add(x);
+                    }
+                    int miss = 0;
+                    for (int x : picked[1][t][g]) {
+                        miss += a.contains(x) ? 0 : 1;
+                    }
+                    selDiffer += miss > 0 ? 1 : 0;
+                    blocksDiffer += miss;
+                    total++;
+                }
+            }
+            System.out.printf("# sparse check %s: last layer's selection, CPU against Metal: %d of %d (step, kv head) selections differ, %d blocks of %d%n",
+                    v, selDiffer, total, blocksDiffer, total * (picked[0][0] == null ? 0 : picked[0][0][0].length));
             boolean replaySame = true;
             for (int t = 0; t < steps; t++) {
                 replaySame &= java.util.Arrays.equals(logits[1][t], logits[2][t]);
             }
             System.out.printf(Locale.ROOT, "# sparse check %s, %d tokens: CPU vs Metal max |logit difference| %.4f (largest logit %.2f), arg max equal %d/%d;"
                     + " Metal with decode replay on = off bit for bit: %s%n", v, len, worst, top, agree, steps, replaySame);
+            String denseV = v.substring(0, v.indexOf('+')) + "+p";
+            float[][][] d = new float[2][8][vocab];
+            for (int run = 0; run < 2; run++) {
+                backendName = names[run];
+                try (Backend b = open(denseV)) {
+                    float[] lg = new float[vocab];
+                    prefill(b, java.util.Arrays.copyOf(text, len), lg);
+                    for (int t = 0; t < 8; t++) {
+                        System.arraycopy(lg, 0, d[run][t], 0, vocab);
+                        b.forward(text, len + t, 1, len + t, lg);
+                    }
+                }
+            }
+            double dw = 0;
+            for (int t = 0; t < 8; t++) {
+                for (int i = 0; i < vocab; i++) {
+                    dw = Math.max(dw, Math.abs(d[0][t][i] - d[1][t][i]));
+                }
+            }
+            System.out.printf(Locale.ROOT, "# sparse check: for reference, dense paged %s CPU vs Metal over 8 steps: max |logit difference| %.4f%n", denseV, dw);
             backendName = "metal";
             String dense = v.substring(0, v.indexOf('+')) + "+p";
             System.out.printf(Locale.ROOT, "# sparse check: a verification chunk of 8 rows against 8 decode steps (Metal), largest logit difference:"

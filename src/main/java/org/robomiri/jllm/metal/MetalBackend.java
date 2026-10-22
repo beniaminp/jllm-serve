@@ -2206,6 +2206,30 @@ public final class MetalBackend implements Backend {
         return seq;
     }
 
+    /**
+     * For tests and studies (docs/26): the logical blocks the last sparse decode step selected per kv head in the last sparse layer
+     * it ran (sinks, chosen blocks, window, ascending), or null when sparse attention is off.
+     */
+    public int[][] lastSparseSelection() {
+        if (!sparseOn) {
+            return null;
+        }
+        int kvHeads = ((Attention.Gqa) arch.attention()).kvHeads();
+        int budget = sparse.budget(1 << pageShift);
+        java.util.Map<Integer, Integer> byPhysical = new java.util.HashMap<>();
+        for (int j = 0; j < seq.blocks(); j++) {
+            byPhysical.put(seq.block(j), j);
+        }
+        int[][] out = new int[kvHeads][budget];
+        for (int g = 0; g < kvHeads; g++) {
+            for (int i = 0; i < budget; i++) {
+                Integer j = byPhysical.get(sparseSel.contents().getAtIndex(ValueLayout.JAVA_INT, (long) g * budget + i));
+                out[g][i] = j == null ? -1 : j;
+            }
+        }
+        return out;
+    }
+
     /** The pool buffer row of position {@code s} of this backend's cache (paged: through the block table). */
     private long rowOf(int s) {
         return seq == null ? s : rowOf(seq, s);

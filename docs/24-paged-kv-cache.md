@@ -534,4 +534,4 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
   need the slot, the pool would, so a pool smaller than `slots · ctx` can run out: `KvPoolExhausted`).
 * The flat-cache attention on Metal needs a scores scratch of `tile · heads · ctx` floats, so the Metal paged cache reaches a million tokens
   in storage but not through `attention_t`; the decode kernels (`attention_dec`, `attention_split`) have no such limit.
-* No scheduler, no sparse attention, no tiered (host / SSD) storage yet: this chapter is the foundation they need.
+* No scheduler, no tiered (host / SSD) storage yet: this chapter is the foundation they need. Sparse decode attention on this cache is chapter 26.
