@@ -110,6 +110,13 @@ public final class PagedEngineTest {
             // The vector reductions of the kernels (reduceLanes) may add in another order in the interpreter, in C1 and in C2,
             // so the same call can differ in the last bit while the JVM warms up, even on the flat cache. The script runs on
             // the flat cache twice; once those two agree the JVM is warm for this code, and the paged run must equal them.
+            // Warm the JVM with both code paths first: while the interpreter, C1 and C2 take turns, reduceLanes may add in
+            // another order, so the same cache can give a last-bit different answer from one call to the next. Only the
+            // comparison afterwards counts, and it needs flat == flat (the run is stable) and paged == flat in the same attempt.
+            for (int w = 0; w < 3; w++) {
+                script(bf, ids, vocab);
+                script(bp, ids, vocab);
+            }
             boolean same = false;
             boolean warm = false;
             int attempts = 0;

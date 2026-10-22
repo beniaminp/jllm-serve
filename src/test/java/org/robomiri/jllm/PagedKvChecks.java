@@ -150,15 +150,15 @@ final class PagedKvChecks {
     }
 
     /**
-     * The scripted passes, repeated until they agree (at most three times). A kernel's first calls (interpreted, or
+     * The scripted passes, repeated until they agree (at most six times). A kernel's first calls (interpreted, or
      * compiled at a lower tier) can round differently from its later ones, so even the flat cache can differ from itself
      * on a repeat of the same call while the JVM is cold; a paging error fails every attempt.
      */
     private void script() {
         int before = failures;
-        for (int attempt = 1; attempt <= 3; attempt++) {
+        for (int attempt = 1; attempt <= 6; attempt++) {
             failures = before;
-            if (script1(attempt == 3)) {
+            if (script1(attempt == 6)) {
                 if (attempt > 1) {
                     System.out.println("  (agreed on attempt " + attempt + ": the first one ran while the kernels were cold)");
                 }
