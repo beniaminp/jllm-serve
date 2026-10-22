@@ -1262,6 +1262,13 @@ about 1 000× slower) the same prompt gives bit-identical logits run after run, 
 `jllm.cpu.deterministic` also for `--batch 1` versus `--batch 16`. For greedy text this noise only matters at a
 near-tie; the `run` gates in [11](11-performance.md) have been stable across hundreds of runs.
 
+The Q4_0 / Q8_0 row dots and the 4-row / 4 x 4 prefill tiles (`dotQ4`, `dotQ8`, `store4`) no longer call `reduceLanes`:
+`VectorKernels.laneSum` adds the lanes in the pairs-first order that C2 uses on 128-bit NEON, in every tier, so those
+kernels give the same bits in the interpreter, in C1 and in C2 (steady-state results did not change) and a CPU run no longer
+depends on when C2 took over. `JitStableKernelsTest` checks it; the Q2_K, Q6_K, GGUF and int8 dots, the float `dot` and the
+softmax sums still have the noise described here. It was found as a flaky check of the Metal backend's CPU expert split
+([8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)).
+
 ---
 
 ## 7.15 Fast math (`jllm.cpu.fastmath`)
