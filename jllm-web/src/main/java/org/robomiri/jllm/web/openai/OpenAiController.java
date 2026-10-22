@@ -140,6 +140,7 @@ public class OpenAiController {
             ChatSupport.send(res, 400, ChatSupport.error("invalid JSON: " + e.getMessage(), "invalid_request_error", null));
             return;
         }
+        OpenAiFeatures.headerPriority(body, req.getHeader(OpenAiFeatures.PRIORITY_HEADER));
         LoadedModel model;
         try {
             model = models.resolve(Json.str(body, "model", null));
@@ -240,7 +241,8 @@ public class OpenAiController {
         int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
         int count = o.count();
 
-        try (LoadedModel.Slot slot = model.pick(prompt, Json.str(body, "user", null), gone)) {
+        try (org.robomiri.jllm.engine.Priority.Scope ignored = org.robomiri.jllm.engine.Priority.enter(decoding.priority()); // the queue's class
+             LoadedModel.Slot slot = model.pick(prompt, Json.str(body, "user", null), gone)) {
             Engine e = slot.engine();
             if (!stream) {
                 List<Engine.Result> all;

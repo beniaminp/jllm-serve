@@ -96,6 +96,7 @@ public class ChatController {
         List<Tool> offered;
         List<org.robomiri.jllm.vision.Rgb> images = List.of(); // the pictures of the conversation, in order (docs/20)
         boolean thinking = ChatSupport.thinking(body, s.getBool("chat.thinking"));
+        org.robomiri.jllm.engine.Priority priority; // "priority": "background" for a job that may wait behind a person
         try {
             conversation = new ArrayList<>(ChatSupport.messages(body, maxPromptBytes));
             if (org.robomiri.jllm.vision.ImageParts.hasImages(conversation)) {
@@ -111,6 +112,7 @@ public class ChatController {
             }
             offered = tools.select(names);
             ChatSupport.params(body, s.sampling(), Integer.MAX_VALUE); // validate the sampling fields up front
+            priority = org.robomiri.jllm.engine.Priority.parse(Json.str(body, "priority", null));
         } catch (RequestError e) {
             ChatSupport.send(res, e.status, ChatSupport.error(e.getMessage(), e.type, e.code));
             return;
@@ -153,7 +155,8 @@ public class ChatController {
             ToolCallFormat.Holdback holdback = new ToolCallFormat.Holdback(piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)));
             Engine.Result r;
             LoadedModel.Slot used;
-            try (LoadedModel.Slot slot = model.pick(prompt, null, gone); AutoCloseable alive = sse.keepAlive()) {
+            try (org.robomiri.jllm.engine.Priority.Scope ignored = org.robomiri.jllm.engine.Priority.enter(priority);
+                 LoadedModel.Slot slot = model.pick(prompt, null, gone); AutoCloseable alive = sse.keepAlive()) {
                 used = slot;
                 Engine.TextSink sink = byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback;
                 java.util.function.BooleanSupplier cancelled = () -> failure[0] != null || sse.failed() || model.closing()
