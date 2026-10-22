@@ -283,10 +283,10 @@ for the first sentence (17 tokens), after which the two take different words at 
 llama.cpp's by 10⁻³, as the half-precision encoder differs from its float one); the same happens between the CPU's
 int8-activation decode and the float one. Do not expect token-for-token identical long answers from any two engines.
 
-`VisionTest` (81 checks, in `mvn install`): the resize against Pillow's hashes, size rules, picture decoding and the
-refusal paths, the request parts and the SSRF rules, projector choice, the rotary positions, and two **tiny random
-vision-language models written as GGUF** (a Qwen2-VL text model with a Qwen2.5-VL style projector, and a Qwen3-VL one with
-deepstack and interleaved sections): the prompt layout, one hash identity per picture, deterministic answers, the cache
+`VisionTest` (113 checks, in `mvn install`): the resize against Pillow's hashes, size rules, picture decoding and the
+refusal paths, the request parts and the SSRF rules, projector choice, the rotary positions, and three **tiny random
+vision-language models written as GGUF** (a Qwen2-VL text model with a Qwen2.5-VL style projector, a Qwen3-VL one with
+deepstack and interleaved sections, and a Qwen3.5 hybrid with a Qwen3-VL style projector, 20.12): the prompt layout, one hash identity per picture, deterministic answers, the cache
 reused for the same picture and not for another, the rotary rows restored for text, `forwardEmbeds` with the rows of
 some ids equal to `forward(ids)`, and the Metal encoder and text backend against the CPU ones.
 

@@ -501,7 +501,7 @@ public final class ModelLoader {
             return switch (backendName) {
                 case "cpu" -> new Qwen3NextCpuBackend(weights, ctx, batch,
                         threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                        s.getBool("backend.cpu.int8-activations"));
+                        hybridInt8(s, weights, threads));
                 case "metal" -> new Qwen3NextMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
@@ -602,6 +602,20 @@ public final class ModelLoader {
         // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
         // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
+    }
+
+    /**
+     * {@code backend.cpu.int8-activations} for a Gated DeltaNet hybrid: {@code auto} is the measurement of the dense
+     * backends when it can be taken on these weights, else the float path (which is what the checks compare with).
+     */
+    private static boolean hybridInt8(Settings s, org.robomiri.jllm.model.ModelWeights weights, int threads) {
+        try {
+            return int8(s, weights, threads);
+        } catch (IllegalArgumentException e) {
+            throw e; // a malformed setting
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /** {@code backend.cpu.int8-activations} for {@code weights} ({@code auto} measures both paths once per model). */
