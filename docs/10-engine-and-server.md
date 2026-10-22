@@ -678,13 +678,13 @@ Statistics: `Engine.Stats.draftedTokens()` / `acceptedTokens()`, printed by `run
 `usage` block as `drafted_tokens` and `accepted_draft_tokens` (0 when speculation is off).
 
 **Prompt lookup pauses when it does not pay.** A pass that drafts and fails costs more than the steps it was meant to save,
-and how much more depends on the backend: about 0.4 of a step per extra position on a dense Metal model, 0.55 on an MoE
+and how much more depends on the backend: about 0.36 of a step per extra position on a dense Metal model, 0.55 on an MoE
 model, and on the CPU a fixed 6 steps (its multi-token pass is the float prefill path, decode uses int8 dot products).
 So the lookup runs under the cost model that already chooses a draft model's length (`Speculator.CostModel`, used as a gate:
 the length stays what the text supports): it learns the acceptance rate of the request's passes (back to the prior at every
 request) and the cost of a pass, and while no draft length would beat plain decoding it takes 16 plain steps, trying a pass
-every fourth time to notice a change of text. Copying text is unaffected; free text and tool calls stop paying for failed
-passes (CPU, Qwen3-0.6B: −37 % on prose became +4 %). `-Djllm.engine.adaptiveNgram=false` drafts at every match,
+every fourth time to notice a change of text, and at once when the full 8-token suffix has occurred earlier (a copy is under way). Copying text is unaffected; free text and tool calls stop paying for failed
+passes (CPU, Qwen3-0.6B: −40 % on prose became −4 %, −37 % on a tool call became −5 %, the code edit keeps +44 %). `-Djllm.engine.adaptiveNgram=false` drafts at every match,
 `-Djllm.engine.specDebug=true` traces the model. Measured in [11 §11.10](11-performance.md#1110-agent-defaults-measured).
 
 ---

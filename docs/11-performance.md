@@ -653,79 +653,141 @@ ring and lose only 7.5 % of prefill speed against f16 (accepting about 3× the e
 
 ## 11.10 Agent defaults, measured
 
-Four defaults for agent serving were re-examined on the Apple M1 Pro (32 GB), bundled settings, under the machine-wide
-benchmark lock: the prefill chunk ([08 §8.32](08-metal-backend.md#832-should-the-prefill-chunk-come-from-the-tuner-backendbatchauto-stays-at-256):
-stays 256), the default context length ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto):
-now `auto`), request priority ([10 §10.14](10-engine-and-server.md#1014-request-priority): new) and prompt lookup, here.
+Four defaults for agent serving were re-examined on the Apple M1 Pro (10 cores, 32 GB), bundled settings, under the machine-wide benchmark
+lock, on 2026-10-22. The prefill chunk is [08 §8.32](08-metal-backend.md#832-should-the-prefill-chunk-come-from-the-tuner-backendbatchauto-stays-at-256)
+(stays 256), the default context length is [10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto) (now `auto`),
+request priority is [10 §10.14](10-engine-and-server.md#1014-request-priority) (new). This section is the fourth: **prompt lookup on agent-like
+prompts, and the cost-model gate that makes it safe to leave on.**
 
-### Speculation on agent-like prompts
+### In plain words
 
-The bench prompt repeats one sentence, which flatters every speculation mode, so `SpecAgentBench` sends the three kinds of
-turn a coding agent produces, greedily, with the chat template: **edit**, a 1 150-token prompt that contains a 110-line Java
-file and asks for it to be written out again with a field renamed (the answer copies the prompt); **tool**, a Hermes-style
-system prompt with three JSON tool schemas asking for one `read_file` call; **prose**, a question answered in about 250
-words. 192 tokens at most (128 on the CPU), decode tok/s of the median of 3 rounds after one warm-up, `--ctx 6144`:
+🧸 Writing an answer one word at a time is slow because the model must walk through all its books for every single word. A trick: look back at
+what is already on the page. When you ask the model to "write this file again with one name changed", most of the answer is a copy of what you
+sent, so a helper can *guess* the next sixteen words by finding the same words earlier on the page, and the model checks all sixteen guesses in one
+walk through its books instead of sixteen walks. Right guesses are free words. But when you ask a question whose answer is new text, the helper's
+guesses are wrong, and a check that finds nothing still costs a walk, sometimes a long one (on a computer's processor a check of two words costs about
+six ordinary steps). So the helper now keeps a tally: how often were my guesses right on this page, and how much does a check cost here? When the
+tally says guessing does not pay, it stays quiet for a while and only tries now and then to see whether the page has changed.
 
-`java -cp target/classes:target/test-classes org.robomiri.jllm.SpecAgentBench --model Qwen/Qwen3-0.6B --engine.speculative off|ngram`
-(`-Djllm.engine.adaptiveNgram=false` for the ungated rows; the 30B also `--engine.speculative draft --engine.draft-model Qwen/Qwen3-0.6B`)
+### How it works
+
+📐 **Prompt lookup.** `Speculator.lookup` (`src/main/java/org/robomiri/jllm/engine/Speculator.java`) keeps a hash index of every n-gram (3 to 8 tokens,
+`engine.ngram-min` / `engine.ngram-max`) of the prompt and the output (`NgramIndex.java`); after each sampled token it finds the latest earlier
+occurrence of the longest suffix and proposes up to `k` tokens that followed it (`k` starts at 4, doubles while a whole draft is accepted, at most
+`engine.draft-tokens` = 16). The target verifies the `m` drafts and the token before them in one `forwardAll` pass of `m + 1` positions
+([10 §10.9](10-engine-and-server.md#109-speculative-decoding)); greedy output is the same as without.
+
+**The gate.** Per pass, with `p` the time of a plain step, `V(n) = a + b (n − 1)` the time of a verification pass of `n` positions (`a`, `b` fitted by
+weighted least squares over the last ~10 passes, `Speculator.CostModel.fit`), and `α` the fraction of examined draft positions accepted (decayed
+sums, reset to the prior 0.6 when a request starts, `forgetAcceptance`): a pass with `k` drafts yields on average `E(k) = 1 + α + α² + … + α^k` tokens
+(the accepted prefix plus the target's own token) in `V(k + 1)`; lookup costs nothing next to a pass. Drafting pays when for some `k`
+
+```
+E(k) / ( a + b·k )   >   1 / p                    (tokens per second with drafts  vs  plain)
+```
+
+`CostModel.bestK` returns the best such `k`, or 0. At 0, `step` takes `PLAIN_STEPS` = 16 plain steps (which also refresh `p`), then asks again, and
+every fourth time (`PROBE_EVERY`) runs a pass anyway so that a change of text is noticed. A request starts from the prior α = 0.6, which on the CPU says
+"do not draft" (below), so a paused lookup also runs a pass whenever the full `engine.ngram-max` = 8-token suffix has occurred earlier (`Speculator.strongMatch`): eight
+tokens repeating is strong evidence of copying (an edit of a file in the prompt). One failed pass lowers α and the pause resumes; a successful one lifts it. The length of an accepted draft is still decided by the text
+(the match and the doubling rule), the model only decides whether to draft at all.
+
+**Worked examples** (numbers from `-Djllm.engine.specDebug=true`, which prints the model after every pass):
+- *CPU, tool call.* `p` = 9.4 ms, `a` = 55 ms, `b` = 5 ms, `α` = 0.6 (the prior). `k` = 4: `E` = 1 + 0.6 + 0.36 + 0.216 + 0.13 = 2.3 tokens in 55 + 20 =
+  75 ms = 31 tok/s against `1/p` = 106 tok/s. Not worth it for any `k` (`bestK` = 0 in the trace), so the 98-token answer drafted 4 tokens instead of 51.
+- *CPU, code edit.* `p` = 14 ms (71 tok/s: a 1 150-token prompt), `a` = 70 ms, `b` = 4 ms, `α` = 0.99. `k` = 16: `E` = 15.7 in 70 + 64 = 134 ms =
+  117 tok/s against 71 → draft; measured 96.9 – 117.9 tok/s (106.7 median of three runs).
+- *30B MoE on Metal, tool call.* `p` = 38.7 ms, `a` ≈ 39 ms, `b` ≈ 0.55 · 39 = 21 ms, `α` = 0.45 (30 of 66 accepted). `k` = 2: `E` = 1.65 in 82 ms =
+  20 tok/s against 25.8: pause. Until `α` has been measured the prior 0.6 lets the first passes through (`k` = 1: `E` = 1.6 in 60 ms = 26.5, break-even),
+  which is the 3 – 10 % the tool call still costs.
+
+**Data layout of the state:** `CostModel` holds `acc`, `exam` (decayed accepted / examined counts), `plainNs` (EMA of plain steps, fed by
+`Engine` through `Speculator.plainStep`), the weighted sums `s0, s1, s2, sy, s1y` of the least-squares fit, and `passes`; `Speculator` holds
+`cooldown`, `unprofitable` and `kNow`. The model persists across requests except `α`.
+
+**Why prompt lookup is now on for MoE models.** `ModelLoader.speculation` used to switch it off for them (a verified position reads its own
+experts: each extra position costs the 30B ≈ 0.55 of a step, 11.6). The data below shows the gain on text that copies the prompt is large and the loss on
+the other turns is bounded, so the exception is gone; `--speculative off` is still one flag.
+
+### Why this design
+
+- **Per-backend defaults** (off on the CPU and for MoE, on for dense Metal) were the previous answer for MoE, and would have been the answer for the CPU. Rejected:
+  the same CPU code gains 4x on an AVX-512 machine (11.6: 19.9 → 81.2 tok/s rewriting a file) where the verification pass is cheap, so a fixed default is wrong for
+  one of the machines; the cost model measures the machine it runs on.
+- **A gate on acceptance alone** (pause below α = 0.5, say) ignores the cost of a pass: Metal pays from α ≈ 0.6 up, the CPU only above ≈ 0.9 (its pass is
+  six steps). Two numbers decide, α and `V`/`p`, hence the existing model.
+- **Using the model to choose the length too** (as for a draft model). Rejected for lookup: the draft is whatever followed the match, a longer draft than the
+  text supports does not exist; the doubling rule already matches the length to the text.
+- **Waiting for the probes only.** The first version did, and the CPU's code-edit gain depended on luck (+13 % to +64 % between runs): each new request starts from the prior and
+  the next probe was up to 64 steps away. The 8-token-repeat test costs one hash lookup per decision and no pass unless it hits.
+- **Keeping α across requests.** Rejected: the next turn of an agent may copy where the last one did not (an edit after a question); a stale low α would
+  pause the edit that benefits most.
+- **Cost:** a model that has decided "does not pay" learns otherwise only from the probes, so after prose the first copy-heavy answer starts cautiously; the first
+  pass-time samples of a fresh process include JIT warm-up. A tool call on the MoE model still loses 3 – 10 % (the prior lets the first passes through).
+
+### Settings
+
+| key | default | meaning |
+|---|---|---|
+| `engine.speculative` (`--speculative`) | `ngram` | `off`, `ngram`, `draft`, `mtp`; now the default for every model, MoE included |
+| `engine.draft-tokens` | 16 | most tokens drafted per pass |
+| `engine.ngram-min` / `engine.ngram-max` / `engine.ngram-window` | 3 / 8 / 0 | the matched suffix length and the copy window |
+| `-Djllm.engine.adaptiveNgram` | `true` | `false`: draft at every match (the earlier behaviour; the "ungated" rows) |
+| `-Djllm.engine.adaptiveDraft` | `true` | the same switch for a draft model's cost-based length |
+| `-Djllm.engine.specDebug` | `false` | print the cost model after every pass |
+
+### Measured
+
+The bench prompt repeats one sentence, which flatters speculation, so `SpecAgentBench` (`src/test/java/org/robomiri/jllm/SpecAgentBench.java`) sends the three
+kinds of turn a coding agent produces, greedily, through the chat template: **edit**, a 1 150-token prompt holding the 110-line `NgramIndex.java` and
+the request to write it out again with the field `used` renamed (the answer copies the prompt); **tool**, a Hermes-style system prompt with three JSON tool
+schemas and a request to open a file range (a `<tool_call>` JSON answer); **prose**, a question answered in about 250 words. One warm-up generation, then the
+median of 3 rounds; 192 tokens at most (128 on the CPU), `--ctx 6144`. Command (lock held):
+
+```
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx4g -Djllm.metal.lib=target/native/libjllm_metal.dylib \
+  -cp target/classes:target/test-classes org.robomiri.jllm.SpecAgentBench --model Qwen/Qwen3-0.6B --engine.speculative off|ngram [--backend cpu --max-tokens 128]
+```
+(`-Djllm.engine.adaptiveNgram=false` for the ungated rows; `--model Qwen/Qwen3-30B-A3B-Thinking-2507` and, for the draft row, `--engine.speculative draft
+--engine.draft-model Qwen/Qwen3-0.6B`.) Decode tok/s:
 
 | model, backend | mode | edit | tool call | prose |
 |---|---|---|---|---|
-| Qwen3-0.6B, Metal | off | 100.7 | 132.6 | 152.1 |
-| | ngram, before this change (ungated) | 206.4 (176 of 176 drafts accepted) | 132.7 (24 of 51) | 142.5 (1 of 12) |
-| | **ngram, now (default)** | **208.7** (+107 %) | 131.1 (−1 %) | 151.9 (0 %) |
-| Qwen3-0.6B, CPU (10 threads, NEON dot products) | off | 70.1 | 106.6 | 126.7 |
-| | ngram, ungated | 112.6 (+61 %) | 66.2 (−38 %) | 79.2 (−37 %) |
-| | **ngram, now (default)** | **116.3** (+66 %) | 104.2 (−2 %) | 131.4 (+4 %) |
-| Qwen3-30B-A3B-Thinking-2507, Metal | off | 23.0 | 25.8 | 27.0 |
-| | ngram, ungated (`engine.speculative=ngram`) | 38.7 (+68 %) | 23.3 (−10 %) | 25.8 (−4 %) |
-| | **ngram, now (default)** | **38.7** (+68 %) | 23.3 (−10 %) | 26.6 (−1 %) |
+| Qwen3-0.6B, Metal | off | 100.5 – 101.1 | 132.6 – 133.1 | 152.1 – 152.4 |
+| | ungated lookup | 206.4 (176 of 176 drafts accepted) | 132.7 (24 of 51) | 142.5 (1 of 12) |
+| | **lookup, default** | **207.2 – 208.8** (+106 %) | 131.1 – 132.4 (−1 %) | 151.7 – 152.7 (0 %) |
+| Qwen3-0.6B, CPU (10 threads, NEON dot products), 128 tokens | off | 74.0 (72.4 / 74.4 / 74.0) | 104.5 (91.4 / 104.5 / 107.1) | 131.4 (112.9 / 132.9 / 131.4) |
+| | ungated lookup | 112.6 | 66.2 (−37 %) | 79.2 (−40 %) |
+| | **lookup, default** | **106.7** (96.9 / 117.9 / 106.7; +44 %) | 98.9 (97.0 / 99.8 / 98.9; −5 %) | 126.2 (125.6 / 126.2 / 127.2; −4 %) |
+| Qwen3-30B-A3B-Thinking-2507, Metal | off | 23.0 – 23.4 | 25.8 | 26.9 – 27.2 |
+| | ungated lookup | 38.7 (+68 %) | 23.3 (−10 %) | 25.8 (−4 %) |
+| | **lookup, default** (3 runs) | **31.1 – 38.7** (+33 … +68 %) | 23.3 – 25.1 (−10 … −3 %) | 26.6 – 27.0; 22.3 in a run with load average 24 |
 | | draft, Qwen3-0.6B | 27.5 (+17 %) | 20.1 (−22 %) | 15.6 (−42 %) |
 
-The CPU "now" row is the single-round run with the cost-model trace (116.3 / 104.2 / 131.4, `p` 9 ms, `a` 55 ms);
-a 3-round run on a loaded Mac read 76.2 / 99.2 / 120.2 because the first plain-step timings were inflated and kept the
-model cautious for a while (see below). The greedy text is the same in every mode on Metal (the md5 of each answer is equal
-across the rows, which the harness prints); on the CPU the int8 single-token path and the float multi-token path differ in
-the last bits, so tool and prose answers can differ there as documented in 11.6.
+**Reading the table.**
+- Metal, dense and MoE: text that copies the prompt gains +106 % (0.6B) and +33 … +68 % (30B: 38.7, 35.1 and 31.1 tok/s in three runs; how fast the cost model reaches 16-token
+  drafts and what else runs on the Mac decide). Tool calls cost 0 – 1 % (dense) and 3 – 10 % (MoE); prose 0 % with the gate on the 0.6B (−6 % without), −1 % on the 30B when the
+  Mac is quiet (the 22.3 run shared it with a load average of 24).
+- The CPU's multi-token pass is the float prefill path (a 2-token pass takes 55 ms against a 9 ms plain step), so ungated lookup lost about a third on text
+  that does not copy; with the gate the CPU keeps most of the edit gain (+44 %, ungated +52 %) and pays 4 – 5 % on tool calls and prose instead of 37 – 40 %. Before the 8-token-repeat rule
+  (`strongMatch`) the CPU's edit gain was +13 % to +64 % from run to run (three interleaved pairs: 81.4 / 78.0 / 90.1 against 71.8 – 74.9 tok/s off), because each request starts
+  from the prior and the next probe could be 64 steps away.
+- A draft model is not a default for any of them: the 0.6B agrees with the 30B on too few positions and every drafted position costs the 30B ≈ 0.55 of a step; it
+  wins on the edit (+17 %) and loses on the rest. A draft for a dense model needs a smaller model of the same tokenizer, which is not available locally for the 0.6B.
+- The greedy text is the same in every mode on Metal (the md5 column of the harness is equal across the rows (edit, tool and prose alike)). On the CPU the int8 single-token path and the float
+  multi-token path differ in the last bits, so the tool and prose answers can differ between runs with different speculation decisions (documented in 11.6).
 
-**What the numbers say.**
-- Dense and mixture-of-experts models on Metal gain the same way on text that copies the prompt (+107 % and +68 %), and the MoE
-  model loses only on the turns whose drafts fail: −10 % on a tool call (39 drafted, 16 accepted; each extra verified
-  position costs the 30B about 0.55 of a step, 11.6), −1 % on prose. That is a bounded loss against a large gain, so **prompt lookup is now on by default for
-  mixture-of-experts models too** (`ModelLoader.speculation` no longer switches it off for them). Earlier measurements
-  (11.6, the 15 % loss on the code edit) were taken on a shared machine with the first prompt lookup, before the hash index,
-  the adaptive length and the pause below.
-- A draft model is not a default for any of them: the 0.6B agrees with the 30B on too few positions, and every drafted
-  position costs the 30B 0.55 of a step. It wins on the edit (+17 %) and loses elsewhere; it stays opt-in. A draft for a
-  dense model needs a smaller model of the same tokenizer, which does not exist locally for the 0.6B.
-- **The CPU's multi-token pass is slow** (a pass of 2 tokens takes 55 ms against a 9 ms plain step: it runs the float prefill
-  kernels, not the int8 dot products of decode), so ungated prompt lookup loses 37 % on text that does not copy. That is
-  why prompt lookup now runs under the cost model.
+The other three defaults, measured the same day: the prefill chunk 64 / 128 / 256 / 512 for the 0.6B and the 30B in 8.32 (256 stays); the context `auto` picks
+for the 0.6B, the 27B GGUF and the 30B in 10.13 (and that it costs about 1 % of decode); the priority in 10.14 (the first token of a short interactive request
+while a long background job runs: 127 ms against 937 ms). `scripts/mac-validate.sh` has rows for all four.
 
-### Prompt lookup under the cost model
+### Checks and limits
 
-The draft-model path has long chosen its length from measured costs and paused speculation when no length beats plain
-decoding ([08 §8.25](08-metal-backend.md#825-draft-model-speculation-on-the-gpu), `Speculator.CostModel`). Prompt lookup
-now uses the same model as a gate (not for the length, which stays what the text supports): per request it learns the
-acceptance rate α of its passes (reset to the prior 0.6 when a request starts, because the next turn may copy where the last
-one did not) and keeps the fitted cost of a verification pass `V(n) = a + b (n − 1)` and of a plain step `p` across requests;
-with a lookup costing nothing, a pass of k drafts pays when `(1 + α + … + α^k) / (a + b k) > 1 / p`. When no k does,
-lookups pause for 16 plain steps, and one decision in four runs a pass anyway so that a change of text is noticed. On
-Metal `a ≈ p` and `b` is about a third (dense) to a half (MoE) of `p` (11.6), so the gate only trims the failed passes; on the CPU `a` is 6
-plain steps and the gate stops almost all of them (tool call: 4 drafted tokens instead of 51; prose: none). Where text is
-copied α is above 0.9, nothing is paused and the edit rows are unchanged within noise (208.7 against 206.4 tok/s on Metal,
-116.3 against 112.6 on the CPU). `-Djllm.engine.adaptiveNgram=false` restores the ungated lookup, and
-`-Djllm.engine.specDebug=true` prints the model's view after every pass (pass size and time, `a`, `b`, `p`, α, the best k). The weak
-spot is the start-up: the first pass-time samples include JIT warm-up, and a model that has judged speculation unprofitable
-only learns otherwise from the probes, so the first answer of a fresh process can be cautious.
-
-### What was measured for the other three
-
-- Prefill chunk by chip: 8.32 (0.6B and 30B at 64 / 128 / 256 / 512, a tuner is not worth it, 256 stays).
-- Default context length: the table of 10.13 for the 0.6B, the 27B GGUF and the 30B; `auto` costs about 1 % of decode.
-- Priority: 10.14 (the first token of a short interactive request while a long background job runs: 127 ms against
-  937 ms without ordering).
-
-`scripts/mac-validate.sh` has rows for all four (speculation on the agent-like prompts for the dense model, and with `--moe`
-for the MoE model with ngram and draft; priority on and off; the contexts `auto` picks; `auto` against `--ctx 4096`; the
-chunk sizes 64 and 512).
+- `CostModelCheck` (`src/test/java/org/robomiri/jllm/engine/CostModelCheck.java`, run by `mvn test` through `SmokeTest`): the gate cases (a CPU-like pass of 6 steps and
+  b = 0.5 step pays only for α above 0.9; a Metal-like pass pays from α = 0.7 up and not at 0.1; failing drafts on a slow pass pause lookups; `forgetAcceptance` lets the
+  next request start from the prior) next to the existing length-choice cases.
+- `SpeculationTest` (fake backend) still checks greedy equality with and without speculation, penalties, stops at every `max_tokens`, and the sampled
+  distribution (total variation against two plain runs); the sampled check runs with `jllm.engine.adaptiveNgram=false` because a fake backend's pass times are noise.
+- Greedy exactness on Metal: the md5 of every answer in the table is equal to the speculation-off answer.
+- `strongMatch` (the 8-token-repeat rule) has no unit test of its own; it is exercised by the CPU edit rows above (102 – 116 of 116 drafted tokens accepted instead of 28 – 58).
+- Limits: three prompts, Qwen3 only, one Mac; the CPU rows move by ±10 % with the load of the machine (other programs use the 10 cores); the gate cannot avoid the probes.
