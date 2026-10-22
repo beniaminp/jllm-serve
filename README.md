@@ -57,6 +57,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Constrained tool calls | inside `<tool_call>` the model can only write a known tool and arguments that match its schema, so a call always parses; the fixed parts of a call are appended in one pass without sampling (jump-forward), speculation checks its drafts against the constraint, and the token mask is computed with a byte trie and memoized (a 32-token call: 254 → 149 ms on an M1 Pro with jump-forward; the mask 60–170 µs per token where it was 190–510 µs; `engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks`) | [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward) |
 | Batched decoding across slots | conversations generating at the same time share one forward pass, so the weights are read once for all of them (CPU backend; on Metal as one pass over the slots' separate caches, `engine.batch-decode`, default `true`; `false` = every slot on its own) | [10 §10.9b](docs/10-engine-and-server.md#109b-batched-decoding-across-slots), [08 §8.24](docs/08-metal-backend.md#824-batched-decoding-across-slots-metalbackendforwardbatch) |
 | Prefix sharing between slots | a second conversation with the same long system prompt copies the first one's cache (34 ms) instead of recomputing it (seconds) | [17 §17.2](docs/17-agent-speedups.md#172-slots-that-share-a-prefix) |
+| Paged KV cache with a prefix tree | `backend.kv-paged=true`: KV memory as one pool of 16-position blocks per model with a block table per slot, instead of a full-size array per slot. Blocks are allocated as a conversation grows; a radix tree over the token ids gives identical prefixes (a shared system prompt, a retry, a subagent forked from one context) one copy across slots and conversations, with reference counts and copy on write; unreferenced blocks are evicted least recently used first and spilled to a disk block store. The CPU tile kernels and the Metal split / flash / decode / prefill kernels read through the block table, bit for bit as with the flat cache (f32, f16, q8); decode replay, pipelined decoding, batched rows, speculation rollback and saved caches work unchanged; every index is `long` (a million-position test). Qwen3-0.6B: 8 conversations sharing a 4 096-token prompt take 1.1 GB instead of 7.7 GB, a resent 4 160-token conversation 32 ms to first token on Metal instead of 6.3 s (CPU 71 ms instead of 24 s), decode −3 % on Metal; q4, DeepSeek and the recurrent hybrids stay flat. Off by default | [24](docs/24-paged-kv-cache.md) |
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
 | Decode replay | a decode step's ~170 GPU dispatches are recorded once and replayed with one native call per token instead of one call per dispatch | [08 §8.22](docs/08-metal-backend.md#822-decode-replay-one-native-call-per-token) |
@@ -465,7 +466,8 @@ Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, `q8`: int
 kv head, about a quarter of the f32 cache, or `q4`: Hadamard-rotated keys and 4-bit groups of 32 with a half scale,
 about an eighth, for long contexts), `backend.kv-q4-recent` (q4: the latest positions also kept in half precision,
 default 128, 0 = none), `backend.kv-q8-rotate` (q8: rotate the keys before the int8 quantization, default `true`,
-`false` = the previous format; saved q8 caches of the old format are refused under the new default), `backend.cpu.int8-activations`
+`false` = the previous format; saved q8 caches of the old format are refused under the new default), `backend.kv-paged` (default false: one pool of `backend.kv-block`-position blocks per model with a
+block table per slot and a prefix tree, docs/24; `backend.kv-pool-tokens`, `backend.kv-prefix-share`), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
 `false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
@@ -520,6 +522,7 @@ Short flags:
 --ctx N               context length / KV cache size (default 4096)
 --batch N|auto       prefill chunk size (default auto: 256 on Metal and for MoE models, 64 on the CPU)
 --backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N; --backend.kv-q8-rotate true|false
+--backend.kv-paged true|false     paged KV cache with a prefix tree (docs/24); --backend.kv-block N, --backend.kv-pool-tokens N
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)

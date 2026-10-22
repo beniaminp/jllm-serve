@@ -48,6 +48,29 @@ import java.util.TreeMap;
 @Service
 public class KvStore {
 
+    /**
+     * A model with a paged KV cache (docs/24): the pool's evicted blocks go to {@code <dir>/blocks/<fingerprint>/} and
+     * come back when a prompt needs them, so this store is also the block store of the pool. The files survive a restart
+     * (found again by the hash of the path of tokens they hold) and are trimmed to {@code jllm.web.kv-spill-max-gb}.
+     * Does nothing for a model with a flat cache or with {@code jllm.web.kv-spill=false}.
+     */
+    public void attachSpill(LoadedModel m) {
+        if (!props.kvSpill() || props.kvSpillMaxGb() <= 0) {
+            return;
+        }
+        org.robomiri.jllm.kv.KvSequence seq = m.engine().backend().kvSequence();
+        if (seq == null) {
+            return;
+        }
+        org.robomiri.jllm.kv.KvPool pool = seq.pool();
+        try {
+            pool.setSpill(new org.robomiri.jllm.kv.FileSpill(dir.resolve("blocks"), fingerprint(m) + "|" + pool.format(),
+                    (long) (props.kvSpillMaxGb() * 1e9)));
+        } catch (IOException e) {
+            System.err.println("kv-cache: no block store for " + m.id() + ": " + e.getMessage());
+        }
+    }
+
     /** Restoring must win at least this many tokens over what the slot already holds. */
     static final int MIN_GAIN = 256;
 

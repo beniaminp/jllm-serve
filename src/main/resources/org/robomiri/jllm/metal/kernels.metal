@@ -1469,6 +1469,13 @@ template [[host_name("rope_il_h")]] kernel decltype(rope<half, true>) rope<half,
 // way whatever the template arguments: scores by simdgroup-strided positions with one simd_sum each, max and
 // sum by the two-level reductions, the value accumulation simdgroup-strided then reduced through `part`.
 
+// Paged KV cache (docs/24): with pageShift > 0 the position s of a sequence lives at row
+// (tbl[s >> pageShift] << pageShift) | (s & (2^pageShift - 1)) of the pool buffer (block size 2^pageShift positions, tbl the
+// sequence's block table, int per logical block); pageShift == 0 is the flat cache (row s) and tbl is not read.
+static inline ulong kv_row(device const int *tbl, int shift, int s) {
+    return shift == 0 ? ulong(s) : ((ulong(tbl[s >> shift]) << shift) | ulong(s & ((1 << shift) - 1)));
+}
+
 struct AttnParams {
     int nHeads;
     int nKvHeads;
@@ -1484,6 +1491,7 @@ struct AttnParams {
     int window;      // sliding-window length in tokens, 0 = full causal attention
     int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
     float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
+    int pageShift;   // paged cache: log2 of the block size (positions) and tbl the block table; 0 = flat (see kv_row)
 };
 
 // The q8 cache (backend.kv-dtype=q8, KV = char): a position's row of the cache is its kvDim int8 values followed by
@@ -1503,7 +1511,8 @@ kernel void attention_t(device const float *q [[buffer(0)]],
                         device const KV *vc [[buffer(2)]],
                         device float *out [[buffer(3)]],
                         device float *scores [[buffer(4)]],
-                        constant AttnParams &p [[buffer(5)]],
+                        device const int *tbl [[buffer(5)]],
+                        constant AttnParams &p [[buffer(6)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort2 tid2 [[thread_position_in_threadgroup]],
                         ushort2 tpg2 [[threads_per_threadgroup]],
@@ -1542,8 +1551,9 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     float mx[G];
     for (int g = 0; g < G; g++) mx[g] = -INFINITY;
     for (int s = first + sg; s < len; s += nsg) {
-        device const KV *kv = kb + (ulong)s * p.kStride;
-        const float ks = p.scale * kv_scale(kc + (ulong)s * p.kStride, p.kStride, p.nKvHeads, kvh);
+        const ulong rk = kv_row(tbl, p.pageShift, s);
+        device const KV *kv = kb + rk * p.kStride;
+        const float ks = p.scale * kv_scale(kc + rk * p.kStride, p.kStride, p.nKvHeads, kvh);
         float kr[MK];
         for (int i = 0; i < MK; i++) kr[i] = i < perK ? float(kv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
@@ -1592,8 +1602,9 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     for (int g = 0; g < G; g++)
         for (int i = 0; i < MV; i++) o[g][i] = 0.0f;
     for (int s = first + sg; s < len; s += nsg) {
-        device const KV *vv = vb + (ulong)s * p.vStride;
-        const float vs = kv_scale(vc + (ulong)s * p.vStride, p.vStride, p.nKvHeads, kvh);
+        const ulong rv = kv_row(tbl, p.pageShift, s);
+        device const KV *vv = vb + rv * p.vStride;
+        const float vs = kv_scale(vc + rv * p.vStride, p.vStride, p.nKvHeads, kvh);
         float vr[MV];
         for (int i = 0; i < MV; i++) vr[i] = i < perV ? float(vv[lane + i * 32]) : 0.0f;
         for (int g = 0; g < G; g++) {
@@ -1662,6 +1673,7 @@ struct AttnSplitParams {
     float softcap;
     int nSplit;
     int chunk;       // keys per split; <= 0: ceil(keys / nSplit), computed by the kernel
+    int pageShift;   // paged cache (see kv_row); 0 = flat
 };
 
 template <typename KV>
@@ -1670,7 +1682,8 @@ kernel void attention_split(device const float *q [[buffer(0)]],
                             device const KV *vc [[buffer(2)]],
                             device float *part [[buffer(3)]],
                             device float *scores [[buffer(4)]],
-                            constant AttnSplitParams &p [[buffer(5)]],
+                            device const int *tbl [[buffer(5)]],
+                            constant AttnSplitParams &p [[buffer(6)]],
                             uint2 tgp [[threadgroup_position_in_grid]],
                             ushort2 tid2 [[thread_position_in_threadgroup]],
                             ushort2 tpg2 [[threads_per_threadgroup]],
@@ -1703,10 +1716,11 @@ kernel void attention_split(device const float *q [[buffer(0)]],
 
     float mx = -INFINITY;
     for (int s = s0 + sg; s < s1; s += nsg) {
-        device const KV *kv = kb + (ulong)s * p.kvStride;
+        const ulong rk = kv_row(tbl, p.pageShift, s);
+        device const KV *kv = kb + rk * p.kvStride;
         float d = 0.0f;
         for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
-        d = simd_sum(d) * (p.scale * kv_scale(kc + (ulong)s * p.kvStride, p.kvStride, p.nKvHeads, kvh));
+        d = simd_sum(d) * (p.scale * kv_scale(kc + rk * p.kvStride, p.kvStride, p.nKvHeads, kvh));
         if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
         if (lane == 0) sc[s] = d;
         mx = max(mx, d);
@@ -1731,8 +1745,9 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     float o[MAX_PER];
     for (int i = 0; i < MAX_PER; i++) o[i] = 0.0f;
     for (int s = s0 + sg; s < s1; s += nsg) {
-        const float pr = sc[s] * kv_scale(vc + (ulong)s * p.kvStride, p.kvStride, p.nKvHeads, kvh);
-        device const KV *vv = vb + (ulong)s * p.kvStride;
+        const ulong rv = kv_row(tbl, p.pageShift, s);
+        const float pr = sc[s] * kv_scale(vc + rv * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+        device const KV *vv = vb + rv * p.kvStride;
         for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
     }
     for (int i = 0; i < MAX_PER; i++) if (i < per) red[sg][lane + i * 32] = o[i];
@@ -1814,7 +1829,7 @@ template [[host_name("attention_split_q8")]] kernel decltype(attention_split<cha
 // Summation order differs from attention_t (scores: 8-lane partial sums, softmax sums per block), so the results
 // agree to rounding, not bit for bit: the host uses this kernel only where MetalTuner's self-check on the device
 // accepts it (-Djllm.metal.decodeAttention=true|false|auto). All arithmetic f32; KV as for attention_t (kv_scale).
-// Buffers: q(0) kc(1) vc(2) part(3) out(4), AttnSplitParams(5).
+// Buffers: q(0) kc(1) vc(2) part(3) out(4) tbl(5), AttnSplitParams(6).
 
 // W consecutive elements of a K / V row (W = 4; 8 for a half cache, one 16-byte load) as W / 4 float4. The 8 lanes of a
 // key take the chunks tx, tx + 8, ... of W elements; the cache's q8 rows are only 4-byte aligned (the scales follow the
@@ -1840,7 +1855,8 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
                           device const KV *vc [[buffer(2)]],
                           device float *part [[buffer(3)]],
                           device float *out [[buffer(4)]],
-                          constant AttnSplitParams &p [[buffer(5)]],
+                          device const int *tbl [[buffer(5)]],
+                          constant AttnSplitParams &p [[buffer(6)]],
                           uint2 tgp [[threadgroup_position_in_grid]],
                           ushort sg [[simdgroup_index_in_threadgroup]],
                           ushort lane [[thread_index_in_simdgroup]]) {
@@ -1891,7 +1907,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             const int key = base + 4 * j + ty;
             for (int g = 0; g < G; g++) ps[g][j] = 0.0f;
             if (key < s1) {
-                device const KV *kr = kb + (ulong)key * p.kvStride;
+                device const KV *kr = kb + kv_row(tbl, p.pageShift, key) * p.kvStride;
                 for (int c = 0; c < NC; c++) {
                     float4 kk[NP];
                     ldw<W>(kr + W * (tx + 8 * c), kk);
@@ -1921,7 +1937,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
         }
         const int mykey = base + 4 * tx + ty;
         float ks = 0.0f;
-        if (mykey < s1) ks = p.scale * kv_scale(kc + (ulong)mykey * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+        if (mykey < s1) ks = p.scale * kv_scale(kc + kv_row(tbl, p.pageShift, mykey) * p.kvStride, p.kvStride, p.nKvHeads, kvh);
         // 2. online softmax over the 32 keys of the block
         float pe[G];
         for (int g = 0; g < G; g++) {
@@ -1943,8 +1959,9 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             for (int g = 0; g < G; g++) pj[g] = simd_shuffle(pe[g], ushort(ty * 8 + j));
             const int key = base + 4 * j + ty;
             if (key < s1) {
-                device const KV *vr = vb + (ulong)key * p.kvStride;
-                const float vs = kv_scale(vc + (ulong)key * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+                const ulong rv = kv_row(tbl, p.pageShift, key);
+                device const KV *vr = vb + rv * p.kvStride;
+                const float vs = kv_scale(vc + rv * p.kvStride, p.kvStride, p.nKvHeads, kvh);
                 for (int c = 0; c < NC; c++) {
                     float4 vv[NP];
                     ldw<W>(vr + W * (tx + 8 * c), vv);
@@ -2008,6 +2025,8 @@ struct KvStoreParams {
     int kvDim;       // values per position (nKvHeads * headDim)
     int nKvHeads;
     int stride;      // bytes per cache position row: kvDim + 4 * nKvHeads
+    int pos;         // paged cache: position of the chunk's first row (the buffers are bound at row 0)
+    int pageShift;   // paged cache (see kv_row); 0 = flat, kc / vc bound at the chunk's first row
 };
 
 // Grid: (2 * nKvHeads, ntok), one simdgroup (32 threads) per row; x < nKvHeads quantizes k head x, the others v
@@ -2017,13 +2036,14 @@ kernel void kv_store_q8(device const float *k [[buffer(0)]],
                         device const float *v [[buffer(1)]],
                         device char *kc [[buffer(2)]],
                         device char *vc [[buffer(3)]],
-                        constant KvStoreParams &p [[buffer(4)]],
+                        device const int *tbl [[buffer(4)]],
+                        constant KvStoreParams &p [[buffer(5)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort lane [[thread_index_in_simdgroup]]) {
     const bool isV = int(tgp.x) >= p.nKvHeads;
     const int h = isV ? int(tgp.x) - p.nKvHeads : int(tgp.x);
     device const float *x = (isV ? v : k) + (ulong)tgp.y * p.kvDim + h * p.headDim;
-    device char *row = (isV ? vc : kc) + (ulong)tgp.y * p.stride;
+    device char *row = (isV ? vc : kc) + (p.pageShift == 0 ? ulong(tgp.y) : kv_row(tbl, p.pageShift, p.pos + int(tgp.y))) * p.stride;
     float mx = 0.0f;
     for (int i = lane; i < p.headDim; i += 32) mx = max(mx, fabs(x[i]));
     const float s = simd_max(mx) / 127.0f;
@@ -2185,6 +2205,42 @@ kernel void kv_put(device const float *src [[buffer(0)]],
 
 template [[host_name("kv_put")]] kernel decltype(kv_put<float>) kv_put<float>;
 template [[host_name("kv_put_h")]] kernel decltype(kv_put<half>) kv_put<half>;
+
+// kv_store_pg<KV>: the paged cache's store of the f32 staging rows of k and v (after rope rotated k in place) into the
+// pool rows of positions pos .. pos + ntok - 1, unchanged for the f32 cache and rounded once to half for the f16 cache
+// (round-to-nearest-even, the rounding of matmul3<.., half> and rope<half, ..>). The row of position pos + t is
+// kv_row(tbl, pageShift, pos + t); `pos` is a parameter (not a buffer offset) so that a recorded decode step only patches
+// the position. Grid: (2 * ceil(kvDim / CHANNEL_THREADS), ntok): the first half of x copies k, the second v.
+// Buffers: k(0) v(1) kc(2) vc(3) tbl(4), KvPagedParams(5).
+
+struct KvPagedParams {
+    int kvDim;       // values per row
+    int stride;      // destination row stride in elements
+    int pos;         // position of the first row
+    int pageShift;   // log2 of the block size
+};
+
+template <typename KV>
+kernel void kv_store_pg(device const float *k [[buffer(0)]],
+                        device const float *v [[buffer(1)]],
+                        device KV *kc [[buffer(2)]],
+                        device KV *vc [[buffer(3)]],
+                        device const int *tbl [[buffer(4)]],
+                        constant KvPagedParams &p [[buffer(5)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort2 tid2 [[thread_position_in_threadgroup]],
+                        ushort2 tpg2 [[threads_per_threadgroup]]) {
+    const int chunks = (p.kvDim + int(tpg2.x) - 1) / int(tpg2.x);
+    const bool isV = int(tgp.x) >= chunks;
+    const int i = (isV ? int(tgp.x) - chunks : int(tgp.x)) * int(tpg2.x) + int(tid2.x);
+    if (i < p.kvDim) {
+        const ulong row = kv_row(tbl, p.pageShift, p.pos + int(tgp.y));
+        (isV ? vc : kc)[row * p.stride + i] = KV((isV ? v : k)[(ulong)tgp.y * p.kvDim + i]);
+    }
+}
+
+template [[host_name("kv_store_pg")]] kernel decltype(kv_store_pg<float>) kv_store_pg<float>;
+template [[host_name("kv_store_pg_h")]] kernel decltype(kv_store_pg<half>) kv_store_pg<half>;
 
 // ---------------------------------------------------------------------------------------------- 5. mixture of experts
 // router: one threadgroup (256 threads = 8 simdgroups) per token. Simdgroup sg computes the logits of experts
@@ -3501,6 +3557,7 @@ struct FlashParams {
     int oStride;     // output row stride (nHeads * D)
     int window;      // sliding-window length, 0 = full causal attention
     float softcap;   // > 0: score = tanh(score / softcap) * softcap
+    int pageShift;   // paged cache (see kv_row); 0 = flat
 };
 
 template <typename KV, int D>
@@ -3508,7 +3565,8 @@ kernel void attention_fa(device const float *q [[buffer(0)]],
                          device const KV *kc [[buffer(1)]],
                          device const KV *vc [[buffer(2)]],
                          device float *out [[buffer(3)]],
-                         constant FlashParams &p [[buffer(4)]],
+                         device const int *tbl [[buffer(4)]],
+                         constant FlashParams &p [[buffer(5)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
@@ -3554,8 +3612,9 @@ kernel void attention_fa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup); // the previous block's V is no longer read
         for (int e = tid; e < BK * D; e += FA_THREADS) {
             const int key = k0 + e / D;
-            kvs[e] = key < lastKey ? float(kb[(ulong)key * p.kStride + e % D])
-                                     * kv_scale(kc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+            const ulong rk = key < lastKey ? kv_row(tbl, p.pageShift, key) : 0;
+            kvs[e] = key < lastKey ? float(kb[rk * p.kStride + e % D])
+                                     * kv_scale(kc + rk * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // S = Q K^T: K is loaded transposed, slice (dims i*8.., keys j*8..)
@@ -3605,8 +3664,9 @@ kernel void attention_fa(device const float *q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup); // every simdgroup is done with the K block
         for (int e = tid; e < BK * D; e += FA_THREADS) {
             const int key = k0 + e / D;
-            kvs[e] = key < lastKey ? float(vb[(ulong)key * p.kStride + e % D])
-                                     * kv_scale(vc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+            const ulong rv = key < lastKey ? kv_row(tbl, p.pageShift, key) : 0;
+            kvs[e] = key < lastKey ? float(vb[rv * p.kStride + e % D])
+                                     * kv_scale(vc + rv * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < NJ; j++) {
@@ -4470,7 +4530,8 @@ kernel void attention_fb(device const float *q [[buffer(0)]],
                          device const KV *kc [[buffer(1)]],
                          device const KV *vc [[buffer(2)]],
                          device float *out [[buffer(3)]],
-                         constant FlashParams &p [[buffer(4)]],
+                         device const int *tbl [[buffer(4)]],
+                         constant FlashParams &p [[buffer(5)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]],
@@ -4522,14 +4583,16 @@ kernel void attention_fb(device const float *q [[buffer(0)]],
             const int c = e % D;
             const int key = k0 + r;
             const bool in = key < lastKey;
-            ks[r * LD + c] = in ? ST(kb[(ulong)key * p.kStride + c]) : ST(0.0f);
-            vs[r * LD + c] = in ? ST(vb[(ulong)key * p.kStride + c]) : ST(0.0f);
+            const ulong rk = in ? kv_row(tbl, p.pageShift, key) : 0;
+            ks[r * LD + c] = in ? ST(kb[rk * p.kStride + c]) : ST(0.0f);
+            vs[r * LD + c] = in ? ST(vb[rk * p.kStride + c]) : ST(0.0f);
         }
         if (tid < BK) {
             const int key = k0 + int(tid);
             const bool in = key < lastKey;
-            kq[tid] = in ? kv_scale(kc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
-            vq[tid] = in ? kv_scale(vc + (ulong)key * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+            const ulong rk = in ? kv_row(tbl, p.pageShift, key) : 0;
+            kq[tid] = in ? kv_scale(kc + rk * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
+            vq[tid] = in ? kv_scale(vc + rk * p.kStride, p.kStride, p.nKvHeads, kvh) : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int j = 0; j < NJ; j++) {
@@ -4758,6 +4821,8 @@ struct KvStoreQ8RParams {
     int nKvHeads;
     int qStride;     // q row stride (nHeads * headDim)
     int stride;      // bytes per cache position row: kvDim + 4 * nKvHeads
+    int pos;         // paged cache: position of the chunk's first row (the buffers are bound at row 0)
+    int pageShift;   // paged cache (see kv_row); 0 = flat, kc / vc bound at the chunk's first row
 };
 
 kernel void kv_store_q8r(device const float *k [[buffer(0)]],
@@ -4765,7 +4830,8 @@ kernel void kv_store_q8r(device const float *k [[buffer(0)]],
                          device char *kc [[buffer(2)]],
                          device char *vc [[buffer(3)]],
                          device float *q [[buffer(4)]],
-                         constant KvStoreQ8RParams &p [[buffer(5)]],
+                         device const int *tbl [[buffer(5)]],
+                         constant KvStoreQ8RParams &p [[buffer(6)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort lane [[thread_index_in_simdgroup]]) {
     const int x = int(tgp.x);
@@ -4788,7 +4854,7 @@ kernel void kv_store_q8r(device const float *k [[buffer(0)]],
     float mx = 0.0f;
     for (int i = 0; i < MAX_PER; i++) if (i < per) mx = max(mx, fabs(r[i]));
     const float s = simd_max(mx) / 127.0f;
-    device char *row = (isV ? vc : kc) + (ulong)t * p.stride;
+    device char *row = (isV ? vc : kc) + (p.pageShift == 0 ? ulong(t) : kv_row(tbl, p.pageShift, p.pos + t)) * p.stride;
     for (int i = 0; i < MAX_PER; i++) if (i < per) row[h * p.headDim + lane + i * 32] = q8_value(r[i], s);
     if (lane == 0) ((device float *)(row + p.kvDim))[h] = s;
 }

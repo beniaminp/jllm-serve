@@ -144,6 +144,15 @@ bench "f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off
 bench "q8 KV cache (default: rotated keys, backend.kv-q8-rotate)" "$DENSE" "" --backend.kv-dtype q8 --engine.speculative off
 bench "q8 KV cache, plain keys (backend.kv-q8-rotate false)" "$DENSE" "" --backend.kv-dtype q8 --backend.kv-q8-rotate false --engine.speculative off
 bench "q4 KV cache" "$DENSE" "" --backend.kv-dtype q4 --engine.speculative off
+# the paged KV cache (docs/24): one pool of 16-token blocks and a block table per slot instead of a flat array, against the
+# flat cache on the same prompts (the flat rows are the defaults above; backend.kv-paged=false is the default)
+bench "paged KV cache (f32, 16-token blocks)" "$DENSE" "" --backend.kv-paged true --engine.speculative off
+bench "paged KV cache, f16" "$DENSE" "" --backend.kv-paged true --backend.kv-dtype f16 --engine.speculative off
+bench "paged KV cache, q8" "$DENSE" "" --backend.kv-paged true --backend.kv-dtype q8 --engine.speculative off
+bench "paged KV cache, 64-token blocks" "$DENSE" "" --backend.kv-paged true --backend.kv-block 64 --engine.speculative off
+bench "~3000-token prompt: flat KV cache" "$DENSE" "" --bench.prompt-repeat 300 --engine.speculative off
+bench "~3000-token prompt: paged KV cache" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
+bench "~3000-token prompt: paged KV cache, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
 bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 0 --engine.speculative off
 bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
 bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200
