@@ -1,40 +1,44 @@
 # How jllm-serve works — a guided tour
 
 These documents explain, from the ground up, how this project turns a 1.5 GB file downloaded from Hugging Face
-into a chatbot that streams answers over HTTP. They assume you can read Java but know nothing about machine
-learning. Math is introduced where it is needed, with concrete numbers from Qwen3-0.6B.
+into a chatbot that streams answers over HTTP, and everything that grew around that: llama.cpp's GGUF files, quantized KV
+caches, speculative decoding, constrained tool calls, pictures, speech, image and video generation. They assume you can read
+Java but know nothing about machine learning. Math is introduced where it is needed, with concrete numbers from Qwen3-0.6B.
 
 New here, or want the intuition first? Start with **[00 Explained simply](00-explained-simply.md)**: every idea
-in the project told as a story for a five-year-old (🧸), followed by the exact math (📐).
+in the project told as a story for a five-year-old (🧸), followed by the exact math (📐). The feature chapters follow the same
+pattern: 🧸 in plain words, 📐 how it works (formulas, a worked example with real numbers, the data layout), why the design is what it is,
+the settings, what was measured, and what is checked and not done.
 
 Suggested reading order:
 
-| # | Document | What you will learn |
+| # | Document | What you will learn (one line) |
 |---|---|---|
-| 0 | [Explained simply](00-explained-simply.md) | The whole project in pictures and stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
-| 0b | [From prompt to answer, on paper](00b-math-on-paper.md) | One question through a toy model (20 tokens, 4-wide vectors, two layers) with every number written down: template, BPE, embedding, weighted RMSNorm, q/k/v, q-norm and k-norm, RoPE, attention, SwiGLU, logits, softmax, sampling, the KV cache, Q4_0 |
-| 1 | [Overview](01-overview.md) | What an LLM is, what "inference" means, the pipeline from text to text, the supported model families, project layout |
-| 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, downloading only the shards a model needs |
-| 3 | [Tensors and safetensors](03-safetensors.md) | What a tensor is, how the file is laid out byte by byte, bfloat16, memory mapping, jllm's quantized cache file (versioned, reconverted when stale, resumable conversion), MLX 4-/8-bit and mxfp4 / mxfp8 checkpoints, FP8 checkpoints |
+| 0 | [Explained simply](00-explained-simply.md) | The whole project as stories, each followed by its math: tokens, vectors, attention, softmax, quantization, the KV cache, GPUs, speculation, MoE |
+| 0b | [From prompt to answer, on paper](00b-math-on-paper.md) | One question through a toy model (20 tokens, 4-wide vectors, two layers) with every number written down, from the template to the sampled token |
+| 1 | [Overview](01-overview.md) | What an LLM is, the pipeline from text to text, the map of every subsystem (GGUF, pictures, speech, diffusion, speculation, quantized caches) and how a request flows through them |
+| 2 | [Downloading from Hugging Face](02-download.md) | The Hub API, resumable HTTP downloads, SHA-256 verification, retries and the stall watchdog, fetching only the shards a model needs |
+| 3 | [Tensors and safetensors](03-safetensors.md) | The file layout byte by byte, bfloat16, memory mapping, jllm's quantized cache file, MLX 4-/8-bit, mxfp4 / mxfp8 and FP8 checkpoints |
 | 4 | [The tokenizer](04-tokenizer.md) | Byte-level BPE from scratch, regex pre-tokenization, the chat template, streaming UTF-8 |
-| 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU, the KV cache — every formula the code implements |
-| 6 | [Quantization (Q4/Q8)](06-quantization.md) | Why 4-bit weights work, the Q4_0/Q8_0 block format, the error it introduces |
-| 7 | [The CPU backend](07-cpu-backend.md) | SIMD with the Vector API, dot-product kernels, prefill vs decode, the custom thread pool |
-| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM bindings, the Objective-C shim, each compute kernel, flash-attention prefill, the start-up kernel self-check, expert-grouped MoE prefill, pipelined decoding, hot MoE experts on the GPU and cold ones on the CPU when the GPU memory budget is exceeded, the prefill chunk, the multi-row decode matvec, the decode attention |
+| 5 | [The transformer, step by step](05-transformer-math.md) | Embeddings, RMSNorm, attention, RoPE, SwiGLU and the KV cache: every formula the code implements |
+| 6 | [Quantization (Q4/Q8 and the ggml formats)](06-quantization.md) | Why 4-bit weights work, the Q4_0 / Q8_0 block layouts and their error, and (§6.12) the byte layout and a worked dequantization of Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16 and BF16 |
+| 7 | [The CPU backend](07-cpu-backend.md) | SIMD with the Vector API, dot-product kernels, int8 activations and the native C kernels, prefill vs decode, and the f16 / q8 / q4 KV caches with rotated keys (§7.13) |
+| 8 | [The Metal backend](08-metal-backend.md) | GPU basics, Panama FFM, every compute kernel, flash attention, the start-up self-check, MoE, decode replay and batched rows, GGUF block types on the GPU, the q4 and rotated q8 caches, the prefill chunk, the multi-row matvec and the decode attention |
 | 9 | [Sampling](09-sampling.md) | Softmax, temperature, top-k, top-p, min-p, repetition penalties |
-| 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix caching, stop strings, HTTP/1.1, SSE streaming, the OpenAI API |
-| 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers (Metal, CPU with int8 activations, f16 / q8 / q4 KV cache, q8 with rotated keys, and what q4 costs in accuracy), what to improve next |
-| 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), stacked expert weights, converting a 61 GB checkpoint on a 32 GB laptop, why prefill chunks of 256 tokens pay, running a model bigger than the GPU's memory with its rarely used experts on the CPU |
-| 13 | [Q2_K quantization](13-q2k-quantization.md) | 2-bit weights: sub-block scales and mins, the 84-byte super-block, the quantizer search, the Σx dot product, measured size/speed/quality |
-| 14 | [Model families](14-model-families.md) | One table of every supported family (Qwen3, Qwen2, Llama 3.x, Mistral, GLM / GLM-4, Phi-3 / 4, Gemma 2 / 3, DeepSeek-V2 / V3, Mamba, Qwen3-Next): what differs (bias, QK-norm, sliding window, RoPE pairing and scaling, sandwich norms, GeLU, soft-capping, MoE routing, multi-head latent attention, BOS), verified tensor names, the typed `Architecture` model and how to add a family, the comparison with transformers on real published weights; Qwen3-Next's Gated DeltaNet (the delta rule, its chunked form, state instead of most of the KV cache) |
-| 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache, why the prefix cache changes |
-| 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format: header, metadata and tensor directory byte by byte, the Q4_0 / Q8_0 / K-quant block layouts and a table of every ggml type (in place on both backends: Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16 too), mapping metadata and tensor names onto the typed `Architecture`, why Llama's q/k rows are permuted (and how interleaved RoPE undoes it), zero-copy mapping on CPU and Metal, the tokenizer stored in the file, choosing and downloading one file of a GGUF repository; the Qwen3.5 / Qwen3-Next hybrids (tiled value heads, split projections, verified against llama.cpp) and the model's own multi-token-prediction head as a draft for speculative decoding |
-| 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup with an n-gram index and adaptive drafts, slots that copy a shared prefix, conversations saved to disk, pipelined GPU decoding, tokenizing only what is new, noticing a client that left, constrained tool calls with jump-forward and speculation under the constraint (§17.7) — measured |
-| 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU: MSL → C++, fibers for GPU threads, simd collectives, deadlock detection, what it can and cannot verify |
-| 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push to Docker Hub, run; the /data volume, the API key, memory sizing, proxies, what was verified |
-| 20 | [Pictures as input](20-vision.md) | Vision-language models: the second GGUF (`mmproj`), llama.cpp-exact picture preprocessing (Pillow resize), the vision transformer on CPU and Metal (patches, 2-D rotary, windows, learned positions), the projectors (pixel shuffle, pooling, 2 x 2 merge, Qwen3-VL deepstack), embeddings in place of placeholder tokens, M-RoPE by rewriting rotary rows, a KV cache keyed by the picture, `image_url` parts, the console and the `describe_image` tool, checked against llama.cpp, measured |
-| 21 | [Audio](21-audio.md) | Speech-to-text and text-to-speech: the log-mel spectrogram, Whisper's encoder, decoder and cross-attention, the special-token protocol, timestamps and word timestamps (DTW), Whisper on Metal; OuteTTS (a Qwen2 language model that writes audio-codec tokens) and the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT); the API, the Audio tab with its waveform editor, the chat tools; checked against transformers and the Python packages, measured against whisper.cpp |
-| 22 | [Image generation](22-image-generation.md) | What "denoising" means, the forward and reverse diffusion math, latent space and the VAE, the CLIP text encoder, the UNet (ResNet blocks, spatial transformers, cross-attention), classifier-free guidance, the samplers (Euler, ancestral, DPM++ 2M, Karras), Turbo distillation, image to image / inpainting / outpainting, the seeded random numbers, how the CPU and Metal backends compute it (convolution as a matrix product, the kernels), the API and the Images tab, checked against diffusers, measured speed, what video will reuse |
-| 23 | [Video generation](23-video-generation.md) | A video is many pictures that must agree; AnimateDiff's motion adapter (21 temporal transformers in the UNet: group norm over the clip, attention along the frame axis, sinusoidal frame positions), frames in the batch with guidance, DDIM and the linear schedule, per-frame VAE decoding, the new kernels, writing GIF (median cut, dithering, LZW), lossless WebP (VP8L) and MP4, the `/v1/videos` API, `jllm video`, the Video tab and its editor, `generate_video`, checked against diffusers (UNet 8·10⁻⁶, 78–87 dB clips), measured speed, and how far Wan 2.1 (transformer, causal 3-D VAE, UMT5 with int8 weights) got |
+| 10 | [Engine and server](10-engine-and-server.md) | The generation loop, prefix cache, stop strings, HTTP/1.1, SSE, the OpenAI API, speculative decoding and batched decoding across slots |
+| 11 | [Performance notes](11-performance.md) | Why decode is memory-bound, measured numbers (Metal, CPU int8, f16 / q8 / q4 caches, q8 with rotated keys), and what to improve next |
+| 12 | [Mixture of Experts](12-mixture-of-experts.md) | Routers and experts (Qwen3-30B-A3B), converting a 61 GB checkpoint on a 32 GB laptop, why prefill chunks of 256 pay, hot experts on the GPU and cold ones on the CPU |
+| 13 | [Q2_K quantization](13-q2k-quantization.md) | 2-bit weights: sub-block scales and mins, the 84-byte super-block, the quantizer search, measured size / speed / quality |
+| 14 | [Model families](14-model-families.md) | Every supported family (Qwen, Llama, Mistral, GLM, Phi, Gemma, DeepSeek, Mamba, Qwen3-Next and more): what differs, the typed `Architecture`, how to add a family, comparison with transformers on real weights |
+| 15 | [Mamba](15-mamba.md) | State-space models: the recurrence, discretization, the causal conv, state instead of a KV cache |
+| 16 | [GGUF](16-gguf.md) | llama.cpp's single-file format run in place: header and tensors byte by byte, block layouts, name mapping, the stored tokenizer and its pre-types, Qwen3.5 hybrids, multi-token prediction, Gemma / Phi / GLM / Mamba / DeepSeek / Mistral 3 |
+| 17 | [Speedups for coding agents](17-agent-speedups.md) | Prompt lookup, shared prefixes, saved conversations, pipelined GPU decoding, cancellation, and constrained tool calls with jump-forward (§17.7) |
+| 18 | [The Metal emulator](18-metal-emulator.md) | Running the GPU kernels on any CPU (MSL → C++, fibers for GPU threads) to test them without a GPU, and what it cannot verify |
+| 19 | [Docker](19-docker.md) | One image with the engine and the web console: build, push, run, the /data volume, memory sizing, what the container can and cannot do (CPU only, no ffmpeg) |
+| 20 | [Pictures as input](20-vision.md) | Vision-language models: the mmproj file, llama.cpp-exact preprocessing, the vision transformer on CPU and Metal, projectors, M-RoPE, picture-keyed caches, `image_url`, checked against llama.cpp |
+| 21 | [Audio](21-audio.md) | Speech to text (log-mel, Whisper, timestamps) and text to speech (OuteTTS + WavTokenizer), the API, the Audio tab, checked against transformers and whisper.cpp |
+| 22 | [Image generation](22-image-generation.md) | Diffusion from scratch: noise schedules, the UNet and VAE, CLIP, guidance, samplers, image-to-image and inpainting, the CPU and Metal kernels, checked against diffusers |
+| 23 | [Video generation](23-video-generation.md) | AnimateDiff's motion adapter on Stable Diffusion, frames that must agree, GIF / WebP / MP4 writers, the `/v1/videos` API, and how far Wan 2.1 got |
+| 24 | The paged KV cache (**coming soon**) | The cache as small blocks with a block table per conversation and a prefix tree, so conversations share a common prompt instead of each storing it |
 
 A glossary of terms is at the end of the [overview](01-overview.md#glossary).

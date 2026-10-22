@@ -2,8 +2,11 @@
 
 Code: `scripts/metal-emu/transpile.py` (Metal Shading Language → C++), `scripts/metal-emu/metal_emu.h` (the Metal
 types and built-in functions in C++), `scripts/metal-emu/runtime.cpp` (the `jm_*` C API of `jllm_metal.m`, running
-kernels on the CPU), `scripts/build-metal-emu.sh` (builds `target/native/libjllm_metal_emu.so`),
-`scripts/metal-emu/emu.py` + `kernel_tests.py` (kernel tests from Python), `scripts/arch-smoke.sh` with `METAL_EMU=1`.
+kernels on the CPU), `scripts/build-metal-emu.sh` (builds `target/native/libjllm_metal_emu.so`, or `.dylib` on macOS),
+`scripts/metal-emu/emu.py` + `kernel_tests.py` (kernel tests from Python; `kernel_tests_diffusion.py` for the image
+generation kernels; `ggml_ref.py`, numpy decoders of the newer GGUF block formats), `scripts/arch-smoke.sh` with
+`METAL_EMU=1`. The build transpiles four shader files together: `kernels.metal` (the language model), `vision.metal`,
+`audio.metal` and `diffusion.metal`.
 
 ---
 
@@ -12,7 +15,7 @@ kernels on the CPU), `scripts/build-metal-emu.sh` (builds `target/native/libjllm
 🧸 You want to check that a recipe for a giant bakery works, but you only have a tiny home kitchen. So you follow
 the same recipe, one tray at a time, very slowly. The cake is the same; it just takes longer.
 
-📐 The Metal backend's kernels are about 2 700 lines of GPU code. Without the emulator, every change to them could
+📐 The Metal backend's kernels are about 7 200 lines of GPU code (`kernels.metal` 5 243 lines, `diffusion.metal` 1 059, `vision.metal` 547, `audio.metal` 366, at this writing; the first version of this chapter covered 2 700). Without the emulator, every change to them could
 only be tested on a Mac, by hand. With it, the **unchanged** `MetalBackend` Java code runs on Linux (or a Mac)
 against a library that has the same C functions as the real Objective-C shim, and the full cross-check of
 `ArchSmoke` — every model family, CPU logits vs Metal logits — runs anywhere:
@@ -20,6 +23,8 @@ against a library that has the same C functions as the real Objective-C shim, an
 ```
 METAL_EMU=1 scripts/arch-smoke.sh                       # every family, CPU vs "Metal" on the emulator
 python3 -I scripts/metal-emu/kernel_tests.py            # single kernels against numpy references
+python3 -I scripts/metal-emu/kernel_tests.py q41 q3k    # only the GGUF block formats listed (q41 q50 q51 q3k iq4nl iq4xs mxfp4 f16w bf16w q4g q8g q4k q5k)
+scripts/build-metal-emu.sh                              # builds the emulator library first (needs clang++ and python3; Linux and macOS)
 java ... -Djllm.metal.emulator=true -Djllm.metal.lib=target/native/libjllm_metal_emu.so ...
 ```
 
@@ -109,13 +114,17 @@ returns immediately, so pipelined decoding ([08 §8.16](08-metal-backend.md#816-
 with its full logic. `jm_run` (a recorded decode step, [08 §8.22](08-metal-backend.md#822-decode-replay-one-native-call-per-token))
 reads the same 384-byte command records as the Objective-C shim and runs them one after the other through
 `jm_dispatch`, so the recording, the patching and the verification of replayed steps are exercised here exactly as on a
-Mac; only the native encoding loop itself is the shim's own.
+Mac; only the native encoding loop itself is the shim's own. The concurrent encoder of [08 §8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)
+has three more calls (`jm_set_concurrent`, `jm_set_group`, `jm_barriers`); the emulator keeps them as no-ops, because it runs every dispatch to
+completion before the next one, which is a valid execution of any schedule that has the barriers the real encoder needs.
 
 ---
 
 ## 18.5 What it catches, and what it cannot
 
-What it verified during this work:
+What it verified during this work (the counts are those of the first run; the family list has grown since, with the Qwen3-Next
+hybrids, the GGUF models of `GgufArchSmoke`, the q8 / q4 KV caches and the rotated q8 cache, replay, batched decoding and
+`attention_dec`, and `arch-smoke.sh` prints its own current totals):
 
 - every family in `scripts/arch-smoke.sh` (Llama, Mistral, Qwen2, Qwen3-MoE, GLM / GLM-4, Phi-3, Gemma 2 / 3, Mamba,
   DeepSeek-V2 / V3 with MLA and MoE, in five formats each):
@@ -125,12 +134,19 @@ What it verified during this work:
     two slots sharing a placement;
   - this end-to-end run is what exercises `moe_sort` and the grouped MoE kernels, the router's remap and counting (with emulated atomics), `embed_token`,
     `argmax` and the Q6_K matrix path;
-- attention (`attention_t` variants), the Q4_0 prefill matmuls and `attention_fa` (windows, soft-cap, half cache)
-  against float64 numpy references (`kernel_tests.py`, 18 tests).
+- single kernels against float64 numpy references (`kernel_tests.py`, about 1 700 lines): attention in every cache type
+  (`attention_t`, flash decoding, `attention_fa` / `fb`, `attention_dec`, the q4 and rotated-q8 stores and attention), the
+  matmul families in every weight format (the nine newer GGUF types against `ggml_ref.py`, which is itself checked against
+  llama.cpp's C code), the matrix-unit and half-weight prefill kernels, the multi-row decode matvecs, the MoE kernels,
+  the Gated DeltaNet kernels, the vision encoder, Whisper's kernels, and (`kernel_tests_diffusion.py`) the image-generation
+  kernels in float32 and float16.
 
 What it cannot tell you:
 
 - **speed** — the real GPU's memory bandwidth, occupancy and tile shapes decide that; measure with `bench` on a Mac;
+- **a missing barrier of the concurrent encoder** — every emulated dispatch finishes before the next starts, so a kernel
+  that reads what the previous one wrote can never see stale data here; the derived barriers are checked on the GPU
+  (`ArchSmoke.concurrentCheck` in `scripts/arch-smoke.sh` without `METAL_EMU`, [08 §8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before));
 - **hardware-specific behaviour** beyond the language: the real lane layout of simdgroup matrices, half-precision
   rounding modes in the GPU's ALUs, driver bugs. The start-up self-check ([08 §8.14](08-metal-backend.md#814-the-kernel-self-check-metaltuner))
   covers that on the user's own device, by comparing each new kernel with the established one before using it;
