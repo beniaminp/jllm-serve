@@ -97,7 +97,7 @@ PE[p, 2i] = sin(p / 10000^{2i/C}),  PE[p, 2i+1] = cos(p / 10000^{2i/C})   (a tab
 Note the position embedding is added to the **input of the attention only** (queries, keys and values all come from `LayerNorm(h) + PE`),
 not to the residual stream. The attention matrices are tiny (F × F = 16 × 16) but there are `B · H · W` of them: 2 · 4 096 sequences at the
 top level. The cost is in the linear layers (`C → C` projections, a `C → 8C` GEGLU and `4C → C`), run on `B · F · H · W` rows, which is
-why the temporal layers add roughly @@MOTIONSHARE@@ % to the time of a UNet evaluation. The group norm over the clip is the one subtle
+why the temporal layers add roughly 40 % to the time of a UNet evaluation. The group norm over the clip is the one subtle
 point: normalising each frame alone changes the result (a frame brighter than the others would be normalised back to the mean), and the
 test of the tiny pipeline fails at 1 · 10⁻² if it is done per frame.
 
@@ -167,7 +167,7 @@ kernels are one thread per output element; each has a numpy reference in `script
 emulator of [chapter 18](18-metal-emulator.md) in float32 and float16, and a CPU-against-GPU test (`VideoTest.opsParity`).
 
 *Memory.* The activations of a 512 × 512, 16-frame clip with guidance are those of a batch of 32 images: a `[32, 64, 64, 320]` tensor
-is 84 MB in float16, the GEGLU intermediate of the first temporal layer `[131 072, 2560]` is 671 MB. @@MEMORY@@
+is 84 MB in float16, the GEGLU intermediate of the first temporal layer `[131 072, 2560]` is 671 MB. Measured peaks of the GPU buffers: 4.1 GB at 256 × 256 and 7.3 GB at 512 × 512 in float16 (8.1 GB at 256 × 256 in float32). `video.decode-chunk` (frames per VAE call, default 1) trades the VAE's activation memory against speed.
 
 ---
 
@@ -202,7 +202,7 @@ full); a Netscape extension makes it loop forever; delays are in centiseconds, r
 ```
 
 The decoded frames are bit-identical to the input (`VideoTest` decodes with an independently written decoder, and a one-off check with
-Pillow's libwebp and `ffmpeg` agreed on every pixel of a 6-frame 200 × 150 clip). Lossless is big: @@WEBPSIZE@@. **MP4**: raw RGB
+Pillow's libwebp and `ffmpeg` agreed on every pixel of a 6-frame 200 × 150 clip). Lossless is big: a real 512 × 512, 16-frame clip is 5.9 MB as WebP against 12.6 MB raw (2.0 MB as GIF, 0.83 MB as MP4), because the detail of a diffusion model is noise-like and does not compress losslessly. **MP4**: raw RGB
 frames are piped into `ffmpeg -f rawvideo -pix_fmt rgb24 -i - -c:v libx264 -crf 17 -pix_fmt yuv420p -movflags +faststart` (`mpeg4` when
 libx264 is missing; dimensions are padded to even); `video.ffmpeg` is `auto` (look it up on the PATH), `off` or a path. Without ffmpeg the
 format `auto` is WebP, and asking for `mp4` is a clear 400.
@@ -262,16 +262,161 @@ for GIF / WebP).
 
 ## 23.10 Verified against diffusers
 
-@@VERIFIED@@
+Two kinds of check, both against **Hugging Face diffusers** (`AnimateDiffPipeline`) given the same weights, the same noise (the
+initial noise is made by torch and handed to jllm: the two do not share a random generator) and the same prompt.
+
+**1. In `mvn test` (no download): a tiny random AnimateDiff.** `scripts/diffusion/make-tiny-video.py` builds a small random Stable Diffusion
+pipeline and a motion adapter with the same module layout as the real one (`src/test/resources/diffusion/tiny-motion-adapter`);
+`reference_video.py` runs diffusers on it and stores the text embeddings, one UNet output, the latents after every step and the frames
+(`ref-video-ddim`, `-euler`, `-dpmpp_2m`). `VideoTest` compares the stages and the final frames; frames PSNR against diffusers (the limits
+for the intermediate stages are in the test):
+
+| scheduler | CPU f32 | Metal f32 | Metal f16 |
+|---|---|---|---|
+| DDIM | 131.2 dB | 130.7 dB | 65.8 dB |
+| Euler | 125.6 dB | 125.9 dB | 60.4 dB |
+| DPM++ 2M | 130.0 dB | 129.1 dB | 62.6 dB |
+
+The file writers are checked by round trip: animated WebP with `Vp8lDecoder`, a decoder written separately from the encoder, bit-exact for
+4-frame clips of several sizes down to 1 × 1, smooth and noisy (and once, by hand, against libwebp and `ffmpeg`); GIF by decoding it again (worst
+frame 26.6 dB after the 256-colour palette, which is what a palette costs), including a noisy clip that forces LZW table resets; MP4 by the `ftyp`
+box when `ffmpeg` is installed. The rest of `VideoTest`: DDIM timesteps against numpy's, `addNoise` then `predictOriginal` returns the clean latents,
+the CPU and the GPU implementation of the new operations (`swapAxes`, `addRows`, the group norm over a whole clip) against each other, the
+engine's HTTP server (`n=2`, streaming progress and previews, bad sizes, MP4 without ffmpeg), and the download of a motion adapter from a fake Hub
+(only `config.json` and the fp16 weights, not downloaded twice).
+
+**2. The real model, run by hand.** `guoyww/animatediff-motion-adapter-v1-5-2` on `stable-diffusion-v1-5` (fp16 files, widened to float32),
+diffusers on the CPU in float32 as the reference (`--device cpu --dtype float32`: a float32 CPU run is the reference, not the MPS GPU), jllm on Metal. 16 frames, guidance 7.5, `--dump-steps` stores the latents after every step:
+
+```sh
+python scripts/diffusion/reference_video.py models/stable-diffusion-v1-5_stable-diffusion-v1-5 models/guoyww_animatediff-motion-adapter-v1-5-2 acc/r256 \
+    --variant fp16 --adapter-variant fp16 --device cpu --dtype float32 --width 256 --height 256 --frames 16 --steps 4 --guidance 7.5 --seed 42 --scheduler ddim --dump-steps
+java ... org.robomiri.jllm.diffusion.VideoCompare models/stable-diffusion-v1-5_stable-diffusion-v1-5 models/guoyww_animatediff-motion-adapter-v1-5-2 acc/r256 metal f32
+```
+
+| run | jllm | UNet, first step (relative max) | latents after the last step (relative max) | frames: PSNR (worst frame) |
+|---|---|---|---|---|
+| 64 × 64, 4 frames, DDIM 3 steps | CPU f32 | 1.8·10⁻⁶ | | 94.7 dB |
+| 256 × 256, 16 frames, DDIM 4 steps | Metal f32 | 6.2·10⁻⁶ | 2.1·10⁻⁴ | 85.3 dB (81.8) |
+| 256 × 256, 16 frames, DDIM 4 steps | Metal f16 | 5.4·10⁻⁴ | 2.5·10⁻² | 45.1 dB (41.3) |
+| 256 × 256, 16 frames, Euler 3 steps, seed 7 | Metal f32 | 7.4·10⁻⁶ | 8.0·10⁻⁴ | 78.1 dB (69.7) |
+| 256 × 256, 16 frames, Euler 3 steps, seed 7 | Metal f16 | 7.3·10⁻⁴ | 3.7·10⁻² | 39.4 dB (31.2) |
+| 512 × 512, 16 frames, DDIM 2 steps | Metal f32 | 3.1·10⁻⁶ | 2.1·10⁻⁴ | 87.5 dB (86.9) |
+| 512 × 512, 16 frames, DDIM 2 steps | Metal f16 | 6.4·10⁻⁴ | 5.7·10⁻² | 39.5 dB (39.0) |
+| 192 × 192, 8 frames, DDIM **20** steps (the whole loop; the latents after each of the 20 steps are compared, the largest 1.2·10⁻⁴) | Metal f32 | 6.5·10⁻⁶ | 1.2·10⁻⁴ | 93.2 dB (88.4) |
+| same | Metal f16 | 5.3·10⁻⁴ | 1.3·10⁻² | 49.4 dB (42.2) |
+
+A float32 clip is the same picture as diffusers' to well under one grey level in the worst pixel (85 dB). Float16 clips agree to 39–45 dB:
+the same clip to the eye, but the latents differ by a few per cent after the last step. The default precision on Metal is float16;
+`video.precision=f32` gives the first rows for twice the memory and 1.5 times the time. Memory of the reference runs, for scale: diffusers on the
+CPU in float32 needs 15–17 GB of resident memory for these 16-frame clips.
+
 
 ---
 
 ## 23.11 Measured speed and memory
 
-@@SPEED@@
+Measured on the development machine (Apple M1 Pro, 32 GB shared with everything else), one benchmark at a time under the machine's
+lock, `VideoBench` for jllm and `scripts/diffusion/bench_diffusers_video.py` for diffusers on the same GPU (MPS, `torch` as installed in
+the reference environment). 16 frames with guidance, so every UNet evaluation is a batch of **32 images**; DDIM, guidance 7.5, the motion
+adapter and base model as above. "Warm" is the second clip of the same process (shader compilation and weight upload are in the first).
+
+```sh
+java ... org.robomiri.jllm.diffusion.VideoBench BASE ADAPTER metal f16 10 256 256 16 2 7.5 ddim        # backend precision steps w h frames reps guidance scheduler
+python scripts/diffusion/bench_diffusers_video.py BASE ADAPTER --device mps --dtype float16 --steps 10 --size 256 --frames 16 --reps 2
+```
+
+| 16 frames, guidance 7.5 | | UNet, s per step | VAE, s per frame | clip, s | GPU memory |
+|---|---|---|---|---|---|
+| 256 × 256, float16, 10 steps | **jllm Metal** | 3.88 | 0.30 | 43.7 | 3.0 GB buffers (peak 4.1 GB) |
+| | diffusers MPS | 2.58 | 0.15 | 28.2 | 13.1 GB driver |
+| 256 × 256, float32, 4 steps | **jllm Metal** | 5.66 | 0.42 | 29.5 | 5.9 GB buffers (peak 8.1 GB) |
+| | diffusers MPS | 3.07 | 0.16 | 14.9 | 21.3 GB driver |
+| 512 × 512, float16, 4 steps | **jllm Metal** | 17.6 | 1.21 | 89.7 | 3.0 GB buffers (peak 7.3 GB) |
+| | diffusers MPS | 242 | 1.3 | 990 | 23.9 GB driver; the machine swapped (10 GB of swap in use) |
+
+Read honestly: **at 256 × 256 diffusers on MPS is faster** (1.5 times per UNet step in float16, 1.8 in float32, 2 to 2.6 times in the VAE): PyTorch's
+Metal kernels are better tuned than the ones written here for these shapes. **At 512 × 512 jllm is 14 times faster per step**, because it never
+materialises the attention scores (flash attention, [chapter 22](22-image-generation.md)): diffusers' scores of the first level are
+`32 images × 8 heads × 4096 × 4096` numbers (8.6 GB in float16), the driver asked for 23.9 GB and the Mac paged. Peak resident memory of the whole jllm process
+(weights memory-mapped, widened to the activation type, plus buffers) was 8.3 GB in float16 at 512 × 512 and 11.5 GB in float32 at 256 × 256.
+
+**What the motion modules cost** (`-Djllm.video.nomotion=true` runs the same batch of 32 frames as independent images; the clip is then
+meaningless, only the time counts): 256 × 256 float16 2.66 s per step without, 3.87 s with (+45 %); 512 × 512 12.68 s without, 17.60 s with
+(+39 %). The 21 temporal transformers are about 30 % of an AnimateDiff UNet evaluation.
+
+**A whole real clip** (`./jllm video --video-model ... --width 512 --height 512 --frames 16 --fps 8 --steps 20 --seed 3 --video.precision f16`):
+371 s = UNet 351 s (17.6 s per step) + VAE 19.3 s; the file as MP4 (libx264 crf 17) 0.83 MB, as animated lossless WebP 5.9 MB, as GIF 2.0 MB; the raw
+frames are 12.6 MB. Time is linear in the number of frames and in steps, and roughly 4.5 times more for a doubled side.
+
+**What the pictures look like.** Frame for frame these clips equal diffusers' (section above), and that includes how they look: with the plain
+Stable Diffusion 1.5 as the base, the `v1-5-2` adapter gives poor clips (flat or smeared colours that change from frame to frame at 192 to 512
+pixels), the same ones diffusers makes (a 20-step 192 × 192 clip from the same noise equals diffusers' on the CPU at 93.2 dB in float32, and shows the same colour smears). A single frame
+without the adapter (`--frames 1`) is a normal Stable Diffusion picture. The adapter is meant for a *fine-tuned* Stable Diffusion 1.5
+checkpoint (`video.base-model`, a diffusers folder or repository with `model_index.json`); none was available within the download limits of this
+work, so no pretty clip was made.
+
 
 ---
 
 ## 23.12 Wan 2.1: how far it got and what remains
 
-@@WAN@@
+**Wan 2.1** (`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`) is a different kind of video model: not a UNet with temporal layers but a *diffusion
+transformer* over a 3-D latent, a *causal 3-D VAE* that squeezes 4 frames into 1 latent frame and 8 × 8 pixels into 1, and a large text
+encoder (UMT5-XXL). Every component of it is written here and checked against diffusers; **what is missing is the text encoder's weights**, so no
+real clip could be made end to end.
+
+| component | what it does | notes |
+|---|---|---|
+| `WanTransformer` | 30 blocks of width 1536 (12 heads of 128): 2 × 2 patches of a frame as tokens, time embedding → 6 modulation vectors per block (shift, scale, gate for attention and for the feed-forward, plus a learned table), self-attention with RMS-normed queries and keys over all heads and 3-D rotary positions (44 channels for the frame axis, 42 + 42 for height and width), cross-attention to the text, tanh-GELU feed-forward | predicts the velocity `v = noise − clean` of a flow-matching model |
+| `WanVae` | causal 3-D convolutions (a 3-tap kernel over time that only looks back, done as three shifted 2-D convolutions that are added), temporal up-sampling by a convolution that doubles the frames, the first frame decoded alone | latent `[F, h, w, 16]` → `1 + 4(F − 1)` frames of `8h × 8w` |
+| `Umt5Encoder`, `UnigramTokenizer` | 24 layers of width 4096, relative position bias per layer, no attention scaling; SentencePiece **Unigram** tokenizer read from `tokenizer.json` (space collapsing, metaspace, Viterbi segmentation, fused unknowns) | on the CPU; the linear layers are quantized to int8 (Q8_0 layout, groups of 32) while they are read |
+| `FlowScheduler` | flow-matching sigmas with shift 3, UniPC multistep predictor-corrector of order 2 (and plain Euler) | 30 steps by default, guidance 5 |
+| `WanPipeline` | tokenize → UMT5 (read, used, freed per request) → transformer twice per step (guidance) → UniPC → VAE | `jllm video --video-model <local Wan folder>` |
+
+New operations on the image stack (`Ops`, CPU and Metal): RMS norm, rotary embedding, adaptive modulation `x (1 + scale) + shift`, gated
+residual, frame shift for the causal convolution, row gather and stack, the tanh GELU; each GPU kernel has a numpy reference in
+`kernel_tests_diffusion.py` (float32 and float16, on the emulator) and a CPU-against-GPU test.
+
+**Accuracy against diffusers / transformers**
+
+| check | result |
+|---|---|
+| tokenizer, 8 prompts (accents, Japanese, emoji, runs of spaces, empty), tiny vocabulary and the real 256 000-piece `umt5-xxl` vocabulary | the same ids as Hugging Face `tokenizers` |
+| UMT5 encoder, tiny random weights | float 3.7·10⁻⁷ relative; int8 weights 1.2·10⁻² (a random 2-layer model, the worst case for quantization) |
+| transformer, tiny random weights | 3·10⁻⁷ (CPU and Metal float32), 7·10⁻⁴ (Metal float16) |
+| **transformer, the real 1.3B weights**, latent 5 × 24 × 40, 64 random text vectors | CPU float32 **2.9·10⁻⁶**, Metal float32 **3.3·10⁻⁶**, Metal float16 5.3·10⁻³ (relative max error) |
+| VAE decoder, tiny random weights | 3.5·10⁻⁶ (132 dB), float16 69 dB |
+| **VAE decoder, the real weights**, latent 5 × 12 × 20 → 17 frames of 96 × 160 | Metal float32 **1.1·10⁻⁵ (128.3 dB)**, Metal float16 77.0 dB |
+| flow sigmas and timesteps, 5 steps | 999, 923, 818, 667, 429 as diffusers |
+| the whole tiny pipeline (UMT5 → transformer → UniPC → VAE) from the same noise, guidance 5 and 1 | 130 to 135 dB in float32 (CPU and Metal), 70 dB in float16 |
+
+All of this is in `mvn test` (`WanTest`, tiny fixtures `src/test/resources/diffusion/tiny-wan`, `ref-wan-*`, made by `scripts/diffusion/make-tiny-wan.py`
+and `reference_wan.py`) except the two rows on the real weights (`WanCompare dit|vae`, by hand). The real-weights run found a bug the tiny test could not:
+the Metal tanh-GELU gave NaN for pre-activations in the hundreds (the real text projection has them; `tanh` of a huge argument is inf / inf
+under fast math), fixed by clamping the argument, with a test of its own (`WanTest.geluTanhHuge` and a kernel test).
+
+**Speed** (`WanBench`, random inputs; transformer evaluation = one of the two per step with guidance):
+
+| latent (frames × h × w) = tokens, video | Metal float32 | Metal float16 | CPU float32 |
+|---|---|---|---|
+| 5 × 24 × 40 = 1 200 tokens, 17 frames of 320 × 192: transformer | 2.05 s | 1.43 s | 17.0 s |
+| same: VAE decode | 6.4 s | 4.9 s | 39.5 s |
+| 9 × 30 × 52 = 3 510 tokens, 33 frames of 416 × 240: transformer | | 6.3 s | |
+| same: VAE decode | | 15 to 33 s | |
+
+Flash attention matters here as well (float32, 1 200 tokens: 2.05 s with it, 5.3 s with `-Djllm.diffusion.flash=false`). Memory: the weights are 6.2 GB
+on disk in float32 (transformer 5.7 GB, VAE 0.5 GB), 3.1 GB in float16; GPU buffers 10.0 GB (float32) and 5.0 GB (float16) for the 17-frame case.
+A 17-frame 320 × 192 clip with 30 steps would be about 30 × 2 × 1.43 s + 5 s ≈ 90 s of GPU time in float16 plus the text encoder.
+
+**What is missing, and why.** The text encoder of that repository is stored only as **float32 (22.7 GB, five shards)**; there is no float16 or
+bfloat16 file. The download budget of this work was 20 GB in total for all models, so the encoder was not fetched, and a real prompt cannot be
+run. Everything downstream was checked with random text vectors of the right shape (the transformer does not care where they come from), and the
+encoder itself on the tiny model and by its tokenizer on the real vocabulary. The design for the real encoder: read tensor by tensor, never keep
+the float32 file resident, quantize each linear layer to int8 as it is read (4.6 GB for the 24 layers; the 256 000 × 4096 embedding table is
+read row by row from the memory-mapped file), run on the CPU for the few hundred tokens of a prompt, free it before the transformer is used
+(`WanPipeline` does exactly this per request). Its numerical error on the real weights has not been measured: the tiny model's 1.2·10⁻² says
+only that int8 costs about a percent. Not done either: the Wan pipeline is reachable from `jllm video` with a local folder only (not from the API
+servers, the console or the chat tool, which stay AnimateDiff); image-to-video, the 14B models, the VAE encoder, float16 end-to-end checks on real
+weights beyond the rows above, and a streaming preview of intermediate steps.
+
