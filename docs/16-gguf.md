@@ -584,7 +584,7 @@ alone they produced llama.cpp's text.)
 
 `mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
-Metal dispatch family), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
+Metal dispatch family; `GgufMetalBench` times them), `NativeCpuCheck` (the native int8 kernels against the Java ones), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
 permutation, metadata mapping), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
 selection, settings) and `GgufTokenizerTest` on the `llama-spm` vocabulary. With the Qwen3-0.6B files downloaded by
 `./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:

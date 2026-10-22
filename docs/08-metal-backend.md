@@ -1547,3 +1547,7 @@ The half-weight kernels round each dequantized weight to half. A weight of the n
 `d (ls - 32) kvalues[nibble]`, which has more than the 11 significant bits of a half, so on a random model with
 `|logit|` about 13 the CPU and the GPU differ by ~1e-3 where MetalTuner chose them (1e-6 with `-Djllm.metal.hmma=false`);
 the same holds for Q6_K and Q8_0, and the tuner's agreement check is the guard (8.21).
+
+**Short chunks.** `MetalKernels.tiledIsSlow` sends Q4_K, Q5_K, Q5_0 and Q3_K prefill chunks of 8 – 31 tokens to the matrix-unit kernels instead of
+the tiled `*_pf` ones, which decode a whole 32-weight unit per lane and row and are 3 – 4x slower for these bit-field formats
+(Q4_K_M prefill of a 413-token prompt: 750 → 1414 tok/s, same text; numbers in [16 §16.9.1](16-gguf.md)).
