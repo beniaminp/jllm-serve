@@ -303,7 +303,36 @@ conversations are found again through the tree rather than in place.
 ---
 ## 25.5 Measured
 
-The measurements of the simulated agent workload (`SchedulerBench`) on Qwen3-0.6B and Qwen3-30B-A3B are being taken under the heavy-job lock; this section is filled in by the next commit.
+Machine: Apple M1 Pro, 10 cores, 32 GB, macOS (Darwin 27.2), 2026-10-22, every row under the heavy-job lock (no other benchmark on the
+machine; load average 2 to 4 from idle background processes). Tool: `jllm-web/src/test/java/org/robomiri/jllm/web/models/SchedulerBench.java`, a simulated
+agent workload against a loaded `LoadedModel` (so the queue, the slot choice, the engines and the passes are the real ones; only HTTP is left out):
+
+* `agents` clients, each running `turns` turns of a coding-agent conversation. Every turn **resends the whole conversation**: a system prompt
+  of `system` tokens shared by all agents, the agent's own earlier messages and the answers it got, and `fresh` new tokens of "file contents";
+  `gen` tokens are generated (the prompt is ~20x longer than the output) and the agent "thinks" for `think` ms before the next turn.
+* `chats` short chats next to them (a 40-token prompt, `chatGen` tokens), back to back until the agents are done.
+* All greedy, speculation off unless a row says otherwise. TTFT is measured from the request's *arrival* (the wait for a slot counts), the
+  inter-token time (ITL) between two streamed pieces of one request.
+
+```sh
+# the engine jar the console's tests use is the one in ~/.m2: install first, in the same job
+mvn -q -o install -DskipTests
+cd jllm-web && mvn -o -q test -Dtest=SchedulerBench -Djllm.metal.lib=$PWD/../target/native/libjllm_metal.dylib \
+  -Dbench.model=Qwen/Qwen3-0.6B -Dbench.dir=../models -Dbench.slots=4 -Dbench.agents=6 -Dbench.turns=4 -Dbench.chats=2 \
+  -Dbench.system=2000 -Dbench.fresh=300 -Dbench.gen=64 -Dbench.chatGen=96 -Dbench.think=200 \
+  "-Dbench.args=--backend metal --backend.ctx 8192 --engine.speculative off --engine.scheduler mixed"      # or: slots [--backend.kv-paged true]
+```
+
+**Qwen3-0.6B, Q4_0, f32 cache, 4 slots, 6 agents x 4 turns (system prompt 2 000 tokens, +300 fresh tokens per turn, 64 generated) and 2 chats.**
+TBD-TABLE-06
+
+TBD-TEXT-06
+
+**Qwen3-30B-A3B-Thinking-2507, Q4_0, f16 cache, `backend.ctx 4096`.**
+TBD-TABLE-30
+
+TBD-TEXT-30
+
 
 ## 25.6 Checks and limits
 
