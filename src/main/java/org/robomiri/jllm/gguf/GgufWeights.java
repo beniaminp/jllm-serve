@@ -38,6 +38,7 @@ import java.util.regex.Pattern;
 public final class GgufWeights implements TensorSource, AutoCloseable {
 
     private static final Pattern LAYER = Pattern.compile("^model\\.layers\\.(\\d+)\\.(.+)$");
+    private static final Pattern MAMBA_LAYER = Pattern.compile("^backbone\\.layers\\.(\\d+)\\.(.+)$");
 
     private final GgufFile gguf;
     private final Arena arena = Arena.ofShared();
@@ -50,24 +51,106 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     /** The Gated DeltaNet hybrids' own tensor mapping (qwen35, qwen3next), else null. */
     private final GgufQwenNext hybrid;
 
+    private final GgufArchitecture.Family family;
+    /** Rows of the q projection and of k (= v) in a fused {@code attn_qkv}; kv_lora_rank and rope width of DeepSeek's fused {@code attn_kv_a_mqa}. */
+    private final long qRows;
+    private final long kvRows;
+    private final long kvLora;
+    private final long ropeDim;
+
     public GgufWeights(GgufFile gguf) {
         this.gguf = gguf;
         String arch = gguf.str("general.architecture", "");
         GgufArchitecture.Family f = GgufArchitecture.Family.of(arch);
+        this.family = f;
         this.hybrid = f != null && f.hybrid() ? new GgufQwenNext(this, gguf, arena, arch) : null;
+        String p = arch + ".";
+        long heads = gguf.num(p + "attention.head_count", 0);
+        long kv = gguf.num(p + "attention.head_count_kv", heads);
+        long hd = gguf.num(p + "attention.key_length", heads > 0 ? gguf.num(p + "embedding_length", 0) / heads : 0);
+        this.qRows = heads * hd;
+        this.kvRows = kv * hd;
+        this.kvLora = gguf.num(p + "attention.kv_lora_rank", 0);
+        this.ropeDim = gguf.num(p + "rope.dimension_count", 0);
+    }
+
+    /** A row range of one GGUF tensor that a canonical tensor is (fused q|k|v, DeepSeek's kv_a latent | rotary key). */
+    private record Slice(String tensor, long start, long rows, boolean vector) {
+    }
+
+    /** The row range behind {@code name} when the file fuses what the engine keeps apart, else null. */
+    private Slice slice(String name) {
+        Matcher m = LAYER.matcher(name);
+        if (!m.matches()) {
+            return null;
+        }
+        String b = "blk." + m.group(1) + ".";
+        String s = m.group(2);
+        for (String suffix : new String[]{"weight", "bias"}) {
+            boolean vec = suffix.equals("bias");
+            if (s.equals("self_attn.q_proj." + suffix) && !gguf.hasTensor(b + "attn_q." + suffix) && gguf.hasTensor(b + "attn_qkv." + suffix)) {
+                return new Slice(b + "attn_qkv." + suffix, 0, qRows, vec);
+            }
+            if (s.equals("self_attn.k_proj." + suffix) && !gguf.hasTensor(b + "attn_k." + suffix) && gguf.hasTensor(b + "attn_qkv." + suffix)) {
+                return new Slice(b + "attn_qkv." + suffix, qRows, kvRows, vec);
+            }
+            if (s.equals("self_attn.v_proj." + suffix) && !gguf.hasTensor(b + "attn_v." + suffix) && gguf.hasTensor(b + "attn_qkv." + suffix)) {
+                return new Slice(b + "attn_qkv." + suffix, qRows + kvRows, kvRows, vec);
+            }
+        }
+        if (s.equals("self_attn.kv_a_latent.weight")) {
+            return new Slice(b + "attn_kv_a_mqa.weight", 0, kvLora, false);
+        }
+        if (s.equals("self_attn.k_pe_proj.weight")) {
+            return new Slice(b + "attn_kv_a_mqa.weight", kvLora, ropeDim, false);
+        }
+        return null;
+    }
+
+    /** The rows of {@code sl} as a tensor of their own (a view of the same bytes). */
+    private GgufFile.Tensor sub(Slice sl) {
+        GgufFile.Tensor t = gguf.tensor(sl.tensor());
+        if (sl.vector()) {
+            long eb = t.type().rowBytes(1);
+            return new GgufFile.Tensor(t.name() + "[" + sl.start() + "+" + sl.rows() + "]", new long[]{sl.rows()}, t.type(), t.part(),
+                    t.offset() + sl.start() * eb, sl.rows() * eb);
+        }
+        long rb = t.rowBytes();
+        if (sl.start() + sl.rows() > t.rows()) {
+            throw new IllegalArgumentException(t + " has " + t.rows() + " rows, " + (sl.start() + sl.rows()) + " are needed");
+        }
+        return new GgufFile.Tensor(t.name() + "[" + sl.start() + "+" + sl.rows() + "]", new long[]{t.cols(), sl.rows()}, t.type(),
+                t.part(), t.offset() + sl.start() * rb, sl.rows() * rb);
     }
 
     /** The llama.cpp names behind a canonical name: one, two for a fused pair, or null if the name is unknown. */
     private String[] resolve(String name) {
         switch (name) {
-            case "model.embed_tokens.weight":
+            case "model.embed_tokens.weight", "backbone.embeddings.weight":
                 return new String[]{"token_embd.weight"};
             case "lm_head.weight":
                 return new String[]{"output.weight"};
-            case "model.norm.weight":
+            case "model.norm.weight", "backbone.norm_f.weight":
                 return new String[]{"output_norm.weight"};
             default:
                 break;
+        }
+        Matcher mb = MAMBA_LAYER.matcher(name);
+        if (mb.matches()) {
+            String b = "blk." + mb.group(1) + ".";
+            return switch (mb.group(2)) {
+                case "norm.weight" -> new String[]{b + "attn_norm.weight"};
+                case "mixer.in_proj.weight" -> new String[]{b + "ssm_in.weight"};
+                case "mixer.conv1d.weight" -> new String[]{b + "ssm_conv1d.weight"};
+                case "mixer.conv1d.bias" -> new String[]{b + "ssm_conv1d.bias"};
+                case "mixer.x_proj.weight" -> new String[]{b + "ssm_x.weight"};
+                case "mixer.dt_proj.weight" -> new String[]{b + "ssm_dt.weight"};
+                case "mixer.dt_proj.bias" -> new String[]{b + "ssm_dt.bias"};
+                case "mixer.A" -> new String[]{b + "ssm_a"};
+                case "mixer.D" -> new String[]{b + "ssm_d"};
+                case "mixer.out_proj.weight" -> new String[]{b + "ssm_out.weight"};
+                default -> null;
+            };
         }
         Matcher m = LAYER.matcher(name);
         if (!m.matches()) {
@@ -76,8 +159,23 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         String b = "blk." + m.group(1) + ".";
         return switch (m.group(2)) {
             case "input_layernorm.weight" -> new String[]{b + "attn_norm.weight"};
-            case "post_attention_layernorm.weight" -> new String[]{b + (gguf.hasTensor(b + "post_attention_norm.weight")
-                    ? "post_attention_norm.weight" : "ffn_norm.weight")}; // the hybrids (qwen35, qwen3next) name it so
+            // Gemma: the norm on the attention output; GLM-4: the norm before the MLP (its attention output norm is
+            // post_self_attn_layernorm); the hybrids (qwen35, qwen3next) store their MLP norm as post_attention_norm
+            case "post_attention_layernorm.weight" -> new String[]{b + (family != null && family.gemma() ? "post_attention_norm.weight"
+                    : family == GgufArchitecture.Family.GLM4 ? "ffn_norm.weight"
+                    : gguf.hasTensor(b + "post_attention_norm.weight") ? "post_attention_norm.weight" : "ffn_norm.weight")};
+            case "pre_feedforward_layernorm.weight" -> new String[]{b + "ffn_norm.weight"};
+            case "post_feedforward_layernorm.weight", "post_mlp_layernorm.weight" -> new String[]{b + "post_ffw_norm.weight"};
+            case "post_self_attn_layernorm.weight" -> new String[]{b + "post_attention_norm.weight"};
+            case "self_attn.o_proj.bias" -> new String[]{b + "attn_output.bias"};
+            case "self_attn.q_a_proj.weight" -> new String[]{b + "attn_q_a.weight"};
+            case "self_attn.q_a_layernorm.weight" -> new String[]{b + "attn_q_a_norm.weight"};
+            case "self_attn.q_b_proj.weight" -> new String[]{b + "attn_q_b.weight"};
+            case "self_attn.kv_a_layernorm.weight" -> new String[]{b + "attn_kv_a_norm.weight"};
+            case "self_attn.kv_b_proj.weight" -> new String[]{b + "attn_kv_b.weight"};
+            case "self_attn.k_b_proj.weight" -> new String[]{b + "attn_k_b.weight"};
+            case "self_attn.v_b_proj.weight" -> new String[]{b + "attn_v_b.weight"};
+            case "mlp.router_bias" -> new String[]{b + "exp_probs_b.bias"};
             case "nextn.eh_proj" -> new String[]{b + "nextn.eh_proj.weight"};
             case "nextn.enorm" -> new String[]{b + "nextn.enorm.weight"};
             case "nextn.hnorm" -> new String[]{b + "nextn.hnorm.weight"};
@@ -96,10 +194,14 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             case "self_attn.k_proj.bias" -> new String[]{b + "attn_k.bias"};
             case "self_attn.v_proj.bias" -> new String[]{b + "attn_v.bias"};
             case "self_attn.o_proj.weight" -> new String[]{b + "attn_output.weight"};
-            case "mlp.gate_up" -> new String[]{b + "ffn_gate.weight", b + "ffn_up.weight"};
+            // Phi-3, ChatGLM, GLM-4 store gate and up as one ffn_up of 2 x ff rows (gate first): already the stacked layout
+            case "mlp.gate_up" -> gguf.hasTensor(b + "ffn_gate.weight") || !gguf.hasTensor(b + "ffn_up.weight")
+                    ? new String[]{b + "ffn_gate.weight", b + "ffn_up.weight"} : new String[]{b + "ffn_up.weight"};
             case "mlp.down_proj.weight" -> new String[]{b + "ffn_down.weight"};
             case "mlp.router" -> new String[]{b + "ffn_gate_inp.weight"};
-            case "mlp.experts.gate_up" -> new String[]{b + "ffn_gate_exps.weight", b + "ffn_up_exps.weight"};
+            // llama.cpp's --fuse-gate-up-exps writes ffn_gate_up_exps: per expert gate rows then up rows, the engine's layout
+            case "mlp.experts.gate_up" -> gguf.hasTensor(b + "ffn_gate_up_exps.weight")
+                    ? new String[]{b + "ffn_gate_up_exps.weight"} : new String[]{b + "ffn_gate_exps.weight", b + "ffn_up_exps.weight"};
             case "mlp.experts.down" -> new String[]{b + "ffn_down_exps.weight"};
             default -> null;
         };
@@ -109,6 +211,10 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     public boolean has(String name) {
         if (hybrid != null && hybrid.owns(name)) {
             return hybrid.has(name);
+        }
+        Slice sl = slice(name);
+        if (sl != null) {
+            return gguf.hasTensor(sl.tensor());
         }
         String[] g = resolve(name);
         if (g == null) {
@@ -136,6 +242,13 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         if (hybrid != null && hybrid.owns(name)) {
             return hybrid.tensor(name);
         }
+        Slice sl = slice(name);
+        if (sl != null) {
+            if (!gguf.hasTensor(sl.tensor())) {
+                throw new IllegalArgumentException("tensor not in the GGUF file: " + name + " (" + sl.tensor() + ")");
+            }
+            return matrix(sub(sl));
+        }
         String[] g = require(name);
         if (g.length == 1) {
             return matrix(gguf.tensor(g[0]));
@@ -148,6 +261,13 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
     public float[] floats(String name) {
         if (hybrid != null && hybrid.owns(name)) {
             return hybrid.floats(name);
+        }
+        Slice sl = slice(name);
+        if (sl != null) {
+            if (!gguf.hasTensor(sl.tensor())) {
+                throw new IllegalArgumentException("tensor not in the GGUF file: " + name + " (" + sl.tensor() + ")");
+            }
+            return floatsOf(sub(sl));
         }
         return floatsOf(gguf.tensor(require(name)[0]));
     }

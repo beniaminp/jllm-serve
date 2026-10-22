@@ -500,9 +500,9 @@ public final class GgufModelTest {
 
     private static void malformed(Path root) throws Exception {
         // unsupported architecture and a missing tensor give clear IOExceptions
-        Path p = root.resolve("mamba.gguf");
-        new GgufWriter().str("general.architecture", "mamba").write(p);
-        expectFail(p, "unsupported GGUF architecture 'mamba'");
+        Path p = root.resolve("olmo2.gguf");
+        new GgufWriter().str("general.architecture", "olmo2").write(p);
+        expectFail(p, "unsupported GGUF architecture 'olmo2'");
         p = root.resolve("notensors.gguf");
         new GgufWriter().str("general.architecture", "llama").u32("llama.block_count", 1).u32("llama.embedding_length", 64)
                 .u32("llama.attention.head_count", 4).u32("llama.feed_forward_length", 96)

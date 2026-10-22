@@ -50,6 +50,9 @@ final class HfToGguf {
     private record T(float[] data, long[] shape) {
     }
 
+    /** Test hook: write the Llama-style conversion under another GGUF architecture name (e.g. mistral3). */
+    static String archOverride;
+
     private final Map<String, Object> hp;
     private final Map<String, Object> raw;
     private final Map<String, float[]> data = new HashMap<>();
@@ -151,7 +154,7 @@ final class HfToGguf {
     private void begin(String archName) {
         arch = archName;
         p = archName + ".";
-        w.str("general.architecture", archName).str("general.name", "tiny-" + archName);
+        w.str("general.architecture", archName).str("general.name", "tiny-random"); // not "phi3": llama.cpp keys vocab tweaks on the name
     }
 
     // ------------------------------------------------------------------ metadata shared by TextModel.set_gguf_parameters
@@ -277,7 +280,7 @@ final class HfToGguf {
     private static final Pattern LAYER = Pattern.compile("^model\\.layers\\.(\\d+)\\.(.+)$");
 
     private void llama() {
-        begin("llama");
+        begin(archOverride != null ? archOverride : "llama");
         textParams(true);
         w.u32(p + "vocab_size", (long) hpNum("vocab_size", 0));
         w.u32(p + "rope.dimension_count", headDim());
@@ -714,7 +717,7 @@ final class HfToGguf {
                     || ms.doubleValue() == ma.doubleValue(), "the GGUF keeps only mscale_all_dim, so mscale must equal it");
         }
         Map<String, Object> saved = new LinkedHashMap<>(hp);
-        hp.put("num_key_value_heads", 1L);
+        hp.put("num_key_value_heads", opt.legacyMla() ? (Object) (long) heads : (Object) 1L);
         hp.putIfAbsent("rms_norm_eps", 1e-6);
         // set_gguf_parameters of DeepseekV2Model, after TextModel's
         textParams(true);
@@ -727,10 +730,16 @@ final class HfToGguf {
             w.u32(p + "attention.q_lora_rank", q.longValue());
         }
         w.u32(p + "attention.kv_lora_rank", kvl);
-        w.u32(p + "attention.key_length", kvl + rope);
-        w.u32(p + "attention.value_length", kvl);
-        w.u32(p + "attention.key_length_mla", nope + rope);
-        w.u32(p + "attention.value_length_mla", vDim);
+        if (opt.legacyMla()) {
+            // before llama.cpp's MLA absorption: K and V widths of the decompressed heads, an unsplit attn_kv_b
+            w.u32(p + "attention.key_length", nope + rope);
+            w.u32(p + "attention.value_length", vDim);
+        } else {
+            w.u32(p + "attention.key_length", kvl + rope);
+            w.u32(p + "attention.value_length", kvl);
+            w.u32(p + "attention.key_length_mla", nope + rope);
+            w.u32(p + "attention.value_length_mla", vDim);
+        }
         w.u32(p + "expert_feed_forward_length", (long) (has("moe_intermediate_size") ? hpNum("moe_intermediate_size", 0) : hpNum("intermediate_size", 0)));
         w.u32(p + "expert_shared_count", (long) hpNum("n_shared_experts", 0));
         if (hp.get("routed_scaling_factor") instanceof Number n) {
