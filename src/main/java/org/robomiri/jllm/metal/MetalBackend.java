@@ -327,6 +327,31 @@ public final class MetalBackend implements Backend {
         return pool;
     }
 
+    /** KV bytes of one position (every layer, keys and values) for {@code w} with cache type {@code kvDtype}; 0 without grouped-query attention. */
+    public static long kvBytesPerPosition(ModelWeights w, KvDtype kvDtype) {
+        if (!(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+            return 0;
+        }
+        return (long) w.decoder().core().layers() * 2 * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+    }
+
+    /**
+     * Whether the slots of {@code w} should keep their KV in host memory and stream it ({@link KvTierConfig#stream()}): forced,
+     * or in {@code auto} when one slot's whole context ({@code ctx} positions) is more than the hot budget
+     * ({@code tier.hotBytes()}, when set) can hold.
+     */
+    public static boolean streamsKv(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, KvTierConfig tier) {
+        long perPos = kvBytesPerPosition(w, kvDtype);
+        if (tier == null || perPos == 0 || tier.stream() == KvTierConfig.Stream.OFF) {
+            return false;
+        }
+        if (tier.stream() == KvTierConfig.Stream.FORCE) {
+            return true;
+        }
+        long slotNeed = ((ctx + blockTokens - 1L) / blockTokens + 2) * blockTokens * perPos;
+        return tier.hotBytes() > 0 && tier.hotBytes() < slotNeed;
+    }
+
     private static Metal open(Decoder d, String metalLib) {
         int hd = d.attention().headDim();
         if (hd % 32 != 0 || hd > 256) {

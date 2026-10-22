@@ -267,6 +267,22 @@ public final class Settings {
         require(getInt("backend.kv-block") >= 16 && Integer.bitCount(getInt("backend.kv-block")) == 1, "backend.kv-block",
                 "must be a power of two of at least 16");
         require(getLong("backend.kv-pool-tokens") >= 0, "backend.kv-pool-tokens", "must be 0 (= every slot's context) or positive");
+        getBool("backend.kv-tier");
+        getBool("backend.kv-prefetch");
+        getBool("backend.memory-plan");
+        require(getLong("backend.kv-hot-mb") >= 0, "backend.kv-hot-mb", "must be 0 (= the planner decides) or positive");
+        require(getLong("backend.kv-host-mb") >= 0, "backend.kv-host-mb", "must be 0 (= straight to the SSD) or positive");
+        require(getLong("backend.kv-tier-max-gb") >= 0, "backend.kv-tier-max-gb", "must be 0 or positive");
+        try {
+            org.robomiri.jllm.kv.KvBlockCodec.Format.parse(get("backend.kv-disk-format"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("backend.kv-disk-format " + e.getMessage());
+        }
+        try {
+            org.robomiri.jllm.kv.KvTierConfig.Stream.parse(get("backend.kv-stream"));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("backend.kv-stream " + e.getMessage());
+        }
         try {
             org.robomiri.jllm.metal.MoeSplit.parseLayers(get("backend.metal.cpu-moe"));
         } catch (IllegalArgumentException e) {
