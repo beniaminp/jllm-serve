@@ -165,8 +165,21 @@ two blocks, converting f16 and q8 on the way, into the kernels' float scratch wi
 segment; the existing tiled prefill kernel and the decode kernel then run unchanged. Every score is the same chain of
 FMAs over the head elements and every output adds the keys in ascending order, so the result is **bit for bit the flat
 cache's** for any block size (`cpu/PagedKvTest`: a few thousand comparisons over cache type, head shape, block size,
-window and soft-cap, with rewinds, verification chunks and adoption). The price is the gather: f32 keys, which the flat
-cache reads in place, are copied once per tile (§24.9 has the cost).
+window and soft-cap, with rewinds, verification chunks and adoption). The price is the gather: f32 keys and values,
+which the flat cache reads in place, are copied once per tile; a first measurement showed it: decode at 2 000 tokens of
+context ran at 57 % of the flat cache (46.6 -> 26.8 tok/s), because a decode step is bound by reading the cache and the
+gather doubles that traffic. Prefill did not notice (237 tok/s both ways: its tiles reuse each gathered block).
+
+**Decode straight from the blocks (f32).** So a single-token step over f32 blocks skips the gather
+(`PagedKv.attentionDecodeDirect`): the scores of a block's `B` keys are `headDim` FMAs over the block's transposed
+`[headDim][B]` floats, loaded from the segment with `FloatVector.fromMemorySegment` (`scores4` / `scores2` / `scores1`,
+the flat `score4` / `score2` / `score1` with the chunk width `B`); the softmax is the flat kernel's; the outputs add each
+block's V rows in ascending key order into the head's accumulator (`accumulate`, the flat `accumulate1` over a segment).
+Each score and each output element is the same chain of FMAs in the same order, whatever the width of the key group,
+so this too is bit for bit the flat kernel (`PagedKvTest`'s n = 1 steps run it). It needs `B` to be a multiple of two
+vector lengths (16 on NEON and AVX2; on AVX-512 with `B = 16` the gather stays), and `-Djllm.cpu.pagedGather=true` brings the
+gather back for comparisons. The f16 and q8 caches expand into scratch in the flat kernels as well, so for them paged
+and flat cost the same.
 
 ---
 

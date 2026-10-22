@@ -144,26 +144,34 @@ public final class PagedKvBench {
         }
     }
 
-    /** One conversation: prefill and decode speed of a 2 000-token prompt and 64 generated tokens, median of 3. */
+    /**
+     * One conversation: prefill and decode speed of a 2 000-token prompt and 64 generated tokens, median of 5. The flat and
+     * the paged engine are loaded together and take turns, so that a busy machine slows both alike.
+     */
     static void speed(Path dir, String[] extra) throws Exception {
         System.out.println("\n| KV cache | prefill tok/s | decode tok/s |");
         System.out.println("|---|---|---|");
         SamplingParams gen = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 64, List.of());
-        for (boolean paged : new boolean[]{false, true}) {
-            try (ModelLoader.Loaded l = load(dir, paged, 1, extra)) {
-                Engine e = l.engine();
+        try (ModelLoader.Loaded flat = load(dir, false, 1, extra); ModelLoader.Loaded paged = load(dir, true, 1, extra)) {
+            Engine[] es = {flat.engine(), paged.engine()};
+            int rounds = 5;
+            double[][] pre = new double[2][rounds];
+            double[][] dec = new double[2][rounds];
+            for (Engine e : es) {
                 e.generate(text(e, 5, 300), GREEDY16, null, () -> false); // warm up
-                double[] pre = new double[3];
-                double[] dec = new double[3];
-                for (int r = 0; r < 3; r++) {
-                    int[] prompt = text(e, 1000 * (r + 3), 2000);
-                    Engine.Result res = e.generate(prompt, gen, null, () -> false);
-                    pre[r] = prompt.length / (res.stats().prefillMs() / 1000);
-                    dec[r] = res.stats().tokPerSec();
+            }
+            for (int r = 0; r < rounds; r++) {
+                for (int k = 0; k < 2; k++) {
+                    int[] prompt = text(es[k], 1000 * (r + 3), 2000);
+                    Engine.Result res = es[k].generate(prompt, gen, null, () -> false);
+                    pre[k][r] = prompt.length / (res.stats().prefillMs() / 1000);
+                    dec[k][r] = res.stats().tokPerSec();
                 }
-                Arrays.sort(pre);
-                Arrays.sort(dec);
-                System.out.printf("| %s | %.0f | %.1f |%n", paged ? "paged" : "flat", pre[1], dec[1]);
+            }
+            for (int k = 0; k < 2; k++) {
+                Arrays.sort(pre[k]);
+                Arrays.sort(dec[k]);
+                System.out.printf("| %s | %.0f | %.1f |%n", k == 0 ? "flat" : "paged", pre[k][rounds / 2], dec[k][rounds / 2]);
             }
         }
     }
