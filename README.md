@@ -483,15 +483,16 @@ Float activations on the CPU (`--backend.cpu.int8-activations false`) decode abo
 measurements is in [docs/11](docs/11-performance.md#111-measured).
 
 Against llama.cpp 0.7.0 (Homebrew, build 11669, Metal) on the same `unsloth/Qwen3-0.6B-GGUF` Q4_0 file, 413-token
-prompt, 128 tokens decoded at depth 413, speculation off (`scripts/mac-validate.sh --vs-llama`, 2026-10-21):
+prompt, 128 tokens decoded at depth 413, speculation off (`scripts/mac-validate.sh --vs-llama`, 2026-10-22, after the
+prefill chunk, multi-row matvec and decode attention of [docs/08 §8.29 – 8.31](docs/08-metal-backend.md#829-the-prefill-chunk-backendbatchauto)):
 
 | Engine | Prefill | Decode |
 |---|---|---|
-| jllm (Metal) | 1 352 tok/s | 104 tok/s |
-| llama.cpp (`llama-bench`, best of flash attention off/on) | 3 069 tok/s | 205 tok/s |
-| jllm / llama.cpp | 0.44× | 0.51× |
+| jllm (Metal) | 1 903 tok/s | 138 tok/s |
+| llama.cpp (`llama-bench`, best of flash attention off/on) | 3 097 tok/s | 217 tok/s |
+| jllm / llama.cpp | 0.61× (was 0.44×) | 0.63× (was 0.51×) |
 
-With its default n-gram speculation jllm decodes this benchmark at 207 tok/s, but the bench prompt repeats one
+With its default n-gram speculation jllm decodes this benchmark at 205 tok/s, but the bench prompt repeats one
 sentence, which flatters speculation; llama-bench has none.
 
 Both backends produce identical greedy output with float activations on the CPU (checked on every merge for
