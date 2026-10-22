@@ -214,6 +214,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- JitStableKernelsTest: the CPU row / tile dots give the interpreter's bits once C2 has compiled them (no model). -->
+                    <execution>
+                        <id>jit-stable-kernels-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.JitStableKernelsTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- LongContextTest: a million positions through the paged CPU cache (block offsets past 2^32 bytes). -->
                     <execution>
                         <id>long-context-test</id>
