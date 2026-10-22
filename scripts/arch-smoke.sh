@@ -143,6 +143,40 @@ done
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
   -Djllm.metal.lib="$METAL_LIB" -cp target/classes:target/test-classes org.robomiri.jllm.GgufQwenNextTest
 
+# The other families as GGUF: the tiny checkpoints that llama.cpp's converter can express (HfToGguf writes what it writes:
+# names, layouts, the llama q/k permutation, Gemma's +1 norms, Mamba's -exp(A_log), DeepSeek's split kv_b, fused qkv and
+# gate|up) as Q8_0 files read in place, 8 greedy tokens on the CPU and on Metal must be equal. (The comparison with
+# llama.cpp's own logits is scripts/gguf-llamacpp-check.sh.)
+G="$M/gguf-friendly"
+mkdir -p "$G"
+ggen() { # family dir-suffix, make-tiny-model.py arguments...
+  rm -rf "$G/$2"
+  python3 scripts/make-tiny-model.py "$G/$2" "$1" "${@:3}" >/dev/null
+}
+ggen llama llama
+ggen llama llama-bias --attention-bias
+ggen llama llama-fused-qkv
+ggen mistral mistral --set sliding_window=null
+ggen qwen2 qwen2 --set use_sliding_window=false
+ggen qwen2 qwen2-fused-qkv --set use_sliding_window=false
+ggen qwen3moeall qwen3moe
+ggen gemma2 gemma2 --set query_pre_attn_scalar=64
+ggen gemma3 gemma3 --set query_pre_attn_scalar=32
+ggen gemma3mm gemma3mm --set query_pre_attn_scalar=32
+ggen phi3nowin phi3-long
+ggen phi3short phi3-short --set original_max_position_embeddings=256
+ggen phi3mha phi3-plain --set sliding_window=null
+ggen glm glm --set rms_norm_eps=1e-5
+ggen glm4 glm4
+ggen mamba mamba
+ggen mamba3 mamba3
+ggen deepseek_v2q deepseek-v2q --set n_group=1 --set topk_group=1 --set topk_method='"greedy"' --set routed_scaling_factor=1.0 \
+  --set rope_scaling='{"type":"yarn","factor":4.0,"original_max_position_embeddings":64,"beta_fast":32,"beta_slow":1,"mscale":0.707,"mscale_all_dim":0.707}'
+ggen deepseek_v3 deepseek-v3
+ggen deepseek_v3 deepseek-v3-fused-exps
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.GgufArchSmoke "$METAL_LIB" "$G"/*/
+
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 \
   -Djllm.smoke.draftPair="${P}-LlamaPlainForCausalLM=$M/${P}-LlamaDraftForCausalLM" ${JAVA_OPTS:-} \
