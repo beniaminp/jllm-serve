@@ -275,7 +275,36 @@ Tool: `src/test/java/org/robomiri/jllm/KvStudy.java` (`needle`, `decodeppl`, `sp
 
 Replay and chunks behave as they do with dense attention (the verification difference is the 8-row projections' rounding, equal for dense and sparse in f32 and f16). CPU and Metal add the bound's terms in a different order, which can put a block on the other side of the cut; the follow-up measurements count the selections that differ and give the dense CPU-vs-Metal difference for comparison (`KvStudy sparsecheck` prints both).
 
-### 26.5.2 Retrieval, perplexity, speed
+### 26.5.2 Decode perplexity (Metal, Qwen3-0.6B, 2026-10-22)
+
+Teacher-forced: the first `L - 512` tokens of a long document (docs 01, 05, 06, 07, 04, 03 concatenated, 330 KB; its later chapters repeat earlier material,
+which is why the perplexity falls with the length) are prefilled in dense chunks, then the last 512 tokens are fed **one decode step at a time** and each
+next-token log-probability is scored (`KvStudy decodeppl`, ctx 33 280, batch 256; 128 / 64 / 32 / 16 = `backend.kv-sparse-blocks`, sink 16, window 256, 2 dense layers). `f16` is the flat
+f16 cache with dense attention (the reference), `f16+p` the paged one (identical), `q8r` the q8 cache with rotated keys. Mean KL and logit
+differences are against the reference, per step.
+
+| context | cache | perplexity | mean log-prob vs f16 (nats) | mean abs logit difference | mean KL (nats) | arg max agreement |
+|---|---|---|---|---|---|---|
+| 8 192 | f16 (dense) | 25.84 | reference | | | |
+| | f16+p (paged dense) | 25.84 | 0 | 0 | 0 | 100 % |
+| | sparse 128 blocks (2 320 positions) | 26.71 | -0.033 | 0.20 | 0.031 | 92.6 % |
+| | sparse 64 | 29.58 | -0.135 | 0.36 | 0.104 | 85.5 % |
+| | sparse 32 | 32.00 | -0.214 | 0.49 | 0.220 | 79.3 % |
+| | sparse 16 | 36.45 | -0.344 | 0.60 | 0.361 | 75.4 % |
+| | q8r dense | 25.76 | +0.003 | 0.05 | 0.002 | 97.3 % |
+| | q8r sparse 64 | 27.75 | -0.071 | 0.44 | 0.155 | 82.8 % |
+| 16 384 | f16 (dense) | 8.14 | reference | | | |
+| | sparse 128 / 64 / 32 / 16 | 8.07 / 8.35 / 8.59 / 9.08 | +0.010 / -0.025 / -0.054 / -0.109 | 0.23 / 0.32 / 0.42 / 0.51 | 0.033 / 0.073 / 0.119 / 0.200 | 89.6 / 86.3 / 83.0 / 79.1 % |
+| | q8r dense / sparse 64 | 8.10 / 8.60 | +0.005 / -0.054 | 0.04 / 0.44 | 0.001 / 0.144 | 98.4 / 83.2 % |
+| 32 768 | f16 (dense) | 2.905 | reference | | | |
+| | sparse 128 / 64 / 32 / 16 | 2.904 / 3.025 / 3.145 / 3.254 | +0.0004 / -0.040 / -0.079 / -0.113 | 0.25 / 0.32 / 0.39 / 0.46 | 0.024 / 0.047 / 0.070 / 0.109 | 91.4 / 89.6 / 88.1 / 87.1 % |
+| | q8r dense / sparse 64 | 2.900 / 3.095 | +0.002 / -0.063 | 0.04 / 0.39 | 0.001 / 0.091 | 98.6 / 85.9 % |
+
+What it says. Sparse attention is lossy in a measurable way: with the default 64 blocks (1 296 positions attended of 8 192 to 32 768) the perplexity of
+the next-token distribution rises by 4 % to 15 %, the per-token KL against dense attention is 0.05 – 0.10 nats, and the arg max agrees on 86 – 90 % of the steps; with 128 blocks it is
+within 0.5 % – 3 % of dense at 16 k and 32 k. The loss shrinks with the context at a fixed budget (the budget is a smaller part of a longer context but the document is also more
+repetitive), and is a smooth function of the budget, not a cliff. Rotated q8 keys give about the same loss (-0.071 against -0.135 at 8 k, -0.054 against -0.025 at 16 k, -0.063 against -0.040 at 32 k): the
+bound in the rotated basis is neither clearly tighter nor looser.
 
 The needle-in-a-haystack, decode perplexity and decode speed tables (8k / 16k / 32k tokens) are being measured under the shared GPU lock and are added in a follow-up commit; the commands are:
 
