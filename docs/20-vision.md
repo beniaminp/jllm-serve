@@ -278,9 +278,10 @@ writes its prompt token ids and the embeddings of each chunk; `VisionDump` write
 The relative error of a half-precision GPU encoder against a float one is a few 10⁻³; with a **Q8_0** projector llama.cpp's
 own output moves by 6.6·10⁻² against its F16 run (it quantizes the activations to 8 bit), which is why the table uses F16
 projectors. Answers: for the same picture and prompt at temperature 0 the engine and `llama-mtmd-cli` give the same
-text for SmolVLM-256M (Metal), Qwen2.5-VL-3B and Qwen3-VL-2B (the first 80 tokens are identical in the logged runs); on
-other pictures some answers part ways late at a near tie, which is also what happens between the CPU's int8-activation
-decode and the float one.
+text for Qwen2.5-VL-3B and Qwen3-VL-2B (the first 80 tokens of the `shapes.png` answer are identical) and, for SmolVLM-256M,
+for the first sentence (17 tokens), after which the two take different words at a near tie (the embeddings differ from
+llama.cpp's by 10⁻³, as the half-precision encoder differs from its float one); the same happens between the CPU's
+int8-activation decode and the float one. Do not expect token-for-token identical long answers from any two engines.
 
 `VisionTest` (81 checks, in `mvn install`): the resize against Pillow's hashes, size rules, picture decoding and the
 refusal paths, the request parts and the SSRF rules, projector choice, the rotary positions, and two **tiny random
