@@ -2,6 +2,7 @@ package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvSparse;
 import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
@@ -1235,6 +1236,79 @@ final class MetalKernels implements AutoCloseable {
                 .i(nHeads * headDim).i(kvStride).i(window).f(softcap).i(nSplit).i(0).i(pageShift);
         String suffix = kv == KvDtype.F16 && !DEC_WIDE ? "_h4" : kvSuffix(kv);
         dispatch("attention_dec_g" + group + "_d" + headDim + suffix, 6, 0, nHeads / group, (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
+        if (nSplit > 1) {
+            bind(0, part, 0);
+            bind(1, out, outOff);
+            p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+            dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+        }
+    }
+
+
+    // ---------------------------------------------------------------- sparse decode attention (docs/26)
+
+    /** Blocks one {@code sparse_score} threadgroup scores (four simdgroups, two blocks each). */
+    static final int SPARSE_PER_GROUP = 8;
+
+    /**
+     * Recomputes the key summaries ({@code kv_summary}) of the blocks that hold the {@code n} positions starting at
+     * {@code pos}, from their valid rows, into {@code sums} (one layer's summary buffer). Run after the keys are stored.
+     */
+    void kvSummary(KvDtype kv, Metal.Buffer kc, Metal.Buffer sums, int headDim, int nKvHeads, int stride, int pos, int n) {
+        int shift = pageShift;
+        int touched = ((pos + n - 1) >> shift) - (pos >> shift) + 1;
+        bind(0, kc, 0);
+        bind(1, sums, 0);
+        bindOrDummy(2, pageTbl);
+        p.reset(KernelParams.KV_SUMMARY).i(headDim).i(nKvHeads).i(stride).iv(DecodeProgram.VAR_POS, pos).i(n).i(shift);
+        dispatch("kv_summary" + kvSuffix(kv), 3, 0, nKvHeads, touched, 1, headDim, 1, 1);
+    }
+
+    /** Splits of {@code attention_dec_sp}: the selection always has the same number of blocks, so the grid is fixed. */
+    int sparseSplits(int selBlocks, int blockTokens) {
+        return Math.max(1, Math.min(DEC_MAX_SPLITS, (selBlocks * blockTokens + decChunk - 1) / decChunk));
+    }
+
+    /**
+     * Attention of the token at {@code pos} over the blocks its query selects (docs/26): {@code sparse_score} bounds every
+     * block with the query, {@code sparse_select} picks the sinks, the best {@code cfg.blocks()} candidates and the window
+     * per kv head, and {@code attention_dec_sp} attends over them (partials in {@code part}, merged by
+     * {@code attention_combine}). The caller has run {@link #kvSummary} for this position and checked that the context has
+     * more blocks than {@code cfg.budget(B)}. {@code scores}: {@code nKvHeads * ctxBlocks} floats, {@code sel}:
+     * {@code nKvHeads * budget} ints, scratch shared by the layers.
+     */
+    void decodeAttentionSparse(KvDtype kv, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer sums,
+                               Metal.Buffer scores, Metal.Buffer sel, Metal.Buffer part, Metal.Buffer out, long outOff,
+                               int nHeads, int nKvHeads, int headDim, int pos, int ctx, float scale, int kvStride, float softcap,
+                               KvSparse cfg) {
+        int shift = pageShift;
+        int blockTokens = 1 << shift;
+        int ctxBlocks = (ctx + blockTokens - 1) / blockTokens;
+        int budget = cfg.budget(blockTokens);
+        bind(0, q, qOff);
+        bind(1, sums, 0);
+        bindOrDummy(2, pageTbl);
+        bind(3, scores, 0);
+        p.reset(KernelParams.SPARSE_SCORE).i(nHeads).i(nKvHeads).iv(DecodeProgram.VAR_POS, pos).i(shift).i(ctxBlocks).i(SPARSE_PER_GROUP);
+        dispatch("sparse_score_d" + headDim, 4, 0, (ctxBlocks + SPARSE_PER_GROUP - 1) / SPARSE_PER_GROUP, nKvHeads, 1, DEC_THREADS, 1, 1);
+        bind(0, scores, 0);
+        bindOrDummy(1, pageTbl);
+        bind(2, sel, 0);
+        p.reset(KernelParams.SPARSE_SELECT).i(nKvHeads).iv(DecodeProgram.VAR_POS, pos).i(shift).i(cfg.sinkBlocks(blockTokens))
+                .i(cfg.windowBlocks(blockTokens)).i(cfg.blocks()).i(ctxBlocks).i(budget);
+        dispatch("sparse_select", 3, 0, nKvHeads, 1, 1, 256, 1, 1);
+        int nSplit = sparseSplits(budget, blockTokens);
+        int group = decGroup(nHeads, nKvHeads, headDim);
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, out, outOff);
+        bind(5, sel, 0);
+        p.reset(KernelParams.ATTN_DEC_SP).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
+                .i(nHeads * headDim).i(kvStride).i(0).f(softcap).i(nSplit).i(0).i(shift).i(budget).i(budget);
+        dispatch("attention_dec_sp_g" + group + "_d" + headDim + kvSuffix(kv), 6, 0, nHeads / group,
+                (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
         if (nSplit > 1) {
             bind(0, part, 0);
             bind(1, out, outOff);

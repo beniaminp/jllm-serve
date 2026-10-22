@@ -12,6 +12,7 @@ import org.robomiri.jllm.kv.KvPool;
 import org.robomiri.jllm.kv.KvSequence;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.KvQ4;
+import org.robomiri.jllm.model.KvSparse;
 import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
@@ -70,6 +71,17 @@ public final class MetalBackend implements Backend {
     private final KvSequence seq;
     private Metal.Buffer pageTbl;
     private int pageShift;
+    /**
+     * Sparse decode attention (docs/26, backend.kv-sparse) on the paged cache: the pool's per-layer key summaries, the
+     * scratch of the block scores and of the selection, and the configuration; {@code sparseOn} once the model and the
+     * cache type allow it. A decode row with more blocks than the budget runs {@code sparse_score}, {@code sparse_select}
+     * and {@code attention_dec_sp} (see {@link #decodeRow}); every other row is dense, exactly as with the switch off.
+     */
+    private boolean sparseOn;
+    private KvSparse sparse = KvSparse.OFF;
+    private Metal.Buffer[] sparseSums;
+    private Metal.Buffer sparseScores;
+    private Metal.Buffer sparseSel;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
     private int[] windows;             // the distinct attention windows of the GQA layers (0 = none), for stepKey
@@ -286,7 +298,8 @@ public final class MetalBackend implements Backend {
         if (blocks > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
         }
-        MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks);
+        MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks,
+                KvSparse.get().enabled());
         String format = "paged " + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && KvQ4.supports(g.headDim()) ? " rot" : "")
                 + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
                 + g.headDim() + " block=" + blockTokens;
@@ -437,6 +450,21 @@ public final class MetalBackend implements Backend {
             System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
                     + (flashDecode ? "on" : "off") + " (" + d.note() + ")");
             decodeAttn = kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(g.headDim()) && MetalTuner.decodeAttention(k, g, kvDtype, attnKernel, attnGroup);
+        }
+        if (KvSparse.get().enabled()) {
+            if (seq != null && a instanceof Attention.Gqa gs && kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(gs.headDim())
+                    && ((MetalKvStorage) seq.pool().storage()).hasSummaries()) {
+                sparse = KvSparse.get();
+                sparseOn = true;
+                decodeAttn = true; // the sparse kernel is attention_dec's: the dense rows of a sparse run take it too
+                sparseSums = ((MetalKvStorage) seq.pool().storage()).sums;
+                int blockTokens = 1 << pageShift;
+                sparseScores = k.scratch(4L * gs.kvHeads() * ((ctx + blockTokens - 1) / blockTokens));
+                sparseSel = k.scratch(4L * gs.kvHeads() * sparse.budget(blockTokens));
+            } else {
+                System.err.println("note: backend.kv-sparse is not available for this model on Metal (it needs grouped-query attention"
+                        + " with head size 64, 128 or 256, an f32, f16 or q8 paged cache), using dense attention");
+            }
         }
         flashPart = flashDecode || decodeAttn
                 ? k.scratch((long) a.heads() * (decodeAttn ? MetalConstants.FLASH_MAX_SPLITS : MetalKernels.FLASH_SPLITS) * (hd + 2) * 4)
@@ -957,14 +985,16 @@ public final class MetalBackend implements Backend {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), pos, n);
                 }
             }
+            if (sparseOn && sparse.layer(layer) && g.window() == 0) { // the summaries of the blocks this chunk wrote
+                k.kvSummary(kvDtype, keyCache[layer], sparseSums[layer], hd, g.kvHeads(), stride, pos, n);
+            }
             float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
             if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
                 // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
                 // token, so that every row is exactly what a decode step at its position computes
                 for (int t = 0; t < n; t++) {
                     long qRow = (long) t * g.qDim() * 4;
-                    k.decodeAttention(kvDtype, q, qRow, keyCache[layer], valCache[layer], flashPart, att, qRow, g.heads(),
-                            g.kvHeads(), hd, pos + t, ctx, scale, stride, g.window(), g.softcap());
+                    decodeRow(MetalBackend.this, layer, g, qRow, qRow, pos + t, scale, stride);
                 }
                 return;
             }
@@ -1084,9 +1114,10 @@ public final class MetalBackend implements Backend {
             if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
                 for (int t = 0; t < n; t++) {
                     k.page(owners[t].pageTbl, owners[t].pageShift);
-                    k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
-                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, scale,
-                            stride, g.window(), g.softcap());
+                    if (sparseOn && sparse.layer(layer) && g.window() == 0) { // the row's block summary, then the row's attention
+                        k.kvSummary(kvDtype, owners[t].keyCache[layer], sparseSums[layer], hd, g.kvHeads(), stride, positions[t], 1);
+                    }
+                    decodeRow(owners[t], layer, g, (long) t * g.qDim() * 4, (long) t * g.qDim() * 4, positions[t], scale, stride);
                 }
                 k.page(pageTbl, pageShift);
                 return;
@@ -1557,6 +1588,26 @@ public final class MetalBackend implements Backend {
         return replay && cpuLayers == 0;
     }
 
+    /** Whether the token at {@code pos} has more blocks than the sparse budget, so that its sparse layers select blocks. */
+    private boolean sparseRow(int pos) {
+        return (pos >> pageShift) + 1 > sparse.budget(1 << pageShift);
+    }
+
+    /**
+     * The decode attention of the row at {@code pos}, reading owner {@code o}'s cache: {@code attention_dec}, or with
+     * sparse attention on a layer that selects blocks and a context beyond the budget, the sparse pipeline (its key
+     * summaries are current: the caller ran {@code kv_summary} after the keys were stored).
+     */
+    private void decodeRow(MetalBackend o, int layer, Attention.Gqa g, long qOff, long outOff, int pos, float scale, int stride) {
+        if (sparseOn && sparse.layer(layer) && g.window() == 0 && sparseRow(pos)) {
+            k.decodeAttentionSparse(kvDtype, q, qOff, o.keyCache[layer], o.valCache[layer], sparseSums[layer], sparseScores,
+                    sparseSel, flashPart, att, outOff, g.heads(), g.kvHeads(), g.headDim(), pos, ctx, scale, stride, g.softcap(), sparse);
+        } else {
+            k.decodeAttention(kvDtype, q, qOff, o.keyCache[layer], o.valCache[layer], flashPart, att, outOff, g.heads(),
+                    g.kvHeads(), g.headDim(), pos, ctx, scale, stride, g.window(), g.softcap());
+        }
+    }
+
     /**
      * What a recorded decode step depends on besides its position and ring slots: pipelined or not, whether this pass
      * counts the experts' picks (the router binds the counters), and flash decoding: on or off at this position and,
@@ -1566,6 +1617,9 @@ public final class MetalBackend implements Backend {
      */
     private long stepKey(boolean pipelined, int pos) {
         long key = (pipelined ? 1 : 0) | (countStep ? 2 : 0);
+        if (sparseOn && sparseRow(pos)) { // the sparse layers' kernels (and their fixed grids) replace attention_dec's
+            key |= 1L << 62;
+        }
         if (decodeAttn) { // the grid of attention_dec: the number of splits for each attention window
             for (int i = 0; i < windows.length; i++) {
                 key |= (long) k.decSplits(pos, windows[i]) << (3 + 7 * i);
@@ -2286,6 +2340,17 @@ public final class MetalBackend implements Backend {
         }
         if (q4Rings != null) {
             loadRecent(n, stored, in);
+        }
+        if (seq != null && sparseOn) { // the rows came in by the host, not through kv_summary
+            MetalKvStorage st = (MetalKvStorage) seq.pool().storage();
+            int blockTokens = 1 << pageShift;
+            for (int l = 0; l < c.layers(); l++) {
+                if (sparse.layer(l)) {
+                    for (int j = 0; j * blockTokens < n; j++) {
+                        st.updateSummary(l, seq.block(j), Math.min(blockTokens, n - j * blockTokens));
+                    }
+                }
+            }
         }
     }
 

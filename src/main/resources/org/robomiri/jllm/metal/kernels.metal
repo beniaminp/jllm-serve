@@ -2118,9 +2118,10 @@ kernel void kv_summary(device const KV *kc [[buffer(0)]],
                        device const int *tbl [[buffer(2)]],
                        constant KvSummaryParams &p [[buffer(3)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
-                       ushort tid [[thread_position_in_threadgroup]]) {
+                       ushort2 tid2 [[thread_position_in_threadgroup]]) {
     const int D = p.headDim;
-    if (int(tid) >= D) return;
+    const int tid = int(tid2.x);
+    if (tid >= D) return;
     const int B = 1 << p.pageShift;
     const int lb = (p.pos >> p.pageShift) + int(tgp.y);
     const int rows = min(B, p.pos + p.n - lb * B);
@@ -2130,13 +2131,13 @@ kernel void kv_summary(device const KV *kc [[buffer(0)]],
     float hi = -INFINITY;
     for (int r = 0; r < rows; r++) {
         device const KV *rp = kc + ((ulong(phys) << p.pageShift) | ulong(r)) * p.stride;
-        const float x = float(rp[kvh * D + int(tid)]) * kv_scale(rp, p.stride, p.nKvHeads, kvh);
+        const float x = float(rp[kvh * D + tid]) * kv_scale(rp, p.stride, p.nKvHeads, kvh);
         lo = min(lo, x);
         hi = max(hi, x);
     }
     device ushort *dst = sum + (ulong(phys) * p.nKvHeads + kvh) * 2 * D;
     dst[tid] = half_down(lo);
-    dst[D + int(tid)] = half_up(hi);
+    dst[D + tid] = half_up(hi);
 }
 
 template [[host_name("kv_summary")]] kernel decltype(kv_summary<float>) kv_summary<float>;

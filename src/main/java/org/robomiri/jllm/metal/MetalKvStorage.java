@@ -1,10 +1,12 @@
 package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.kv.KvStorage;
+import org.robomiri.jllm.kv.KvSummary;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 
 /**
@@ -16,6 +18,12 @@ import java.nio.ByteBuffer;
  * written, which is what "allocated as a conversation grows" means on a unified-memory GPU (the address range is
  * reserved up front, as the flat cache's was). They belong to a Metal context of their own, so a slot closing does not
  * free what the others use; every slot's encoder binds them.
+ *
+ * <p>With sparse decode attention ({@code backend.kv-sparse}, docs/26) every layer also has a buffer of <em>key
+ * summaries</em>: for block {@code b} and kv head {@code g}, {@code 2 * headDim} halves at
+ * {@code (b * kvHeads + g) * 2 * headDim}: the per-channel minimum of the block's keys, then the maximum, rounded
+ * outwards ({@link KvSummary}). The {@code kv_summary} kernel keeps them current as blocks are written; the host
+ * recomputes them where rows arrive by other means (a block copied in part, read back from disk, a saved cache).
  */
 public final class MetalKvStorage implements KvStorage {
 
@@ -24,30 +32,53 @@ public final class MetalKvStorage implements KvStorage {
     private final int B;
     private final long rowBytes;
     private final int maxBlocks;
+    private final KvDtype dtype;
+    private final int kvHeads;
+    private final int headDim;
+    private final int kvDim;
     final Metal.Buffer[] keys;
     final Metal.Buffer[] vals;
+    /** Per layer, the key summaries of every block; null without sparse decode attention. */
+    final Metal.Buffer[] sums;
 
     MetalKvStorage(String metalLib, KvDtype dtype, int layers, Attention.Gqa a, int blockTokens, int maxBlocks) {
+        this(metalLib, dtype, layers, a, blockTokens, maxBlocks, false);
+    }
+
+    MetalKvStorage(String metalLib, KvDtype dtype, int layers, Attention.Gqa a, int blockTokens, int maxBlocks, boolean summaries) {
         if (dtype == KvDtype.Q4) {
             throw new IllegalArgumentException("the paged Metal cache has no q4 blocks");
         }
         this.metal = Metal.create(metalLib);
         this.layers = layers;
         this.B = blockTokens;
+        this.dtype = dtype;
+        this.kvHeads = a.kvHeads();
+        this.headDim = a.headDim();
+        this.kvDim = a.kvDim();
         this.rowBytes = dtype.rowBytes(a.kvDim(), a.kvHeads());
         this.maxBlocks = maxBlocks;
         long bytes = (long) maxBlocks * blockTokens * rowBytes;
         keys = new Metal.Buffer[layers];
         vals = new Metal.Buffer[layers];
+        sums = summaries ? new Metal.Buffer[layers] : null;
         try {
             for (int l = 0; l < layers; l++) {
                 keys[l] = metal.newBuffer(bytes, false);
                 vals[l] = metal.newBuffer(bytes, false);
+                if (summaries) {
+                    sums[l] = metal.newBuffer(sumBytes() * maxBlocks, false);
+                }
             }
         } catch (RuntimeException | Error e) {
             metal.close();
             throw e;
         }
+    }
+
+    /** Bytes of one block's key summary in one layer. */
+    private long sumBytes() {
+        return (long) kvHeads * 2 * headDim * 2;
     }
 
     @Override
@@ -66,7 +97,7 @@ public final class MetalKvStorage implements KvStorage {
 
     @Override
     public long residentBytes() {
-        return (long) layers * B * 2 * rowBytes;
+        return (long) layers * (B * 2 * rowBytes + (sums != null ? sumBytes() : 0));
     }
 
     @Override
@@ -87,6 +118,12 @@ public final class MetalKvStorage implements KvStorage {
         for (int l = 0; l < layers; l++) {
             MemorySegment.copy(keys[l].contents(), at(src, 0), keys[l].contents(), at(dst, 0), n);
             MemorySegment.copy(vals[l].contents(), at(src, 0), vals[l].contents(), at(dst, 0), n);
+            if (sums != null) {
+                MemorySegment.copy(sums[l].contents(), src * sumBytes(), sums[l].contents(), dst * sumBytes(), sumBytes());
+                if (rows < B) { // the source's summary also covers the rows past `rows`
+                    updateSummary(l, dst, rows);
+                }
+            }
         }
     }
 
@@ -116,8 +153,54 @@ public final class MetalKvStorage implements KvStorage {
                 MemorySegment.copy(in, o, vals[l].contents(), at(block, t), rowBytes);
                 o += rowBytes;
             }
+            updateSummary(l, block, B);
         }
         src.position(src.position() + spillBytes());
+    }
+
+    /**
+     * Recomputes the key summary of {@code layer} of {@code block} from its first {@code rows} rows, on the host (the
+     * memory is shared with the GPU, and nothing is in flight when blocks are copied, loaded or read back): the same
+     * numbers {@code kv_summary} writes for them. No-op without summaries.
+     */
+    void updateSummary(int layer, int block, int rows) {
+        if (sums == null || rows <= 0) {
+            return;
+        }
+        MemorySegment k = keys[layer].contents();
+        MemorySegment s = sums[layer].contents();
+        for (int g = 0; g < kvHeads; g++) {
+            long sb = ((long) block * kvHeads + g) * 2 * headDim * 2;
+            for (int i = 0; i < headDim; i++) {
+                float lo = Float.POSITIVE_INFINITY;
+                float hi = Float.NEGATIVE_INFINITY;
+                for (int t = 0; t < rows; t++) {
+                    long row = at(block, t);
+                    float x = switch (dtype) {
+                        case F32 -> k.get(ValueLayout.JAVA_FLOAT_UNALIGNED, row + ((long) g * headDim + i) * 4);
+                        case F16 -> Float.float16ToFloat(k.get(ValueLayout.JAVA_SHORT_UNALIGNED, row + ((long) g * headDim + i) * 2));
+                        default -> k.get(ValueLayout.JAVA_BYTE, row + (long) g * headDim + i)
+                                * k.get(ValueLayout.JAVA_FLOAT_UNALIGNED, row + kvDim + (long) g * 4);
+                    };
+                    lo = Math.min(lo, x);
+                    hi = Math.max(hi, x);
+                }
+                s.set(ValueLayout.JAVA_SHORT_UNALIGNED, sb + (long) i * 2, KvSummary.down(lo));
+                s.set(ValueLayout.JAVA_SHORT_UNALIGNED, sb + ((long) headDim + i) * 2, KvSummary.up(hi));
+            }
+        }
+    }
+
+    /** {@link #updateSummary} for the first {@code rows} rows of every layer. */
+    void updateSummaries(int block, int rows) {
+        for (int l = 0; sums != null && l < layers; l++) {
+            updateSummary(l, block, rows);
+        }
+    }
+
+    /** Whether the key summaries of sparse decode attention are kept. */
+    boolean hasSummaries() {
+        return sums != null;
     }
 
     @Override
