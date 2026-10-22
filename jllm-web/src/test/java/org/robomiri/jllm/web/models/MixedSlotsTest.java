@@ -138,6 +138,15 @@ class MixedSlotsTest {
             return st.rows[seq.block(p / B)][p % B];
         }
 
+        /** One pass of the "device": takes {@link #passMillis}, so that several conversations overlap in time. */
+        private static void pass() {
+            try {
+                Thread.sleep(passMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
         /** Row p = f(row p - 1, token): like a key, it depends on every token before. */
         private void compute(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
             seq.beginWrite(pos, n);
@@ -156,11 +165,13 @@ class MixedSlotsTest {
         @Override
         public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
             compute(tokens, off, n, pos, logits, 0);
+            pass();
         }
 
         @Override
         public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
             compute(tokens, off, n, pos, logitsOut, stride);
+            pass();
         }
 
         @Override
@@ -172,11 +183,7 @@ class MixedSlotsTest {
                 ((MixBackend) s.owner()).compute(s.tokens(), s.off(), s.n(), s.pos(), s.logits(), s.stride());
             }
             PASSES.add(sizes);
-            try {
-                Thread.sleep(passMillis);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            pass();
             return true;
         }
 

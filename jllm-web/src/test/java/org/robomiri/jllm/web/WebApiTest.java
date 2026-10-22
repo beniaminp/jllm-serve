@@ -158,7 +158,7 @@ class WebApiTest {
                     .andExpect(status().isConflict()).andExpect(jsonPath("$.error", containsString("no model is loaded")));
         }
         mvc.perform(post("/api/models/load").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"source\":\"Qwen/Qwen3-0.6B\",\"slots\":9}"))
+                        .content("{\"source\":\"Qwen/Qwen3-0.6B\",\"slots\":17}"))
                 .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error", containsString("slots")));
     }
 }

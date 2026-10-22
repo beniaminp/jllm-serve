@@ -227,15 +227,19 @@ final class MixedPassChecks {
                     base = Math.max(base, maxDiff(x, z));
                 }
             }
-            // The bound is that of the batched-decode checks, 1e-4 of the largest logit, for the f32 and f16 caches: the rounding
-            // of a decode row in a pass of many rows (another matmul kernel than the lone step's). A q8 cache turns that rounding
-            // into a flipped int8 code now and then (the documented hazard of the quantized caches: the row's maximum, or a value
-            // next to a rounding boundary, moves by one step of 1/127 of its head's maximum); the logits then move by up to a
-            // few thousandths of their range. Another cut of the same conversation does not show it (its kernels are the same
-            // as the first run's: "alone cut differently" below), so the bound for q8 is 5e-3 of the largest logit; the arg max of
-            // every row must still be equal.
-            boolean quantized = dt != KvDtype.F32 && dt != KvDtype.F16;
-            float bound = (quantized ? 5e-3f : 1e-4f) * scale + 1e-5f;
+            // The bound is that of the batched-decode checks, 1e-4 of the largest logit, for the f32 cache: the rounding of a decode
+            // row in a pass of many rows (another matmul kernel than the lone step's). A cache that stores less precisely turns
+            // that rounding into a flipped code now and then: f16 rounds a key or value to the neighbouring half-precision number,
+            // q8 moves it by one int8 step (1/127 of its head's maximum); the logits then move by a few thousandths of their range
+            // (q8) or less (f16). Another cut of the same conversation shows the same flips ("alone cut differently" below), so the
+            // bound for f16 is that of f32 or twice how far the other cut is from the first, whichever is larger, and for q8 5e-3 of
+            // the largest logit; the arg max of every row must still be equal.
+            float bound = 1e-4f * scale + 1e-5f;
+            if (dt == KvDtype.F16) {
+                bound = Math.max(bound, 2 * base);
+            } else if (dt != KvDtype.F32) {
+                bound = 5e-3f * scale + 1e-5f;
+            }
             boolean ok = argmax && diff <= bound;
             check(ok, String.format("%d mixed passes of a chunk, decode rows and a verification run: arg max %s, max|alone-mixed| = %.1e"
                     + " (bound %.1e; alone cut differently: %.1e), %d of %d rows bit-identical", mixedPasses,
