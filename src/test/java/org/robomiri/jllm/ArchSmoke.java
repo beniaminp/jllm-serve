@@ -254,7 +254,9 @@ public final class ArchSmoke {
                 try {
                     failures += q8Check(w, lib, cfg, cpu, KvDtype.Q8, 0);
                     failures += replayCheck(w, lib, cfg, KvDtype.Q8);
-                    failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
+                    if (Q4) { // (the forced-MMA pass leaves it out, like q4's: a rotated int8 code flips between a batched pass and a lone step)
+                        failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
+                    }
                     failures += kvStateChecks(w, lib, cfg, KvDtype.Q8);
                     failures += replayStateCheck(w, lib, cfg, KvDtype.Q8);
                 } finally {
@@ -571,7 +573,8 @@ public final class ArchSmoke {
             // CPU file's: both prefilled the prompt in their own float arithmetic, so a q4 value on a rounding edge of the
             // 4-bit grid lands one step (1/7.5 of its group's largest value) apart in the two caches, and a tiny random
             // model turns that into a logit difference a q8 edge flip (1/127) does not reach: 10x the tolerance for q4.
-            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 ? 1e-2f : 1e-3f) * scale + 1e-4f;
+            // q8 with rotated keys: the same kind of edge flip as q4's, 10x the tolerance (see q8Check)
+            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 || dt == KvDtype.Q8 && KvDtype.q8Rotate() ? 1e-2f : 1e-3f) * scale + 1e-4f;
             System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e, bytes %s)%n", a.stateFormat(),
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
                     sameFormat && crossOk ? "ok" : "MISMATCH", diff, sameBytes ? "unchanged" : "CHANGED");
@@ -721,7 +724,12 @@ public final class ArchSmoke {
                 drift16 = Math.max(drift16, Math.abs(f16[r][i] - f32[r][i]));
             }
         }
-        boolean agree = diff <= 1e-3f * scale + 1e-4f;
+        // q8 with rotated keys: the CPU and the Metal prefill compute k in float with rounding differences of ~1e-7, and
+        // an int8 code of the rotated row that sits on a rounding edge (one code in ~6000) lands one step apart: a flip
+        // in layer 0 of a tiny random model moves later layers' k and v codes too (counted on the Qwen2 checkpoint: one
+        // flip in layer 0, 71 of 6144 codes in all, with plain q8 none) and the logits by up to 1.5e-3 of the largest
+        // logit. The kernels themselves agree bit for bit on equal inputs (kernel_tests.py), so this is q4's case: 10x.
+        boolean agree = diff <= (dt == KvDtype.Q8 && KvDtype.q8Rotate() ? 1e-2f : 1e-3f) * scale + 1e-4f;
         boolean close = drift <= (dt == KvDtype.Q4 ? 3200 : 200) * drift16 + 1e-3f * scale;
         String what = dt + (dt == KvDtype.Q4 ? " recent=" + recent : dt == KvDtype.Q8 && KvDtype.q8Rotate() ? " rotated keys" : "");
         System.out.printf("  kv %s: max|cpu-metal| = %.2e%s, max|%s-f32| = %.2e%s (f16: %.2e, ratio %.0f, max|logit| = %.2f)%n",

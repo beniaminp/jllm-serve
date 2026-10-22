@@ -1823,6 +1823,13 @@ independent: other q, other staging row, other owner's cache, so they sit in one
 attention takes `scale / B`. `ArchSmoke.batchCheck` has a rotated q8 case: the tokens equal each slot's own and the logits equal
 its own decode step to rounding.
 
+**CPU against Metal.** Both backends compute k in f32 with rounding differences of ~10⁻⁷, so now and then a code of the
+rotated row that sits on a rounding edge lands one step apart (on the Qwen2 smoke checkpoint: one flip in layer 0 and, through
+the later layers of the tiny random model, 71 of 6 144 codes in all; plain q8 had none there; a rotated entry is a sum of 32 terms,
+so its rounding noise is larger in code units than an unrotated entry's). The kernels agree bit for bit on equal inputs (`kernel_tests.py`), and a
+file saved by either backend loads unchanged into the other; the smoke test's logit comparison for this cache is
+therefore 10× as wide as for plain q8 (1.5·10⁻³ of the largest logit observed, bound 10⁻²), as q4's.
+
 **Draft speculation.** Target and draft backends are built from the same settings, so both hold rotated keys; the rolled-back
 positions are simply stored again (rotated) by the next pass. `ArchSmoke.draftCheck` has a rotated q8 round: the greedy output
 with a draft equals the output without.
