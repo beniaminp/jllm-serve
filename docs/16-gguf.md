@@ -330,7 +330,7 @@ Q2_K         336     0.98 MiB          4 x 84 B
 ```
 
 Decoding one token streams the whole matrix once, so on a memory-bound GPU the time per matrix is about proportional to these sizes: a Q3_K file
-moves 40 % of the bytes of its Q8_0 requantization, an IQ4_XS or MXFP4 file 49 %, which is what "in place" buys (16.9.1 measures what that is worth on a
+moves 40 % of the bytes of its Q8_0 requantization, an IQ4_XS or MXFP4 file half, which is what "in place" buys (16.9.1 measures what that is worth on a
 0.6B model, where decode is not bandwidth bound, and what it costs on the CPU).
 
 ### Why in place, the settings, the limits
