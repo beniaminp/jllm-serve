@@ -424,6 +424,59 @@ pass over 151 936 logits) and tested them; when none was allowed it tested the w
    memo marks it the first time), so one-off states never pay for it; string contents (most of the vocabulary
    allowed) are never walked.
 
+### 17.7.1 A worked trace, and why it is built this way
+
+**A tool call, pass by pass.** The model is asked for `get_weather` and writes the call below. This trace was replayed through the real
+`ToolCallConstraint` with the Qwen3 tokenizer (the model's side is simulated: it "writes" the text, whatever jump-forward forces is not sampled);
+`S` is a token the model chose, `F` a token the constraint forced and the engine appended without sampling. Each line is **one forward pass**
+(the sampled token and the forced ones after it go through the model together):
+
+```
+<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris", "days": 3, "unit": "celsius"}}
+</tool_call>
+
+pass  1: S[<tool_call>] F[\n] F[{"] F[name] F[":]                         the envelope head; ` "` is left to the model (4 forced tokens)
+pass  2: S[ "]                                                            held-back token: the model's natural token, merged across the boundary
+pass  3: S[get] F[_weather] F[",] F[ "] F[arguments] F[":] F[ {"]         the name is unambiguous after "get" (the other tool is read_file), then the envelope
+pass  4: S[city] F[":]                                                    a key: only one unused key of a closed object fits after the first letters
+pass  5: S[ "]    pass 6: S[Paris]    pass 7: S[",]    pass 8: S[ "]      values: the model's own choices; free text inside a string
+pass  9: S[days] F[":]    pass 10: S[ ]    pass 11: S[3]                    an integer: digits only, no quote, no point
+pass 12: S[,] F[ "] F[unit] F[":]                                         only `unit` is left, so the whole key is forced
+pass 13: S[ "]
+pass 14: S[c] F[elsius] F["}}\n] F[</tool_call>]                           an enum with one value starting with "c", then the closing: committed whole
+tokens 32, sampled 14, forced 18, passes 14
+```
+
+That is the 32 tokens and 18 forced of the measurement below (decode 254 ms -> 149 ms on Metal): 18 of the 32 passes disappear, while the sampled
+tokens are exactly the ones that carry information. Without jump-forward every one of the 32 tokens takes a pass, and a model that wrote
+`"days":3` instead of `"days": 3`, or `Paris` for an integer, would have produced a call that does not parse.
+
+**What is forced and what is not, around passes 11 and 12.** After `"days": 3` the next byte may be another digit (an integer continues; `maximum` is one of the
+keywords the lenient compile ignores), `,` or `}` (`city` is present and `unit` is optional): three kinds of byte, nothing forced, so the model chooses (`,`). After the comma the object is
+closed (`additionalProperties: false`) and `city`, `days` are used, so exactly one key fits and the whole ` "unit": "` follows without a sampling step. Greedy decoding checks the model's
+top token first (usually allowed: 58 µs, the same as unconstrained greedy); only when the model's favourite is refused does the trie walk (about 780 nodes on the Qwen3 vocabulary) or a memoized mask run.
+
+### Why this design
+
+* **A byte automaton, not a token grammar.** Tokenizers cut text differently for every model; an automaton over bytes plus a byte trie of the vocabulary (`TokenTrie`) works
+  for any tokenizer, and the same automaton decides what the forced text is, which tokens may be sampled, and whether a draft token is acceptable.
+* **Fixed, canonical layout.** The envelope and the whitespace inside the arguments (`: ` and `, ` exactly) are fixed so that most positions have exactly one allowed byte: that is what jump-forward
+  needs. Free whitespace would allow `,` followed by any number of spaces and force almost nothing. Earlier calls in the conversation are rendered in the same layout, so the model sees one format.
+* **Free text stays free.** Outside a call the sampler draws as if unconstrained (`TokenConstraint.relaxed`), so a constrained request produces the same prose as an unconstrained one,
+  token for token; the constraint switches on at `<tool_call>` and off at `</tool_call>`, and `<think>` blocks are free.
+* **Lenient schemas.** Agents send schemas written for other servers; the constraint enforces what an automaton can (`type`, `required`, `additionalProperties`, `enum`, `items`, lengths, local `$ref`)
+  and allows anything for the rest, so it is looser than the schema, never stricter: a valid call is never refused. The price is that a call can still violate a `pattern` or a `minimum`.
+* **The last forced token is held back** when the vocabulary has a token that extends it, because at the boundary between forced and free text the model's natural tokenization merges across it
+  (` "Paris` rather than `"` + `Paris`); forcing the short token would change the distribution of the free text.
+* **Rejected: parse afterwards.** The old path (`engine.constrained-tools=false`) lets the model write free text and parses it: a missing brace or a wrong tool name costs a round trip, which for a small model is the most common failure.
+  **Rejected: switch speculation off under a constraint** (what the first version did): tool calls repeat the shapes of earlier calls, so prompt lookup drafts them well; drafts are checked against copies of the constraint and cut at the first token it refuses.
+* **Costs:** the device-side greedy pipeline ([17.4](#174-pipelined-decoding-on-the-gpu)) is off for constrained requests; `logprobs` turn jump-forward off; the layout is the Hermes / Qwen one (other families are served through the same prompt);
+  the console's `/api/chat` is not constrained yet.
+
+
+### 17.7.2 Measured, checks, limits and switches
+
 **Measured.** Apple M1 Pro (10 cores, 32 GB), JDK 26, under the machine-wide benchmark lock (no other job ran), the
 Qwen3-0.6B vocabulary (151 669 tokens).
 
