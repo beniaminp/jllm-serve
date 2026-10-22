@@ -285,7 +285,21 @@ see differ in the last digits.
 
 ## 26.5 Measured
 
-PLACEHOLDER-MEASURED
+Machine: Apple M1 Pro, 10 cores, 32 GB, macOS (Darwin 27.2), 2026-10-22. Interim figures from quick runs (one conversation, not under the heavy lock);
+the locked tables with the 32 000-token and 30B runs replace them in the next commit.
+
+```sh
+./scripts/tier-study ... (TierStudy: java -cp target/classes:target/test-classes org.robomiri.jllm.TierStudy models/Qwen_Qwen3-0.6B 512,1024 --backend metal --backend.ctx 2048 --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 2)
+```
+
+| Qwen3-0.6B, f16, Metal | context | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| streamed (2 MB budget) | 512 | 1 065 | 58.7 |
+| streamed | 1 024 | 1 240 | 69.0 |
+| pool tier with the memory planner (hot cap starts at 8 192 positions) | 1 024 | 1 434 | 105.4 |
+| | 4 096 | 564 | 89.5 |
+| | 7 500 (cap 512 → 768 blocks) | 266 | 71.7 |
+| | 12 000 (cap 768 → 1 026 blocks) | 160 | 49.3 |
 
 ---
 
