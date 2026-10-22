@@ -165,10 +165,11 @@ The exported functions (the rest: `jm_thermal_state` [8.19](#819-thermal-state),
 | `jm_buffer_wrap(ctx, ptr, len)` | `newBufferWithBytesNoCopy:` — wraps memory **owned by Java** (the mmap'd cache file) without copying. If Metal refuses (`ptr` or `len` not page aligned) it prints the reason to stderr and returns NULL, and `Metal.wrap` throws: there is deliberately no copying fallback, which would silently double the memory of a multi-gigabyte model | every quantized weight tensor |
 | `jm_buffer_contents(buf)` | the CPU pointer to a buffer's bytes | Java reads logits / writes embeddings |
 | `jm_buffer_release(buf)` | drop the reference | `Metal.close` |
-| `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels | start of `forward` |
+| `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels (with `jm_set_concurrent` a concurrent encoder instead, [8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) | start of `forward` |
 | `jm_dispatch(ctx, pipe, bufs[], offsets[], nbuf, params, plen, tgmem, gx,gy,gz, tx,ty,tz)` | `setComputePipelineState`, `setBuffer:offset:atIndex:` for `i < nbuf`, `setBytes:` for the params at index `nbuf`, `setThreadgroupMemoryLength:` for the kernel's dynamic `[[threadgroup(0)]]` argument when `tgmem > 0`, then `dispatchThreadgroups:threadsPerThreadgroup:` | once per kernel launch |
 | `jm_run(ctx, cmds, n)` | encodes `n` recorded dispatches (384-byte `JMCmd` records: pipeline, buffers, offsets, params, grid) exactly as `n` `jm_dispatch` calls would, skipping a pipeline / buffer / offset the previous command already set — a whole decode step in one call ([8.22](#822-decode-replay-one-native-call-per-token)) | every decode step |
 | `jm_commit(ctx)` | `endEncoding`, `commit` **without waiting**, then opens a fresh command buffer and encoder: the GPU starts on the layers recorded so far while Java encodes the next ones. The queue runs command buffers in submission order, so the serial guarantee of `jm_begin` carries across the split | every 8 layers (`-Djllm.metal.commitLayers`) |
+| `jm_set_concurrent(ctx, mode)`, `jm_set_group(ctx, id)`, `jm_barriers(ctx)` | the concurrent encoder: its mode (0 serial, 1 hazard-tracked barriers, 2 a barrier before every dispatch, 3 none, +4 barriers naming their buffers), the independent group the next dispatches belong to, and how many barriers were inserted ([8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) | `MetalKernels` |
 | `jm_abort(ctx)` | ends and drops the command buffer being recorded without running it (Metal aborts the process if an encoder is released un-ended), after waiting for the parts `jm_commit` already submitted | `forward` when recording throws |
 | `jm_commit_wait(ctx, err, len)` | `endEncoding`, `commit`, `waitUntilCompleted`; returns −1 with the error text if any command buffer of the pass has status `MTLCommandBufferStatusError` (a GPU fault) | end of `forward` |
 
@@ -1668,3 +1669,122 @@ lost ring slots and soft-capping.
 The window's corrections make prefill with q4 about 16 % slower than f16 at 2 000 tokens (window 128) and decode up to
 9 % slower (at 413 tokens; equal at 2 000, within noise); the cache is 3.6× smaller. Qwen3-Next's Metal backend and DeepSeek's latent cache have no q4 path and serve a
 q4 request as f16 / q8.
+
+## 8.28 The concurrent compute encoder: barriers only where a kernel needs the one before
+
+🧸 A row of children builds a tall tower, one floor each. The old rule was: "nobody starts a floor until the child
+before has finished it **and cleared the whole table**." It is safe, but while a child is putting down the last brick
+of a floor, the next child stands there with empty hands, and the table is empty again before the next floor starts.
+The new rule: everybody may start whenever there is a brick free, and a helper walks beside the row with a pile of red
+flags. When a child is about to use a brick that the child before is still making, the helper puts down a flag
+("wait here until everything before the flag is finished"). Where two children build different things, they work at
+the same time and there is no flag. The tower is exactly the same tower. We measured how much time the flags save:
+on a tower where every floor needs the floor below, none (a flag costs as much as the old rule), and on a tower built by
+three children at once, a little.
+
+📐 **The two encoders.** A Metal compute encoder takes a *dispatch type*. `MTLDispatchTypeSerial` (what every pass used
+until now) makes the GPU finish dispatch *i* completely before it starts dispatch *i + 1*: the Java side never needs a
+barrier, and the price is that between two dispatches the GPU drains (the last threadgroups run alone on a few cores)
+and refills (the next kernel's first wave reads its weights from cold). `MTLDispatchTypeConcurrent` lets dispatches
+overlap, and orders them only where the encoder is told to: `memoryBarrierWithScope:MTLBarrierScopeBuffers` (everything
+dispatched before the barrier is complete and visible to everything dispatched after it).
+
+**What an upper bound looks like.** With the concurrent encoder and *no* barriers (`-Djllm.metal.concurrent=unsafe`,
+wrong results, timing only) an M1 Pro decodes Qwen3-0.6B (GGUF Q4_0) at 138.6 tok/s against 103.8 serial, and prefills
+at 1 648 against 1 340 tok/s: ~2.4 ms of a 9.6 ms decode step is the ~14 µs boundary between each of the 170 dependent
+dispatches. That is the whole prize of removing serialization, and it can only be won where dispatches are really
+independent.
+
+**Hazard tracking in the native layer** (`track_hazards` in `jllm_metal.m`; no kernel is changed and the Java writers
+declare nothing per binding). The shim asks Metal for each pipeline's *reflection* when it builds it
+(`MTLPipelineOptionBindingInfo`) and keeps, per buffer index, whether the kernel only reads it (`device const T *`, access
+`ReadOnly`), may write it (`device T *`) or never touches it (`used == false`: the dummy buffers bound to unused slots
+never count). Per encoder it keeps two small sets of buffer handles: those written since the last barrier (`W`) and those
+only read (`R`). Before a dispatch is encoded:
+
+```
+hazard = any binding b that the kernel reads or writes with  b in W            (read after write, write after write)
+      or any binding b that the kernel may write with        b in R            (write after read)
+if hazard:  memoryBarrier(buffers);  W = R = {}
+W += buffers the kernel may write;   R += buffers it only reads
+```
+
+The granularity is the whole buffer (the extent a kernel touches inside a binding is not known), so two dispatches that
+write different rows of one buffer count as dependent. A full set forces a barrier. A new encoder (`jm_begin`,
+`jm_commit`) starts empty: command buffers of a queue run in order, and Metal's own tracking orders their resources.
+`-Djllm.metal.concurrent=resources` names the buffers in the barrier (`memoryBarrierWithResources:`) instead of covering
+all of them; it measured the same. `JLLM_METAL_TRACE=1` prints every dispatch with a mark where a barrier precedes it,
+`JLLM_METAL_STATS=1` the totals at exit, `JLLM_METAL_DUMP_ACCESS=1` the access table of every pipeline.
+
+**Independent groups.** Whole-buffer tracking cannot see that `rope(q row 0)` and `rope(q row 1)` write apart. The
+Java writers can say so: `MetalKernels.beginIndependent()` / `endIndependent()` bracket dispatches that the caller
+guarantees read nothing another one writes and write disjoint memory. They are compared with what came *before* the
+group, never with each other, and become visible to what follows when the group ends. The group id travels in the first
+padding word of the 384-byte `JMCmd` (`DecodeProgram.OFF_GROUP`), so a recorded decode step replays with its groups
+([8.22](#822-decode-replay-one-native-call-per-token); ids are numbered from 1 in every recording, so the replay check
+still compares equal programs). Where groups are used (the order of issue changes there; results do not):
+
+| where | group | why they are independent |
+|---|---|---|
+| batched decoding, `GqaStep.runRows` ([8.24](#824-batched-decoding-across-slots-metalbackendforwardbatch)) | stage 1: `rope` of every row and the v store (`kv_put`); stage 2 (q8 caches): `kv_store_q8` of every row; stage 3: `attention` of every row | rows have their own q / k / v / att rows and their owner's cache; attention gets its own slice of the `scores` scratch per row (`MetalKernels.rowScores`; the scratch holds a tile of 32) |
+| MLA ([8.12](#812-deepseek-mla-and-mamba-on-the-gpu)), single and batched | q (or q_a), kv_a and k_pe projections; the two norms; q_b with the k_pe rotation; the q rotation with the latent store | they read one input and write apart |
+| Qwen3-Next gated attention | the q/k/v and the gate projection; the q-norm and the k-norm | same input, separate outputs |
+| Qwen3-Next MoE, per-slot kernels | router with the shared expert's gate/up; `moe_up` with the shared expert's down projection | the shared expert reads `xb` and writes `sharedOut`; the routed experts still add into `x` before it does |
+
+The dense decode step of Qwen3 has none of this: q/k/v are one `matmul3` ([8.23](#823-decode-fusions)), q/k-norm and RoPE
+one `rope`, gate and up one `matmul_swiglu`; every one of its 170 dispatches reads what the one before wrote. The tracker
+inserts a barrier before 69 762 of 70 254 dispatches of a bench run.
+
+**Where the encoder is selected.** `-Djllm.metal.concurrent=false` (default) | `true` | `batch` (concurrent only inside
+`forwardBatch`, which switches the encoder for that pass and back; recorded decode steps stay valid) | `auto` (= `false`
+until it measures faster) | `barriers` (a barrier before every dispatch, to measure what a barrier costs) | `resources` |
+`unsafe`. Natively `jm_set_concurrent(ctx, mode)` before a command buffer opens, `jm_set_group(ctx, id)` for the
+dispatches that follow (`jm_run` reads the id from the command) and `jm_barriers(ctx)`; `MetalBackend.concurrent(boolean)`
+(and the Mamba and Qwen3-Next backends) switch one backend. The emulator (`scripts/metal-emu/runtime.cpp`) accepts the
+calls and ignores them: it runs each dispatch to completion, a valid order of any schedule that has the barriers.
+
+**Everything that uses the bridge** works with it, because the tracker lives where all of them meet: decode replay
+(`jm_run` tracks every command, groups included), pipelined decoding (the token ring is a buffer like the others;
+steps are separate command buffers), the CPU/GPU expert split (the handoffs are `jm_commit` / `jm_commit_wait`, which end
+the encoder, so a new one starts clean), batched decoding across slots, draft-model speculation (`forwardAll` and the
+pipelined draft are the same kernels), MLA, Qwen3-Next, Mamba (a chain, nothing to overlap).
+
+**Checked bit for bit.** Concurrency does not change what any kernel computes, only the order of independent work, so
+any difference from the serial encoder is a missing barrier or a wrong group. `ArchSmoke.concurrentCheck` runs, for every
+family and quantization, a 40-token prefill chunk (the simdgroup-matrix kernels), 10 decode steps (replay), a 7-token
+chunk, and a 4-token `forwardAll` on a serial and on a concurrent backend and requires the logits of every pass to be
+equal bit for bit, three times (races are intermittent); for Q4_0 also with the f16 and q8 caches, pipelined greedy decoding,
+batched decoding of three slots (f32 / f16 / q8: the groups), and the experts of one layer, of all layers, and every other
+expert on the CPU. As a control the same check with `-Djllm.metal.concurrent=unsafe` (no barriers) fails on the first
+pass of every family, so the check does see races on these tiny models. `scripts/arch-smoke.sh` ends `arch smoke passed`
+with the flag off and with `JAVA_OPTS=-Djllm.metal.concurrent=true`, and the haiku gate (`scripts` md5gate, CPU and Metal) prints `79472f69...` with `concurrent` false, true and batch.
+
+**Measured** (M1 Pro, `./jllm bench --temp 0 --engine.speculative off`, 4 rounds, alternating on and off; tok/s):
+
+| model / pass | serial (default) | `concurrent=true` | `concurrent=unsafe` (wrong results) |
+|---|---|---|---|
+| Qwen3-0.6B safetensors Q4, decode | 114 / 109 | 113.5 / 108 | |
+| same, pipelined decoding off | 112 / 111 | 109 / 111 | |
+| same, prefill (413 tokens) | 1 440 | 1 438 | |
+| Qwen3-0.6B GGUF Q4_0, decode | 103.5 / 100 | 103 / 102 | 138.6 |
+| same, prefill | 1 330 | 1 340 | 1 648 |
+| Qwen3-30B-A3B Q4 (MoE), decode | 25.1 | 25.1 | |
+| same, prefill | 277 | 277 | |
+| 3 slots in shared passes (`BatchDecodeTest bench`, 0.6B) | 177 (176-181) | 181-198 | |
+
+(Decode and prefill: median of 4 rounds, two passes alternating the settings, shown as pass 1 / pass 2 where they differ;
+the 30B rows are 3 rounds, two passes. `concurrent=batch` for the last row: 162-199 over four runs, the same as `true` within
+the noise of a machine other people also use. The load average was 5-70 from processes outside the lock, so differences
+below ~5 % mean nothing.)
+
+**Decision.** The concurrent encoder is **correct and bit-identical, and off by default** (`auto` = `false`). Every dispatch of a
+single-stream decode step or prefill chunk depends on the one before, so the tracker puts a barrier in front of 99 % of them
+and a barrier costs as much as the serial encoder's drain: 0.6B and 30B decode and prefill are unchanged within the noise.
+The ~30 % that the no-barrier run shows is the overlap of *dependent* kernels (a kernel starting before its input is
+complete), which no correct schedule can have. Only fewer dependent boundaries win it back: more fusion (8.23), or kernels
+that need no full drain. What the encoder does buy is the overlap of really independent work: batched decoding across
+slots gains a few percent (the per-row dispatches of the slots overlap, 177 -> ~185 tok/s for three slots, within noise
+of 180-198), so `concurrent=batch` is the setting to try on a server that runs several conversations at once; MLA and
+Qwen3-Next save two to three barriers per layer. Neither is worth changing the default for; the machinery is the base for
+any future kernel split that has independent branches (for example a shared expert beside the routed ones, once they add
+into separate buffers).

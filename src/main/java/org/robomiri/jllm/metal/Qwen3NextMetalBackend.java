@@ -111,6 +111,20 @@ public final class Qwen3NextMetalBackend implements Backend {
         Metal.Buffer sharedGate;
     }
 
+    /**
+     * Selects the concurrent compute encoder (true: independent dispatches overlap, a barrier goes between dependent ones)
+     * or the serial one (false) for the passes that follow; the results are bit-identical. The default is
+     * {@code -Djllm.metal.concurrent} (docs/08 section 8.28).
+     */
+    public void concurrent(boolean on) {
+        k.concurrent(on ? MetalKernels.concurrentOn() : 0);
+    }
+
+    /** Memory barriers the concurrent encoder has inserted so far. */
+    public long barriers() {
+        return k.metal.barriers();
+    }
+
     public Qwen3NextMetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype) {
         this.w = w;
         this.arch = w.qwen3Next();
@@ -348,12 +362,16 @@ public final class Qwen3NextMetalBackend implements Backend {
         int hd = g.headDim();
         int kvDim = g.kvDim();
         long cacheOff = (long) pos * kvDim * (kvHalf ? 2 : 4);
+        k.beginIndependent(); // the projections of xb write apart; so do the two norms below (concurrent encoder)
         k.matmul3(wg.wq(), b.wq, wg.wk(), b.wk, wg.wv(), b.wv, xb, null, q, kStage, 0, valCache[fi], cacheOff, kvHalf,
                 null, null, null, n);
         k.matmul(a.gate(), b.wGate, xb, 0, gate, 0, n, false, null, 0f);
+        k.endIndependent();
         // per-head q / k norms over the whole head (rows of headDim), then RoPE on the rotary slice only
+        k.beginIndependent();
         k.rmsnorm(q, 0, b.qNorm, q, n * g.heads(), hd);
         k.rmsnorm(kStage, 0, b.kNorm, kStage, n * g.kvHeads(), hd);
+        k.endIndependent();
         k.rope(false, kvHalf, q, kStage, 0, keyCache[fi], cacheOff, null, null, ropeCos, ropeSin, hd, g.qDim(), kvDim,
                 g.heads(), g.kvHeads(), pos, 0, arch.rope().rotaryDim() / 2, n);
         k.attention(attnKernel, 1, q, keyCache[fi], valCache[fi], att, scores, g.heads(), g.kvHeads(), hd, hd, pos, ctx,
@@ -364,18 +382,27 @@ public final class Qwen3NextMetalBackend implements Backend {
 
     private void moe(Mlp.Moe spec, MlpWeights.Moe m, LayerBufs b, int n) {
         int dim = c.dim();
-        k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
         QTensor gu = m.expGateUp();
         QTensor dw = m.expDown();
         if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+            k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
             k.moeGrouped(gu, b.expGateUp, dw, b.expDown, xb, assign, routeWeight, moeOrder, moeTiles, moeHidden, moeOut, x,
                     spec.experts(), spec.moeDim(), dim, spec.topK(), n);
+            k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
+            k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
         } else {
+            // the shared expert (up to sharedOut) and the routed ones read xb and write apart; the routed ones still add
+            // into x before the shared one does, as before
+            k.beginIndependent();
+            k.router(xb, b.router, assign, routeWeight, spec.experts(), dim, spec.topK(), spec.normTopK(), null, null, null, n);
+            k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
+            k.endIndependent();
+            k.beginIndependent();
             k.moeUp(gu, b.expGateUp, xb, assign, moeHidden, spec.moeDim(), spec.topK(), n);
+            k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
+            k.endIndependent();
             k.moeDown(dw, b.expDown, moeHidden, assign, routeWeight, x, dim, spec.topK(), n);
         }
-        k.swiglu(m.shared().gateUp(), b.gateUp, xb, null, hidden, false, n);
-        k.matmul(m.shared().down(), b.down, hidden, 0, sharedOut, 0, n, false, null, 0f);
         k.sharedGateAdd(xb, b.sharedGate, sharedOut, x, dim, n);
     }
 

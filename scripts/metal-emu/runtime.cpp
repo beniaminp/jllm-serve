@@ -221,6 +221,17 @@ void jm_buffer_release(void *buf) {
     delete b;
 }
 
+// The concurrent encoder's calls: the emulator runs every dispatch to completion before the next one, which is a valid
+// execution of any concurrent schedule that has the barriers the real encoder needs, so these only keep the API.
+static int emuConcurrent = 0;
+int jm_set_concurrent(void *ctx, int mode) {
+    int old = emuConcurrent;
+    emuConcurrent = mode;
+    return old;
+}
+void jm_set_group(void *ctx, int id) {}
+long jm_barriers(void *ctx) { return 0; }
+
 void jm_begin(void *ctx) {}
 void jm_commit(void *ctx) {}
 void jm_abort(void *ctx) {}

@@ -13,11 +13,38 @@
 #include <stdio.h>
 #include <string.h>
 
-@interface JMContext : NSObject
+#define JM_MAX_ARGS 31   // buffer bindings per kernel (Metal allows 31)
+#define JM_SET_CAP 192   // buffers tracked between two barriers; a full set forces a barrier
+
+// The access a kernel declares to each of its buffer arguments (from the pipeline's reflection).
+enum { JM_NONE = 0, JM_READ = 1, JM_WRITE = 2 };
+
+@interface JMContext : NSObject {
+@public
+    // ---- concurrent encoder mode (jm_set_concurrent) and its hazard tracker
+    int mode;                // 0 serial encoder; 1 concurrent + barriers where a hazard is found; 2 concurrent + a barrier before every dispatch
+    int useResources;        // barrier on the conflicting buffers only (memoryBarrierWithResources:) instead of on every buffer
+    uint8_t *access;         // per pipeline, JM_MAX_ARGS entries: JM_NONE / JM_READ / JM_WRITE (read-write counts as write)
+    int accessCap;           // pipelines the table has room for
+    void *wBuf[JM_SET_CAP];  // buffers written since the last barrier ...
+    int nW;
+    void *rBuf[JM_SET_CAP];  // ... and buffers only read since then
+    int nR;
+    void *pwBuf[JM_SET_CAP]; // the same for the dispatches of the open group (their members are independent of each other)
+    int npW;
+    void *prBuf[JM_SET_CAP];
+    int npR;
+    int group;               // the tracker's open group: consecutive dispatches with the same non-zero id are independent
+    int setGroup;            // the group id jm_set_group declared for the dispatches that follow
+    int trace;               // JLLM_METAL_TRACE: print every tracked dispatch with a mark for the barrier before it
+    long barriers;           // statistics since the context was created
+    long dispatched;
+}
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLLibrary> library;
 @property(nonatomic, strong) NSMutableArray<id<MTLComputePipelineState>> *pipelines;
+@property(nonatomic, strong) NSMutableArray<NSString *> *names;
 @property(nonatomic, strong) id<MTLCommandBuffer> cmd;
 @property(nonatomic, strong) id<MTLComputeCommandEncoder> enc;
 // command buffers of the current forward pass that jm_commit already submitted (jm_commit_wait checks them)
@@ -46,6 +73,8 @@ void *jm_create(const char *source, char *err, int errlen) {
         c.device = dev;
         c.queue = [dev newCommandQueue];
         c.pipelines = [NSMutableArray new];
+        c.names = [NSMutableArray new];
+        c->trace = getenv("JLLM_METAL_TRACE") != NULL;
         c.inflight = [NSMutableArray new];
         NSError *e = nil;
         MTLCompileOptions *opts = [MTLCompileOptions new];
@@ -70,6 +99,11 @@ void jm_destroy(void *ctx) {
         JMContext *c = (__bridge_transfer JMContext *) ctx;
         c.enc = nil;
         c.cmd = nil;
+        if (getenv("JLLM_METAL_STATS")) {
+            fprintf(stderr, "jllm_metal: %ld dispatches tracked, %ld barriers\n", c->dispatched, c->barriers);
+        }
+        free(c->access);
+        c->access = NULL;
         c = nil;
     }
 }
@@ -111,13 +145,45 @@ int jm_pipeline(void *ctx, const char *name, char *err, int errlen) {
             return -1;
         }
         NSError *e = nil;
-        id<MTLComputePipelineState> p = [c.device newComputePipelineStateWithFunction:f error:&e];
+        // the reflection tells which buffer arguments a kernel can write (`device T *`) and which it only reads
+        // (`device const T *`): the concurrent encoder's hazard tracker needs that
+        MTLComputePipelineReflection *__autoreleasing refl = nil;
+        id<MTLComputePipelineState> p = [c.device newComputePipelineStateWithFunction:f
+                                                                              options:MTLPipelineOptionBindingInfo
+                                                                           reflection:&refl
+                                                                                error:&e];
         if (!p) {
             set_err(err, errlen, e ? e.localizedDescription : @"pipeline creation failed");
             return -1;
         }
+        int idx = (int) c.pipelines.count;
         [c.pipelines addObject:p];
-        return (int) c.pipelines.count - 1;
+        [c.names addObject:[NSString stringWithUTF8String:name]];
+        if (idx >= c->accessCap) {
+            int cap = c->accessCap ? c->accessCap * 2 : 256;
+            c->access = (uint8_t *) realloc(c->access, (size_t) cap * JM_MAX_ARGS);
+            c->accessCap = cap;
+        }
+        uint8_t *a = c->access + (size_t) idx * JM_MAX_ARGS;
+        // without a reflection every argument counts as written: more barriers, never fewer
+        memset(a, refl ? JM_NONE : JM_WRITE, JM_MAX_ARGS);
+        if (refl) {
+            for (id<MTLBinding> bind in refl.bindings) {
+                if (bind.type == MTLBindingTypeBuffer && bind.index < JM_MAX_ARGS && bind.used) {
+                    a[bind.index] = bind.access == MTLBindingAccessReadOnly ? JM_READ : JM_WRITE;
+                }
+            }
+        }
+        if (getenv("JLLM_METAL_DUMP_ACCESS")) {
+            fprintf(stderr, "jllm_metal access %-40s", name);
+            for (int i = 0; i < JM_MAX_ARGS; i++) {
+                if (a[i]) {
+                    fprintf(stderr, " %d%c", i, a[i] == JM_WRITE ? 'W' : 'r');
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        return idx;
     }
 }
 
@@ -179,9 +245,165 @@ void jm_buffer_release(void *buf) {
     }
 }
 
+static void reset_tracker(JMContext *c) {
+    c->nW = c->nR = c->npW = c->npR = 0;
+    c->group = 0;
+}
+
 static void open_cmd(JMContext *c) {
     c.cmd = [c.queue commandBufferWithUnretainedReferences];
-    c.enc = [c.cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    // Serial: every dispatch sees the results of the one before it (the GPU drains between them). Concurrent: dispatches
+    // may overlap, and track_hazards() inserts a barrier wherever one reads or overwrites what an earlier one wrote.
+    // A new encoder needs no barrier against the previous one: encoders of one queue run in order.
+    c.enc = [c.cmd computeCommandEncoderWithDispatchType:c->mode ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
+    reset_tracker(c);
+}
+
+static int in_set(void **set, int n, void *b) {
+    for (int i = 0; i < n; i++) {
+        if (set[i] == b) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Adds b to a set; returns 0 when the set is full.
+static int add_set(void **set, int *n, void *b) {
+    if (in_set(set, *n, b)) {
+        return 1;
+    }
+    if (*n >= JM_SET_CAP) {
+        return 0;
+    }
+    set[(*n)++] = b;
+    return 1;
+}
+
+// Called before the dispatch is encoded: decides whether it needs a barrier against the dispatches since the last one
+// (it reads a buffer one of them writes, or writes a buffer one of them reads or writes) and records its own accesses.
+// Dispatches of one group are independent by contract: they are compared with what came before the group only.
+// Buffer granularity: a kernel's extent inside a buffer is not known, so two dispatches that touch different rows of the
+// same buffer conflict unless the caller puts them in a group.
+static void track_hazards_impl(JMContext *c, int pipeline, void *const *bufs, int nbuf, int group) {
+    c->dispatched++;
+    if (c->mode == 3) { // timing only (the results are wrong): no barriers at all, the upper bound of what overlap can gain
+        return;
+    }
+    if (c->mode == 2) { // measuring aid: a barrier between every pair of dispatches
+        if (c->dispatched > 1) {
+            [c.enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            c->barriers++;
+        }
+        return;
+    }
+    if (nbuf > JM_MAX_ARGS) {
+        nbuf = JM_MAX_ARGS;
+    }
+    if (group != c->group || group == 0) { // the open group ends: its members become visible to what follows
+        for (int i = 0; i < c->npW; i++) {
+            add_set(c->wBuf, &c->nW, c->pwBuf[i]);
+        }
+        for (int i = 0; i < c->npR; i++) {
+            add_set(c->rBuf, &c->nR, c->prBuf[i]);
+        }
+        c->npW = c->npR = 0;
+        c->group = group;
+    }
+    const uint8_t *acc = c->access + (size_t) pipeline * JM_MAX_ARGS;
+    int hazard = 0;
+    for (int i = 0; i < nbuf && !hazard; i++) {
+        if (acc[i] == JM_NONE) {
+            continue;
+        }
+        void *b = bufs[i];
+        if (in_set(c->wBuf, c->nW, b) || (acc[i] == JM_WRITE && in_set(c->rBuf, c->nR, b))) {
+            hazard = 1;
+        }
+    }
+    if (hazard) {
+        if (c->useResources) {
+            // every buffer touched since the last barrier (a read before a later write is a hazard too)
+            id<MTLResource> res[4 * JM_SET_CAP];
+            int n = 0;
+            for (int i = 0; i < c->nW; i++) {
+                res[n++] = (__bridge id<MTLResource>) c->wBuf[i];
+            }
+            for (int i = 0; i < c->nR; i++) {
+                res[n++] = (__bridge id<MTLResource>) c->rBuf[i];
+            }
+            for (int i = 0; i < c->npW; i++) {
+                res[n++] = (__bridge id<MTLResource>) c->pwBuf[i];
+            }
+            for (int i = 0; i < c->npR; i++) {
+                res[n++] = (__bridge id<MTLResource>) c->prBuf[i];
+            }
+            [c.enc memoryBarrierWithResources:res count:(NSUInteger) n];
+        } else {
+            [c.enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        c->barriers++;
+        c->nW = c->nR = c->npW = c->npR = 0;
+    }
+    for (int i = 0; i < nbuf; i++) {
+        if (acc[i] == JM_NONE) {
+            continue;
+        }
+        void *b = bufs[i];
+        int ok;
+        if (group) {
+            ok = acc[i] == JM_WRITE ? add_set(c->pwBuf, &c->npW, b) : add_set(c->prBuf, &c->npR, b);
+        } else {
+            ok = acc[i] == JM_WRITE ? add_set(c->wBuf, &c->nW, b) : add_set(c->rBuf, &c->nR, b);
+        }
+        if (!ok) { // a full set: a barrier now makes room, and orders this dispatch after everything before it
+            [c.enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            c->barriers++;
+            c->nW = c->nR = c->npW = c->npR = 0;
+            if (group) {
+                acc[i] == JM_WRITE ? add_set(c->pwBuf, &c->npW, b) : add_set(c->prBuf, &c->npR, b);
+            } else {
+                acc[i] == JM_WRITE ? add_set(c->wBuf, &c->nW, b) : add_set(c->rBuf, &c->nR, b);
+            }
+        }
+    }
+}
+
+static void track_hazards(JMContext *c, int pipeline, void *const *bufs, int nbuf, int group) {
+    long before = c->barriers;
+    track_hazards_impl(c, pipeline, bufs, nbuf, group);
+    if (c->trace) { // JLLM_METAL_TRACE=1: "B" = a barrier precedes the dispatch, "g<id>" = it belongs to a group
+        fprintf(stderr, "jllm_metal trace %c %-32s", c->barriers > before ? 'B' : '-', c.names[(NSUInteger) pipeline].UTF8String);
+        if (group) {
+            fprintf(stderr, " g%d", group);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+// Selects the encoder type for the command buffers opened from now on (call between forward passes, not while one is
+// being recorded): 0 serial; 1 concurrent with barriers inserted by hazard tracking; 2 concurrent with a barrier
+// before every dispatch (to measure what a barrier costs); +4 barriers name the conflicting buffers instead of
+// covering every buffer. Returns the previous mode.
+int jm_set_concurrent(void *ctx, int m) {
+    JMContext *c = (__bridge JMContext *) ctx;
+    int old = c->mode | (c->useResources ? 4 : 0);
+    c->mode = m & 3;
+    c->useResources = (m & 4) != 0;
+    return old;
+}
+
+// Declares that the dispatches that follow, until the next jm_set_group call, are independent of each other (they read
+// what none of them writes, and write disjoint memory), so they may overlap. Ids must differ between two adjacent groups;
+// 0 closes the group. Only meaningful in the concurrent modes.
+void jm_set_group(void *ctx, int id) {
+    JMContext *c = (__bridge JMContext *) ctx;
+    c->setGroup = id;
+}
+
+// Barriers and dispatches the tracker has seen on this context (for tests and the benchmark logs).
+long jm_barriers(void *ctx) {
+    return ((__bridge JMContext *) ctx)->barriers;
 }
 
 // Starts recording a new command buffer with a serial compute encoder: each dispatch sees the results of the
@@ -200,6 +422,9 @@ void jm_dispatch(void *ctx, int pipeline, void **bufs, const uint64_t *offsets, 
     @autoreleasepool {
         JMContext *c = (__bridge JMContext *) ctx;
         id<MTLComputeCommandEncoder> enc = c.enc;
+        if (c->mode) {
+            track_hazards(c, pipeline, bufs, nbuf, c->setGroup);
+        }
         [enc setComputePipelineState:c.pipelines[(NSUInteger) pipeline]];
         for (int i = 0; i < nbuf; i++) {
             [enc setBuffer:(__bridge id<MTLBuffer>) bufs[i] offset:(NSUInteger) offsets[i] atIndex:(NSUInteger) i];
@@ -240,6 +465,9 @@ void jm_run(void *ctx, const JMCmd *cmds, int n) {
         uint64_t boundOff[16] = {0};
         for (int k = 0; k < n; k++) {
             const JMCmd *d = &cmds[k];
+            if (c->mode) {
+                track_hazards(c, d->pipe, d->bufs, d->nbuf, d->pad[0]);
+            }
             if (d->pipe != lastPipe) {
                 [enc setComputePipelineState:c.pipelines[(NSUInteger) d->pipe]];
                 lastPipe = d->pipe;

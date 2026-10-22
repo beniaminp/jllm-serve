@@ -88,6 +88,13 @@ bench "flash decode off" "$DENSE" "-Djllm.metal.flashDecode=false"
 bench "pipelined decoding off" "$DENSE" "-Djllm.metal.pipeline=false"
 bench "decode replay off" "$DENSE" "-Djllm.metal.replay=false"
 bench "decode replay off, pipelined decoding off" "$DENSE" "-Djllm.metal.replay=false -Djllm.metal.pipeline=false"
+# the serial compute encoder (default) against the concurrent one with hazard-tracked barriers (docs/08 8.28); "unsafe"
+# has no barriers at all (wrong results), it times the ceiling of what overlapping dependent kernels could gain
+bench "concurrent encoder off (serial, default)" "$DENSE" "-Djllm.metal.concurrent=false"
+bench "concurrent encoder on" "$DENSE" "-Djllm.metal.concurrent=true"
+bench "concurrent encoder on, pipelined decoding off" "$DENSE" "-Djllm.metal.concurrent=true -Djllm.metal.pipeline=false"
+bench "concurrent encoder, a barrier before every dispatch" "$DENSE" "-Djllm.metal.concurrent=barriers"
+bench "concurrent encoder, no barriers (WRONG RESULTS, timing only)" "$DENSE" "-Djllm.metal.concurrent=unsafe"
 bench "q8 KV cache, decode fusions off" "$DENSE" "-Djllm.metal.fuse=false" --backend.kv-dtype q8 --engine.speculative off
 bench "simdgroup-matrix prefill off" "$DENSE" "-Djllm.metal.mmaPrefill=false"
 # the prefill kernels' two forms: f32 *_mma vs half-weight *_hmma (default: per shape, as the start-up check timed them),
@@ -142,6 +149,7 @@ mvn -q compile test-compile
 [ -f target/native/libjllm_metal.dylib ] || ./scripts/build-native.sh >/dev/null
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
+batch "3 slots generating together, concurrent encoder on" "-Djllm.metal.concurrent=true"
 # constrained tool calls (docs/17 section 17.7). ToolCallCheck generates a tool call under the tool-call constraint
 # with speculation off, with prompt lookup and with the model drafting for itself, jump-forward off and on, and fails
 # the run when the tokens differ from speculation off; its decode time is the median of 5 generations.
@@ -202,6 +210,8 @@ if [ -n "$MOE" ]; then
   bench "half-weight MMA prefill forced on" "$MOE" "-Djllm.metal.hmma=true"
   bench "half-weight MMA prefill off (f32 MMA)" "$MOE" "-Djllm.metal.hmma=false"
   bench "decode replay off" "$MOE" "-Djllm.metal.replay=false"
+  bench "concurrent encoder on" "$MOE" "-Djllm.metal.concurrent=true"
+  bench "concurrent encoder on, experts of 4 layers on the CPU" "$MOE" "-Djllm.metal.concurrent=true" --backend.metal.cpu-moe 4
   bench "experts of 4 layers on the CPU" "$MOE" "" --backend.metal.cpu-moe 4
   bench "experts of 4 layers on the CPU, int8 off" "$MOE" "" --backend.metal.cpu-moe 4 --backend.cpu.int8-activations false
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off

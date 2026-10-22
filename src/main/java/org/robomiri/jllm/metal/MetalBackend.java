@@ -904,21 +904,35 @@ public final class MetalBackend implements Backend {
             boolean useNorm = !partial && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
+            // The rows are independent (each has its own q, k, v and att row and its own owner's cache), so each stage is
+            // issued for all rows before the next: with the concurrent encoder the rows of a stage overlap, the barriers
+            // go between stages (the serial encoder runs them in this order too, to the same results).
+            k.beginIndependent();
             for (int t = 0; t < n; t++) {
-                MetalBackend o = owners[t];
-                int pos = positions[t];
-                long cacheOff = pos * rowBytes;
-                long qOff = (long) t * g.qDim() * 4;
+                Metal.Buffer kc = owners[t].keyCache[layer];
+                long cacheOff = positions[t] * rowBytes;
                 long kvOff = (long) t * kvDim * 4;
-                Metal.Buffer kc = o.keyCache[layer];
-                Metal.Buffer vc = o.valCache[layer];
-                k.ropeRow(adjacent, kvHalf, q, qOff, rowK, kvOff, q8 || q4 ? rowK : kc, q8 || q4 ? kvOff : cacheOff,
-                        useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(), kvDim, g.heads(),
-                        g.kvHeads(), pos, 0, rotHalf);
-                if (q4) { // the owner's ring and q4 rows, as the owner's own decode step
+                k.ropeRow(adjacent, kvHalf, q, (long) t * g.qDim() * 4, rowK, kvOff, q8 || q4 ? rowK : kc,
+                        q8 || q4 ? kvOff : cacheOff, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin, hd, g.qDim(),
+                        kvDim, g.heads(), g.kvHeads(), positions[t], 0, rotHalf);
+                if (!q8 && !q4) { // (writes the cache's v rows: independent of the rope above, which writes q and the k rows)
+                    k.kvPut(kvHalf, rowV, kvOff, owners[t].valCache[layer], cacheOff, kvDim);
+                }
+            }
+            k.endIndependent();
+            if (q4) { // the owner's ring and q4 rows, as the owner's own decode step; one row after the other (the q4
+                // attention kernels use the scores scratch from offset 0, so the encoder's barriers keep them in order)
+                float scale = g.scale() / KvQ4.scaleDivisor(hd);
+                for (int t = 0; t < n; t++) {
+                    MetalBackend o = owners[t];
+                    Metal.Buffer kc = o.keyCache[layer];
+                    Metal.Buffer vc = o.valCache[layer];
                     MetalKernels.Q4Ring ring = o.q4Rings == null ? null : o.q4Rings[layer];
-                    k.kvStoreQ4Row(rowK, kvOff, rowV, kvOff, kc, vc, cacheOff, q, qOff, ring, hd, g.kvHeads(), g.heads(), pos);
-                    float scale = g.scale() / KvQ4.scaleDivisor(hd);
+                    int pos = positions[t];
+                    long qOff = (long) t * g.qDim() * 4;
+                    long kvOff = (long) t * kvDim * 4;
+                    k.kvStoreQ4Row(rowK, kvOff, rowV, kvOff, kc, vc, pos * rowBytes, q, qOff, ring, hd, g.kvHeads(),
+                            g.heads(), pos);
                     if (flashDecode && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionQ4Row(q, qOff, kc, vc, flashPart, scores, att, qOff, ring, g.heads(), g.kvHeads(), hd,
                                 pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
@@ -926,21 +940,45 @@ public final class MetalBackend implements Backend {
                         k.attentionQ4Row(attnKernel, q, qOff, kc, vc, att, qOff, scores, ring, g.heads(), g.kvHeads(), hd, pos,
                                 ctx, scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                     }
-                    continue;
                 }
-                if (q8) {
-                    k.kvStoreQ8Row(rowK, kvOff, rowV, kvOff, kc, vc, cacheOff, hd, g.kvHeads());
-                } else {
-                    k.kvPut(kvHalf, rowV, kvOff, vc, cacheOff, kvDim);
-                }
-                if (flashDecode && pos + 1 >= k.flashMinLen) { // the instance's thresholds, as the single step uses
-                    k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
-                            hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
-                } else {
-                    k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                            hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
-                }
+                return;
             }
+            if (q8) {
+                k.beginIndependent();
+                for (int t = 0; t < n; t++) {
+                    k.kvStoreQ8Row(rowK, (long) t * kvDim * 4, rowV, (long) t * kvDim * 4, owners[t].keyCache[layer],
+                            owners[t].valCache[layer], positions[t] * rowBytes, hd, g.kvHeads());
+                }
+                k.endIndependent();
+            }
+            // attention: one slice of the scores scratch per row (it holds a tile's worth), so rows can overlap; the
+            // flash form shares its partial-result buffer between rows and stays one after the other
+            boolean anyFlash = false;
+            for (int t = 0; t < n; t++) {
+                anyFlash |= flashDecode && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
+            }
+            int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
+            for (int t = 0; t < n; t++) {
+                Metal.Buffer kc = owners[t].keyCache[layer];
+                Metal.Buffer vc = owners[t].valCache[layer];
+                int pos = positions[t];
+                long qOff = (long) t * g.qDim() * 4;
+                if (anyFlash) {
+                    if (flashDecode && pos + 1 >= k.flashMinLen) {
+                        k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
+                                hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
+                        continue;
+                    }
+                } else if (t % sliceRows == 0) {
+                    k.endIndependent();
+                    k.beginIndependent();
+                }
+                k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
+                k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
+                        hd, pos, ctx, g.scale(), g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+            }
+            k.endIndependent();
+            k.rowScores(0);
         }
     }
 
@@ -1308,6 +1346,20 @@ public final class MetalBackend implements Backend {
         return key;
     }
 
+    /**
+     * Selects the concurrent compute encoder (true: independent dispatches overlap, a barrier goes between dependent ones)
+     * or the serial one (false) for the passes that follow; the results are bit-identical. The default is
+     * {@code -Djllm.metal.concurrent} (docs/08 section 8.28).
+     */
+    public void concurrent(boolean on) {
+        k.concurrent(on ? MetalKernels.concurrentOn() : 0);
+    }
+
+    /** Memory barriers the concurrent encoder has inserted so far. */
+    public long barriers() {
+        return k.metal.barriers();
+    }
+
     /** Turns decode replay on or off for this backend (on only where it can work: see {@link #replayable}). */
     public void replay(boolean on) {
         replay = on && k.metal.canRun() && windows.length <= 8;
@@ -1605,6 +1657,10 @@ public final class MetalBackend implements Backend {
         }
         countStep = counts != null && steps++ % COUNT_EVERY == 0;
         watchThermal();
+        int encoder = k.concurrentMode();
+        if (MetalKernels.CONCURRENT_BATCH && n > 1 && k.metal.canRunConcurrent()) {
+            k.encoder(1); // the per-row dispatches of the n slots are independent: let them overlap
+        }
         k.begin();
         boolean committed = false;
         try {
@@ -1630,6 +1686,7 @@ public final class MetalBackend implements Backend {
             if (!committed) {
                 k.abort();
             }
+            k.encoder(encoder);
         }
         if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
             rebalanceExperts();

@@ -114,6 +114,36 @@ final class MetalKernels implements AutoCloseable {
      */
     static final boolean FUSE = !"false".equals(System.getProperty("jllm.metal.fuse"));
 
+    /**
+     * Concurrent compute encoder ({@code -Djllm.metal.concurrent}): "false" (default) = the serial encoder, every dispatch
+     * waits for the one before; "true" = a concurrent encoder, the native side inserting a memory barrier only before
+     * a dispatch that reads or overwrites what an earlier one wrote since the last barrier (so independent dispatches
+     * overlap); "auto" = as measured on the device (currently the same as "false"); "barriers" = concurrent with a
+     * barrier before every dispatch (a measuring aid); "resources" = "true" with barriers naming the buffers. The results
+     * are bit-identical in every mode: only the order of independent work changes.
+     */
+    static final String CONCURRENT = System.getProperty("jllm.metal.concurrent", "false");
+
+    static int concurrentMode(String v) {
+        return switch (v) {
+            case "true" -> 1;
+            case "barriers" -> 2;
+            case "unsafe" -> 3; // no barriers at all: wrong results, for timing the upper bound only
+            case "resources" -> 1 | 4;
+            case "false", "auto", "batch" -> 0; // (batch: serial, except in the passes of batched decoding)
+            default -> throw new IllegalArgumentException("jllm.metal.concurrent=" + v
+                    + ": expected false, true, auto, batch, barriers, resources or unsafe");
+        };
+    }
+
+    /** {@code -Djllm.metal.concurrent=batch}: the concurrent encoder for the passes of batched decoding only. */
+    static final boolean CONCURRENT_BATCH = "batch".equals(CONCURRENT);
+
+    /** The mode "concurrent on" means: {@code -Djllm.metal.concurrent}'s when that names a concurrent one, else 1. */
+    static int concurrentOn() {
+        return Math.max(1, concurrentMode(CONCURRENT));
+    }
+
     final Metal metal;
     private final float eps;
     private final Arena arena = Arena.ofShared();
@@ -135,6 +165,71 @@ final class MetalKernels implements AutoCloseable {
         offArgs = arena.allocate(ValueLayout.JAVA_LONG, MAX_BUFS);
         p = new Params(arena.allocate(64));
         dummy = metal.newBuffer(64, true);
+        concurrent(concurrentMode(CONCURRENT));
+    }
+
+    private int concurrentMode;
+    private int groupId;  // the independent group being recorded (0 = none)
+    private int groupSeq;
+
+    /** Selects the serial (0) or a concurrent encoder (see {@link #CONCURRENT}) for the command buffers opened from now on. */
+    void concurrent(int mode) {
+        if (mode != 0 && !metal.canRunConcurrent()) {
+            System.err.println("warning: the Metal library has no concurrent encoder; using the serial one");
+            mode = 0;
+        }
+        invalidatePrograms(); // their group ids only matter in a concurrent mode
+        concurrentMode = mode;
+        metal.concurrent(mode);
+    }
+
+    boolean concurrent() {
+        return concurrentMode != 0;
+    }
+
+    int concurrentMode() {
+        return concurrentMode;
+    }
+
+    /**
+     * Switches the encoder for the command buffers opened from now on without dropping the recorded decode steps (a
+     * program recorded in one mode runs correctly in the other; only its groups matter in the concurrent one): for a
+     * pass that wants the other encoder once, such as a batched decode step.
+     */
+    void encoder(int mode) {
+        if (mode != concurrentMode) {
+            concurrentMode = mode;
+            metal.concurrent(mode);
+        }
+    }
+
+    /**
+     * The dispatches until {@link #endIndependent} are mutually independent: none reads what another writes and their
+     * writes do not overlap (the per-row dispatches of a batched pass, for one kernel). With the concurrent encoder they
+     * may overlap; with the serial one this does nothing. They are still ordered after what came before the group and
+     * before what follows it, by the hazard tracking.
+     */
+    void beginIndependent() {
+        if (concurrentMode == 0) {
+            return;
+        }
+        groupId = ++groupSeq & 0x3fffffff;
+        if (groupId == 0) {
+            groupId = ++groupSeq;
+        }
+        if (rec == null) {
+            metal.group(groupId);
+        }
+    }
+
+    void endIndependent() {
+        if (groupId == 0) {
+            return;
+        }
+        groupId = 0;
+        if (rec == null) {
+            metal.group(0);
+        }
     }
 
     @Override
@@ -175,6 +270,7 @@ final class MetalKernels implements AutoCloseable {
 
     void begin() {
         notRecording();
+        groupId = 0;
         metal.begin();
     }
 
@@ -189,6 +285,7 @@ final class MetalKernels implements AutoCloseable {
     }
 
     void abort() {
+        groupId = 0;
         metal.abort();
     }
 
@@ -305,6 +402,7 @@ final class MetalKernels implements AutoCloseable {
         DecodeProgram prog = new DecodeProgram();
         System.arraycopy(vars, 0, recVars, 0, vars.length);
         java.util.Arrays.fill(bindVar, -1);
+        groupSeq = 0; // group ids are numbered from 1 in every recording, so equal steps record equal programs
         rec = prog;
         try {
             body.run();
@@ -352,7 +450,7 @@ final class MetalKernels implements AutoCloseable {
         int plen = p.done();
         if (rec != null) {
             int cmd = rec.add(metal.pipeline(kernel), kernel, bufArgs, offArgs, nbuf, p.segment(), plen, tgmem, gx, gy, gz,
-                    tx, ty, tz);
+                    tx, ty, tz, groupId);
             for (int i = 0; i < nbuf; i++) {
                 if (bindVar[i] >= 0) {
                     rec.patch(cmd, DecodeProgram.KIND_OFFSET, i, bindVar[i], bindBase[i], bindCoeff[i]);
@@ -1283,6 +1381,17 @@ final class MetalKernels implements AutoCloseable {
                 nHeads + nKHeads, 1, 1, rotHalf, 1, 1);
     }
 
+    /**
+     * Where {@link #attentionRow} binds the scores scratch, in bytes: 0, or a row's own slice of it (the scratch holds one
+     * slice of {@code heads * ctx} floats per tile token), so the attention dispatches of several rows write disjoint memory
+     * and can sit in one independent group.
+     */
+    private long rowScoresOff;
+
+    void rowScores(long off) {
+        rowScoresOff = off;
+    }
+
     /** {@link #attention} of the one token at pos whose q row starts at byte qOff; its output row goes to byte outOff. */
     void attentionRow(String kernel, int groups, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
                       Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
@@ -1292,7 +1401,7 @@ final class MetalKernels implements AutoCloseable {
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, out, outOff);
-        bind(4, scores, 0);
+        bind(4, scores, rowScoresOff);
         p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
                 .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(0).f(softcap);
         dispatch(kernel, 5, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
