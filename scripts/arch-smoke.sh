@@ -67,6 +67,11 @@
 # with a draft equals the output without; drafts: the model itself, its Q2_K quantization, and for the plain Llama the
 # other-seed model). The engine needs a tokenizer: models/Qwen_Qwen3-0.6B/tokenizer.json (-Djllm.smoke.tokenizer).
 #
+# Every attention model (not Mamba / Qwen3-Next / DeepSeek's latent cache) also checks the paged KV cache against the flat one, bit for
+# bit, on the CPU backend and on Metal for f32, q8 (and f16 on the first dense and MoE model): scripted prefill / decode /
+# rewind / verification passes, adoption of another slot's blocks, a fork in the middle of a block, eviction to a spill
+# directory and reload, three rows in one batched pass, saved-cache bytes both ways (PagedKvChecks, docs/24); the forced-MMA
+# pass leaves it out (-Djllm.smoke.paged=false).
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 #        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
 #                                            (scripts/build-metal-emu.sh, needs clang++), so no Apple GPU is needed
@@ -164,6 +169,40 @@ done
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
   -Djllm.metal.lib="$METAL_LIB" -cp target/classes:target/test-classes org.robomiri.jllm.GgufQwenNextTest
 
+# The other families as GGUF: the tiny checkpoints that llama.cpp's converter can express (HfToGguf writes what it writes:
+# names, layouts, the llama q/k permutation, Gemma's +1 norms, Mamba's -exp(A_log), DeepSeek's split kv_b, fused qkv and
+# gate|up) as Q8_0 files read in place, 8 greedy tokens on the CPU and on Metal must be equal. (The comparison with
+# llama.cpp's own logits is scripts/gguf-llamacpp-check.sh.)
+G="$M/gguf-friendly"
+mkdir -p "$G"
+ggen() { # family dir-suffix, make-tiny-model.py arguments...
+  rm -rf "$G/$2"
+  python3 scripts/make-tiny-model.py "$G/$2" "$1" "${@:3}" >/dev/null
+}
+ggen llama llama
+ggen llama llama-bias --attention-bias
+ggen llama llama-fused-qkv
+ggen mistral mistral --set sliding_window=null
+ggen qwen2 qwen2 --set use_sliding_window=false
+ggen qwen2 qwen2-fused-qkv --set use_sliding_window=false
+ggen qwen3moeall qwen3moe
+ggen gemma2 gemma2 --set query_pre_attn_scalar=64
+ggen gemma3 gemma3 --set query_pre_attn_scalar=32
+ggen gemma3mm gemma3mm --set query_pre_attn_scalar=32
+ggen phi3nowin phi3-long
+ggen phi3short phi3-short --set original_max_position_embeddings=256
+ggen phi3mha phi3-plain --set sliding_window=null
+ggen glm glm --set rms_norm_eps=1e-5
+ggen glm4 glm4
+ggen mamba mamba
+ggen mamba3 mamba3
+ggen deepseek_v2q deepseek-v2q --set n_group=1 --set topk_group=1 --set topk_method='"greedy"' --set routed_scaling_factor=1.0 \
+  --set rope_scaling='{"type":"yarn","factor":4.0,"original_max_position_embeddings":64,"beta_fast":32,"beta_slow":1,"mscale":0.707,"mscale_all_dim":0.707}'
+ggen deepseek_v3 deepseek-v3
+ggen deepseek_v3 deepseek-v3-fused-exps
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.GgufArchSmoke "$METAL_LIB" "$G"/*/
+
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 \
   -Djllm.smoke.draftPair="${P}-LlamaPlainForCausalLM=$M/${P}-LlamaDraftForCausalLM" ${JAVA_OPTS:-} \
@@ -187,14 +226,24 @@ if [ -n "${REF_PYTHON:-}" ]; then
   REF_WORK="${REF_WORK:-$M/hf}" METAL_EMU="${METAL_EMU:-}" ./scripts/hf-arch-check.sh
 fi
 
+# attention_dec (docs/08 8.31) forced on for the checkpoints whose head size it handles (64, 256; the self-check would
+# otherwise decide, and the 32-wide tiny models never use it): every cache type, including the q8 cache with rotated keys
+# (backend.kv-q8-rotate: the rotated query and scale / B go to attention_dec like the other kernels), in single steps,
+# batched rows, replay, speculation and short verification chunks.
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
+  -Djllm.metal.decodeAttention=true -Djllm.smoke.quants=Q4_0 ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
+  "$LLAMA" "$M/${P}-Phi3MhaForCausalLM" "$M/${P}-Gemma2Hd256ForCausalLM"
+
 # Second pass: every dense and MoE prefill matmul through the half-weight MMA kernels (hmma=true, MMA from 2 tokens
 # on instead of 32 / 16), for the formats where they are exact (Q4_0, Q8_0): the same bounds as above must hold.
 # (Not Phi3: with MMA prefill from 2 tokens its q8-cache replay x batch comparison flips an int8 rounding step, 4e-2 with
 # the f32 MMA kernels as well, 3e-3 with the half-weight ones; its f32 / f16 caches and every other model pass.)
 # The q4-cache cases are left out of this pass (-Djllm.smoke.q4=false) for the same reason: a batched pass of 3 rows and a
 # lone step take different matmul kernels here, and a 4-bit code flips (4e-3 on Phi3Mha); the first pass checks them all.
+# So is the replay x batch case of the q8 cache with rotated keys (backend.kv-q8-rotate): its codes flip the same way.
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
-  -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 -Djllm.smoke.q4=false \
+  -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 -Djllm.smoke.q4=false -Djllm.smoke.paged=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \

@@ -915,10 +915,18 @@ until the CPU and Metal backends, `LayerWeights` and the converter handle it.
 
 The same parsers run on a GGUF file: `GgufArchitecture` writes the `config.json` that the file's llama.cpp metadata
 describes (`qwen3.block_count` → `num_hidden_layers`, ...) and calls `Architecture.parse`, so the description and the
-defaults are those of the safetensors load. Four architectures are mapped today (`llama`, `qwen2`, `qwen3`,
-`qwen3moe`); adding one means its metadata keys in `GgufArchitecture`, its tensor names in `GgufWeights.resolve` and,
-if llama.cpp's converter permutes or folds something for it (Llama's q/k rows, Gemma's `1 + w` norms), the matching
-switch in the `Architecture`. See [16](16-gguf.md).
+defaults are those of the safetensors load. Besides `llama`, `qwen2`, `qwen3`, `qwen3moe` (and the Qwen3.5 / Qwen3-Next
+hybrids) the GGUF architectures `gemma2`, `gemma3`, `phi3`, `chatglm`, `glm4`, `mamba`, `deepseek2` and `mistral3` are
+mapped ([16 §16.15](16-gguf.md#1615-gemma-23-phi-3-glm-mamba-deepseek-v2v3-and-mistral-3-as-gguf-files)); adding one means its
+metadata keys in `GgufArchitecture` / `GgufFamilies`, its tensor names in `GgufWeights.resolve` and, if llama.cpp's converter
+permutes or folds something for it (Llama's q/k rows, Gemma's `1 + w` norms, Mamba's `-exp(A_log)`), the matching switch in
+the `Architecture`.
+
+Where the GGUF layout differs from the checkpoint's, per family: **Gemma 2/3** the norms already hold `1 + w` (the cache's
+convention), the attention scale is `1/sqrt(head_dim)` (no `query_pre_attn_scalar` in the file) and the embedding scale is
+the float `sqrt(dim)`; **Phi-3 / ChatGLM / GLM-4** `attn_qkv` and `ffn_up` are the fused `qkv_proj` / `gate_up_proj` rows,
+LongRoPE comes as two `rope_factors_*` tensors; **Mamba** `ssm_a` is `-exp(A_log)`; **DeepSeek** `kv_b_proj` is two tensors,
+`attn_k_b` (the key half, transposed) and `attn_v_b`, and `yarn_log_multiplier = 0.1 × mscale_all_dim`.
 
 ## 14.13 Verified on real weights
 
@@ -1268,7 +1276,7 @@ python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
   inference. A **Qwen3.5 GGUF** carries the same layer (`nextn.*` tensors) and *is* used, as a built-in draft for
   speculative decoding: `engine.speculative=mtp`, [16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model).
   The recurrent state cannot be rewound by overwriting, so that mode checkpoints it around each verification pass.
-- **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.13](16-gguf.md#1613-qwen35-and-qwen3next-as-gguf-files).
+- **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.13](16-gguf.md#1613-qwen35-and-qwen3-next-as-gguf-files).
   The `gguf` package lists both the fused DeltaNet input `ssm_in` + `ssm_ba` and the split `attn_qkv` + `attn_gate`; the
   split one (what current converters write) is mapped (and `qwen35moe`, on tiny models only). The legacy fused `ssm_in` is not.
 - The chunked delta rule on Metal (prefill uses the token loop); a state snapshot to rewind to a shared prefix;

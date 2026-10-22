@@ -30,7 +30,7 @@ public class ApiKeyFilter extends OncePerRequestFilter {
         String p = request.getRequestURI().substring(request.getContextPath().length());
         // generated pictures are fetched by <img> tags, which cannot send the key: their unguessable URL is the capability
         return key == null || "OPTIONS".equals(request.getMethod()) || !(p.startsWith("/v1/") || p.startsWith("/api/"))
-                || (p.startsWith("/v1/images/files/") && "GET".equals(request.getMethod()));
+                || ((p.startsWith("/v1/images/files/") || p.startsWith("/v1/videos/files/")) && "GET".equals(request.getMethod()));
     }
 
     @Override

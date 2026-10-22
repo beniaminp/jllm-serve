@@ -33,6 +33,15 @@ final class GgufWriter {
         return this;
     }
 
+    boolean has(String key) {
+        for (Object[] e : kv) {
+            if (e[0].equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static ByteBuffer buf(int n) {
         return ByteBuffer.allocate(n).order(ByteOrder.LITTLE_ENDIAN);
     }
@@ -111,6 +120,16 @@ final class GgufWriter {
         ByteBuffer b = buf(12 + 4 * v.length).putInt(I32).putLong(v.length);
         for (int x : v) {
             b.putInt(x);
+        }
+        put(key, ARRAY, b.array());
+        return this;
+    }
+
+    /** An array of bools (one byte each), e.g. {@code attention.sliding_window_pattern}. */
+    GgufWriter bools(String key, boolean... v) {
+        ByteBuffer b = buf(12 + v.length).putInt(BOOL).putLong(v.length);
+        for (boolean x : v) {
+            b.put((byte) (x ? 1 : 0));
         }
         put(key, ARRAY, b.array());
         return this;

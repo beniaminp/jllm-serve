@@ -110,6 +110,27 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- AgentDefaultsTest: backend.ctx=auto arithmetic, request priority parsing and the device queue order. -->
+                    <execution>
+                        <id>agent-defaults-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.AgentDefaultsTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- PromptCacheTest: cached prompt tokenization equals a full one (needs only the tokenizer). -->
                     <execution>
                         <id>prompt-cache-test</id>
@@ -126,6 +147,91 @@
                                 <argument>-cp</argument>
                                 <classpath/>
                                 <argument>org.robomiri.jllm.PromptCacheTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- KvPoolTest: the block pool, prefix tree, copy on write, eviction and spill store (no model). -->
+                    <execution>
+                        <id>kv-pool-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.KvPoolTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- PagedKvTest: the paged CPU cache equals the flat one bit for bit (no model). -->
+                    <execution>
+                        <id>paged-kv-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.PagedKvTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- LongContextTest: a million positions through the paged CPU cache (block offsets past 2^32 bytes). -->
+                    <execution>
+                        <id>long-context-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.cpu.LongContextTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- PagedEngineTest: paged vs flat through the engine; sharing, fork, eviction + spill, speculation, batched rows, saved caches. -->
+                    <execution>
+                        <id>paged-engine-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-Djllm.cpu.deterministic=true</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.PagedEngineTest</argument>
                                 <argument>${jllm.test.model}</argument>
                             </arguments>
                             <classpathScope>test</classpathScope>
@@ -349,6 +455,29 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- GGUF files of every family, written as llama.cpp's converter writes them from the tiny random
+                         checkpoints of scripts/make-tiny-model.py (python3), loaded and compared with the safetensors load;
+                         the llama.cpp comparison is scripts/gguf-llamacpp-check.sh -->
+                    <execution>
+                        <id>gguf-families-check</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.GgufFamiliesCheck</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <execution>
                         <id>gguf-qwen-next-test</id>
                         <phase>test</phase>
@@ -497,6 +626,50 @@
                                 <argument>-cp</argument>
                                 <classpath/>
                                 <argument>org.robomiri.jllm.diffusion.DiffusionTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- VideoTest: AnimateDiff video generation (motion adapter, DDIM, temporal layers, GIF / WebP / MP4 writers, API) on a
+                         tiny random pipeline against diffusers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>video-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.VideoTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- WanTest: Wan 2.1 video components (UMT5 encoder and tokenizer, diffusion transformer, causal 3-D VAE, flow sampler, pipeline) on
+                         a tiny random pipeline against diffusers' / transformers' outputs, CPU and Metal (needs no downloaded model) -->
+                    <execution>
+                        <id>wan-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.diffusion.WanTest</argument>
                             </arguments>
                             <classpathScope>test</classpathScope>
                         </configuration>

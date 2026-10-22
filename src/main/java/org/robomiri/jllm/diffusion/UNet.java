@@ -52,9 +52,23 @@ public final class UNet implements AutoCloseable {
     private record Up(Res[] res, Trans[] att, Conv up) {
     }
 
+    /** One transformer block of a motion module: two self-attentions over the frames (each after a sinusoidal position) and a feed-forward. */
+    private record MBlock(Tn n1g, Tn n1b, Attn a1, Tn n2g, Tn n2b, Attn a2, Tn n3g, Tn n3b, Tn f0w, Tn f0b, Tn f2w, Tn f2b, Tn pos) {
+    }
+
+    /** {@code AnimateDiffTransformer3D}: group norm over the whole clip, proj_in, blocks over the frame axis, proj_out, residual. */
+    private record Motion(Tn ng, Tn nb, Tn pinw, Tn pinb, MBlock[] blocks, Tn poutw, Tn poutb, int groups) {
+    }
+
+    /** The motion modules of an AnimateDiff adapter, by place in the network. */
+    private record MotionSet(Checkpoint ckpt, Loader ld, Motion[][] down, Motion[] mid, Motion[][] up, int maxFrames) {
+    }
+
     private final Ops ops;
     private final Checkpoint ckpt;
     private final Loader ld;
+    private MotionSet motion;
+    private int frames = 1;
     public final int inChannels;
     public final int outChannels;
     public final int blockCount;
@@ -240,6 +254,36 @@ public final class UNet implements AutoCloseable {
      * @return the prediction {@code [B, h, w, outChannels]} (the caller frees it)
      */
     public Tn forward(Tn sample, float timestep, Cond cond) {
+        return forward(sample, timestep, cond, 1);
+    }
+
+    /** True when a motion adapter is attached ({@link #attachMotion}). */
+    public boolean hasMotion() {
+        return motion != null;
+    }
+
+    /** The longest clip the attached motion adapter was trained for (positions of its temporal embedding). */
+    public int motionMaxFrames() {
+        return motion == null ? 1 : motion.maxFrames;
+    }
+
+    /**
+     * One evaluation of the network on a video latent: {@code sample [B·frames, h, w, C]} holds the {@code frames} frames of each of
+     * the {@code B} clips one after the other (frame fastest), and {@code cond.encoder()} has one row of text per frame. With the
+     * motion adapter attached every ResNet / spatial attention pair is followed by a temporal transformer that lets each pixel
+     * attend to the same pixel in the other frames; without frames {@code > 1} it is the plain image network.
+     */
+    public Tn forward(Tn sample, float timestep, Cond cond, int frames) {
+        if (frames > 1 && motion == null) {
+            throw new IllegalStateException("this UNet has no motion adapter: it can only make single images");
+        }
+        if (motion != null && frames > motion.maxFrames) {
+            throw new IllegalArgumentException("at most " + motion.maxFrames + " frames (the motion adapter's temporal embedding), got " + frames);
+        }
+        if (sample.dim(0) % frames != 0) {
+            throw new IllegalArgumentException("batch " + sample.dim(0) + " is not a multiple of " + frames + " frames");
+        }
+        this.frames = frames;
         int b = sample.dim(0);
         float[] te = timestepEmbedding(timestep, baseChannels, flipSinToCos, freqShift);
         float[] teb = new float[b * baseChannels];
@@ -283,11 +327,15 @@ public final class UNet implements AutoCloseable {
         Tn x = ops.conv2d(sample, convIn.w, convIn.b, 1, 1, 1, 1, 1, null, null);
         skips.add(x);
         held.add(x);
-        for (Down d : downs) {
+        for (int i = 0; i < downs.length; i++) {
+            Down d = downs[i];
             for (int j = 0; j < d.res.length; j++) {
                 x = resnet(d.res[j], x, embAct);
                 if (d.att != null) {
                     x = transformer(d.att[j], x, cond.encoder());
+                }
+                if (frames > 1) {
+                    x = motion(motion.down[i][j], x);
                 }
                 skips.add(x);
                 held.add(x);
@@ -302,8 +350,12 @@ public final class UNet implements AutoCloseable {
         }
         x = resnet(midRes[0], x, embAct);
         x = transformer(midAtt, x, cond.encoder());
+        if (frames > 1 && motion.mid != null) {
+            x = motion(motion.mid[0], x);
+        }
         x = resnet(midRes[1], x, embAct);
-        for (Up u : ups) {
+        for (int i = 0; i < ups.length; i++) {
+            Up u = ups[i];
             for (int j = 0; j < u.res.length; j++) {
                 Tn skip = skips.removeLast();
                 held.remove(skip);
@@ -313,6 +365,9 @@ public final class UNet implements AutoCloseable {
                 x = resnet(u.res[j], cat, embAct);
                 if (u.att != null) {
                     x = transformer(u.att[j], x, cond.encoder());
+                }
+                if (frames > 1) {
+                    x = motion(motion.up[i][j], x);
                 }
             }
             if (u.up != null) {
@@ -400,14 +455,176 @@ public final class UNet implements AutoCloseable {
         return out;
     }
 
-    /** Bytes of the checkpoint this network was read from. */
+    // ------------------------------------------------------------------ motion adapter (AnimateDiff)
+
+    /**
+     * Loads the motion modules of an AnimateDiff {@code MotionAdapter} (a diffusers folder with {@code config.json} and
+     * {@code diffusion_pytorch_model[.fp16].safetensors}) and attaches them to this network: one temporal transformer after
+     * every ResNet / attention pair of the down and up blocks and one in the middle. The adapter must match this UNet's block
+     * layout (SD 1.5: 4 blocks of 320, 640, 1280, 1280 channels).
+     */
+    public synchronized void attachMotion(Path dir) throws IOException {
+        if (motion != null) {
+            throw new IllegalStateException("a motion adapter is already attached");
+        }
+        Checkpoint mc = Checkpoint.open(dir, "diffusion_pytorch_model");
+        Loader ml = new Loader(ops, mc);
+        try {
+            int[] blockOut = mc.getIntArray("block_out_channels", 320, 640, 1280, 1280);
+            if (!java.util.Arrays.equals(blockOut, ckpt.getIntArray("block_out_channels", 320, 640, 1280, 1280))) {
+                throw new IOException("the motion adapter in " + dir + " was made for blocks " + java.util.Arrays.toString(blockOut)
+                        + ", this UNet has " + java.util.Arrays.toString(ckpt.getIntArray("block_out_channels")));
+            }
+            int n = blockOut.length;
+            int[] layers = mc.getIntList("motion_layers_per_block", n, 2);
+            int[] tLayers = mc.getIntList("motion_transformer_layers_per_block", n, 1);
+            int[] heads = mc.getIntList("motion_num_attention_heads", n, 8);
+            int mg = mc.getInt("motion_norm_num_groups", 32);
+            int maxSeq = mc.getInt("motion_max_seq_length", 32);
+            if (!"geglu".equals(mc.getString("motion_activation_fn", "geglu")) || mc.config.get("motion_cross_attention_dim") != null) {
+                throw new IOException("unsupported motion adapter configuration in " + dir + " (geglu self-attention modules only)");
+            }
+            Motion[][] down = new Motion[n][];
+            Motion[][] up = new Motion[n][];
+            for (int i = 0; i < n; i++) {
+                down[i] = new Motion[layers[i]];
+                for (int j = 0; j < layers[i]; j++) {
+                    down[i][j] = motionModule(ml, "down_blocks." + i + ".motion_modules." + j + ".", blockOut[i], heads[i], tLayers[i], mg, maxSeq);
+                }
+                int r = n - 1 - i; // up block i mirrors down block r
+                up[i] = new Motion[layers[r] + 1];
+                for (int j = 0; j <= layers[r]; j++) {
+                    up[i][j] = motionModule(ml, "up_blocks." + i + ".motion_modules." + j + ".", blockOut[r], heads[r], tLayers[r], mg, maxSeq);
+                }
+            }
+            Motion[] mid = null;
+            if (mc.getBool("use_motion_mid_block", true)) {
+                int midLayers = mc.getInt("motion_mid_block_layers_per_block", 1);
+                if (midLayers != 1) {
+                    throw new IOException("unsupported motion adapter: " + midLayers + " motion modules in the middle block (1 expected)");
+                }
+                int[] mt = mc.getIntList("motion_transformer_layers_per_mid_block", midLayers, 1);
+                mid = new Motion[midLayers];
+                for (int j = 0; j < midLayers; j++) {
+                    mid[j] = motionModule(ml, "mid_block.motion_modules." + j + ".", blockOut[n - 1], heads[n - 1], mt[j], mg, maxSeq);
+                }
+            }
+            motion = new MotionSet(mc, ml, down, mid, up, maxSeq);
+        } catch (IOException | RuntimeException e) {
+            ml.free();
+            mc.close();
+            throw e;
+        }
+    }
+
+    private Motion motionModule(Loader ml, String p, int channels, int heads, int depth, int groups, int maxSeq) {
+        MBlock[] bs = new MBlock[depth];
+        for (int i = 0; i < depth; i++) {
+            String q = p + "transformer_blocks." + i + ".";
+            bs[i] = new MBlock(ml.vec(q + "norm1.weight"), ml.vec(q + "norm1.bias"), motionAttn(ml, q + "attn1.", heads),
+                    ml.vec(q + "norm2.weight"), ml.vec(q + "norm2.bias"), motionAttn(ml, q + "attn2.", heads),
+                    ml.vec(q + "norm3.weight"), ml.vec(q + "norm3.bias"),
+                    ml.lin(q + "ff.net.0.proj.weight"), ml.vec(q + "ff.net.0.proj.bias"),
+                    ml.lin(q + "ff.net.2.weight"), ml.vec(q + "ff.net.2.bias"), positions(ml, q + "pos_embed.pe", channels, maxSeq));
+        }
+        return new Motion(ml.vec(p + "norm.weight"), ml.vec(p + "norm.bias"), ml.lin(p + "proj_in.weight"), ml.vec(p + "proj_in.bias"), bs,
+                ml.lin(p + "proj_out.weight"), ml.vec(p + "proj_out.bias"), groups);
+    }
+
+    private Attn motionAttn(Loader ml, String p, int heads) {
+        return new Attn(ml.lin(p + "to_q.weight"), ml.lin(p + "to_k.weight"), ml.lin(p + "to_v.weight"),
+                ml.lin(p + "to_out.0.weight"), ml.vec(p + "to_out.0.bias"), heads);
+    }
+
+    /** The checkpoint's temporal position table {@code [max_seq, C]} if it stores one (diffusers keeps it as a buffer), else the sinusoidal formula. */
+    private Tn positions(Loader ml, String name, int channels, int maxSeq) {
+        if (ml.has(name)) {
+            return ml.vec(name);
+        }
+        Tn t = ops.vector(sinusoidalPositions(maxSeq, channels), maxSeq, channels);
+        return ml.adopt(t);
+    }
+
+    /** diffusers {@code SinusoidalPositionalEmbedding}: {@code pe[p, 2i] = sin(p·w_i)}, {@code pe[p, 2i+1] = cos(p·w_i)}, {@code w_i = 10000^(-2i/C)}. */
+    static float[] sinusoidalPositions(int maxSeq, int channels) {
+        float[] pe = new float[maxSeq * channels];
+        for (int p = 0; p < maxSeq; p++) {
+            for (int i = 0; i < channels / 2; i++) {
+                double w = Math.exp(2.0 * i * (-Math.log(10000.0) / channels));
+                pe[p * channels + 2 * i] = (float) Math.sin(p * w);
+                pe[p * channels + 2 * i + 1] = (float) Math.cos(p * w);
+            }
+        }
+        return pe;
+    }
+
+    /**
+     * {@code AnimateDiffTransformer3D}: {@code x [B*F, H, W, C]} is normalised over (frames, pixels, group channels), moved to
+     * {@code [B*H*W, F, C]} so that attention runs along the frame axis of each pixel, and added back to the input.
+     */
+    private Tn motion(Motion m, Tn x) {
+        int f = frames;
+        int bf = x.dim(0);
+        int bsz = bf / f;
+        int h = x.dim(1);
+        int w = x.dim(2);
+        int c = x.dim(3);
+        Tn n = ops.groupNorm(x, m.ng, m.nb, m.groups, 1e-6f, false, bsz);
+        Tn t = ops.swapAxes(n, bsz, f, h * w, bsz * h * w, f, c);
+        ops.free(n);
+        Tn hs = ops.linear(t, m.pinw, m.pinb, null, Ops.Act.NONE);
+        ops.free(t);
+        for (MBlock bl : m.blocks) {
+            hs = motionBlock(bl, hs, f);
+        }
+        Tn o = ops.linear(hs, m.poutw, m.poutb, null, Ops.Act.NONE);
+        ops.free(hs);
+        Tn back = ops.swapAxes(o, bsz, h * w, f, bf, h, w, c);
+        ops.free(o);
+        Tn out = ops.add(back, x);
+        ops.free(back);
+        release(x);
+        return out;
+    }
+
+    /** {@code BasicTransformerBlock} with two self-attentions, each of whose inputs gets the temporal position added after its norm. */
+    private Tn motionBlock(MBlock b, Tn h, int f) {
+        Tn n1 = ops.layerNorm(h, b.n1g, b.n1b, 1e-5f);
+        Tn p1 = ops.addRows(n1, b.pos, f);
+        ops.free(n1);
+        Tn a1 = attention(b.a1, p1, p1, h);
+        ops.free(p1);
+        ops.free(h);
+        Tn n2 = ops.layerNorm(a1, b.n2g, b.n2b, 1e-5f);
+        Tn p2 = ops.addRows(n2, b.pos, f);
+        ops.free(n2);
+        Tn a2 = attention(b.a2, p2, p2, a1);
+        ops.free(p2);
+        ops.free(a1);
+        Tn n3 = ops.layerNorm(a2, b.n3g, b.n3b, 1e-5f);
+        Tn g = ops.linear(n3, b.f0w, b.f0b, null, Ops.Act.NONE);
+        ops.free(n3);
+        Tn gg = ops.geglu(g);
+        ops.free(g);
+        Tn out = ops.linear(gg, b.f2w, b.f2b, a2, Ops.Act.NONE);
+        ops.free(gg);
+        ops.free(a2);
+        return out;
+    }
+
+    /** Bytes of the checkpoint this network was read from (with the motion adapter, if attached). */
     public long weightBytes() {
-        return ckpt.bytes();
+        return ckpt.bytes() + (motion == null ? 0 : motion.ckpt.bytes());
     }
 
     @Override
     public void close() {
         ld.free();
         ckpt.close();
+        if (motion != null) {
+            motion.ld.free();
+            motion.ckpt.close();
+            motion = null;
+        }
     }
 }

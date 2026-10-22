@@ -2,7 +2,7 @@
 """Writes a tiny random-weight Hugging Face checkpoint (config.json + model.safetensors, float32) for
 pipeline tests. Standard library only.
 
-usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N] [--attention-bias]
+usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N] [--attention-bias] [--set key=json ...]
   family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2 | gptoss | gptoss_mxfp4 | llama4 | llama4mix | granite | nemotronh | jamba
 
 All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
@@ -65,6 +65,9 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
              (4 experts top 2, per-expert tensors) in layers 1 and 3 and a SwiGLU MLP in 0 and 2, untied head
 MLA head sizes are nope 32 + rope 32 = 64 for q/k and v 32, so the attention kernel's separate q/k and v widths
 are exercised.
+--set key=json overrides one config key after the family is built (the value is JSON: 6, 1e-5, null, "x", [1,2]); the tensors are
+generated from the overridden config, e.g. `--set sliding_window=null --set query_pre_attn_scalar=64` (the GGUF smoke tests build
+models llama.cpp's converter can express this way).
 --attention-bias sets attention_bias: true on a llama / qwen3 / gemma config, which (as in transformers) gives
 q_proj, k_proj, v_proj AND o_proj a bias.
 """
@@ -556,6 +559,8 @@ def phi3(hidden, heads, kv, orig, prf, window, tied, scaled, theta=10000.0):
 FAMILIES["phi3"] = phi3(128, 4, 2, 32, 0.75, 6, False, True)
 FAMILIES["phi3short"] = phi3(128, 4, 2, 128, 0.75, None, True, True)
 FAMILIES["phi3mha"] = phi3(256, 4, 4, 512, 1.0, 6, False, False)
+FAMILIES["phi3nowin"] = phi3(128, 4, 2, 32, 0.75, None, False, True)  # as phi3 without the window (llama.cpp ignores Phi-3's)
+FAMILIES["qwen3moeall"] = dict(FAMILIES["qwen3moe"], mlp_only_layers=[])  # every layer sparse: what llama.cpp's qwen3moe can express
 def mamba_tensors(cfg, rnd):
     """Random Mamba v1 weights with the real checkpoint's names and shapes (A_log = log(1..d_state) like the
     S4D-real init, dt_proj.bias spread so softplus(dt) covers small and large steps)."""
@@ -667,6 +672,10 @@ def main():
     rnd = random.Random(seed)
     wrapper = fam == "gemma3mm"
     cfg = dict(FAMILIES["gemma3" if wrapper else fam])
+    for i, a in enumerate(sys.argv):
+        if a == "--set":
+            k, v = sys.argv[i + 1].split("=", 1)
+            cfg[k] = json.loads(v)
     if cfg["model_type"] == "mamba":
         write(out, fam, cfg, mamba_tensors(cfg, rnd))
         return

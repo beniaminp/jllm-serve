@@ -13,7 +13,8 @@ enum DiffusionParams {
     GN("DfGnParams", "iiifiiii"),
     FLASH("DfFlashParams", "iiiiiiifi"),
     SOFTMAX("DfSoftmaxParams", "iiii"),
-    EW("DfEwParams", "liiii");
+    EW("DfEwParams", "liiii"),
+    MOD("DfModParams", "liiiiiii");
 
     final String struct;
     final String kinds;

@@ -30,16 +30,19 @@ public class ToolRegistry {
     private final McpManager mcp;
     private final List<Tool> builtins;
     private final ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
+    private final org.robomiri.jllm.web.settings.SettingsService settings;
 
     public ToolRegistry(ToolsConfig config, McpManager mcp, org.robomiri.jllm.web.models.ModelManager models,
                         org.robomiri.jllm.web.settings.SettingsService settings, org.robomiri.jllm.web.chat.ImageStore chatImages,
-                        org.robomiri.jllm.web.images.ImageService images) {
+                        org.robomiri.jllm.web.images.ImageService images, org.robomiri.jllm.web.video.VideoService videos) {
         this.config = config;
+        this.settings = settings;
         this.mcp = mcp;
         List<Tool> all = new ArrayList<>(BuiltinTools.all(config::general));
         all.add(new DescribeImageTool(models, settings, chatImages, config::general)); // vision: lets a text model ask a vision model
         all.addAll(AudioTools.all()); // transcribe_audio, speak
         all.addAll(ImageToolSupport.all(images)); // generate_image, edit_image
+        all.add(new GenerateVideoTool(videos, settings)); // video
         this.builtins = List.copyOf(all);
     }
 
@@ -47,7 +50,11 @@ public class ToolRegistry {
     public List<Info> describe() {
         List<String> off = config.general().disabledBuiltins();
         List<Info> out = new ArrayList<>();
+        boolean video = settings.current().getBool("video.enabled");
         for (Tool t : builtins) {
+            if (!video && t.name().equals("generate_video")) {
+                continue; // switched off with video.enabled=false
+            }
             out.add(new Info(t.name(), t.description(), t.source(), !off.contains(t.name()), t.parameters()));
         }
         for (Tool t : mcp.tools()) {
@@ -60,8 +67,9 @@ public class ToolRegistry {
     public List<Tool> available() {
         List<String> off = config.general().disabledBuiltins();
         List<Tool> out = new ArrayList<>();
+        boolean video = settings.current().getBool("video.enabled");
         for (Tool t : builtins) {
-            if (!off.contains(t.name())) {
+            if (!off.contains(t.name()) && (video || !t.name().equals("generate_video"))) {
                 out.add(t);
             }
         }
@@ -87,14 +95,15 @@ public class ToolRegistry {
     public Outcome call(Tool tool, Map<String, Object> args) {
         ToolsConfig.Agent cfg = config.general().agent();
         long t0 = System.nanoTime();
+        int limit = tool.timeoutSeconds(cfg.timeoutSeconds());
         Future<String> f = pool.submit(() -> tool.call(args));
         String text;
         boolean error = false;
         try {
-            text = f.get(cfg.timeoutSeconds(), TimeUnit.SECONDS);
+            text = f.get(limit, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             f.cancel(true);
-            text = "the tool did not finish within " + cfg.timeoutSeconds() + " s";
+            text = "the tool did not finish within " + limit + " s";
             error = true;
         } catch (InterruptedException e) {
             f.cancel(true);

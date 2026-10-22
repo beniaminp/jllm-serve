@@ -987,17 +987,21 @@ public final class SmokeTest {
                 q[i] = (rnd.nextFloat() * 2 - 1) * 3;
             }
             boolean q4 = org.robomiri.jllm.model.KvQ4.supports(hd);
-            Object[][] cases = {{KvDtype.F32, 0}, {KvDtype.F16, 0}, {KvDtype.Q8, 0}, {KvDtype.Q4, 0}, {KvDtype.Q4, 5}};
+            // {type, recent window, rotated keys (q8 only: backend.kv-q8-rotate)}
+            Object[][] cases = {{KvDtype.F32, 0, false}, {KvDtype.F16, 0, false}, {KvDtype.Q8, 0, false}, {KvDtype.Q8, 0, true},
+                    {KvDtype.Q4, 0, false}, {KvDtype.Q4, 5, false}};
             try (org.robomiri.jllm.cpu.ThreadPool pool = new org.robomiri.jllm.cpu.ThreadPool(3)) {
                 for (Object[] c : cases) {
                     KvDtype dtype = (KvDtype) c[0];
                     int recent = (Integer) c[1];
-                    if (dtype == KvDtype.Q4 && !q4 && recent > 0) {
+                    boolean rot = (Boolean) c[2] && q4; // q8 with rotated keys needs whole groups of 32 per head, as q4
+                    if (dtype == KvDtype.Q4 && !q4 && recent > 0 || (Boolean) c[2] && !q4) {
                         continue;
                     }
-                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, 1, cfg, ctx, 64, recent);
+                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, 1, cfg, ctx, 64, recent, rot);
                     KvDtype held = dtype == KvDtype.Q4 && !q4 ? KvDtype.Q8 : dtype; // q4 falls back to q8
-                    check(kv.format().startsWith(held + (recent > 0 ? " recent=" + recent : "") + " "), "kv format " + kv.format());
+                    check(kv.format().startsWith(held + (rot ? " rot" : "") + (recent > 0 ? " recent=" + recent : "") + " "),
+                            "kv format " + kv.format());
                     kv.store(0, 0, k, v, n);
                     for (int window : new int[]{0, 6}) {
                         for (float softcap : new float[]{0f, 5f}) {
@@ -1033,7 +1037,7 @@ public final class SmokeTest {
                             float[] vx = vs;
                             float[] qs = q;
                             double sc0 = scale;
-                            if (held == KvDtype.Q4) {
+                            if (held == KvDtype.Q4 || rot) { // (rotated q8: the same references, no recent window)
                                 float[] kr = k.clone();
                                 qs = q.clone();
                                 for (int o = 0; o < kr.length; o += hd) {
@@ -1043,7 +1047,7 @@ public final class SmokeTest {
                                     org.robomiri.jllm.model.KvQ4.rotate(qs, o, hd);
                                 }
                                 ks = stored(held, kr, hd);
-                                kx = stored(KvDtype.F16, kr, hd);
+                                kx = stored(KvDtype.F16, kr, hd); // (unused without a window)
                                 vx = stored(KvDtype.F16, v, hd);
                                 sc0 = (double) scale / org.robomiri.jllm.model.KvQ4.block(hd);
                             }

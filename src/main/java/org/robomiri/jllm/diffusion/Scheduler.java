@@ -20,13 +20,15 @@ import java.util.Map;
  *   <li>Euler ancestral: step down to {@code σ_down} then add fresh noise of size {@code σ_up}
  *       ({@code σ_up² = σ_next² (σ² − σ_next²)/σ²}, {@code σ_down² = σ_next² − σ_up²});</li>
  *   <li>DPM-Solver++ (2M): second-order multistep in the log-SNR variable λ = −ln σ, reusing the previous step's
- *       prediction; the first and the last step are first-order.</li>
+ *       prediction; the first and the last step are first-order;</li>
+ *   <li>DDIM (η = 0, the deterministic sampler AnimateDiff is usually run with): jump from timestep t to t' with
+ *       {@code x' = √ᾱ_t' · x̂_0 + √(1−ᾱ_t') · ε̂}, {@code x̂_0 = (x − √(1−ᾱ_t) ε̂)/√ᾱ_t}.</li>
  * </ul>
  */
 public final class Scheduler {
 
     public enum Kind {
-        EULER, EULER_ANCESTRAL, DPMPP_2M, DPMPP_2M_KARRAS;
+        EULER, EULER_ANCESTRAL, DPMPP_2M, DPMPP_2M_KARRAS, DDIM;
 
         public static Kind parse(String s) {
             String n = s == null ? "" : s.toLowerCase(Locale.ROOT).replace("-", "_").replace("+", "p").replace(" ", "_");
@@ -35,8 +37,9 @@ public final class Scheduler {
                 case "euler_a", "euler_ancestral", "eulerancestral", "k_euler_a" -> EULER_ANCESTRAL;
                 case "dpmpp_2m", "dpmpp2m", "dpmsolver++", "dpmsolver_multistep", "dpmpp_2m_k_off" -> DPMPP_2M;
                 case "dpmpp_2m_karras", "dpmpp2m_karras", "karras", "k_dpmpp_2m" -> DPMPP_2M_KARRAS;
+                case "ddim" -> DDIM;
                 default -> throw new IllegalArgumentException("unknown scheduler '" + s
-                        + "' (euler, euler_a, dpmpp_2m, dpmpp_2m_karras)");
+                        + "' (euler, euler_a, dpmpp_2m, dpmpp_2m_karras, ddim)");
             };
         }
     }
@@ -47,6 +50,10 @@ public final class Scheduler {
     private final int stepsOffset;
     private final boolean vPrediction;
     private final double[] sigmaTable; // sigma of every training step, ascending
+    private final double[] alphaCum;   // cumulative alpha of every training step (DDIM)
+    private final boolean clipSample;
+    private final double clipRange;
+    private final double finalAlphaCum;
     private float[] timesteps = new float[0];
     private float[] sigmas = new float[0];
     // DPM-Solver++ history
@@ -90,12 +97,17 @@ public final class Scheduler {
             };
         }
         sigmaTable = new double[trainSteps];
+        alphaCum = new double[trainSteps];
         double cum = 1;
         for (int i = 0; i < trainSteps; i++) {
             cum *= 1 - (float) betas[i];
             double ac = (float) cum;
+            alphaCum[i] = ac;
             sigmaTable[i] = (float) Math.sqrt((1 - ac) / ac);
         }
+        clipSample = Json.bool(config, "clip_sample", cls.startsWith("DDIM"));
+        clipRange = Json.dbl(config, "clip_sample_range", 1.0);
+        finalAlphaCum = Json.bool(config, "set_alpha_to_one", true) ? 1.0 : alphaCum[0];
     }
 
     private static double cosineBeta(int i, int n) {
@@ -126,6 +138,37 @@ public final class Scheduler {
         }
         double[] ts = new double[n];
         boolean dpm = kind == Kind.DPMPP_2M || kind == Kind.DPMPP_2M_KARRAS;
+        if (kind == Kind.DDIM) {
+            switch (spacing) {
+                case "linspace" -> {
+                    double[] l = linspace(0, trainSteps - 1, n);
+                    for (int i = 0; i < n; i++) {
+                        ts[i] = Math.rint(l[n - 1 - i]);
+                    }
+                }
+                case "leading" -> {
+                    int ratio = trainSteps / n;
+                    for (int i = 0; i < n; i++) {
+                        ts[i] = (double) (n - 1 - i) * ratio + stepsOffset;
+                    }
+                }
+                case "trailing" -> {
+                    double ratio = (double) trainSteps / n;
+                    for (int i = 0; i < n; i++) {
+                        ts[i] = Math.rint(trainSteps - i * ratio) - 1;
+                    }
+                }
+                default -> throw new IllegalArgumentException("unsupported timestep_spacing " + spacing);
+            }
+            timesteps = new float[n];
+            sigmas = new float[n + 1];
+            for (int i = 0; i < n; i++) {
+                timesteps[i] = (float) ts[i];
+                sigmas[i] = (float) interp(ts[i]);
+            }
+            reset();
+            return;
+        }
         switch (spacing) {
             case "linspace" -> {
                 if (dpm) {
@@ -232,7 +275,7 @@ public final class Scheduler {
 
     /** The scale of the initial noise: σ_max (trailing / linspace) or √(σ_max²+1) (leading) for Euler, 1 for DPM-Solver. */
     public float initNoiseSigma() {
-        if (kind == Kind.DPMPP_2M || kind == Kind.DPMPP_2M_KARRAS) {
+        if (kind == Kind.DPMPP_2M || kind == Kind.DPMPP_2M_KARRAS || kind == Kind.DDIM) {
             return 1f;
         }
         float max = sigmas[0];
@@ -240,6 +283,36 @@ public final class Scheduler {
     }
 
     // ------------------------------------------------------------------ sampling
+
+    /** diffusers {@code DDIMScheduler.step} with eta = 0 (no noise is added, the update is deterministic). */
+    private float[] ddimStep(float[] out, int i, float[] x) {
+        int n = x.length;
+        int t = (int) timesteps[i];
+        int prev = t - trainSteps / timesteps.length;
+        double at = alphaCum[t];
+        double ap = prev >= 0 ? alphaCum[prev] : finalAlphaCum;
+        double sa = Math.sqrt(at);
+        double sb = Math.sqrt(1 - at);
+        double sap = Math.sqrt(ap);
+        double sbp = Math.sqrt(1 - ap);
+        float[] res = new float[n];
+        for (int k = 0; k < n; k++) {
+            double x0;
+            double eps;
+            if (vPrediction) {
+                x0 = sa * x[k] - sb * out[k];
+                eps = sa * out[k] + sb * x[k];
+            } else {
+                eps = out[k];
+                x0 = (x[k] - sb * eps) / sa;
+            }
+            if (clipSample) {
+                x0 = Math.max(-clipRange, Math.min(clipRange, x0)); // the noise estimate keeps its unclipped value (use_clipped_model_output=False)
+            }
+            res[k] = (float) (sap * x0 + sbp * eps);
+        }
+        return res;
+    }
 
     private boolean ve() {
         return kind == Kind.EULER || kind == Kind.EULER_ANCESTRAL;
@@ -261,6 +334,15 @@ public final class Scheduler {
     /** The noisy version of {@code x0} at step {@code i} (img2img, inpainting): {@code x0 + σ ε} or {@code α x0 + σ_t ε}. */
     public float[] addNoise(float[] x0, float[] noise, int i) {
         float[] out = new float[x0.length];
+        if (kind == Kind.DDIM) {
+            double ac = alphaCum[(int) timesteps[i]];
+            float a = (float) Math.sqrt(ac);
+            float sg = (float) Math.sqrt(1 - ac);
+            for (int k = 0; k < out.length; k++) {
+                out[k] = a * x0[k] + sg * noise[k];
+            }
+            return out;
+        }
         float s = sigmas[i];
         if (ve()) {
             for (int k = 0; k < out.length; k++) {
@@ -279,6 +361,16 @@ public final class Scheduler {
     /** The network's estimate of the clean latents x_0 at step {@code i}, from its output {@code out} and the state {@code x} before the step. */
     public float[] predictOriginal(float[] out, int i, float[] x) {
         int n = x.length;
+        if (kind == Kind.DDIM) {
+            double ac = alphaCum[(int) timesteps[i]];
+            double sa = Math.sqrt(ac);
+            double sb = Math.sqrt(1 - ac);
+            float[] x0 = new float[n];
+            for (int k = 0; k < n; k++) {
+                x0[k] = (float) (vPrediction ? sa * x[k] - sb * out[k] : (x[k] - sb * out[k]) / sa);
+            }
+            return x0;
+        }
         float sigma = sigmas[i];
         float[] x0 = new float[n];
         if (ve()) {
@@ -310,6 +402,9 @@ public final class Scheduler {
      */
     public float[] step(float[] out, int i, float[] x, java.util.function.Supplier<float[]> noiseSource) {
         int n = x.length;
+        if (kind == Kind.DDIM) {
+            return ddimStep(out, i, x);
+        }
         float sigma = sigmas[i];
         float sigmaNext = sigmas[i + 1];
         float[] res = new float[n];

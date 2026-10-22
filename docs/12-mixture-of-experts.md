@@ -235,3 +235,47 @@ picked experts, so the CPU is called for a few percent of the picks instead of a
 experts of a split layer are packed into their own GPU memory; the GPU skips the cold slots (the router marks them
 −1) while the CPU computes them with the same `MoeExperts` code as the CPU backend. Every detail, the timeline
 and the tests are in [08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe).
+
+## 12.11 Mixture of experts in GGUF files, and the variants that reuse these kernels
+
+Code: `gguf/GgufWeights.java` (names, the split pair of gate and up), `gguf/GgufFamilies.java` (DeepSeek metadata), `model/QTensor.java` (`split`), `GgufFamiliesCheck`, `GgufArchSmoke`, `scripts/gguf-llamacpp-check.sh`; the routing rules themselves are in [14.11.4](14-model-families.md#14114-the-three-routing-rules).
+
+🧸 In 12.3 jllm had to *stack* the experts of a checkpoint (128 separate little matrices per layer) into two big ones before it could run them. llama.cpp's single-file box ([16](16-gguf.md)) arrives with the stacking already done: each layer carries one big drawer per kind of matrix, holding all experts one after the other. So loading a GGUF MoE model is the easy case, and the only new work is reading the labels (which router rule, how many groups) from the file's metadata.
+
+📐 **Tensors.** Per layer, with `dim` the model width, `m` the expert width (`moe_intermediate_size`, 768 for Qwen3-30B-A3B) and `E` the number of experts:
+
+| GGUF tensor (`blk.N.`) | shape (GGUF order) | engine name (12.3) | handling |
+|---|---|---|---|
+| `ffn_gate_inp.weight` | `[dim, E]` f32 | `mlp.router` | the router, unquantized (12.2); copied into a float array |
+| `ffn_gate_exps.weight`, `ffn_up_exps.weight` | `[dim, m, E]` each | `mlp.experts.gate_up` | two tensors, read **in place** and presented as one stack |
+| `ffn_gate_up_exps.weight` | `[dim, 2m, E]` | `mlp.experts.gate_up` | the fused form `--fuse-gate-up-exps` writes: per expert the gate rows, then the up rows, which is the engine's layout |
+| `ffn_down_exps.weight` | `[m, dim, E]` | `mlp.experts.down` | rows `e·dim + r`: exactly the stacked layout, in place |
+| `ffn_gate_shexp`, `ffn_up_shexp`, `ffn_down_shexp`; `ffn_gate_inp_shexp` | | `mlp.shared.*`; `mlp.shared_gate` | the always-on shared expert (DeepSeek, Qwen3-Next / Qwen3.5-MoE) and its sigmoid gate |
+| `exp_probs_b.bias` | `[E]` | `mlp.router_bias` | DeepSeek-V3's selection bias |
+
+*The split pair.* The engine's stack interleaves gate and up per expert (`[e·2m + k]`: gate rows `0 … m−1`, then up rows `m … 2m−1`, expert after expert) so that one simdgroup computes `silu(gate)·up` for a row. A GGUF has the two as separate tensors, and the quantized blocks cannot be moved without requantizing, so `QTensor.split(gate, up, interleave = m)` keeps them where they are and
+routes a logical row to the view that holds it: logical row `e·2m + k` is row `e·m + k` of the gate view if `k < m`, else row `e·m + k − m` of the up view. With `m = 768`: expert 3, gate row 5 is logical row `3·1536 + 5 = 4 613`, which is gate-view row `3·768 + 5 = 2 309`; expert 3, up row 32 (`k = 800`) is logical row `5 408`, which is up-view row `3·768 + 32 = 2 336`. The Metal `moe_up` kernels read the gate and the up rows from the two buffers,
+the CPU entry points route each row. Only Q2_K, whose kernels read one block, copies its pair into one allocation.
+
+**DeepSeek-V2 / V3 from the metadata** (`deepseek2`): which `Router` variant to build is read, not guessed.
+
+| key | meaning | `Router.DeepSeek` field |
+|---|---|---|
+| `expert_gating_func` | 1 = softmax, 2 = sigmoid | `scoring_func` |
+| `expert_count`, `expert_used_count`, `expert_feed_forward_length`, `expert_shared_count` | `E`, `k`, `m`, the number of shared experts | `num_experts_per_tok`, `moe_intermediate_size`, `n_shared_experts` |
+| `expert_group_count`, `expert_group_used_count` | `n_group`, `topk_group` | group-limited selection |
+| `expert_weights_norm` | divide the chosen weights by their sum | `norm_topk_prob` |
+| `expert_weights_scale` (absent = 1) | `routed_scaling_factor` | |
+| `exp_probs_b.bias` (tensor) | the correction added to the scores to *choose* (not to weigh) | V3's `noaux_tc` |
+| `leading_dense_block_count` | the first layers have a dense MLP | `first_k_dense_replace` |
+
+*Two judgement calls where the file is silent* (16.15.1). (1) llama.cpp scores a group by the sum of its two best experts for any file with `expert_group_count > 1`, V3's rule; V2-236B (`group_limited_greedy`) scores by the best expert. The engine uses V3's rule when the file has the `exp_probs_b` bias and V2's when it has not. They pick different experts:
+groups of two, scores `g0 = (0.9, 0.0)`, `g1 = (0.5, 0.5)`, `g2 = (0.4, 0.3)`, `g3 = (0.2, 0.1)`, `topk_group = 1`, `k = 2`: by the **best** score group 0 wins (0.9 against 0.5) and the experts are 0 and 1 (scores 0.9, 0.0); by the **sum of the two best** group 1 wins (1.0 against 0.9) and the experts are 2 and 3 (0.5, 0.5).
+(2) V2's router scales its weights only when it does *not* normalize them, V3's after normalizing; llama.cpp normalizes if asked and then scales, so a file with both `expert_weights_norm` and a scale ≠ 1 gets V3's rule (real V2 files never have both).
+
+**Qwen3-Next / Qwen3.5-MoE** (`qwen3next`, `qwen35moe`) use the Qwen3-MoE router (softmax, top-k, renormalized when `norm_topk_prob`) plus a shared expert whose output is scaled by `sigmoid(ffn_gate_inp_shexp · h)`: `y = Σ_k w_k expert_k(h) + sigmoid(g·h) · shared(h)`
+([14.14](14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe), [16.13](16-gguf.md#1613-qwen35-and-qwen3-next-as-gguf-files)). The experts are the same `MoeExperts` on the CPU and the same `moe_up` / `moe_down` or grouped MMA kernels on Metal; the shared expert and its gate are the extra matmul and `shared_gate_add`.
+
+**Why this design.** Reading the file's stacked tensors in place keeps a quantized MoE file zero-copy: no stacking pass (12.6 describes that pass for safetensors checkpoints), and the split pair costs only an indirection per logical row. The alternative of copying gate and up into one interleaved block needs a copy of every expert (most of the 19.4 GB of Qwen3-30B-A3B Q4_0) and gives up the zero-copy mapping.
+**Settings.** None specific: `backend.metal.cpu-moe` (12.10) and the prefill chunk (12.8) apply to GGUF MoE models as to converted ones. **Checked** on tiny random models written the way llama.cpp's converter writes them (`GgufFamiliesCheck`: four DeepSeek routers and Qwen3-MoE among its 24 tiny variants): the F32 GGUF gives the same logits as the safetensors load (≤ 9·10⁻⁷ for DeepSeek, ≤ 3·10⁻⁷ for Qwen3-MoE), jllm's logits equal
+llama.cpp's on the same file (Qwen3-MoE 2.5·10⁻⁷ … 3.1·10⁻⁷, DeepSeek 1.4·10⁻⁶ … 1.9·10⁻⁵), and Metal equals CPU (`GgufArchSmoke`). **Limits:** no real DeepSeek or Qwen3-30B-A3B MoE GGUF was used for these checks (no weights are downloaded for this work); `qwen2moe` files (a sigmoid-gated shared expert inside a Qwen2-style decoder layer) are refused (16.15).

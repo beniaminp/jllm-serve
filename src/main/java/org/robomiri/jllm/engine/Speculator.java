@@ -125,6 +125,10 @@ public final class Speculator implements AutoCloseable {
         this.ready = new int[maxDrafts + 1];
         this.forks = new TokenConstraint[maxDrafts + 1];
         this.index = cfg.mode() == Mode.NGRAM ? new NgramIndex(cfg.ngramMin(), cfg.ngramMax()) : null;
+        this.gated = cfg.mode() == Mode.NGRAM && adaptive && !"false".equals(System.getProperty("jllm.engine.adaptiveNgram"));
+        if (gated) {
+            cost.draft(0, 1); // a lookup costs nothing next to a pass: the model only weighs verification against plain steps
+        }
         this.mtpLogits = cfg.mode() == Mode.MTP ? new float[stride] : null;
         if (cfg.mode() == Mode.MTP) {
             target.enableMtp(true);
@@ -157,6 +161,9 @@ public final class Speculator implements AutoCloseable {
         len = keep;
         misses = 0;
         cooldown = 0;
+        if (gated) {
+            cost.forgetAcceptance(); // a new request may copy where the last one did not (and the other way round)
+        }
         kNow = Math.min(4, maxDrafts);
         for (int i = keep; i < prompt.length; i++) {
             onToken(prompt[i]);
@@ -203,8 +210,9 @@ public final class Speculator implements AutoCloseable {
                         TokenConstraint con) {
         // a draft model: the length the measured costs and acceptance rate make best (-1: not measured yet, then the
         // doubling rule below; 0: speculation does not pay at all right now)
-        int best = cfg.mode() == Mode.DRAFT && adaptive ? cost.bestK(maxDrafts) : -1;
-        int want = Math.min(Math.min(best > 0 ? best : kNow, room - 1), ctxLimit - pos - 1);
+        int best = cfg.mode() == Mode.DRAFT && adaptive || gated ? cost.bestK(maxDrafts) : -1;
+        // (prompt lookup uses the model only to pause: the length is what the text supports, see kNow)
+        int want = Math.min(Math.min(best > 0 && !gated ? best : kNow, room - 1), ctxLimit - pos - 1);
         if (want < 1) {
             return false;
         }
@@ -212,7 +220,7 @@ public final class Speculator implements AutoCloseable {
             cooldown--;
             return false;
         }
-        if (best == 0 && ++unprofitable % PROBE_EVERY != 0) {
+        if (best == 0 && ++unprofitable % PROBE_EVERY != 0 && !strongMatch()) {
             cooldown = PLAIN_STEPS - 1; // plain steps (which also re-measure their cost), then look again
             return false;
         }                               // (every PROBE_EVERY-th time a pass is tried anyway: the text may have changed)
@@ -259,7 +267,8 @@ public final class Speculator implements AutoCloseable {
             target.checkpointState(); // the recurrent state goes through every fed token: kept to undo the rejected one
         }
         target.forwardAll(feed, 0, m + 1, pos, rows, stride);
-        cost.verify(m + 1, System.nanoTime() - t1);
+        long verifyNanos = System.nanoTime() - t1;
+        cost.verify(m + 1, verifyNanos);
         int acc = 0;
         int examined = 0;
         readyCount = 0;
@@ -291,6 +300,9 @@ public final class Speculator implements AutoCloseable {
             target.rollbackState(acc + 1);
         }
         cost.acceptance(acc, examined);
+        if (DEBUG) {
+            System.err.printf("spec %s: pass of %d took %.1f ms, accepted %d; %s%n", cfg.mode(), m + 1, verifyNanos / 1e6, acc, cost.describe(maxDrafts));
+        }
         // whole draft accepted: try longer ones next time; else as many as this text supported
         kNow = acc == m ? Math.min(maxDrafts, Math.max(kNow, 2 * m)) : Math.max(1, Math.min(kNow, acc + 1));
         if (acc > 0) {
@@ -313,6 +325,13 @@ public final class Speculator implements AutoCloseable {
         cost.plain(nanos);
     }
 
+    /**
+     * Prompt lookup under the cost model ({@code -Djllm.engine.adaptiveNgram=false} turns it off): when the measured
+     * acceptance of this request's passes and the measured cost of a verification pass say that no draft beats plain
+     * steps, lookups pause as a draft model's do. Costs a mixed workload nothing where text is copied, and spares the
+     * backends whose multi-token pass is slow (the CPU, mixture-of-experts models) the failed passes of free text.
+     */
+    private final boolean gated;
     /** {@code -Djllm.engine.adaptiveDraft=false}: a draft model's length follows the doubling rule only. */
     private final boolean adaptive = !"false".equals(System.getProperty("jllm.engine.adaptiveDraft"));
     /** Plain steps taken when the cost model says speculation does not pay, before it is asked again. */
@@ -320,6 +339,7 @@ public final class Speculator implements AutoCloseable {
     /** One in this many "does not pay" decisions runs a pass anyway, so a change in acceptance is noticed. */
     static final int PROBE_EVERY = 4;
 
+    private static final boolean DEBUG = Boolean.getBoolean("jllm.engine.specDebug");
     private final CostModel cost = new CostModel();
     private int unprofitable;
 
@@ -350,6 +370,12 @@ public final class Speculator implements AutoCloseable {
         private double s0, s1, s2, sy, s1y;          // weighted sums of x = n - 1 and y = V(n)
         private int passes;
 
+        /** Back to the prior acceptance (α 0.6): the next request is judged on its own passes. */
+        void forgetAcceptance() {
+            acc = 1.2;
+            exam = 2.0;
+        }
+
         void acceptance(int accepted, int examined) {
             acc = DECAY * acc + accepted;
             exam = DECAY * exam + examined;
@@ -372,6 +398,15 @@ public final class Speculator implements AutoCloseable {
             sy = DECAY * sy + nanos;
             s1y = DECAY * s1y + x * nanos;
             passes++;
+        }
+
+        String describe(int max) {
+            if (passes < 1) {
+                return "no data";
+            }
+            double[] ab = fit();
+            return String.format(java.util.Locale.ROOT, "plain %.1f ms, a %.1f b %.1f ms, alpha %.2f, best k %d", plainNs / 1e6, ab[0] / 1e6,
+                    ab[1] / 1e6, alpha(), bestK(max));
         }
 
         double alpha() {
@@ -468,6 +503,20 @@ public final class Speculator implements AutoCloseable {
 
     public long accepted() {
         return acceptedTotal;
+    }
+
+    /**
+     * Prompt lookup under the gate: whether the longest suffix ({@code engine.ngram-max} tokens) already occurred earlier.
+     * Eight tokens repeating is strong evidence that the text is being copied (an edit of a file in the prompt), far
+     * stronger than the prior acceptance a new request starts from, so a paused lookup tries a pass.
+     */
+    private boolean strongMatch() {
+        int n = cfg.ngramMax();
+        if (!gated || len - 1 < n) {
+            return false;
+        }
+        int e = index.find(hist, len - 1, n);
+        return e >= 0 && (cfg.window() <= 0 || e > len - 1 - cfg.window());
     }
 
     /**

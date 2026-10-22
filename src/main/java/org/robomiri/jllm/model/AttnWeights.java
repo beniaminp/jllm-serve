@@ -80,8 +80,13 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
      *               value rows. The backends never multiply by it directly: its two halves are absorbed into
      *               the query and applied after the softmax ({@link #kvBKeys}, {@link #kvBValues}), which is
      *               what lets the cache hold the latent
+     * @param kB     null for a checkpoint; a GGUF written since llama.cpp's MLA absorption stores {@code kv_b_proj} already
+     *               split (and the key half transposed) as {@code attn_k_b}: {@code [heads * kvLora, nope]}, row
+     *               {@code h * kvLora + j} holding column {@code j} of head {@code h}'s key matrix. Then {@code kvB} is null
+     * @param vB     the value half, {@code attn_v_b}: {@code [heads * v, kvLora]}, row {@code h * v + r} = row {@code r} of head {@code h}
      */
-    record Mla(Query query, QTensor kvA, QTensor kPe, float[] kvALayernorm, QTensor kvB) implements AttnWeights {
+    record Mla(Query query, QTensor kvA, QTensor kPe, float[] kvALayernorm, QTensor kvB, QTensor kB, QTensor vB)
+            implements AttnWeights {
 
         /** The query projection: one matrix, or the low-rank pair with a norm in between ({@code q_lora_rank > 0}). */
         public sealed interface Query permits Proj, Lora {
@@ -108,8 +113,10 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
             Query q = m.qLoraRank() > 0
                     ? new Lora(f.tensor(a + "q_a_proj.weight"), f.floats(a + "q_a_layernorm.weight"), f.tensor(a + "q_b_proj.weight"))
                     : new Proj(f.tensor(a + "q_proj.weight"));
+            boolean split = !f.has(a + "kv_b_proj.weight") && f.has(a + "k_b_proj.weight");
             return new Mla(q, f.tensor(a + "kv_a_latent.weight"), f.tensor(a + "k_pe_proj.weight"),
-                    f.floats(a + "kv_a_layernorm.weight"), f.tensor(a + "kv_b_proj.weight"));
+                    f.floats(a + "kv_a_layernorm.weight"), split ? null : f.tensor(a + "kv_b_proj.weight"),
+                    split ? f.tensor(a + "k_b_proj.weight") : null, split ? f.tensor(a + "v_b_proj.weight") : null);
         }
 
         @Override
@@ -126,12 +133,15 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
             return q && kvA.rows == m.kvLoraRank() && kvA.cols == dim
                     && kPe.rows == m.rope() && kPe.cols == dim
                     && kvALayernorm.length == m.kvLoraRank()
-                    && kvB.rows == h * (m.nope() + m.vDim()) && kvB.cols == m.kvLoraRank();
+                    && (kvB != null ? kvB.rows == h * (m.nope() + m.vDim()) && kvB.cols == m.kvLoraRank()
+                    : kB != null && vB != null && kB.rows == h * m.kvLoraRank() && kB.cols == m.nope()
+                    && vB.rows == h * m.vDim() && vB.cols == m.kvLoraRank());
         }
 
         @Override
         public int maxCols() {
-            return Math.max(Math.max(query.maxCols(), kvA.cols), Math.max(kPe.cols, kvB.cols));
+            int b = kvB != null ? kvB.cols : Math.max(kB.cols, vB.cols);
+            return Math.max(Math.max(query.maxCols(), kvA.cols), Math.max(kPe.cols, b));
         }
 
         /**
@@ -154,8 +164,41 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
             return half(m, m.nope(), m.vDim(), transposed);
         }
 
+        /**
+         * The key ({@code keys}) or value half from the split tensors of a GGUF. {@code kB} is {@code [heads][kvl][nope]}, which
+         * is the {@code transposed} key layout; {@code vB} is {@code [heads][v][kvl]}, the plain value layout; the other
+         * layout of each is a transposition of every head's block.
+         */
+        private float[] splitHalf(Attention.Mla m, boolean keys, boolean transposed) {
+            int kvl = m.kvLoraRank();
+            int heads = m.heads();
+            QTensor t = keys ? kB : vB;
+            int width = keys ? m.nope() : m.vDim();    // columns of t
+            int rowsPerHead = keys ? kvl : width;       // rows of t per head
+            boolean asStored = keys == transposed;      // k: transposed layout is the stored one; v: the plain one
+            float[] out = new float[heads * width * kvl];
+            float[] row = new float[t.cols];
+            for (int h = 0; h < heads; h++) {
+                int base = h * width * kvl;
+                for (int r = 0; r < rowsPerHead; r++) {
+                    t.dequantizeRow(h * rowsPerHead + r, row, 0);
+                    if (asStored) {
+                        System.arraycopy(row, 0, out, base + r * t.cols, t.cols);
+                    } else {
+                        for (int j = 0; j < t.cols; j++) {
+                            out[base + j * rowsPerHead + r] = row[j];
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+
         /** Rows {@code [first, first + count)} of every head's {@code nope + v} block of kvB, optionally transposed per head. */
         private float[] half(Attention.Mla m, int first, int count, boolean transposed) {
+            if (kvB == null) {
+                return splitHalf(m, first == 0, transposed);
+            }
             int kvl = m.kvLoraRank();
             int block = m.nope() + m.vDim();
             int heads = m.heads();

@@ -23,6 +23,9 @@ import java.util.List;
  *                           again)
  * @param kvCacheSaveAfterMs a request whose prefill took at least this long saves its slot's cache (default 2000: the
  *                           save only holds the slot to copy the token list, the rows are written in the background)
+ * @param kvSpill            a model with a paged KV cache ({@code backend.kv-paged}) writes the blocks it evicts to
+ *                           {@code <kv-cache-dir>/blocks} and reads them back when a prompt needs them (docs/24 §24.3)
+ * @param kvSpillMaxGb       disk budget of those block files
  * @param modelDirs          more folders whose models the Models page lists and loads in place, besides
  *                           {@code model.dir} (default {@code ../models}: the repository's folder when the console runs
  *                           from {@code jllm-web/}); folders that do not exist are skipped
@@ -40,7 +43,9 @@ public record WebProperties(
         @DefaultValue("10") double kvCacheMaxGb,
         @DefaultValue("512") int kvCacheMinTokens,
         @DefaultValue("2000") long kvCacheSaveAfterMs,
-        @DefaultValue("../models") List<String> modelDirs) {
+        @DefaultValue("../models") List<String> modelDirs,
+        @DefaultValue("true") boolean kvSpill,
+        @DefaultValue("10") double kvSpillMaxGb) {
 
     public WebProperties {
         if (!(kvCacheMaxGb >= 0)) {
@@ -48,6 +53,9 @@ public record WebProperties(
         }
         if (kvCacheMinTokens < 1) {
             throw new IllegalArgumentException("jllm.web.kv-cache-min-tokens must be at least 1, got " + kvCacheMinTokens);
+        }
+        if (!(kvSpillMaxGb >= 0)) {
+            throw new IllegalArgumentException("jllm.web.kv-spill-max-gb must be 0 or more, got " + kvSpillMaxGb);
         }
         if (kvCacheSaveAfterMs < 0) {
             throw new IllegalArgumentException("jllm.web.kv-cache-save-after-ms must be 0 or more, got " + kvCacheSaveAfterMs);

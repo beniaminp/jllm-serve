@@ -1,5 +1,7 @@
 package org.robomiri.jllm.cpu;
 
+import org.robomiri.jllm.kv.KvPool;
+import org.robomiri.jllm.kv.KvSequence;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.AttnWeights;
@@ -46,6 +48,8 @@ public final class CpuBackend implements Backend {
 
     /** The key/value cache of the grouped-query layers; null for a latent-attention model. */
     private final KvCache kv;
+    /** The block table of a paged cache ({@code backend.kv-paged}); null with the flat cache. */
+    private final KvSequence seq;
     /** DeepSeek multi-head latent attention (own cache); null for every other family. */
     private final MlaCpu mla;
     // k/v of the current chunk, [maxBatch, kvDim]: projected, normalized and rotated here, then stored
@@ -91,7 +95,13 @@ public final class CpuBackend implements Backend {
      *                        (Q4_0 and Q8_0 weights; other formats keep the float path)
      */
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, KvDtype kvDtype, boolean int8Activations) {
-        this(w, ctx, maxBatch, new ThreadPool(threads), true, kvDtype, int8Activations);
+        this(w, ctx, maxBatch, new ThreadPool(threads), true, kvDtype, int8Activations, null);
+    }
+
+    /** With a paged KV cache over {@code kvPool} (from {@link #newKvPool}); null = the flat cache. */
+    public CpuBackend(ModelWeights w, int ctx, int maxBatch, int threads, KvDtype kvDtype, boolean int8Activations,
+                      KvPool kvPool) {
+        this(w, ctx, maxBatch, new ThreadPool(threads), true, kvDtype, int8Activations, kvPool);
     }
 
     /**
@@ -99,11 +109,46 @@ public final class CpuBackend implements Backend {
      * compute at the same time, share one pool instead of keeping one set of threads each.
      */
     public CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, KvDtype kvDtype, boolean int8Activations) {
-        this(w, ctx, maxBatch, pool, false, kvDtype, int8Activations);
+        this(w, ctx, maxBatch, pool, false, kvDtype, int8Activations, null);
+    }
+
+    /** {@link #CpuBackend(ModelWeights, int, int, ThreadPool, KvDtype, boolean)} with a paged KV cache over {@code kvPool}. */
+    public CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, KvDtype kvDtype, boolean int8Activations,
+                      KvPool kvPool) {
+        this(w, ctx, maxBatch, pool, false, kvDtype, int8Activations, kvPool);
+    }
+
+    /**
+     * A pool of KV blocks for the backends that run on {@code w} ({@code backend.kv-paged}): they share it, so identical
+     * prefixes are stored once. Null when this model's cache cannot be paged (latent attention, q4 for now); the
+     * caller then builds flat backends.
+     *
+     * @param poolTokens capacity in positions across all sequences (0 = {@code slots} contexts and a spare)
+     */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens) {
+        return newKvPool(w, ctx, slots, kvDtype, blockTokens, poolTokens, KvDtype.q8Rotate());
+    }
+
+    /** {@link #newKvPool(ModelWeights, int, int, KvDtype, int, long)} with the q8 cache's rotated keys given ({@code backend.kv-q8-rotate}). */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   boolean rotateQ8) {
+        Decoder arch = w.decoder();
+        if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+            return null;
+        }
+        CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8);
+        long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
+        long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
+        if (blocks > Integer.MAX_VALUE - 16) {
+            throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
+        }
+        String format = "paged " + kvDtype + (st.rotate ? " rot" : "") + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim()
+                + " block=" + blockTokens;
+        return new KvPool(st, (int) blocks, format);
     }
 
     private CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, boolean ownsPool, KvDtype kvDtype,
-                       boolean int8Activations) {
+                       boolean int8Activations, KvPool kvPool) {
         this.w = w;
         this.arch = w.decoder();
         this.c = arch.core();
@@ -129,12 +174,19 @@ public final class CpuBackend implements Backend {
                             + "attention temperature (gpt-oss, Llama 4), using q8");
                     kvDtype = KvDtype.Q8;
                 }
-                kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
+                if (kvPool != null) {
+                    seq = kvPool.newSequence(ctx);
+                    kv = new PagedKv(c.layers(), g, ctx, (CpuKvStorage) kvPool.storage(), seq);
+                } else {
+                    seq = null;
+                    kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
+                }
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];
                 vStage = new float[maxBatch * g.kvDim()];
             }
             case Attention.Mla m -> {
+                seq = null;
                 kv = null;
                 if (kvDtype == KvDtype.Q4) {
                     System.err.println("note: backend.kv-dtype=q4 is not implemented for DeepSeek's latent cache, using q8");
@@ -170,7 +222,8 @@ public final class CpuBackend implements Backend {
     }
 
     /** Whether some layer needs sinks / chunks / the attention temperature at this context ({@link Attention.Gqa#special}). */
-    private static boolean anySpecial(Decoder d, int ctx) {
+    /** Whether a layer has attention sinks, chunked attention or temperature tuning at this context (gpt-oss, Llama 4). */
+    public static boolean anySpecial(Decoder d, int ctx) {
         for (LayerSpec s : d.layers()) {
             if (s.attn() instanceof Attention.Gqa g && g.forContext(ctx).special()) {
                 return true;
@@ -420,6 +473,11 @@ public final class CpuBackend implements Backend {
     }
 
     @Override
+    public KvSequence kvSequence() {
+        return seq;
+    }
+
+    @Override
     public int maxBatch() {
         return maxBatch;
     }
@@ -476,6 +534,9 @@ public final class CpuBackend implements Backend {
             ropes[i].refill(arch.ropeTables().get(i), ctx, from, p);
         }
         ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        if (seq != null) {
+            seq.setShareable(ropeCustomFrom == Integer.MAX_VALUE); // rows rotated for picture positions are not a function of the tokens
+        }
         return true;
     }
 
@@ -502,6 +563,11 @@ public final class CpuBackend implements Backend {
                 return false;
             }
             owners[t] = o;
+        }
+        for (int t = 0; t < n; t++) {
+            if (owners[t].seq != null) {
+                owners[t].seq.beginWrite(positions[t], 1);
+            }
         }
         int dim = c.dim();
         for (int t = 0; t < n; t++) {
@@ -539,6 +605,9 @@ public final class CpuBackend implements Backend {
     private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (seq != null) {
+            seq.beginWrite(pos, n); // blocks for [pos, pos + n), private; positions past it are forgotten
         }
         int dim = c.dim();
         if (embeds != null) {
@@ -907,6 +976,26 @@ public final class CpuBackend implements Backend {
         return stateFormat() != null;
     }
 
+    @Override
+    public StateSnapshot snapshotState(int n) {
+        if (seq == null) {
+            return null;
+        }
+        KvSequence snap = seq.snapshot(n); // retains the blocks: this backend copies one before it writes it
+        PagedKv view = new PagedKv(c.layers(), (Attention.Gqa) arch.attention(), ctx, (CpuKvStorage) seq.pool().storage(), snap);
+        return new StateSnapshot() {
+            @Override
+            public void write(java.nio.channels.WritableByteChannel out) throws java.io.IOException {
+                view.write(n, out);
+            }
+
+            @Override
+            public void close() {
+                snap.close();
+            }
+        };
+    }
+
     /** {@link #saveState} only reads the cache arrays (rows below {@code n}): safe while later rows are written. */
     @Override
     public void saveStateWhileServing(int n, java.nio.channels.WritableByteChannel out) throws java.io.IOException {
@@ -919,7 +1008,9 @@ public final class CpuBackend implements Backend {
             Backend.super.copyStateFrom(other, n);
             return;
         }
-        if (kv != null) {
+        if (seq != null && o.seq != null) {
+            seq.shareFrom(o.seq, n); // the blocks themselves are shared; the first write to a shared one copies it
+        } else if (kv != null) {
             kv.copyFrom(o.kv, n);
         } else {
             mla.copyFrom(o.mla, n);
@@ -934,6 +1025,9 @@ public final class CpuBackend implements Backend {
     @Override
     public void loadState(int n, int stored, java.nio.channels.ReadableByteChannel in) throws java.io.IOException {
         if (kv != null) {
+            if (seq != null) {
+                seq.beginWrite(0, n);
+            }
             kv.read(n, stored, in);
         } else if (mla != null) {
             mla.read(n, stored, in);
@@ -944,6 +1038,9 @@ public final class CpuBackend implements Backend {
 
     @Override
     public void close() {
+        if (seq != null) {
+            seq.close();
+        }
         if (ownsPool) {
             pool.close();
         }

@@ -240,6 +240,33 @@ public interface Backend extends AutoCloseable {
         throw new UnsupportedOperationException(name() + " cannot save its cache while serving");
     }
 
+    /**
+     * The block table of this backend's paged KV cache ({@code backend.kv-paged}, docs/24), or null when its cache is
+     * flat. The engine uses it to take over blocks other conversations computed ({@link org.robomiri.jllm.kv.KvSequence#adopt})
+     * and to publish its own once their tokens are final.
+     */
+    default org.robomiri.jllm.kv.KvSequence kvSequence() {
+        return null;
+    }
+
+    /** A frozen copy of the first {@code n} positions' rows that another thread can write out ({@link #snapshotState}). */
+    interface StateSnapshot extends AutoCloseable {
+        /** Writes what {@link #saveState} would have written for the positions at the time of the snapshot. */
+        void write(java.nio.channels.WritableByteChannel out) throws java.io.IOException;
+
+        @Override
+        void close();
+    }
+
+    /**
+     * Freezes positions {@code [0, n)} for a background save without copying them: a paged cache retains the blocks, and
+     * whoever writes one afterwards copies it first. Null when the backend has no such cache (the flat caches are saved
+     * with {@link #saveStateWhileServing} and the engine waits before overwriting what is still being written).
+     */
+    default StateSnapshot snapshotState(int n) {
+        return null;
+    }
+
     /** Skips {@code bytes} of a saved state: a seek when {@code in} is seekable (a file), else reads them. */
     static void skipState(java.nio.channels.ReadableByteChannel in, long bytes) throws java.io.IOException {
         if (bytes <= 0) {

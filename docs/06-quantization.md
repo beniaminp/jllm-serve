@@ -536,22 +536,162 @@ unit `u = 4n + j` (`n = 0, 1` the 128-weight half, `j = 0 … 3` the bit pair) i
 `((qs[32 n + l] >> 2j) & 3) - (hmask[l] bit u ? 0 : 4)`, i.e. `-4 … 3`; the 16 weights `l < 16` use scale
 `sc_{2u}` and `l >= 16` use `sc_{2u+1}`.
 
-**Worked examples** (the first weights of a block, decoded by the same reference the tests use):
+**Byte layouts.** Offsets are bytes from the start of a block; `qs` is the nibble area described above.
 
 ```
-Q4_1    d = 0.5,  m = -1,  qs[0] = 0x73, qs[1] = 0xF0
-          w0  = 3 · 0.5 - 1   =  0.5      w1  =  0 · 0.5 - 1  = -1       (low nibbles of qs[0], qs[1])
-          w16 = 7 · 0.5 - 1   =  2.5      w17 = 15 · 0.5 - 1  =  6.5     (high nibbles)
-Q5_0    d = 0.25, qh = bit 0 and bit 16 set, qs[0] = 0x73
-          w0  = (3 + 16 - 16) · 0.25 = 0.75     w1 = (0 - 16) · 0.25 = -4  (its bit 1 is clear)
-          w16 = (7 + 16 - 16) · 0.25 = 1.75
-IQ4_NL  d = 0.01, qs[0] = 0x9F, qs[1] = 0x30
-          w0 = kvalues[15] d = 113 · 0.01 = 1.13      w1 = kvalues[0] d = -127 · 0.01 = -1.27
-          w16 = kvalues[9] d = 13 · 0.01 = 0.13       w17 = kvalues[3] d = -65 · 0.01 = -0.65
-MXFP4   e = 127 (2^-1), qs[0] = 0xA5, qs[1] = 0x7F
-          w0 = kvalues[5] · 0.5 = 6 · 0.5 = 3          w1 = kvalues[15] · 0.5 = -12 · 0.5 = -6
-          w16 = kvalues[10] · 0.5 = -2 · 0.5 = -1      w17 = kvalues[7] · 0.5 = 12 · 0.5 = 6
+Q4_1   20 B      0     2     4                                      19
+                 +-----+-----+--------------------------------------+
+                 |  d  |  m  | qs[0] qs[1] ............ qs[15]      |
+                 +-----+-----+--------------------------------------+
+                  f16   f16    byte j: low nibble = weight j, high nibble = weight j+16
+
+Q5_0   22 B      0     2           6                                21
+                 +-----+-----------+--------------------------------+
+                 |  d  | qh (u32)  | qs[0] ............ qs[15]      |
+                 +-----+-----------+--------------------------------+
+                         bit j of qh = the 5th bit of weight j (j = 0 .. 31)
+
+Q5_1   24 B      0     2     4           8                          23
+                 +-----+-----+-----------+--------------------------+
+                 |  d  |  m  | qh (u32)  | qs[0] ........ qs[15]    |
+                 +-----+-----+-----------+--------------------------+
+
+IQ4_NL 18 B      0     2                                            17
+                 +-----+-------------------------------------------+
+                 |  d  | qs[0] ........................ qs[15]     |
+                 +-----+-------------------------------------------+
+
+MXFP4  17 B      0  1                                               16
+                 +--+----------------------------------------------+
+                 | e| qs[0] ......................... qs[15]       |
+                 +--+----------------------------------------------+
+                  e8m0: one byte, a bare exponent
+
+Q3_K   110 B, 256 weights
+       0                 32                                   96             108    110
+       +-----------------+------------------------------------+--------------+------+
+       | hmask[32]       | qs[64]                             | scales[12]   |  d   |
+       +-----------------+------------------------------------+--------------+------+
+        bit u of hmask[l]      qs[32n + l] bits 2j+1..2j        16 six-bit numbers,
+        = high bit of weight   = 2-bit code of weight           one per 16 weights
+        32u + l                32(4n + j) + l  (n=0,1; j=0..3)
+
+IQ4_XS 136 B, 256 weights
+       0     2          4             8                                          135
+       +-----+----------+-------------+------------------------------------------+
+       |  d  | scales_h | scales_l[4] | qs[128] = 8 sub-blocks x 16 bytes        |
+       +-----+----------+-------------+------------------------------------------+
+              u16: top 2   4 bytes: low    sub-block i reads qs[16i .. 16i+15]; in each
+              bits of the  4 bits of the   byte the low nibble is weight j, the high
+              8 scales     8 scales        nibble weight j+16 of the sub-block's 32
+
+F16    2 B per weight   sign(1) exponent(5) mantissa(10)    w = (-1)^s 2^(e-15) (1 + m/1024)
+BF16   2 B per weight   sign(1) exponent(8) mantissa(7)     w = the f32 whose upper 16 bits these are
 ```
+
+**One whole block of each, decoded by hand.** The blocks below were built so that the arithmetic can be followed, and then
+decoded by `scripts/metal-emu/ggml_ref.py` (the numpy decoder that is checked against llama.cpp's C code); every result
+below is what that decoder returned. In the five 32-weight blocks the 16 `qs` bytes are the ramp
+`F0 E1 D2 C3 B4 A5 96 87 78 69 5A 4B 3C 2D 1E 0F` (byte `j` has low nibble `j` and high nibble `15 - j`), so the low
+nibbles run `0 … 15`, the high nibbles `15 … 0`, and every level of the format appears once in each half of the block.
+
+```
+Q4_1    d = 0.5 (bytes 00 38), m = -1 (00 BC), qs = ramp
+          w_j      = j · 0.5 - 1          -1 -0.5 0 0.5 1 1.5 2 2.5 3 3.5 4 4.5 5 5.5 6 6.5          (weights 0..15)
+          w_(j+16) = (15 - j) · 0.5 - 1   6.5 6 5.5 5 4.5 4 3.5 3 2.5 2 1.5 1 0.5 0 -0.5 -1          (weights 16..31)
+
+Q5_0    d = 0.25 (00 34), qh = AA AA FF 00 (the u32 0x00FFAAAA), qs = ramp
+          bits set: weights 1, 3, 5, ... 15 (bytes 0 and 1 are 0xAA) and 16 ... 23 (byte 2 = 0xFF)
+          w_j      = (j + 16 bit_j - 16) · 0.25
+                   = -4 0.25 -3.5 0.75 -3 1.25 -2.5 1.75 -2 2.25 -1.5 2.75 -1 3.25 -0.5 3.75
+          w_(j+16) = (15 - j + 16 bit_(j+16) - 16) · 0.25
+                   = 3.75 3.5 3.25 3 2.75 2.5 2.25 2 -2.25 -2.5 -2.75 -3 -3.25 -3.5 -3.75 -4
+          by hand: w_0 has nibble 0 and its bit clear: (0 - 16) · 0.25 = -4;  w_1 has nibble 1 and its bit set:
+          (1 + 16 - 16) · 0.25 = 0.25;  w_16 has nibble 15 and its bit set: (15 + 16 - 16) · 0.25 = 3.75
+
+Q5_1    d = 0.25 (00 34), m = -2 (00 C0), qh = AA AA FF 00, qs = ramp
+          w_j      = (j + 16 bit_j) · 0.25 - 2
+                   = -2 2.25 -1.5 2.75 -1 3.25 -0.5 3.75 0 4.25 0.5 4.75 1 5.25 1.5 5.75
+          w_(j+16) = (15 - j + 16 bit_(j+16)) · 0.25 - 2
+                   = 5.75 5.5 5.25 5 4.75 4.5 4.25 4 -0.25 -0.5 -0.75 -1 -1.25 -1.5 -1.75 -2
+
+IQ4_NL  d = the f16 nearest 0.01 = 0.01000214 (1F 21), qs = ramp
+          w_j      = d · kvalues_iq4nl[j]
+                   = -1.2703 -1.0402 -0.8302 -0.6501 -0.4901 -0.3501 -0.2200 -0.1000
+                      0.0100  0.1300  0.2501  0.3801  0.5301  0.6901  0.8902  1.1302
+          w_(j+16) = d · kvalues_iq4nl[15 - j]: the same numbers in reverse order
+
+MXFP4   e = 126, so 2^(e - 128) = 0.25; qs = ramp
+          w_j      = kvalues_mxfp4[j] · 0.25       0 0.25 0.5 0.75 1 1.5 2 3 | 0 -0.25 -0.5 -0.75 -1 -1.5 -2 -3
+          w_(j+16) = kvalues_mxfp4[15 - j] · 0.25  -3 -2 -1.5 -1 -0.75 -0.5 -0.25 0 | 3 2 1.5 1 0.75 0.5 0.25 0
+          (the stored table is doubled, so kvalues = 6 stands for the e2m1 number 3; the real e8m0 scale is
+          2^(e - 127) = 0.5 and 3 · 0.5 = 6 · 0.25)
+```
+
+The IQ4_NL grid is not uniform: the steps between neighbouring `kvalues_iq4nl` are 23, 21, 18, 16, 14, 13, 12, 11, 12, 12,
+13, 15, 16, 20, 24 (in units of `d`), 11 near zero and 24 at the ends, where a uniform 16-level grid over the same range
+would have 16 everywhere. That is the whole point of the format: weights are bell-shaped, so more of the levels sit where the
+weights are.
+
+**Q3_K, a whole 256-weight block.** `d = 1/64` (bytes 00 24), `hmask[l] = 0xA5` for every `l` (bits 0, 2, 5, 7 set), every
+`qs` byte `0xE4` (`11 10 01 00`: its four 2-bit codes are 0, 1, 2, 3) and the sixteen 6-bit scales `sc_s = 24 + s`, that is
+`sc_s - 32 = s - 8 = -8 … 7`. Scale `s = 4g + i` is stored in the low nibble of byte `4 (g & 1) + i` when `g < 2` and in the
+high nibble when `g >= 2`; its top two bits are bits `2g, 2g + 1` of byte `8 + i`:
+
+```
+s = 0..3   (g=0)  sc = 24 25 26 27 = 0x18 0x19 0x1A 0x1B    low nibbles 8 9 A B -> bytes 0..3, low nibble     top bits 01
+s = 4..7   (g=1)  sc = 28 29 30 31 = 0x1C 0x1D 0x1E 0x1F    low nibbles C D E F -> bytes 4..7, low nibble     top bits 01
+s = 8..11  (g=2)  sc = 32 33 34 35 = 0x20 0x21 0x22 0x23    low nibbles 0 1 2 3 -> bytes 0..3, HIGH nibble    top bits 10
+s = 12..15 (g=3)  sc = 36 37 38 39 = 0x24 0x25 0x26 0x27    low nibbles 4 5 6 7 -> bytes 4..7, HIGH nibble    top bits 10
+bytes 8..11, each:  01 | 01 << 2 | 10 << 4 | 10 << 6 = 0xA5
+scales[12] = 08 19 2A 3B 4C 5D 6E 7F A5 A5 A5 A5
+```
+
+A weight is `d (sc_s - 32) (code - 4 (1 - hbit))`. Unit `u` (weights `32u … 32u + 31`) uses bit `u` of `hmask` and the 2-bit
+code `(qs >> 2 (u & 3)) & 3`, which in this block is `u & 3`; `hbit` is bit `u` of `0xA5`. The integer part
+`code - 4 (1 - hbit)` per unit is
+
+```
+unit u              0   1   2   3   4   5   6   7
+code (u & 3)        0   1   2   3   0   1   2   3
+hmask bit u         1   0   1   0   0   1   0   1        (0xA5 = 1010 0101)
+code - 4(1-bit)     0  -3   2  -1  -4   1  -2   3
+```
+
+multiplied by `d (sc_s - 32)` with `s = 2u` for the first 16 weights of the unit and `s = 2u + 1` for the second 16:
+
+```
+weight 32  (u = 1, first half,  s = 2):    (1/64) · (-6) · (-3)  =  18/64 =  0.28125
+weight 48  (u = 1, second half, s = 3):    (1/64) · (-5) · (-3)  =  15/64 =  0.234375
+weight 64  (u = 2, first half,  s = 4):    (1/64) · (-4) ·   2   =  -8/64 = -0.125
+weight 255 (u = 7, second half, s = 15):   (1/64) ·   7  ·   3   =  21/64 =  0.328125
+```
+
+The decoder returns the same four numbers. (Weights of unit 0 are 0 here because its code minus its offset is 0; a real
+block has a different `qs` byte at every position, and the unit and scale are found in exactly the same way.)
+
+**IQ4_XS, a whole 256-weight block.** `d = 1/64` (00 24); the eight 6-bit scales `ls_i = 32, 40, 36, 28, 48, 16, 33, 31`
+(`ls_i - 32 = 0, 8, 4, -4, 16, -16, 1, -1`) are stored as low nibbles in `scales_l[4]` (sub-block `2k` in the low and `2k + 1`
+in the high nibble of byte `k`) and top two bits in `scales_h` (sub-block `i` in bits `2i, 2i + 1`):
+
+```
+ls_i & 15 = 0 8 4 C 0 0 1 F   ->  scales_l = 80 C4 00 F1
+ls_i >> 4 = 2 2 2 1 3 1 2 1   ->  scales_h = 0x676A  (bytes 6A 67)
+qs[k] = (7k + 3) mod 256 :  03 0A 11 18 1F 26 2D 34 3B 42 49 50 57 5E 65 6C | 73 7A 81 88 8F 96 9D A4 AB B2 B9 C0 C7 CE D5 DC | ...
+```
+
+Sub-block 1 (weights 32 … 63) has `ls_1 - 32 = 8`, so `d_l = (1/64) · 8 = 0.125`, and it reads `qs[16 … 31]`: `qs[16] = 0x73`
+gives weight 32 = `0.125 · kvalues[3] = 0.125 · (-65) = -8.125` and weight 48 = `0.125 · kvalues[7] = 0.125 · (-10) = -1.25`;
+`qs[17] = 0x7A` gives weight 33 = `0.125 · kvalues[10] = 3.125`. Sub-block 3 has `ls_3 - 32 = -4`, so the same table is read
+with `d_l = -1/16` and the signs flip; sub-block 0 has `ls_0 = 32`, a scale of exactly 0, so all 32 of its weights are 0
+whatever its nibbles say. The scales `d_l` of the eight sub-blocks are `0, 0.125, 0.0625, -0.0625, 0.25, -0.25, 0.015625,
+-0.015625`, and every weight is `d_l · kvalues[nibble]` and nothing else.
+
+**F16 and BF16.** There is no block: a matrix is read as 16-bit numbers, 32 of them (64 bytes) forming the "unit" the
+kernels walk. `0.1` as an F16 is `0x2E66 = 0.0999755859375` (10-bit mantissa: relative error up to 2^-11 = 0.049 %); as a
+BF16 it is the upper half of the f32 `0x3DCCCCCD`, i.e. `0x3DCC = 0.099609375` (7-bit mantissa: relative error up to
+2^-8 = 0.39 %, but the exponent range of an f32). Decoding is a half-to-float conversion, or for BF16 a shift left by 16 bits;
+no multiplication.
 
 **Is the arithmetic exact?** Every product in these formulas is exactly representable in an f32 (`q`, `kvalues`, `sc`
 are integers of at most 7 bits and `d`, `m` have an 11-bit mantissa; IQ4_XS's `d (ls - 32) · kvalues` needs 24 bits,
@@ -569,3 +709,73 @@ these formats is one more branch of `gg_unit` (`kernels.metal`, "GGUF block type
 consecutive weights into 8 `float4`, so every kernel family (decode matvec, tiled and matrix-unit prefill, the MoE
 expert kernels, the embedding lookup) has them without further code. Which type is used in place and which is converted
 is in [16.4](16-gguf.md#164-the-block-formats) and [16.6](16-gguf.md#166-zero-copy-how-the-kernels-read-the-files-pages).
+
+### Why this design
+
+* **Why read them in place at all.** The older behaviour was to dequantize any type the engine had no kernels for, row by
+  row, and requantize it to Q8_0 at load. That costs 8.5 bits per weight whatever the file used (Q3_K is 3.44, MXFP4 4.25) and
+  a *second* rounding on top of the file's own: reading the same files that way changed the greedy text in 3 of 22
+  comparison runs against llama.cpp on each backend, while the in-place kernels reproduced it in 22 of 22 (Metal and the
+  CPU float path; [16 §16.9.1](16-gguf.md#1691-the-newer-block-types-in-place-apple-m1-pro-qwen3-06b-requantized-with-llama-quantize)).
+  With 32 GB, memory is the reason this matters: the in-place file is 1.5 to 2.6 times smaller than its Q8_0 copy for every type
+  but F16.
+* **Why not convert to the engine's own Q4_0 / Q4_K.** A different format means a different rounding of every weight, so
+  the model would no longer be the file's model, and nothing could be compared with llama.cpp bit for bit.
+* **One decoder per backend, not one kernel per format.** The Metal side has 27 kernels that read weights (decode
+  matvec, tiled and matrix-unit prefill, the MoE kernels, the embedding lookup, ...). Writing a variant of each for nine
+  formats would be 243 hand-written kernels; instead each format is one branch of the function that turns 32 weights into
+  8 `float4` (`gg_new`, [08 §8.26](08-metal-backend.md#826-gguf-block-types-on-the-gpu-gg_unit-gg_new)) and the 243
+  instantiations are generated by templates. The CPU side has the same split: `Ggml.java` (scalar definition), the Vector
+  API kernels, the int8-activation kernels and the native NEON kernels all take the format as a `QType`.
+* **Costs.** The shader library grows from 310 to 553 kernels (first compile 1.5 s to 2.8 s, cached afterwards); blocks of 17,
+  18, 22 and 110 bytes are not 4-byte aligned, so quants are read as `ushort`s or bytes; the two table formats cost a lookup per
+  weight (10 - 14 % lower Metal decode on the 0.6B model, where decode is not bandwidth bound); the bit-field formats (Q5_x,
+  Q3_K) are slow on the CPU unless a native kernel exists (the default of the CPU backend then falls back, below).
+
+### Settings
+
+| switch | default | when to change it |
+|---|---|---|
+| `-Djllm.gguf.requantize=<types>` | Metal: `none` (everything in place). CPU: `Q5_1,Q3_K,F16,BF16` | `none` to read everything in place on the CPU too (the model barely fits in memory, or F16 / BF16 precision matters: requantizing F16 costs about 0.5 % per weight); `Q4_1,Q5_0,Q5_1` or `all` to put types back on the old Q8_0 path for an A/B comparison (`scripts/mac-validate.sh --gguf-types DIR` runs both) |
+| `-Djllm.metal.hmmaKQuants=true` | off | enables the half-weight matrix-unit kernels of the K-quants and of these formats; they round each weight to half, are lossy, and the start-up tuner never picks them ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
+| `-Djllm.cpu.native=false` | `auto` | measure the Java int8 kernels without `libjllm_cpu` (x86-64 always uses them for these formats) |
+
+### Measured
+
+All numbers are from [16 §16.9.1](16-gguf.md#1691-the-newer-block-types-in-place-apple-m1-pro-qwen3-06b-requantized-with-llama-quantize)
+(Apple M1 Pro, Qwen3-0.6B re-quantized with `llama-quantize --allow-requantize --pure <TYPE>`, `./jllm bench` medians, 413-token
+prompt, speculation off, heavy lock; "Q8_0" = the same file with `-Djllm.gguf.requantize` naming the type). Bits per weight are the
+file's; the sizes are the files:
+
+| type | bits/weight | file | requantized in RAM | Metal decode tok/s in place / Q8_0 | CPU decode tok/s in place / Q8_0 |
+|---|---|---|---|---|---|
+| Q4_1 | 5.0 | 379 MB | 670 MB | 101.0 / 99.9 | 83.7 / 92.2 (-9%) |
+| Q5_0 | 5.5 | 416 MB | 670 MB | 103.3 / 103.4 | 85.6 / 91.8 (-7%) |
+| Q5_1 | 6.0 | 453 MB | 670 MB | 105.1 / 102.8 | 66.2 / 91.9 (-28%) |
+| Q3_K | 3.4375 | 262 MB | 670 MB | 101.5 / 105.1 | 58.0 / 92.4 (-37%) |
+| IQ4_NL | 4.5 | 341 MB | 670 MB | 92.0 / 107.6 | 100.1 / 95.1 (+5%) |
+| IQ4_XS | 4.25 | 323 MB | 670 MB | 93.0 / 107.8 | 115.3 / 93.6 (+23%) |
+| MXFP4 | 4.25 | 323 MB | 670 MB | 92.0 / 102.8 | 120.9 / 92.7 (+30%) |
+| F16 | 16 | 1198 MB | 670 MB | 81.2 / 102.9 | 22.4 / 91.7 (-76%) |
+
+What the numbers mean: on the GPU the in-place decode is as fast as Q8_0 within noise for the arithmetic formats and 10 - 14 %
+slower for the table formats, but the weights take half the memory or less; on the CPU the formats whose native kernel is a
+byte shuffle (IQ4_XS, MXFP4) are *faster* than Q8_0 because they read half the bytes, and the bit-field formats (Q5_1, Q3_K) and
+F16 are slower by more than the 25 % the default tolerates, which is why those four are requantized on the CPU by default. The
+raw kernel (`GgufMetalBench`, an 8192 x 4096 matrix, one token, microseconds): Q4_0 290, Q8_0 310, Q4_1 287, Q5_0 304,
+Q5_1 302, Q3_K 372, IQ4_NL 348, IQ4_XS 338, MXFP4 343, F16 433. The one-thread CPU int8 kernels per format (2048 x 1024
+matrix, Java / native NEON / dotprod, microseconds) are in [07 §7.10](07-cpu-backend.md#the-other-gguf-formats-ggufint8kernels-native-aarch64-kernels).
+
+### Checks and limits
+
+* **Bit for bit against llama.cpp's C code.** `GgufKernelsCheck` (in `mvn test`) and `scripts/metal-emu/ggml_ref.py <libggmlq>`
+  (a shared library built from `ggml-quants.c`) compare the dequantizers on 2048 - 12 288 random-block weights per type with zero
+  differing floats; `kernel_tests.py` checks every Metal kernel family that reads these formats against the same numpy decoders;
+  `GgufBackendsTest` checks CPU == Metal on random GGUF models of every type; `GgufMetalCheck` runs the kernels on weights at an odd
+  offset of a mapped file. Whole answers: 22 of 22 greedy runs equal llama.cpp's text on Metal and on the CPU float path, 20 of 22 with
+  int8 activations on the CPU (16.9.1).
+* **Not exact on purpose.** The GPU kernels sum a dot product in a different order than the CPU, so logits differ at rounding
+  level; the half-weight kernels (opt-in) round weights to half.
+* **Not done.** The 256-entry-grid types IQ1\*, IQ2\*, IQ3\*, the ternary TQ1_0 / TQ2_0 and Q8_K / Q8_1 are refused by name. An
+  MXFP4 scale byte below 2 is a subnormal that the GPU may flush to zero (no real model has one). There are no x86-64 native
+  kernels for these formats (the Java int8 kernels serve them); Q2_K, F16 and BF16 have no int8-activation kernel.

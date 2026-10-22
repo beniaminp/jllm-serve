@@ -133,6 +133,14 @@ public final class ApiServer implements AutoCloseable {
         return this;
     }
 
+    private volatile VideoHttp video;
+
+    /** Adds the video endpoints ({@code /v1/videos/*}) served by {@code video}; the text engine may be null (video only). */
+    public ApiServer withVideo(VideoHttp video) {
+        this.video = video;
+        return this;
+    }
+
     // ---- pictures in chat messages (docs/20)
     private long imageMaxBytes = 32L << 20;
     private long imageMaxPixels = org.robomiri.jllm.vision.ImageDecoder.MAX_PIXELS;
@@ -164,7 +172,7 @@ public final class ApiServer implements AutoCloseable {
         if (req.method.equals("OPTIONS")) { // CORS preflight; the headers only make sense when an origin is configured
             if (res.cors()) {
                 res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                        .header("Access-Control-Allow-Headers", "Content-Type, Authorization, " + OpenAiFeatures.PRIORITY_HEADER)
                         .header("Access-Control-Max-Age", "86400");
             }
             res.send(204, "text/plain", "");
@@ -172,6 +180,10 @@ public final class ApiServer implements AutoCloseable {
         }
         ImageHttp img = images;
         if (img != null && img.handle(path, req, res)) {
+            return;
+        }
+        VideoHttp vid = video;
+        if (vid != null && vid.handle(path, req, res)) {
             return;
         }
         AudioRoutes ar = audio;
@@ -188,6 +200,9 @@ public final class ApiServer implements AutoCloseable {
                 }
                 if (img != null) {
                     data.add(img.modelObject());
+                }
+                if (vid != null) {
+                    data.add(vid.modelObject());
                 }
                 if (ar != null) {
                     data.addAll(ar.modelObjects());
@@ -220,6 +235,7 @@ public final class ApiServer implements AutoCloseable {
             res.send(400, "application/json", error("invalid JSON: " + e.getMessage()));
             return;
         }
+        OpenAiFeatures.headerPriority(body, req.headers.get(OpenAiFeatures.PRIORITY_HEADER.toLowerCase(java.util.Locale.ROOT)));
         Tokenizer tok = engine.tokenizer();
         int[] prompt;
         org.robomiri.jllm.engine.MediaPrompt media = null;

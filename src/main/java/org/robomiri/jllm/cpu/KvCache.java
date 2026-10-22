@@ -136,6 +136,15 @@ public abstract class KvCache {
         return create(dtype, layers, a, ctx, 64, KvDtype.q4Recent());
     }
 
+    /** {@link #create(KvDtype, int, Attention.Gqa, int, int, int)} with a q8 cache of rotated keys when {@code rotateQ8}. */
+    public static KvCache create(KvDtype dtype, int layers, Attention.Gqa a, int ctx, int chunk, int recent, boolean rotateQ8) {
+        KvCache c = create(dtype, layers, a, ctx, chunk, recent);
+        if (rotateQ8 && c instanceof Q8 q8) {
+            q8.rotate = KvQ4.supports(a.headDim());
+        }
+        return c;
+    }
+
     /**
      * @param chunk  most positions one {@link #store} call writes (the backend's batch): q4's recent window keeps
      *               {@code recent + chunk} rows so that a chunk never evicts a row one of its own queries reads
@@ -270,9 +279,47 @@ public abstract class KvCache {
 
     /** Layout of {@link #write}: the element type and the shape, so a file is only read into an equal cache. */
     public final String format() {
-        String type = this instanceof F16 ? "f16" : this instanceof Q8 ? "q8"
-                : this instanceof Q4 q4 ? "q4" + (q4.recent > 0 ? " recent=" + q4.recent : "") : "f32";
+        RecentWindow w = window();
+        String type = storedType().toString() + (rotatedKeys() ? " rot" : "")
+                + (storedType() == KvDtype.Q4 && w != null ? " recent=" + w.windowSize() : "");
         return type + " layers=" + layers + " kvDim=" + kvDim + " headDim=" + headDim;
+    }
+
+    /** A q8 cache of Hadamard-rotated keys ({@code backend.kv-q8-rotate}); part of the saved-cache {@link #format}. */
+    boolean rotatedKeys() {
+        return this instanceof Q8 q8 && q8.rotate;
+    }
+
+    /** The element type a saved cache stores ({@link #format}); the paged cache reports its own. */
+    KvDtype storedType() {
+        return this instanceof F16 ? KvDtype.F16 : this instanceof Q8 ? KvDtype.Q8 : this instanceof Q4 ? KvDtype.Q4 : KvDtype.F32;
+    }
+
+    /** Puts and reads one position's K or V row in the saved-cache layout of a quantized type (q8, q4). */
+    interface RowCodec {
+        /** Puts row {@code s} (K or V) as {@link #write} stores it. */
+        void writeRow(int layer, boolean values, int s, ByteBuffer buf);
+
+        /** Reads what {@link #writeRow} put into row {@code s}. */
+        void readRow(int layer, boolean values, int s, ByteBuffer buf);
+    }
+
+    /** The q4 recent window as a saved cache stores it: after the rows of each layer, the exact rows of the latest positions. */
+    interface RecentWindow {
+        /** Positions the window keeps exact. */
+        int windowSize();
+
+        void writeRecent(int layer, int n, WritableByteChannel out) throws IOException;
+
+        void readRecent(int layer, int n, int stored, ReadableByteChannel in) throws IOException;
+    }
+
+    final RowCodec codec() {
+        return this instanceof RowCodec c ? c : null;
+    }
+
+    final RecentWindow window() {
+        return this instanceof RecentWindow w && w.windowSize() > 0 ? w : null;
     }
 
     /** Positions {@code [0, n)} of every layer copied from {@code o}, a cache of the same {@link #format}. */
@@ -293,8 +340,7 @@ public abstract class KvCache {
 
     /** Bytes of one position's K (or V) row in {@link #write}'s format. */
     private int ioRowBytes() {
-        return (int) (this instanceof F16 ? KvDtype.F16 : this instanceof Q8 ? KvDtype.Q8
-                : this instanceof Q4 ? KvDtype.Q4 : KvDtype.F32).rowBytes(kvDim, kvHeads);
+        return (int) storedType().rowBytes(kvDim, kvHeads);
     }
 
     /**
@@ -304,9 +350,9 @@ public abstract class KvCache {
      * recent window then adds, per layer, the exact rows of the window ({@link Q4#writeRecent}).
      */
     public final void write(int n, WritableByteChannel out) throws IOException {
-        boolean half = this instanceof F16;
-        Q8 q8 = this instanceof Q8 c ? c : null;
-        Q4 q4 = this instanceof Q4 c ? c : null;
+        boolean half = storedType() == KvDtype.F16;
+        RowCodec codec = codec();
+        RecentWindow window = window();
         float[] row = new float[kvDim];
         ByteBuffer buf = ByteBuffer.allocate(IO_ROWS * 2 * ioRowBytes()).order(ByteOrder.LITTLE_ENDIAN);
         for (int layer = 0; layer < layers; layer++) {
@@ -314,12 +360,8 @@ public abstract class KvCache {
                 buf.clear();
                 for (int s = s0; s < Math.min(n, s0 + IO_ROWS); s++) {
                     for (int kind = 0; kind < 2; kind++) {
-                        if (q8 != null) {
-                            q8.writeRow(layer, kind == 1, s, buf);
-                            continue;
-                        }
-                        if (q4 != null) {
-                            q4.writeRow(layer, kind == 1, s, buf);
+                        if (codec != null) {
+                            codec.writeRow(layer, kind == 1, s, buf);
                             continue;
                         }
                         for (int g = 0; g < kvHeads; g++) {
@@ -340,8 +382,8 @@ public abstract class KvCache {
                 }
             }
         }
-        for (int layer = 0; q4 != null && q4.recent > 0 && layer < layers; layer++) {
-            q4.writeRecent(layer, n, out);
+        for (int layer = 0; window != null && layer < layers; layer++) {
+            window.writeRecent(layer, n, out);
         }
     }
 
@@ -361,9 +403,9 @@ public abstract class KvCache {
         if (n > stored) {
             throw new IllegalArgumentException(n + " positions requested, " + stored + " saved");
         }
-        boolean half = this instanceof F16;
-        Q8 q8 = this instanceof Q8 c ? c : null;
-        Q4 q4 = this instanceof Q4 c ? c : null;
+        boolean half = storedType() == KvDtype.F16;
+        RowCodec codec = codec();
+        RecentWindow window = window();
         int rb = ioRowBytes();
         float[] k = new float[IO_ROWS * kvDim];
         float[] v = new float[IO_ROWS * kvDim];
@@ -378,17 +420,10 @@ public abstract class KvCache {
                     }
                 }
                 buf.flip();
-                if (q8 != null) { // the stored int8 values and scales as they are: no second rounding
+                if (codec != null) { // the stored values and scales as they are: no second rounding
                     for (int r = 0; r < m; r++) {
-                        q8.readRow(layer, false, s0 + r, buf);
-                        q8.readRow(layer, true, s0 + r, buf);
-                    }
-                    continue;
-                }
-                if (q4 != null) {
-                    for (int r = 0; r < m; r++) {
-                        q4.readRow(layer, false, s0 + r, buf);
-                        q4.readRow(layer, true, s0 + r, buf);
+                        codec.readRow(layer, false, s0 + r, buf);
+                        codec.readRow(layer, true, s0 + r, buf);
                     }
                     continue;
                 }
@@ -404,8 +439,8 @@ public abstract class KvCache {
             }
             org.robomiri.jllm.model.Backend.skipState(in, (long) (stored - n) * 2 * rb);
         }
-        for (int layer = 0; q4 != null && q4.recent > 0 && layer < layers; layer++) {
-            q4.readRecent(layer, n, stored, in);
+        for (int layer = 0; window != null && layer < layers; layer++) {
+            window.readRecent(layer, n, stored, in);
         }
     }
 
@@ -1315,12 +1350,20 @@ public abstract class KvCache {
      * {@code [ctx, kvDim]} bytes with scales {@code [ctx, kvHeads]}. The byte arrays carry 16 bytes of padding so a
      * 16-byte load at the last vector stays inside them.
      */
-    static final class Q8 extends KvCache {
+    static final class Q8 extends KvCache implements RowCodec {
         private static final VectorSpecies<Byte> B16 = VectorKernels.B16;
         final byte[][] key;
         final float[][] keyScale;
         final byte[][] val;
         final float[][] valScale;
+        /**
+         * Keys are Walsh–Hadamard rotated before they are quantized ({@code backend.kv-q8-rotate}, {@link KvQ4#rotate}):
+         * the queries get the same rotation inside {@link #attention} and the score scale is divided by the block, as
+         * for {@link Q4}. Set right after construction, before any {@link #store}.
+         */
+        boolean rotate;
+        /** The rotated queries of the current {@link #attention} call. */
+        private float[] qRot = new float[0];
 
         Q8(int layers, Attention.Gqa a, int ctx) {
             super(layers, a, ctx);
@@ -1347,15 +1390,24 @@ public abstract class KvCache {
         public void store(int layer, int pos, float[] k, float[] v, int n) {
             byte[] kc = key[layer];
             byte[] vc = val[layer];
+            float[] row = rotate ? new float[headDim] : null;
             for (int t = 0; t < n; t++) {
                 int s = pos + t;
                 for (int g = 0; g < kvHeads; g++) {
                     int src = t * kvDim + g * headDim;
-                    float ks = KvDtype.q8Scale(maxAbs(k, src, headDim));
+                    float[] kx = k;
+                    int ko = src;
+                    if (rotate) { // the key row as the attention reads it: rotated, then quantized
+                        System.arraycopy(k, src, row, 0, headDim);
+                        KvQ4.rotate(row, 0, headDim);
+                        kx = row;
+                        ko = 0;
+                    }
+                    float ks = KvDtype.q8Scale(maxAbs(kx, ko, headDim));
                     keyScale[layer][keyScaleAt(g, s)] = ks;
                     int base = keyChunk(g, s / CHUNK) + s % CHUNK;
                     for (int i = 0; i < headDim; i++) {
-                        kc[base + i * CHUNK] = KvDtype.q8(k[src + i], ks);
+                        kc[base + i * CHUNK] = KvDtype.q8(kx[ko + i], ks);
                     }
                     float vs = KvDtype.q8Scale(maxAbs(v, src, headDim));
                     valScale[layer][s * kvHeads + g] = vs;
@@ -1368,7 +1420,8 @@ public abstract class KvCache {
         }
 
         /** Puts row {@code s} (K or V) as {@link #write} stores it: {@code kvDim} int8 values, then the scales. */
-        void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
+        @Override
+        public void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
             for (int g = 0; g < kvHeads; g++) {
                 if (values) {
                     buf.put(val[layer], s * kvDim + g * headDim, headDim);
@@ -1385,7 +1438,8 @@ public abstract class KvCache {
         }
 
         /** Reads what {@link #writeRow} put into row {@code s}. */
-        void readRow(int layer, boolean values, int s, ByteBuffer buf) {
+        @Override
+        public void readRow(int layer, boolean values, int s, ByteBuffer buf) {
             for (int g = 0; g < kvHeads; g++) {
                 if (values) {
                     buf.get(val[layer], s * kvDim + g * headDim, headDim);
@@ -1486,6 +1540,18 @@ public abstract class KvCache {
         @Override
         public void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, float scale,
                        float softcap) {
+            if (rotate) { // (Hq)·(Hk) = B q·k, and B is a power of two
+                int len = n * qDim;
+                if (qRot.length < len) {
+                    qRot = new float[len];
+                }
+                System.arraycopy(q, 0, qRot, 0, len);
+                for (int o = 0; o < len; o += headDim) {
+                    KvQ4.rotate(qRot, o, headDim);
+                }
+                q = qRot;
+                scale /= KvQ4.block(headDim);
+            }
             // with as many kv heads as threads the tiled kernel is already balanced and keeps a head's work on one core
             if (n == 1 && vectorized() && kvHeads < pool.threads()) {
                 attentionDecode(pool, layer, pos, q, att, window, scale, softcap);
@@ -1513,7 +1579,7 @@ public abstract class KvCache {
      * (query, key) pair uses depends only on {@code P} and the ring, so prefill and decode still agree bit for bit.
      * A chunk of up to {@code chunk} tokens stored at once cannot evict a slot a query of the same chunk needs.
      */
-    static final class Q4 extends KvCache {
+    static final class Q4 extends KvCache implements RowCodec, RecentWindow {
         private static final VectorSpecies<Byte> B16 = VectorKernels.B16;
         private static final VectorSpecies<Integer> I = IntVector.SPECIES_PREFERRED;
         final int groups;      // per head
@@ -1779,8 +1845,14 @@ public abstract class KvCache {
             }
         }
 
+        @Override
+        public int windowSize() {
+            return recent;
+        }
+
         /** Puts row {@code s} (K or V) in the {@link KvQ4} row layout: the nibbles, then the scales. */
-        void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
+        @Override
+        public void writeRow(int layer, boolean values, int s, ByteBuffer buf) {
             for (int g = 0; g < kvHeads; g++) {
                 if (values) {
                     buf.put(val[layer], s * (kvDim / 2) + g * (headDim / 2), headDim / 2);
@@ -1800,7 +1872,8 @@ public abstract class KvCache {
         }
 
         /** Reads what {@link #writeRow} put into row {@code s}. */
-        void readRow(int layer, boolean values, int s, ByteBuffer buf) {
+        @Override
+        public void readRow(int layer, boolean values, int s, ByteBuffer buf) {
             for (int g = 0; g < kvHeads; g++) {
                 if (values) {
                     buf.get(val[layer], s * (kvDim / 2) + g * (headDim / 2), headDim / 2);
@@ -1827,7 +1900,8 @@ public abstract class KvCache {
          * The recent window of {@link #write}: for each of the positions {@code [max(0, n - R), n)} of a layer an int
          * (1: the ring holds it, 0: not), then its K and V rows as {@code kvDim} halves each (zeros when absent).
          */
-        void writeRecent(int layer, int n, WritableByteChannel out) throws IOException {
+        @Override
+        public void writeRecent(int layer, int n, WritableByteChannel out) throws IOException {
             int first = Math.max(0, n - recent);
             ByteBuffer buf = ByteBuffer.allocate(Math.max(1, n - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
             for (int s = first; s < n; s++) {
@@ -1851,7 +1925,8 @@ public abstract class KvCache {
          * prefix keep only the part of it below {@code n}; older positions of the prefix's own window are then read from
          * the q4 rows (the ring forgets them, as after a rollback).
          */
-        void readRecent(int layer, int n, int stored, ReadableByteChannel in) throws IOException {
+        @Override
+        public void readRecent(int layer, int n, int stored, ReadableByteChannel in) throws IOException {
             int first = Math.max(0, stored - recent);
             ByteBuffer buf = ByteBuffer.allocate(Math.max(1, stored - first) * (4 + 4 * kvDim)).order(ByteOrder.LITTLE_ENDIAN);
             buf.limit((stored - first) * (4 + 4 * kvDim));

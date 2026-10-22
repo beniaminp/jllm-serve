@@ -115,7 +115,8 @@ const Chat = (() => {
       + `<span class="tc-args">${esc(short)}</span>${result?.ms != null ? `<span class="muted small">${result.ms} ms</span>` : ''}${icon}</summary>`
       + `<div class="tc-body"><div class="muted small">arguments</div><pre>${esc(args)}</pre>`
       + (result ? `<div class="muted small">result</div><pre>${esc(result.content)}</pre>` : '') + '</div></details>'
-      + (typeof Images !== 'undefined' ? Images.inlineHtml(result?.content) : '') /* images: pictures of the result, visible without expanding */;
+      + (typeof Images !== 'undefined' ? Images.inlineHtml(result?.content) : '') /* images: pictures of the result, visible without expanding */
+      + (typeof Video !== 'undefined' ? Video.inlineHtml(result?.content) : '') /* video: clips of the result */;
   }
 
   function statsLine(usage, extra) {
@@ -276,7 +277,8 @@ const Chat = (() => {
     await Vision.prepare(c.messages); // vision: data: URLs of the pictures, so wire() stays synchronous
     const body = {model, messages: [...(system ? [{role: 'system', content: system}] : []), ...wire(c.messages)],
       tools: (c.tools || []).filter(n => availableTools.some(t => t.name === n && t.enabled)),
-      enable_thinking: $('#chat-think').checked, ...params()};
+      enable_thinking: $('#chat-think').checked, ...params(),
+      ...($('#p-priority').value === 'background' ? {priority: 'background'} : {})}; // a job that may wait behind a person
     running = {abort: new AbortController(), conv: c, text: '', calls: {}, usage: null, error: null, toolRunning: false};
     c.updated = Date.now();
     setBusy(true);
@@ -447,7 +449,7 @@ const Chat = (() => {
 
   function renderModelSelect(list) {
     const sel = $('#chat-model');
-    list = list.filter(m => m.kind !== 'image');   // images: image models are used on the Images tab
+    list = list.filter(m => m.kind !== 'image' && m.kind !== 'video');   // images / video: those models are used on their own tabs
     const want = sel.value || store.get('jllm.model', '');
     const html = list.length ? list.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('') : '<option value="">(no model loaded)</option>';
     if (sel.innerHTML !== html) sel.innerHTML = html;
@@ -467,6 +469,8 @@ const Chat = (() => {
     const p = store.get('jllm.params', {});
     for (const [k, v] of Object.entries(p)) { const el = $('#p-' + k); if (el) el.value = v; }
     $('#p-system').value = store.get('jllm.system', '');
+    $('#p-priority').value = store.get('jllm.priority', 'interactive');
+    $('#p-priority').addEventListener('change', () => store.set('jllm.priority', $('#p-priority').value));
     $('#chat-think').checked = store.get('jllm.think', false);
     $('#input').placeholder = 'Message…   (Enter to send, Shift+Enter for a new line)';
     if (!convs.length) newConv(false); else { if (!current()) currentId = convs[0].id; renderConvs(); renderMessages(); }
@@ -497,7 +501,7 @@ const Chat = (() => {
     });
     $('#toggle-params').addEventListener('click', () => $('#params').classList.toggle('hidden'));
     $('#close-params').addEventListener('click', () => $('#params').classList.add('hidden'));
-    $('#reset-params').addEventListener('click', () => { PARAMS.forEach(k => { $('#p-' + k).value = ''; }); params(); });
+    $('#reset-params').addEventListener('click', () => { PARAMS.forEach(k => { $('#p-' + k).value = ''; }); $('#p-priority').value = 'interactive'; store.set('jllm.priority', 'interactive'); params(); });
     $('#chat-think').addEventListener('change', () => store.set('jllm.think', $('#chat-think').checked));
     $('#chat-model').addEventListener('change', () => { store.set('jllm.model', $('#chat-model').value); updateCtx(); });
     $('#export-chat').addEventListener('click', exportMarkdown);
