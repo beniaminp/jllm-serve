@@ -31,10 +31,23 @@ public final class GgufProfile {
                     + "    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n");
             try (ModelWeights w = g.weights();
                  Backend b = args[1].equals("metal")
-                         ? new Qwen3NextMetalBackend(w, 1024, 64, System.getProperty("jllm.metal.lib"), KvDtype.F32)
-                         : new Qwen3NextCpuBackend(w, 1024, 64, Runtime.getRuntime().availableProcessors(), KvDtype.F32)) {
+                         ? new Qwen3NextMetalBackend(w, 1024, 512, System.getProperty("jllm.metal.lib"), KvDtype.F32)
+                         : new Qwen3NextCpuBackend(w, 1024, 512, Runtime.getRuntime().availableProcessors(), KvDtype.F32)) {
                 float[] logits = new float[vocab];
                 float[] rows = new float[2 * vocab];
+                for (int n : new int[]{8, 32, 128, 512}) { // prefill speed (median of 3 repetitions), head off
+                    int[] ids = new int[n];
+                    for (int i = 0; i < n; i++) {
+                        ids[i] = prompt[i % prompt.length];
+                    }
+                    long[] t = new long[3];
+                    for (int r = 0; r < 3; r++) {
+                        long t0 = System.nanoTime();
+                        b.forward(ids, 0, n, 0, logits);
+                        t[r] = System.nanoTime() - t0;
+                    }
+                    System.out.printf("prefill %d tokens: %.0f ms = %.1f tok/s%n", n, median(t), n / (median(t) / 1e3));
+                }
                 for (boolean mtp : new boolean[]{false, true}) {
                     if (mtp) {
                         b.enableMtp(true);
