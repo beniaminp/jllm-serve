@@ -257,6 +257,11 @@ public final class Settings {
         }
         KvDtype.parse(get("backend.kv-dtype")); // its message names the key
         require(getInt("backend.kv-q4-recent") >= 0, "backend.kv-q4-recent", "must be 0 (= none) or positive");
+        getBool("backend.kv-paged");
+        getBool("backend.kv-prefix-share");
+        require(getInt("backend.kv-block") >= 16 && Integer.bitCount(getInt("backend.kv-block")) == 1, "backend.kv-block",
+                "must be a power of two of at least 16");
+        require(getLong("backend.kv-pool-tokens") >= 0, "backend.kv-pool-tokens", "must be 0 (= every slot's context) or positive");
         try {
             org.robomiri.jllm.metal.MoeSplit.parseLayers(get("backend.metal.cpu-moe"));
         } catch (IllegalArgumentException e) {

@@ -56,6 +56,9 @@ public final class ArchSmoke {
      * their rounding-level difference into a flipped 4-bit code (4e-3 on Phi3Mha); the default pass checks every q4 case.
      */
     private static final boolean Q4 = !"false".equals(System.getProperty("jllm.smoke.q4"));
+    /** -Djllm.smoke.paged=false leaves out the paged-vs-flat KV cache checks (the forced-MMA pass of arch-smoke.sh). */
+    private static final boolean PAGED = !"false".equals(System.getProperty("jllm.smoke.paged"));
+    private static final java.util.Set<String> pagedF16 = new java.util.HashSet<>();
 
     public static void main(String[] args) throws Exception {
         String lib = args[0].equals("-") ? null : args[0];
@@ -186,6 +189,11 @@ public final class ArchSmoke {
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
+            if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
+                boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
+                failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
+            }
             if (!metal) {
                 return failures;
             }

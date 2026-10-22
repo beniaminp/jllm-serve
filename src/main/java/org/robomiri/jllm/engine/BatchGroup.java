@@ -338,6 +338,18 @@ public final class BatchGroup {
         }
 
         @Override
+        public org.robomiri.jllm.kv.KvSequence kvSequence() {
+            return inner.kvSequence();
+        }
+
+        @Override
+        public StateSnapshot snapshotState(int n) {
+            StateSnapshot[] r = new StateSnapshot[1];
+            locked(() -> r[0] = inner.snapshotState(n));
+            return r[0];
+        }
+
+        @Override
         public void saveState(int n, WritableByteChannel out) throws IOException {
             device.lock();
             try {

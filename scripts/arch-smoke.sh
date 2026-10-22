@@ -53,6 +53,11 @@
 # with a draft equals the output without; drafts: the model itself, its Q2_K quantization, and for the plain Llama the
 # other-seed model). The engine needs a tokenizer: models/Qwen_Qwen3-0.6B/tokenizer.json (-Djllm.smoke.tokenizer).
 #
+# Every attention model (not Mamba / Qwen3-Next / DeepSeek's latent cache) also checks the paged KV cache against the flat one, bit for
+# bit, on the CPU backend and on Metal for f32, q8 (and f16 on the first dense and MoE model): scripted prefill / decode /
+# rewind / verification passes, adoption of another slot's blocks, a fork in the middle of a block, eviction to a spill
+# directory and reload, three rows in one batched pass, saved-cache bytes both ways (PagedKvChecks, docs/24); the forced-MMA
+# pass leaves it out (-Djllm.smoke.paged=false).
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 #        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
 #                                            (scripts/build-metal-emu.sh, needs clang++), so no Apple GPU is needed
@@ -164,7 +169,7 @@ done
 # The q4-cache cases are left out of this pass (-Djllm.smoke.q4=false) for the same reason: a batched pass of 3 rows and a
 # lone step take different matmul kernels here, and a 4-bit code flips (4e-3 on Phi3Mha); the first pass checks them all.
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
-  -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 -Djllm.smoke.q4=false \
+  -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 -Djllm.smoke.q4=false -Djllm.smoke.paged=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
   "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
