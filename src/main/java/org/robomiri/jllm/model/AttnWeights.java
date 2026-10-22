@@ -19,18 +19,32 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
     /**
      * Grouped-query attention: {@code q_proj [qDim, dim]}, {@code k_proj} / {@code v_proj [kvDim, dim]}, the
      * q/k/v biases when the spec has them (all three or none), the per-head {@code q_norm} / {@code k_norm}
-     * gains {@code [headDim]} when it has QK-norm (both or none).
+     * gains {@code [headDim]} when it has QK-norm (both or none), and the per-head {@code sinks [heads]} logits when it
+     * has attention sinks.
      */
-    record Gqa(QTensor wq, QTensor wk, QTensor wv, float[] bq, float[] bk, float[] bv, float[] qNorm, float[] kNorm)
-            implements AttnWeights {
+    record Gqa(QTensor wq, QTensor wk, QTensor wv, float[] bq, float[] bk, float[] bv, float[] qNorm, float[] kNorm,
+               float[] sinks) implements AttnWeights {
+
+        /** A layer without attention sinks. */
+        public Gqa(QTensor wq, QTensor wk, QTensor wv, float[] bq, float[] bk, float[] bv, float[] qNorm, float[] kNorm) {
+            this(wq, wk, wv, bq, bk, bv, qNorm, kNorm, null);
+        }
 
         static Gqa load(TensorSource f, String a, Attention.Gqa g) {
             return new Gqa(f.tensor(a + "q_proj.weight"), f.tensor(a + "k_proj.weight"), f.tensor(a + "v_proj.weight"),
                     g.bias() ? f.floats(a + "q_proj.bias") : null,
                     g.bias() ? f.floats(a + "k_proj.bias") : null,
                     g.bias() ? f.floats(a + "v_proj.bias") : null,
-                    g.qkNorm() ? f.floats(a + "q_norm.weight") : null,
-                    g.qkNorm() ? f.floats(a + "k_norm.weight") : null);
+                    g.qkNorm() ? f.floats(a + "q_norm.weight") : g.l2Norm() ? ones(g.headDim()) : null,
+                    g.qkNorm() ? f.floats(a + "k_norm.weight") : g.l2Norm() ? ones(g.headDim()) : null,
+                    g.sinks() ? f.floats(a + "sinks") : null);
+        }
+
+        /** Llama 4's L2 norm of q and k is an RMS norm with all gains 1 (a rotation does not change the norm, so it runs before the RoPE). */
+        private static float[] ones(int n) {
+            float[] v = new float[n];
+            java.util.Arrays.fill(v, 1f);
+            return v;
         }
 
         @Override
@@ -43,8 +57,9 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
                     && wv.rows == g.kvDim() && wv.cols == dim
                     && g.bias() == (bq != null) && g.bias() == (bk != null) && g.bias() == (bv != null)
                     && (bq == null || (bq.length == g.qDim() && bk.length == g.kvDim() && bv.length == g.kvDim()))
-                    && g.qkNorm() == (qNorm != null) && g.qkNorm() == (kNorm != null)
-                    && (qNorm == null || (qNorm.length == g.headDim() && kNorm.length == g.headDim()));
+                    && (g.qkNorm() || g.l2Norm()) == (qNorm != null) && (g.qkNorm() || g.l2Norm()) == (kNorm != null)
+                    && (qNorm == null || (qNorm.length == g.headDim() && kNorm.length == g.headDim()))
+                    && g.sinks() == (sinks != null) && (sinks == null || sinks.length == g.heads());
         }
 
         @Override

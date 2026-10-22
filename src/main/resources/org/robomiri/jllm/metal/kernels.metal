@@ -1486,6 +1486,15 @@ struct AttnParams {
     float softcap;   // Gemma 2: score = tanh(score / softcap) * softcap before the softmax, 0 = off
 };
 
+// What gpt-oss and Llama 4 add to attention_t, per layer and constant: buffer(5) of attention_t holds the words
+//   [0] chunk       Llama 4 chunked attention: a query sees only the keys of its own chunk of `chunk` positions, 0 = off
+//   [1] hasSinks    gpt-oss: one sink logit per query head (words 4 ..) joins the softmax, with a zero value
+//   [2] tempFloor   Llama 4 temperature tuning: q *= 1 + tempScale * ln(1 + floor((pos + 1) / tempFloor)), 0 = off
+//   [3] tempScale   (a float)
+//   [4 + h] sink of query head h
+// (a zeroed buffer for the layers without any of them; the parameter struct stays within the 64 bytes of a recorded step)
+
+
 // The q8 cache (backend.kv-dtype=q8, KV = char): a position's row of the cache is its kvDim int8 values followed by
 // one f32 scale per kv head (stride = kvDim + 4 * nKvHeads bytes; DeepSeek's latent row: aw values, one scale), so
 // value i of kv head h at position s is row[h * headDim + i] * scale[h]. kv_scale(row, stride, nKvHeads, h) is that
@@ -1503,7 +1512,8 @@ kernel void attention_t(device const float *q [[buffer(0)]],
                         device const KV *vc [[buffer(2)]],
                         device float *out [[buffer(3)]],
                         device float *scores [[buffer(4)]],
-                        constant AttnParams &p [[buffer(5)]],
+                        device const float *ext [[buffer(5)]],
+                        constant AttnParams &p [[buffer(6)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort2 tid2 [[thread_position_in_threadgroup]],
                         ushort2 tpg2 [[threads_per_threadgroup]],
@@ -1526,16 +1536,22 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     const int t = p.tokenOffset + tl;
     const int kvh = h0 / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    const int chunk = as_type<int>(ext[0]);
+    const bool hasSinks = as_type<int>(ext[1]) != 0;
+    const int tempFloor = as_type<int>(ext[2]);
+    int first = p.window > 0 ? max(0, len - p.window) : 0;
+    if (chunk > 0) first = max(first, ((len - 1) / chunk) * chunk);
     device const KV *kb = kc + kvh * qkDim;
     device const KV *vb = vc + kvh * vDim;
     device float *sc[G];
     for (int g = 0; g < G; g++) sc[g] = scores + ((ulong)tl * p.nHeads + h0 + g) * p.ctx;
 
+    // Llama 4's temperature tuning scales the query by a function of its position (= len - 1)
+    const float tf = tempFloor > 0 ? precise::log(1.0f + floor(float(len) / float(tempFloor))) * ext[3] + 1.0f : 1.0f;
     float qr[G][MK];
     for (int g = 0; g < G; g++) {
         device const float *qv = q + (ulong)t * p.qStride + (h0 + g) * qkDim;
-        for (int i = 0; i < MK; i++) qr[g][i] = i < perK ? qv[lane + i * 32] : 0.0f;
+        for (int i = 0; i < MK; i++) qr[g][i] = i < perK ? (tempFloor > 0 ? qv[lane + i * 32] * tf : qv[lane + i * 32]) : 0.0f;
     }
 
     // 1. scores: each K row is read once per threadgroup and dotted with the G query heads
@@ -1564,6 +1580,11 @@ kernel void attention_t(device const float *q [[buffer(0)]],
         float r = lane < nsg ? red[g * 8 + lane] : -INFINITY;
         mx[g] = simd_max(r);
     }
+    float sk[G]; // the sink logit of each head joins the maximum and the denominator
+    for (int g = 0; g < G; g++) {
+        sk[g] = hasSinks ? ext[4 + h0 + g] : -INFINITY;
+        mx[g] = max(mx[g], sk[g]);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     // 2. softmax numerators
@@ -1584,6 +1605,7 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     for (int g = 0; g < G; g++) {
         float r = lane < nsg ? red[g * 8 + lane] : 0.0f;
         sum[g] = simd_sum(r);
+        if (hasSinks) sum[g] += exp(sk[g] - mx[g]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
@@ -2313,13 +2335,56 @@ struct MoeParams {
     int topK;
 };
 
+// The parameters of the expert kernels (moe_up / moe_down and their mma / hmma forms): MoeParams plus the arithmetic
+// of gpt-oss's and Llama 4's experts. flags: 1 = clamped SwiGLU (limit, alpha), 2 = the experts have a gate/up bias
+// (added before the activation, buffer `gub`: [experts * 2 * m] gate then up per expert) and a down bias (added to the
+// expert's output before the routing weight, buffer `dnb`: [experts * dim]), 4 = the routing weight multiplies the
+// expert's input (so gate and up before the activation) and not its output. flags 0 is the plain SwiGLU of
+// Qwen3-MoE / DeepSeek with the weight on the output: exactly the arithmetic of these kernels before the flags existed.
+struct MoeXParams {
+    int rowsPerExpert;
+    int cols;
+    int topK;
+    int flags;
+    float limit;
+    float alpha;
+};
+
+// h = act(g, u) of slot s (expert e, unit `unit` of m): see MoeXParams. rw is the slot's routing weight.
+static inline float moe_act(float g, float u, constant MoeXParams &p, device const float *gub, float rws, int e, int unit,
+                            int m) {
+    if (p.flags == 0) return g / (1.0f + exp(-g)) * u;
+    if (p.flags & 2) {
+        g += gub[(ulong)e * 2 * m + unit];
+        u += gub[(ulong)e * 2 * m + m + unit];
+    }
+    if (p.flags & 4) {
+        g *= rws;
+        u *= rws;
+    }
+    if (p.flags & 1) {
+        g = min(g, p.limit);
+        u = max(-p.limit, min(p.limit, u));
+        return (u + 1.0f) * (g / (1.0f + exp(-p.alpha * g)));
+    }
+    return g / (1.0f + exp(-g)) * u;
+}
+
+// y = rw * (dot + down bias): the weighted output of an expert (the weight is 1 when it went into the input).
+static inline float moe_out(float dot, constant MoeXParams &p, device const float *dnb, float rws, int e, int row, int dim) {
+    if (p.flags == 0) return rws * dot;
+    return ((p.flags & 4) ? 1.0f : rws) * (dot + ((p.flags & 2) ? dnb[(ulong)e * dim + row] : 0.0f));
+}
+
 template <int QT>
 kernel void moe_up(device const uchar *wq [[buffer(0)]],
                    device const float *ws [[buffer(1)]],
                    device const float *x [[buffer(2)]],
                    device const int *assign [[buffer(3)]],
                    device float *out [[buffer(4)]],
-                   constant MoeParams &p [[buffer(5)]],
+                   device const float *gub [[buffer(5)]],
+                   device const float *rw [[buffer(6)]],
+                   constant MoeXParams &p [[buffer(7)]],
                    uint2 tgp [[threadgroup_position_in_grid]],
                    ushort sg [[simdgroup_index_in_threadgroup]],
                    ushort lane [[thread_index_in_simdgroup]],
@@ -2344,7 +2409,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
     }
     g = simd_sum(g);
     u = simd_sum(u);
-    if (lane == 0) out[(ulong)s * m + row] = g / (1.0f + exp(-g)) * u;
+    if (lane == 0) out[(ulong)s * m + row] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, assign[s], row, m);
 }
 
 // moe_down: x[t, row] += sum_k rw[t,k] * (W_{assign[t,k]}[row] . h[t*topK + k]). rowsPerExpert = dim.
@@ -2358,7 +2423,8 @@ kernel void moe_down(device const uchar *wq [[buffer(0)]],
                      device const int *assign [[buffer(3)]],
                      device const float *rw [[buffer(4)]],
                      device float *x [[buffer(5)]],
-                     constant MoeParams &p [[buffer(6)]],
+                     device const float *dnb [[buffer(6)]],
+                     constant MoeXParams &p [[buffer(7)]],
                      uint2 tgp [[threadgroup_position_in_grid]],
                      ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]],
@@ -2375,7 +2441,7 @@ kernel void moe_down(device const uchar *wq [[buffer(0)]],
         device const float4 *h4 = (device const float4 *)(h + (ulong)s * p.cols);
         float acc = 0.0f;
         for (int b = lane; b < nb; b += 32) acc += block_dot<QT>(wq, ws, grow, nb, b, h4 + b * 8);
-        total += rw[s] * simd_sum(acc);
+        total += moe_out(simd_sum(acc), p, dnb, rw[s], assign[s], row, p.rowsPerExpert);
     }
     if (lane == 0) x[(ulong)t * p.rowsPerExpert + row] += total;
 }
@@ -2455,7 +2521,9 @@ kernel void moe_up_mma(device const uchar *wq [[buffer(0)]],
                        device const int *order [[buffer(3)]],
                        device const int *tiles [[buffer(4)]],
                        device float *out [[buffer(5)]],
-                       constant MoeParams &p [[buffer(6)]],
+                       device const float *gub [[buffer(6)]],
+                       device const float *rw [[buffer(7)]],
+                       constant MoeXParams &p [[buffer(8)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -2481,7 +2549,8 @@ kernel void moe_up_mma(device const uchar *wq [[buffer(0)]],
         if (t < cnt && unit0 + j < m) {
             const float g = sa[t * MMA_BR + j];
             const float u = sa[t * MMA_BR + 32 + j];
-            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+            const int s = order[start + t];
+            out[(ulong)s * m + unit0 + j] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, e, unit0 + j, m);
         }
     }
 }
@@ -2495,7 +2564,8 @@ kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
                          device const int *tiles [[buffer(4)]],
                          device const float *rw [[buffer(5)]],
                          device float *ys [[buffer(6)]],
-                         constant MoeParams &p [[buffer(7)]],
+                         device const float *dnb [[buffer(7)]],
+                         constant MoeXParams &p [[buffer(8)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -2515,7 +2585,7 @@ kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
         const int t = i / MMA_BR, j = i % MMA_BR;
         if (t < cnt && row0 + j < p.rowsPerExpert) {
             const int s = order[start + t];
-            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * sa[t * MMA_BR + j];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = moe_out(sa[t * MMA_BR + j], p, dnb, rw[s], e, row0 + j, p.rowsPerExpert);
         }
     }
 }
@@ -2588,7 +2658,7 @@ static inline void router_ds_row(device const float *xv, device const float *w, 
         for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
         for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
         d = simd_sum(d);
-        if (lane == 0) scores[e] = d;
+        if (lane == 0) scores[e] = p.method == 3 ? d + bias[e] : d; // method 3: gpt-oss's router has a linear bias
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (p.sigmoidScore) {
@@ -2611,7 +2681,7 @@ static inline void router_ds_row(device const float *xv, device const float *w, 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid != 0) return;
 
-    if (p.method != 0) {
+    if (p.method == 1 || p.method == 2) {
         const int gs = ne / p.nGroup;
         float gsc[MAX_GROUPS];
         bool keep[MAX_GROUPS];
@@ -4332,7 +4402,9 @@ kernel void moe_up_hmma(device const uchar *wq [[buffer(0)]],
                         device const int *order [[buffer(3)]],
                         device const int *tiles [[buffer(4)]],
                         device float *out [[buffer(5)]],
-                        constant MoeParams &p [[buffer(6)]],
+                        device const float *gub [[buffer(6)]],
+                        device const float *rw [[buffer(7)]],
+                        constant MoeXParams &p [[buffer(8)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort tid [[thread_index_in_threadgroup]],
                         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -4356,7 +4428,8 @@ kernel void moe_up_hmma(device const uchar *wq [[buffer(0)]],
         if (t < cnt && unit0 + j < m) {
             const float g = smem[t * MMA_BR + j];
             const float u = smem[t * MMA_BR + 32 + j];
-            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+            const int s = order[start + t];
+            out[(ulong)s * m + unit0 + j] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, e, unit0 + j, m);
         }
     }
 }
@@ -4369,7 +4442,8 @@ kernel void moe_down_hmma(device const uchar *wq [[buffer(0)]],
                           device const int *tiles [[buffer(4)]],
                           device const float *rw [[buffer(5)]],
                           device float *ys [[buffer(6)]],
-                          constant MoeParams &p [[buffer(7)]],
+                          device const float *dnb [[buffer(7)]],
+                          constant MoeXParams &p [[buffer(8)]],
                           uint2 tgp [[threadgroup_position_in_grid]],
                           ushort tid [[thread_index_in_threadgroup]],
                           ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -4389,7 +4463,7 @@ kernel void moe_down_hmma(device const uchar *wq [[buffer(0)]],
         const int t = i / MMA_BR, j = i % MMA_BR;
         if (t < cnt && row0 + j < p.rowsPerExpert) {
             const int s = order[start + t];
-            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * smem[t * MMA_BR + j];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = moe_out(smem[t * MMA_BR + j], p, dnb, rw[s], e, row0 + j, p.rowsPerExpert);
         }
     }
 }

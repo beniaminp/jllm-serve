@@ -43,17 +43,36 @@ public sealed interface MlpWeights permits MlpWeights.Dense, MlpWeights.Moe {
      * {@code expDown} (cols = moeDim).
      *
      * @param router     {@code [experts × dim]}, f32
-     * @param routerBias DeepSeek-V3 {@code e_score_correction_bias [experts]}, null for the other routers
+     * @param routerBias DeepSeek-V3 {@code e_score_correction_bias [experts]} (a selection bias), or the linear bias of a
+     *                   {@link Router.TopLogits} router; null for the other routers
      * @param shared     DeepSeek's shared experts as one dense SwiGLU, null when the layer has none
+     * @param gateUpBias gpt-oss: {@code [experts * 2 * moeDim]} f32, gate then up per expert like the rows of expGateUp; else null
+     * @param downBias   gpt-oss: {@code [experts * dim]} f32; else null
      */
-    record Moe(float[] router, float[] routerBias, QTensor expGateUp, QTensor expDown, Dense shared) implements MlpWeights {
+    record Moe(float[] router, float[] routerBias, QTensor expGateUp, QTensor expDown, Dense shared, float[] gateUpBias,
+               float[] downBias) implements MlpWeights {
+
+        public Moe(float[] router, float[] routerBias, QTensor expGateUp, QTensor expDown, Dense shared) {
+            this(router, routerBias, expGateUp, expDown, shared, null, null);
+        }
 
         static Moe load(TensorSource f, String p, Mlp.Moe m) {
-            boolean bias = m.router() instanceof Router.DeepSeek r && r.hasBias();
+            boolean bias = hasRouterBias(m);
             Dense shared = m.shared() == null ? null
                     : new Dense(f.tensor(p + "mlp.shared.gate_up"), f.tensor(p + "mlp.shared.down"));
+            // an MXFP4 checkpoint keeps the gate and the up experts apart (the GGUF kernels read them as two views)
+            QTensor gateUp = f.has(p + "mlp.experts.gate_up") ? f.tensor(p + "mlp.experts.gate_up")
+                    : QTensor.split(f.tensor(p + "mlp.experts.gate"), f.tensor(p + "mlp.experts.up"), m.moeDim());
             return new Moe(f.floats(p + "mlp.router"), bias ? f.floats(p + "mlp.router_bias") : null,
-                    f.tensor(p + "mlp.experts.gate_up"), f.tensor(p + "mlp.experts.down"), shared);
+                    gateUp, f.tensor(p + "mlp.experts.down"), shared,
+                    m.spec().bias() ? f.floats(p + "mlp.experts.gate_up_bias") : null,
+                    m.spec().bias() ? f.floats(p + "mlp.experts.down_bias") : null);
+        }
+
+        /** Whether the router has a bias vector: DeepSeek-V3's correction bias or the linear bias of a top-logits router. */
+        static boolean hasRouterBias(Mlp.Moe m) {
+            return m.router() instanceof Router.DeepSeek r ? r.hasBias()
+                    : m.router() instanceof Router.TopLogits t && t.bias();
         }
 
         @Override
@@ -61,12 +80,15 @@ public sealed interface MlpWeights permits MlpWeights.Dense, MlpWeights.Moe {
             if (!(spec instanceof Mlp.Moe m)) {
                 return false;
             }
-            boolean bias = m.router() instanceof Router.DeepSeek r && r.hasBias();
+            boolean bias = hasRouterBias(m);
+            boolean eb = m.spec().bias();
             return router.length == m.experts() * dim
                     && expGateUp.rows == m.experts() * 2 * m.moeDim() && expGateUp.cols == dim
                     && expDown.rows == m.experts() * dim && expDown.cols == m.moeDim()
                     && (m.shared() == null ? shared == null : shared != null && shared.matches(m.shared(), dim))
-                    && (bias ? routerBias != null && routerBias.length == m.experts() : routerBias == null);
+                    && (bias ? routerBias != null && routerBias.length == m.experts() : routerBias == null)
+                    && (eb ? gateUpBias != null && gateUpBias.length == m.experts() * 2 * m.moeDim()
+                    && downBias != null && downBias.length == m.experts() * dim : gateUpBias == null && downBias == null);
         }
 
         @Override

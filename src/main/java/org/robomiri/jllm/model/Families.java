@@ -39,10 +39,13 @@ final class Families {
             Map.entry("mamba", "MambaForCausalLM"),
             Map.entry("deepseek_v2", "DeepseekV2ForCausalLM"),
             Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"),
-            Map.entry("qwen3_next", "Qwen3NextForCausalLM"));
+            Map.entry("qwen3_next", "Qwen3NextForCausalLM"),
+            Map.entry("gpt_oss", "GptOssForCausalLM"),
+            Map.entry("llama4_text", "Llama4ForCausalLM"));
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
-    private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration");
+    private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration",
+            "llama4_text", "Llama4ForConditionalGeneration");
 
     static Architecture parse(Map<String, Object> c) {
         List<Object> archs = Json.list(c, "architectures");
@@ -91,6 +94,8 @@ final class Families {
             case "gemma3_text" -> gemma(new Draft(c, modelType, arch), true);
             case "deepseek_v2" -> deepseek(new Draft(c, modelType, arch), false);
             case "deepseek_v3" -> deepseek(new Draft(c, modelType, arch), true);
+            case "gpt_oss" -> gptOss(new Draft(c, modelType, arch));
+            case "llama4_text" -> llama4(new Draft(c, modelType, arch));
             default -> throw new IllegalStateException(modelType); // SUPPORTED lists exactly the cases above
         };
     }
@@ -308,6 +313,127 @@ final class Families {
     }
 
     /**
+     * gpt-oss (transformers' modeling_gpt_oss.py): alternating sliding-window ({@code sliding_window}, 128) and full
+     * attention layers ({@code layer_types}, else sliding on the even layers), a learned sink logit per head in every
+     * softmax, biases on q, k, v and o_proj ({@code attention_bias} defaults to true), YaRN with {@code truncate} false,
+     * and in every layer a MoE of {@code num_local_experts} experts of width {@code intermediate_size} with a biased
+     * router (top-k logits, then a softmax over the selected ones) and the clamped SwiGLU of
+     * {@code swiglu_limit} / {@code swiglu_alpha}, with biases in the experts.
+     */
+    private static Decoder gptOss(Draft d) {
+        Map<String, Object> c = d.c;
+        d.bias = Draft.Bias.CONFIG_QKVO_DEFAULT_TRUE;
+        d.thetaDefault = 150000.0;
+        d.normEpsDefault = 1e-5;
+        d.expertsKey = "num_local_experts";
+        d.moeDimOverride = (int) Json.num(c, "intermediate_size", 0);
+        d.sinks = true;
+        d.window = Draft.Window.PER_LAYER;
+        d.local = new boolean[d.layers];
+        List<Object> types = Json.list(c, "layer_types");
+        if (types != null && types.size() < d.layers) {
+            throw new IllegalArgumentException("config.json: layer_types has " + types.size() + " entries for "
+                    + d.layers + " layers");
+        }
+        for (int l = 0; l < d.layers; l++) {
+            if (types == null) {
+                d.local[l] = l % 2 == 0;
+                continue;
+            }
+            Object t = types.get(l);
+            if (!"sliding_attention".equals(t) && !"full_attention".equals(t)) {
+                throw new IllegalArgumentException("config.json: unsupported layer_types[" + l + "] = " + t
+                        + " (sliding_attention, full_attention)");
+            }
+            d.local[l] = "sliding_attention".equals(t);
+        }
+        d.slidingDefault = 128; // GptOssConfig's default
+        Map<String, Object> yarn = new LinkedHashMap<>();
+        yarn.put("rope_type", "yarn");
+        yarn.put("factor", 32.0);
+        yarn.put("beta_fast", 32.0);
+        yarn.put("beta_slow", 1.0);
+        yarn.put("truncate", Boolean.FALSE);
+        yarn.put("original_max_position_embeddings", 4096L);
+        d.scalingDefault = yarn;
+        d.router = new Router.TopLogits(false, true);
+        d.expertSpec = new Mlp.ExpertSpec((float) Json.dbl(c, "swiglu_limit", 7.0), (float) Json.dbl(c, "swiglu_alpha", 1.702),
+                true, false, true);
+        return d.build();
+    }
+
+    /**
+     * Llama 4 text (Scout, Maverick; transformers' modeling_llama4.py): rotate-pairs RoPE (adjacent pairs, llama3-scaled)
+     * on the layers {@code no_rope_layers} marks with 1, which also attend chunk-wise ({@code attention_chunk_size}, the
+     * {@code layer_types} "chunked_attention"); the others (every 4th) are NoPE layers with global attention whose
+     * queries get the position-dependent temperature of {@code attn_temperature_tuning}; the rotated layers L2-normalize
+     * q and k after the rotation ({@code use_qk_norm}). Layers in {@code moe_layers} (else every
+     * {@code interleave_moe_layer_step}-th) route to {@code num_local_experts} experts of width {@code intermediate_size}
+     * by the sigmoid of the top-k router logits applied to the expert's input, plus one shared expert; the other
+     * layers are dense with {@code intermediate_size_mlp}.
+     */
+    private static Decoder llama4(Draft d) {
+        Map<String, Object> c = d.c;
+        d.bias = Draft.Bias.CONFIG_QKVO;
+        d.thetaDefault = 500000.0;
+        d.normEpsDefault = 1e-5;
+        d.pairing = Pairing.INTERLEAVED;
+        d.expertsKey = "num_local_experts";
+        d.moeDimOverride = (int) Json.num(c, "intermediate_size", 0);
+        d.hiddenDim = (int) Json.num(c, "intermediate_size_mlp", 0);
+        d.nShared = 1;
+        d.router = new Router.TopLogits(true, false);
+        d.expertSpec = new Mlp.ExpertSpec(0f, 0f, false, true, false);
+        d.noPe = new boolean[d.layers];
+        List<Object> noRope = Json.list(c, "no_rope_layers");
+        int interval = (int) Json.num(c, "no_rope_layer_interval", 4);
+        if (noRope != null && noRope.size() < d.layers) {
+            throw new IllegalArgumentException("config.json: no_rope_layers has " + noRope.size() + " entries for "
+                    + d.layers + " layers");
+        }
+        for (int l = 0; l < d.layers; l++) {
+            boolean rope = noRope != null ? ((Number) noRope.get(l)).intValue() != 0 : (l + 1) % Math.max(1, interval) != 0;
+            d.noPe[l] = !rope;
+        }
+        long chunk = c.get("attention_chunk_size") == null && c.containsKey("attention_chunk_size") ? 0
+                : Json.num(c, "attention_chunk_size", 8192);
+        d.chunked = new boolean[d.layers];
+        List<Object> types = Json.list(c, "layer_types");
+        for (int l = 0; l < d.layers; l++) {
+            if (types != null && l < types.size()) {
+                Object t = types.get(l);
+                if (!"chunked_attention".equals(t) && !"full_attention".equals(t)) {
+                    throw new IllegalArgumentException("config.json: unsupported layer_types[" + l + "] = " + t
+                            + " (chunked_attention, full_attention)");
+                }
+                d.chunked[l] = "chunked_attention".equals(t);
+            } else {
+                d.chunked[l] = !d.noPe[l];
+            }
+        }
+        d.chunkSize = (int) Math.max(0, Math.min(chunk, Integer.MAX_VALUE));
+        d.l2Norm = Json.bool(c, "use_qk_norm", true);
+        if (Json.bool(c, "attn_temperature_tuning", true)) {
+            d.tempFloor = (int) Json.num(c, "floor_scale", 8192);
+            d.tempScale = (float) Json.dbl(c, "attn_scale", 0.1);
+        }
+        int step = (int) Json.num(c, "interleave_moe_layer_step", 1);
+        List<Object> moeLayers = Json.list(c, "moe_layers");
+        Set<Integer> moeSet = new java.util.HashSet<>();
+        if (moeLayers != null) {
+            for (Object o : moeLayers) {
+                moeSet.add(((Number) o).intValue());
+            }
+        } else {
+            for (int l = Math.max(1, step) - 1; l < d.layers; l += Math.max(1, step)) {
+                moeSet.add(l);
+            }
+        }
+        d.moeLayer = moeSet::contains;
+        return d.build();
+    }
+
+    /**
      * Mamba (v1) sizes: {@code state_size}, {@code conv_kernel}, {@code time_step_rank} (resolved from "auto" =
      * ceil(d_model/16)), {@code d_inner} ({@code intermediate_size} or {@code expand * hidden_size}) and the two
      * optional biases. The LM head is tied to the embeddings unless the config says otherwise (the released
@@ -373,7 +499,9 @@ final class Families {
             /** q/k/v biases from the config value, true when absent (GLM); no o_proj bias. */
             CONFIG_DEFAULT_TRUE,
             /** The config value, false when absent, biases q, k, v and o_proj (Llama, Qwen3, Gemma). */
-            CONFIG_QKVO
+            CONFIG_QKVO,
+            /** As {@link #CONFIG_QKVO} but true when absent (gpt-oss). */
+            CONFIG_QKVO_DEFAULT_TRUE
         }
 
         final Map<String, Object> c;
@@ -387,7 +515,7 @@ final class Families {
         final int dim;
         final int layers;
         final int vocab;
-        final int hiddenDim;
+        int hiddenDim;
         final int heads;
         int kvHeads;
         int headDim;
@@ -422,6 +550,21 @@ final class Families {
         int firstKDense;
         Attention.Mla mla;
         Scaling.Yarn yarn;
+        /** gpt-oss / Llama 4: the learned attention sinks, the experts' arithmetic, and where the width of an expert lives. */
+        boolean sinks;
+        Mlp.ExpertSpec expertSpec = Mlp.ExpertSpec.PLAIN;
+        int moeDimOverride;
+        /** {@code sliding_window} when the config omits it (gpt-oss: 128). */
+        long slidingDefault;
+        /** The rope scaling a config without one gets (gpt-oss's YaRN), null = plain RoPE. */
+        Map<String, Object> scalingDefault;
+        /** Llama 4: chunked attention layers and their chunk, NoPE layers, L2 q/k norm, temperature tuning. */
+        int chunkSize;
+        boolean[] chunked;
+        boolean[] noPe;
+        boolean l2Norm;
+        int tempFloor;
+        float tempScale;
 
         Draft(Map<String, Object> c, String modelType, String architecture) {
             this.c = c;
@@ -469,6 +612,7 @@ final class Families {
                 case ALWAYS -> true;
                 case CONFIG_DEFAULT_TRUE -> Json.bool(c, "attention_bias", true);
                 case CONFIG_QKVO -> Json.bool(c, "attention_bias", false);
+                case CONFIG_QKVO_DEFAULT_TRUE -> Json.bool(c, "attention_bias", true);
                 case REJECT -> {
                     if (Json.bool(c, "attention_bias", false)) {
                         throw new IllegalArgumentException("attention_bias=true is not supported for " + modelType
@@ -477,7 +621,7 @@ final class Families {
                     yield false;
                 }
             };
-            boolean outBias = attnBias && bias == Bias.CONFIG_QKVO;
+            boolean outBias = attnBias && (bias == Bias.CONFIG_QKVO || bias == Bias.CONFIG_QKVO_DEFAULT_TRUE);
             double partialRotary = Json.dbl(c, "partial_rotary_factor",
                     Json.dbl(globalRope, "partial_rotary_factor", partialRotaryDefault));
             if (partialRotary <= 0 || partialRotary > 1 || (int) (headDim * partialRotary) < 2) {
@@ -487,7 +631,7 @@ final class Families {
             double ropeTheta = Json.dbl(c, "rope_theta", Json.dbl(globalRope, "rope_theta", thetaDefault));
             int sw = 0;
             int windowFrom = 0;
-            long swRaw = Json.num(c, "sliding_window", 0);
+            long swRaw = Json.num(c, "sliding_window", slidingDefault);
             if (swRaw > 0) {
                 switch (window) {
                     case NONE -> {
@@ -501,13 +645,14 @@ final class Families {
                     }
                 }
             }
+            Map<String, Object> scalingMap = this.scalingMap != null ? this.scalingMap : scalingDefault;
             Scaling scaling = mla != null ? Scaling.NONE : parseRopeScaling(scalingMap, c, rotaryDim);
             List<Integer> eos = intList(c, "eos_token_id");
             Set<Integer> mlpOnlyLayers = Set.copyOf(intList(c, "mlp_only_layers"));
             double normEps = Json.dbl(c, "rms_norm_eps", normEpsDefault);
             int numExperts = (int) Json.num(c, expertsKey, 0);
             int topK = (int) Json.num(c, "num_experts_per_tok", 0);
-            int moeDim = (int) Json.num(c, "moe_intermediate_size", 0);
+            int moeDim = moeDimOverride > 0 ? moeDimOverride : (int) Json.num(c, "moe_intermediate_size", 0);
             if (numExperts > 0 && (topK <= 0 || topK > numExperts || moeDim <= 0)) {
                 throw new IllegalArgumentException("invalid MoE config: num_experts=" + numExperts
                         + " num_experts_per_tok=" + topK + " moe_intermediate_size=" + moeDim);
@@ -540,15 +685,25 @@ final class Families {
             if (anyLocal) {
                 tables.add(new RopeTable(rotaryDim, localTheta, Scaling.NONE, pairing));
             }
+            int noPeTable = -1;
+            for (int l = 0; noPe != null && l < layers; l++) {
+                if (noPe[l] && noPeTable < 0) {
+                    noPeTable = tables.size(); // an identity table: the NoPE layers go through the same rotary kernels
+                    tables.add(new RopeTable(rotaryDim, ropeTheta, Scaling.IDENTITY, pairing));
+                }
+            }
             float scale = (float) (1.0 / Math.sqrt(Double.isNaN(queryScalar) ? headDim : queryScalar));
             Mlp.Dense shared = nShared > 0 ? new Mlp.Dense(nShared * moeDim, Activation.SILU) : null;
             List<LayerSpec> specs = new ArrayList<>(layers);
             for (int l = 0; l < layers; l++) {
                 boolean windowed = sw > 0 && (window == Window.PER_LAYER ? local[l] : l >= windowFrom);
+                boolean nope = noPe != null && noPe[l];
                 Attention attn = mla != null ? mla
-                        : new Attention.Gqa(heads, kvHeads, headDim, windowed ? sw : 0, anyLocal && local[l] ? 1 : 0,
-                        qkNorm, attnBias, outBias, scale, attnSoftcap);
-                Mlp mlp = isMoe[l] ? new Mlp.Moe(numExperts, topK, moeDim, normTopK, router, shared)
+                        : new Attention.Gqa(heads, kvHeads, headDim, windowed ? sw : 0,
+                        nope ? noPeTable : anyLocal && local[l] ? 1 : 0, qkNorm, attnBias, outBias, scale, attnSoftcap,
+                        sinks, chunked != null && chunked[l] ? chunkSize : 0, l2Norm && !nope,
+                        nope ? tempFloor : 0, nope ? tempScale : 0f);
+                Mlp mlp = isMoe[l] ? new Mlp.Moe(numExperts, topK, moeDim, normTopK, router, shared, expertSpec)
                         : new Mlp.Dense(hiddenDim, act);
                 specs.add(new LayerSpec(attn, mlp, norms));
             }
@@ -570,7 +725,16 @@ final class Families {
                     + (pairing != Pairing.INTERLEAVED && rotaryDim != headDim ? " rotary=" + rotaryDim : "")
                     + (norms.post() ? " postnorms" : "")
                     + (gemma ? " gemma(softcap=" + attnSoftcap + "/" + finalSoftcap + " qscalar=" + queryScalar
-                    + " localRope=" + localTheta + " layers=" + localLayerString() + ")" : "");
+                    + " localRope=" + localTheta + " layers=" + localLayerString() + ")" : "")
+                    + (sinks ? " sinks layers=" + localLayerString() : "")
+                    + (expertSpec.special() ? String.format(" experts(%s%s%s)", expertSpec.clamped()
+                    ? "clamp" + expertSpec.clampLimit() + "/" + expertSpec.alpha() + " " : "",
+                    expertSpec.bias() ? "bias " : "", expertSpec.weightInput() ? "inputweight" : "") : "")
+                    + (router instanceof Router.TopLogits t ? " router=toplogits" + (t.sigmoid() ? "/sigmoid" : "/softmax")
+                    + (t.bias() ? "/bias" : "") : "")
+                    + (chunked != null ? " chunk=" + chunkSize + " layers=" + layerString(chunked) + " nope="
+                    + layerString(noPe) + (l2Norm ? " l2" : "") + (tempFloor > 0 ? " temp=" + tempFloor + "/" + tempScale : "") : "")
+                    + (scaling instanceof Scaling.Yarn y && !y.truncate() ? " yarn-notrunc" : "");
             String description = String.format("%s dim=%d ffn=%d layers=%d heads=%d/%d headDim=%d vocab=%d theta=%.0f%s%s",
                     architecture, dim, hiddenDim, layers, heads, kvHeads, headDim, vocab, ropeTheta, moe, extra);
 
@@ -581,8 +745,12 @@ final class Families {
         }
 
         private String localLayerString() {
+            return layerString(local);
+        }
+
+        private static String layerString(boolean[] flags) {
             StringBuilder sb = new StringBuilder();
-            for (boolean b : local) {
+            for (boolean b : flags) {
                 sb.append(b ? 'L' : 'G');
             }
             return sb.toString();
@@ -595,6 +763,7 @@ final class Families {
     private static String scalingKey(Scaling s) {
         return switch (s) {
             case Scaling.None n -> "default";
+            case Scaling.Identity i -> "none";
             case Scaling.Linear l -> "linear";
             case Scaling.Llama3 l -> "llama3";
             case Scaling.LongRope l -> "longrope";
@@ -605,6 +774,7 @@ final class Families {
     private static double scalingFactor(Scaling s) {
         return switch (s) {
             case Scaling.None n -> 1.0;
+            case Scaling.Identity i -> 1.0;
             case Scaling.Linear l -> l.factor();
             case Scaling.Llama3 l -> l.factor();
             case Scaling.LongRope l -> l.factor();
@@ -649,7 +819,7 @@ final class Families {
                 double low = Json.dbl(rs, "low_freq_factor", 1.0);
                 double high = Json.dbl(rs, "high_freq_factor", 4.0);
                 int orig = (int) Json.num(rs, "original_max_position_embeddings", 8192);
-                if (factor <= 0 || low <= 0 || high <= low || orig <= 0) {
+                if (factor <= 0 || low <= 0 || high < low || orig <= 0) {
                     throw new IllegalArgumentException("invalid llama3 rope_scaling: " + rs);
                 }
                 return new Scaling.Llama3(factor, low, high, orig);
@@ -702,13 +872,11 @@ final class Families {
         if (!(factor > 0) || orig <= 0 || !(betaFast > betaSlow) || !(betaSlow > 0) || attention < 0) {
             throw new IllegalArgumentException("invalid yarn rope_scaling: " + rs);
         }
-        if (!Json.bool(rs, "truncate", true)) {
-            throw new IllegalArgumentException("yarn rope_scaling with truncate=false is not supported");
-        }
+        boolean truncate = Json.bool(rs, "truncate", true);
         double mscale = Json.dbl(rs, "mscale", 0);
         double mscaleAllDim = Json.dbl(rs, "mscale_all_dim", 0);
         boolean both = mscale != 0 && mscaleAllDim != 0;
-        return new Scaling.Yarn(factor, orig, betaFast, betaSlow, both ? mscale : 1, both ? mscaleAllDim : 0, attention);
+        return new Scaling.Yarn(factor, orig, betaFast, betaSlow, both ? mscale : 1, both ? mscaleAllDim : 0, attention, truncate);
     }
 
     private static double[] factors(Map<String, Object> rs, String key, int n) {

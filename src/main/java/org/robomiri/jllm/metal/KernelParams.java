@@ -29,6 +29,7 @@ public enum KernelParams {
     ROUTER_DS("RouterDsParams", "iiiiiiiiifi"),
     ROUTER_DS_NORM("RouterDsNormParams", "iiiiiiiiifif"),
     MOE("MoeParams", "iii"),
+    MOE_X("MoeXParams", "iiiiff"),
     MOE_SORT("MoeSortParams", "iii"),
     EMBED("EmbedParams", "iif"),
     ARGMAX("ArgmaxParams", "ii"),
