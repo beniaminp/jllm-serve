@@ -10,6 +10,7 @@ import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DecoderLayer;
 import org.robomiri.jllm.kv.KvPool;
 import org.robomiri.jllm.kv.KvSequence;
+import org.robomiri.jllm.kv.KvTierConfig;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.LayerSpec;
@@ -68,6 +69,13 @@ public final class MetalBackend implements Backend {
      * ({@code pageTbl}, a device copy of {@link KvSequence#table()} kept by the sequence's sink, and {@code pageShift}).
      */
     private final KvSequence seq;
+    /**
+     * A slot whose context does not fit the hot tier keeps its KV in host memory and streams one layer at a time through two
+     * windows (docs/26 §26.2.2): true when {@link #streamed} is set up. The flat attention kernels run over the windows.
+     */
+    private final boolean streaming;
+    private final KvTierConfig tier;
+    private StreamedKv streamed;
     private Metal.Buffer pageTbl;
     private int pageShift;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
@@ -259,13 +267,23 @@ public final class MetalBackend implements Backend {
 
     /** {@code split}: which MoE layers run their routed experts on the CPU (see {@link MoeSplit}). */
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, null);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, null, null);
     }
 
     /** With a paged KV cache over {@code kvPool} (from {@link #newKvPool}); null = the flat cache. */
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split,
                         KvPool kvPool) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool, null);
+    }
+
+    /**
+     * With tiered KV storage: a {@code tier} whose {@link KvTierConfig#stream()} is {@code FORCE} (and no pool) makes this slot
+     * keep its KV cache in host memory and stream it layer by layer through two GPU windows, for a context larger than the
+     * GPU's share of memory; results are bit-identical to the flat cache (docs/26).
+     */
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split,
+                        KvPool kvPool, KvTierConfig tier) {
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool, tier);
     }
 
     /**
@@ -276,6 +294,16 @@ public final class MetalBackend implements Backend {
      */
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
                                    String metalLib) {
+        return newKvPool(w, ctx, slots, kvDtype, blockTokens, poolTokens, metalLib, null);
+    }
+
+    /**
+     * {@link #newKvPool(ModelWeights, int, int, KvDtype, int, long, String)} with tiered storage: {@code tier.hotBytes()}
+     * (when positive) caps the blocks the pool commits on the GPU; the blocks pushed out go down to the pool's spill
+     * store. The pool is counted in the {@link DeviceLedger} either way.
+     */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   String metalLib, KvTierConfig tier) {
         Decoder arch = w.decoder();
         if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4 || blockTokens < 16
                 || Integer.bitCount(blockTokens) != 1) {
@@ -290,7 +318,13 @@ public final class MetalBackend implements Backend {
         String format = "paged " + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && KvQ4.supports(g.headDim()) ? " rot" : "")
                 + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
                 + g.headDim() + " block=" + blockTokens;
-        return new KvPool(st, (int) blocks, format);
+        KvPool pool = new KvPool(st, (int) blocks, format);
+        if (tier != null && tier.hotBytes() > 0) {
+            pool.setHotCap((int) Math.max(1, Math.min(blocks, tier.hotBytes() / st.residentBytes())));
+            pool.setPrefetch(tier.prefetch());
+        }
+        st.register(w, pool);
+        return pool;
     }
 
     private static Metal open(Decoder d, String metalLib) {
@@ -322,7 +356,7 @@ public final class MetalBackend implements Backend {
 
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
     private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype, MoeSplit split,
-                         KvPool kvPool) {
+                         KvPool kvPool, KvTierConfig tier) {
         this.w = w;
         this.split = split;
         this.arch = w.decoder();
@@ -341,6 +375,9 @@ public final class MetalBackend implements Backend {
         this.kvHalf = kvDtype == KvDtype.F16;
         this.seq = kvPool != null && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4
                 ? kvPool.newSequence(ctx) : null;
+        this.tier = tier;
+        this.streaming = tier != null && tier.stream() == KvTierConfig.Stream.FORCE && seq == null
+                && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -397,6 +434,17 @@ public final class MetalBackend implements Backend {
                 pageTbl = k.scratch(4L * Math.max(1, seq.table().length));
                 MemorySegment table = pageTbl.contents();
                 seq.setSink((i, b) -> table.setAtIndex(ValueLayout.JAVA_INT, i, b));
+            } else if (streaming) { // two windows of one layer's rows each, shared by even and odd layers (docs/26)
+                long rowBytes = kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+                long kvBytes = ctx * rowBytes;
+                Metal.Buffer[] wk = {k.scratch(kvBytes), k.scratch(kvBytes)};
+                Metal.Buffer[] wv = {k.scratch(kvBytes), k.scratch(kvBytes)};
+                for (int l = 0; l < c.layers(); l++) {
+                    keyCache[l] = wk[l & 1];
+                    valCache[l] = wv[l & 1];
+                }
+                streamed = new StreamedKv(c.layers(), ctx, rowBytes, wk, wv, tier.hostBytes(),
+                        tier.dir() != null ? tier.dir().resolve("stream") : null);
             } else {
                 long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
                 for (int l = 0; l < c.layers(); l++) {
@@ -1524,25 +1572,72 @@ public final class MetalBackend implements Backend {
      * rest is encoded (not in a pipelined step, which must stay one command buffer).
      */
     private void encodeLayers(int n, int pos, boolean split) {
-        int dim = c.dim();
         boolean fuseNorm = n == 1 && fusedNormFits;
         for (int l = 0; l < c.layers(); l++) {
-            LayerPlan L = plans[l];
-            L.attention().run(l, n, pos, fuseNorm);
-            if (L.postAttnNorm() != null) {
-                // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
-                k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
-                k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
-            } else {
-                k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
-            }
-            L.ffn().run(l, n, fuseNorm);
-            if (deepstack != null && l < deepstack.length) {
-                addDeepstack(l, n);
-            }
+            encodeLayer(l, n, pos, fuseNorm);
             if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                 k.commit(); // the GPU starts on these layers while the next ones are encoded
             }
+        }
+    }
+
+    /**
+     * The layers of a pass for a slot that streams its KV cache (docs/26 §26.2.2): layer l runs as its own command buffer
+     * over window {@code l & 1}; while the GPU works on layer l the CPU copies layer l + 1's rows from the host into the
+     * other window, and layer l - 1's new rows from its window to the host. Ends with every layer finished and the
+     * windows' new rows back on the host; the caller encodes the head into the command buffer left open.
+     */
+    private void streamedLayers(int n, int pos) {
+        int layers = c.layers();
+        boolean fuseNorm = n == 1 && fusedNormFits;
+        boolean async = k.metal.canWaitPending();
+        streamed.stage(0, pos);
+        streamed.prefetch(1, pos);
+        for (int l = 0; l < layers; l++) {
+            encodeLayer(l, n, pos, fuseNorm);
+            if (!async) { // an old native library: one layer at a time, nothing overlaps
+                k.commitAndWait();
+                streamed.writeBack(l, pos, n);
+                if (l + 1 < layers) {
+                    streamed.stage(l + 1, pos);
+                }
+                continue;
+            }
+            k.commit();
+            if (l + 1 < layers) {
+                k.metal.waitPending(1); // layer l - 1 is done: its window is free, and its new rows are final
+                if (l > 0) {
+                    streamed.writeBack(l - 1, pos, n);
+                }
+                streamed.stage(l + 1, pos);
+                streamed.prefetch(l + 2, pos);
+            }
+        }
+        if (async) {
+            k.metal.waitPending(0);
+            if (layers > 1) {
+                streamed.writeBack(layers - 2, pos, n);
+            }
+            streamed.writeBack(layers - 1, pos, n);
+        }
+        streamed.endPass();
+    }
+
+    /** The dispatches of decoder layer {@code l}: attention, o_proj, feed-forward. */
+    private void encodeLayer(int l, int n, int pos, boolean fuseNorm) {
+        int dim = c.dim();
+        LayerPlan L = plans[l];
+        L.attention().run(l, n, pos, fuseNorm);
+        if (L.postAttnNorm() != null) {
+            // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
+            k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
+            k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
+        } else {
+            k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
+        }
+        L.ffn().run(l, n, fuseNorm);
+        if (deepstack != null && l < deepstack.length) {
+            addDeepstack(l, n);
         }
     }
 
@@ -1554,7 +1649,7 @@ public final class MetalBackend implements Backend {
      * the CPU (such a step waits for the CPU halfway, so it is not one program).
      */
     private boolean replayable() {
-        return replay && cpuLayers == 0;
+        return replay && cpuLayers == 0 && !streaming; // (a streaming slot changes windows between layers: not one program)
     }
 
     /**
@@ -1651,7 +1746,7 @@ public final class MetalBackend implements Backend {
 
     @Override
     public GreedyPipe greedyPipe(int vocab) {
-        if (!k.metal.canWaitPending() || !PIPELINE || cpuLayers > 0) {
+        if (!k.metal.canWaitPending() || !PIPELINE || cpuLayers > 0 || streaming) {
             return null; // a step with experts on the CPU cannot run ahead of the CPU
         }
         if (pipe == null) {
@@ -1793,6 +1888,8 @@ public final class MetalBackend implements Backend {
                     k.rmsnorm(x, 0, finalNorm, xb, 1, dim);
                     k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
                 });
+            } else if (streaming) {
+                streamedLayers(n, pos);
             } else {
                 encodeLayers(n, pos, true);
             }
@@ -1858,7 +1955,7 @@ public final class MetalBackend implements Backend {
     @Override
     public boolean forwardBatch(Backend[] members, int[] tokens, int[] positions, float[][] logits) {
         int n = members.length;
-        if (!BATCH_DECODE || closed || n < 1 || n > maxBatch) {
+        if (!BATCH_DECODE || closed || streaming || n < 1 || n > maxBatch) {
             return false;
         }
         MetalBackend[] owners = new MetalBackend[n];
@@ -1867,7 +1964,7 @@ public final class MetalBackend implements Backend {
             if (!(members[t] instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed
                     || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)
                     || o.ropeCustomFrom != Integer.MAX_VALUE // its own rotary rows cannot share this backend's tables
-                    || (o.seq == null) != (seq == null)) {
+                    || o.streaming || (o.seq == null) != (seq == null)) {
                 return false;
             }
             for (int u = 0; u < t; u++) {
@@ -2144,6 +2241,7 @@ public final class MetalBackend implements Backend {
     /** The cache segments of layer {@code l} whose rows are saved one after the other per position: K and V, or the latent rows. */
     private MemorySegment[] segments(int l) {
         return mla != null ? new MemorySegment[]{mla.cache(l)}
+                : streamed != null ? new MemorySegment[]{streamed.keys(l), streamed.values(l)}
                 : new MemorySegment[]{keyCache[l].contents(), valCache[l].contents()};
     }
 
@@ -2352,6 +2450,9 @@ public final class MetalBackend implements Backend {
         try {
             k.close();
         } finally {
+            if (streamed != null) {
+                streamed.close();
+            }
             DeviceLedger.remove(ledger);
             releasePlacement();
         }

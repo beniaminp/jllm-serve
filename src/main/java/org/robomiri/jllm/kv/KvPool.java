@@ -630,6 +630,13 @@ public final class KvPool implements AutoCloseable {
 
     @Override
     public synchronized void close() {
+        if (spill instanceof AutoCloseable c) { // the warm tier writes what it holds to the files
+            try {
+                c.close();
+            } catch (Exception ignored) {
+                // closing anyway
+            }
+        }
         storage.close();
     }
 }
