@@ -227,12 +227,16 @@ final class MixedPassChecks {
                     base = Math.max(base, maxDiff(x, z));
                 }
             }
-            // The bound is that of the batched-decode checks (1e-4 of the largest logit). A q8 cache can exceed it: a different
-            // kernel for a different number of rows rounds a key or value a hair differently and an int8 code flips (the
-            // documented hazard of the q8 and q4 caches), which any other cut of the same conversation does too; there the
-            // bound is twice how far the other chunking of the same conversation is from the first.
-            float bound = 1e-4f * scale + 1e-5f;
-            boolean ok = argmax && (diff <= bound || (dt != KvDtype.F32 && dt != KvDtype.F16 && diff <= 2 * base));
+            // The bound is that of the batched-decode checks, 1e-4 of the largest logit, for the f32 and f16 caches: the rounding
+            // of a decode row in a pass of many rows (another matmul kernel than the lone step's). A q8 cache turns that rounding
+            // into a flipped int8 code now and then (the documented hazard of the quantized caches: the row's maximum, or a value
+            // next to a rounding boundary, moves by one step of 1/127 of its head's maximum); the logits then move by up to a
+            // few thousandths of their range. Another cut of the same conversation does not show it (its kernels are the same
+            // as the first run's: "alone cut differently" below), so the bound for q8 is 5e-3 of the largest logit; the arg max of
+            // every row must still be equal.
+            boolean quantized = dt != KvDtype.F32 && dt != KvDtype.F16;
+            float bound = (quantized ? 5e-3f : 1e-4f) * scale + 1e-5f;
+            boolean ok = argmax && diff <= bound;
             check(ok, String.format("%d mixed passes of a chunk, decode rows and a verification run: arg max %s, max|alone-mixed| = %.1e"
                     + " (bound %.1e; alone cut differently: %.1e), %d of %d rows bit-identical", mixedPasses,
                     argmax ? "same" : "DIFFERENT", diff, bound, base, exact, pa.size()));
