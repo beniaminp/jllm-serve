@@ -278,8 +278,87 @@ restarts.
 
 ---
 
+## 14. Pictures in: giving the friend eyes
+
+🧸 The friend only understands words, but you want to show them a photo. So you hire a **translator** who looks at the picture the way you look at a jigsaw puzzle: first the photo is cut into small squares, then the squares talk to each other until each one means more than "some blue" ("the edge of a red circle"), and neighbouring squares are merged so there are not thousands. The translator writes the result in the friend's own secret
+language: a row of "picture words", each a bundle of numbers just like the bundle that every ordinary word turns into. The friend reads `<picture> picture-word picture-word … </picture> What shapes do you see?` and answers. And because a photo cannot be looked up by a number, the engine remembers it by its fingerprint: the same photo in the next turn is not looked at again.
+
+📐 A picture of `W × H` pixels with patch size `p` has `(W/p)(H/p)` patches of `3p²` numbers; one matrix product turns each into a vector, `L` transformer blocks (attention without a mask: every patch sees every patch) refine them, and a merger shrinks them. Worked: a 640 × 480 picture for Qwen2.5-VL is resized to 644 × 476 (multiples of 28), cut into `46 × 34 = 1 564` patches of `14 × 14 × 3 = 588` numbers, and every 2 × 2 block of patches is merged:
+`23 × 17 =` **391 picture words** replace the placeholder in the prompt, and the model's own KV cache rows for them are reused when the same picture comes back. Models that need to know *where* a picture word sits rotate it by its row and its column (M-RoPE). Details: [20](20-vision.md).
+
+---
+
+## 15. Speech in: giving the friend ears
+
+🧸 You do not hear single wiggles of the air; you hear **which pitches are present**. So the recording is turned into a picture: time goes to the right, pitch goes up, brightness says how loud. The pitch axis is squeezed the way ears do it (many thin rows for low sounds, a few thick ones for high ones). A second pair of helpers, **Whisper**, reads the picture: one looks at the whole 30 seconds and writes notes, the other writes the words one at a time,
+glancing back at the notes before each word ("what was said around here?"). Because it glances at the notes it can also tell you *when* each word was said.
+
+📐 Sound is 16 000 numbers per second. Every 10 ms a window of 400 samples (25 ms) is multiplied by a Hann curve and Fourier-transformed (201 pitches, 40 Hz apart), the powers are summed into 80 mel bands, and `log10` is taken: 30 seconds become an `80 × 3 000` picture. The encoder turns it into 1 500 positions (20 ms each); the decoder attends to them (cross-attention, [21](21-audio.md)).
+Worked: a 1 kHz tone of amplitude 0.5 lands exactly on pitch number `1000 / 40 = 25` with power `(0.5 · 200 / 2)² = 2 500`, between the mel bands 24-27 (mostly 25-27); the 80 dB floor sets every other band to `(−6.24 + 4)/4 = −0.56`. Measured: a 61.7 s recording is written down in 4.7 s with Whisper-small on the GPU (0.076 s of work per second of sound), with the same words as the Python reference on all 73 real clips used to check it.
+
+---
+
+## 16. Speech out: giving the friend a voice
+
+🧸 Teaching a computer to speak can be done by building a machine "text in, sound out", or by noticing that the friend already knows how to continue a story, and letting them continue a story whose words are **sound pieces**. The text is `the<|t_0.12|><|1090|><|512|>…` where every `<|number|>` is a 13-millisecond piece of sound from a catalogue of 4 096. A second helper, the *codec*, turns the pieces back into air wiggles. To make it sound like a person, the story starts with a few seconds of
+someone speaking, written in the same pieces; the friend carries on in that voice.
+
+📐 The codec describes sound with 75 pieces per second, 4 096 possible pieces each, i.e. `75 · 12 bits = 900 bits` per second; each piece is 320 samples of 24 kHz sound (13.3 ms). The language model (Qwen2, run by the same engine as a chat model) writes about 90 tokens for each second of speech (75 sound pieces plus the words and their times), so speaking takes about as long as the speech lasts (measured 7.67 s of work for 7.56 s of speech with the 8-bit model,
+0.81 s per second with the 4-bit one); the codec adds 0.05 s per second of speech. At the end, a Fourier transform in reverse (1 280 points, windows overlapped by hops of 320) puts the waves back together ([21](21-audio.md)).
+
+---
+
+## 17. Pictures out: removing the snow
+
+🧸 Take a photo and sprinkle it with static. A little static and you still see the photo; a lot and you see only snow. A patient helper has seen millions of captioned photos: show them a snowy screen and tell them "a cat on a sofa" and they can guess *which flakes do not belong* and wipe a few away. Repeat many times and a cat on a sofa appears from pure snow. A "Turbo" helper was taught to do it in one or two big wipes. To keep the
+work small, the helper does not wipe the 786 432 dots of the picture but a 16 384-number sketch of it, and a separate pair of helpers turns sketches into pictures and back.
+
+📐 Noise is added as `x_t = √ᾱ_t · x₀ + √(1 − ᾱ_t) · ε`: at step 499 of 1 000, `ᾱ = 0.278`, so a clean value 0.5 with noise 1.0 becomes `0.527 · 0.5 + 0.850 · 1.0 = 1.113`. The network predicts `ε`; a sampler walks the noise level down (Euler: `x̃ ← x̃ + (σ_next − σ) ε̂`), and "guidance" asks twice, with and without the caption, and goes further in the direction the caption made a difference:
+`ε = ε_u + w (ε_c − ε_u)`, `0.20 + 7.5 · (0.50 − 0.20) = 2.45`. Measured: a 512 × 512 picture in one Turbo step takes 1.68 s on the M1 GPU (0.42 s for the network, 1.2 s to turn the sketch into dots); 20 steps of the same model take 9.6 s ([22](22-image-generation.md)).
+
+---
+
+## 18. Video out: many pictures that must agree
+
+🧸 If a helper drew every page of a cartoon separately, the balloon would change colour on page 5. So the pages are drawn **together**: while wiping the snow off page 7 the helper keeps glancing at the same spot on all the other pages ("you moved up a bit, I will too"), and each page is stamped with its number, because "page 3 of 16" is not "page 11 of 16". AnimateDiff adds exactly those glances to an ordinary picture painter. Wan 2.1 is a different, bigger design: it cuts the whole video into bricks that all look at all
+the others, and instead of naming the snow it learns the *direction to walk* from noise to video, which is a straight line.
+
+📐 Sixteen 512 × 512 frames are `16 × 64 × 64 × 4 = 262 144` numbers; with guidance a step processes 32 pictures, so a 20-step clip takes 371 s on this Mac (351 s in the network, 19 s to turn the 16 sketches into pictures). For every pixel the temporal layer makes a little sequence of its 16 frames and lets them attend to each other; without the frame stamps frames with the same content would be indistinguishable (a toy: outputs `[0.67, 0.33]` for both; with stamps `[0.86, 0.48]` and `[1.05, 0.26]`).
+In Wan, the path is `x_σ = (1 − σ) x₀ + σ ε`, so the direction `v = ε − x₀` is constant: with `x₀ = 0.5`, `ε = 0.7`, `v = 0.2` and one Euler step from `σ = 1` to 0.9232 lands exactly on the path (`0.7 + (−0.0768)(0.2) = 0.6846`). Honest status: both are verified against the reference programs to a fraction of a grey level, but the AnimateDiff clips look poor with the plain Stable Diffusion 1.5 it was paired with, and Wan's text reader (22.7 GB) was never downloaded, so no real Wan clip exists ([23](23-video-generation.md)).
+
+---
+
+## 19. The model guessing for itself: multi-token prediction
+
+🧸 In section 12 someone guesses the next ten words and the friend checks them all at once. Usually the guesser is a small second model. Some models (Qwen3.5) come with their own tiny guesser: one extra layer, trained to look at what the big model was thinking and the word it just said, and guess the word *after* that. It costs about one layer per word and needs no second download. If the guess is right the friend gets two words for the price of one pass; if it is wrong, nothing is lost
+except that the friend's whiteboards (the fixed-size memory of its Gated DeltaNet layers, [14 §14.14](14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)) must be put back as they were, so jllm keeps a second copy of them.
+
+📐 With one guess per pass and the guess right with probability `α`, a pass yields `1 + α` words: `1.9` for `α = 0.9`. Measured on the 27B Qwen3.5 file, the head guessed the next token 111 times out of 124 (`α = 0.90`) in greedy runs of four prompts. The output is exactly the output without the guess (greedy), because the friend verifies every guessed word against its own choice ([16 §16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model); the sampling rule is [9 §9.7](09-sampling.md#97-the-full-order-of-operations)).
+
+---
+
+## 20. Smaller sticky notes: the KV cache in 16, 8 or 4 bits
+
+🧸 The friend's sticky notes (section 8) grow with every word. You can write each note with fewer digits. **f16** keeps half the digits, **q8** writes every number as one whole-number step on a ruler (plus one note saying how long the ruler is), and **q4** keeps small thumbnails. Two tricks stop the thumbnails from being useless: the question and the notes are first *shaken* with a fixed recipe so that no single number is huge, and the newest few pages are kept sharp.
+Some models need fewer notes by design: DeepSeek writes one short summary per word instead of notes per head, and models like Qwen3-Next keep a fixed-size whiteboard in most layers.
+
+📐 Per token, Qwen3-0.6B (28 layers, K and V, 1 024 numbers each):
+
+```
+f32   2 · 28 · 1024 · 4 B                    = 229 376 B     940 MB at 4 096 tokens
+f16   2 · 28 · 1024 · 2 B                    = 114 688 B     470 MB
+q8    2 · 28 · 1024 · (1 + 4/128) B          =  59 136 B     242 MB      (one signed byte + one f32 scale per 128 numbers; error ≤ max|x|/254 of the row)
+q4    2 · 28 · 1024 · 0.5625 B               =  32 256 B     132 MB      (4 bits + one f16 scale per 32 numbers, plus a ring of sharp recent rows)
+```
+
+The honest part: f16 and q8 are the choices to make for memory; q4 is clearly worse than q8 on this small model (the keys are too rough even after the shaking) and stays opt-in, `backend.kv-dtype=q4` ([7](07-cpu-backend.md), [11 §11.3](11-performance.md#113-memory-footprint)).
+
+---
+
 ## Where to go next
 
 - [01 Overview](01-overview.md) for the map of the code, then [05](05-transformer-math.md) for every formula of a layer.
 - [17 Speedups for coding agents](17-agent-speedups.md) for prompt lookup, shared prefixes, saved caches and pipelining.
 - [18 The Metal emulator](18-metal-emulator.md) for how the GPU kernels are tested on machines without a GPU.
+- [20 Pictures as input](20-vision.md), [21 Audio](21-audio.md), [22 Image generation](22-image-generation.md) and [23 Video generation](23-video-generation.md) for sections 14-18 in full.
+- [16 §16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model) for the model's own guessing head (19) and [11 §11.3](11-performance.md#113-memory-footprint) for the KV cache sizes (20).
