@@ -151,6 +151,8 @@ public class OpenAiController {
             completion(body, model, res, chat, ClientGone.of(req));
         } catch (LoadedModel.UnavailableException e) {
             ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "model_unavailable"));
+        } catch (org.robomiri.jllm.engine.Admission.Abandoned e) {
+            // the client left while the request waited for a slot: nothing to answer
         }
     }
 
@@ -238,7 +240,7 @@ public class OpenAiController {
         int messages = chat && Json.list(body, "messages") != null ? Json.list(body, "messages").size() : 1;
         int count = o.count();
 
-        try (LoadedModel.Slot slot = model.pick(prompt)) {
+        try (LoadedModel.Slot slot = model.pick(prompt, Json.str(body, "user", null), gone)) {
             Engine e = slot.engine();
             if (!stream) {
                 List<Engine.Result> all;

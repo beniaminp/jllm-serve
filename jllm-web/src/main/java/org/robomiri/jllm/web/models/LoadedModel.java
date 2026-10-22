@@ -1,7 +1,10 @@
 package org.robomiri.jllm.web.models;
 
 import org.robomiri.jllm.ModelLoader;
+import org.robomiri.jllm.engine.Admission;
+import org.robomiri.jllm.engine.BatchGroup;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.Priority;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -50,6 +53,7 @@ public final class LoadedModel {
         private final int index;
         private final AtomicInteger users = new AtomicInteger();
         private volatile long lastUsed;
+        private volatile Admission<Slot> admission; // the model's queue under engine.scheduler=mixed
 
         Slot(Engine engine, int index) {
             this.engine = engine;
@@ -68,6 +72,14 @@ public final class LoadedModel {
         public void close() {
             lastUsed = System.nanoTime();
             users.decrementAndGet();
+            Admission<Slot> q = admission;
+            if (q != null) {
+                if (engine.backend() instanceof BatchGroup.Member m) {
+                    m.resume(); // a pause asked for after the last checkpoint must not catch the next request
+                }
+                engine.releaseCache(); // the conversation stays in the prefix tree, the slot stops pinning its blocks
+                q.release(this); // the next request in line gets the slot
+            }
         }
     }
 
@@ -85,6 +97,8 @@ public final class LoadedModel {
     private final AtomicInteger active = new AtomicInteger();
     private volatile double lastTokPerSec;
     private volatile boolean closing;
+    /** The one queue of the model under {@code engine.scheduler=mixed} (docs/25); null with the slots scheduler. */
+    private final Admission<Slot> admission;
 
     /** @param extra the engines of slots 1.. (slot 0 is {@code loaded}'s) */
     LoadedModel(String id, String source, ModelLoader.Loaded loaded, List<Engine> extra, Map<String, String> settings,
@@ -99,6 +113,51 @@ public final class LoadedModel {
         }
         this.settings = Map.copyOf(settings);
         this.loadSeconds = loadSeconds;
+        this.admission = admissionFor(this.settings);
+        if (admission != null) {
+            slots.forEach(sl -> sl.admission = admission);
+        }
+    }
+
+    /** The queue of a model whose slots form a mixed group; null for the slots scheduler (or a model that cannot mix). */
+    private Admission<Slot> admissionFor(Map<String, String> st) {
+        if (!(slots.getFirst().engine.backend() instanceof BatchGroup.Member m) || !m.group().mixed()) {
+            return null;
+        }
+        int maxRunning = Integer.parseInt(st.getOrDefault("engine.max-running", "0"));
+        boolean preempt = Boolean.parseBoolean(st.getOrDefault("engine.preempt", "true"));
+        int sessionMax = Integer.parseInt(st.getOrDefault("engine.session-max-running", "0"));
+        long agePromote = Long.parseLong(st.getOrDefault("engine.age-promote-ms", "10000")) * 1_000_000L;
+        return new Admission<>(slots, new Admission.Ops<>() {
+            @Override
+            public int match(Slot slot, int[] prompt) {
+                return slot.engine.cachedPrefix(prompt);
+            }
+
+            @Override
+            public boolean pause(Slot slot) {
+                if (!(slot.engine.backend() instanceof BatchGroup.Member mm) || !mm.requestPause()) {
+                    return false;
+                }
+                mm.awaitPaused(PAUSE_WAIT_MS); // the blocks are back in the pool before the newcomer asks for its own
+                return true;
+            }
+
+            @Override
+            public void resume(Slot slot) {
+                if (slot.engine.backend() instanceof BatchGroup.Member mm) {
+                    mm.resume();
+                }
+            }
+        }, new Admission.Config(maxRunning, preempt, sessionMax, agePromote));
+    }
+
+    /** How long a request waits for a generation it pauses to reach its next checkpoint (one step, normally milliseconds). */
+    static final long PAUSE_WAIT_MS = 3000;
+
+    /** The queue of the mixed scheduler, or null. */
+    public Admission<Slot> admission() {
+        return admission;
     }
 
     public String id() {
@@ -129,6 +188,23 @@ public final class LoadedModel {
      * saved to disk ({@link KvStore}) that covers more of the prompt is then loaded into the slot.
      */
     public Slot pick(int[] prompt) {
+        return pick(prompt, null, () -> false);
+    }
+
+    /**
+     * {@link #pick(int[])} for the request of {@code session} (the OpenAI {@code user}, or null) whose client's presence
+     * is {@code gone}. Under {@code engine.scheduler=mixed} the request waits in the model's one queue (docs/25): the
+     * waiting request with the most cached tokens, in the highest priority class ({@link Priority#current()}), gets a
+     * freed slot, and a request whose client left while it waited is dropped from the queue with
+     * {@link Admission.Abandoned}.
+     */
+    public Slot pick(int[] prompt, String session, java.util.function.BooleanSupplier gone) {
+        if (admission != null) {
+            Slot s = admission.acquire(prompt, Priority.current().ordinal(), session, () -> closing || gone.getAsBoolean());
+            s.users.incrementAndGet();
+            restore(s, prompt);
+            return s;
+        }
         Choice c = choose(prompt);
         Slot s = c.slot();
         if (c.donor() != null) {
@@ -146,6 +222,11 @@ public final class LoadedModel {
                 c.donor().users.decrementAndGet();
             }
         }
+        restore(s, prompt);
+        return s;
+    }
+
+    private void restore(Slot s, int[] prompt) {
         if (store != null) {
             try {
                 store.restore(this, s, prompt);
@@ -153,7 +234,6 @@ public final class LoadedModel {
                 System.err.println("kv-cache: restore failed: " + e);
             }
         }
-        return s;
     }
 
     /** Copying a prefix from another slot must save at least this many tokens of prefill. */

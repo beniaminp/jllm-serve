@@ -47,7 +47,7 @@ public class ModelManager implements DisposableBean {
      * @param source   a Hugging Face link, {@code owner/name}, {@code owner/name:QUANT} or a local {@code .gguf} path
      * @param id       the name clients use in the {@code model} field; empty = derived from the source
      * @param settings engine settings for this model only, e.g. {@code backend.ctx}, {@code backend}, {@code model.quant}
-     * @param slots    KV cache slots (1 to 8, default 1): each keeps one conversation's prefix cached; see {@link LoadedModel}
+     * @param slots    KV cache slots (1 to 16, default 1): each keeps one conversation's prefix cached; see {@link LoadedModel}
      */
     public record LoadRequest(String source, String id, String revision, String ggufFile, String ggufQuant,
                               Map<String, String> settings, Integer slots) {
@@ -270,8 +270,8 @@ public class ModelManager implements DisposableBean {
             return loadImageModel(t, s, extra);
         }
         int slots = r.slots() == null ? 1 : r.slots();
-        if (slots < 1 || slots > 8) {
-            throw new IllegalArgumentException("slots must be 1 to 8");
+        if (slots < 1 || slots > 16) {
+            throw new IllegalArgumentException("slots must be 1 to 16");
         }
         synchronized (this) {
             if (loaded.containsKey(t.id()) || images.has(t.id()) || (video != null && video.has(t.id()))) {

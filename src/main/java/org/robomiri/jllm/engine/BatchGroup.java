@@ -426,6 +426,30 @@ public final class BatchGroup {
             return true;
         }
 
+        /**
+         * Waits until the generation has paused (it does at its next checkpoint, after the step it is in) or {@code millis}
+         * have passed; true if it is paused. A scheduler that gives the freed place to another request waits for this, so
+         * the paused blocks are back in the pool before the newcomer asks for its own.
+         */
+        public boolean awaitPaused(long millis) {
+            long end = System.nanoTime() + millis * 1_000_000L;
+            synchronized (BatchGroup.this) {
+                while (!paused && pauseRequested) {
+                    long left = end - System.nanoTime();
+                    if (left <= 0) {
+                        break;
+                    }
+                    try {
+                        BatchGroup.this.wait(Math.max(1, left / 1_000_000));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                return paused;
+            }
+        }
+
         /** Lets a paused (or about to pause) generation go on. */
         public void resume() {
             synchronized (BatchGroup.this) {

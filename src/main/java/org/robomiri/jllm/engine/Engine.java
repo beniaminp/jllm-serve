@@ -920,6 +920,26 @@ public final class Engine implements AutoCloseable {
         }
     }
 
+    /**
+     * Gives this slot's blocks back to the pool (a paged cache) now that its request is over: the finished conversation stays
+     * findable through the prefix tree (its full blocks are published and become ordinary cached blocks the pool may evict
+     * and spill), but the slot no longer pins them, so an idle slot does not take memory from the running ones (docs/25).
+     * The next request on this or any slot adopts what it needs from the tree. Does nothing while a request runs here.
+     */
+    public void releaseCache() {
+        org.robomiri.jllm.kv.KvSequence kvs = backend.kvSequence();
+        if (kvs == null || !lock.tryLock()) {
+            return;
+        }
+        try {
+            cachedLen = 0;
+            cached = new int[0];
+            kvs.clear();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** How many positions the cache holds now (0 while a request is running). */
     public int cachedLength() {
         return cachedLen;

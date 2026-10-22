@@ -153,13 +153,16 @@ public class ChatController {
             ToolCallFormat.Holdback holdback = new ToolCallFormat.Holdback(piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)));
             Engine.Result r;
             LoadedModel.Slot used;
-            try (LoadedModel.Slot slot = model.pick(prompt); AutoCloseable alive = sse.keepAlive()) {
+            try (LoadedModel.Slot slot = model.pick(prompt, null, gone); AutoCloseable alive = sse.keepAlive()) {
                 used = slot;
                 Engine.TextSink sink = byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback;
                 java.util.function.BooleanSupplier cancelled = () -> failure[0] != null || sse.failed() || model.closing()
                         || deadline.getAsBoolean() || gone.getAsBoolean();
                 r = media == null ? slot.engine().generate(prompt, params, sink, cancelled)
                         : slot.engine().generate(media, params, sink, cancelled);
+            } catch (org.robomiri.jllm.engine.Admission.Abandoned e) {
+                finish = "cancelled"; // the client left while the request waited for a slot
+                break;
             } catch (Exception e) {
                 emit(sse, failure, Json.obj("type", "error", "message", e instanceof Engine.OverloadedException
                         ? e.getMessage() : "generation failed: " + e.getMessage()));
