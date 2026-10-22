@@ -66,6 +66,11 @@ public final class Settings {
             Map.entry("init", "image.init"),
             Map.entry("mask", "image.mask"),
             Map.entry("strength", "image.strength"),
+            Map.entry("video-model", "video.model"),
+            Map.entry("base-model", "video.base-model"),
+            Map.entry("frames", "video.frames"),
+            Map.entry("fps", "video.fps"),
+            Map.entry("video-format", "video.format"),
             Map.entry("host", "server.host"),
             Map.entry("port", "server.port"));
 
@@ -274,6 +279,18 @@ public final class Settings {
         require(getInt("image.vae-tile") >= 8 && getInt("image.vae-tile") <= 512, "image.vae-tile", "must be 8..512");
         require(getInt("image.vae-tile-overlap") >= 1 && getInt("image.vae-tile-overlap") < getInt("image.vae-tile"),
                 "image.vae-tile-overlap", "must be at least 1 and below image.vae-tile");
+        getBool("video.enabled");
+        require(get("video.backend").matches("cpu|metal|auto"), "video.backend", "must be cpu, metal or auto");
+        require(get("video.precision").matches("auto|f16|f32"), "video.precision", "must be auto, f16 or f32");
+        require(get("video.format").matches("(?i)auto|mp4|webp|gif"), "video.format", "must be auto, mp4, webp or gif");
+        require(!get("video.ffmpeg").trim().isEmpty(), "video.ffmpeg", "must be auto, off or a path");
+        require(getInt("video.frames") >= 1 && getInt("video.frames") <= 128, "video.frames", "must be 1..128");
+        require(getFloat("video.fps") > 0 && getFloat("video.fps") <= 60, "video.fps", "must be above 0 and at most 60");
+        require(getInt("video.steps") >= 0 && getInt("video.steps") <= 200, "video.steps", "must be 0 (model default) .. 200");
+        require(getInt("video.width") >= 0 && getInt("video.height") >= 0, "video.width", "and video.height must be 0 (model default) or positive");
+        require(getInt("video.decode-chunk") >= 1 && getInt("video.decode-chunk") <= 32, "video.decode-chunk", "must be 1..32");
+        getLong("video.seed");
+        getFloat("video.guidance");
         require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
         for (String k : new String[]{"vision.enabled", "vision.auto-download", "vision.allow-private-urls"}) {
             getBool(k);

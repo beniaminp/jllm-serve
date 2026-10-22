@@ -100,7 +100,7 @@ public final class VideoPipeline implements AutoCloseable {
         c.put("steps_offset", 1);
         schedulerConfig = c;
         int size = base.defaults.size();
-        defaults = new Defaults(16, 8, 25, 7.5, Math.min(size, 512), "ddim");
+        defaults = new Defaults(Math.min(16, unet.motionMaxFrames()), 8, 25, 7.5, Math.min(size, 512), "ddim");
     }
 
     /** The UNet with the motion adapter attached (tests compare single evaluations). */

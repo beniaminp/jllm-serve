@@ -44,6 +44,7 @@ public final class VideoTest {
     public static void main(String[] args) throws Exception {
         scheduler();
         encoders();
+        engineServer();
         // {reference, per-stage limits (largest difference relative to the largest reference value)}
         String[][] cases = {
                 {"ref-video-ddim", "unet=1e-5,step 0=1e-5,step 1=1e-5,step 2=1e-5,latents=1e-5,frames=1e-5"},
@@ -329,6 +330,60 @@ public final class VideoTest {
             threw = e.getMessage().contains("ffmpeg");
         }
         check(threw, "MP4 without ffmpeg is a clear error");
+    }
+
+    // ------------------------------------------------------------------ the engine's own HTTP server
+
+    private static void engineServer() throws Exception {
+        VideoStore store = new VideoStore(2, 1000);
+        String a = store.put(new byte[400], VideoEncoder.Format.GIF);
+        String b = store.put(new byte[400], VideoEncoder.Format.WEBP);
+        String c = store.put(new byte[400], VideoEncoder.Format.MP4);
+        check(store.get(a) == null && store.get(b).ext().equals("webp") && store.get(c).mime().equals("video/mp4") && a.length() == 24,
+                "clip store: oldest evicted beyond its limits, 24-hex ids, the file type is kept");
+        try (Devices dev = Devices.cpu();
+             VideoPipeline pipe = new VideoPipeline(resource("tiny-sd"), resource("tiny-motion-adapter"), dev);
+             org.robomiri.jllm.server.ApiServer server = new org.robomiri.jllm.server.ApiServer(null, "none", "127.0.0.1", 0,
+                     org.robomiri.jllm.server.ApiServer.Options.defaults())
+                     .withVideo(new org.robomiri.jllm.server.VideoHttp(pipe, "tiny-video", new VideoApi.Config(null, "auto")))) {
+            Thread t = Thread.ofVirtual().start(server::serve);
+            String base = "http://127.0.0.1:" + server.port();
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            java.util.function.Function<String, java.net.http.HttpRequest.Builder> req = path -> java.net.http.HttpRequest.newBuilder(java.net.URI.create(base + path));
+            java.net.http.HttpResponse<String> r = http.send(req.apply("/v1/videos/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"a cat\",\"size\":\"64x64\",\"num_frames\":3,\"steps\":2,\"guidance\":3,\"seed\":7,\"n\":2,"
+                            + "\"response_format\":\"url\"}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            Map<String, Object> out = Json.parseObject(r.body());
+            List<Object> data = Json.list(out, "data");
+            String url = data == null ? "" : Json.str(data.get(0), "url", "");
+            check(r.statusCode() == 200 && data.size() == 2 && url.contains("/v1/videos/files/") && url.endsWith(".webp") && Json.num(data.get(1), "seed", 0) == 8,
+                    "engine server: POST /v1/videos/generations with n=2 and response_format url (webp without ffmpeg)");
+            java.net.http.HttpResponse<byte[]> f = http.send(req.apply(url.substring(url.indexOf("/v1/"))).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            check(f.statusCode() == 200 && Vp8lDecoder.parseWebp(f.body()).size() == 3 && f.headers().firstValue("content-type").orElse("").equals("image/webp"),
+                    "engine server: GET /v1/videos/files/<id>.webp serves the clip with its 3 frames");
+            java.net.http.HttpResponse<String> models = http.send(req.apply("/v1/models").GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(models.body().contains("\"kind\":\"video\"") && !models.body().contains("\"kind\":\"text\""), "engine server: /v1/models lists the video model");
+            java.net.http.HttpResponse<String> s = http.send(req.apply("/v1/videos/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"a cat\",\"size\":\"64x64\",\"num_frames\":2,\"steps\":3,\"guidance\":3,\"seed\":1,\"stream\":true,"
+                            + "\"output_format\":\"gif\"}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(s.body().contains("video_generation.progress") && s.body().contains("video_generation.partial_image") && s.body().contains("video_generation.decoding")
+                            && s.body().contains("video_generation.completed") && s.body().trim().endsWith("[DONE]"),
+                    "engine server: streaming progress, previews, decoding, completion, [DONE]");
+            java.net.http.HttpResponse<String> bad = http.send(req.apply("/v1/videos/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"x\",\"size\":\"50x50\"}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(bad.statusCode() == 400 && bad.body().contains("multiple of"), "engine server: a bad size is a 400 with the reason");
+            java.net.http.HttpResponse<String> mp4 = http.send(req.apply("/v1/videos/generations").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"prompt\":\"x\",\"size\":\"64x64\",\"output_format\":\"mp4\"}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(mp4.statusCode() == 400 && mp4.body().contains("ffmpeg"), "engine server: mp4 without ffmpeg is a 400 that says so");
+            String frame = java.util.Base64.getEncoder().encodeToString(Imaging.png(sampleFrames(32, 24, 1, false).get(0)));
+            java.net.http.HttpResponse<String> enc = http.send(req.apply("/v1/videos/encode").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"frames\":[\"" + frame + "\",\"" + frame + "\"],\"fps\":4,\"output_format\":\"gif\"}")).build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(enc.statusCode() == 200 && enc.body().contains("\"frames\":2") && enc.body().contains("\"format\":\"gif\""), "engine server: POST /v1/videos/encode turns pictures into a GIF");
+            java.net.http.HttpResponse<String> chat = http.send(req.apply("/v1/chat/completions").header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{\"messages\":[]}")).build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            check(chat.statusCode() == 404 && chat.body().contains("no text model"), "engine server: video only, the chat endpoint says there is no text model");
+        }
     }
 
     static Map<String, Object> obj(Object... kv) {
