@@ -197,6 +197,60 @@ mvn -q compile test-compile
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
 batch "3 slots generating together, concurrent encoder on" "-Djllm.metal.concurrent=true"
+
+# defaults for agent serving (docs/10 sections 10.13 and 10.14, docs/11 section 11.11)
+# 1. speculation on agent-like prompts: a code edit that resends a file, a JSON tool call, and prose (SpecAgentBench;
+#    the md5 of the text must be the same in every mode: greedy output does not depend on speculation)
+spec() { # label settings...
+  local label="$1"
+  shift
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.SpecAgentBench --rounds "$ROUNDS" "$@" > "$OUT/spec.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/spec.log") |"; return; }
+  grep '^SPEC scenario' "$OUT/spec.log" | sed -E "s/SPEC scenario=([a-z]+) .*decode_tok_s=([0-9.]+) .*drafted=([0-9]+) accepted=([0-9]+) md5=([0-9a-f]+)/| $label, \1 | \2 | \4 of \3 | \5 |/"
+}
+echo
+echo "| speculation on agent-like prompts | decode tok/s | accepted of drafted | md5 of the text |"
+echo "|---|---|---|---|"
+spec "$DENSE off" --model "$DENSE" --engine.speculative off
+spec "$DENSE ngram (default)" --model "$DENSE" --engine.speculative ngram
+# 2. the request priority: a background job (1500-token prompt, then 96 tokens) runs on one slot when a short interactive
+#    request arrives on another (PriorityBench); with engine.priority-order the job gives way at the device
+prio() { # label settings...
+  local label="$1"
+  shift
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.PriorityBench --rounds "$ROUNDS" "$@" > "$OUT/prio.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/prio.log") |"; return; }
+  grep '^PRIO job=' "$OUT/prio.log" | sed -E "s/PRIO job=([a-z]+) interactive request: first token ([0-9]+) ms.*whole request ([0-9]+) ms; the job took ([0-9]+) ms/| $label, the job is \1 | \2 | \3 | \4 |/"
+}
+echo
+echo "| request priority (a short interactive request while a long job runs) | first token ms | whole request ms | the job ms |"
+echo "|---|---|---|---|"
+prio "$DENSE, engine.priority-order=true (default)" --model "$DENSE" --engine.priority-order true
+prio "$DENSE, engine.priority-order=false" --model "$DENSE" --engine.priority-order false
+# 3. the context length backend.ctx=auto picks (the "Context:" line of the load log), and that a long context costs no speed
+ctxrow() { # label settings...
+  local label="$1"
+  shift
+  echo "| $label | $(./jllm run "$@" --max-tokens 1 --prompt hi 2>&1 | grep -m1 '^Context:' | sed 's/^Context: //') |"
+}
+echo
+echo "| context length | what backend.ctx=auto picks |"
+echo "|---|---|"
+ctxrow "$DENSE" --model "$DENSE"
+ctxrow "$DENSE, f16 KV cache" --model "$DENSE" --backend.kv-dtype f16
+JAVA_OPTS="-Djllm.metal.workingSetGb=2" ctxrow "$DENSE, Metal working set limited to 2 GB (-Djllm.metal.workingSetGb)" --model "$DENSE"
+[ -z "$QWEN35" ] || ctxrow "$QWEN35" --model "$QWEN35"
+[ -z "$MOE" ] || ctxrow "$MOE" --model "$MOE"
+[ -z "$MOE" ] || ctxrow "$MOE, f16 KV cache" --model "$MOE" --backend.kv-dtype f16
+echo
+echo "| context length and speed | prefill tok/s | decode tok/s | note |"
+echo "|---|---|---|---|"
+bench "$DENSE: backend.ctx=auto (default)" "$DENSE" ""
+bench "$DENSE: --ctx 4096 (the old default)" "$DENSE" "" --ctx 4096
 # the vision encoder (docs/20): the second encoding of a picture (weights resident, pipelines built) on the GPU against
 # the CPU encoder (vision.backend=cpu); VisionDump prints the time per chunk of the picture
 vision() { # label backend
@@ -298,6 +352,13 @@ if [ -n "$MOE" ]; then
   bench "all experts on the GPU" "$MOE" "" --backend.metal.cpu-moe off
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
+  # speculation on agent-like prompts (see the dense rows above): MoE models run without it unless asked
+  echo
+  echo "| speculation on agent-like prompts, $MOE | decode tok/s | accepted of drafted | md5 of the text |"
+  echo "|---|---|---|---|"
+  spec "off" --model "$MOE" --engine.speculative off --ctx 6144
+  spec "ngram" --model "$MOE" --engine.speculative ngram --ctx 6144
+  spec "draft $DENSE" --model "$MOE" --engine.speculative draft --engine.draft-model "$DENSE" --ctx 6144
 fi
 # image generation (docs/22): Stable Diffusion on the GPU, each switch on and off (needs the diffusers folder of a model in
 # models/, default stabilityai/sd-turbo; IMAGE_MODEL=<folder> to choose another)

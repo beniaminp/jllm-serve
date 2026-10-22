@@ -79,6 +79,8 @@
               <label>presence_penalty <input id="p-presence_penalty" type="number" step="0.1" placeholder="default"></label>
               <label>seed <input id="p-seed" type="number" step="1" placeholder="random"></label>
             </div>
+            <label title="Who gets the GPU first when several requests wait for it. A background request lets interactive ones go ahead (engine.priority-order); the API takes the same as the priority field or the X-Jllm-Priority header.">priority
+              <select id="p-priority"><option value="interactive">interactive</option><option value="background">background (subagent, batch job)</option></select></label>
             <p class="hint">Empty fields use the server defaults (<a href="#settings">Settings</a>, <code>sampling.*</code>). Saved in this browser.</p>
             <button id="reset-params" class="ghost small">Reset to defaults</button>
           </aside>
@@ -294,7 +296,7 @@
       <!-- video: end -->
       <label class="mm-only" title="vision-language models see pictures through a second file, the multimodal projector (mmproj-*.gguf)">Projector (mmproj) <select name="mmprojChoice"></select></label> <!-- vision -->
       <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
-      <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
+      <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="auto (from memory)"></label>
       <label>KV cache <select name="backend.kv-dtype"><option value="">(default)</option><option>f32</option><option>f16</option><option>q8</option><option>q4</option></select></label>
       <label class="st-only">Weights <select name="model.quant"><option value="">(default)</option><option value="q4">q4 (Q4_0)</option><option value="q8">q8 (Q8_0)</option><option value="q6k">q6k (Q6_K)</option><option value="q2k">q2k (Q2_K)</option></select></label>
       <label>Batch <input name="backend.batch" type="number" min="1" placeholder="(default)"></label>

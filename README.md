@@ -66,6 +66,9 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Multi-row decode matvec on Metal | the single-token matmuls give a simdgroup 4 rows that share the activations and the rmsnorm prologue: matvecs per token 6.76 → 5.52 ms, 0.6B decode 118 → 132 tok/s, GGUF Q4_0 105 → 133 (`-Djllm.metal.mvRows=1` for the old kernels) | [08 §8.30](docs/08-metal-backend.md#830-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_) |
 | Decode attention on Metal | independent simdgroups with online softmax in registers and K/V rows shared by a kv head's query heads, picked by the start-up check: ~2× at 3 000 tokens of context (63 → 93 tok/s; f16 / q8 caches 62 → 113) | [08 §8.31](docs/08-metal-backend.md#831-decode-attention-attention_dec) |
 | Prefill chunk `auto` | 256-token chunks for dense models on Metal (prefill 1 426 → 2 012 tok/s on Qwen3-0.6B), logits identical across chunk sizes | [08 §8.29](docs/08-metal-backend.md#829-the-prefill-chunk-backendbatchauto) |
+| Context from memory | `backend.ctx=auto` sizes the context from the free memory (Metal working set minus the weights and other models, or the free Java heap), up to 131 072 and the trained length, and logs it: 40 960 for Qwen3-0.6B, 44 032 for the 27B hybrid GGUF, 18 432 for the 30B MoE at f32 (37 888 at f16); a number still overrides | [10 §10.13](docs/10-engine-and-server.md#1013-the-default-context-length-backendctxauto) |
+| Request priority | `"priority": "background"` (or `X-Jllm-Priority`) makes a subagent or batch job give way at the GPU: a short interactive request behind a long background prompt gets its first token in 127 ms instead of 937 ms (`engine.priority-order`) | [10 §10.14](docs/10-engine-and-server.md#1014-request-priority) |
+| Prompt lookup that pauses | speculation on agent-like prompts, measured: code edit +106 % (0.6B) / +33 … +68 % (30B MoE) / +44 % (CPU), tool calls and prose within −10 %; lookups pause while the measured cost says no draft pays, so the CPU's slow multi-token pass costs 4 – 5 % on prose and tool calls instead of 37 – 40 %; now on for MoE models too | [11 §11.11](docs/11-performance.md#1111-agent-defaults-measured) |
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
@@ -275,7 +278,10 @@ Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"s
   the constraint);
 - completions only: `echo` (with prompt logprobs), `suffix` (fill-in-the-middle for tokenizers with
   `<|fim_prefix|>`/`<|fim_suffix|>`/`<|fim_middle|>`, a 400 otherwise) and `best_of` (the n most likely of best_of
-  candidates; not with `stream`).
+  candidates; not with `stream`);
+- `priority`: `"interactive"` (the default) or `"background"` (an extension; or the header `X-Jllm-Priority`): a
+  subagent or batch job that gives way to people waiting when requests contend for the device
+  ([docs/10 §10.14](docs/10-engine-and-server.md#1014-request-priority)).
 
 Details and the math: [docs/10 §10.6](docs/10-engine-and-server.md#106-the-openai-compatible-api).
 
@@ -479,7 +485,7 @@ path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engin
 `vision.*` (the multimodal projector, where the picture encoder runs, token budget, size limits: [docs/20](docs/20-vision.md#209-settings)),
 `engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
-the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides) and the `server.*` limits listed under Security below.
+the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides), `backend.ctx` (`auto` = sized from the memory free for the KV cache, [docs/10 §10.13](docs/10-engine-and-server.md#1013-the-default-context-length-backendctxauto); a number overrides) with `backend.ctx-max` (its cap, 131072), `engine.priority-order` (background requests give way at the device) and the `server.*` limits listed under Security below.
 
 Settings added with the features above (all in [`src/main/resources/jllm.properties`](src/main/resources/jllm.properties), documented there; a flag
 `--key value` or the console's Settings page changes any of them; `./jllm config` prints the effective values):
@@ -520,7 +526,7 @@ Short flags:
 --head-quant q8|q6k   format of the embedding / LM head (default q8; q6k = Q6_K, a separate jllm-q4_0-h6k cache)
 --gguf-quant LABEL    GGUF repository: the file whose name carries LABEL (Q4_K_M, Q8_0, ...); --gguf-file NAME: exact file name
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
---ctx N               context length / KV cache size (default 4096)
+--ctx N|auto          context length / KV cache size (default auto: sized from the free memory, up to 131072 and the model's trained length; logged at load)
 --batch N|auto       prefill chunk size (default auto: 256 on Metal and for MoE models, 64 on the CPU)
 --backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N; --backend.kv-q8-rotate true|false
 --backend.kv-paged true|false     paged KV cache with a prefix tree (docs/24); --backend.kv-block N, --backend.kv-pool-tokens N

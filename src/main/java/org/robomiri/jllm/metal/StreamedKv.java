@@ -63,8 +63,8 @@ final class StreamedKv implements AutoCloseable {
         try {
             for (int l = 0; l < layers; l++) {
                 if (l < ramLayers) {
-                    hostK[l] = arena.allocate((long) ctx * rowBytes, 64);
-                    hostV[l] = arena.allocate((long) ctx * rowBytes, 64);
+                    hostK[l] = Os.anonymous((long) ctx * rowBytes, arena);
+                    hostV[l] = Os.anonymous((long) ctx * rowBytes, arena);
                 } else {
                     mapped[l] = true;
                     hostK[l] = mapFile(dir);
@@ -180,9 +180,54 @@ final class StreamedKv implements AutoCloseable {
         arena.close();
     }
 
-    /** madvise(WILLNEED), when the C library has it. */
+    /** madvise(WILLNEED) and anonymous mappings, when the C library has them. */
     private static final class Os {
         private static final MethodHandle MADVISE;
+        private static final MethodHandle MMAP;
+        private static final MethodHandle MUNMAP;
+
+        static {
+            MethodHandle mm = null;
+            MethodHandle um = null;
+            try {
+                Linker l = Linker.nativeLinker();
+                mm = l.defaultLookup().find("mmap").map(s -> l.downcallHandle(s, FunctionDescriptor.of(ValueLayout.ADDRESS,
+                        ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                        ValueLayout.JAVA_LONG))).orElse(null);
+                um = l.defaultLookup().find("munmap").map(s -> l.downcallHandle(s,
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))).orElse(null);
+            } catch (Throwable ignored) {
+                // no mmap: plain memory
+            }
+            MMAP = mm;
+            MUNMAP = um;
+        }
+
+        /**
+         * {@code bytes} of zero-filled memory whose pages are committed only when first written (an anonymous mapping), so a
+         * context of a million positions costs what it holds; released when {@code arena} closes. Plain (eagerly zeroed)
+         * memory when the C library cannot map.
+         */
+        static MemorySegment anonymous(long bytes, Arena arena) {
+            if (MMAP != null && MUNMAP != null) {
+                try {
+                    // PROT_READ | PROT_WRITE = 3; MAP_PRIVATE = 2 | MAP_ANON = 0x1000 (macOS)
+                    MemorySegment p = (MemorySegment) MMAP.invokeExact(MemorySegment.NULL, bytes, 3, 0x1002, -1, 0L);
+                    if (p.address() != -1L && p.address() != 0L) {
+                        return p.reinterpret(bytes, arena, seg -> {
+                            try {
+                                int rc = (int) MUNMAP.invokeExact(seg, bytes);
+                            } catch (Throwable ignored) {
+                                // leaked at exit
+                            }
+                        });
+                    }
+                } catch (Throwable ignored) {
+                    // fall back
+                }
+            }
+            return arena.allocate(bytes, 64);
+        }
 
         static {
             MethodHandle h = null;

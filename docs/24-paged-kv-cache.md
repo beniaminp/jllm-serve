@@ -417,6 +417,10 @@ their blocks referenced (they are not evictable until the slot moves on).
 | `jllm.web.kv-spill-max-gb` | `10` | disk budget of those block files (least recently used files go first) |
 | `-Djllm.cpu.pagedGather=true` | off | CPU f32 decode through the gather instead of in place (for comparisons) |
 
+`backend.ctx` is `auto` by default ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)); `ModelLoader` decides it
+once per model, before the pool is created, and the pool key and size use that number. With paging on, the CPU budget `auto` uses is the
+physical memory (the blocks are off the Java heap) instead of the free heap of the flat cache.
+
 ---
 
 ## 24.5 Measured
