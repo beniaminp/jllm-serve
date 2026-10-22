@@ -558,11 +558,28 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /**
+     * Set while the rows of a batched decode step are encoded (docs/10): a few rows (fewer than {@link #PREFILL_MIN_TOKENS})
+     * then take the matrix-vector kernels, as a lone decode step does, instead of the simdgroup-matrix ones that
+     * {@code -Djllm.metal.mmaMinTokens} / {@code moeMmaMin} may allow for short chunks, so that a row computes exactly what its
+     * own step would (the default thresholds never put 8 or fewer rows on the matrix kernels anyway).
+     */
+    private boolean singleRows;
+
+    void singleRows(boolean on) {
+        singleRows = on;
+    }
+
+    /** Whether the expert-grouped matrix kernels serve a pass of n rows (not the few rows of a batched decode step). */
+    boolean moeGrouped(int n) {
+        return MOE_MMA && n >= MOE_MMA_MIN && !(singleRows && n < PREFILL_MIN_TOKENS);
+    }
+
+    /**
      * True if a chunk of n tokens of weights of type {@code type} runs on the simdgroup-matrix prefill kernels: every
      * format has an MMA instantiation ({@code matmul_mma_q4/q8/q2k/q6k} and the GGUF ones).
      */
-    private static boolean useMma(int n, QType type) {
-        return MMA_PREFILL && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
+    private boolean useMma(int n, QType type) {
+        return MMA_PREFILL && !(singleRows && n < PREFILL_MIN_TOKENS) && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
                 && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
     }
 

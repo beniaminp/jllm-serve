@@ -1390,7 +1390,7 @@ public final class MetalBackend implements Backend {
 
         /** The routed experts the GPU holds, for the slots of {@code slotExperts} (index into expGateUp / expDown, -1 = skip). */
         private void gpuRouted(Metal.Buffer slotExperts, int n) {
-            if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+            if (k.moeGrouped(n)) {
                 k.moeGrouped(expGateUp, bExpGateUp, expDown, bExpDown, xb, slotExperts, routeWeight, moeOrder, moeTiles,
                         moeHidden, moeOut, x, gpuExperts, spec.moeDim(), c.dim(), spec.topK(), n, math);
             } else {
@@ -1996,6 +1996,7 @@ public final class MetalBackend implements Backend {
         if (MetalKernels.CONCURRENT_BATCH && n > 1 && k.metal.canRunConcurrent()) {
             k.encoder(1); // the per-row dispatches of the n slots are independent: let them overlap
         }
+        k.singleRows(true);
         k.begin();
         boolean committed = false;
         try {
@@ -2022,6 +2023,7 @@ public final class MetalBackend implements Backend {
                 k.abort();
             }
             k.encoder(encoder);
+            k.singleRows(false);
         }
         if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
             rebalanceExperts();

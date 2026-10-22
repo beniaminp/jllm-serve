@@ -1476,6 +1476,12 @@ tokenizer and chat template of `openai/gpt-oss-20b`), and a tiny model says noth
   q4 / q8 / MXFP4, and `router_ds` method 3; `SmokeTest.kvCacheAttention` checks sink and chunk masks in f32 / f16 / q8 / q4
   caches; `ArchSmoke` runs `GptOss` and `GptOssMxfp4` tiny models through the whole battery (CPU == Metal, batching,
   q8 cache, replay, saved caches, experts on the CPU).
+- **Batched rows equal single steps:** the arch smoke checks that three slots decoded in one batched pass give the logits of
+  three lone steps. In its second pass the matrix-unit kernels are forced on from 2 tokens (`mmaMinTokens=2`,
+  `moeMmaMin=2`), so the 3 rows took other kernels than a lone step and differed by 1e-5 (and by 2.6e-2 with the q8 cache,
+  where one flipped int8 code is amplified by these models). `forwardBatch` now encodes fewer than 8 rows on the matrix-vector
+  kernels a lone step uses (`MetalKernels.singleRows`); the default thresholds never put so few rows on the matrix kernels,
+  so only the forced test configuration changes, and the check reads 0.0 (bit-identical) for gpt-oss and Llama 4 too.
 - **A reference caveat found on the way:** the reference rounds weights to Q8_0 with round-half-up like the engine's
   `Math.round`; `torch.round` rounds half to even and made the first comparisons look like 1e-2 errors.
 - **Not done:** q4 KV cache for these layers; flash / flash-decoding attention for layers with sinks on Metal; real-weight
