@@ -47,6 +47,8 @@ public final class WanTransformer implements AutoCloseable {
     private final Tn textW1, textB1, textW2, textB2;
     private final Block[] blocks;
     private final Tn outTable, outW, outB;
+    /** -Djllm.wan.trace=true prints the largest magnitude and the number of non-finite values after every stage of every block (debugging). */
+    private static final boolean TRACE = Boolean.getBoolean("jllm.wan.trace");
 
     public WanTransformer(Ops ops, Path dir) throws IOException {
         this.ops = ops;
@@ -195,12 +197,21 @@ public final class WanTransformer implements AutoCloseable {
         Tn hs = ops.linear(tokens, patchW, patchB, null, Ops.Act.NONE);
         ops.free(tokens);
         int d = dim;
+        trace("patch embedding", hs);
+        trace("time projection", tproj);
+        trace("text", text);
+        int blockNo = 0;
         for (Block b : blocks) {
+            blockNo++;
             // 1. self-attention with shift / scale / gate from the modulation
             Tn n1 = ops.layerNorm(hs, null, null, eps);
             Tn m1 = ops.modulate(n1, tproj, b.table, new int[]{6 * d, d, 0, d, 0}, 1);
             ops.free(n1);
             Tn a1 = attention(b.a1, m1, m1, cosT, sinT, n, null);
+            if (TRACE) {
+                trace("block " + blockNo + " modulated input", m1);
+                trace("block " + blockNo + " self-attention", a1);
+            }
             ops.free(m1);
             Tn x1 = ops.gatedAdd(hs, a1, tproj, b.table, 6 * d, 2 * d, 2 * d, 1);
             ops.free(a1);
@@ -208,6 +219,7 @@ public final class WanTransformer implements AutoCloseable {
             // 2. cross-attention to the text
             Tn n2 = ops.layerNorm(x1, b.n2g, b.n2b, eps);
             Tn a2 = attention(b.a2, n2, text, null, null, n, x1);
+            trace("block " + blockNo + " cross-attention", a2);
             ops.free(n2);
             ops.free(x1);
             // 3. feed-forward
@@ -219,6 +231,7 @@ public final class WanTransformer implements AutoCloseable {
             Tn ff = ops.linear(g, b.f2w, b.f2b, null, Ops.Act.NONE);
             ops.free(g);
             hs = ops.gatedAdd(a2, ff, tproj, b.table, 6 * d, 5 * d, 5 * d, 1);
+            trace("block " + blockNo + " output", hs);
             ops.free(ff);
             ops.free(a2);
         }
@@ -250,6 +263,23 @@ public final class WanTransformer implements AutoCloseable {
             }
         }
         return out;
+    }
+
+    private void trace(String what, Tn t) {
+        if (!TRACE) {
+            return;
+        }
+        float[] v = ops.download(t);
+        double max = 0;
+        int bad = 0;
+        for (float f : v) {
+            if (Float.isNaN(f) || Float.isInfinite(f)) {
+                bad++;
+            } else {
+                max = Math.max(max, Math.abs(f));
+            }
+        }
+        System.err.printf("trace %-34s max |x| %.4g, %d non-finite of %d%n", what, max, bad, v.length);
     }
 
     /** Attention with RMS-normed q / k over all heads (and rotary positions in self-attention); {@code residual + to_out(attention)}. */

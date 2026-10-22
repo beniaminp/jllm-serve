@@ -86,6 +86,8 @@ public final class WanTest {
                     check(w.pipe(model, resource(r), "metal", pr[0]) == 0 && w.relative > min, String.format("%s: pipeline on Metal %s (PSNR %.1f dB, need %.0f)", r, pr[0], w.relative, min));
                 }
             }
+            geluTanhHuge("f32", 1e-5);
+            geluTanhHuge("f16", 1.5e-2);
         } else {
             System.out.println("skip Metal checks: no GPU library");
         }
@@ -94,6 +96,38 @@ public final class WanTest {
             System.exit(1);
         }
         System.out.println("WanTest passed");
+    }
+
+    /**
+     * The tanh GELU of pre-activations in the hundreds (the real transformer's text projection has them; the tiny random one does not): tanh of a
+     * huge argument is 1, and must not be inf / inf = NaN on the GPU.
+     */
+    private static void geluTanhHuge(String precision, double relTol) {
+        int m = 24, k = 64, n = 72;
+        java.util.Random rnd = new java.util.Random(5);
+        float[] a = new float[m * k];
+        float[] w = new float[n * k];
+        float[] b = new float[n];
+        for (int i = 0; i < a.length; i++) {
+            a[i] = (float) (rnd.nextGaussian() * 12);
+        }
+        for (int i = 0; i < w.length; i++) {
+            w[i] = (float) (rnd.nextGaussian() * 0.5);
+        }
+        float[][] out = new float[2][];
+        try (Devices cpu = Devices.cpu(); Devices gpu = Devices.open("metal", precision, false)) {
+            for (int dev = 0; dev < 2; dev++) {
+                Ops ops = dev == 0 ? cpu.main() : gpu.main();
+                Tn wt = ops.matrix(w, Ops.Kind.LINEAR, n, k);
+                out[dev] = ops.download(ops.linear(ops.upload(a, 1, m, k), wt, ops.vector(b, 1, n), null, Ops.Act.GELU_TANH));
+            }
+        }
+        int bad = 0;
+        for (float f : out[1]) {
+            bad += Float.isFinite(f) ? 0 : 1;
+        }
+        double[] d = DiffusionCompare.diff(out[0], out[1]);
+        check(bad == 0 && d[0] <= relTol * Math.max(1, d[2]), String.format("tanh GELU of pre-activations up to %.0f on Metal %s: %d non-finite, max diff %.2e vs CPU", d[2], precision, bad, d[0]));
     }
 
     private static void scheduler() {

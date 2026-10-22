@@ -45,8 +45,8 @@ def run(E, check):
     tile_n = {np.float32: 32, np.float16: 64}   # columns of the output tile of the matrix kernels (DF_BNT)
 
     # ---------------------------------------------------------------- df_gemm_nt: act(A W^T + bias) + res
-    def gemm(dtype, m, n, k, act=0, bias=True, res=True, vec=None):
-        a, w = rnd(dtype, m, k), rnd(dtype, n, k, scale=0.3)
+    def gemm(dtype, m, n, k, act=0, bias=True, res=True, vec=None, a_scale=1.0):
+        a, w = rnd(dtype, m, k, scale=a_scale), rnd(dtype, n, k, scale=0.3)
         b = rnd(np.float32, n)
         r = rnd(dtype, m, n)
         out = np.zeros((m, n), dtype)
@@ -72,6 +72,7 @@ def run(E, check):
         gemm(dt, 5, 72, 96, act=QUICK, res=False)
         gemm(dt, 3, 20, 8, bias=False, res=False)
         gemm(dt, 40, 72, 64, act=GELU_TANH)       # the feed-forward and text projection of the Wan transformer
+        gemm(dt, 24, 72, 64, act=GELU_TANH, a_scale=6.0)   # large inputs: tanh of a huge argument must be 1, not NaN (real Wan text embeddings)
 
     # ---------------------------------------------------------------- scores, softmax, P V: naive attention, batched
     def naive_attention(dtype, batch, heads, lq, lk, hd, causal):

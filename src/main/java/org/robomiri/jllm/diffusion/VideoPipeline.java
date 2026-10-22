@@ -141,6 +141,8 @@ public final class VideoPipeline implements AutoCloseable {
     }
 
     /** Time spent in the last {@link #generate} call: text encoder, UNet evaluations, VAE decoding, everything. */
+    /** Benchmark switch (-Djllm.video.nomotion=true): run the frames as independent images, to time what the motion modules add. The clip is garbage. */
+    private static final boolean NO_MOTION = Boolean.getBoolean("jllm.video.nomotion");
     public volatile long textNs, unetNs, vaeNs, totalNs;
 
     /** Diagnostics of the last clip: the final latents (NHWC per frame: {@code [F, h, w, 4]}) and the decoded pixels before clamping. */
@@ -247,7 +249,7 @@ public final class VideoPipeline implements AutoCloseable {
                 }
                 long u0 = System.nanoTime();
                 Tn sample = ops.upload(batch, bs * f, lh, lw, lc);
-                Tn eps = unet.forward(sample, sched.timestep(i), new UNet.Cond(enc, null, null), f);
+                Tn eps = unet.forward(sample, sched.timestep(i), new UNet.Cond(enc, null, null), NO_MOTION ? 1 : f);
                 ops.free(sample);
                 float[] e = ops.download(eps);
                 ops.free(eps);

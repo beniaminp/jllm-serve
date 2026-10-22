@@ -81,7 +81,7 @@ static inline float df_act(float v, int act) {
     if (act == ACT_SILU) return df_silu(v);
     if (act == ACT_GELU) return df_gelu(v);
     if (act == ACT_QUICK_GELU) return v / (1.0f + exp(-1.702f * v));
-    if (act == ACT_GELU_TANH) return 0.5f * v * (1.0f + tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+    if (act == ACT_GELU_TANH) return 0.5f * v * (1.0f + tanh(clamp(0.7978845608028654f * (v + 0.044715f * v * v * v), -15.0f, 15.0f))); // the clamp: tanh of a huge argument is inf / inf = NaN under fast math
     return v;
 }
 
