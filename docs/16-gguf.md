@@ -503,17 +503,9 @@ cache, 452 MB; Metal; the machine was shared with other jobs, load average 12-30
 | *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
 
 Before `QType.Q6_K` existed the 29 Q6_K tensors of this file were requantized to Q8_0 at load: 1.4 s to map, 510 MB
-RSS. The output is token for token the same (md5 `1a5dc189...` for the haiku prompt, Metal and CPU). With a file
-that holds Q3_K, Q4_1/Q5_x or float matrices those tensors are still converted (`GGUF weights:` reports it).
-
----|---|---|---|
-| converted q4 cache | 0.02 s | 1.7 s | ~230 MB |
-| *conversion from safetensors, once* | *3 s, peak RSS 1.6 GB, 452 MB written* | | |
-
-*Measured before `QType.Q6_K` was merged, when the 29 Q6_K tensors of this file were requantized to Q8_0 at load.* That
-fallback (176 MB of copies) accounted for the difference in resident memory and about a second of the load; with Q6_K
-used in place a `Q4_K_M` file is mapped entirely as it is (see the numbers re-measured below), and with a `Q8_0` file
-the load is dominated by the tokenizer.
+RSS. The output is token for token the same (md5 `1a5dc189...` for the haiku prompt, Metal and CPU). Q4_1, Q5_0,
+Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16 and BF16 are now read in place too, except where a backend's default
+requantizes them (§16.4.1); `GGUF weights:` reports what was converted, and §16.9.1 has their numbers.
 
 ### 16.9.1 The newer block types in place (Apple M1 Pro, Qwen3-0.6B requantized with `llama-quantize`)
 
