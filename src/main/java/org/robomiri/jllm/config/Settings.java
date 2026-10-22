@@ -55,6 +55,17 @@ public final class Settings {
             Map.entry("draft-tokens", "engine.draft-tokens"),
             Map.entry("think", "chat.thinking"),
             Map.entry("system", "chat.system"),
+            Map.entry("image-model", "image.model"),
+            Map.entry("steps", "image.steps"),
+            Map.entry("guidance", "image.guidance"),
+            Map.entry("width", "image.width"),
+            Map.entry("height", "image.height"),
+            Map.entry("scheduler", "image.scheduler"),
+            Map.entry("negative", "image.negative"),
+            Map.entry("out", "image.out"),
+            Map.entry("init", "image.init"),
+            Map.entry("mask", "image.mask"),
+            Map.entry("strength", "image.strength"),
             Map.entry("host", "server.host"),
             Map.entry("port", "server.port"));
 
@@ -251,6 +262,18 @@ public final class Settings {
         String backend = get("backend");
         require(backend.equals("cpu") || backend.equals("metal") || backend.equals("auto"), "backend",
                 "must be cpu, metal or auto");
+        require(get("image.backend").equals("cpu") || get("image.backend").equals("metal") || get("image.backend").equals("auto"),
+                "image.backend", "must be cpu, metal or auto");
+        require(get("image.precision").matches("auto|f16|f32"), "image.precision", "must be auto, f16 or f32");
+        require(getInt("image.steps") >= 0 && getInt("image.steps") <= 200, "image.steps", "must be 0 (model default) .. 200");
+        require(getInt("image.width") >= 0 && getInt("image.height") >= 0, "image.width", "and image.height must be 0 (model default) or positive");
+        require(getInt("image.count") >= 1 && getInt("image.count") <= 64, "image.count", "must be 1..64");
+        require(getFloat("image.strength") >= 0 && getFloat("image.strength") <= 1, "image.strength", "must be 0..1");
+        getLong("image.seed");
+        getFloat("image.guidance");
+        require(getInt("image.vae-tile") >= 8 && getInt("image.vae-tile") <= 512, "image.vae-tile", "must be 8..512");
+        require(getInt("image.vae-tile-overlap") >= 1 && getInt("image.vae-tile-overlap") < getInt("image.vae-tile"),
+                "image.vae-tile-overlap", "must be at least 1 and below image.vae-tile");
         require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");
         for (String k : new String[]{"vision.enabled", "vision.auto-download", "vision.allow-private-urls"}) {
             getBool(k);

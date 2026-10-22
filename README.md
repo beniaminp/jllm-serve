@@ -21,6 +21,9 @@ multi-token-prediction layer can draft for speculative decoding (`--engine.specu
 [docs/16 §16.14](docs/16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
 (`mlx-community/*-4bit`, `-8bit`, and the `mxfp4` / `mxfp8` modes) and block-quantized **FP8** checkpoints are read too:
 dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
+It also draws: **Stable Diffusion** image generation (SD 1.x, SD 2.x / SD-Turbo, SDXL / SDXL-Turbo, from the Hugging Face
+diffusers layout) as text to image, image to image, inpainting, outpainting and upscaling, on Metal or the CPU, with an
+OpenAI-compatible `/v1/images` API and an Images tab in the web console ([docs/22](docs/22-image-generation.md)).
 
 | Piece | Where | Written from scratch |
 |---|---|---|
@@ -67,6 +70,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |
 | Audio tab and editor | record or upload, transcribe (SRT/VTT/JSON, word times), text to speech, a waveform editor (cut, fade, normalize, silence removal, mix, undo; transcribe or replace a selection, edit audio by editing its transcript), dictation and read-aloud in the chat, `transcribe_audio` / `speak` tools | [21](docs/21-audio.md) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
+| Image generation | Stable Diffusion 1.x / 2.x / Turbo and SDXL written from scratch (CLIP tokenizer and text encoders, UNet, VAE with tiled decoding, Euler / Euler-ancestral / DPM++ 2M, classifier-free guidance, image to image, inpainting with blending or a 9-channel UNet, outpainting, upscaling); on Metal in float16 with its own kernels (implicit-GEMM convolution, flash attention, chunked group norm) and on the CPU; `/v1/images/generations` and `/edits` (streaming progress and previews), `./jllm image`, an Images tab with gallery and canvas editor, `generate_image` / `edit_image` chat tools. Equal to Hugging Face diffusers stage by stage on the same noise: float32 UNet within 5·10⁻⁶ relative, final images at 74–137 dB PSNR (float16: 50–77 dB) | [22](docs/22-image-generation.md) |
 | Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL; the Gemma 3 projector) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
 
 The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
@@ -128,6 +132,21 @@ Models load like text models (the console's Models page, `jllm.web.autoload`); W
 ./jllm chat --model THUDM/GLM-4-9B-0414 --backend.kv-dtype f16  # GLM-4 with a half-precision KV cache
 ./jllm run  --model state-spaces/mamba-130m-hf --raw --prompt "The capital of France is"
 ```
+
+### Images
+
+```sh
+./jllm image --image-model stabilityai/sd-turbo --prompt "a red fox in a snowy forest, photo" --out fox.png    # ~2.6 GB, once
+./jllm image --image-model stabilityai/sd-turbo --prompt "watercolor" --init fox.png --strength 0.5 --out fox2.png   # image to image
+./jllm serve --image-model stabilityai/sd-turbo --model none          # OpenAI-compatible POST /v1/images/generations and /edits
+./jllm-web/run.sh                                                      # Models: load stabilityai/sd-turbo; then the Images tab
+```
+
+SD-Turbo makes a 512 × 512 picture in 1–4 steps without guidance; `stable-diffusion-v1-5/stable-diffusion-v1-5`,
+`stabilityai/sdxl-turbo` and the inpainting model `stable-diffusion-v1-5/stable-diffusion-inpainting` work too. Settings:
+`image.backend` (`auto` = Metal when there is a GPU), `image.precision` (`f16` / `f32`), `image.vae-tile`; all `image.*`
+keys are in [`jllm.properties`](src/main/resources/jllm.properties). Details, the math of diffusion and the measured speed
+against diffusers: [docs/22](docs/22-image-generation.md).
 
 ### GGUF files
 
@@ -199,7 +218,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
-`GET /health`, `GET /` (chat UI), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+`GET /health`, `GET /` (chat UI), with an image model loaded `POST /v1/images/generations` and `/v1/images/edits` ([docs/22](docs/22-image-generation.md#2212-api-command-line-console-and-chat-tools)), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`, `logit_bias` (token id →
 −100…100, added to the logits). Also supported:
 
@@ -275,6 +294,12 @@ repository by its launcher).
   (default `../models`, so a console started from `jllm-web/` also shows the repository's `models/` folder that
   `./jllm` uses), grouped by folder. A model is loaded from the folder it is in, and a checkpoint whose quantized
   cache is there loads from the cache without contacting the Hub, even after its shards were deleted (`model.low-disk`).
+- **Images**: pictures from an image model (Stable Diffusion, SDXL; load one on the Models page like a text model):
+  prompt, negative prompt, size, steps, guidance, seed, scheduler, batch, a progress bar per step with live previews;
+  a gallery kept in the browser (IndexedDB: download, use as input, re-run); and an editor on a canvas with crop,
+  rotate / flip, resize, brightness / contrast / saturation, a brush and eraser that paint an inpainting mask, outpainting
+  (extend the canvas and inpaint the border), undo / redo, PNG export and image-to-image / inpaint requests with a strength
+  slider. The chat tools `generate_image` and `edit_image` let a model draw and change pictures, shown inline in the chat.
 - **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
   from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
   `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and
@@ -482,6 +507,11 @@ sh scripts/build-metal-emu.sh && python3 -I scripts/metal-emu/kernel_tests.py   
 REAL_PYTHON=<venv>/bin/python scripts/real-weights-check.sh Qwen/Qwen2.5-0.5B-Instruct   # engine vs transformers on real weights (docs/14.13)
 ```
 
+`mvn test` also runs `DiffusionTest`: tiny random Stable Diffusion pipelines (SD 1.x, SDXL, inpainting; a few hundred kB each,
+`src/test/resources/diffusion`) against the outputs of Hugging Face diffusers for the same weights and noise, on the CPU and the
+GPU (`scripts/diffusion/make-tiny.py`, `reference.py`; the real-model checks and the speed comparison are in
+[docs/22](docs/22-image-generation.md#2213-verified-against-diffusers)).
+
 `mvn test` also runs `ToolCallTest` (constrained tool calls, jump-forward and speculation under the constraint, on a scripted model and on Qwen3-0.6B) and `ConstraintBench` in its quick mode (the token masks against a brute-force oracle); `scripts/tool-call-check.sh` checks on the CPU and on Metal that the constrained greedy output is the same with speculation off, prompt lookup and draft models ([docs/17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)). `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
 against a fake backend (settings validation, bad requests, keep-alive, slow, stalled and disconnected clients). Two more checks are run by hand:
 
@@ -521,11 +551,13 @@ src/main/java/org/robomiri/jllm/
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
   engine/                generation loop, prefix cache, stop strings, KV cache files
+  diffusion/             image generation: CLIP tokenizer + text encoders, UNet, VAE, samplers, pipelines, Ops (CPU, Metal), image API
   vision/                pictures as input: preprocessing (Pillow-compatible resize), the vision transformer on CPU and Metal, chat-request parts, projector discovery
   server/                HTTP server, OpenAI-compatible API, web UI
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
 src/main/resources/org/robomiri/jllm/metal/vision.metal    GPU kernels of the vision encoder
+src/main/resources/org/robomiri/jllm/metal/diffusion.metal  GPU kernels of the image-generation stack (own Metal library)
 docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
@@ -535,6 +567,7 @@ jllm-web/                Spring Boot web console + OpenAI API (separate Maven pr
     tools/               tool-call prompt format and parsing, built-in tools (search, fetch, calculator, time)
     mcp/                 MCP client: stdio, Streamable HTTP and SSE transports, server manager
     openai/              /v1 endpoints
+    images/              image models in memory, /v1/images/generations and /edits, the pictures served by link
     settings/            jllm.properties view and persisted overrides
     api/                 /api management, tools and integrations (opencode, Continue, aider, Cline) endpoints, API key filter
     logs/                captured engine output

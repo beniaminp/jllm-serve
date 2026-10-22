@@ -7,6 +7,7 @@ import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.server.ApiServer;
 import org.robomiri.jllm.server.HttpServer;
+import org.robomiri.jllm.server.ImageHttp;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 
 import java.io.BufferedReader;
@@ -53,10 +54,17 @@ public final class Main {
         try {
             switch (cmd) {
                 case "config" -> System.out.print(s.describe());
-                case "download" -> ModelLoader.download(s, hub, model);
+                case "download" -> {
+                    if (s.opt("image.model") != null) {
+                        System.out.println(org.robomiri.jllm.diffusion.ImageModels.resolve(s, hub, s.get("image.model")));
+                    } else {
+                        ModelLoader.download(s, hub, model);
+                    }
+                }
                 case "chat" -> chat(ModelLoader.load(s, hub, model), s);
                 case "run" -> run(ModelLoader.load(s, hub, model), s);
-                case "serve" -> serve(ModelLoader.load(s, hub, model), model, s, hub);
+                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model), model, s, hub);
+                case "image" -> image(s, hub);
                 case "transcribe" -> org.robomiri.jllm.audio.AudioCli.transcribe(s, hub, model, cli(s, "audio"), cli(s, "language"),
                         "true".equals(cli(s, "translate")), cli(s, "format") == null ? "text" : cli(s, "format"),
                         "true".equals(cli(s, "words")));
@@ -81,7 +89,8 @@ public final class Main {
                   download   fetch the model from the Hugging Face Hub
                   chat       interactive chat in the terminal
                   run        single prompt completion (--prompt "...")
-                  serve      OpenAI-compatible HTTP server
+                  serve      OpenAI-compatible HTTP server (--image-model <repo> adds /v1/images; --model none: images only)
+                  image      generate a picture with a Stable Diffusion model (--image-model <repo|folder> --prompt "...")
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
@@ -216,12 +225,28 @@ public final class Main {
         }
     }
 
+    /** {@code jllm image --image.model stabilityai/sd-turbo --prompt "..." [--out file.png] [--steps n] ...}: one picture from the command line. */
+    private static void image(Settings s, HuggingFaceHub hub) throws Exception {
+        String source = s.opt("image.model");
+        if (source == null) {
+            System.err.println("usage: jllm image --image.model <diffusers repo or folder> --prompt \"...\" [--out file.png]"
+                    + " [--steps n --guidance g --seed n --width w --height h --scheduler euler|euler_a|dpmpp_2m|dpmpp_2m_karras"
+                    + " --negative \"...\" --init picture.png [--mask mask.png] --strength s]");
+            System.exit(2);
+        }
+        org.robomiri.jllm.diffusion.ImageCli.run(s, hub, source);
+    }
+
     /** A flag only some commands take (--audio, --voice, ...), or null. */
     private static String cli(Settings s, String key) {
         return s.has(key) ? s.get(key) : null;
     }
 
     private static void serve(ModelLoader.Loaded l, String model, Settings s, HuggingFaceHub hub) throws Exception {
+        String imageSource = s.opt("image.model");
+        if (l == null && imageSource == null) {
+            throw new IllegalArgumentException("--model none needs --image.model");
+        }
         int port = s.getInt("server.port");
         String host = s.get("server.host");
         org.robomiri.jllm.audio.AudioSettings as = org.robomiri.jllm.audio.AudioSettings.of(s);
@@ -234,21 +259,41 @@ public final class Main {
                 s.opt("server.cors-origin"));
         ApiServer.Options options = new ApiServer.Options(s.sampling(), s.getBool("chat.thinking"),
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
-        try (ModelWeights weights = l.weights(); Engine engine = l.engine();
-             org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels();
-             ApiServer server = new ApiServer(engine, model, host, port, options).imageLimits(
-                     s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
-            if (audio) {
-                for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
-                    if (!repo.isEmpty()) {
-                        System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
-                    }
-                }
-                server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
-                        new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+        ModelWeights weights = l == null ? null : l.weights();
+        Engine engine = l == null ? null : l.engine();
+        org.robomiri.jllm.diffusion.ImagePipeline pipe = null;
+        try (org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels()) {
+            ImageHttp images = null;
+            if (imageSource != null) {
+                pipe = org.robomiri.jllm.diffusion.ImageModels.load(s, hub, imageSource);
+                images = new ImageHttp(pipe, org.robomiri.jllm.diffusion.ImageModels.defaultId(imageSource));
+                System.err.println("Image model " + images.modelId() + ": " + pipe.description());
             }
-            System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions)");
-            server.serve();
+            try (ApiServer server = new ApiServer(engine, model, host, port, options).withImages(images).imageLimits(
+                    s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
+                if (audio) {
+                    for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
+                        if (!repo.isEmpty()) {
+                            System.err.println("Audio model " + org.robomiri.jllm.audio.AudioCli.load(s, hub, audioModels, repo).description());
+                        }
+                    }
+                    server.setAudio(new org.robomiri.jllm.server.AudioRoutes(audioModels,
+                            new org.robomiri.jllm.audio.AudioDecoder(as.ffmpeg(), as.maxSeconds()), as));
+                }
+                System.err.println("Listening on http://" + host + ":" + server.port() + "  (chat UI at /, API at /v1/chat/completions"
+                        + (images != null ? ", /v1/images/generations" : "") + ")");
+                server.serve();
+            }
+        } finally {
+            if (pipe != null) {
+                pipe.close();
+            }
+            if (engine != null) {
+                engine.close();
+            }
+            if (weights != null) {
+                weights.close();
+            }
         }
     }
 

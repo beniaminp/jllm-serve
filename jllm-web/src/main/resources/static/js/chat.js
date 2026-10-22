@@ -114,7 +114,8 @@ const Chat = (() => {
     return `<details class="toolcard${err ? ' err' : ''}"><summary>🛠 <span class="tc-name">${esc(call.function?.name || '?')}</span>`
       + `<span class="tc-args">${esc(short)}</span>${result?.ms != null ? `<span class="muted small">${result.ms} ms</span>` : ''}${icon}</summary>`
       + `<div class="tc-body"><div class="muted small">arguments</div><pre>${esc(args)}</pre>`
-      + (result ? `<div class="muted small">result</div><pre>${esc(result.content)}</pre>` : '') + '</div></details>';
+      + (result ? `<div class="muted small">result</div><pre>${esc(result.content)}</pre>` : '') + '</div></details>'
+      + (typeof Images !== 'undefined' ? Images.inlineHtml(result?.content) : '') /* images: pictures of the result, visible without expanding */;
   }
 
   function statsLine(usage, extra) {
@@ -195,7 +196,7 @@ const Chat = (() => {
   function welcome() {
     const div = document.createElement('div');
     div.className = 'welcome';
-    if (!loadedModels.length) {
+    if (!loadedModels.some(m => m.kind !== 'image') /* images */) {
       div.innerHTML = `<h2>No model loaded</h2><p class="muted">Open <a href="#models">Models</a> to download one from Hugging Face and load it.</p>`;
       return div;
     }
@@ -446,6 +447,7 @@ const Chat = (() => {
 
   function renderModelSelect(list) {
     const sel = $('#chat-model');
+    list = list.filter(m => m.kind !== 'image');   // images: image models are used on the Images tab
     const want = sel.value || store.get('jllm.model', '');
     const html = list.length ? list.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('') : '<option value="">(no model loaded)</option>';
     if (sel.innerHTML !== html) sel.innerHTML = html;
