@@ -647,3 +647,37 @@ the quality gain per position of window is largest at the start (0 → 32 positi
 −0.64, → 512: −0.76), the cost grows with it (prefill at 2 000 tokens: window 0 −7.5 %, 128 −16 %, 512 −29 % against f16). The default stays 128: it takes the larger part of the gain at a cost
 of 16 % of prefill; raise `backend.kv-q4-recent` to 512 when answers matter more than prefill speed, set 0 to save the
 ring and lose only 7.5 % of prefill speed against f16 (accepting about 3× the error).
+
+## 11.10 The q8 cache with rotated keys, measured
+
+🧸 Shaking the keys before the one-byte shrink makes the answers much closer to the full-size shelf's, and it costs almost
+nothing: the same memory and a few percent of speed.
+
+📐 **Memory** is q8's (59 KB per token, 242 MB at `--ctx 4096` for Qwen3-0.6B): the rows and scales are the same, nothing is added.
+
+**Speed on the current tree** (with the decode attention `attention_dec` ([08 §8.31](08-metal-backend.md#831-decode-attention-attention_dec))
+chosen by the start-up check for the q8 cache of this model, the multi-row matvecs, and `backend.batch=auto` = 256 on Metal; M1 Pro,
+Qwen3-0.6B Q4_0, `./jllm bench --model Qwen/Qwen3-0.6B --temp 0 --bench.rounds 3 --engine.speculative off --backend.kv-dtype f16|q8
+--backend.kv-q8-rotate false|true [--bench.prompt-repeat 200]`, median of 3 rounds, under the heavy lock, two passes alternating the
+configurations, shown as pass 1 / pass 2; 413 or 2 013 prompt tokens, decode 128 tokens):
+
+| configuration | prompt tokens | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| Metal, f16 | 413 | 2112.5 / 2081.6 | 142.5 / 142.8 |
+| Metal, q8 (plain keys) | 413 | 2064.8 / 2073.6 | 142.9 / 143.7 |
+| Metal, **q8, rotated keys** | 413 | 2039.0 / 2042.4 | 139.1 / 138.8 |
+| Metal, f16 | 2013 | 1202.5 / 1190.9 | 121.0 / 121.0 |
+| Metal, q8 (plain keys) | 2013 | 1213.4 / 1213.6 | 126.8 / 126.9 |
+| Metal, **q8, rotated keys** | 2013 | 1206.5 / 1201.2 | 122.9 / 123.0 |
+
+The rotated cache costs 1.2–1.5 % of prefill at 413 tokens and 0.6–1 % at 2 013, and 2.7–3.4 % of decode at 413 and 3.1 % at 2 013 against
+plain q8. The rotated query and `scale / B` go to `attention_dec` like to every other attention kernel, so that cost is the rotation
+itself (a Hadamard transform of 8 k heads and 16 q heads per layer in the fused rope-and-store kernel), not a slower attention.
+Accuracy: [07 §7.13](07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate). Commands for the accuracy and needle tables:
+`KvStudy accuracy … variants=f32,q8,q8r` and `KvStudy needle … lens=4096,8192,16384 variants=f16,q8,q8r`
+(`src/test/java/org/robomiri/jllm/KvStudy.java`).
+
+*Before `attention_dec` and the multi-row matvecs* (the branch's first measurement; prefill chunk 64, `attention_t`): q8 plain 1457 / 1467 tok/s
+prefill and 116.6 / 118.4 decode at 413 tokens, rotated 1453 / 1452 and 116.5 / 114.5 (0.3–1 % and 0–3 %); at 2 013 tokens plain 1050 / 1049
+and 80.7 / 80.5, rotated 1038 / 1041 and 80.3 / 80.3 (1 % and 0.4 %). The first version, with the rotation as a separate dispatch (`rope` +
+`kv_store_q8r`), cost 3–6 % of decode at 413 tokens and 2 % of prefill, which is why the rotation lives in `rope_store_q8r`.

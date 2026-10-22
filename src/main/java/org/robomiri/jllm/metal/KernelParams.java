@@ -21,6 +21,7 @@ public enum KernelParams {
     KV_STORE("KvStoreParams", "iiii"),
     KV_PUT("KvPutParams", "ii"),
     KV_STORE_Q4("KvStoreQ4Params", "iiiiiiii"),
+    KV_STORE_Q8R("KvStoreQ8RParams", "iiiii"),
     ATTN_Q4("AttnQ4Params", "iiiiifiiiiifii"),
     ATTN_SPLIT_Q4("AttnSplitQ4Params", "iiiiifiiifiiii"),
     FLASH_Q4("FlashQ4Params", "iiiifiiiifii"),

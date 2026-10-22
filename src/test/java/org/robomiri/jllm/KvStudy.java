@@ -107,10 +107,12 @@ public final class KvStudy {
             this.ban = engine.stopTokenIds();
         }
 
-        /** A backend of the variant ({@code f32}, {@code f16}, {@code q8}, {@code q4:R}); f16 is the loader's own. */
+        /** A backend of the variant ({@code f32}, {@code f16}, {@code q8}, {@code q8r} (q8 with rotated keys), {@code q4:R}); f16 is the loader's own. */
         Backend open(String variant) {
             String[] p = variant.split(":");
-            KvDtype dt = KvDtype.parse(p[0]);
+            boolean rot = p[0].equals("q8r"); // q8 with Hadamard-rotated keys (backend.kv-q8-rotate)
+            KvDtype dt = KvDtype.parse(rot ? "q8" : p[0]);
+            KvDtype.setQ8Rotate(rot);
             if (dt == KvDtype.Q4) {
                 KvDtype.setQ4Recent(p.length > 1 ? Integer.parseInt(p[1]) : KvDtype.Q4_RECENT_DEFAULT);
             }

@@ -962,7 +962,7 @@ What the numbers say:
   Qwen3-0.6B's keys need about 5 bits: 4 bits is a cliff, not a slope (smaller groups or an asymmetric scale do not
   move it, and keeping the attention-sink positions exact does not either). The values are not the problem. Rotating
   the keys of the *q8* cache would also make it about 15× more accurate (K at 8 bits rotated: −0.0015 nats against
-  −0.027 unrotated); that is a change of the q8 format and not made here.
+  −0.027 unrotated); that is now done, see [q8 with rotated keys](#q8-with-rotated-keys-backendkv-q8-rotate) below.
 
 #### 📐 Needle in a haystack
 
@@ -1004,6 +1004,90 @@ unrotated keys was not made (their perplexity above, in the tens of thousands, a
 always rotated (there is no setting; `-Djllm.kv.q4.rotate=false` exists only to reproduce the study), and
 `backend.kv-q4-recent` stays 128: it recovers most of what the window can (+0.27 nats against +0.91 without, +0.15 at
 512) for 16 % of prefill speed at 2 000 tokens on the GPU; 512 buys the last part for another 13 percentage points of it.
+
+### q8 with rotated keys (`backend.kv-q8-rotate`)
+
+#### 🧸 The idea
+
+The q8 shelf keeps every note as a fairly good JPEG, but a note's biggest number sets how coarse the whole JPEG is: in a
+key a few numbers are huge and most are tiny, and the tiny ones get rounded away. The "shaking" trick that q4 needs to
+work at all helps q8 too: shake each key with the same fixed recipe before shrinking it, and shake the question the same
+way, so "how much does this key match my question?" gives the same answer. After shaking no number sticks out, so the
+same one-byte-per-number JPEG loses much less. Nothing else changes: the shelf is exactly as big, the values are not
+shaken, and with the setting off you get the old shelf back.
+
+#### 📐 The math
+
+The same transform as q4 ([`KvQ4.rotate`](#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)): each kv head's K
+row after QK-norm and RoPE is multiplied by the unnormalized Walsh–Hadamard matrix of its block `B` (the largest power of
+two dividing `headDim`: 64, 128, 256, or three blocks of 32 for 96), and **then** quantized exactly as q8 always was: one
+scale per (position, kv head) row, `scale = max|x| / 127`, `q = rint(x / scale)`. The queries get the same transform
+inside attention and the score scale is divided by `B`: `(Hq)·(Hk) / B = q·k`. V is not rotated. After the rotation a row's
+entries are ±1 sums of `B` entries, close to Gaussian, so the largest value is about 2–2.5 RMS instead of 7.3 RMS and the
+rounding error `scale / 2 = max|x| / 254` shrinks by the same factor. The row layout, the memory (59 KB per token for
+Qwen3-0.6B), the Metal kernels' stride and the CPU's transposed chunks are q8's; only the stored numbers differ.
+
+**Where it applies.** Grouped-query attention whose head size is a multiple of 32 (what q4 needs too), on both
+backends. DeepSeek's latent cache `[c | k_pe]` has no per-head key to rotate (the absorbed query multiplies the
+latent row, which also carries the value) and stays plain q8, and so do head sizes that are not multiples of 32 and
+Qwen3-Next's CPU full-attention layers (its Metal backend serves q8 as f16). `KvCache.Q8` rotates in `store` and
+`attention` (a rotated copy of the chunk's queries); the Metal backend does it in `kv_store_q8r` / `rope_store_q8r`
+([08 §8.32](08-metal-backend.md#832-the-q8-kv-cache-with-rotated-keys-on-the-gpu-backendkv-q8-rotate)).
+
+**Saved caches.** The format string gains a word: `kv q8 rot layers=… kvDim=… headDim=…` against `kv q8 layers=…`. A file
+saved with rotated keys is refused by a plain q8 backend and the other way round (`the saved cache has another layout`);
+old q8 files carry the old string and load into a backend with `backend.kv-q8-rotate=false` as before
+(`KvStateTest.rotateRefusal`, `ArchSmoke.kvStateChecks`).
+
+**Accuracy** (Metal, Qwen3-0.6B Q4_0, the same harness and prompts as the q4 tables above, `variants=f32,q8,q8r`; `q8r` is q8
+with rotated keys; the q8 rows reproduce the table above):
+
+| prompt | cache | first divergence | identical tokens | mean \|Δlogit\| | max \|Δlogit\| | mean KL (nats) | arg max agreement |
+|---|---|---|---|---|---|---|---|
+| code | q8 | 61 | 22.3% (67/300) | 0.2595 | 5.807 | 0.00976 | 98.3% |
+| code | **q8, rotated keys** | 89 | 30.3% (91/300) | 0.0537 | 2.393 | 0.00059 | 99.7% |
+| prose | q8 | 27 | 12.3% (37/300) | 0.3097 | 18.378 | 0.03714 | 93.3% |
+| prose | **q8, rotated keys** | 34 | 13.3% (40/300) | 0.0471 | 0.726 | 0.00065 | 98.7% |
+| long document | q8 | 79 | 27.0% (81/300) | 0.3585 | 7.550 | 0.03291 | 95.0% |
+| long document | **q8, rotated keys** | 157 | 53.7% (161/300) | 0.0640 | 2.921 | 0.00110 | 98.3% |
+
+| cache (README, 4 096 tokens) | mean log-prob | perplexity | mean log-prob difference vs f16 | mean \|difference\| per token | largest per-token difference |
+|---|---|---|---|---|---|
+| f16 (reference) | -3.0550 | 21.2222 | 0 | 0 | 0 |
+| q8 | -3.0832 | 21.8289 | -0.02819 | 0.22144 | 5.5597 |
+| q8, rotated keys | -3.0578 | 21.2804 | **-0.00274** | 0.04259 | 1.7055 |
+
+The KL divergence from f16 falls 15–55× (0.010–0.037 to 0.0006–0.0011 nats), the perplexity cost 10× (−0.028 to −0.0027 nats
+per token; the CPU simulation above predicted −0.0015 for the ideal 8-bit rotated quantizer; the real model also rounds
+the weights and the activations), the largest single-token error 2–25×. Greedy text still diverges from f16 at some near
+tie, later: the first difference comes 1.2–2× later and the long document keeps 54 % of the tokens against 27 %.
+
+Needle in a haystack (the harness above, `--ctx 20000`, 3 depths × 3 pass keys; Metal):
+
+| prompt tokens | cache | pass key found (of 9) | by depth: start / middle / end |
+|---|---|---|---|
+| 4097 | f16 | 9/9 | 3/3 / 3/3 / 3/3 |
+| 4097 | q8 | 9/9 | 3/3 / 3/3 / 3/3 |
+| 4097 | q8, rotated keys | 9/9 | 3/3 / 3/3 / 3/3 |
+| 8360 | f16 | 6/9 | 1/3 / 2/3 / 3/3 |
+| 8360 | q8 | 8/9 | 2/3 / 3/3 / 3/3 |
+| 8360 | q8, rotated keys | 6/9 | 1/3 / 2/3 / 3/3 |
+| 16769 | f16 | 8/9 | 3/3 / 2/3 / 3/3 |
+| 16769 | q8 | 9/9 | 3/3 / 3/3 / 3/3 |
+| 16769 | q8, rotated keys | 8/9 | 3/3 / 2/3 / 3/3 |
+
+Retrieval is not what rotation changes: the rotated cache finds exactly the keys f16 finds in every cell (23 of 27), and plain
+q8 finds three more, which is the 0.6B model's noise (it misses a third of the questions at 8k even with f16; the q4
+study says the same of a difference of one or two in nine). Plain q8's extra hits are errors in its favour, not a
+sign of accuracy: the rotated cache is the one that reproduces f16.
+
+**Speed** (Metal, M1 Pro, under the heavy lock): about 1 % slower than plain q8 in prefill and about 3 % in decode, see
+[11 §11.10](11-performance.md#1110-the-q8-cache-with-rotated-keys-measured). **Default:** `backend.kv-q8-rotate=true` in the shipped
+`jllm.properties` (q8 itself stays opt-in): the accuracy gain is large, the memory is the same and the speed cost is 1–3 %, the
+only cost is that saved q8 caches of the old format are refused and have to be rebuilt (**existing q8 users:** a saved q8
+cache file from before this default is refused with "the saved cache has another layout", the console deletes it and prefills
+afresh; set `backend.kv-q8-rotate=false` to keep the old format and keep using those files). `false` restores the previous format;
+code that builds a backend without the settings (tests, library use) gets the plain format (`KvDtype.Q8_ROTATE_DEFAULT`).
 
 ---
 
