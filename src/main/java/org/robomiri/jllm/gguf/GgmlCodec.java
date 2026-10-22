@@ -27,7 +27,28 @@ final class GgmlCodec {
     static final String SUPPORTED = "F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,"
             + " MXFP4";
 
+    /** True when {@code -Djllm.gguf.requantize} is set (to anything, {@code none} included): it then overrides the backend defaults. */
+    private static final boolean EXPLICIT = System.getProperty("jllm.gguf.requantize") != null;
+
+    /**
+     * What the CPU backend requantizes by default: its decode is faster on the Q8_0 kernels than on the in-place kernels of
+     * these formats by more than 25% (Q5_1: 29%, Q3_K: 37%, F16 and BF16 read twice the bytes of Q8_0; measured in docs/16
+     * 16.9). Metal reads everything in place.
+     */
+    private static final Set<GgmlType> CPU_DEFAULT = EnumSet.of(GgmlType.Q5_1, GgmlType.Q3_K, GgmlType.F16, GgmlType.BF16);
+
     private static volatile Set<GgmlType> requantize = parseRequantize(System.getProperty("jllm.gguf.requantize", ""));
+
+    /**
+     * Sets the default for the backend the next model is loaded for ({@code cpu}: {@link #CPU_DEFAULT}; otherwise nothing is
+     * requantized) unless {@code -Djllm.gguf.requantize} was given. Returns the types now requantized by that default.
+     */
+    static Set<GgmlType> backendDefault(boolean cpu) {
+        if (!EXPLICIT) {
+            requantize = cpu ? EnumSet.copyOf(CPU_DEFAULT) : EnumSet.noneOf(GgmlType.class);
+        }
+        return EXPLICIT ? EnumSet.noneOf(GgmlType.class) : requantize;
+    }
 
     private GgmlCodec() {
     }

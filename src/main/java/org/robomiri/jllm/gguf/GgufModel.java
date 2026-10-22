@@ -163,6 +163,22 @@ public final class GgufModel implements AutoCloseable {
     }
 
     /**
+     * Chooses which formats the next {@link #weights()} reads in place for the backend they are loaded for (the CPU backend
+     * requantizes a few formats whose in-place kernels decode more than 25% slower than Q8_0; {@code -Djllm.gguf.requantize}
+     * overrides). Returns the formats of this file that the default requantizes, to report them.
+     */
+    public java.util.Set<GgmlType> forBackend(boolean cpu) {
+        java.util.Set<GgmlType> types = GgmlCodec.backendDefault(cpu);
+        java.util.Set<GgmlType> here = java.util.EnumSet.noneOf(GgmlType.class);
+        for (GgufFile.Tensor t : file.tensors().values()) {
+            if (t.dims().length >= 2 && types.contains(t.type())) {
+                here.add(t.type());
+            }
+        }
+        return here;
+    }
+
+    /**
      * The weights, read in place from the file. The returned {@link ModelWeights} owns the open file from now on.
      *
      * @throws IOException if a tensor is missing, has an unsupported type or does not match the architecture
