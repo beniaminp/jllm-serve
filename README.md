@@ -14,8 +14,10 @@ and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`m
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
-conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures and the hybrid **Qwen3.5** (`qwen35`) and
-Qwen3-Next (`qwen3next`) ones, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
+conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama / Mistral 3 architectures, **Gemma 2 / 3** (`gemma2`, `gemma3`), **Phi-3 / 4**
+(`phi3`), **GLM** (`chatglm`, `glm4`), **Mamba** (`mamba`), **DeepSeek V2 / V3 / R1** (`deepseek2`) and the hybrid **Qwen3.5**
+(`qwen35`) and Qwen3-Next (`qwen3next`) ones (the layouts of the new ones checked against llama.cpp's own loader on tiny files,
+[docs/16 §16.15](docs/16-gguf.md#1615-gemma-23-phi-3-glm-mamba-deepseek-v2v3-and-mistral-3-as-gguf-files)), Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
 place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)); a Qwen3.5 file's own
 multi-token-prediction layer can draft for speculative decoding (`--engine.speculative mtp`,
 [docs/16 §16.14](docs/16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
@@ -234,8 +236,8 @@ attaches, pastes or drops pictures; a text-only model can use a loaded vision mo
 Put the picture before the question. Settings: `vision.*` in [`jllm.properties`](src/main/resources/jllm.properties);
 the chapter is [docs/20](docs/20-vision.md). `unsloth/Qwen3.8-27B-GGUF` (Qwen3.5, a Gated DeltaNet hybrid) sees pictures on CPU
 and Metal and matches llama.cpp's prompt ids, first-position log-probs and greedy answer. Gemma 3: the projector and the
-attention that runs both ways inside a picture are implemented and checked, but the `gemma3` GGUF text architecture is not in
-this build, so a Gemma 3 model cannot be loaded yet.
+attention that runs both ways inside a picture are implemented and checked, and the `gemma3` GGUF text architecture is mapped
+(docs/16 §16.15; its layout is checked against llama.cpp on tiny files, no real Gemma 3 file was loaded).
 
 ### API
 

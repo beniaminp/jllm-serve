@@ -154,6 +154,8 @@ public final class GgufModel implements AutoCloseable {
             case "qwen2", "qwen3", "qwen3_moe", "qwen3_next", "qwen3_5" -> "<|im_start|>";
             case "llama" -> "<|start_header_id|>";
             case "mistral" -> "[INST]";
+            case "gemma2", "gemma3_text" -> "<start_of_turn>";
+            case "phi3" -> "<|assistant|>";
             default -> null;
         };
         if (marker == null || jinja.contains(marker)) {

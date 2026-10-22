@@ -37,7 +37,23 @@ final class GgufArchitecture {
         /** Qwen3-Next (80B-A3B MoE hybrid, grouped value heads): {@link GgufQwenNext}. */
         QWEN3NEXT("qwen3next", "qwen3_next"),
         /** Qwen3.5 MoE (35B-A3B...): Qwen3-Next's experts and gated shared expert with Qwen3.5's tiled value heads. */
-        QWEN35MOE("qwen35moe", "qwen3_next");
+        QWEN35MOE("qwen35moe", "qwen3_next"),
+        /** Gemma 2: {@link GgufFamilies#gemma}. */
+        GEMMA2("gemma2", "gemma2"),
+        /** Gemma 3 (text; the vision tower of the bigger sizes is a separate mmproj file): {@link GgufFamilies#gemma}. */
+        GEMMA3("gemma3", "gemma3_text"),
+        /** Phi-3 / 3.5 / 4-mini / Phi-4: fused {@code attn_qkv} and {@code ffn_up}, LongRoPE tables. */
+        PHI3("phi3", "phi3"),
+        /** {@code GlmForCausalLM} (GLM-4-9B-chat-hf, GLM-Edge): fused {@code ffn_up}, interleaved partial RoPE. */
+        CHATGLM("chatglm", "glm"),
+        /** GLM-4-0414 ({@code Glm4ForCausalLM}): chatglm plus the post-attention / post-MLP norms. */
+        GLM4("glm4", "glm4"),
+        /** Mamba v1: the {@code ssm_*} tensors, {@link GgufFamilies#mamba}. */
+        MAMBA("mamba", "mamba"),
+        /** DeepSeek-V2 / V3 / R1 (MLA, shared + routed experts): {@link GgufFamilies#deepseek2}. */
+        DEEPSEEK2("deepseek2", "deepseek_v3"),
+        /** Mistral Small 3.x / Ministral / Devstral: the llama architecture under another name (and no attention temperature). */
+        MISTRAL3("mistral3", "mistral");
 
         final String ggufName;
         final String modelType;
@@ -50,6 +66,15 @@ final class GgufArchitecture {
         /** True for the Gated DeltaNet hybrids, whose tensors {@link GgufQwenNext} maps. */
         boolean hybrid() {
             return this == QWEN35 || this == QWEN3NEXT || this == QWEN35MOE;
+        }
+
+        /** The Llama-style families whose q/k rows the converter permutes to the interleaved RoPE layout. */
+        boolean llamaLike() {
+            return this == LLAMA || this == MISTRAL3;
+        }
+
+        boolean gemma() {
+            return this == GEMMA2 || this == GEMMA3;
         }
 
         static Family of(String ggufName) {
@@ -65,6 +90,26 @@ final class GgufArchitecture {
     record Result(Architecture arch, Family family, Map<String, Object> config) {
     }
 
+    /** Architectures llama.cpp has that map onto jllm's blocks only with math the engine does not have, and why. */
+    private static final Map<String, String> UNSUPPORTED = Map.ofEntries(
+            Map.entry("granite", "scales the embeddings, the residual branches and the logits"),
+            Map.entry("granitemoe", "scales the embeddings, the residual branches and the logits"),
+            Map.entry("olmo2", "normalizes after the attention and the MLP and the whole q / k vector"),
+            Map.entry("olmo", "LayerNorm without gains"),
+            Map.entry("smollm3", "has NoPE layers without rotary embeddings"),
+            Map.entry("qwen2moe", "has a sigmoid-gated shared expert in a decoder layer"),
+            Map.entry("stablelm", "uses LayerNorm"),
+            Map.entry("phi2", "uses LayerNorm and a non-gated MLP"),
+            Map.entry("starcoder2", "uses LayerNorm and a non-gated MLP"),
+            Map.entry("command-r", "uses LayerNorm and a parallel residual"),
+            Map.entry("cohere2", "uses LayerNorm and a parallel residual"),
+            Map.entry("gemma", "Gemma 1 is not among the families (Gemma 2 and 3 are)"),
+            Map.entry("falcon", "uses LayerNorm and a parallel residual"),
+            Map.entry("mamba2", "Mamba 2 is not implemented (Mamba 1 is)"),
+            Map.entry("internlm2", "has no chat template here"),
+            Map.entry("exaone", "has no chat template here"),
+            Map.entry("exaone4", "has no chat template here"));
+
     private GgufArchitecture() {
     }
 
@@ -79,7 +124,9 @@ final class GgufArchitecture {
             for (Family f : Family.values()) {
                 ok.add(f.ggufName);
             }
-            throw new IOException("unsupported GGUF architecture '" + name + "' (supported: " + String.join(", ", ok) + ")");
+            String why = UNSUPPORTED.get(name);
+            throw new IOException("unsupported GGUF architecture '" + name + "'" + (why == null ? "" : " (" + why + ")")
+                    + " (supported: " + String.join(", ", ok) + ")");
         }
         Map<String, Object> c = config(g, family);
         try {
@@ -89,7 +136,7 @@ final class GgufArchitecture {
         }
     }
 
-    private static long need(GgufFile g, String key) throws IOException {
+    static long need(GgufFile g, String key) throws IOException {
         if (!(g.get(key) instanceof Number n)) {
             throw new IOException("GGUF metadata has no " + key);
         }
@@ -102,6 +149,9 @@ final class GgufArchitecture {
     /** The Hugging Face {@code config.json} the file's metadata describes. */
     static Map<String, Object> config(GgufFile g, Family family) throws IOException {
         String p = family.ggufName + ".";
+        if (family == Family.MAMBA) {
+            return GgufFamilies.mamba(g);
+        }
         Map<String, Object> c = new LinkedHashMap<>();
         c.put("model_type", family.modelType);
         long dim = need(g, p + "embedding_length");
@@ -138,12 +188,25 @@ final class GgufArchitecture {
         c.put("eos_token_id", eos);
         c.put("hidden_act", "silu");
 
+        // q/k/v and o_proj biases are tensors in a GGUF: say so, so a family whose config key defaults to true (GLM) or
+        // false (Llama, Qwen3, Gemma) is configured as the file is
+        if (g.hasTensor("blk.0.attn_q.bias") || g.hasTensor("blk.0.attn_qkv.bias")) {
+            c.put("attention_bias", true);
+        } else if (family != Family.QWEN2 && family != Family.QWEN2VL) {
+            c.put("attention_bias", false);
+        }
         long headDim = c.get("head_dim") instanceof Long h ? h : dim / heads;
         if (g.get(p + "rope.dimension_count") instanceof Number rd && rd.longValue() > 0 && rd.longValue() < headDim) {
             c.put("partial_rotary_factor", (double) rd.longValue() / headDim);
         }
 
-        if (family == Family.LLAMA) {
+        if (family.llamaLike()) {
+            if (family == Family.MISTRAL3) {
+                if (g.dbl(p + "attention.temperature_scale", 0) != 0) {
+                    throw new IOException(p + "attention.temperature_scale (Ministral 3's position-dependent query scaling) is not supported");
+                }
+                c.put("model_type", "mistral");
+            }
             // llama.cpp's converter permutes the q and k rows of the llama architecture (and only of it) to the
             // interleaved RoPE layout that llama.cpp applies; qwen2 / qwen3 weights keep the Hugging Face layout
             c.put(Architecture.GGUF_INTERLEAVED_ROPE, true);
@@ -157,6 +220,15 @@ final class GgufArchitecture {
         }
         if (family.hybrid()) {
             hybrid(g, p, family, c);
+        }
+        if (family.gemma()) {
+            GgufFamilies.gemma(g, family, p, c, dim, heads, headDim, ((Number) c.get("num_hidden_layers")).longValue());
+        }
+        if (family == Family.PHI3) {
+            GgufFamilies.phi3(g, p, c);
+        }
+        if (family == Family.DEEPSEEK2) {
+            GgufFamilies.deepseek2(g, p, c);
         }
         if (family == Family.QWEN3MOE) {
             c.put("num_experts", need(g, p + "expert_count"));
@@ -245,7 +317,7 @@ final class GgufArchitecture {
     }
 
     /** An attention head count must be one number for the whole model (some architectures store one per layer). */
-    private static long scalar(GgufFile g, String key) throws IOException {
+    static long scalar(GgufFile g, String key) throws IOException {
         if (g.get(key) instanceof long[]) {
             throw new IOException("GGUF metadata " + key + " is a per-layer array, which is not supported");
         }
@@ -282,11 +354,22 @@ final class GgufArchitecture {
                     rs.put("attention_factor", attn * Rope.yarnMscale(factor, 1));
                 }
                 if (g.dbl(p + "rope.scaling.yarn_log_multiplier", 0) != 0) {
-                    throw new IOException(p + "rope.scaling.yarn_log_multiplier (DeepSeek's mscale_all_dim) is not supported");
+                    if (family != Family.DEEPSEEK2) {
+                        throw new IOException(p + "rope.scaling.yarn_log_multiplier (DeepSeek's mscale_all_dim) is not supported");
+                    }
+                    GgufFamilies.deepseekYarn(g, p, rs);
+                }
+                if (g.get(p + "rope.scaling.yarn_attn_factor") instanceof Number ya && ya.doubleValue() > 0 && family != Family.DEEPSEEK2) {
+                    // convert_hf_to_gguf.py writes a config's attention_factor here (llama.cpp's loader does not read it)
+                    rs.put("attention_factor", ya.doubleValue());
                 }
             }
             default -> throw new IOException("unsupported rope scaling type '" + type + "' (" + p + "rope.scaling.type);"
                     + " supported: none, linear, yarn, and llama3 via rope_freqs.weight");
+        }
+        Map<String, Object> longRope = GgufFamilies.longRope(g, p);
+        if (longRope != null) {
+            return longRope;
         }
         if (g.hasTensor("rope_freqs.weight")) {
             // llama.cpp stores Llama 3.x's scaled frequencies as per-pair divisors

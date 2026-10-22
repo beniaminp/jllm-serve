@@ -434,6 +434,29 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- GGUF files of every family, written as llama.cpp's converter writes them from the tiny random
+                         checkpoints of scripts/make-tiny-model.py (python3), loaded and compared with the safetensors load;
+                         the llama.cpp comparison is scripts/gguf-llamacpp-check.sh -->
+                    <execution>
+                        <id>gguf-families-check</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.GgufFamiliesCheck</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <execution>
                         <id>gguf-qwen-next-test</id>
                         <phase>test</phase>
