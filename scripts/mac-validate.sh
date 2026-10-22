@@ -357,7 +357,7 @@ if [ -n "$VS_LLAMA" ]; then
     echo; echo "python3 not found (xcode-select --install): it reads llama-bench's JSON"
   else
     echo
-    echo "llama.cpp: $("$LLAMA_BENCH" --version 2>&1 | head -1)"
+    echo "llama.cpp: $("$LLAMA_BENCH" --version 2>&1 | grep -m1 -i version)"
     echo
     echo "| model file | engine | prefill tok/s | decode tok/s | note |"
     echo "|---|---|---|---|---|"
