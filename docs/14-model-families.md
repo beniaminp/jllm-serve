@@ -1273,7 +1273,7 @@ python3 scripts/qwen3next-hf-compare.py <dir>   # needs torch + transformers
   inference. A **Qwen3.5 GGUF** carries the same layer (`nextn.*` tensors) and *is* used, as a built-in draft for
   speculative decoding: `engine.speculative=mtp`, [16.14](16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model).
   The recurrent state cannot be rewound by overwriting, so that mode checkpoints it around each verification pass.
-- **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.13](16-gguf.md#1613-qwen35-and-qwen3next-as-gguf-files).
+- **GGUF** (llama.cpp's `qwen3next` and `qwen35` architectures): supported, [16.13](16-gguf.md#1613-qwen35-and-qwen3-next-as-gguf-files).
   The `gguf` package lists both the fused DeltaNet input `ssm_in` + `ssm_ba` and the split `attn_qkv` + `attn_gate`; the
   split one (what current converters write) is mapped (and `qwen35moe`, on tiny models only). The legacy fused `ssm_in` is not.
 - The chunked delta rule on Metal (prefill uses the token loop); a state snapshot to rewind to a shared prefix;
