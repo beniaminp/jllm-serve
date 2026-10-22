@@ -12,12 +12,12 @@ and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`m
 **Qwen3-Next** (`qwen3_next`; also **Qwen3.5** from GGUF: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
 [docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)),
 **gpt-oss** (`gpt_oss`: attention sinks, clamped-SwiGLU experts, MXFP4 experts read in place,
-[§14.18](docs/14-model-families.md#1418-gpt-oss-attention-sinks-clamped-swiglu-experts-with-biases-mxfp4)),
+[§14.18](docs/14-model-families.md#1418-gpt-oss-attention-sinks-sliding-windows-clamped-swiglu-experts-with-biases-mxfp4)),
 **Llama 4** text (`llama4_text`: chunked attention, NoPE layers with temperature tuning, sigmoid MoE,
 [§14.19](docs/14-model-families.md#1419-llama-4-text-chunked-attention-nope-layers-temperature-tuning-sigmoid-moe)) and the
 attention / state-space hybrids **Granite 4** (`granitemoehybrid`), **Nemotron-H** (`nemotron_h`, dense) and **Jamba** (`jamba`)
 ([§14.22](docs/14-model-families.md#1422-attention--state-space-hybrids-granite-4-nemotron-h-jamba)); Qwen2.5-1M's Dual Chunk
-Attention is a [documented design](docs/14-model-families.md#1420-dual-chunk-attention-for-qwen25-1m-design-not-implemented), not code.
+Attention is a [documented design](docs/14-model-families.md#1420-dual-chunk-attention-for-qwen25-1m-the-design-not-implemented), not code.
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a

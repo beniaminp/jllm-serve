@@ -347,13 +347,13 @@ def gptoss_tensors(cfg, rnd, mxfp4):
         vec(p + "input_layernorm.weight", d, 1.0)
         vec(p + "post_attention_layernorm.weight", d, 1.0)
         for n, rows in (("q", heads * hd), ("k", kv * hd), ("v", kv * hd)):
-            mat(p + "self_attn.%s_proj.weight" % n, rows, d)
+            mat(p + "self_attn.%s_proj.weight" % n, rows, d, 0.05 if n != "v" else 0.12)
             vec(p + "self_attn.%s_proj.bias" % n, rows)
         mat(p + "self_attn.o_proj.weight", d, heads * hd)
         vec(p + "self_attn.o_proj.bias", d)
         vec(p + "self_attn.sinks", heads, 0.0, 1.0)
-        mat(p + "mlp.router.weight", e, d, 0.5)
-        vec(p + "mlp.router.bias", e)
+        mat(p + "mlp.router.weight", e, d, 0.02)
+        vec(p + "mlp.router.bias", e, 0.0, 2.0)
         x = p + "mlp.experts."
         tensors[x + "gate_up_proj_bias"] = ([e, 2 * m], [rnd.gauss(0, 0.2) for _ in range(e * 2 * m)])
         tensors[x + "down_proj_bias"] = ([e, d], [rnd.gauss(0, 0.2) for _ in range(e * d)])
