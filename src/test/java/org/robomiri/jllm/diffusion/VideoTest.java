@@ -45,6 +45,7 @@ public final class VideoTest {
         scheduler();
         encoders();
         engineServer();
+        modelDownload();
         // {reference, per-stage limits (largest difference relative to the largest reference value)}
         String[][] cases = {
                 {"ref-video-ddim", "unet=1e-5,step 0=1e-5,step 1=1e-5,step 2=1e-5,latents=1e-5,frames=1e-5"},
@@ -330,6 +331,54 @@ public final class VideoTest {
             threw = e.getMessage().contains("ffmpeg");
         }
         check(threw, "MP4 without ffmpeg is a clear error");
+    }
+
+    // ------------------------------------------------------------------ fetching a motion adapter from a (fake) Hub
+
+    private static void modelDownload() throws Exception {
+        Path adapter = resource("tiny-motion-adapter");
+        byte[] cfg = Files.readAllBytes(adapter.resolve("config.json"));
+        byte[] weights = Files.readAllBytes(adapter.resolve("diffusion_pytorch_model.safetensors"));
+        com.sun.net.httpserver.HttpServer hub = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        java.util.concurrent.atomic.AtomicInteger weightRequests = new java.util.concurrent.atomic.AtomicInteger();
+        hub.createContext("/", ex -> {
+            String path = ex.getRequestURI().getPath();
+            byte[] body;
+            if (path.equals("/api/models/test/adapter/revision/main")) {
+                body = ("{\"sha\":\"abc\",\"siblings\":[{\"rfilename\":\"README.md\",\"size\":3},{\"rfilename\":\"config.json\",\"size\":" + cfg.length
+                        + "},{\"rfilename\":\"diffusion_pytorch_model.fp16.safetensors\",\"size\":" + weights.length + "},{\"rfilename\":\"diffusion_pytorch_model.safetensors\",\"size\":"
+                        + weights.length + "}]}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            } else if (path.equals("/test/adapter/resolve/main/config.json")) {
+                body = cfg;
+            } else if (path.equals("/test/adapter/resolve/main/diffusion_pytorch_model.fp16.safetensors")) {
+                weightRequests.incrementAndGet();
+                body = weights;
+            } else {
+                ex.sendResponseHeaders(404, -1);
+                ex.close();
+                return;
+            }
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        hub.start();
+        Path tmp = Files.createTempDirectory("jllm-video-hub");
+        try {
+            org.robomiri.jllm.config.Settings s = org.robomiri.jllm.config.Settings.load(new String[]{"video", "--model.dir", tmp.toString()});
+            org.robomiri.jllm.hub.HuggingFaceHub h = new org.robomiri.jllm.hub.HuggingFaceHub("http://127.0.0.1:" + hub.getAddress().getPort(), null);
+            Path dir = VideoModels.resolveAdapter(s, h, "test/adapter");
+            check(dir.equals(tmp.resolve("test_adapter")) && VideoModels.isAdapterDir(dir) && Files.size(dir.resolve("diffusion_pytorch_model.fp16.safetensors")) == weights.length
+                            && !Files.exists(dir.resolve("diffusion_pytorch_model.safetensors")) && !Files.exists(dir.resolve("README.md")),
+                    "motion adapter download: config.json and only the fp16 weights, into model.dir/owner_name");
+            VideoModels.resolveAdapter(s, h, "test/adapter");
+            check(weightRequests.get() == 1, "a motion adapter already on disk is not downloaded again");
+            check(VideoModels.isAdapterRepo(h.listFiles("test/adapter", "main"), new String(cfg, java.nio.charset.StandardCharsets.UTF_8))
+                    && !VideoModels.isAdapterRepo(java.util.List.of(), "{}") && VideoModels.defaultId("guoyww/animatediff-motion-adapter-v1-5-2").equals("animatediff-motion-adapter-v1-5-2"),
+                    "a repository with a MotionAdapter config.json is recognised");
+        } finally {
+            hub.stop(0);
+        }
     }
 
     // ------------------------------------------------------------------ the engine's own HTTP server

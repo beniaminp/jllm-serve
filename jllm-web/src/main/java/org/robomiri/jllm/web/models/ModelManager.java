@@ -359,7 +359,7 @@ public class ModelManager implements DisposableBean {
         try {
             HuggingFaceHub hub = ModelLoader.hub(s);
             List<HuggingFaceHub.RepoFile> listing = hub.listFiles(t.model(), s.get("model.revision"));
-            if (listing.stream().noneMatch(f -> f.name().equals("config.json")) || listing.stream().anyMatch(f -> f.name().equals("model_index.json"))) {
+            if (!looksLikeAdapter(listing)) {
                 return false;
             }
             Path tmp = Files.createTempDirectory("jllm-adapter");
@@ -372,6 +372,12 @@ public class ModelManager implements DisposableBean {
         } catch (Exception e) {
             return false; // the Hub is unreachable: the normal path reports it
         }
+    }
+
+    /** A config.json next to diffusers weights at the top level and no pipeline index: only then is it worth fetching the config to see its class. */
+    private static boolean looksLikeAdapter(List<HuggingFaceHub.RepoFile> files) {
+        return files.stream().anyMatch(f -> f.name().equals("config.json")) && files.stream().noneMatch(f -> f.name().equals("model_index.json"))
+                && files.stream().anyMatch(f -> f.name().startsWith("diffusion_pytorch_model") && f.name().endsWith(".safetensors"));
     }
 
     private static void deleteTree(Path dir) {
@@ -798,7 +804,7 @@ public class ModelManager implements DisposableBean {
         boolean diffusers = DiffusersRepo.isDiffusers(files);
         List<HuggingFaceHub.RepoFile> imageFiles = List.of();
         boolean adapter = false;
-        if (!diffusers && video != null && files.stream().anyMatch(f -> f.name().equals("config.json"))) { // an AnimateDiff motion adapter?
+        if (!diffusers && video != null && looksLikeAdapter(files)) { // an AnimateDiff motion adapter?
             try {
                 Path tmp = Files.createTempDirectory("jllm-adapter");
                 try {
