@@ -225,9 +225,14 @@ repository by its launcher).
   by date, exportable as Markdown); edit a message and resend, regenerate, copy; Markdown with tables and code blocks;
   Qwen3 thinking toggle (the `<think>` part is collapsible); per-chat sampling parameters and system prompt; tokens/s
   and a context-usage meter; light / dark theme.
+- **Pictures**: with a vision-language GGUF model (SmolVLM, Qwen2.5-VL, Qwen3-VL; the projector is loaded with it,
+  the load form can name another or none) the chat box takes pictures: the attach button, paste and drag and drop;
+  thumbnails stay in the browser, the model list shows a *vision* badge, and `image_url` parts work on `/v1/chat/completions`
+  and `/api/chat`. The built-in `describe_image` tool lets a text-only model ask a loaded vision model about a picture
+  (URL, `data:` URL or an id from `POST /api/images`). [docs/20](docs/20-vision.md)
 - **Tools**: pick per chat which functions the model may call. Built in: `web_search` (DuckDuckGo with no key,
   or a SearXNG instance, or the Brave Search API), `fetch_url` (a page as readable text; private addresses refused
-  unless allowed), `calculator` and `current_time`. **MCP servers** add their tools: stdio commands
+  unless allowed), `calculator`, `current_time` and `describe_image`. **MCP servers** add their tools: stdio commands
   (`npx -y @modelcontextprotocol/server-filesystem ~/notes`, `uvx mcp-server-fetch`, ...), Streamable HTTP and
   legacy SSE servers, with headers / environment for credentials; Claude Desktop / Cursor `mcpServers` JSON can be
   pasted as it is. The server runs the calls, feeds the results back and lets the model continue (up to a set number

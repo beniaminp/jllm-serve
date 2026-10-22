@@ -42,8 +42,21 @@ public final class VisionDump {
                     t1 = System.nanoTime();
                     e = enc.encode(px);
                 }
-                System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d) in %.0f ms%n", i, px.width(), px.height(), e.tokens(),
-                        e.nx(), e.ny(), (System.nanoTime() - t1) / 1e6);
+                int reps = Integer.getInteger("jllm.vision.reps", 0); // more warm runs: report the fastest and the median
+                if (reps > 1) {
+                    double[] ms = new double[reps];
+                    for (int r = 0; r < reps; r++) {
+                        long t2 = System.nanoTime();
+                        e = enc.encode(px);
+                        ms[r] = (System.nanoTime() - t2) / 1e6;
+                    }
+                    java.util.Arrays.sort(ms);
+                    System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d): fastest %.0f ms, median %.0f ms of %d runs%n", i, px.width(),
+                            px.height(), e.tokens(), e.nx(), e.ny(), ms[0], ms[reps / 2], reps);
+                } else {
+                    System.out.printf("chunk %d: %dx%d px -> %d tokens (%dx%d) in %.0f ms%n", i, px.width(), px.height(), e.tokens(),
+                            e.nx(), e.ny(), (System.nanoTime() - t1) / 1e6);
+                }
                 float[] flat = e.embd();
                 if (e.deepstack() != null) { // like mtmd: per token, the main features then each deepstack layer's
                     int d = e.embd().length / e.tokens();

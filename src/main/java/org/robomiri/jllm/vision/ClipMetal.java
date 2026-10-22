@@ -360,6 +360,7 @@ public final class ClipMetal implements VisionEncoder {
 
     @Override
     public synchronized Encoded encode(Pixels px) {
+        profile.clear(); // (the profile of the last picture only: the first one includes compiling the pipelines)
         return switch (m.projector) {
             case IDEFICS3, GEMMA3 -> siglip(px);
             case QWEN2VL, QWEN25VL, QWEN3VL -> qwen(px);

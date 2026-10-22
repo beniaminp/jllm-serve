@@ -803,7 +803,7 @@ def vit_attention(t, heads, dh, windows):
                    (heads, (t + 31) // 32), (128,))
         out2 = np.zeros_like(out)  # and the simple kernel must agree
         E.dispatch('vit_attention', [q, k, v, out2, lo, hi], pack('iiif', t, heads, dh, scale), ((t + 15) // 16, heads), (128,))
-        check(np.abs(out - out2).max() < 2e-5, 'vit_attention_mma_d%d t=%d: agrees with vit_attention (%.1e)' % (dh, t, np.abs(out - out2).max()))
+        check(np.abs(out - out2).max() < 3e-3, 'vit_attention_mma_d%d t=%d: agrees with vit_attention, which is float (%.1e; the mma kernel works in half)' % (dh, t, np.abs(out - out2).max()))
     else:
         E.dispatch('vit_attention', [q, k, v, out, lo, hi], pack('iiif', t, heads, dh, scale), ((t + 15) // 16, heads), (128,))
     ref = np.zeros((t, dim))
@@ -814,7 +814,7 @@ def vit_attention(t, heads, dh, windows):
             e = np.exp(sc - sc.max())
             ref[i, h * dh:(h + 1) * dh] = (e / e.sum()) @ vh[lo[i]:hi[i]]
     err = np.abs(out - ref).max()
-    check(err < 2e-5, 'vit_attention t=%d heads=%d dh=%d windows=%s: max err %.2e' % (t, heads, dh, windows, err))
+    check(err < (3e-3 if mma else 2e-5), 'vit_attention t=%d heads=%d dh=%d windows=%s: max err %.2e' % (t, heads, dh, windows, err))
 
 
 vit_attention(21, 3, 64, 0)
