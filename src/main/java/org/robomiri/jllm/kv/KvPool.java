@@ -402,6 +402,9 @@ public final class KvPool implements AutoCloseable {
             node = c;
             i++;
         }
+        // what the sequence holds past the shared part is replaced anyway: free it first, so that reading spilled blocks
+        // back can evict it (a full pool whose only evictable blocks are this sequence's old tail would run out)
+        s.dropFrom(i);
         KvSpill sp = spill;
         while (i < full && sp != null) {
             int off = i * B;

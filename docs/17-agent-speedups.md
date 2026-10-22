@@ -94,6 +94,10 @@ physical rows, saving memory, but every attention kernel and every cache write o
 through a page table. On unified memory a copy of a long prefix costs milliseconds and leaves the hot kernels as they
 are; the memory saving is the part this design gives up.
 
+**Update:** that is exactly what [chapter 24](24-paged-kv-cache.md) now does behind `backend.kv-paged=true`: slots share the
+physical blocks of one pool through a prefix tree (copy on write), so a second conversation with the same system prompt costs a table
+write, not a copy, and the prefix exists once (8 conversations sharing 4 096 tokens: 1.1 GB instead of 7.7 GB).
+
 ---
 
 ## 17.3 Saved conversations

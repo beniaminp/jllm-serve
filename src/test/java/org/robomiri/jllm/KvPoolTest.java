@@ -346,6 +346,28 @@ public final class KvPoolTest {
             KvPool p3 = new KvPool(new FakeStorage(16), 30, "fake");
             p3.setSpill(new FileSpill(dir, "other-model", 1L << 30));
             check(p3.newSequence(1024).match(sys, 159) == 0, "a store of another fingerprint is not read");
+            // a full pool whose evictable blocks are the adopting sequence's own old tail: reading spilled blocks back must
+            // free that tail first
+            FakeStorage st4 = new FakeStorage(16);
+            KvPool p4 = new KvPool(st4, 30, "fake");
+            p4.setSpill(new FileSpill(dir, "tail-model", 1L << 30));
+            int[] ta = tokens(90, 160);   // 10 blocks
+            int[] tc = tokens(91, 320);   // 20 blocks
+            int[] tx = tokens(92, 80);    // 5 blocks
+            KvSequence sa = p4.newSequence(1024);
+            fill(st4, sa, ta, 0, 160);
+            sa.publish(ta, 160);
+            sa.clear();
+            KvSequence sc = p4.newSequence(1024);
+            fill(st4, sc, tc, 0, 320);
+            sc.publish(tc, 320);
+            KvSequence sx = p4.newSequence(1024);
+            fill(st4, sx, tx, 0, 80); // evicts the last 5 blocks of a
+            sx.publish(tx, 80);
+            KvPool.Match mt4 = sc.matchDetail(ta, 159);
+            int got4 = sc.adopt(ta, mt4.tokens());
+            check(mt4.spilled() > 0 && got4 == mt4.tokens() && holds(st4, sc, ta, got4), "a sequence holding its old conversation in a full pool"
+                    + " adopts a prefix that is partly on disk (" + got4 + " of " + mt4.tokens() + " tokens, " + mt4.spilled() + " from disk)");
             // a budget deletes the oldest files
             FileSpill small = new FileSpill(dir, "small", 3 * (16 * 8 + 100));
             ByteBuffer payload = ByteBuffer.allocate(16 * 8).order(ByteOrder.LITTLE_ENDIAN);
