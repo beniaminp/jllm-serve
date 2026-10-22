@@ -1564,11 +1564,11 @@ walks the blocks `l, l+32, …` of the row and, for a 1 024-wide Q4_0 row, handl
 reading 16 bytes of weights plus a 4-byte scale but 128 bytes of activations. The activation traffic (L1 and
 threadgroup memory) is therefore ~6× the weight traffic and a simdgroup has very little work per row. The kernels
 `mvr_matmul`, `mvr_matmul3` and `mvr_matmul_swiglu` (section 2a of `kernels.metal`, host names `mv<NR>_matmul…`,
-`NR` = 2, 4, 8) give a simdgroup `NR` **consecutive** rows (for swiglu `NR` units = `2·NR` rows, a gate row and its
+`NR` = 2, 4) give a simdgroup `NR` **consecutive** rows (for swiglu `NR` units = `2·NR` rows, a gate row and its
 up row each) and run all of them over the lane's block before moving on:
 
 ```
-for block b = lane, lane + 32, …:                      grid: (ceil(rows / (NR · sg)), ceil(ntok / 8)), 128 threads
+for block b = lane, lane + 32, …:                      grid: (ceil(rows / (NR · sg)), 1), 128 threads
     for row r in 0 … NR-1:  load block b of row r (16 B + scale);  acc[r] += blockdot(block, x[b]) · scale
 simd_sum(acc[r]) for every r;  lane 0 writes row0 + r
 ```
@@ -1577,24 +1577,25 @@ so an activation block is fetched once for `NR` rows, a `_norm` kernel recompute
 `NR · 4` rows instead of once per 4 (at a 1 024-wide row the norm prologue is a larger share of a threadgroup's life
 than the rows it serves), and a lane has `NR` independent weight loads in flight. `matmul3`'s rows may straddle the q / k / v
 ranges (per-row pointers, as in the prefill tiles `mm_tile`); the bias, the half V row, the soft-cap and the residual
-accumulate are the epilogues of the one-row kernels; up to 8 tokens per threadgroup row are handled exactly like
-the one-row kernels' `TOK_TILE` (batched decode rows go through the same kernels as a single token, so a row computes
-what its own decode step does). Q2_K and Q6_K have another lane unit (16-weight sub-blocks): they call `mm_row` once per
+accumulate are the epilogues of the one-row kernels; Q2_K and Q6_K have another lane unit (16-weight sub-blocks): they call `mm_row` once per
 row, which gives them the grid and norm savings but no activation reuse. The GGUF types (`q4g`, `q8g`, `q4k`,
 `q5k`) use `gg_unit`, the same dequantization as their one-row kernels.
 
-**Bit-identity.** Each row is accumulated by the code of `mm_row`, so the same blocks are added in the same order
-and the result should be the same float. On a GPU "should" needs care. The first version loaded the 32 activations
-of a block into registers once, outside the per-row work, and its Q4_0 outputs differed from `mm_row`'s in the last
-bit in 70 % of the outputs (≤ 5e-7 relative to a 2.5 range, and the greedy tokens did not change): Metal compiles with
-fast-math, which lets it reassociate sums, and it did so differently in the new loop. The kernels now keep the
-structure of `mm_row` (the token loop of up to 8 with its runtime token count, the activations loaded inside it) and
-then agree to the byte ‹TBD›. Three checks keep it so: `kernel_tests.py` compares every kernel and format with its
-one-row twin byte for byte on the emulator (which cannot reassociate, so it tests the arithmetic written down), the
-logits of 48 decode steps after a 600-token prompt hash to the same value with `mvRows=1`, 2, 4, 8 ‹TBD›, and
-`-Djllm.metal.mvRows=1` brings the one-row kernels back. If a future driver reassociates differently, results change
-by an ulp, not by a bug: the invariants that matter (batched equals alone, replay equals encoded, pipelined equals
-plain) hold because they all use the same family.
+**Bit-identity, and where it is not.** Each row is accumulated in `mm_row`'s order (same blocks, same lane order, same
+block-dot expression, one `simd_sum`), so the sum is the same mathematically, and on the emulator, which cannot
+reassociate, every kernel and format equals its one-row twin **byte for byte** (`kernel_tests.py`, 150+ cases with tails
+and straddling q/k/v ranges). On the GPU Metal compiles with fast-math and may round a sum differently in a loop of another shape.
+Measured on the M1 Pro (`MvCheck`-style runs of one matmul, and the logits of 48 decode steps after a 600-token prompt):
+Q8_0, Q8_0 GGUF, Q4_K, Q5_K, Q6_K and the f16 path agree to the byte; **own Q4_0 differs in the last bit of ~70 % of the
+outputs (≤ 5e-7 on a range of 2.5), GGUF Q4_0 likewise** (greedy tokens unchanged in every run). A variant that keeps
+`mm_row`'s token loop (up to 8 tokens, runtime count) with several rows per simdgroup reproduces the one-row bytes for
+Q4_0 on every shape tried (and for GGUF Q4_0 at NR = 4 only), but it holds `NR × 8` accumulators and measured **no
+faster than the one-row kernels** (6.96 ms vs 7.0 ms per token, NR = 4: 9.5 ms), i.e. the whole gain; so the kernels
+here take one token (`ntok == 1`), keep the activations in registers across rows, and accept the ulp. What stays exact
+is what matters for consistency: every decode path (alone, pipelined, replayed, the draft) uses the same family, and
+`-Djllm.metal.mvRows=1` brings the one-row kernels back bit for bit. Batched rows (2..7 tokens) and prefill tiles keep
+their kernels; batched against alone already differs at rounding level by design (§8.24, bound 1e-4 of the largest
+logit in `ArchSmoke`).
 
 **Choosing NR.** Time of the matvecs of a whole token (28 layers + LM head, 28 distinct weight sets so nothing stays
 cached; `MvBench` in the review notes; M1 Pro, microseconds per layer):
@@ -1608,8 +1609,8 @@ cached; `MvBench` in the review notes; M1 Pro, microseconds per layer):
 | LM head (151 936 × 1 024, Q8_0), µs | ‹TBD› | | | |
 | whole token, ms | ‹TBD› | | | |
 
-`NR = 8` is worse for the SwiGLU kernel (16 accumulators and 16 row pointers per lane spill registers), so the
-default is **2** and 4 stays available. `-Djllm.metal.mvRows=0|1|2|4|8`, `-Djllm.metal.mvThreads` (threads of the
+`NR = 8` was tried and dropped (the SwiGLU kernel then holds 16 accumulators and 16 row pointers per lane and spills
+registers: 130 µs per layer against 61); the default is **2**, 4 stays available. `-Djllm.metal.mvRows=0|1|2|4|8`, `-Djllm.metal.mvThreads` (threads of the
 plain, non-norm variants; the fused ones need 128).
 
 ---

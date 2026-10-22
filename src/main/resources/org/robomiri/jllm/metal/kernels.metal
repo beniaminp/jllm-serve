@@ -540,54 +540,50 @@ template [[host_name("matmul_swiglu_q8")]] kernel matmul_swiglu_t matmul_swiglu<
 template [[host_name("matmul_swiglu_q4_norm")]] kernel matmul_swiglu_t matmul_swiglu<4, true>;
 template [[host_name("matmul_swiglu_q8_norm")]] kernel matmul_swiglu_t matmul_swiglu<8, true>;
 
-// ---------------------------------------------------------------------------------------------- 2a. matmul: multi-row single-row walk
-// The same three products as the kernels above with NR output rows per simdgroup (mvr_matmul / mvr_matmul3 /
-// mvr_matmul_swiglu, host names mv<NR>_...). The kernels above give a simdgroup ONE row: a lane loads 16 B of weights
-// (Q4_0) but 128 B of activations per block, so the activation traffic is ~6x the weight traffic and each simdgroup has
-// little to do. Here a lane runs the NR rows' blocks against the same activations, and the *_norm variants recompute
-// the rmsnorm once per NR x simdgroups rows instead of once per simdgroups rows (the norm prologue costs more than the
-// rows it serves at a 1024-wide row).
+// ---------------------------------------------------------------------------------------------- 2a. matmul: multi-row decode
+// The single-token (decode) products with NR output rows per simdgroup (mvr_matmul / mvr_matmul3 / mvr_matmul_swiglu,
+// host names mv<NR>_...). The kernels above give a simdgroup ONE row: a lane loads 16 B of weights (Q4_0) but 128 B of
+// activations per block, so the activation traffic is ~6x the weight traffic and each simdgroup has little to do. Here a
+// lane loads its 32 activations of a block ONCE into registers and runs the NR rows' blocks against them, and the *_norm
+// variants recompute the rmsnorm once per NR x simdgroups rows instead of once per simdgroups rows.
 //
-// Each output row is accumulated by the code of mm_row: the same blocks in the same lane order, the same block dot
-// expression (q4_block_dot / q8_block_dot / the GGUF unit dot), the TOK_TILE token loop around it with its runtime
-// token count, one simd_sum per (row, token). Mathematically that is the same sum; and on the M1 Pro it is the same
-// bytes, which the shapes of kernel_tests.py check on the emulator and MetalTuner.decodeMatvec checks again on the
-// device with the model's own matrices (a compiler is free to reassociate fast-math sums differently in a kernel of
-// another shape, and does, for example when the activations are hoisted out of the token loop: the first version of
-// these kernels differed from mm_row in the last bit of 70 % of the Q4_0 outputs). Where the check finds a difference
-// the host keeps the one-row kernels. Q2_K and Q6_K have a different lane unit: they run mm_row per row.
-// Grid: (ceil(rows / (NR * simdgroups)), ceil(ntok / TOK_TILE)); the NORM variants (one token) have 128 threads.
+// Every output row is accumulated as in mm_row: the same blocks in the same lane order, the same block dot expression
+// (q4_block_dot / q8_block_dot / the GGUF unit dot), one simd_sum. The sums are therefore the same mathematically and
+// on the emulator the bytes are the same (kernel_tests.py); on a GPU the compiler (fast-math, free to reassociate) may
+// round a Q4_0 sum differently in this loop shape: measured on the M1 Pro, Q8_0, the K-quants and the f16 path agree
+// with the one-row kernels to the byte, Q4_0 differs in the last bit of ~70 % of the outputs (<= 5e-7 of a 2.5 range;
+// greedy tokens unchanged). Keeping mm_row's token loop (a variant that is exact for Q4_0) costs all of the speedup.
+// Single token only (ntok == 1); batched rows of 2..7 tokens keep the one-row kernels. Q2_K and Q6_K have a different
+// lane unit: they run mm_row per row.
+// Grid: (ceil(rows / (NR * simdgroups)), 1); the NORM variants have 128 threads (norm_scale_128).
 
 template <int QT, int NR, typename XP>
 static inline void mm_rows(thread device const uchar *const *wq, thread device const float *const *ws,
-                           thread const ulong *grow, int nr, int nb, XP x, ulong xstride, int nt,
-                           thread float (*acc)[TOK_TILE], ushort lane) {
+                           thread const ulong *grow, int nr, int nb, XP x, thread float *acc, ushort lane) {
     if (QT == 2) {
         for (int r = 0; r < NR; r++) {
-            if (r < nr) mm_row_q2k(wq[r], grow[r], nb, x, xstride, nt, acc[r], lane);
+            if (r < nr) mm_row_q2k(wq[r], grow[r], nb, x, 0, 1, acc + r, lane);
         }
         return;
     }
     if (QT == 6) {
         for (int r = 0; r < NR; r++) {
-            if (r < nr) mm_row_q6k(wq[r], grow[r], nb, x, xstride, nt, acc[r], lane);
+            if (r < nr) mm_row_q6k(wq[r], grow[r], nb, x, 0, 1, acc + r, lane);
         }
         return;
     }
     if (QT >= GG_FIRST) {
         for (int u = lane; u < nb; u += 32) {
+            auto x4 = as_f4(x + u * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
             for (int r = 0; r < NR; r++) {
                 if (r < nr) {
                     float4 w[8];
                     gg_unit<QT>(wq[r], grow[r], nb, u, w);
-                    for (int t = 0; t < TOK_TILE; t++) {
-                        if (t < nt) {
-                            auto x4 = as_f4(x + (ulong)t * xstride + u * QK);
-                            float d = 0.0f;
-                            for (int k = 0; k < 8; k++) d += dot(w[k], x4[k]);
-                            acc[r][t] += d;
-                        }
-                    }
+                    float d = 0.0f;
+                    for (int k = 0; k < 8; k++) d += dot(w[k], xv[k]);
+                    acc[r] += d;
                 }
             }
         }
@@ -595,46 +591,36 @@ static inline void mm_rows(thread device const uchar *const *wq, thread device c
     }
     if (QT == 4) {
         for (int b = lane; b < nb; b += 32) {
+            auto x4 = as_f4(x + b * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
             for (int r = 0; r < NR; r++) {
                 if (r < nr) {
                     device const uchar4 *rq = (device const uchar4 *)(wq[r] + grow[r] * nb * 16) + b * 4;
                     uchar4 pk[4];
                     for (int k = 0; k < 4; k++) pk[k] = rq[k];
-                    const float s = ws[r][grow[r] * nb + b];
-                    for (int t = 0; t < TOK_TILE; t++) {
-                        if (t < nt) {
-                            auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
-                            float4 xv[8];
-                            for (int k = 0; k < 8; k++) xv[k] = x4[k];
-                            acc[r][t] += q4_block_dot(pk, xv) * s;
-                        }
-                    }
+                    acc[r] += q4_block_dot(pk, xv) * ws[r][grow[r] * nb + b];
                 }
             }
         }
     } else {
         for (int b = lane; b < nb; b += 32) {
+            auto x4 = as_f4(x + b * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
             for (int r = 0; r < NR; r++) {
                 if (r < nr) {
                     device const char4 *rq = (device const char4 *)(wq[r] + grow[r] * nb * 32) + b * 8;
                     char4 pk[8];
                     for (int k = 0; k < 8; k++) pk[k] = rq[k];
-                    const float s = ws[r][grow[r] * nb + b];
-                    for (int t = 0; t < TOK_TILE; t++) {
-                        if (t < nt) {
-                            auto x4 = as_f4(x + (ulong)t * xstride + b * QK);
-                            float4 xv[8];
-                            for (int k = 0; k < 8; k++) xv[k] = x4[k];
-                            acc[r][t] += q8_block_dot(pk, xv) * s;
-                        }
-                    }
+                    acc[r] += q8_block_dot(pk, xv) * ws[r][grow[r] * nb + b];
                 }
             }
         }
     }
 }
 
-// out[t, row] (+)= W[row] . x[t] for up to TOK_TILE tokens; NR consecutive rows per simdgroup.
+// out[row] (+)= W[row] . x for one token; NR consecutive rows per simdgroup.
 template <int QT, int NR, bool NORM>
 kernel void mvr_matmul(device const uchar *wq [[buffer(0)]],
                        device const float *ws [[buffer(1)]],
@@ -650,8 +636,6 @@ kernel void mvr_matmul(device const uchar *wq [[buffer(0)]],
                        ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[8];
     const int row0 = (int(tgp.x) * nsg + sg) * NR;
-    const int t0 = int(tgp.y) * TOK_TILE;
-    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
     const int nb = p.cols / QK;
     if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane); // all threads: barriers inside
     if (row0 >= p.rows) return;
@@ -659,35 +643,31 @@ kernel void mvr_matmul(device const uchar *wq [[buffer(0)]],
     device const uchar *wqs[NR];
     device const float *wss[NR];
     ulong grow[NR];
-    float acc[NR][TOK_TILE];
+    float acc[NR];
     for (int r = 0; r < NR; r++) {
         wqs[r] = wq;
         wss[r] = ws;
         grow[r] = (ulong)(row0 + min(r, nr - 1));
-        for (int t = 0; t < TOK_TILE; t++) acc[r][t] = 0.0f;
+        acc[r] = 0.0f;
     }
     if (NORM) {
-        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, 0, 1, acc, lane);
+        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, acc, lane);
     } else {
-        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x, acc, lane);
     }
     for (int r = 0; r < NR; r++) {
         if (r < nr) {
-            for (int t = 0; t < TOK_TILE; t++) {
-                if (t < nt) {
-                    float v = simd_sum(acc[r][t]);
-                    if (lane == 0) {
-                        const ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
-                        if (p.hasBias) v += bias[row0 + r];
-                        out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
-                    }
-                }
+            float v = simd_sum(acc[r]);
+            if (lane == 0) {
+                const ulong o = (ulong)(row0 + r);
+                if (p.hasBias) v += bias[row0 + r];
+                out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
             }
         }
     }
 }
 
-// q, k, v of the tokens: rows [0, rows0) from W0 into out0, [rows0, rows0 + rows1) from W1 into out1, the rest from W2
+// q, k, v of one token: rows [0, rows0) from W0 into out0, [rows0, rows0 + rows1) from W1 into out1, the rest from W2
 // into out2 (VT = half: the f16 cache's rows); the NR rows of a simdgroup may straddle two matrices.
 template <int QT, int NR, bool NORM, typename VT>
 kernel void mvr_matmul3(device const uchar *wq0 [[buffer(0)]],
@@ -713,8 +693,6 @@ kernel void mvr_matmul3(device const uchar *wq0 [[buffer(0)]],
     threadgroup float buf[8];
     const int total = p.rows0 + p.rows1 + p.rows2;
     const int row0 = (int(tgp.x) * nsg + sg) * NR;
-    const int t0 = int(tgp.y) * TOK_TILE;
-    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
     const int nb = p.cols / QK;
     if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane);
     if (row0 >= total) return;
@@ -724,40 +702,34 @@ kernel void mvr_matmul3(device const uchar *wq0 [[buffer(0)]],
     device float *outs[NR];
     bool isV[NR];
     float bias[NR];
-    int rows[NR];
     ulong grow[NR];
-    float acc[NR][TOK_TILE];
+    float acc[NR];
     for (int r = 0; r < NR; r++) {
         const int row = row0 + min(r, nr - 1);
         isV[r] = row >= p.rows0 + p.rows1;
         if (row < p.rows0) {
-            wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; rows[r] = p.rows0; grow[r] = (ulong)row;
+            wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; grow[r] = (ulong)row;
             bias[r] = p.hasBias ? b0[grow[r]] : 0.0f;
         } else if (!isV[r]) {
-            wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; rows[r] = p.rows1; grow[r] = (ulong)(row - p.rows0);
+            wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; grow[r] = (ulong)(row - p.rows0);
             bias[r] = p.hasBias ? b1[grow[r]] : 0.0f;
         } else {
-            wqs[r] = wq2; wss[r] = ws2; outs[r] = out0; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
+            wqs[r] = wq2; wss[r] = ws2; outs[r] = out0; grow[r] = (ulong)(row - p.rows0 - p.rows1);
             bias[r] = p.hasBias ? b2[grow[r]] : 0.0f; // written to out2 below
         }
-        for (int t = 0; t < TOK_TILE; t++) acc[r][t] = 0.0f;
+        acc[r] = 0.0f;
     }
     if (NORM) {
-        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, 0, 1, acc, lane);
+        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, acc, lane);
     } else {
-        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+        mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x, acc, lane);
     }
     for (int r = 0; r < NR; r++) {
         if (r < nr) {
-            for (int t = 0; t < TOK_TILE; t++) {
-                if (t < nt) {
-                    float v = simd_sum(acc[r][t]);
-                    if (lane == 0) {
-                        const float o = p.hasBias ? v + bias[r] : v;
-                        const ulong idx = (ulong)(t0 + t) * rows[r] + grow[r];
-                        if (isV[r]) out2[idx] = VT(o); else outs[r][idx] = o;
-                    }
-                }
+            float v = simd_sum(acc[r]);
+            if (lane == 0) {
+                const float o = p.hasBias ? v + bias[r] : v;
+                if (isV[r]) out2[grow[r]] = VT(o); else outs[r][grow[r]] = o;
             }
         }
     }
@@ -778,8 +750,6 @@ kernel void mvr_matmul_swiglu(device const uchar *wq [[buffer(0)]],
                               ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[8];
     const int unit0 = (int(tgp.x) * nsg + sg) * NR;
-    const int t0 = int(tgp.y) * TOK_TILE;
-    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
     const int nb = p.cols / QK;
     if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane);
     if (unit0 >= p.hidden) return;
@@ -787,7 +757,7 @@ kernel void mvr_matmul_swiglu(device const uchar *wq [[buffer(0)]],
     device const uchar *wqs[2 * NR];
     device const float *wss[2 * NR];
     ulong grow[2 * NR];
-    float acc[2 * NR][TOK_TILE];
+    float acc[2 * NR];
     for (int r = 0; r < NR; r++) {
         const int unit = unit0 + min(r, nu - 1);
         wqs[r] = wq; wss[r] = ws; grow[r] = (ulong)unit;
@@ -796,28 +766,20 @@ kernel void mvr_matmul_swiglu(device const uchar *wq [[buffer(0)]],
         } else {
             wqs[NR + r] = wq; wss[NR + r] = ws; grow[NR + r] = (ulong)(p.hidden + unit);
         }
-        for (int t = 0; t < TOK_TILE; t++) {
-            acc[r][t] = 0.0f;
-            acc[NR + r][t] = 0.0f;
-        }
+        acc[r] = 0.0f;
+        acc[NR + r] = 0.0f;
     }
     // nr = 2 * NR: the padded rows (unit clamped to the last valid one) are computed and discarded
     if (NORM) {
-        mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, (threadgroup const float *)xn, 0, 1, acc, lane);
+        mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, (threadgroup const float *)xn, acc, lane);
     } else {
-        mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, x + (ulong)t0 * p.cols, (ulong)p.cols, nt, acc, lane);
+        mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, x, acc, lane);
     }
     for (int r = 0; r < NR; r++) {
         if (r < nu) {
-            for (int t = 0; t < TOK_TILE; t++) {
-                if (t < nt) {
-                    float g = simd_sum(acc[r][t]);
-                    float u = simd_sum(acc[NR + r][t]);
-                    if (lane == 0) {
-                        out[(ulong)(t0 + t) * p.hidden + unit0 + r] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
-                    }
-                }
-            }
+            float g = simd_sum(acc[r]);
+            float u = simd_sum(acc[NR + r]);
+            if (lane == 0) out[(ulong)(unit0 + r)] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
         }
     }
 }
@@ -3292,7 +3254,6 @@ GG_INSTANTIATE("q5k", GG_Q5_K)
     MVR_INSTANTIATE(NRS, NRV, "q5k", GG_Q5_K)
 MVR_ALL("2", 2)
 MVR_ALL("4", 4)
-MVR_ALL("8", 8)
 
 // ---------------------------------------------------------------------------------------------- 9. flash-attention prefill
 // attention_fa<KV, D>: causal (optionally windowed, soft-capped) attention for a prefill chunk without a scores

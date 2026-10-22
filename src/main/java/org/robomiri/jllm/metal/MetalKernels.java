@@ -484,7 +484,7 @@ final class MetalKernels implements AutoCloseable {
     /**
      * Output rows per simdgroup of the single-token (decode) matmul / matmul3 / swiglu kernels (section 2a of
      * kernels.metal: {@code mv<N>_matmul...}, accumulating every row exactly as the one-row kernels do).
-     * 0 or 1 = the one-row kernels. {@code -Djllm.metal.mvRows=N}, N in 0, 1, 2, 4, 8.
+     * 0 or 1 = the one-row kernels. {@code -Djllm.metal.mvRows=N}, N in 0, 1, 2, 4.
      */
     static final int MV_ROWS = mvRows();
     /** Threads per threadgroup of the multi-row kernels without a fused norm (the fused ones need 128). */
@@ -495,15 +495,15 @@ final class MetalKernels implements AutoCloseable {
 
     private static int mvRows() {
         int n = Integer.getInteger("jllm.metal.mvRows", 2);
-        if (n != 0 && n != 1 && n != 2 && n != 4 && n != 8) {
-            throw new IllegalArgumentException("-Djllm.metal.mvRows must be 0, 1, 2, 4 or 8, got " + n);
+        if (n != 0 && n != 1 && n != 2 && n != 4) {
+            throw new IllegalArgumentException("-Djllm.metal.mvRows must be 0, 1, 2 or 4, got " + n);
         }
         return n;
     }
 
-    /** True if a matmul / matmul3 / swiglu of fewer than PF tokens (the branches before this one took the longer chunks) runs the multi-row kernels. */
+    /** True if a matmul / matmul3 / swiglu runs the multi-row kernels: a single token (2..7 batched rows keep the one-row tiles). */
     private boolean mv(int n) {
-        return mvRows > 1;
+        return mvRows > 1 && n == 1;
     }
 
     /** Threadgroups along the row axis of a multi-row kernel with {@code threads} threads per threadgroup. */
@@ -566,7 +566,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul"), t.type, norm != null ? "_norm" : ""), 6, normTgMem(norm, t.cols),
-                    mvGrid(t.rows, threads), tokTiles(n), 1, threads, 1, 1);
+                    mvGrid(t.rows, threads), 1, 1, threads, 1, 1);
         } else if (norm == null && n == 1) {
             int sgs = decodeThreads / 32;
             dispatch(kernel("matmul", t.type, ""), 6, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
@@ -624,7 +624,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul3"), wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
-                    mvGrid(rows, threads), tokTiles(n), 1, threads, 1, 1);
+                    mvGrid(rows, threads), 1, 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
                     rowGrid(rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -669,7 +669,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul3"), w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
-                    mvGrid(w.rows, threads), tokTiles(n), 1, threads, 1, 1);
+                    mvGrid(w.rows, threads), 1, 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
                     rowGrid(w.rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -704,7 +704,7 @@ final class MetalKernels implements AutoCloseable {
         } else if (mv(n)) {
             int threads = norm != null ? MM_THREADS : mvThreads;
             dispatch(kernel(mvName("matmul_swiglu"), t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
-                    mvGrid(hidden, threads), tokTiles(n), 1, threads, 1, 1);
+                    mvGrid(hidden, threads), 1, 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(hidden), tokTiles(n), 1, MM_THREADS, 1, 1);
