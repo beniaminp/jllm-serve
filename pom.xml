@@ -216,6 +216,50 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- SchedulerPolicyTest: the mixed scheduler's pass planner, admission queue and sequence pausing (no model). -->
+                    <execution>
+                        <id>scheduler-policy-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.SchedulerPolicyTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- MixedSchedulerTest: engine.scheduler=mixed on the real model; answers equal those alone, a paused generation continues. -->
+                    <execution>
+                        <id>mixed-scheduler-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-Djllm.cpu.deterministic=true</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.MixedSchedulerTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- DraftSpecTest: greedy output with a draft model equals the output without speculation. -->
                     <execution>
                         <id>draft-spec-test</id>

@@ -194,6 +194,7 @@ public final class ArchSmoke {
                 // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
                 boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
                 failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
+                failures += MixedPassChecks.run(w, lib, metal, cfg, firstOfKind); // mixed passes against the same conversations alone: docs/25
             }
             if (!metal) {
                 return failures;

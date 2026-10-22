@@ -95,6 +95,7 @@ public final class BatchGroup {
     private long mixedPasses;           // passes that carried a prefill chunk and at least one other segment
     private long riderRows;             // rows of other segments those passes carried
     private long trimmedChunks;         // prefill chunks run in parts because the budget left no room for all of it
+    private long verifyRuns;            // speculative drafts verified in a pass together with another segment
 
     /** {@code inner} as a member of this group. */
     public synchronized Member join(Backend inner) {
@@ -121,9 +122,9 @@ public final class BatchGroup {
         return mixed != null;
     }
 
-    /** Mixed-pass counters: {passes with a chunk and riders, rows of riders, chunks run in parts}. */
+    /** Mixed-pass counters: {passes with a chunk and riders, rows of riders, chunks run in parts, drafts verified in a shared pass}. */
     public synchronized long[] mixedStats() {
-        return new long[]{mixedPasses, riderRows, trimmedChunks};
+        return new long[]{mixedPasses, riderRows, trimmedChunks, verifyRuns};
     }
 
     /** The CPU thread pool for a member's CPU backend: created by the first, shared by the others. */
@@ -319,15 +320,19 @@ public final class BatchGroup {
                     last || s.stride > 0 ? s.logits : null, s.stride);
         }
         RuntimeException[] errors = new RuntimeException[m];
-        boolean ran;
-        try {
-            ran = leader.inner.forwardMixed(segs);
-        } catch (RuntimeException e) {
-            ran = false; // the segments are run one by one below, so that only the step that fails reports it
+        boolean onlyDecodes = true;
+        for (Step s : steps) {
+            onlyDecodes &= s.kind() == PassPlanner.Kind.DECODE;
         }
-        if (!ran) {
-            runApart(steps, rows, segs, errors);
+        boolean ran = false;
+        if (m > 1 && !onlyDecodes) { // a lone step, or decode tokens only, take the paths of the slots scheduler (decode replay, forwardBatch)
+            try {
+                ran = leader.inner.forwardMixed(segs);
+            } catch (RuntimeException e) {
+                ran = false; // the segments are run one by one below, so that only the step that fails reports it
+            }
         }
+        int batchedApart = ran ? 0 : runApart(steps, rows, segs, errors);
         synchronized (this) {
             batches++;
             boolean hasChunk = steps.get(0).kind() == PassPlanner.Kind.CHUNK;
@@ -337,9 +342,11 @@ public final class BatchGroup {
                     riderRows += rows.get(i);
                 }
             }
-            if (ran && m > 1) {
+            batchedSteps += batchedApart;
+            if (ran) {
                 for (Step s : steps) {
                     batchedSteps += s.kind() == PassPlanner.Kind.DECODE ? 1 : 0;
+                    verifyRuns += s.kind() == PassPlanner.Kind.VERIFY ? 1 : 0;
                 }
             }
             for (int i = 0; i < m; i++) {
@@ -359,7 +366,7 @@ public final class BatchGroup {
     }
 
     /** The picks of a mixed pass the backend would not take as one pass: decode steps batched if possible, the rest alone. */
-    private static void runApart(List<Step> steps, List<Integer> rows, Backend.Segment[] segs, RuntimeException[] errors) {
+    private static int runApart(List<Step> steps, List<Integer> rows, Backend.Segment[] segs, RuntimeException[] errors) {
         List<Integer> decodes = new ArrayList<>();
         for (int i = 0; i < steps.size(); i++) {
             Step s = steps.get(i);
@@ -368,6 +375,7 @@ public final class BatchGroup {
             }
         }
         boolean[] handled = new boolean[steps.size()];
+        int batched = 0;
         if (decodes.size() > 1) {
             List<Step> ds = new ArrayList<>();
             for (int i : decodes) {
@@ -378,6 +386,7 @@ public final class BatchGroup {
                     for (int i : decodes) {
                         handled[i] = true;
                     }
+                    batched = decodes.size();
                 }
             } catch (RuntimeException e) {
                 // below, one by one
@@ -398,6 +407,7 @@ public final class BatchGroup {
                 errors[i] = e;
             }
         }
+        return batched;
     }
 
     /** One slot's backend in the group (see {@link BatchGroup}). */

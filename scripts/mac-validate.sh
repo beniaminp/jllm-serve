@@ -189,6 +189,34 @@ mvn -q compile test-compile
 batch "3 slots generating together (batched)" ""
 batch "3 slots taking turns" "-Djllm.metal.batchDecode=false"
 batch "3 slots generating together, concurrent encoder on" "-Djllm.metal.concurrent=true"
+# the mixed scheduler (docs/25): MixedSchedulerTest runs a long prompt's prefill chunks together with two slots' decode tokens
+# on the GPU and requires every answer to equal the one it gives alone; SchedulerBench (jllm-web) is the simulated agent
+# workload (6 agents resending 2000-token conversations, 2 short chats) with engine.scheduler=slots on the flat and the paged
+# cache against mixed: wall time, tokens per second, time to first token and gaps between tokens
+mixedtest() { # label java-opts
+  local label="$1" opts="$2"
+  # shellcheck disable=SC2086
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g $opts \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.MixedSchedulerTest "models/$(echo "$DENSE" | tr / _)" --backend metal > "$OUT/mixed.log" 2>&1 || {
+    echo "| $label | failed | | $(tail -1 "$OUT/mixed.log") |"; return; }
+  echo "| $label | | $(grep -c '^ok' "$OUT/mixed.log") checks ok | $(grep -o 'mixed passes [0-9]*, rider rows [0-9]*' "$OUT/mixed.log") |"
+}
+mixedtest "mixed scheduler: answers equal those alone, a paused generation continues" ""
+mixedtest "mixed scheduler, concurrent encoder on" "-Djllm.metal.concurrent=true"
+schedbench() { # label scheduler-settings...
+  local label="$1"; shift
+  (cd jllm-web && mvn -o -q test -Dtest=SchedulerBench -Dbench.model="../models/$(echo "$DENSE" | tr / _)" -Dbench.label="$label" \
+    -Dbench.args="--backend metal --engine.speculative off $*" > "$OUT/schedbench.log" 2>&1) || {
+    echo "| $label | failed | | $(tail -1 "$OUT/schedbench.log") |"; return; }
+  echo "| $label | $(grep -o 'agents finished in [0-9.]* s' "$OUT/schedbench.log") | $(grep -o '[0-9.]* tok/s over' "$OUT/schedbench.log" | head -1) | $(grep 'chat ' "$OUT/schedbench.log" | grep -o 'TTFT p50 *[0-9]* ms  p95 *[0-9]* ms') |"
+}
+if [ -d jllm-web ]; then
+  mvn -q install -DskipTests >/dev/null # the console's tests run against the engine jar in ~/.m2
+  schedbench "agent workload, slots, flat cache (default)" --engine.scheduler slots
+  schedbench "agent workload, slots, paged cache" --engine.scheduler slots --backend.kv-paged true
+  schedbench "agent workload, mixed scheduler" --engine.scheduler mixed
+fi
 # the vision encoder (docs/20): the second encoding of a picture (weights resident, pipelines built) on the GPU against
 # the CPU encoder (vision.backend=cpu); VisionDump prints the time per chunk of the picture
 vision() { # label backend

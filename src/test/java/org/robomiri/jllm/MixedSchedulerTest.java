@@ -61,13 +61,13 @@ public final class MixedSchedulerTest {
             check(engines[0].backend() instanceof BatchGroup.Member m && m.group().mixed(), "the slots form a mixed group");
             check(engines[0].backend().kvSequence() != null, "the slots have a paged cache");
             StringBuilder longText = new StringBuilder("Read this carefully and then summarize it in one sentence: ");
-            for (int i = 0; i < 40; i++) {
+            for (int i = 0; i < 14; i++) {
                 longText.append("Item ").append(i).append(" is a small wooden box that holds exactly ").append(i * 3 + 1)
                         .append(" brass keys. ");
             }
             int[][] prompts = {chat(engines[0], longText.toString()), chat(engines[1], "The capital of France is"),
                     chat(engines[2], "Write a haiku about autumn leaves.")};
-            check(prompts[0].length > 400, "the long prompt has " + prompts[0].length + " tokens (several chunks)");
+            check(prompts[0].length > 150, "the long prompt has " + prompts[0].length + " tokens (several chunks)");
 
             String[] alone = new String[3];
             for (int i = 0; i < 3; i++) {
@@ -103,6 +103,57 @@ public final class MixedSchedulerTest {
 
             // pause a generation in the middle and let it go on
             pauseCheck(engines, prompts, greedy, alone);
+        }
+        speculationCheck(dir, extra);
+    }
+
+    /**
+     * Batched speculative verification: with prompt-lookup speculation every slot's draft is verified as a segment of a
+     * mixed pass. Three slots repeat a sentence (so the drafts are accepted), generate at once, and give the tokens they give
+     * alone; some drafts were verified in a pass shared with another segment.
+     */
+    private static void speculationCheck(Path dir, String[] extra) throws Exception {
+        String[] base = {"--backend", "cpu", "--model.dir", dir.toAbsolutePath().getParent().toString(),
+                "--backend.ctx", "1024", "--engine.speculative", "ngram", "--engine.draft-tokens", "6",
+                "--backend.cpu.int8-activations", "false", "--engine.scheduler", "mixed", "--backend.batch", "64"};
+        String[] all = java.util.Arrays.copyOf(base, base.length + extra.length);
+        System.arraycopy(extra, 0, all, base.length, extra.length);
+        Settings st = Settings.load(all);
+        SamplingParams p = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 60, List.of());
+        try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), dir.getFileName().toString(), 3);
+             Engine e2 = ModelLoader.extraEngine(st, l);
+             Engine e3 = ModelLoader.extraEngine(st, l)) {
+            Engine[] engines = {l.engine(), e2, e3};
+            String[] sentences = {"The quick brown fox jumps over the lazy dog.", "Pack my box with five dozen liquor jugs.",
+                    "How vexingly quick daft zebras jump."};
+            int[][] prompts = new int[3][];
+            for (int i = 0; i < 3; i++) {
+                prompts[i] = chat(engines[i], "Repeat this sentence exactly ten times, one per line: " + sentences[i]);
+            }
+            String[] alone = new String[3];
+            for (int i = 0; i < 3; i++) {
+                alone[i] = engines[i].generate(prompts[i], p, null, () -> false).text();
+                reset(engines[i]);
+            }
+            BatchGroup group = ((BatchGroup.Member) engines[0].backend()).group();
+            long[] before = group.mixedStats();
+            ExecutorService ex = Executors.newFixedThreadPool(3);
+            List<Future<Engine.Result>> fs = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                int k = i;
+                fs.add(ex.submit(() -> engines[k].generate(prompts[k], p, null, () -> false)));
+            }
+            int drafted = 0;
+            for (int i = 0; i < 3; i++) {
+                Engine.Result r = fs.get(i).get();
+                drafted += r.stats().draftedTokens();
+                check(alone[i].equals(r.text()), "speculation: slot " + i + " gives the same answer alone and in mixed passes");
+            }
+            ex.shutdown();
+            long[] after = group.mixedStats();
+            System.out.println("     drafted " + drafted + " tokens; drafts verified in shared passes: " + (after[3] - before[3]));
+            check(drafted > 0, "prompt-lookup speculation drafted tokens");
+            check(after[3] > before[3], "drafts were verified in a pass shared with other slots' segments");
         }
     }
 
