@@ -203,6 +203,9 @@ public final class ArchSmoke {
             }
             System.out.println("  metal " + Arrays.toString(gpu));
             failures += concurrentCheck(w, lib, cfg, quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD);
+            if (CONC_ONLY) {
+                return failures;
+            }
             if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
@@ -721,6 +724,19 @@ public final class ArchSmoke {
 
     // ------------------------------------------------------------------ the concurrent compute encoder (docs/08 8.26)
 
+    /**
+     * -Djllm.smoke.only=concurrent runs just the concurrent-encoder cases of each model (to loop on a race);
+     * -Djllm.smoke.case=<text> keeps the cases whose label contains the text ("pipelined" and "batched" select those two);
+     * -Djllm.smoke.concRuns=<n> sets the concurrent runs per case (default 3).
+     */
+    private static final boolean CONC_ONLY = "concurrent".equals(System.getProperty("jllm.smoke.only"));
+    private static final String CONC_CASE = System.getProperty("jllm.smoke.case");
+    private static final int CONC_RUNS = Integer.getInteger("jllm.smoke.concRuns", 3);
+
+    private static boolean concCase(String label) {
+        return CONC_CASE == null || (CONC_CASE.startsWith("=") ? label.equals(CONC_CASE.substring(1)) : label.contains(CONC_CASE));
+    }
+
     private static final int CONC_CHUNK = 40; // >= 32 tokens: the simdgroup-matrix prefill kernels too
 
     /** Concurrent encoder on or off for a backend of any Metal family. */
@@ -836,8 +852,8 @@ public final class ArchSmoke {
             }
         }
         if (full && !mamba && !hybrid) {
-            bad += concurrentPipe(w, lib, cfg);
-            bad += concurrentBatch(w, lib, cfg);
+            bad += concCase("pipelined") ? concurrentPipe(w, lib, cfg) : 0;
+            bad += concCase("batched") ? concurrentBatch(w, lib, cfg) : 0;
         }
         return bad;
     }
@@ -845,13 +861,35 @@ public final class ArchSmoke {
     private static int concurrentCases(List<Object[]> cases, int vocab) throws Exception {
         int bad = 0;
         for (Object[] c : cases) {
+            if (!concCase((String) c[0])) {
+                continue;
+            }
             BackendMaker mk = (BackendMaker) c[1];
+            int serialRuns = Integer.getInteger("jllm.smoke.serialRuns", 0);
+            if (serialRuns > 0) { // diagnosis: is the serial encoder repeatable on this case?
+                List<float[]> ref = null;
+                for (int r = 0; r < serialRuns; r++) {
+                    try (Backend b = mk.make()) {
+                        concurrent(b, false);
+                        List<float[]> got = concurrentScenario(b, vocab);
+                        if (ref == null) {
+                            ref = got;
+                        }
+                        for (int i = 0; i < got.size(); i++) {
+                            if (!Arrays.equals(ref.get(i), got.get(i))) {
+                                System.out.println("  SERIAL run " + r + " pass " + i + " differs from run 0 in " + c[0]);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             List<float[]> want;
             try (Backend b = mk.make()) {
                 concurrent(b, false);
                 want = concurrentScenario(b, vocab);
             }
-            int runs = 3;
+            int runs = CONC_RUNS;
             long barriers = 0;
             boolean same = true;
             for (int r = 0; r < runs; r++) {
@@ -861,7 +899,27 @@ public final class ArchSmoke {
                     barriers = barriers(b);
                     for (int i = 0; i < want.size(); i++) {
                         if (!Arrays.equals(want.get(i), got.get(i))) {
-                            System.out.println("  concurrent encoder, " + c[0] + ": pass " + i + " differs (run " + r + ")");
+                            float[] w0 = want.get(i);
+                            float[] g0 = got.get(i);
+                            int nd = 0;
+                            int first = -1;
+                            float maxd = 0;
+                            for (int j = 0; j < w0.length; j++) {
+                                if (w0[j] != g0[j]) {
+                                    nd++;
+                                    first = first < 0 ? j : first;
+                                    maxd = Math.max(maxd, Math.abs(w0[j] - g0[j]));
+                                }
+                            }
+                            List<float[]> second;
+                            try (Backend b2 = mk.make()) {
+                                concurrent(b2, false);
+                                second = concurrentScenario(b2, vocab);
+                            }
+                            System.out.println("  concurrent encoder, " + c[0] + ": pass " + i + " differs (run " + r + "): " + nd + " of "
+                                    + w0.length + " logits, first " + first + ", max |diff| " + maxd + "; a second serial run "
+                                    + (Arrays.equals(second.get(i), w0) ? "equals the first serial run" : Arrays.equals(second.get(i), g0)
+                                    ? "equals the concurrent run" : "differs from both"));
                             same = false;
                             break;
                         }
