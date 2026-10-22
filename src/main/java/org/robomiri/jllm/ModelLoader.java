@@ -368,6 +368,7 @@ public final class ModelLoader {
         return new org.robomiri.jllm.kv.KvTierConfig(s.getLong("backend.kv-hot-mb") * 1_000_000L,
                 s.getLong("backend.kv-host-mb") * 1_000_000L,
                 org.robomiri.jllm.kv.KvBlockCodec.Format.parse(s.get("backend.kv-disk-format")), s.getBool("backend.kv-prefetch"),
+                s.getBool("backend.memory-plan"),
                 org.robomiri.jllm.kv.KvTierConfig.Stream.parse(s.get("backend.kv-stream")), dir);
     }
 
@@ -585,8 +586,19 @@ public final class ModelLoader {
             };
         }
         org.robomiri.jllm.kv.KvTierConfig tier = member && arch instanceof org.robomiri.jllm.model.Decoder ? tierConfig(s) : null;
-        boolean streamKv = tier != null && backendName.equals("metal") && org.robomiri.jllm.metal.MetalBackend.streamsKv(weights, ctx,
-                slots, kvDtype, s.getInt("backend.kv-block"), tier);
+        boolean planned = tier != null && tier.plan() && tier.hotBytes() == 0 && backendName.equals("metal");
+        boolean streamKv = tier != null && backendName.equals("metal") && (planned
+                ? tier.stream() != org.robomiri.jllm.kv.KvTierConfig.Stream.FORCE
+                        ? org.robomiri.jllm.metal.MetalBackend.planStreams(weights, ctx, Math.max(1, slots), batch, kvDtype,
+                                s.opt("backend.metal.lib"), tier)
+                        : org.robomiri.jllm.metal.MetalBackend.kvBytesPerPosition(weights, kvDtype) > 0
+                : org.robomiri.jllm.metal.MetalBackend.streamsKv(weights, ctx, slots, kvDtype, s.getInt("backend.kv-block"), tier));
+        if (planned && !streamKv) { // the planner's hot cap starts small and grows with the contexts
+            long perPos = org.robomiri.jllm.metal.MetalBackend.kvBytesPerPosition(weights, kvDtype);
+            if (perPos > 0) {
+                tier = tier.withHotBytes(Math.min((long) Math.max(1, slots) * ctx, org.robomiri.jllm.metal.MetalBackend.PLAN_INITIAL_POSITIONS) * perPos);
+            }
+        }
         return switch (backendName) {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,

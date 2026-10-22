@@ -11,11 +11,12 @@ import java.nio.file.Path;
  * @param hostBytes  host memory for blocks pushed out of the hot pool, before they go to the SSD (0 = straight to the SSD)
  * @param diskFormat how the block files store rows ({@link KvBlockCodec.Format})
  * @param prefetch   bring blocks a prompt is about to adopt closer ahead of time
+ * @param plan       the memory planner is on ({@code backend.memory-plan}): it sizes the hot tier and moves experts as contexts grow
  * @param stream     a slot whose whole context does not fit the hot budget keeps its KV in host memory and streams one layer
  *                   at a time to the GPU
  * @param dir        where the SSD tier lives (block files, memory-mapped slabs)
  */
-public record KvTierConfig(long hotBytes, long hostBytes, KvBlockCodec.Format diskFormat, boolean prefetch, Stream stream,
+public record KvTierConfig(long hotBytes, long hostBytes, KvBlockCodec.Format diskFormat, boolean prefetch, boolean plan, Stream stream,
                            Path dir) {
 
     /** Whether a slot may stream its KV layer by layer. */
@@ -50,10 +51,10 @@ public record KvTierConfig(long hotBytes, long hostBytes, KvBlockCodec.Format di
     }
 
     public KvTierConfig withHotBytes(long bytes) {
-        return new KvTierConfig(bytes, hostBytes, diskFormat, prefetch, stream, dir);
+        return new KvTierConfig(bytes, hostBytes, diskFormat, prefetch, plan, stream, dir);
     }
 
     public KvTierConfig withStream(Stream s) {
-        return new KvTierConfig(hotBytes, hostBytes, diskFormat, prefetch, s, dir);
+        return new KvTierConfig(hotBytes, hostBytes, diskFormat, prefetch, plan, s, dir);
     }
 }

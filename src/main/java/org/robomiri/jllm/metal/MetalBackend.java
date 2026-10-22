@@ -352,6 +352,59 @@ public final class MetalBackend implements Backend {
         return tier.hotBytes() > 0 && tier.hotBytes() < slotNeed;
     }
 
+    /**
+     * With the memory planner on and no explicit hot budget: whether the planner, at {@code slots * ctx} positions of KV, finds
+     * streaming cheaper than keeping the cache resident and moving experts (or finds resident impossible). Figures the model's
+     * share of the working set before any backend exists.
+     */
+    public static boolean planStreams(ModelWeights w, int ctx, int slots, int maxBatch, KvDtype kvDtype, String metalLib,
+                                      KvTierConfig tier) {
+        Decoder arch = w.decoder();
+        long perPos = kvBytesPerPosition(w, kvDtype);
+        if (perPos == 0 || tier.stream() == KvTierConfig.Stream.OFF) {
+            return false;
+        }
+        int layers = arch.core().layers();
+        long[] eb = new long[layers];
+        int[] ex = new int[layers];
+        int[] top = new int[layers];
+        long expertTotal = 0;
+        for (int l = 0; l < layers; l++) {
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                MlpWeights.Moe mw = w.decoderLayer(l).moe();
+                long bytes = bytes(mw.expGateUp()) + bytes(mw.expDown());
+                eb[l] = bytes / m.experts();
+                ex[l] = m.experts();
+                top[l] = m.topK();
+                expertTotal += bytes;
+            }
+        }
+        Attention.Gqa g = (Attention.Gqa) arch.attention();
+        long ws;
+        try (Metal m = Metal.create(metalLib)) {
+            ws = m.recommendedWorkingSet();
+        }
+        double gb = ExpertPlacement.positiveProperty("jllm.metal.workingSetGb", -1);
+        if (gb > 0) {
+            ws = (long) (gb * 1e9);
+        }
+        long acts = (long) Math.min(MetalConstants.ATT_TILE, maxBatch) * g.heads() * ctx * 4
+                + (long) maxBatch * (3L * arch.core().dim() + 2L * g.qDim() + 2L * arch.maxMlpDim()) * 4
+                + (long) w.lmHead.rows * 4 * (1 + 16L) + (128L << 20);
+        long fixed = w.byteSize() - expertTotal + slots * acts + DeviceLedger.total();
+        long rowBytes = kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+        MemoryPlanner.Inputs in = new MemoryPlanner.Inputs(ws, fixed, eb, ex, top, null, perPos, (long) slots * ctx, true,
+                slots * 4L * ctx * rowBytes, layers, Math.max(1, ctx / 2), MemoryPlanner.STAGE_BYTES_PER_US);
+        MemoryPlanner.Plan p = MemoryPlanner.plan(in);
+        for (String line : MemoryPlanner.describe(in, p)) {
+            System.err.println("Metal memory plan (load): " + line);
+        }
+        return p.mode() == MemoryPlanner.Mode.STREAMED;
+    }
+
+    /** The positions the pool may hold at first under the memory planner; it grows as contexts do. */
+    public static final int PLAN_INITIAL_POSITIONS = 8192;
+
     private static Metal open(Decoder d, String metalLib) {
         int hd = d.attention().headDim();
         if (hd % 32 != 0 || hd > 256) {
@@ -563,6 +616,7 @@ public final class MetalBackend implements Backend {
                             ? " (backend.metal.cpu-moe=auto leaves experts on the CPU; a placement shared by slots is made "
                             + "when the first slot loads)" : "");
         }
+        logLoadPlan();
     }
 
     // ------------------------------------------------------------------ experts on the CPU
@@ -599,6 +653,11 @@ public final class MetalBackend implements Backend {
             }
         }
         return b;
+    }
+
+    /** Whether the memory planner may move experts of this model between the GPU and the CPU at run time. */
+    private boolean plannerExperts() {
+        return tier != null && tier.plan() && arch.anyMoe() && split.layers() == MoeSplit.AUTO && split.cold() == null;
     }
 
     private static final long STATS_SAVE_NANOS = 10L * 60 * 1_000_000_000L;
@@ -661,7 +720,8 @@ public final class MetalBackend implements Backend {
             }
             cpuLayers += n > 0 ? 1 : 0;
         }
-        if (cpuLayers > 0) {
+        // with the memory planner (docs/26) the CPU side exists from the start, so experts can leave the GPU later as the KV grows
+        if (cpuLayers > 0 || plannerExperts()) {
             synchronized (PLACEMENTS) {
                 if (placement.pool == null) {
                     placement.pool = new ThreadPool(split.threads());
@@ -1947,6 +2007,7 @@ public final class MetalBackend implements Backend {
         } else if (counts != null && System.nanoTime() - lastStatsSave > STATS_SAVE_NANOS) {
             saveExpertStats(true); // a long-running server keeps its statistics current, not only at shutdown
         }
+        memoryTick(); // the memory planner (docs/26): between passes, the GPU is idle
         if (logits != null && stride > 0) {
             int rows = Math.min(w.lmHead.rows, stride);
             for (int i = 0; i < n; i++) {
@@ -2128,6 +2189,26 @@ public final class MetalBackend implements Backend {
         if (!(after < 0.8 * before)) {
             return 0;
         }
+        int changed = replaceExperts(next);
+        System.err.printf("Metal: experts re-placed from the usage so far: %d layers changed, estimated cost per token "
+                + "%.1f -> %.1f us%n", changed, before, after);
+        return changed;
+    }
+
+    /**
+     * Moves the experts to the placement {@code next} ({@code next[l][e]} true = on the CPU), one layer at a time (the new hot
+     * experts are packed, the GPU switches to them, then the old copy is freed). Only while this backend is the placement's sole
+     * user; between forward passes. Used by {@link #rebalanceExperts} and by the memory planner.
+     *
+     * @return the number of layers whose experts moved
+     */
+    int replaceExperts(boolean[][] next) {
+        int layers = c.layers();
+        synchronized (PLACEMENTS) {
+            if (placement.refs > 1 || counts == null) {
+                return 0;
+            }
+        }
         int changed = 0;
         for (int l = 0; l < layers; l++) {
             if (next[l] == null || java.util.Arrays.equals(next[l], placement.cold[l])) {
@@ -2151,9 +2232,224 @@ public final class MetalBackend implements Backend {
             }
             cpuLayers += any ? 1 : 0;
         }
-        System.err.printf("Metal: experts re-placed from the usage so far: %d layers changed, estimated cost per token "
-                + "%.1f -> %.1f us%n", changed, before, after);
         return changed;
+    }
+
+    // ------------------------------------------------------------------ the memory planner (docs/26 §26.2.6)
+
+    private MemoryGovernor ownGovernor;
+
+    private MemoryGovernor governor() {
+        if (seq != null) {
+            return ((MetalKvStorage) seq.pool().storage()).governor;
+        }
+        if (ownGovernor == null) {
+            ownGovernor = new MemoryGovernor();
+        }
+        return ownGovernor;
+    }
+
+    /**
+     * The planner's view of this model now, for {@code kvPositions} positions of resident KV: the budget (Metal's working
+     * set), what is on the GPU besides experts and KV (the other weights, this backend's buffers, other models), the experts,
+     * the cost model's usage statistics.
+     */
+    MemoryPlanner.Inputs planInputs(long kvPositions, boolean canStream) {
+        int layers = c.layers();
+        long[] perExpert = new long[layers];
+        int[] experts = new int[layers];
+        int[] topK = new int[layers];
+        long expertTotal = 0;
+        for (int l = 0; l < layers; l++) {
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                perExpert[l] = bytesPerExpert(l);
+                experts[l] = m.experts();
+                topK[l] = m.topK();
+                expertTotal += perExpert[l] * experts[l];
+            }
+        }
+        long poolReserved = seq != null ? (long) seq.pool().hotCap() * seq.pool().storage().residentBytes() : 0;
+        long rowBytes = arch.attention() instanceof Attention.Gqa g ? kvDtype.rowBytes(g.kvDim(), g.kvHeads()) : 0;
+        long windows = 4L * ctx * rowBytes; // one slot's streaming windows
+        long others = DeviceLedger.others(ledger) - poolReserved;
+        long own = k.metal.allocatedBytes() - (streaming ? windows : 0);
+        long fixed = w.byteSize() - expertTotal + own + others;
+        long[][] usage = statsFile != null && HOT_EXPERTS ? ExpertPlacement.load(statsFile, layers, modelKey) : null;
+        double bw = streamed != null && streamed.stagedNanos() > 0
+                ? Math.max(1e3, streamed.stagedBytes() / (streamed.stagedNanos() / 1e3)) : MemoryPlanner.STAGE_BYTES_PER_US;
+        return new MemoryPlanner.Inputs(workingSet(), fixed, perExpert, experts, topK, usage, kvBytesPerPosition(w, kvDtype),
+                kvPositions, canStream, split.backends() * windows, layers, Math.max(1, ctx / 2), bw);
+    }
+
+    private static long coldBytes(boolean[][] cold, long[] perExpert) {
+        long b = 0;
+        for (int l = 0; l < cold.length; l++) {
+            for (int e = 0; cold[l] != null && e < cold[l].length; e++) {
+                b += cold[l][e] ? perExpert[l] : 0;
+            }
+        }
+        return b;
+    }
+
+    /**
+     * Between forward passes, with the memory planner on: when the pool's committed blocks near its hot cap, grows the cap by
+     * half (never past the pool's size) and, if the GPU then no longer fits its budget, moves the experts the plan names to the
+     * CPU first. The step is refused (and retried after a while) when it would not fit even with the plan's experts on the CPU,
+     * or when the experts cannot move (slots sharing one placement keep the plan made at load). Blocks already committed stay
+     * committed: the cap only grows, so a long session leaves its experts on the CPU until the model is reloaded.
+     */
+    private void memoryTick() {
+        if (tier == null || !tier.plan() || seq == null || closed) {
+            return;
+        }
+        KvPool pool = seq.pool();
+        MemoryGovernor g = governor();
+        long now = System.nanoTime();
+        int cap = pool.hotCap();
+        int target = MemoryPlanner.nextCap(cap, pool.committedBlocks(), pool.maxBlocks(), 0.85, 1.5);
+        if (target == cap || !g.due(now)) {
+            return;
+        }
+        MemoryPlanner.Inputs in = planInputs((long) target * pool.blockTokens(), false);
+        MemoryPlanner.Plan p = MemoryPlanner.plan(in);
+        boolean[][] cur = placement != null ? placement.cold : new boolean[c.layers()][];
+        long movedNow = coldBytes(cur, in.expertBytes());
+        long gpuNow = in.fixed() + MemoryPlanner.totalExpertBytes(in) - movedNow + in.kvPerPosition() * in.kvPositions();
+        boolean currentFits = gpuNow <= in.budget();
+        String what = String.format("hot cap %d -> %d blocks (%.1f -> %.1f GB)", cap, target,
+                (double) cap * pool.storage().residentBytes() / 1e9, (double) target * pool.storage().residentBytes() / 1e9);
+        if (!currentFits && !p.fits()) {
+            g.record("refused", what + ": would not fit even with " + String.format("%.1f GB", p.expertBytesOnCpu() / 1e9)
+                    + " of experts on the CPU");
+            g.backOff(now);
+            return;
+        }
+        if (p.expertBytesOnCpu() > movedNow || !currentFits) {
+            double curCost = ExpertPlacement.cost(cur, in.expertBytes(), in.experts(), in.topK(), in.usage());
+            if (g.hysteresis.accept(currentFits, curCost, p.costUs(), now)) {
+                int changed = replaceExperts(p.cold());
+                if (changed == 0 && !currentFits) {
+                    g.record("refused", what + ": " + String.format("%.1f GB", (gpuNow - in.budget()) / 1e9)
+                            + " over the budget and the experts cannot move (shared placement or no CPU side)");
+                    g.backOff(now);
+                    return;
+                }
+                if (changed > 0) {
+                    g.record("experts", changed + " layers re-placed: " + String.format("%.1f -> %.1f GB on the CPU, cost per token %.0f -> %.0f us",
+                            movedNow / 1e9, p.expertBytesOnCpu() / 1e9, curCost, p.costUs()));
+                }
+            }
+        }
+        pool.setHotCap(target);
+        g.record("grow", what);
+        g.setPlan(MemoryPlanner.describe(in, p));
+    }
+
+    @Override
+    public java.util.Map<String, Object> memoryReport() {
+        java.util.Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("backend", "metal");
+        out.put("device", k.metal.deviceName());
+        long budget = workingSet();
+        boolean[][] cold = placement != null ? placement.cold : new boolean[c.layers()][];
+        long expertsCpu = 0;
+        long expertsTotal = 0;
+        int cpuExperts = 0;
+        for (int l = 0; l < c.layers(); l++) {
+            expertsTotal += expertBytes(l);
+            for (int e = 0; cold[l] != null && e < cold[l].length; e++) {
+                if (cold[l][e]) {
+                    expertsCpu += bytesPerExpert(l);
+                    cpuExperts++;
+                }
+            }
+        }
+        long poolReserved = seq != null ? (long) seq.pool().hotCap() * seq.pool().storage().residentBytes() : 0;
+        long windows = streamed != null ? 4L * ctx * rowBytes() : 0;
+        long scratch = k.metal.allocatedBytes() - windows;
+        long others = DeviceLedger.others(ledger) - poolReserved;
+        long weightsGpu = w.byteSize() - expertsCpu;
+        java.util.Map<String, Object> dev = new java.util.LinkedHashMap<>();
+        dev.put("budgetBytes", budget);
+        java.util.List<java.util.Map<String, Object>> comps = new java.util.ArrayList<>();
+        comps.add(component("weights on the GPU", weightsGpu, "expert tensors included: " + (expertsTotal - expertsCpu) / 1_000_000 + " MB"));
+        comps.add(component("activations and scratch", scratch, "this slot's buffers"));
+        if (seq != null) {
+            comps.add(component("KV blocks (hot cap)", poolReserved, "committed " + seq.pool().committedBlocks() + " of "
+                    + seq.pool().hotCap() + " blocks"));
+        } else if (streamed != null) {
+            comps.add(component("KV windows", windows, "two layers of the streamed cache"));
+        } else if (arch.attention() instanceof Attention.Gqa) {
+            comps.add(component("KV cache (flat)", (long) ctx * kvBytesPerPosition(w, kvDtype), "counted in the scratch above"));
+        }
+        comps.add(component("other models and slots", others, "DeviceLedger"));
+        dev.put("components", comps);
+        long used = weightsGpu + scratch + windows + poolReserved + others;
+        dev.put("usedBytes", used);
+        dev.put("fits", used <= budget);
+        out.put("device", dev);
+        java.util.Map<String, Object> ex = new java.util.LinkedHashMap<>();
+        ex.put("totalBytes", expertsTotal);
+        ex.put("onCpuBytes", expertsCpu);
+        ex.put("onCpuExperts", cpuExperts);
+        ex.put("cpuLayers", cpuLayers);
+        ex.put("mode", split.layers() == MoeSplit.AUTO ? "auto" : split.layers() == 0 ? "off" : "fixed");
+        out.put("experts", ex);
+        if (seq != null) {
+            out.putAll(org.robomiri.jllm.kv.KvReports.pool(seq.pool()));
+        } else if (streamed != null) {
+            java.util.Map<String, Object> kv = new java.util.LinkedHashMap<>();
+            kv.put("mode", "streamed");
+            kv.put("hostBytes", streamed.hostBytes());
+            kv.put("mappedLayers", streamed.mappedLayers());
+            kv.put("windowBytes", windows);
+            kv.put("passes", streamed.passes());
+            kv.put("stagedBytes", streamed.stagedBytes());
+            kv.put("writtenBytes", streamed.writtenBytes());
+            kv.put("stageGBPerSecond", streamed.stagedNanos() > 0 ? streamed.stagedBytes() / (double) streamed.stagedNanos() : 0);
+            out.put("kv", kv);
+        } else {
+            java.util.Map<String, Object> kv = new java.util.LinkedHashMap<>();
+            kv.put("mode", "flat");
+            out.put("kv", kv);
+        }
+        MemoryGovernor g = governor();
+        java.util.Map<String, Object> plan = new java.util.LinkedHashMap<>();
+        plan.put("enabled", tier != null && tier.plan());
+        plan.put("summary", g.plan());
+        plan.put("decisions", g.history());
+        out.put("plan", plan);
+        return out;
+    }
+
+    private static java.util.Map<String, Object> component(String name, long bytes, String note) {
+        java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("name", name);
+        m.put("bytes", bytes);
+        m.put("note", note);
+        return m;
+    }
+
+    /** The plan at load, for the log and the console. */
+    private void logLoadPlan() {
+        if (tier == null || !tier.plan()) {
+            return;
+        }
+        long positions = seq != null ? (long) seq.pool().hotCap() * seq.pool().blockTokens() : (long) ctx;
+        MemoryPlanner.Inputs in = planInputs(positions, false);
+        boolean[][] cur = placement != null ? placement.cold : new boolean[c.layers()][];
+        long moved = coldBytes(cur, in.expertBytes());
+        long gpu = in.fixed() + MemoryPlanner.totalExpertBytes(in) - moved + (streaming ? in.windowBytes() : in.kvPerPosition() * positions);
+        MemoryPlanner.Plan p = new MemoryPlanner.Plan(streaming ? MemoryPlanner.Mode.STREAMED : MemoryPlanner.Mode.RESIDENT, cur, moved,
+                streaming ? in.windowBytes() : in.kvPerPosition() * positions, gpu, gpu <= in.budget(),
+                ExpertPlacement.cost(cur, in.expertBytes(), in.experts(), in.topK(), in.usage()), 0,
+                streaming ? "the KV is streamed" : "the KV is resident up to the hot cap");
+        MemoryGovernor g = governor();
+        g.setPlan(MemoryPlanner.describe(in, p));
+        for (String line : g.plan()) {
+            System.err.println("Metal memory plan: " + line);
+        }
+        g.record("load", (streaming ? "streamed KV, windows " + in.windowBytes() / 1_000_000 + " MB" : "KV hot cap " + positions + " positions"));
     }
 
     /** Drops this backend's hold on its placement; the last backend on it frees the packed experts. */

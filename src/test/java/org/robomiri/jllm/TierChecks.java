@@ -122,7 +122,7 @@ final class TierChecks {
     }
 
     private KvTierConfig cfg(long hot, long host) {
-        return new KvTierConfig(hot, host, org.robomiri.jllm.kv.KvBlockCodec.Format.NATIVE, true, KvTierConfig.Stream.OFF, dir);
+        return new KvTierConfig(hot, host, org.robomiri.jllm.kv.KvBlockCodec.Format.NATIVE, true, false, KvTierConfig.Stream.OFF, dir);
     }
 
     private KvPool pool(int slots, long poolTokens, KvTierConfig tier) {
@@ -261,7 +261,7 @@ final class TierChecks {
     }
 
     private Backend streaming(long hostBytes) {
-        KvTierConfig t = new KvTierConfig(1, hostBytes, org.robomiri.jllm.kv.KvBlockCodec.Format.NATIVE, true, KvTierConfig.Stream.FORCE, dir);
+        KvTierConfig t = new KvTierConfig(1, hostBytes, org.robomiri.jllm.kv.KvBlockCodec.Format.NATIVE, true, false, KvTierConfig.Stream.FORCE, dir);
         return new MetalBackend(w, CTX, BATCH, lib, dt, MoeSplit.OFF, null, t);
     }
 

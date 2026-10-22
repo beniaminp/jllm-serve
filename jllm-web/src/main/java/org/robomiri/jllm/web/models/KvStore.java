@@ -63,6 +63,9 @@ public class KvStore {
             return;
         }
         org.robomiri.jllm.kv.KvPool pool = seq.pool();
+        if (pool.spill() != null) {
+            return; // backend.kv-tier already gave the pool its tiered block store (host memory, then files)
+        }
         try {
             pool.setSpill(new org.robomiri.jllm.kv.FileSpill(dir.resolve("blocks"), fingerprint(m) + "|" + pool.format(),
                     (long) (props.kvSpillMaxGb() * 1e9)));

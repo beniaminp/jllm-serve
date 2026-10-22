@@ -167,6 +167,9 @@ public final class MetalKvStorage implements KvStorage {
 
     private volatile int committedBlocks;
 
+    /** The memory planner's state for this pool's model (docs/26). */
+    final MemoryGovernor governor = new MemoryGovernor();
+
     @Override
     public void close() {
         if (ledger != null) {
