@@ -92,6 +92,11 @@ public final class CpuOps implements Ops {
     }
 
     @Override
+    public Tn vector(float[] data, int... shape) {
+        return new T(data.clone(), shape);
+    }
+
+    @Override
     public float[] download(Tn t) {
         return ((T) t).a.clone();
     }
@@ -426,9 +431,9 @@ public final class CpuOps implements Ops {
     // ------------------------------------------------------------------ normalisation
 
     @Override
-    public Tn groupNorm(Tn xt, Tn gamma, Tn beta, int groups, float eps, boolean silu) {
+    public Tn groupNorm(Tn xt, Tn gamma, Tn beta, int groups, float eps, boolean silu, int samples) {
         T x = (T) xt;
-        int b = x.dim(0);
+        int b = samples;
         int c = x.last();
         int hw = x.rows() / b;
         int gs = c / groups;
@@ -651,6 +656,39 @@ public final class CpuOps implements Ops {
             System.arraycopy(a.a, r * ca, out.a, r * (ca + cb), ca);
             System.arraycopy(b.a, r * cb, out.a, r * (ca + cb) + ca, cb);
         }
+        return out;
+    }
+
+    @Override
+    public Tn swapAxes(Tn xt, int outer, int d1, int d2, int... shape) {
+        T x = (T) xt;
+        int c = x.last();
+        if ((long) outer * d1 * d2 * c != x.numel()) {
+            throw new IllegalArgumentException("swapAxes: " + outer + "x" + d1 + "x" + d2 + "x" + c + " does not fit " + x);
+        }
+        T out = (T) create(shape);
+        IntStream.range(0, outer * d2).parallel().forEach(r -> {
+            int o = r / d2;
+            int j2 = r % d2;
+            for (int j1 = 0; j1 < d1; j1++) {
+                System.arraycopy(x.a, ((o * d1 + j1) * d2 + j2) * c, out.a, ((o * d2 + j2) * d1 + j1) * c, c);
+            }
+        });
+        return out;
+    }
+
+    @Override
+    public Tn addRows(Tn xt, Tn table, int period) {
+        T x = (T) xt;
+        int c = x.last();
+        float[] t = ((T) table).a;
+        T out = (T) create(x.shape);
+        IntStream.range(0, x.rows()).parallel().forEach(r -> {
+            int to = (r % period) * c;
+            for (int j = 0; j < c; j++) {
+                out.a[r * c + j] = x.a[r * c + j] + t[to + j];
+            }
+        });
         return out;
     }
 }

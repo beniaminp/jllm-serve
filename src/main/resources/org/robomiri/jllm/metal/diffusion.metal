@@ -907,11 +907,37 @@ kernel void df_concat(device const T *x [[buffer(0)]], device const T *y [[buffe
     out[gid] = c < p.a ? x[row * p.a + c] : y[row * p.b + (c - p.a)];
 }
 
+// swap two axes: x read as [outer, d1, d2, C] -> out [outer, d2, d1, C]; p.a = d1, p.b = d2, p.c = C
+template <typename T>
+kernel void df_swap_axes(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
+                         constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const int c = int(gid % p.c);
+    long r = gid / p.c;                 // output row = (o, j2, j1)
+    const int j1 = int(r % p.a);
+    r /= p.a;
+    const int j2 = int(r % p.b);
+    const long o = r / p.b;
+    out[gid] = x[((o * p.a + j1) * p.b + j2) * p.c + c];
+}
+
+// out = x + table[row mod period]: p.a = C, p.b = period; the table is float32 [>= period, C] (the temporal positions of a video UNet)
+template <typename T>
+kernel void df_add_rows(device const T *x [[buffer(0)]], device const float *table [[buffer(1)]], device T *out [[buffer(2)]],
+                        constant DfEwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const long row = gid / p.a;
+    const int c = int(gid - row * p.a);
+    out[gid] = T(float(x[gid]) + table[(row % p.b) * p.a + c]);
+}
+
 #define DF_INST_EW(SUF, T) \
     template [[host_name("df_add" SUF)]] kernel decltype(df_add<T>) df_add<T>; \
     template [[host_name("df_silu" SUF)]] kernel decltype(df_silu_k<T>) df_silu_k<T>; \
     template [[host_name("df_geglu" SUF)]] kernel decltype(df_geglu<T>) df_geglu<T>; \
     template [[host_name("df_upsample2x" SUF)]] kernel decltype(df_upsample2x<T>) df_upsample2x<T>; \
-    template [[host_name("df_concat" SUF)]] kernel decltype(df_concat<T>) df_concat<T>;
+    template [[host_name("df_concat" SUF)]] kernel decltype(df_concat<T>) df_concat<T>; \
+    template [[host_name("df_swap_axes" SUF)]] kernel decltype(df_swap_axes<T>) df_swap_axes<T>; \
+    template [[host_name("df_add_rows" SUF)]] kernel decltype(df_add_rows<T>) df_add_rows<T>;
 DF_INST_EW("_f", float)
 DF_INST_EW("_h", half)

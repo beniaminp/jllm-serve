@@ -187,6 +187,18 @@ final class MetalOps implements Ops {
     }
 
     @Override
+    public Tn vector(float[] data, int... shape) {
+        long bytes = Math.max(16, data.length * 4L);
+        Metal.Buffer buf = gpu.metal.newBuffer(bytes, false);
+        gpu.liveBytes += bytes;
+        gpu.peakBytes = Math.max(gpu.peakBytes, gpu.liveBytes);
+        MemorySegment.copy(data, 0, buf.contents(), ValueLayout.JAVA_FLOAT_UNALIGNED, 0, data.length);
+        MT t = new MT(buf, false, true, bytes, shape);
+        weights.add(t);
+        return t;
+    }
+
+    @Override
     public float[] download(Tn t) {
         sync();
         MT m = (MT) t;
@@ -519,8 +531,8 @@ final class MetalOps implements Ops {
     }
 
     @Override
-    public Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu) {
-        int b = x.dim(0);
+    public Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu, int samples) {
+        int b = samples;
         int c = x.last();
         Tn out = create(x.shape);
         int hw = x.rows() / b;
@@ -678,6 +690,29 @@ final class MetalOps implements Ops {
         long total = out.numel();
         int plen = p(DiffusionParams.EW).l(total).i(ca).i(cb).i(0).i(0).done();
         run("df_concat" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(a), buf(b), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn swapAxes(Tn x, int outer, int d1, int d2, int... shape) {
+        int c = x.last();
+        if ((long) outer * d1 * d2 * c != x.numel()) {
+            throw new IllegalArgumentException("swapAxes: " + outer + "x" + d1 + "x" + d2 + "x" + c + " does not fit " + x);
+        }
+        Tn out = create(shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.EW).l(total).i(d1).i(d2).i(c).i(0).done();
+        run("df_swap_axes" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(out));
+        return out;
+    }
+
+    @Override
+    public Tn addRows(Tn x, Tn table, int period) {
+        int c = x.last();
+        Tn out = create(x.shape);
+        long total = out.numel();
+        int plen = p(DiffusionParams.EW).l(total).i(c).i(period).i(0).i(0).done();
+        run("df_add_rows" + sfx, cdiv(total, 256), 1, 1, 256, plen, buf(x), buf(table), buf(out));
         return out;
     }
 }

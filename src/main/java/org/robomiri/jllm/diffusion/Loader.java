@@ -36,6 +36,11 @@ final class Loader {
         return ckpt.has(name) ? vec(name) : null;
     }
 
+    /** Takes over a tensor this loader did not read from the checkpoint, to free it with the others. */
+    Tn adopt(Tn t) {
+        return put(t);
+    }
+
     private Tn put(Tn t) {
         loaded.add(t);
         return t;

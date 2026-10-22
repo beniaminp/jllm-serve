@@ -54,6 +54,9 @@ public interface Ops extends AutoCloseable {
     default void trim(long keepBytes) {
     }
 
+    /** A persistent float32 vector or table (a {@link Kind#VECTOR} weight) made from host data; freed with {@link #free}. */
+    Tn vector(float[] data, int... shape);
+
     /** Loads a checkpoint tensor as a weight of the given kind (converted to this device's format). */
     Tn weight(SafeTensors.Tensor t, Kind kind);
 
@@ -73,7 +76,16 @@ public interface Ops extends AutoCloseable {
     Tn conv2d(Tn x, Tn w, Tn bias, int stride, int padT, int padL, int padB, int padR, Tn chanBias, Tn residual);
 
     /** Group normalisation over {@code [B, H, W, C]} (or {@code [B, L, C]}), optionally followed by SiLU. */
-    Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu);
+    default Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu) {
+        return groupNorm(x, gamma, beta, groups, eps, silu, x.dim(0));
+    }
+
+    /**
+     * Group normalisation where the tensor is read as {@code samples} independent items of {@code rows / samples} positions
+     * each: the statistics of a group are taken over all positions of one item. The video networks use it to normalise over
+     * the frames of a clip too ({@code [B·F, H, W, C]} with {@code samples = B}).
+     */
+    Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu, int samples);
 
     /** Layer normalisation over the last dimension. */
     Tn layerNorm(Tn x, Tn gamma, Tn beta, float eps);
@@ -108,6 +120,15 @@ public interface Ops extends AutoCloseable {
 
     /** Concatenation along the channel dimension of two {@code [B, H, W, *]} tensors. */
     Tn concat(Tn a, Tn b);
+
+    /**
+     * Swaps two axes: {@code x} read as {@code [outer, d1, d2, C]} becomes {@code [outer, d2, d1, C]}, returned with the given
+     * shape (any shape of the same size). The video networks move between "frames of one pixel" and "pixels of one frame" with it.
+     */
+    Tn swapAxes(Tn x, int outer, int d1, int d2, int... shape);
+
+    /** {@code out[r, :] = x[r, :] + table[r mod period, :]} for {@code x [rows, C]} and a float vector table {@code [>= period, C]}. */
+    Tn addRows(Tn x, Tn table, int period);
 
     @Override
     void close();
