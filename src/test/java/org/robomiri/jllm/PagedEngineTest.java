@@ -107,35 +107,19 @@ public final class PagedEngineTest {
             check(bf.stateFormat().equals(bp.stateFormat()), dt + ": the same saved-cache format " + bf.stateFormat());
             int[] ids = text(flat.engine(), 0, 150);
             int vocab = flat.weights().arch.core().vocabSize();
-            // The vector reductions of the kernels (reduceLanes) may add in another order in the interpreter, in C1 and in C2,
-            // so the same call can differ in the last bit while the JVM warms up, even on the flat cache. The script runs on
-            // the flat cache twice; once those two agree the JVM is warm for this code, and the paged run must equal them.
-            // Warm the JVM with both code paths first: while the interpreter, C1 and C2 take turns, reduceLanes may add in
-            // another order, so the same cache can give a last-bit different answer from one call to the next. Only the
-            // comparison afterwards counts, and it needs flat == flat (the run is stable) and paged == flat in the same attempt.
-            for (int w = 0; w < 3; w++) {
-                script(bf, ids, vocab);
-                script(bp, ids, vocab);
+            // One comparison, from a cold JVM: the lane sums of the kernels add in one fixed order in every JIT tier
+            // (VectorKernels.laneSum, JitStableKernelsTest), so the first call needs no warm-up. The flat cache runs
+            // twice only to name the cause if the answer ever differs: a flat cache that disagrees with itself is not a paging error.
+            List<float[]> f1 = script(bf, ids, vocab);
+            List<float[]> p1 = script(bp, ids, vocab);
+            List<float[]> f2 = script(bf, ids, vocab);
+            boolean same = sameLogits(f1, p1);
+            boolean stable = sameLogits(f1, f2);
+            if (!same || !stable) {
+                System.out.println("     (flat twice " + (stable ? "agree" : "differ at " + firstDifference(f1, f2))
+                        + ", paged vs flat " + (same ? "agree" : "differ at " + firstDifference(f1, p1)) + ")");
             }
-            boolean same = false;
-            boolean warm = false;
-            int attempts = 0;
-            String why = "";
-            for (int attempt = 0; attempt < 12 && !(warm && same); attempt++) {
-                attempts++;
-                List<float[]> f1 = script(bf, ids, vocab);
-                List<float[]> f2 = script(bf, ids, vocab);
-                warm = sameLogits(f1, f2);
-                List<float[]> p1 = script(bp, ids, vocab);
-                same = sameLogits(f1, p1);
-                why = "attempt " + attempt + ": flat twice " + (warm ? "agree" : "differ at " + firstDifference(f1, f2))
-                        + ", paged vs flat " + (same ? "agree" : "differ at " + firstDifference(f1, p1));
-                if (!warm || !same) {
-                    System.out.println("     (" + why + ")");
-                }
-            }
-            check(warm && same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache"
-                    + (attempts > 1 ? " (" + attempts + " attempts)" : ""));
+            check(same && stable, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
             int[] prompt = text(flat.engine(), 7, 100);
             Engine.Result rf = flat.engine().generate(prompt, GREEDY, null, () -> false);
             Engine.Result rp = paged.engine().generate(prompt, GREEDY, null, () -> false);

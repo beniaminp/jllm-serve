@@ -186,7 +186,7 @@ public final class VectorKernels {
             a0 = FloatVector.fromArray(F, a, ao + i).fma(FloatVector.fromArray(F, b, bo + i), a0);
             a1 = FloatVector.fromArray(F, a, ao + i + FL).fma(FloatVector.fromArray(F, b, bo + i + FL), a1);
         }
-        float s = a0.add(a1).reduceLanes(VectorOperators.ADD);
+        float s = laneSum(a0.add(a1));
         for (; i < n; i++) {
             s += a[ao + i] * b[bo + i];
         }
@@ -381,7 +381,7 @@ public final class VectorKernels {
             e.intoArray(x, i);
             acc = acc.add(e);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = laneSum(acc);
         for (; i < o + n; i++) {
             float e = expFast(x[i] - max);
             x[i] = e;
