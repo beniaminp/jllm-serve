@@ -40,6 +40,7 @@ public final class MetalBackend implements Backend {
     private String attnKernel;         // attention_t instantiation for headDim / attnGroup / cache type
     private int attnGroup;             // query heads per attention threadgroup
     private boolean flashDecode;       // flash decoding for long decode steps (decided by MetalTuner, dense attention only)
+    private boolean decodeAttn;        // attention_dec for every single-token step (decided by MetalTuner, dense attention only)
     private boolean flashPrefill;      // attention_fa for prefill chunks (decided by MetalTuner)
     private Metal.Buffer flashPart;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
@@ -370,8 +371,11 @@ public final class MetalBackend implements Backend {
             flashDecode = d.flashDecode();
             System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
                     + (flashDecode ? "on" : "off") + " (" + d.note() + ")");
+            decodeAttn = kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(g.headDim()) && MetalTuner.decodeAttention(k, g, kvDtype, attnKernel, attnGroup);
         }
-        flashPart = flashDecode ? k.scratch((long) a.heads() * MetalKernels.FLASH_SPLITS * (hd + 2) * 4) : null;
+        flashPart = flashDecode || decodeAttn
+                ? k.scratch((long) a.heads() * (decodeAttn ? MetalConstants.FLASH_MAX_SPLITS : MetalKernels.FLASH_SPLITS) * (hd + 2) * 4)
+                : null;
         if (arch.anyMoe()) {
             int slots = maxBatch * arch.maxTopK();
             assign = k.scratch((long) slots * 4);
@@ -391,7 +395,9 @@ public final class MetalBackend implements Backend {
         for (int l = 0; l < c.layers(); l++) {
             plans[l] = plan(arch.layers().get(l), w.decoderLayer(l), cold[l], l);
         }
-        k.decodeThreads = MetalTuner.decodeThreads(k, plans[0].wo(), plans[0].woBuf());
+        if (k.mvRows <= 1) { // the multi-row decode kernels have their own shape (MetalKernels.mvRows)
+            k.decodeThreads = MetalTuner.decodeThreads(k, plans[0].wo(), plans[0].woBuf());
+        }
         MetalTuner.prefillMatmuls(k, w); // f32 or half-weight MMA prefill kernels, per matrix shape
         java.util.TreeSet<Integer> wins = new java.util.TreeSet<>();
         for (LayerSpec s : arch.layers()) {
@@ -868,6 +874,16 @@ public final class MetalBackend implements Backend {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), n);
                 }
             }
+            if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
+                // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
+                // token, so that every row is exactly what a decode step at its position computes
+                for (int t = 0; t < n; t++) {
+                    long qRow = (long) t * g.qDim() * 4;
+                    k.decodeAttention(kvDtype, q, qRow, keyCache[layer], valCache[layer], flashPart, att, qRow, g.heads(),
+                            g.kvHeads(), hd, pos + t, ctx, g.scale(), stride, g.window(), g.softcap());
+                }
+                return;
+            }
             if (bidirectional && n > 1) {
                 // every row attends to all rows of the picture: with all n keys stored, each is a "last row" at pos + n - 1
                 // (the single-row attention of the batched step, one dispatch per row)
@@ -968,6 +984,14 @@ public final class MetalBackend implements Backend {
                             owners[t].valCache[layer], positions[t] * rowBytes, hd, g.kvHeads());
                 }
                 k.endIndependent();
+            }
+            if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
+                for (int t = 0; t < n; t++) {
+                    k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
+                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, g.scale(),
+                            stride, g.window(), g.softcap());
+                }
+                return;
             }
             // attention: one slice of the scores scratch per row (it holds a tile's worth), so rows can overlap; the
             // flash form shares its partial-result buffer between rows and stays one after the other
@@ -1439,7 +1463,11 @@ public final class MetalBackend implements Backend {
      */
     private long stepKey(boolean pipelined, int pos) {
         long key = (pipelined ? 1 : 0) | (countStep ? 2 : 0);
-        if (flashDecode && pos + 1 >= k.flashMinLen) {
+        if (decodeAttn) { // the grid of attention_dec: the number of splits for each attention window
+            for (int i = 0; i < windows.length; i++) {
+                key |= (long) k.decSplits(pos, windows[i]) << (3 + 7 * i);
+            }
+        } else if (flashDecode && pos + 1 >= k.flashMinLen) {
             key |= 4;
             for (int i = 0; i < windows.length; i++) {
                 key |= (long) k.flashSplits(pos, windows[i]) << (3 + 7 * i);
@@ -1498,6 +1526,11 @@ public final class MetalBackend implements Backend {
      */
     public void flashDecodeThresholds(int minLen, int chunk) {
         if (!(arch.attention() instanceof Attention.Gqa)) {
+            return;
+        }
+        if (decodeAttn) { // the decode attention supersedes flash decoding: cross its split counts early instead
+            k.decChunk = chunk;
+            k.invalidatePrograms();
             return;
         }
         if (flashPart == null) {

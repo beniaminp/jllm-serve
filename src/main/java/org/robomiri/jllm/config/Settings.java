@@ -205,9 +205,12 @@ public final class Settings {
      * @throws IllegalArgumentException naming the offending key and value
      */
     public Settings validate() {
-        for (String k : new String[]{"backend.ctx", "backend.batch", "bench.max-tokens", "bench.rounds",
+        for (String k : new String[]{"backend.ctx", "bench.max-tokens", "bench.rounds",
                 "bench.prompt-repeat", "server.max-connections"}) {
             require(getInt(k) >= 1, k, "must be at least 1");
+        }
+        if (!"auto".equalsIgnoreCase(get("backend.batch").trim())) {
+            require(getInt("backend.batch") >= 1, "backend.batch", "must be auto or at least 1");
         }
         require(getInt("backend.threads") >= 0, "backend.threads", "must be 0 (= all processors) or positive");
         require(getInt("server.port") >= 0 && getInt("server.port") <= 65535, "server.port", "must be 0..65535");

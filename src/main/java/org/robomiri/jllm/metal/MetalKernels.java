@@ -13,6 +13,8 @@ import java.lang.foreign.ValueLayout;
 import static org.robomiri.jllm.metal.MetalConstants.ATT_THREADS;
 import static org.robomiri.jllm.metal.MetalConstants.ATT_TILE;
 import static org.robomiri.jllm.metal.MetalConstants.CHANNEL_THREADS;
+import static org.robomiri.jllm.metal.MetalConstants.DEC_SG;
+import static org.robomiri.jllm.metal.MetalConstants.DEC_THREADS;
 import static org.robomiri.jllm.metal.MetalConstants.FLASH_MAX_SPLITS;
 import static org.robomiri.jllm.metal.MetalConstants.MM_THREADS;
 import static org.robomiri.jllm.metal.MetalConstants.MMA_BR;
@@ -101,6 +103,22 @@ final class MetalKernels implements AutoCloseable {
     static final int FLASH_CHUNK = Integer.getInteger("jllm.metal.flashChunk", 128); // 64-128 measured best, 256+ slower
     static final int FLASH_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.flashSplits", 32));
     /**
+     * Decode attention ({@code attention_dec}, section 4b of kernels.metal): the attention of a single token over the
+     * cache with the K/V rows read once per kv head, the softmax online in registers and the key range split over up
+     * to DEC_MAX_SPLITS simdgroups of at least DEC_CHUNK keys. Agrees with {@code attention_t} to rounding, not bit for bit.
+     * {@code -Djllm.metal.decodeAttention=true|false} forces it on or off; "auto": {@link MetalTuner#decodeAttention}
+     * decides on the device (it must agree with attention_t and be faster).
+     */
+    static final String DEC_ATTN_MODE = System.getProperty("jllm.metal.decodeAttention", "auto");
+    /** Keys per attention_dec simdgroup (a split); a decode step over up to DEC_CHUNK keys runs one simdgroup per head group. */
+    static final int DEC_CHUNK = Integer.getInteger("jllm.metal.decChunk", 32);
+    /** Most splits (simdgroups per query-head group) of one attention_dec step: long contexts use bigger splits instead of more. */
+    static final int DEC_MAX_SPLITS = Math.min(FLASH_MAX_SPLITS, Integer.getInteger("jllm.metal.decMaxSplits", 24));
+    /** A half cache is read with 16-byte loads (8 elements per lane chunk); {@code -Djllm.metal.decWide=false}: 8-byte ones. */
+    static final boolean DEC_WIDE = !"false".equals(System.getProperty("jllm.metal.decWide"));
+    /** Query heads per attention_dec threadgroup; 0 = automatic (at most 2, 4 for 64-wide heads, dividing heads / kvHeads). */
+    static final int DEC_GROUP = Integer.getInteger("jllm.metal.decGroup", 0);
+    /**
      * Decode replay: a single-token decode step is recorded once per shape and later steps re-run the recording with
      * their position (and token ring slots) patched in, one native call per step instead of one per dispatch (see
      * {@link #step}). {@code -Djllm.metal.replay=false} encodes every step dispatch by dispatch.
@@ -156,6 +174,8 @@ final class MetalKernels implements AutoCloseable {
     /** Flash decoding thresholds (see FLASH_MIN_LEN, FLASH_CHUNK); per instance so a test can cross them early. */
     int flashMinLen = FLASH_MIN_LEN;
     int flashChunk = FLASH_CHUNK;
+    /** Keys per attention_dec threadgroup (DEC_CHUNK); per instance so a test can cross the split counts early. */
+    int decChunk = DEC_CHUNK;
 
     /** Owns {@code metal} from here on. */
     MetalKernels(Metal metal, float normEps) {
@@ -592,6 +612,41 @@ final class MetalKernels implements AutoCloseable {
      */
     int decodeThreads = MetalConstants.MM_THREADS;
 
+    /**
+     * Output rows per simdgroup of the single-token (decode) matmul / matmul3 / swiglu kernels (section 2a of
+     * kernels.metal: {@code mv<N>_matmul...}, accumulating every row exactly as the one-row kernels do).
+     * 0 or 1 = the one-row kernels. {@code -Djllm.metal.mvRows=N}, N in 0, 1, 2, 4.
+     */
+    static final int MV_ROWS = mvRows();
+    /** Threads per threadgroup of the multi-row kernels without a fused norm (the fused ones need 128). */
+    static final int MV_THREADS = Integer.getInteger("jllm.metal.mvThreads", MM_THREADS);
+    /** Per instance (a benchmark switches them): rows per simdgroup (see MV_ROWS) and plain-kernel threads. */
+    int mvRows = MV_ROWS;
+    int mvThreads = MV_THREADS;
+
+    private static int mvRows() {
+        int n = Integer.getInteger("jllm.metal.mvRows", 4);
+        if (n != 0 && n != 1 && n != 2 && n != 4) {
+            throw new IllegalArgumentException("-Djllm.metal.mvRows must be 0, 1, 2 or 4, got " + n);
+        }
+        return n;
+    }
+
+    /** True if a matmul / matmul3 / swiglu of fewer tokens than the prefill tiles take runs the multi-row kernels. */
+    private boolean mv(int n) {
+        return mvRows > 1;
+    }
+
+    /** Threadgroups along the row axis of a multi-row kernel with {@code threads} threads per threadgroup. */
+    private int mvGrid(int rows, int threads) {
+        int per = threads / 32 * mvRows;
+        return (rows + per - 1) / per;
+    }
+
+    private String mvName(String base) {
+        return "mv" + mvRows + "_" + base;
+    }
+
     private static int tokTiles(int n) {
         return (n + TOK_TILE - 1) / TOK_TILE;
     }
@@ -639,6 +694,10 @@ final class MetalKernels implements AutoCloseable {
                     mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul_pf", t.type, ""), 6, 0, pfGrid(t.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (mv(n)) {
+            int threads = norm != null ? MM_THREADS : mvThreads;
+            dispatch(kernel(mvName("matmul"), t.type, norm != null ? "_norm" : ""), 6, normTgMem(norm, t.cols),
+                    mvGrid(t.rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else if (norm == null && n == 1) {
             int sgs = decodeThreads / 32;
             dispatch(kernel("matmul", t.type, ""), 6, 0, (t.rows + sgs - 1) / sgs, 1, 1, decodeThreads, 1, 1);
@@ -693,6 +752,10 @@ final class MetalKernels implements AutoCloseable {
                     mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", wq.type, vh), 14, 0, pfGrid(rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (mv(n)) {
+            int threads = norm != null ? MM_THREADS : mvThreads;
+            dispatch(kernel(mvName("matmul3"), wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
+                    mvGrid(rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", wq.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, wq.cols),
                     rowGrid(rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -734,6 +797,10 @@ final class MetalKernels implements AutoCloseable {
                     mmaTiles(n), 1, MM_THREADS, 1, 1);
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             dispatch(kernel("matmul3_pf", w.type, vh), 14, 0, pfGrid(w.rows), pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (mv(n)) {
+            int threads = norm != null ? MM_THREADS : mvThreads;
+            dispatch(kernel(mvName("matmul3"), w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
+                    mvGrid(w.rows, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul3", w.type, (norm != null ? "_norm" : "") + vh), 14, normTgMem(norm, w.cols),
                     rowGrid(w.rows), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -765,6 +832,10 @@ final class MetalKernels implements AutoCloseable {
         } else if (norm == null && n >= PREFILL_MIN_TOKENS) {
             int gx = (hidden + SG_PER_TG * PF_UNITS - 1) / (SG_PER_TG * PF_UNITS);
             dispatch(kernel("matmul_swiglu_pf", t.type, ""), 5, 0, gx, pfTiles(n), 1, MM_THREADS, 1, 1);
+        } else if (mv(n)) {
+            int threads = norm != null ? MM_THREADS : mvThreads;
+            dispatch(kernel(mvName("matmul_swiglu"), t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
+                    mvGrid(hidden, threads), tokTiles(n), 1, threads, 1, 1);
         } else {
             dispatch(kernel("matmul_swiglu", t.type, norm != null ? "_norm" : ""), 5, normTgMem(norm, t.cols),
                     rowGrid(hidden), tokTiles(n), 1, MM_THREADS, 1, 1);
@@ -1050,6 +1121,58 @@ final class MetalKernels implements AutoCloseable {
         bind(1, out, 0);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
         dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** Whether {@code attention_dec} exists for this head width. */
+    static boolean decodeAttentionFits(int headDim) {
+        return headDim == 64 || headDim == 128 || headDim == 256;
+    }
+
+    /** Query heads per attention_dec threadgroup: they share each K/V row; bounded by the registers (o and q per head). */
+    static int decGroup(int nHeads, int nKvHeads, int headDim) {
+        int ratio = nHeads / nKvHeads;
+        int max = DEC_GROUP > 0 ? DEC_GROUP : (headDim <= 64 ? 4 : 2);
+        int g = 1;
+        while (g * 2 <= max && ratio % (g * 2) == 0) {
+            g *= 2;
+        }
+        return g;
+    }
+
+    /** Threadgroups per query-head group of attention_dec for the token at pos: one per decChunk keys it sees, at most DEC_MAX_SPLITS. */
+    int decSplits(int pos, int window) {
+        int len = pos + 1;
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        return Math.max(1, Math.min(DEC_MAX_SPLITS, (len - first + decChunk - 1) / decChunk));
+    }
+
+    /**
+     * {@code attention_dec} for the single token at pos whose q row starts at byte {@code qOff}; its output row goes
+     * to byte {@code outOff} of {@code out}. With more than one split the partials go to {@code part} (heads * splits *
+     * (headDim + 2) floats) and {@code attention_combine} merges them into {@code out}.
+     */
+    void decodeAttention(KvDtype kv, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer part,
+                         Metal.Buffer out, long outOff, int nHeads, int nKvHeads, int headDim, int pos, int ctx,
+                         float scale, int kvStride, int window, float softcap) {
+        int nSplit = decSplits(pos, window);
+        int group = decGroup(nHeads, nKvHeads, headDim);
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, out, outOff);
+        // chunk 0: the kernel derives the keys per split from the position, so a recorded decode step stays valid while
+        // nSplit does (MetalBackend's step key)
+        p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
+                .i(nHeads * headDim).i(kvStride).i(window).f(softcap).i(nSplit).i(0);
+        String suffix = kv == KvDtype.F16 && !DEC_WIDE ? "_h4" : kvSuffix(kv);
+        dispatch("attention_dec_g" + group + "_d" + headDim + suffix, 5, 0, nHeads / group, (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
+        if (nSplit > 1) {
+            bind(0, part, 0);
+            bind(1, out, outOff);
+            p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+            dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+        }
     }
 
     // ---------------------------------------------------------------- mixture of experts

@@ -37,6 +37,8 @@ using namespace metal;
 #define ATT_THREADS 256         // attention threadgroup = ATT_SIMDGROUPS simdgroups
 #define ATT_SIMDGROUPS 8
 #define ATT_TILE 32             // tokens per attention dispatch (scores scratch rows per head)
+#define DEC_SG 4                // simdgroups per attention_dec threadgroup (decode attention, section 4b)
+#define DEC_THREADS 128         // attention_dec threadgroup = DEC_SG simdgroups
 #define MAX_PER 8               // widest head in units of 32 lanes (headDim <= 256)
 #define MLA_MAX_PER 18          // widest absorbed MLA query / cache row in units of 32 lanes (kv_lora_rank + rope <= 576)
 #define CHANNEL_THREADS 64      // mla_lat_store / mamba_conv / mamba_scan threadgroup
@@ -541,6 +543,284 @@ template [[host_name("matmul_swiglu_q4")]] kernel matmul_swiglu_t matmul_swiglu<
 template [[host_name("matmul_swiglu_q8")]] kernel matmul_swiglu_t matmul_swiglu<8, false>;
 template [[host_name("matmul_swiglu_q4_norm")]] kernel matmul_swiglu_t matmul_swiglu<4, true>;
 template [[host_name("matmul_swiglu_q8_norm")]] kernel matmul_swiglu_t matmul_swiglu<8, true>;
+
+// ---------------------------------------------------------------------------------------------- 2a. matmul: multi-row decode
+// The single-token (decode) products with NR output rows per simdgroup (mvr_matmul / mvr_matmul3 / mvr_matmul_swiglu,
+// host names mv<NR>_...). The kernels above give a simdgroup ONE row: a lane loads 16 B of weights (Q4_0) but 128 B of
+// activations per block, so the activation traffic is ~6x the weight traffic and each simdgroup has little to do. Here a
+// lane loads its 32 activations of a block ONCE into registers and runs the NR rows' blocks against them, and the *_norm
+// variants recompute the rmsnorm once per NR x simdgroups rows instead of once per simdgroups rows.
+//
+// Every output row is accumulated as in mm_row: the same blocks in the same lane order, the same block dot expression
+// (q4_block_dot / q8_block_dot / the GGUF unit dot), one simd_sum. The sums are therefore the same mathematically and
+// on the emulator the bytes are the same (kernel_tests.py); on a GPU the compiler (fast-math, free to reassociate) may
+// round a Q4_0 sum differently in this loop shape: measured on the M1 Pro, Q8_0, the K-quants and the f16 path agree
+// with the one-row kernels to the byte, Q4_0 differs in the last bit of ~70 % of the outputs (<= 5e-7 of a 2.5 range;
+// greedy tokens unchanged). Keeping mm_row's token loop (a variant that is exact for Q4_0) costs all of the speedup.
+// Up to TOK_TILE tokens per threadgroup row run one after the other through the same loop body (the NORM variants are
+// single-token), so a row of a batched step computes exactly what the same token computes alone. Q2_K and Q6_K have a
+// different lane unit: they run mm_row per row.
+// Grid: (ceil(rows / (NR * simdgroups)), ceil(ntok / TOK_TILE)); the NORM variants have 128 threads (norm_scale_128).
+
+template <int QT, int NR, typename XP>
+static inline void mm_rows(thread device const uchar *const *wq, thread device const float *const *ws,
+                           thread const ulong *grow, int nr, int nb, XP x, thread float *acc, ushort lane) {
+    if (QT == 2) {
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) mm_row_q2k(wq[r], grow[r], nb, x, 0, 1, acc + r, lane);
+        }
+        return;
+    }
+    if (QT == 6) {
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) mm_row_q6k(wq[r], grow[r], nb, x, 0, 1, acc + r, lane);
+        }
+        return;
+    }
+    if (QT >= GG_FIRST) {
+        for (int u = lane; u < nb; u += 32) {
+            auto x4 = as_f4(x + u * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    float4 w[8];
+                    gg_unit<QT>(wq[r], grow[r], nb, u, w);
+                    float d = 0.0f;
+                    for (int k = 0; k < 8; k++) d += dot(w[k], xv[k]);
+                    acc[r] += d;
+                }
+            }
+        }
+        return;
+    }
+    if (QT == 4) {
+        for (int b = lane; b < nb; b += 32) {
+            auto x4 = as_f4(x + b * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    device const uchar4 *rq = (device const uchar4 *)(wq[r] + grow[r] * nb * 16) + b * 4;
+                    uchar4 pk[4];
+                    for (int k = 0; k < 4; k++) pk[k] = rq[k];
+                    acc[r] += q4_block_dot(pk, xv) * ws[r][grow[r] * nb + b];
+                }
+            }
+        }
+    } else {
+        for (int b = lane; b < nb; b += 32) {
+            auto x4 = as_f4(x + b * QK);
+            float4 xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = x4[k];
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    device const char4 *rq = (device const char4 *)(wq[r] + grow[r] * nb * 32) + b * 8;
+                    char4 pk[8];
+                    for (int k = 0; k < 8; k++) pk[k] = rq[k];
+                    acc[r] += q8_block_dot(pk, xv) * ws[r][grow[r] * nb + b];
+                }
+            }
+        }
+    }
+}
+
+// out[row] (+)= W[row] . x for one token; NR consecutive rows per simdgroup.
+template <int QT, int NR, bool NORM>
+kernel void mvr_matmul(device const uchar *wq [[buffer(0)]],
+                       device const float *ws [[buffer(1)]],
+                       device const float *x [[buffer(2)]],
+                       device float *out [[buffer(3)]],
+                       device const float *nw [[buffer(4)]],
+                       device const float *bias [[buffer(5)]],
+                       constant MatmulParams &p [[buffer(6)]],
+                       threadgroup float *xn [[threadgroup(0)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]],
+                       ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[8];
+    const int row0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TOK_TILE;
+    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane); // all threads: barriers inside
+    if (row0 >= p.rows) return;
+    const int nr = min(NR, p.rows - row0);
+    device const uchar *wqs[NR];
+    device const float *wss[NR];
+    ulong grow[NR];
+    for (int r = 0; r < NR; r++) {
+        wqs[r] = wq;
+        wss[r] = ws;
+        grow[r] = (ulong)(row0 + min(r, nr - 1));
+    }
+    // one token after the other through the same code (the weights of the threadgroup's rows stay in cache), so a row
+    // of a batched step computes exactly what the same token computes alone
+    for (int t = 0; t < nt; t++) {
+        float acc[NR];
+        for (int r = 0; r < NR; r++) acc[r] = 0.0f;
+        if (NORM) {
+            mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, acc, lane);
+        } else {
+            mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x + (ulong)(t0 + t) * p.cols, acc, lane);
+        }
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) {
+                float v = simd_sum(acc[r]);
+                if (lane == 0) {
+                    const ulong o = (ulong)(t0 + t) * p.rows + row0 + r;
+                    if (p.hasBias) v += bias[row0 + r];
+                    out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
+                }
+            }
+        }
+    }
+}
+
+// q, k, v of one token: rows [0, rows0) from W0 into out0, [rows0, rows0 + rows1) from W1 into out1, the rest from W2
+// into out2 (VT = half: the f16 cache's rows); the NR rows of a simdgroup may straddle two matrices.
+template <int QT, int NR, bool NORM, typename VT>
+kernel void mvr_matmul3(device const uchar *wq0 [[buffer(0)]],
+                        device const float *ws0 [[buffer(1)]],
+                        device const uchar *wq1 [[buffer(2)]],
+                        device const float *ws1 [[buffer(3)]],
+                        device const uchar *wq2 [[buffer(4)]],
+                        device const float *ws2 [[buffer(5)]],
+                        device const float *x [[buffer(6)]],
+                        device float *out0 [[buffer(7)]],
+                        device float *out1 [[buffer(8)]],
+                        device VT *out2 [[buffer(9)]],
+                        device const float *nw [[buffer(10)]],
+                        device const float *b0 [[buffer(11)]],
+                        device const float *b1 [[buffer(12)]],
+                        device const float *b2 [[buffer(13)]],
+                        constant Matmul3Params &p [[buffer(14)]],
+                        threadgroup float *xn [[threadgroup(0)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort sg [[simdgroup_index_in_threadgroup]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[8];
+    const int total = p.rows0 + p.rows1 + p.rows2;
+    const int row0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TOK_TILE;
+    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane);
+    if (row0 >= total) return;
+    const int nr = min(NR, total - row0);
+    device const uchar *wqs[NR];
+    device const float *wss[NR];
+    device float *outs[NR];
+    bool isV[NR];
+    float bias[NR];
+    int rows[NR];
+    ulong grow[NR];
+    for (int r = 0; r < NR; r++) {
+        const int row = row0 + min(r, nr - 1);
+        isV[r] = row >= p.rows0 + p.rows1;
+        if (row < p.rows0) {
+            wqs[r] = wq0; wss[r] = ws0; outs[r] = out0; rows[r] = p.rows0; grow[r] = (ulong)row;
+            bias[r] = p.hasBias ? b0[grow[r]] : 0.0f;
+        } else if (!isV[r]) {
+            wqs[r] = wq1; wss[r] = ws1; outs[r] = out1; rows[r] = p.rows1; grow[r] = (ulong)(row - p.rows0);
+            bias[r] = p.hasBias ? b1[grow[r]] : 0.0f;
+        } else {
+            wqs[r] = wq2; wss[r] = ws2; outs[r] = out0; rows[r] = p.rows2; grow[r] = (ulong)(row - p.rows0 - p.rows1);
+            bias[r] = p.hasBias ? b2[grow[r]] : 0.0f; // written to out2 below
+        }
+    }
+    for (int t = 0; t < nt; t++) {
+        float acc[NR];
+        for (int r = 0; r < NR; r++) acc[r] = 0.0f;
+        if (NORM) {
+            mm_rows<QT, NR>(wqs, wss, grow, nr, nb, (threadgroup const float *)xn, acc, lane);
+        } else {
+            mm_rows<QT, NR>(wqs, wss, grow, nr, nb, x + (ulong)(t0 + t) * p.cols, acc, lane);
+        }
+        for (int r = 0; r < NR; r++) {
+            if (r < nr) {
+                float v = simd_sum(acc[r]);
+                if (lane == 0) {
+                    const float o = p.hasBias ? v + bias[r] : v;
+                    const ulong idx = (ulong)(t0 + t) * rows[r] + grow[r];
+                    if (isV[r]) out2[idx] = VT(o); else outs[r][idx] = o;
+                }
+            }
+        }
+    }
+}
+
+// NR hidden units per simdgroup: gate rows [unit0, unit0 + nu), up rows hidden + the same (GGUF: the second view).
+template <int QT, int NR, bool NORM>
+kernel void mvr_matmul_swiglu(device const uchar *wq [[buffer(0)]],
+                              device const float *ws [[buffer(1)]],
+                              device const float *x [[buffer(2)]],
+                              device float *out [[buffer(3)]],
+                              device const float *nw [[buffer(4)]],
+                              constant SwigluParams &p [[buffer(5)]],
+                              threadgroup float *xn [[threadgroup(0)]],
+                              uint2 tgp [[threadgroup_position_in_grid]],
+                              ushort sg [[simdgroup_index_in_threadgroup]],
+                              ushort lane [[thread_index_in_simdgroup]],
+                              ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[8];
+    const int unit0 = (int(tgp.x) * nsg + sg) * NR;
+    const int t0 = int(tgp.y) * TOK_TILE;
+    const int nt = NORM ? 1 : min(TOK_TILE, p.ntok - t0);
+    const int nb = p.cols / QK;
+    if (NORM) norm_row_128(x, nw, p.cols, p.eps, xn, buf, sg, lane);
+    if (unit0 >= p.hidden) return;
+    const int nu = min(NR, p.hidden - unit0);
+    device const uchar *wqs[2 * NR];
+    device const float *wss[2 * NR];
+    ulong grow[2 * NR];
+    for (int r = 0; r < NR; r++) {
+        const int unit = unit0 + min(r, nu - 1);
+        wqs[r] = wq; wss[r] = ws; grow[r] = (ulong)unit;
+        if (QT >= GG_FIRST) {   // GGUF types: the up rows are the separate view bound as buffer(1)
+            wqs[NR + r] = (device const uchar *)ws; wss[NR + r] = ws; grow[NR + r] = (ulong)unit;
+        } else {
+            wqs[NR + r] = wq; wss[NR + r] = ws; grow[NR + r] = (ulong)(p.hidden + unit);
+        }
+    }
+    // nr = 2 * NR: the padded rows (unit clamped to the last valid one) are computed and discarded
+    for (int t = 0; t < nt; t++) {
+        float acc[2 * NR];
+        for (int r = 0; r < 2 * NR; r++) acc[r] = 0.0f;
+        if (NORM) {
+            mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, (threadgroup const float *)xn, acc, lane);
+        } else {
+            mm_rows<QT, 2 * NR>(wqs, wss, grow, 2 * NR, nb, x + (ulong)(t0 + t) * p.cols, acc, lane);
+        }
+        for (int r = 0; r < NR; r++) {
+            if (r < nu) {
+                float g = simd_sum(acc[r]);
+                float u = simd_sum(acc[NR + r]);
+                if (lane == 0) {
+                    out[(ulong)(t0 + t) * p.hidden + unit0 + r] = (p.gelu ? gelu_tanh_f(g) : g / (1.0f + exp(-g))) * u;
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(mvr_matmul<4, 2, false>) mvr_matmul_t;
+typedef decltype(mvr_matmul3<4, 2, false, float>) mvr_matmul3_t;
+typedef decltype(mvr_matmul3<4, 2, false, half>) mvr_matmul3_h_t;
+typedef decltype(mvr_matmul_swiglu<4, 2, false>) mvr_swiglu_t;
+
+// the eight kernels of one (format, NR): matmul / matmul3 (+_h: v rows as half) / swiglu, plain and _norm
+#define MVR_INSTANTIATE(NRS, NRV, SUF, QTV)                                                                           \
+    template [[host_name("mv" NRS "_matmul_" SUF)]] kernel mvr_matmul_t mvr_matmul<QTV, NRV, false>;                  \
+    template [[host_name("mv" NRS "_matmul_" SUF "_norm")]] kernel mvr_matmul_t mvr_matmul<QTV, NRV, true>;           \
+    template [[host_name("mv" NRS "_matmul3_" SUF)]] kernel mvr_matmul3_t mvr_matmul3<QTV, NRV, false, float>;        \
+    template [[host_name("mv" NRS "_matmul3_" SUF "_norm")]] kernel mvr_matmul3_t mvr_matmul3<QTV, NRV, true, float>; \
+    template [[host_name("mv" NRS "_matmul3_" SUF "_h")]] kernel mvr_matmul3_h_t mvr_matmul3<QTV, NRV, false, half>;  \
+    template [[host_name("mv" NRS "_matmul3_" SUF "_norm_h")]] kernel mvr_matmul3_h_t mvr_matmul3<QTV, NRV, true, half>; \
+    template [[host_name("mv" NRS "_matmul_swiglu_" SUF)]] kernel mvr_swiglu_t mvr_matmul_swiglu<QTV, NRV, false>;    \
+    template [[host_name("mv" NRS "_matmul_swiglu_" SUF "_norm")]] kernel mvr_swiglu_t mvr_matmul_swiglu<QTV, NRV, true>;
 
 // ---------------------------------------------------------------------------------------------- 2. matmul: prefill tiles
 // The same three products for a chunk of tokens, with one simdgroup computing a tile of NR rows x TT tokens
@@ -1508,6 +1788,208 @@ kernel void attention_combine(device const float *part [[buffer(0)]],
 template [[host_name("attention_split")]] kernel decltype(attention_split<float>) attention_split<float>;
 template [[host_name("attention_split_h")]] kernel decltype(attention_split<half>) attention_split<half>;
 template [[host_name("attention_split_q8")]] kernel decltype(attention_split<char>) attention_split<char>;
+
+// ---------------------------------------------------------------------------------------------- 4b. attention: decode
+// attention_dec<KV, G, D>: the attention of ONE token (a decode step) over a long cache, written for memory-level
+// parallelism instead of for the generic tile of attention_t. attention_t gives a threadgroup one query head, makes
+// every simdgroup walk keys one at a time (a 128-byte coalesced row, 4 FMAs per lane, then a 5-step simd_sum per key),
+// parks the scores in device memory between three barrier-separated passes, and runs only nHeads threadgroups.
+// Here every SIMDGROUP is an independent worker on a slice of the keys of one (G query heads of one kv head) group:
+//   - it takes 32 keys at a time; 8 lanes (tx = lane & 7) share a key and 4 keys (ty = lane >> 3) run at once.
+//     Lane tx loads the 4-vectors tx, tx + 8, ... of the key's head row (8 lanes = 128 contiguous bytes per vector) and
+//     dots them with the query held in registers; the G query heads of the group share each loaded K row;
+//   - the 8 partial scores of a lane (one per step) are reduced over the 8 lanes with a reduce-scatter (7 shuffles,
+//     not 24): lane tx ends up with the complete score of the block's key 4 tx + ty;
+//   - the softmax is online, one running (max, sum) per head: per 32-key block a simd_max, one exp per lane, a rescale
+//     of the accumulator; the scores never touch memory;
+//   - P V: step j's probability comes from lane (j, ty) by one shuffle, and the lane multiplies its 4-vectors of
+//     the key's V row (the same lane layout as K) into its accumulator; at the end the accumulators of the 4 ty
+//     groups are added with two xor-shuffles.
+// There are no barriers and no threadgroup memory: a simdgroup writes its own unnormalised partial (o[D], max, sum, the
+// layout of attention_split) and attention_combine merges them (several simdgroups per head, so a decode step gets
+// 4 to 64 independent workers per head instead of 1). Grid (nHeads / G, ceil(nSplit / DEC_SG)), 128 threads: simdgroup
+// sg of threadgroup y takes split y * DEC_SG + sg, the keys [first + split * chunk, ...) with chunk = ceil(keys /
+// nSplit) rounded up to a multiple of 32 (chunk > 0 in the params fixes it). With nSplit == 1 the normalised output row
+// is written to `out` and no combine is needed.
+// Summation order differs from attention_t (scores: 8-lane partial sums, softmax sums per block), so the results
+// agree to rounding, not bit for bit: the host uses this kernel only where MetalTuner's self-check on the device
+// accepts it (-Djllm.metal.decodeAttention=true|false|auto). All arithmetic f32; KV as for attention_t (kv_scale).
+// Buffers: q(0) kc(1) vc(2) part(3) out(4), AttnSplitParams(5).
+
+// W consecutive elements of a K / V row (W = 4; 8 for a half cache, one 16-byte load) as W / 4 float4. The 8 lanes of a
+// key take the chunks tx, tx + 8, ... of W elements; the cache's q8 rows are only 4-byte aligned (the scales follow the
+// values), so they stay at 4 elements.
+template <int W>
+static inline void ldw(device const float *p, thread float4 *o) { o[0] = *(device const float4 *)p; }
+template <int W>
+static inline void ldw(device const half *p, thread float4 *o) {
+    if (W == 8) {
+        const uint4 u = *(device const uint4 *)p;
+        o[0] = float4(as_type<half4>(u.xy));
+        o[1] = float4(as_type<half4>(u.zw));
+    } else {
+        o[0] = float4(*(device const half4 *)p);
+    }
+}
+template <int W>
+static inline void ldw(device const char *p, thread float4 *o) { o[0] = float4(*(device const char4 *)p); }
+
+template <typename KV, int G, int D, int W>
+kernel void attention_dec(device const float *q [[buffer(0)]],
+                          device const KV *kc [[buffer(1)]],
+                          device const KV *vc [[buffer(2)]],
+                          device float *part [[buffer(3)]],
+                          device float *out [[buffer(4)]],
+                          constant AttnSplitParams &p [[buffer(5)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NP = W / 4;                   // float4 per chunk
+    constexpr int NC = D / (8 * W);             // chunks of a key row per lane
+    constexpr int NV = NC * NP;                 // float4 of a key row per lane
+    const int split = int(tgp.y) * DEC_SG + sg;
+    if (split >= p.nSplit) return;              // whole simdgroup: no collective is skipped
+    const ushort tx = lane & 7;
+    const ushort ty = lane >> 3;
+    const int hq0 = int(tgp.x) * G;
+    const int kvh = hq0 / (p.nHeads / p.nKvHeads);
+    const int len = p.pos0 + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    const int chunk = p.chunk > 0 ? p.chunk : (((len - first + p.nSplit - 1) / p.nSplit + 31) & ~31);
+    const int s0 = first + split * chunk;
+    const int s1 = min(len, s0 + chunk);
+    if (s0 >= s1) { // empty split (fewer keys than nSplit * chunk): contributes nothing
+        for (int g = 0; g < G; g++) {
+            device float *pg = part + ((ulong)(hq0 + g) * p.nSplit + split) * (D + 2);
+            for (int d = lane; d < D; d += 32) pg[d] = 0.0f;
+            if (lane == 0) { pg[D] = -INFINITY; pg[D + 1] = 0.0f; }
+        }
+        return;
+    }
+
+    float4 qr[G][NV];
+    for (int g = 0; g < G; g++) {
+        device const float *qv = q + (ulong)(hq0 + g) * D;
+        for (int c = 0; c < NC; c++)
+            for (int e = 0; e < NP; e++) qr[g][c * NP + e] = *(device const float4 *)(qv + W * (tx + 8 * c) + 4 * e);
+    }
+    float m[G];
+    float l[G];
+    float4 o[G][NV];
+    for (int g = 0; g < G; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+        for (int i = 0; i < NV; i++) o[g][i] = float4(0.0f);
+    }
+    device const KV *kb = kc + kvh * D;
+    device const KV *vb = vc + kvh * D;
+
+    for (int base = s0; base < s1; base += 32) {
+        // 1. the 8 partial scores of this lane (key base + 4 j + ty for step j), summed over the 8 lanes of the key
+        float ps[G][8];
+        for (int j = 0; j < 8; j++) {
+            const int key = base + 4 * j + ty;
+            for (int g = 0; g < G; g++) ps[g][j] = 0.0f;
+            if (key < s1) {
+                device const KV *kr = kb + (ulong)key * p.kvStride;
+                for (int c = 0; c < NC; c++) {
+                    float4 kk[NP];
+                    ldw<W>(kr + W * (tx + 8 * c), kk);
+                    for (int e = 0; e < NP; e++)
+                        for (int g = 0; g < G; g++) ps[g][j] += dot(kk[e], qr[g][c * NP + e]);
+                }
+            }
+        }
+        float sc[G];
+        for (int g = 0; g < G; g++) {
+            // reduce-scatter over the lanes tx = 0..7: afterwards lane tx holds the sum for step j = tx
+            float r4[4];
+            for (int j = 0; j < 4; j++) {
+                const float keep = (tx & 4) ? ps[g][j + 4] : ps[g][j];
+                const float send = (tx & 4) ? ps[g][j] : ps[g][j + 4];
+                r4[j] = keep + simd_shuffle_xor(send, 4);
+            }
+            float r2[2];
+            for (int j = 0; j < 2; j++) {
+                const float keep = (tx & 2) ? r4[j + 2] : r4[j];
+                const float send = (tx & 2) ? r4[j] : r4[j + 2];
+                r2[j] = keep + simd_shuffle_xor(send, 2);
+            }
+            const float keep = (tx & 1) ? r2[1] : r2[0];
+            const float send = (tx & 1) ? r2[0] : r2[1];
+            sc[g] = keep + simd_shuffle_xor(send, 1);
+        }
+        const int mykey = base + 4 * tx + ty;
+        float ks = 0.0f;
+        if (mykey < s1) ks = p.scale * kv_scale(kc + (ulong)mykey * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+        // 2. online softmax over the 32 keys of the block
+        float pe[G];
+        for (int g = 0; g < G; g++) {
+            float s = -INFINITY;
+            if (mykey < s1) {
+                s = sc[g] * ks;
+                if (p.softcap > 0.0f) s = softcap_f(s, p.softcap);
+            }
+            const float mn = max(m[g], simd_max(s));
+            const float corr = exp(m[g] - mn);
+            pe[g] = exp(s - mn);
+            l[g] = l[g] * corr + pe[g];
+            for (int i = 0; i < NV; i++) o[g][i] *= corr;
+            m[g] = mn;
+        }
+        // 3. P V: step j's key is base + 4 j + ty, its probability sits in lane (tx = j, ty)
+        for (int j = 0; j < 8; j++) {
+            float pj[G];
+            for (int g = 0; g < G; g++) pj[g] = simd_shuffle(pe[g], ushort(ty * 8 + j));
+            const int key = base + 4 * j + ty;
+            if (key < s1) {
+                device const KV *vr = vb + (ulong)key * p.kvStride;
+                const float vs = kv_scale(vc + (ulong)key * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+                for (int c = 0; c < NC; c++) {
+                    float4 vv[NP];
+                    ldw<W>(vr + W * (tx + 8 * c), vv);
+                    for (int e = 0; e < NP; e++)
+                        for (int g = 0; g < G; g++) o[g][c * NP + e] += (pj[g] * vs) * vv[e];
+                }
+            }
+        }
+    }
+
+    // add the four ty groups' accumulators and sums, then write the partial (or, with one split, the output row)
+    for (int g = 0; g < G; g++) {
+        const float ls = simd_sum(l[g]);
+        const float inv = p.nSplit == 1 ? 1.0f / ls : 1.0f;
+        device float *dst = p.nSplit == 1 ? out + (ulong)(hq0 + g) * D
+                                          : part + ((ulong)(hq0 + g) * p.nSplit + split) * (D + 2);
+        for (int c = 0; c < NC; c++) {
+            for (int e = 0; e < NP; e++) {
+                float4 v = o[g][c * NP + e];
+                v += simd_shuffle_xor(v, ushort(8));
+                v += simd_shuffle_xor(v, ushort(16));
+                if (ty == 0) {   // (D + 2)-float partial rows are not 16-byte aligned: scalar stores
+                    v *= inv;
+                    for (int k = 0; k < 4; k++) dst[W * (tx + 8 * c) + 4 * e + k] = v[k];
+                }
+            }
+        }
+        if (p.nSplit > 1 && lane == 0) {
+            dst[D] = m[g];
+            dst[D + 1] = ls;
+        }
+    }
+}
+
+// float / q8 caches: 4 elements per lane chunk; half: 8 (16-byte loads), and "_h4" with 4 for an A/B run (-Djllm.metal.decWide=false)
+#define DEC_INST(KV, G, D, W, NAME) \
+    template [[host_name(NAME)]] kernel decltype(attention_dec<KV, G, D, W>) attention_dec<KV, G, D, W>;
+#define DEC_INST_KV(G, D) \
+    DEC_INST(float, G, D, 4, "attention_dec_g" #G "_d" #D) \
+    DEC_INST(half, G, D, 8, "attention_dec_g" #G "_d" #D "_h") \
+    DEC_INST(half, G, D, 4, "attention_dec_g" #G "_d" #D "_h4") \
+    DEC_INST(char, G, D, 4, "attention_dec_g" #G "_d" #D "_q8")
+DEC_INST_KV(1, 64) DEC_INST_KV(2, 64) DEC_INST_KV(4, 64)
+DEC_INST_KV(1, 128) DEC_INST_KV(2, 128) DEC_INST_KV(4, 128)
+DEC_INST_KV(1, 256) DEC_INST_KV(2, 256)
 
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
@@ -2945,6 +3427,28 @@ GG_INSTANTIATE("iq4xs", GG_IQ4_XS)
 GG_INSTANTIATE("mxfp4", GG_MXFP4)
 GG_INSTANTIATE("f16w", GG_F16)
 GG_INSTANTIATE("bf16w", GG_BF16)
+
+// multi-row decode kernels (section 2a) of every format, for the row counts the host can choose (MetalKernels.MV_ROWS)
+#define MVR_ALL(NRS, NRV)                                                                                             \
+    MVR_INSTANTIATE(NRS, NRV, "q4", 4)                                                                                \
+    MVR_INSTANTIATE(NRS, NRV, "q8", 8)                                                                                \
+    MVR_INSTANTIATE(NRS, NRV, "q2k", 2)                                                                               \
+    MVR_INSTANTIATE(NRS, NRV, "q6k", 6)                                                                               \
+    MVR_INSTANTIATE(NRS, NRV, "q4g", GG_Q4_0)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q8g", GG_Q8_0)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q4k", GG_Q4_K)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q5k", GG_Q5_K)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q41", GG_Q4_1)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q50", GG_Q5_0)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q51", GG_Q5_1)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q3k", GG_Q3_K)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "iq4nl", GG_IQ4_NL)                                                                     \
+    MVR_INSTANTIATE(NRS, NRV, "iq4xs", GG_IQ4_XS)                                                                     \
+    MVR_INSTANTIATE(NRS, NRV, "mxfp4", GG_MXFP4)                                                                      \
+    MVR_INSTANTIATE(NRS, NRV, "f16w", GG_F16)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "bf16w", GG_BF16)
+MVR_ALL("2", 2)
+MVR_ALL("4", 4)
 
 // ---------------------------------------------------------------------------------------------- 9. flash-attention prefill
 // attention_fa<KV, D>: causal (optionally windowed, soft-capped) attention for a prefill chunk without a scores

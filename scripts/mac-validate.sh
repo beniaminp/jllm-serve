@@ -119,6 +119,19 @@ bench "GGUF $LLAMA_QUANT: half-weight MMA prefill off, --batch 256" "$LLAMA_DENS
   --gguf-quant "$LLAMA_QUANT" --batch 256
 bench "flash prefill form fa" "$DENSE" "-Djllm.metal.flashPrefillKernel=fa"
 bench "flash prefill form fb" "$DENSE" "-Djllm.metal.flashPrefillKernel=fb"
+# prefill chunk (backend.batch=auto is 256 for dense decoders on Metal; 64 was the default before)
+bench "64-token prefill chunks (the old default)" "$DENSE" "" --batch 64
+bench "512-token prefill chunks" "$DENSE" "" --batch 512
+# multi-row decode matvec (NR rows per simdgroup; mvRows=1 brings the one-row kernels back) and the decode attention
+bench "decode matvec: one row per simdgroup (mvRows=1)" "$DENSE" "-Djllm.metal.mvRows=1"
+bench "decode matvec: 2 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=2"
+bench "decode matvec: 4 rows per simdgroup" "$DENSE" "-Djllm.metal.mvRows=4"
+bench "decode attention off (attention_t)" "$DENSE" "-Djllm.metal.decodeAttention=false"
+bench "decode attention on (attention_dec)" "$DENSE" "-Djllm.metal.decodeAttention=true"
+bench "~1000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 100
+bench "~1000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 100
+bench "~3000-token prompt: decode attention off" "$DENSE" "-Djllm.metal.decodeAttention=false" --bench.prompt-repeat 300
+bench "~3000-token prompt: decode attention on" "$DENSE" "-Djllm.metal.decodeAttention=true" --bench.prompt-repeat 300
 bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma off, fa" "$DENSE" "-Djllm.metal.hmma=false -Djllm.metal.flashPrefillKernel=fa" --bench.prompt-repeat 200
 bench "~2000-token prompt: hmma on, fb" "$DENSE" "-Djllm.metal.hmma=true -Djllm.metal.flashPrefillKernel=fb" --bench.prompt-repeat 200
@@ -191,6 +204,7 @@ echo "|---|---|---|---|---|"
     | awk -F'|' '{printf "|%s %s|%s|%s|%s|%s|\n", $2, $3, $4, $5, $6, $7}' \
   || { echo "| failed | | | | $(tail -1 "$OUT/tc.log") |"; }
 masks() { # label java-opts
+  local label="$1"
   # shellcheck disable=SC2086
   "$JAVA" --add-modules jdk.incubator.vector $2 -cp target/classes:target/test-classes org.robomiri.jllm.ConstraintBench \
     "models/$(echo "$DENSE" | tr / _)" 10 > "$OUT/cb.log" 2>&1 || { echo "| $label | failed | | $(tail -1 "$OUT/cb.log") |"; return; }
