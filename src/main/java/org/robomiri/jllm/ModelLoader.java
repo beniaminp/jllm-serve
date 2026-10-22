@@ -592,7 +592,7 @@ public final class ModelLoader {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
                     + ": a recurrent state is a function of every earlier token and cannot be shared per block, so the flat cache is used");
         }
-        if (member && s.getBool("backend.kv-paged") && arch instanceof org.robomiri.jllm.model.HybridArch) {
+        if (member && s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && arch instanceof org.robomiri.jllm.model.HybridArch) {
             System.err.println("note: backend.kv-paged does not apply to the attention / state-space hybrids (Granite 4, Nemotron-H, Jamba): "
                     + "a recurrent state cannot be shared per block, so the flat cache is used");
         }
