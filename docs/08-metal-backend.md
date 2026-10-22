@@ -165,10 +165,11 @@ The exported functions (the rest: `jm_thermal_state` [8.19](#819-thermal-state),
 | `jm_buffer_wrap(ctx, ptr, len)` | `newBufferWithBytesNoCopy:` — wraps memory **owned by Java** (the mmap'd cache file) without copying. If Metal refuses (`ptr` or `len` not page aligned) it prints the reason to stderr and returns NULL, and `Metal.wrap` throws: there is deliberately no copying fallback, which would silently double the memory of a multi-gigabyte model | every quantized weight tensor |
 | `jm_buffer_contents(buf)` | the CPU pointer to a buffer's bytes | Java reads logits / writes embeddings |
 | `jm_buffer_release(buf)` | drop the reference | `Metal.close` |
-| `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels | start of `forward` |
+| `jm_begin(ctx)` | `commandBufferWithUnretainedReferences` + a compute encoder with `MTLDispatchTypeSerial` — dispatches execute **in order**, each seeing the previous one's writes, so Java needs no explicit barriers between kernels (with `jm_set_concurrent` a concurrent encoder instead, [8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) | start of `forward` |
 | `jm_dispatch(ctx, pipe, bufs[], offsets[], nbuf, params, plen, tgmem, gx,gy,gz, tx,ty,tz)` | `setComputePipelineState`, `setBuffer:offset:atIndex:` for `i < nbuf`, `setBytes:` for the params at index `nbuf`, `setThreadgroupMemoryLength:` for the kernel's dynamic `[[threadgroup(0)]]` argument when `tgmem > 0`, then `dispatchThreadgroups:threadsPerThreadgroup:` | once per kernel launch |
 | `jm_run(ctx, cmds, n)` | encodes `n` recorded dispatches (384-byte `JMCmd` records: pipeline, buffers, offsets, params, grid) exactly as `n` `jm_dispatch` calls would, skipping a pipeline / buffer / offset the previous command already set — a whole decode step in one call ([8.22](#822-decode-replay-one-native-call-per-token)) | every decode step |
 | `jm_commit(ctx)` | `endEncoding`, `commit` **without waiting**, then opens a fresh command buffer and encoder: the GPU starts on the layers recorded so far while Java encodes the next ones. The queue runs command buffers in submission order, so the serial guarantee of `jm_begin` carries across the split | every 8 layers (`-Djllm.metal.commitLayers`) |
+| `jm_set_concurrent(ctx, mode)`, `jm_set_group(ctx, id)`, `jm_barriers(ctx)` | the concurrent encoder: its mode (0 serial, 1 hazard-tracked barriers, 2 a barrier before every dispatch, 3 none, +4 barriers naming their buffers), the independent group the next dispatches belong to, and how many barriers were inserted ([8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) | `MetalKernels` |
 | `jm_abort(ctx)` | ends and drops the command buffer being recorded without running it (Metal aborts the process if an encoder is released un-ended), after waiting for the parts `jm_commit` already submitted | `forward` when recording throws |
 | `jm_commit_wait(ctx, err, len)` | `endEncoding`, `commit`, `waitUntilCompleted`; returns −1 with the error text if any command buffer of the pass has status `MTLCommandBufferStatusError` (a GPU fault) | end of `forward` |
 
@@ -890,7 +891,7 @@ simdgroup per output row: 64, 128 or 256 threads, i.e. 2, 4 or 8 rows per thread
 model's own output projection, checks that the results are bit-identical, and keeps the fastest. Small matrices fill
 the GPU better with smaller threadgroups, and which size pays differs between chips. The log line `Metal kernels: flash prefill on|off, flash decode on|off (…)` says what was chosen and why.
 
-The decode attention `attention_dec` ([8.28](#828-decode-attention-attention_dec)) is chosen the same way, per cache type: it must agree with `attention_t` and be ≥ 3 % faster over 2 048 keys and not slower over 400.
+The decode attention `attention_dec` ([8.31](#831-decode-attention-attention_dec)) is chosen the same way, per cache type: it must agree with `attention_t` and be ≥ 3 % faster over 2 048 keys and not slower over 400.
 
 Two more choices are made the same way ([8.21](#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)):
 which flash prefill form runs (`attention_fa` or `attention_fb`: each is checked against `attention_t`, and of those
@@ -947,7 +948,7 @@ backend call drains it first. `-Djllm.metal.pipeline=false` turns it off.
 
 `MetalBackend.saveState` / `loadState` / `copyStateFrom` implement the backend-neutral cache file and the slot copy
 of [17 §17.2–17.3](17-agent-speedups.md#172-slots-that-share-a-prefix). The format string
-`kv f16 layers=L kvDim=K headDim=D` (or `f32`, `q8`) is the same the CPU backend writes; rows are written as per
+`kv f16 layers=L kvDim=K headDim=D` (or `f32`, `q8`, or `q4 recent=R …` with the recent window's rows after the cache rows, [8.27](#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4)) is the same the CPU backend writes; rows are written as per
 layer, per position, K then V, little-endian (q8: the row's `kvDim` int8 values, then its `kvHeads` f32 scales — the
 cache's own row layout, so saving is a copy here too). The cache buffers live in unified memory, so loading reads from the file
 straight into them, and a slot copy is a `memcpy` of `n` rows per layer between two engines' buffers.
@@ -1207,7 +1208,38 @@ is at least 3 % faster; the decision is cached like the others ([8.14](#814-the-
 the emulator, where nothing can be timed, the check still runs and logs its agreement but the more accurate f32 form
 is kept (the half-weight form only exists to be faster); `-Djllm.metal.hmma=true` runs it there.
 `-Djllm.metal.hmma=true|false` forces one form everywhere; shapes the check did not see (an LM head in a multi-token
-verification pass) keep the f32 kernels.
+verification pass) keep the f32 kernels. Only the formats whose half-weight kernels are exact (below) are candidates;
+`-Djllm.metal.hmmaKQuants=true` adds the lossy K-quant kernels (Q2_K, Q6_K, Q4_K, Q5_K), which are then timed and
+forced like the others.
+
+**Exact scales (the fix of the half-weight rounding).** The first version stored `fl16(q · s)` for every format. The
+rounding (`u / √3 ≈ 2.8e-4` of a dot product) is small against the quantization step but it is *systematic*: every
+prefill matmul of a model carries it and the decode kernels (f32) do not. On the real GPU, with `-Djllm.metal.hmma=true`
+and MMA from 2 tokens on, the tiny test models then differed from the CPU by 1.5e-3 to 4.5e-3 of the logits (max |logit|
+16–22; f32 MMA: 6e-6), batched decoding was no longer bit-identical to decoding alone (8.6e-3), the q8 KV cache
+comparisons moved by whole int8 steps (8e-2), and Qwen3-Next's chunking invariance bound (1e-4) failed at 4.8e-4. None of
+it is a bug of the kernels: `kernel_tests.py` matches numpy with weights rounded to half to 1e-6. (The `REBALANCE FAILED`
+and `moved 0 layers` of the first report did not reproduce on the GPU: with hmma forced and MMA from 2 tokens on, all
+families re-place 2–3 layers with CPU-vs-split differences equal to the logit differences above; the expert counting is
+the router's and does not depend on the matmul form.)
+
+For Q4_0 and Q8_0 (the engine's own, and the GGUF `Q4_0` / `Q8_0`) the rounding is avoidable: `q` (−8..7, −127..127) is
+exact in half, and the scale is one f32 per 32-weight block, i.e. per k step. So `hm_core` keeps **q** in the half tile
+and, per k step and per (token block, row block) accumulator pair, computes
+
+```
+tmp = Σ_kk  A_kk · Q_kk           (4 multiply-accumulates, f32 accumulation, starting from 0)
+acc += tmp · D                    (D = diag(s of the 8 rows of the block), an f32 8 × 8 matrix)
+```
+
+`D` lives in threadgroup memory (8 matrices of 64 floats; only the diagonal is rewritten per step, the rest stays 0, so
+`tmp · D` is exactly `tmp[t][r] · s[r]`). The scale is thus applied in f32 after the integer products, as the CPU and the
+scalar kernels do: measured 1e-7 relative to the exact weights in `kernel_tests.py` (was 1.5e-4 to 4.5e-4), 6e-6 of the
+logits on the GPU, bit-identical batched decoding, Qwen3-Next 150 tokens 9e-7. Costs: 25 % more multiply-accumulates
+(40 instead of 32 per k step and simdgroup) and 2 KB more threadgroup memory (10 KB). K-quants have scales per 16
+weights and minimums (`w = dl · q − ml`), which would need a second MMA per accumulator for the offset
+(`Σ x` of the group times `ml`) and 5 KB more threadgroup memory; they keep the half-rounded tile, are therefore not
+exact, and run only with `-Djllm.metal.hmmaKQuants=true` (error 1.5e-4 to 3e-4 as above).
 
 **The second flash prefill form, `attention_fb`.** The online softmax of [8.13](#813-flash-attention-prefill-attention_fa)
 is unchanged; the staging of keys and values is not:
@@ -1229,15 +1261,36 @@ scratch. The tuner checks both forms against `attention_t` and keeps the faster 
 layouts, with partial row tiles (96 rows), partial token tiles (37 and 7 tokens), full tiles taking the direct store
 with and without `accumulate`, bias, soft-cap, GeGLU, the f16 V output, and MoE tiles of 1, 3, 5, 16 and 32 slots
 scattered over the chunk; the old `*_mma` kernels are checked against the same decoders. `attention_fb` runs the
-`attention_fa` cases plus half and q8 caches at D = 64, 128 and 256. End to end (Qwen3-MoE tiny model, all five
-formats, MMA forced down to 2-token chunks on the emulator) the half-weight kernels keep the greedy tokens equal to
-the CPU's with final-logit differences of ~4e-3 at max |logit| ≈ 22 (f32 MMA: ~1e-5), inside the smoke test's
-`1e-3 · max + 1e-4` bound; only the q8-cache comparisons, which re-quantize K and V to int8 and so turn a 2e-4
-shift into whole rounding steps, exceed theirs. `arch-smoke.sh` therefore runs the f32 form
-(`-Djllm.metal.hmma=false`, overridable). **Speed is not measured here**: the emulator
-runs one GPU thread per CPU fiber, so its timings say nothing about a GPU. `scripts/mac-validate.sh` has the rows
-that measure it on a Mac (half-weight MMA forced on / off, `fa` / `fb`, a ~2 000-token prompt); the expected gains
-and their arithmetic are in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design).
+`attention_fa` cases plus half and q8 caches at D = 64, 128 and 256. End to end, `arch-smoke.sh` runs everything with the tuner's choice (hmma auto) and a last pass with the half-weight
+kernels forced on and MMA from 2-token chunks on (`-Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2
+-Djllm.metal.moeMmaMin=2`) for Q4_0 / Q8_0 on Llama, Qwen2, Gemma3, Phi3, Qwen3-MoE (also with experts on the CPU and
+re-placed while running), DeepSeek-V3 (MLA) and Qwen3-Next: same bounds as the f32 form (CPU-vs-Metal 4e-6 to 4e-5 of the
+logits, batched decoding bit-identical, q8 cache 7e-6 to 5e-5).
+
+**Measured on an Apple M1 Pro (10 cores, 32 GB), `./jllm bench --temp 0 --engine.speculative off
+--bench.max-tokens 16`, 413-token prompt, median of 3, under the heavy lock; `JAVA_OPTS` shown.** The half-weight
+form did not pay on this GPU, in either version:
+
+| prefill tok/s | `--batch 64` hmma=false (f32 MMA) | hmma=true, first version (half-rounded) | hmma=true, exact scales | `--batch 256` hmma=false | hmma=true first version | hmma=true exact |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B q4 | 1 436 | 1 419 | 873 | 2 092 | 1 995 | 1 101–1 110 |
+| Qwen3-0.6B q8 | 1 479 | 1 459 | 885 | 2 105 | 2 041 | 1 110 |
+| GGUF Q4_0 | 1 361 | 1 368 | 853 | 1 950 | 1 954 | 1 106 |
+| GGUF Q4_K_M (K-quants, `hmmaKQuants=true`) | 949 | 958 | – | 1 815 | 1 860 | – |
+
+The 64-token chunk underfills the GPU (2 092 vs 1 436 tok/s with `--batch 256` for the same f32 kernels), but the ranking
+is the same. The half tile (4 KB, up to four resident threadgroups instead of two) buys nothing here (not investigated further:
+the f32 kernels do not seem limited by threadgroup occupancy on this chip); the first version is within
+±5 % of the f32 kernels (the K-quant row +1 %, within the noise), the exact one is 40 % slower (the extra f32
+`tmp · D` multiply-accumulates and the longer dependency chain cost more than their 25 % of the arithmetic would suggest;
+not profiled). The start-up
+check measures it per shape (MATMUL3 Q4_0 4096 × 1024: 1.009 ms exact against 0.542 ms f32; MATMUL Q4_0 1024 × 2048:
+0.508 against 0.309) and keeps the f32 form for all 4 distinct shapes of Qwen3-0.6B ("half-weight MMA for 0 of 4
+shapes"), so the default is unchanged on this chip: the exact kernels are the safe candidate for GPUs where half MMA is
+faster (the M3/M4 generations were not available), and the reason the whole smoke can run with them on. `scripts/mac-validate.sh`
+has the rows (hmma forced on / off at the default chunk, at `--batch 256`, for the GGUF Q4_0, `fa` / `fb`, the 2 000-token
+prompt). The ~1.1–1.45× expected in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design) did not
+materialize on the M1 Pro.
 ---
 
 ## 8.22 Decode replay: one native call per token
@@ -1514,7 +1567,231 @@ CPU), so the costs on a real Mac come from `scripts/mac-validate.sh` (§8.20).
 
 ---
 
-## 8.26 The prefill chunk (`backend.batch=auto`)
+## 8.26 GGUF block types on the GPU (`gg_unit`, `gg_new`)
+
+The ggml formats of a GGUF file ([16](16-gguf.md)) are read in place by the same kernels as the engine's own formats
+(kernel suffix `q4g q8g q4k q5k` and, since the types of [06 §6.12](06-quantization.md#612-the-other-ggml-block-formats-read-in-place-from-gguf-files),
+`q41 q50 q51 q3k iq4nl iq4xs mxfp4 f16w bf16w`; `QT` 20 … 32 in `kernels.metal`). One lane unit is 32 consecutive
+weights; the whole format is the function that turns a unit into 8 `float4`:
+
+```
+gg_unit<QT>(wq, grow, nb, u, w)      32 weights of unit u (nb units per row) of row grow -> w[0..8), natural order
+gg_half<QT>(wq, grow, nb, u, h, w)   weights 16 h .. 16 h + 15 (the *_hmma kernels: two threads share a unit)
+gg_new<QT, NV>(..., v0, w)           the decoder behind both for the nine newer types: NV float4 starting at float4 v0
+```
+
+Everything else is shared: `mm_row_gguf` (decode: lane `l` walks units `l, l + 32, ...`), `mm_tile_gguf` (tiled prefill),
+`GG_BLOCK_DOT` (the MoE kernels), `dequant_block` (the embedding lookup), `mma_core` / `hm_core` (matrix-unit prefill),
+so a format costs one branch of `gg_new` plus a row in `GG_INSTANTIATE`, `HM_INSTANTIATE` and `embed_token`. Block
+sizes of 22, 110, 18 and 17 bytes are not multiples of 4: those formats read their quants as `ushort`s (2-byte aligned) or
+byte by byte (MXFP4), as Q4_0 / Q8_0 already did; the 4-bit lookup tables (IQ4_NL, MXFP4: 16 values each) are
+program-scope `constexpr constant` arrays indexed per nibble (`gg_tab_iq4nl`, `gg_tab_mxfp4`; a first version packed the
+int8 values four to a `uint4` and extracted them with shifts, 15-20% slower on the decode matvec). The 256-weight
+formats (Q3_K, IQ4_XS) address unit `u` as sub-block `u & 7` of super-block `u >> 3`, like Q4_K.
+
+**What is compared and how.** `scripts/metal-emu/ggml_ref.py` holds numpy decoders of the new formats written from
+`ggml-quants.c` (and checked against it bit for bit by compiling that file and calling `dequantize_row_*` through
+`ctypes`); `kernel_tests.py` runs, for each of them, the decode `matmul`, the tiled `matmul_pf`, `matmul_swiglu`,
+`embed_token`, and the matrix-unit and half-weight families (`mma`, `hmma`: matmul, matmul3, swiglu, MoE up and down)
+on the emulator against a float64 reference (`python3 scripts/metal-emu/kernel_tests.py q41 q3k ...` runs chosen formats
+only); `GgufMetalCheck` does the same on the GPU through `MetalKernels` on weights at an odd offset of a mapped file.
+Compile cost: the Metal source grows by 9 x 27 = 243 kernel instantiations (from 310 to 553); `newLibraryWithSource` goes from 1.5 s to 2.8 s the
+first time a changed source is compiled (it is cached by the system afterwards, 0.1 s).
+
+The half-weight kernels of these formats round each dequantized weight to half. A weight of the non-linear formats is
+`d (ls - 32) kvalues[nibble]`, which has more than the 11 significant bits of a half, so on a random model with
+`|logit|` about 13 the CPU and the GPU would differ by ~1e-3 (1e-6 with the f32 `*_mma` kernels). Like the K-quants'
+they therefore run only with `-Djllm.metal.hmmaKQuants=true`, and the start-up tuner never picks them; only Q4_0 / Q8_0
+have exact half-weight kernels (8.21).
+
+**Short chunks.** `MetalKernels.tiledIsSlow` sends Q4_K, Q5_K, Q5_0 and Q3_K prefill chunks of 8 – 31 tokens to the matrix-unit kernels instead of
+the tiled `*_pf` ones, which decode a whole 32-weight unit per lane and row and are 3 – 4x slower for these bit-field formats
+(Q4_K_M prefill of a 413-token prompt: 750 → 1414 tok/s, same text; numbers in [16 §16.9.1](16-gguf.md)).
+
+## 8.27 The q4 KV cache on the GPU (`backend.kv-dtype=q4`)
+
+### 🧸 In plain words
+
+The GPU keeps the same thumbnail shelf as the CPU ([07 §7.13](07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)):
+every new word's key and value are shrunk to 4 bits, the key first being "shaken" so no number sticks out, and the
+latest 128 words (the *window*) are also kept sharp. One small helper kernel does the shaking and shrinking when a word
+arrives; the attention kernels then read the thumbnails (and the sharp copies for the newest words) when a word asks
+its question. Everything that already speeds up a normal step — recording a step once and replaying it, putting several
+conversations in one pass, saving a conversation to disk — works with it too.
+
+### 📐 Design
+
+| step | q4 |
+|---|---|
+| 2 `matmul3` | the plain `float` variant: k into `kStage`, v into `vStage` (as q8) |
+| 3 `rope` | QK-norm + RoPE of q (in place) and of k, back into `kStage` (the q8 fusion `rope_store_q8` is not used: the rotation needs a whole head) |
+| 3b `kv_store_q4` | grid `(2·kvHeads + heads, n)`, one simdgroup per row: k head → Walsh–Hadamard in registers and shuffles (`q4_rotate`: strides < 32 by `simd_shuffle_xor`, the rest between registers; the same operations on the same operands as `KvQ4.rotate`, so the bytes are the CPU's), then `q4_code` (`simd_max`, the half scale, the 16 codes, two codes per byte through `simd_shuffle_down`); v head → quantized, not rotated; query head → rotated in place. With a ring the rotated k row and the v row also go to the ring slot `pos % ringCap` as halves and the slot's tag (the position) is written |
+| 4 attention | `attention_g1_d{64,128,256}_q4` / `attention_q4` (one threadgroup per (head, token), the phases of `attention_t`), flash decoding `attention_split_q4` + `attention_combine`, flash prefill `attention_fa_d{64,128,256}_q4` |
+
+The score scale handed to the attention kernels is `scale / B` (`KvQ4.scaleDivisor`), because the queries were
+rotated by `kv_store_q4`. Where a key is read from depends on the **ring tags**: `q4_held_from` scans the tags of the
+window with one simdgroup (32 positions per step) and returns the first position from which the ring holds every
+position up to the query's, so a query at `P` reads `[exactFrom(P), P]` from the ring (`kr`, `vr`, halves) and older keys
+from the 4-bit rows (`q4_value`: nibble, `− 7.5`, times the half scale). This is the CPU cache's rule, so both
+backends read the same values for every (query, key) pair. `attention_fa_q4` stages 4 096 / D keys per block
+dequantized from the 4-bit rows in threadgroup memory, computes `Q Kᵀ` on the 8×8 simdgroup matrices, and, for the
+blocks that contain keys some row of the tile reads exactly, corrects the scores and the product with the ring
+rows (`S += q · (k_ring − k_q4)` for the band, `O += P_band (V_ring − V_q4)`), so most blocks cost the same as the
+plain kernel and only the blocks of the window pay.
+
+**Decode replay.** `kv_store_q4`, `attention_q4`, and `attention_split_q4` take the step position as a patched variable
+(`DecodeProgram.VAR_POS`, like `attention_t`), and the cache bindings follow the position's row (the q4 caches are
+registered with `rowIndexed`). Flash decoding derives its keys per split inside the kernel (chunk 0 in `AttnSplitQ4Params`,
+as `attention_split`), so a recording stays valid while the number of splits does. The ring adds nothing to patch: the
+kernels read the tags at run time. `ArchSmoke.replayCheck` runs q4 with no window and with a 6-position window and
+requires the logits of 40 decode steps to be bit-identical to the unrecorded steps, and pipelined greedy decoding
+to give the same tokens.
+
+**Batched decoding.** `kvStoreQ4Row`, `attentionQ4Row` and `flashAttentionQ4Row` are the per-row forms
+(`MetalBackend.GqaStep.runRows`): the same kernels dispatched for one token with the row's q, k and v offsets and the
+*owner's* cache and ring, so a row computes exactly what its owner's own decode step would
+(`ArchSmoke.batchCheck`: q4 among the cache types, tokens equal to the slot's own and logits equal to rounding).
+
+**Saved caches.** The rows are the cache's own layout ([07 §7.13](07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)),
+so saving is a copy; `stateFormat()` is `kv q4 recent=R layers=… kvDim=… headDim=…` (the CPU backend's string), and the
+window's halves are written after the rows by `saveRecent` / read by `loadRecent` (the first `n` of `stored` positions
+keep the part of the window below `n`). `copyStateFrom` copies the rows and the ring slots the source still holds.
+`ArchSmoke.kvStateChecks` runs all of it for q4 as for the other types, including a CPU file in a Metal backend.
+
+**Tuner.** `MetalTuner` checks `attention_fa_d*_q4` and `attention_split_q4` against `attention_q4` on synthetic data
+of the model's shapes with a ring (window and chunk as configured, keys in both representations), under its own cache
+key (`|q4r<R>`); the second flash prefill form (`attention_fb`) has no q4 variant and is not tried for it.
+
+**Kernel tests** (`scripts/metal-emu/kernel_tests.py`): `kv_store_q4` bit for bit against a numpy rotation and
+quantization (head widths 64, 96, 128, 256; with and without rotation), the ring rows and tags, and the rotated
+queries; `attention_q4`, `attention_split_q4` and `attention_fa_q4` against a float64 reference with windows,
+lost ring slots and soft-capping.
+
+**Speed** (M1 Pro, Qwen3-0.6B, speculation off): see [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured).
+The window's corrections make prefill with q4 about 16 % slower than f16 at 2 000 tokens (window 128) and decode up to
+9 % slower (at 413 tokens; equal at 2 000, within noise); the cache is 3.6× smaller. Qwen3-Next's Metal backend and DeepSeek's latent cache have no q4 path and serve a
+q4 request as f16 / q8.
+
+## 8.28 The concurrent compute encoder: barriers only where a kernel needs the one before
+
+🧸 A row of children builds a tall tower, one floor each. The old rule was: "nobody starts a floor until the child
+before has finished it **and cleared the whole table**." It is safe, but while a child is putting down the last brick
+of a floor, the next child stands there with empty hands, and the table is empty again before the next floor starts.
+The new rule: everybody may start whenever there is a brick free, and a helper walks beside the row with a pile of red
+flags. When a child is about to use a brick that the child before is still making, the helper puts down a flag
+("wait here until everything before the flag is finished"). Where two children build different things, they work at
+the same time and there is no flag. The tower is exactly the same tower. We measured how much time the flags save:
+on a tower where every floor needs the floor below, none (a flag costs as much as the old rule), and on a tower built by
+three children at once, a little.
+
+📐 **The two encoders.** A Metal compute encoder takes a *dispatch type*. `MTLDispatchTypeSerial` (what every pass used
+until now) makes the GPU finish dispatch *i* completely before it starts dispatch *i + 1*: the Java side never needs a
+barrier, and the price is that between two dispatches the GPU drains (the last threadgroups run alone on a few cores)
+and refills (the next kernel's first wave reads its weights from cold). `MTLDispatchTypeConcurrent` lets dispatches
+overlap, and orders them only where the encoder is told to: `memoryBarrierWithScope:MTLBarrierScopeBuffers` (everything
+dispatched before the barrier is complete and visible to everything dispatched after it).
+
+**What an upper bound looks like.** With the concurrent encoder and *no* barriers (`-Djllm.metal.concurrent=unsafe`,
+wrong results, timing only) an M1 Pro decodes Qwen3-0.6B (GGUF Q4_0) at 138.6 tok/s against 103.8 serial, and prefills
+at 1 648 against 1 340 tok/s: ~2.4 ms of a 9.6 ms decode step is the ~14 µs boundary between each of the 170 dependent
+dispatches. That is the whole prize of removing serialization, and it can only be won where dispatches are really
+independent.
+
+**Hazard tracking in the native layer** (`track_hazards` in `jllm_metal.m`; no kernel is changed and the Java writers
+declare nothing per binding). The shim asks Metal for each pipeline's *reflection* when it builds it
+(`MTLPipelineOptionBindingInfo`) and keeps, per buffer index, whether the kernel only reads it (`device const T *`, access
+`ReadOnly`), may write it (`device T *`) or never touches it (`used == false`: the dummy buffers bound to unused slots
+never count). Per encoder it keeps two small sets of buffer handles: those written since the last barrier (`W`) and those
+only read (`R`). Before a dispatch is encoded:
+
+```
+hazard = any binding b that the kernel reads or writes with  b in W            (read after write, write after write)
+      or any binding b that the kernel may write with        b in R            (write after read)
+if hazard:  memoryBarrier(buffers);  W = R = {}
+W += buffers the kernel may write;   R += buffers it only reads
+```
+
+The granularity is the whole buffer (the extent a kernel touches inside a binding is not known), so two dispatches that
+write different rows of one buffer count as dependent. A full set forces a barrier. A new encoder (`jm_begin`,
+`jm_commit`) starts empty: command buffers of a queue run in order, and Metal's own tracking orders their resources.
+`-Djllm.metal.concurrent=resources` names the buffers in the barrier (`memoryBarrierWithResources:`) instead of covering
+all of them; it measured the same. `JLLM_METAL_TRACE=1` prints every dispatch with a mark where a barrier precedes it,
+`JLLM_METAL_STATS=1` the totals at exit, `JLLM_METAL_DUMP_ACCESS=1` the access table of every pipeline.
+
+**Independent groups.** Whole-buffer tracking cannot see that `rope(q row 0)` and `rope(q row 1)` write apart. The
+Java writers can say so: `MetalKernels.beginIndependent()` / `endIndependent()` bracket dispatches that the caller
+guarantees read nothing another one writes and write disjoint memory. They are compared with what came *before* the
+group, never with each other, and become visible to what follows when the group ends. The group id travels in the first
+padding word of the 384-byte `JMCmd` (`DecodeProgram.OFF_GROUP`), so a recorded decode step replays with its groups
+([8.22](#822-decode-replay-one-native-call-per-token); ids are numbered from 1 in every recording, so the replay check
+still compares equal programs). Where groups are used (the order of issue changes there; results do not):
+
+| where | group | why they are independent |
+|---|---|---|
+| batched decoding, `GqaStep.runRows` ([8.24](#824-batched-decoding-across-slots-metalbackendforwardbatch)) | stage 1: `rope` of every row and the v store (`kv_put`); stage 2 (q8 caches): `kv_store_q8` of every row; stage 3: `attention` of every row | rows have their own q / k / v / att rows and their owner's cache; attention gets its own slice of the `scores` scratch per row (`MetalKernels.rowScores`; the scratch holds a tile of 32) |
+| MLA ([8.12](#812-deepseek-mla-and-mamba-on-the-gpu)), single and batched | q (or q_a), kv_a and k_pe projections; the two norms; q_b with the k_pe rotation; the q rotation with the latent store | they read one input and write apart |
+| Qwen3-Next gated attention | the q/k/v and the gate projection; the q-norm and the k-norm | same input, separate outputs |
+| Qwen3-Next MoE, per-slot kernels | router with the shared expert's gate/up; `moe_up` with the shared expert's down projection | the shared expert reads `xb` and writes `sharedOut`; the routed experts still add into `x` before it does |
+
+The dense decode step of Qwen3 has none of this: q/k/v are one `matmul3` ([8.23](#823-decode-fusions)), q/k-norm and RoPE
+one `rope`, gate and up one `matmul_swiglu`; every one of its 170 dispatches reads what the one before wrote. The tracker
+inserts a barrier before 69 762 of 70 254 dispatches of a bench run.
+
+**Where the encoder is selected.** `-Djllm.metal.concurrent=false` (default) | `true` | `batch` (concurrent only inside
+`forwardBatch`, which switches the encoder for that pass and back; recorded decode steps stay valid) | `auto` (= `false`
+until it measures faster) | `barriers` (a barrier before every dispatch, to measure what a barrier costs) | `resources` |
+`unsafe`. Natively `jm_set_concurrent(ctx, mode)` before a command buffer opens, `jm_set_group(ctx, id)` for the
+dispatches that follow (`jm_run` reads the id from the command) and `jm_barriers(ctx)`; `MetalBackend.concurrent(boolean)`
+(and the Mamba and Qwen3-Next backends) switch one backend. The emulator (`scripts/metal-emu/runtime.cpp`) accepts the
+calls and ignores them: it runs each dispatch to completion, a valid order of any schedule that has the barriers.
+
+**Everything that uses the bridge** works with it, because the tracker lives where all of them meet: decode replay
+(`jm_run` tracks every command, groups included), pipelined decoding (the token ring is a buffer like the others;
+steps are separate command buffers), the CPU/GPU expert split (the handoffs are `jm_commit` / `jm_commit_wait`, which end
+the encoder, so a new one starts clean), batched decoding across slots, draft-model speculation (`forwardAll` and the
+pipelined draft are the same kernels), MLA, Qwen3-Next, Mamba (a chain, nothing to overlap).
+
+**Checked bit for bit.** Concurrency does not change what any kernel computes, only the order of independent work, so
+any difference from the serial encoder is a missing barrier or a wrong group. `ArchSmoke.concurrentCheck` runs, for every
+family and quantization, a 40-token prefill chunk (the simdgroup-matrix kernels), 10 decode steps (replay), a 7-token
+chunk, and a 4-token `forwardAll` on a serial and on a concurrent backend and requires the logits of every pass to be
+equal bit for bit, three times (races are intermittent); for Q4_0 also with the f16 and q8 caches, pipelined greedy decoding,
+batched decoding of three slots (f32 / f16 / q8: the groups), and the experts of one layer, of all layers, and every other
+expert on the CPU. As a control the same check with `-Djllm.metal.concurrent=unsafe` (no barriers) fails on the first
+pass of every family, so the check does see races on these tiny models. `scripts/arch-smoke.sh` ends `arch smoke passed`
+with the flag off and with `JAVA_OPTS=-Djllm.metal.concurrent=true`, and the haiku gate (`scripts` md5gate, CPU and Metal) prints `79472f69...` with `concurrent` false, true and batch.
+
+**Measured** (M1 Pro, `./jllm bench --temp 0 --engine.speculative off`, 4 rounds, alternating on and off; tok/s):
+
+| model / pass | serial (default) | `concurrent=true` | `concurrent=unsafe` (wrong results) |
+|---|---|---|---|
+| Qwen3-0.6B safetensors Q4, decode | 114 / 109 | 113.5 / 108 | |
+| same, pipelined decoding off | 112 / 111 | 109 / 111 | |
+| same, prefill (413 tokens) | 1 440 | 1 438 | |
+| Qwen3-0.6B GGUF Q4_0, decode | 103.5 / 100 | 103 / 102 | 138.6 |
+| same, prefill | 1 330 | 1 340 | 1 648 |
+| Qwen3-30B-A3B Q4 (MoE), decode | 25.1 | 25.1 | |
+| same, prefill | 277 | 277 | |
+| 3 slots in shared passes (`BatchDecodeTest bench`, 0.6B) | 177 (176-181) | 181-198 | |
+
+(Decode and prefill: median of 4 rounds, two passes alternating the settings, shown as pass 1 / pass 2 where they differ;
+the 30B rows are 3 rounds, two passes. `concurrent=batch` for the last row: 162-199 over four runs, the same as `true` within
+the noise of a machine other people also use. The load average was 5-70 from processes outside the lock, so differences
+below ~5 % mean nothing.)
+
+**Decision.** The concurrent encoder is **correct and bit-identical, and off by default** (`auto` = `false`). Every dispatch of a
+single-stream decode step or prefill chunk depends on the one before, so the tracker puts a barrier in front of 99 % of them
+and a barrier costs as much as the serial encoder's drain: 0.6B and 30B decode and prefill are unchanged within the noise.
+The ~30 % that the no-barrier run shows is the overlap of *dependent* kernels (a kernel starting before its input is
+complete), which no correct schedule can have. Only fewer dependent boundaries win it back: more fusion (8.23), or kernels
+that need no full drain. What the encoder does buy is the overlap of really independent work: batched decoding across
+slots gains a few percent (the per-row dispatches of the slots overlap, 177 -> ~185 tok/s for three slots, within noise
+of 180-198), so `concurrent=batch` is the setting to try on a server that runs several conversations at once; MLA and
+Qwen3-Next save two to three barriers per layer. Neither is worth changing the default for; the machinery is the base for
+any future kernel split that has independent branches (for example a shared expert beside the routed ones, once they add
+into separate buffers).
+
+## 8.29 The prefill chunk (`backend.batch=auto`)
 
 🧸 Carrying shopping home in a tiny bag means many trips, and on each trip you walk the same road. A bigger bag
 means fewer trips; the only limit is the bag you can lift. The GPU is the shopper: a small chunk of prompt tokens
@@ -1557,7 +1834,7 @@ exactness gate (greedy text of a short prompt) is unaffected.
 
 ---
 
-## 8.27 Several output rows per simdgroup in the decode matvec (`mv<NR>_*`)
+## 8.30 Several output rows per simdgroup in the decode matvec (`mv<NR>_*`)
 
 🧸 A shopper has a list of 1 024 things to look up for each of 4 096 customers. The old way sent one helper per
 customer, and every helper read the whole list again from the notice board. Now a helper serves two customers
@@ -1622,12 +1899,14 @@ unless noted):
 −18 % of the matvec time for the safetensors cache and −27 % for the GGUF file (whose blocks cost more to unpack, see
 below). **NR = 4 is the default.** A threadgroup of 64, 128 or 256 threads changes nothing (5.52 – 5.68 ms). `NR = 8` was
 tried and dropped: the SwiGLU kernel then holds 16 accumulators and 16 row pointers per lane and spills (130 µs per layer
-against 61). `-Djllm.metal.mvRows=0|1|2|4`, `-Djllm.metal.mvThreads` (threads of the plain, non-norm variants; the fused
+against 61). All formats have the kernels, including the nine GGUF types of [8.26](#826-gguf-block-types-on-the-gpu-gg_unit-gg_new) (Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16: they go through `gg_unit` like Q4_0G, byte-identical to their one-row twins on the emulator). The batched rows of [8.24](#824-batched-decoding-across-slots-metalbackendforwardbatch) use them too, inside the concurrent encoder's independent groups ([8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)): the kernels only read the shared activations and write their own rows, so the derived barriers are the same as for the one-row kernels.
+
+`-Djllm.metal.mvRows=0|1|2|4`, `-Djllm.metal.mvThreads` (threads of the plain, non-norm variants; the fused
 ones need 128).
 
 End to end (`./jllm bench`, 413-token prompt, 128 tokens, speculation off, median of 3 rounds, decode tok/s):
 
-| | one-row kernels, `attention_t` | + multi-row, 2 rows | + multi-row, 4 rows | 4 rows + `attention_dec` ([8.28](#828-decode-attention-attention_dec)) |
+| | one-row kernels, `attention_t` | + multi-row, 2 rows | + multi-row, 4 rows | 4 rows + `attention_dec` ([8.31](#831-decode-attention-attention_dec)) |
 |---|---|---|---|---|
 | Qwen3-0.6B Q4_0 cache | 117.9 | 134.9 | 132.1 | **143.3** (+22 %) |
 | Qwen3-0.6B-Q4_0.gguf | 104.7 | 132.6 (2 rows, with `attention_dec`) | 134.8 (with `attention_dec`) | **134.8** (+29 %) |
@@ -1642,7 +1921,7 @@ aligned) and the dequantized weights are scaled before the dot instead of once a
 
 ---
 
-## 8.28 Decode attention (`attention_dec`)
+## 8.31 Decode attention (`attention_dec`)
 
 🧸 Sixteen readers each look for one answer in a very long book (the KV cache), and until now each reader read the whole
 book alone, one page at a time, shouting every page's score across the room into a notebook and reading the notebook
@@ -1683,7 +1962,7 @@ one at ~70 GB/s. `attention_dec<KV, G, D, W>` is written for decode (one token, 
 output agrees with `attention_t` to rounding (max |difference| 3e-8 on a 0.13 range at 413 keys, 2e-8 at 3 000). Like flash
 decoding it is therefore chosen by the **start-up self-check** ([8.14](#814-the-kernel-self-check-metaltuner),
 `MetalTuner.decodeAttention`): it must agree within `1e-3·max|ref| + 1e-5` on synthetic data of the model's head shape
-and be ≥ 3 % faster over 2 048 keys and not slower over 400, per cache type; on the emulator agreement alone decides.
+and be ≥ 3 % faster over 2 048 keys and not slower over 400, per cache type; on the emulator agreement alone decides. The q4 cache ([8.27](#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4)) keeps its own attention kernels: `attention_dec` is never used with it.
 `-Djllm.metal.decodeAttention=true|false` forces it. It supersedes flash decoding when both are on (an explicit
 `-Djllm.metal.flashDecode=true` turns it off). Consistency is kept where it matters: every row of a verification pass or
 batched step of fewer than 16 tokens runs the same kernel at its own position (`forward` loops over the rows), so
@@ -1692,7 +1971,7 @@ prefill kernels as before. A recorded decode step depends on the number of split
 (a new recording about every 32–64 tokens).
 
 **Measured** (M1 Pro, Qwen3-0.6B Q4_0 cache, 128 generated tokens after a prompt of the given length, `./jllm bench
---batch 256 --engine.speculative off`, median of 3; decode tok/s; the multi-row matvec of [8.27](#827-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_)
+--batch 256 --engine.speculative off`, median of 3; decode tok/s; the multi-row matvec of [8.30](#830-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_)
 is on in the right-hand columns, the left one is the code before this change):
 
 | context / cache | one-row matvec, `attention_t` | multi-row matvec, `attention_t` | multi-row matvec + `attention_dec` |

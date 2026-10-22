@@ -20,6 +20,10 @@ public enum KernelParams {
     FLASH("FlashParams", "iiiifiiiif"),
     KV_STORE("KvStoreParams", "iiii"),
     KV_PUT("KvPutParams", "ii"),
+    KV_STORE_Q4("KvStoreQ4Params", "iiiiiiii"),
+    ATTN_Q4("AttnQ4Params", "iiiiifiiiiifii"),
+    ATTN_SPLIT_Q4("AttnSplitQ4Params", "iiiiifiiifiiii"),
+    FLASH_Q4("FlashQ4Params", "iiiifiiiifii"),
     ROUTER("RouterParams", "iiiii"),
     ROUTER_NORM("RouterNormParams", "iiiiif"),
     ROUTER_DS("RouterDsParams", "iiiiiiiiifi"),
@@ -31,8 +35,8 @@ public enum KernelParams {
     MLA("MlaParams", "iiiii"),
     MAMBA_CONV("MambaConvParams", "iii"),
     MAMBA_SCAN("MambaScanParams", "iiii"),
-    GDN_CONV("GdnConvParams", "iiiii"),
-    GDN_RULE("GdnRuleParams", "iiiiiiiif"),
+    GDN_CONV("GdnConvParams", "iiiiii"),
+    GDN_RULE("GdnRuleParams", "iiiiiiiifii"),
     GDN_NORM("GdnNormParams", "iiiif"),
     GATE("GateParams", "i");
 

@@ -330,6 +330,21 @@ public final class ChatSupport {
         return extra != null ? Json.bool(extra, "enable_thinking", thinking) : thinking;
     }
 
+    /** A message's text for the size check: the text parts; picture parts have their own limits (vision.max-image-bytes). */
+    private static String textBytes(Object content) {
+        if (content instanceof List<?> parts) {
+            StringBuilder sb = new StringBuilder();
+            for (Object p : parts) {
+                if (p instanceof Map<?, ?> pm && ("image_url".equals(pm.get("type")) || "input_image".equals(pm.get("type")))) {
+                    continue;
+                }
+                sb.append(org.robomiri.jllm.web.tools.ToolCallFormat.text(List.of(p)));
+            }
+            return sb.toString();
+        }
+        return org.robomiri.jllm.web.tools.ToolCallFormat.text(content);
+    }
+
     /** Validates the messages array and its size in bytes (before tokenizing). */
     public static List<Object> messages(Map<String, Object> body, long maxPromptBytes) {
         List<Object> msgs = Json.list(body, "messages");
@@ -341,7 +356,7 @@ public final class ChatSupport {
             if (!(m instanceof Map<?, ?> mm)) {
                 throw RequestError.invalid("each message must be an object");
             }
-            bytes += utf8Length(String.valueOf(mm.get("role"))) + utf8Length(org.robomiri.jllm.web.tools.ToolCallFormat.text(mm.get("content")));
+            bytes += utf8Length(String.valueOf(mm.get("role"))) + utf8Length(textBytes(mm.get("content")));
             Object calls = mm.get("tool_calls");
             if (calls != null) {
                 bytes += utf8Length(Json.write(calls));

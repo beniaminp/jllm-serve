@@ -4,6 +4,7 @@ import org.robomiri.jllm.cpu.Int8Kernels;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
+import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DeepSeekRouter;
 import org.robomiri.jllm.model.InterleavedRope;
@@ -953,12 +954,15 @@ public final class SmokeTest {
     /**
      * The KV cache's tiled prefill attention against its per-token decode path (same kernels, so the same bits are
      * expected once both are compiled; the check tolerates the last bit because the interpreter's lane reduction
-     * order differs from C2's) and against a double-precision reference, for f32, f16 and q8 caches, with and without a
-     * sliding window and soft-capping.
+     * order differs from C2's) and against a double-precision reference, for f32, f16, q8 and q4 caches (q4 also with
+     * a recent window of 5 positions, so that rows of one tile read different keys exactly), with and without a sliding
+     * window and soft-capping.
      */
     static void kvCacheAttention() throws Exception {
         kvCacheAttention(128); // head dim 32: the vector kernels
-        kvCacheAttention(96);  // head dim 24: the one-key-at-a-time fallback where a head is not whole vectors
+        kvCacheAttention(96);  // head dim 24: the one-key-at-a-time fallback where a head is not whole vectors (q4: q8)
+        kvCacheAttention(256); // head dim 64: q4 with two groups per head, a 64-wide Hadamard transform
+        kvCacheAttention(384); // head dim 96: q4 with three Hadamard blocks of 32
     }
 
     static void kvCacheAttention(int hidden) throws Exception {
@@ -982,9 +986,18 @@ public final class SmokeTest {
             for (int i = 0; i < q.length; i++) {
                 q[i] = (rnd.nextFloat() * 2 - 1) * 3;
             }
+            boolean q4 = org.robomiri.jllm.model.KvQ4.supports(hd);
+            Object[][] cases = {{KvDtype.F32, 0}, {KvDtype.F16, 0}, {KvDtype.Q8, 0}, {KvDtype.Q4, 0}, {KvDtype.Q4, 5}};
             try (org.robomiri.jllm.cpu.ThreadPool pool = new org.robomiri.jllm.cpu.ThreadPool(3)) {
-                for (org.robomiri.jllm.model.KvDtype dtype : org.robomiri.jllm.model.KvDtype.values()) {
-                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, 1, cfg, ctx);
+                for (Object[] c : cases) {
+                    KvDtype dtype = (KvDtype) c[0];
+                    int recent = (Integer) c[1];
+                    if (dtype == KvDtype.Q4 && !q4 && recent > 0) {
+                        continue;
+                    }
+                    org.robomiri.jllm.cpu.KvCache kv = org.robomiri.jllm.cpu.KvCache.create(dtype, 1, cfg, ctx, 64, recent);
+                    KvDtype held = dtype == KvDtype.Q4 && !q4 ? KvDtype.Q8 : dtype; // q4 falls back to q8
+                    check(kv.format().startsWith(held + (recent > 0 ? " recent=" + recent : "") + " "), "kv format " + kv.format());
                     kv.store(0, 0, k, v, n);
                     for (int window : new int[]{0, 6}) {
                         for (float softcap : new float[]{0f, 5f}) {
@@ -1001,9 +1014,29 @@ public final class SmokeTest {
                                     System.arraycopy(one, 0, decode, t * qDim, qDim);
                                 }
                             }
-                            // double-precision reference on the stored (possibly f16-rounded or q8-quantized) rows
-                            float[] ks = stored(dtype, k, hd);
-                            float[] vs = stored(dtype, v, hd);
+                            // double-precision reference on the stored (possibly f16-rounded or q8-quantized) rows; q4:
+                            // on the rotated K rows and queries, with the score scale divided by the block, exact (f16)
+                            // rows for the keys a query reads from the recent window
+                            float[] ks = stored(held, k, hd);
+                            float[] vs = stored(held, v, hd);
+                            float[] kx = ks;
+                            float[] vx = vs;
+                            float[] qs = q;
+                            double sc0 = scale;
+                            if (held == KvDtype.Q4) {
+                                float[] kr = k.clone();
+                                qs = q.clone();
+                                for (int o = 0; o < kr.length; o += hd) {
+                                    org.robomiri.jllm.model.KvQ4.rotate(kr, o, hd);
+                                }
+                                for (int o = 0; o < qs.length; o += hd) {
+                                    org.robomiri.jllm.model.KvQ4.rotate(qs, o, hd);
+                                }
+                                ks = stored(held, kr, hd);
+                                kx = stored(KvDtype.F16, kr, hd);
+                                vx = stored(KvDtype.F16, v, hd);
+                                sc0 = (double) scale / org.robomiri.jllm.model.KvQ4.block(hd);
+                            }
                             double maxRef = 0;
                             double maxPd = 0;
                             int exact = 0;
@@ -1015,12 +1048,14 @@ public final class SmokeTest {
                                     int ko = (h / group) * hd;
                                     double[] sc = new double[len];
                                     double max = Double.NEGATIVE_INFINITY;
+                                    int exFrom = Math.max(0, len - recent);
                                     for (int s = first; s < len; s++) {
+                                        float[] kk = s >= exFrom && recent > 0 ? kx : ks;
                                         double d = 0;
                                         for (int i = 0; i < hd; i++) {
-                                            d += (double) q[t * qDim + h * hd + i] * ks[s * kvDim + ko + i];
+                                            d += (double) qs[t * qDim + h * hd + i] * kk[s * kvDim + ko + i];
                                         }
-                                        d *= scale;
+                                        d *= sc0;
                                         if (softcap > 0) {
                                             d = Math.tanh(d / softcap) * softcap;
                                         }
@@ -1035,7 +1070,7 @@ public final class SmokeTest {
                                     for (int i = 0; i < hd; i++) {
                                         double o = 0;
                                         for (int s = first; s < len; s++) {
-                                            o += sc[s] / sum * vs[s * kvDim + ko + i];
+                                            o += sc[s] / sum * (s >= exFrom && recent > 0 ? vx : vs)[s * kvDim + ko + i];
                                         }
                                         int idx = t * qDim + h * hd + i;
                                         maxRef = Math.max(maxRef, Math.abs(o - prefill[idx]));
@@ -1046,7 +1081,7 @@ public final class SmokeTest {
                                     }
                                 }
                             }
-                            String what = dtype + " hd=" + hd + " window=" + window + " softcap=" + softcap;
+                            String what = kv.format() + " window=" + window + " softcap=" + softcap;
                             check(maxRef < 2e-6, "kv attention " + what + " vs double reference: max diff " + maxRef);
                             // same kernels, so bit-identical once both run C2 code; while one of them still runs
                             // the interpreter's sequential lane reduction a last-bit (1e-7) difference is expected
@@ -1065,10 +1100,30 @@ public final class SmokeTest {
     /**
      * The values a cache of type {@code dtype} gives back for {@code x} (rows of heads of {@code hd} values): f16
      * rounding, or q8 per head row ({@code scale = max|x| / 127}, {@code q = rint(x / scale)}), whose error must stay
-     * within {@code scale / 2}.
+     * within {@code scale / 2}, or q4 per group of 32 ({@code d = half(max|x| / 7.5)}, levels {@code (code - 7.5) · d}),
+     * whose error must stay within half a step {@code max|x| / 15}.
      */
     static float[] stored(org.robomiri.jllm.model.KvDtype dtype, float[] x, int hd) {
         float[] r = new float[x.length];
+        if (dtype == KvDtype.Q4) {
+            int g = org.robomiri.jllm.model.KvQ4.GROUP;
+            byte[] nib = new byte[g / 2];
+            short[] sc = new short[1];
+            for (int o = 0; o < x.length; o += g) {
+                org.robomiri.jllm.model.KvQ4.quantize(x, o, g, nib, 0, sc, 0);
+                org.robomiri.jllm.model.KvQ4.dequantize(nib, 0, sc, 0, g, r, o);
+                float max = 0f;
+                for (int i = o; i < o + g; i++) {
+                    max = Math.max(max, Math.abs(x[i]));
+                }
+                for (int i = o; i < o + g; i++) {
+                    if (Math.abs(r[i] - x[i]) > max / 15f * 1.002f) {
+                        throw new AssertionError("q4 rounding error above max|x| / 15: " + x[i] + " -> " + r[i]);
+                    }
+                }
+            }
+            return r;
+        }
         for (int o = 0; o < x.length; o += hd) {
             float max = 0f;
             for (int i = o; i < o + hd; i++) {
@@ -1080,6 +1135,7 @@ public final class SmokeTest {
                     case F32 -> x[i];
                     case F16 -> Float.float16ToFloat(Float.floatToFloat16(x[i]));
                     case Q8 -> scale == 0f ? 0f : (float) Math.max(-127, Math.min(127, Math.rint(x[i] / scale))) * scale;
+                    case Q4 -> throw new AssertionError();
                 };
                 if (Math.abs(r[i] - x[i]) > max / 254f * 1.0001f) {
                     throw new AssertionError(dtype + " rounding error above max|x| / 254");
@@ -1243,7 +1299,7 @@ public final class SmokeTest {
      * be rewound (Mamba) only when the new prompt extends everything it has seen, otherwise it restarts at 0.
      */
     /**
-     * {@link org.robomiri.jllm.engine.Engine#saveCache} / {@code loadCache} on the real model, for f32, f16 and q8 caches:
+     * {@link org.robomiri.jllm.engine.Engine#saveCache} / {@code loadCache} on the real model, for f32, f16, q8 and q4 caches:
      * a cache saved by one engine and loaded into a fresh one (another backend on the same weights) holds the same
      * tokens, saves back to an identical file, and continues a conversation exactly like the original engine; a wrong
      * fingerprint is refused.
@@ -1251,9 +1307,11 @@ public final class SmokeTest {
     static void persistCache(Path dir) throws Exception {
         Path tmp = Files.createTempDirectory("jllm-kvfile");
         try {
-            for (String dtype : new String[]{"f32", "f16", "q8"}) {
+            for (String dtype : new String[]{"f32", "f16", "q8", "q4"}) {
+                // q4 with a recent window of 4 positions: the saved file holds 4-bit rows and the window's half rows
                 org.robomiri.jllm.config.Settings st = org.robomiri.jllm.config.Settings.load(new String[]{"--backend", "cpu",
-                        "--model.dir", dir.toAbsolutePath().getParent().toString(), "--backend.ctx", "256", "--backend.kv-dtype", dtype, "--engine.speculative", "off"});
+                        "--model.dir", dir.toAbsolutePath().getParent().toString(), "--backend.ctx", "256", "--backend.kv-dtype", dtype,
+                        "--backend.kv-q4-recent", "4", "--engine.speculative", "off"});
                 try (org.robomiri.jllm.ModelLoader.Loaded l = org.robomiri.jllm.ModelLoader.load(st,
                         org.robomiri.jllm.ModelLoader.hub(st), dir.getFileName().toString());
                      org.robomiri.jllm.engine.Engine fresh = org.robomiri.jllm.ModelLoader.extraEngine(st, l)) {

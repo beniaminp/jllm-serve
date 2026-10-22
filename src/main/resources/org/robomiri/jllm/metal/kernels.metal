@@ -10,6 +10,7 @@
 //  11. Qwen3-Next (Gated DeltaNet conv / delta rule / gated norm, the attention output gate, the shared-expert gate)
 //  12. half-weight MMA prefill (*_hmma: the section 2b / 5 MMA kernels with half weight tiles, chosen per shape)
 //  13. flash prefill, second form (attention_fb: K and V staged together, half staging for f16 / q8 caches)
+//  14. q4 KV cache (kv_store_q4: Hadamard rotation + 4-bit groups; the *_q4 attention kernels, recent window)
 // Model-specific pieces live in the generic kernels: Gemma's sandwich norms are rmsnorm_add, its GeGLU the
 // `gelu` flag of matmul_swiglu, its attention soft-cap AttnParams.softcap and its final-logit soft-cap
 // MatmulParams.softcap on the LM-head matmul; GLM / Phi partial rotation is rope_il / rope with rotHalf.
@@ -310,6 +311,9 @@ static inline void mm_row_gguf(device const uchar *wq, ulong grow, int nb, XP x,
                                thread float *acc, ushort lane);
 template <int QT>
 static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w);
+#define GG_NEW 24   // first QT of the second set of GGUF block types (Q4_1 ...), decoded by gg_new at the end of the file
+template <int QT, int NV>
+static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int v0, thread float4 *w);
 static inline void q6k_sub_block(device const uchar *wq, ulong grow, int nsb, int u, thread float4 *w);
 template <int QT, int NR, int TT>
 static inline void mm_tile_gguf(thread device const uchar *const *wq, thread const ulong *grow, int nr, int nb,
@@ -1119,6 +1123,11 @@ static inline void mma_core_rows(device const uchar *rwq, device const float *rw
             device const char4 *q = (device const char4 *)(rwq + rgrow * nb * 32 + b * 32 + h * 16);
             const float s = rws[rgrow * nb + b];
             for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = float4(q[k]) * s;
+        } else if (QT >= GG_NEW) {
+            // the newer GGUF types decode only their own 16 weights (their decoders cost more than Q4_0's: bit fields, tables)
+            float4 w[4];
+            gg_new<QT, 4>(rwq, rgrow, nb, b, 4 * h, w);
+            for (int k = 0; k < 4; k++) *(threadgroup float4 *)(wd + h * 16 + k * 4) = w[k];
         } else if (QT >= GG_FIRST) {
             // GGUF types: the 32-weight unit b of the row, both threads of the row decode it and store their half
             float4 w[8];
@@ -3124,10 +3133,151 @@ template [[host_name("moe_down_q6k")]] kernel moe_down_t moe_down<6>;
 #define GG_Q4_K 22
 #define GG_Q5_K 23
 
+// ---------------------------------------------------------------------------------------------- GGUF block types, second set
+// Q4_1, Q5_0, Q5_1, Q3_K, IQ4_NL, IQ4_XS, MXFP4 and the plain F16 / BF16 matrices (docs/16-gguf.md, docs/06). Same
+// scheme as the first four: one lane unit is 32 consecutive weights (a block, or a sub-block / 32-weight slice of a
+// 256-weight super-block), gg_unit returns them in natural order as 8 float4, gg_half returns 16 of them (half h =
+// weights 16h .. 16h + 15) for the *_hmma kernels. The decoder is gg_new<QT, NV>, which writes NV float4 of the
+// unit, starting at float4 v0 (unit: NV 8, v0 0; half h: NV 4, v0 4h), so both entry points share one definition.
+//   QT  24 Q4_1  (20 B: half d, m, 16 nibble bytes)                      w = q d + m
+//       25 Q5_0  (22 B: half d, u32 qh, 16 nibble bytes)                 w = (q5 - 16) d
+//       26 Q5_1  (24 B: half d, m, u32 qh, 16 nibble bytes)              w = q5 d + m
+//       27 Q3_K  (110 B: hmask[32], qs[64], scales[12], half d)          w = d (sc - 32) ((qs >> 2j) & 3 - (hm bit ? 0 : 4))
+//       28 IQ4_NL (18 B: half d, 16 nibble bytes)                        w = d kvalues[nibble]
+//       29 IQ4_XS (136 B: half d, u16 scales_h, scales_l[4], qs[128])    w = d (ls - 32) kvalues[nibble]
+//       30 MXFP4 (17 B: e8m0 e, 16 nibble bytes)                         w = kvalues_fp4[nibble] 2^(e - 128)
+//       31 F16, 32 BF16 (64 B per 32 weights)                            w = the half / bfloat16
+// Block sizes 22, 110, 18 and 17 are not multiples of 4: Q5_0 / Q3_K / IQ4_NL read their quants as ushorts (2-byte
+// aligned), MXFP4 byte by byte (17 B blocks are only 1-byte aligned). The 4-bit tables sit in constant memory.
+
+#define GG_Q4_1 24
+#define GG_Q5_0 25
+#define GG_Q5_1 26
+#define GG_Q3_K 27
+#define GG_IQ4_NL 28
+#define GG_IQ4_XS 29
+#define GG_MXFP4 30
+#define GG_F16 31
+#define GG_BF16 32
+
+// ggml's kvalues_iq4nl and kvalues_mxfp4 (int8, as floats) in constant memory
+constexpr constant static float GG_KV_IQ4NL[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                                                   1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f};
+constexpr constant static float GG_KV_MXFP4[16] = {0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
+                                                   0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f};
+
+// 4 bytes at any 2-byte aligned address as a uchar4
+static inline uchar4 gg_ld4(device const ushort *p, int i) {
+    return as_type<uchar4>(uint(p[i]) | (uint(p[i + 1]) << 16));
+}
+
+// table[n] for four nibbles n
+static inline float4 gg_tab_iq4nl(uchar4 n) {
+    return float4(GG_KV_IQ4NL[n.x], GG_KV_IQ4NL[n.y], GG_KV_IQ4NL[n.z], GG_KV_IQ4NL[n.w]);
+}
+static inline float4 gg_tab_mxfp4(uchar4 n) {
+    return float4(GG_KV_MXFP4[n.x], GG_KV_MXFP4[n.y], GG_KV_MXFP4[n.z], GG_KV_MXFP4[n.w]);
+}
+
+// The 6-bit scale (minus 32) number s (0..15) of a Q3_K block whose 12 scale bytes start at sc (ggml's kmask shuffle).
+static inline int gg_q3k_scale(device const uchar *sc, int s) {
+    const int g = s >> 2;
+    const int i = s & 3;
+    const uint lowb = sc[4 * (g & 1) + i];
+    const uint lo = g < 2 ? (lowb & 15u) : (lowb >> 4);
+    const uint hi = (uint(sc[8 + i]) >> (2 * g)) & 3u;
+    return int(lo | (hi << 4)) - 32;
+}
+
+template <int QT, int NV>
+static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int v0, thread float4 *w) {
+    if (QT == GG_Q4_1 || QT == GG_Q5_1) {
+        constexpr bool Q5 = QT == GG_Q5_1;
+        device const uchar *blk = wq + (grow * nb + u) * (Q5 ? 24 : 20);
+        const float2 dm = float2(as_type<half2>(*(device const uint *)blk));
+        const uint qh = Q5 ? *(device const uint *)(blk + 4) : 0u;
+        device const uint *q = (device const uint *)(blk + (Q5 ? 8 : 4));
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            // four nibbles of a uint at once; the four fifth bits spread to one per byte by a multiply (SWAR, few registers)
+            uint n = (q[v & 3] >> ((v >> 2) << 2)) & 0x0F0F0F0Fu;
+            if (Q5) n |= ((((qh >> (((v >> 2) << 4) + ((v & 3) << 2))) & 15u) * 0x204081u) & 0x01010101u) << 4;
+            w[k] = float4(as_type<uchar4>(n)) * dm.x + dm.y;
+        }
+    } else if (QT == GG_Q5_0) {
+        device const uchar *blk = wq + (grow * nb + u) * 22;
+        const float d = float(*(device const half *)blk);
+        const uint qh = as_type<uint>(*(device const packed_uchar4 *)(blk + 2));
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            uint n = (as_type<uint>(*(device const packed_uchar4 *)(blk + 6 + 4 * (v & 3))) >> ((v >> 2) << 2)) & 0x0F0F0F0Fu;
+            n |= ((((qh >> (((v >> 2) << 4) + ((v & 3) << 2))) & 15u) * 0x204081u) & 0x01010101u) << 4;
+            w[k] = (float4(as_type<uchar4>(n)) - 16.0f) * d;
+        }
+    } else if (QT == GG_Q3_K) {
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * 110;
+        device const ushort *p = (device const ushort *)blk;
+        const int uu = u & 7;                                  // unit inside the super-block = 4 n + j
+        const float d = float(*(device const half *)(blk + 108));
+        const float dl0 = d * float(gg_q3k_scale(blk + 96, 2 * uu));
+        const float dl1 = d * float(gg_q3k_scale(blk + 96, 2 * uu + 1));
+        const uchar sh = uchar(2 * (uu & 3));
+        const int qbase = 16 + 16 * (uu >> 2);                 // ushort index of qs[32 n]
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            const uint qw = uint(p[qbase + 2 * v]) | (uint(p[qbase + 2 * v + 1]) << 16);
+            const uint hw = uint(p[2 * v]) | (uint(p[2 * v + 1]) << 16);
+            // per byte: 2-bit code + 4 where the mask bit is set (always below 8), minus 4
+            const uint c = ((qw >> sh) & 0x03030303u) + (((hw >> uu) & 0x01010101u) << 2);
+            w[k] = (float4(as_type<uchar4>(c)) - 4.0f) * (v < 4 ? dl0 : dl1);
+        }
+    } else if (QT == GG_IQ4_NL) {
+        device const uchar *blk = wq + (grow * nb + u) * 18;
+        device const ushort *p = (device const ushort *)blk;
+        const float d = float(*(device const half *)blk);
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            w[k] = gg_tab_iq4nl((gg_ld4(p, 1 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * d;
+        }
+    } else if (QT == GG_IQ4_XS) {
+        const int nsb = nb >> 3;
+        device const uchar *blk = wq + (grow * nsb + (u >> 3)) * 136;
+        const int ib = u & 7;
+        const float d = float(*(device const half *)blk);
+        const uint sh16 = uint(*(device const ushort *)(blk + 2));
+        const uint ls = ((uint(blk[4 + (ib >> 1)]) >> (4 * (ib & 1))) & 15u) | (((sh16 >> (2 * ib)) & 3u) << 4);
+        const float dl = d * float(int(ls) - 32);
+        device const uchar4 *q = (device const uchar4 *)(blk + 8 + 16 * ib);
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            w[k] = gg_tab_iq4nl((q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * dl;
+        }
+    } else if (QT == GG_MXFP4) {
+        device const uchar *blk = wq + (grow * nb + u) * 17;
+        const uint e = blk[0];
+        const float d = as_type<float>(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+        for (int k = 0; k < NV; k++) {
+            const int v = v0 + k;
+            device const uchar *b = blk + 1 + 4 * (v & 3);
+            const uchar4 nib = uchar4(b[0], b[1], b[2], b[3]);
+            w[k] = gg_tab_mxfp4((nib >> uchar4(uchar((v >> 2) << 2))) & uchar4(15)) * d;
+        }
+    } else if (QT == GG_F16) {
+        device const half4 *p = (device const half4 *)(wq + (grow * nb + u) * 64);
+        for (int k = 0; k < NV; k++) w[k] = float4(p[v0 + k]);
+    } else {  // GG_BF16
+        device const ushort4 *p = (device const ushort4 *)(wq + (grow * nb + u) * 64);
+        for (int k = 0; k < NV; k++) w[k] = as_type<float4>(uint4(p[v0 + k]) << 16);
+    }
+}
+
 // 32 weights of unit u of global row `grow` (nb units per row) into w[0..8) as dequantized floats.
 template <int QT>
 static inline void gg_unit(device const uchar *wq, ulong grow, int nb, int u, thread float4 *w) {
-    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+    if (QT >= GG_NEW) {
+        gg_new<QT, 8>(wq, grow, nb, u, 0, w);
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) {
         constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
         device const uchar *blk = wq + (grow * nb + u) * BYTES;
         const float d = float(*(device const half *)blk);
@@ -3233,6 +3383,15 @@ GG_BLOCK_DOT(GG_Q4_0)
 GG_BLOCK_DOT(GG_Q8_0)
 GG_BLOCK_DOT(GG_Q4_K)
 GG_BLOCK_DOT(GG_Q5_K)
+GG_BLOCK_DOT(GG_Q4_1)
+GG_BLOCK_DOT(GG_Q5_0)
+GG_BLOCK_DOT(GG_Q5_1)
+GG_BLOCK_DOT(GG_Q3_K)
+GG_BLOCK_DOT(GG_IQ4_NL)
+GG_BLOCK_DOT(GG_IQ4_XS)
+GG_BLOCK_DOT(GG_MXFP4)
+GG_BLOCK_DOT(GG_F16)
+GG_BLOCK_DOT(GG_BF16)
 
 #define GG_INSTANTIATE(SUF, QTV)                                                                                  \
     template [[host_name("matmul_" SUF)]] kernel matmul_t matmul<QTV, false>;                                     \
@@ -3259,6 +3418,15 @@ GG_INSTANTIATE("q4g", GG_Q4_0)
 GG_INSTANTIATE("q8g", GG_Q8_0)
 GG_INSTANTIATE("q4k", GG_Q4_K)
 GG_INSTANTIATE("q5k", GG_Q5_K)
+GG_INSTANTIATE("q41", GG_Q4_1)
+GG_INSTANTIATE("q50", GG_Q5_0)
+GG_INSTANTIATE("q51", GG_Q5_1)
+GG_INSTANTIATE("q3k", GG_Q3_K)
+GG_INSTANTIATE("iq4nl", GG_IQ4_NL)
+GG_INSTANTIATE("iq4xs", GG_IQ4_XS)
+GG_INSTANTIATE("mxfp4", GG_MXFP4)
+GG_INSTANTIATE("f16w", GG_F16)
+GG_INSTANTIATE("bf16w", GG_BF16)
 
 // multi-row decode kernels (section 2a) of every format, for the row counts the host can choose (MetalKernels.MV_ROWS)
 #define MVR_ALL(NRS, NRV)                                                                                             \
@@ -3269,7 +3437,16 @@ GG_INSTANTIATE("q5k", GG_Q5_K)
     MVR_INSTANTIATE(NRS, NRV, "q4g", GG_Q4_0)                                                                         \
     MVR_INSTANTIATE(NRS, NRV, "q8g", GG_Q8_0)                                                                         \
     MVR_INSTANTIATE(NRS, NRV, "q4k", GG_Q4_K)                                                                         \
-    MVR_INSTANTIATE(NRS, NRV, "q5k", GG_Q5_K)
+    MVR_INSTANTIATE(NRS, NRV, "q5k", GG_Q5_K)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q41", GG_Q4_1)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q50", GG_Q5_0)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q51", GG_Q5_1)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "q3k", GG_Q3_K)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "iq4nl", GG_IQ4_NL)                                                                     \
+    MVR_INSTANTIATE(NRS, NRV, "iq4xs", GG_IQ4_XS)                                                                     \
+    MVR_INSTANTIATE(NRS, NRV, "mxfp4", GG_MXFP4)                                                                      \
+    MVR_INSTANTIATE(NRS, NRV, "f16w", GG_F16)                                                                         \
+    MVR_INSTANTIATE(NRS, NRV, "bf16w", GG_BF16)
 MVR_ALL("2", 2)
 MVR_ALL("4", 4)
 
@@ -3552,6 +3729,15 @@ template [[host_name("embed_token_q4g")]] kernel embed_token_t embed_token<GG_Q4
 template [[host_name("embed_token_q8g")]] kernel embed_token_t embed_token<GG_Q8_0>;
 template [[host_name("embed_token_q4k")]] kernel embed_token_t embed_token<GG_Q4_K>;
 template [[host_name("embed_token_q5k")]] kernel embed_token_t embed_token<GG_Q5_K>;
+template [[host_name("embed_token_q41")]] kernel embed_token_t embed_token<GG_Q4_1>;
+template [[host_name("embed_token_q50")]] kernel embed_token_t embed_token<GG_Q5_0>;
+template [[host_name("embed_token_q51")]] kernel embed_token_t embed_token<GG_Q5_1>;
+template [[host_name("embed_token_q3k")]] kernel embed_token_t embed_token<GG_Q3_K>;
+template [[host_name("embed_token_iq4nl")]] kernel embed_token_t embed_token<GG_IQ4_NL>;
+template [[host_name("embed_token_iq4xs")]] kernel embed_token_t embed_token<GG_IQ4_XS>;
+template [[host_name("embed_token_mxfp4")]] kernel embed_token_t embed_token<GG_MXFP4>;
+template [[host_name("embed_token_f16w")]] kernel embed_token_t embed_token<GG_F16>;
+template [[host_name("embed_token_bf16w")]] kernel embed_token_t embed_token<GG_BF16>;
 
 // ---------------------------------------------------------------------------------------------- 11. Qwen3-Next
 // The pieces of Qwen3NextMetalBackend that the generic kernels lack (docs/14.14). The projections, norms, RoPE,
@@ -3570,6 +3756,7 @@ struct GdnConvParams {
     int ntok;
     int inStride;   // floats per token of the input (the fused projection row)
     int outStride;  // floats per token of the output
+    int snapTok;    // >= 0: also write the conv state as it is after token snapTok to snap (a verification pass keeps it); -1: no
 };
 
 // y[t, c] = silu(sum_k w[c, k] * window[k]) with window = (the conv state of channel c, x[t, c]): Qwen3-Next's
@@ -3579,7 +3766,8 @@ kernel void gdn_conv(device const float *x [[buffer(0)]],
                      device const float *w [[buffer(1)]],
                      device float *state [[buffer(2)]],
                      device float *y [[buffer(3)]],
-                     constant GdnConvParams &p [[buffer(4)]],
+                     device float *snap [[buffer(4)]],
+                     constant GdnConvParams &p [[buffer(5)]],
                      uint gid [[thread_position_in_grid]]) {
     const int c = int(gid);
     if (c >= p.channels) return;
@@ -3598,6 +3786,9 @@ kernel void gdn_conv(device const float *x [[buffer(0)]],
         for (int k = 0; k + 1 < kc - 1; k++) win[k] = win[k + 1];
         if (kc > 1) win[kc - 2] = u;
         y[(ulong)t * p.outStride + c] = sum / (1.0f + precise::exp(-sum));
+        if (t == p.snapTok) {
+            for (int k = 0; k < kc - 1; k++) snap[(ulong)c * (kc - 1) + k] = win[k];
+        }
     }
     for (int k = 0; k < kc - 1; k++) st[k] = win[k];
 }
@@ -3612,6 +3803,8 @@ struct GdnRuleParams {
     int projStride; // floats per token of the projection (b and a of the token are read from it)
     int bOff;       // offset of b in a projection row; a follows after valueHeads
     float eps;      // of the q / k L2 norm
+    int tiled;      // 1: value head h reads key head h % keyHeads (Qwen3.5 GGUF order); 0: h / (valueHeads / keyHeads)
+    int snapTok;    // >= 0: also write the state as it is after token snapTok to snapState; -1: no
 };
 
 // The gated delta rule of value head h = tgp.y, state column j (value dim) = tgp.x * GDN_COLS + simdgroup:
@@ -3626,7 +3819,8 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
                      device const float *dtBias [[buffer(3)]],
                      device float *state [[buffer(4)]],
                      device float *out [[buffer(5)]],
-                     constant GdnRuleParams &p [[buffer(6)]],
+                     device float *snapState [[buffer(6)]],
+                     constant GdnRuleParams &p [[buffer(7)]],
                      uint2 tgp [[threadgroup_position_in_grid]],
                      ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]]) {
@@ -3635,7 +3829,7 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
     if (j >= p.valueDim) return;   // the whole simdgroup leaves together: no barrier below
     const int dk = p.keyDim;
     const int per = dk / 32;
-    const int kh = h / (p.valueHeads / p.keyHeads);
+    const int kh = p.tiled != 0 ? h % p.keyHeads : h / (p.valueHeads / p.keyHeads);
     const int kw = p.keyHeads * dk;
     const float scale = rsqrt(float(dk));
     device float *col = state + ((ulong)h * p.valueDim + j) * dk;
@@ -3678,6 +3872,10 @@ kernel void gdn_rule(device const float *qkv [[buffer(0)]],
         }
         o = simd_sum(o);
         if (lane == 0) out[(ulong)t * p.valueHeads * p.valueDim + h * p.valueDim + j] = o;
+        if (t == p.snapTok) {
+            device float *sc = snapState + ((ulong)h * p.valueDim + j) * dk;
+            for (int r = 0; r < per; r++) sc[lane + 32 * r] = s[r];
+        }
     }
     for (int r = 0; r < per; r++) col[lane + 32 * r] = s[r];
 }
@@ -3779,17 +3977,20 @@ kernel void shared_gate_add(device const float *xb [[buffer(0)]],
 // Total threadgroup memory 8 KB (the f32 result tile of the staging epilogue aliases both input tiles), so up to four
 // threadgroups share a GPU core's 32 KB where the f32 kernels (12 KB) fit two.
 
-#define HM_SMEM 2048        // floats of threadgroup memory per *_hmma threadgroup: half weights 64 x 32 + f32 x 32 x 32
+#define HM_SMEM 2560        // floats of threadgroup memory per *_hmma threadgroup: half weights 64 x 32 + f32 x 32 x 32 + 8 diagonal 8 x 8 scale matrices
 
 // 16 weights (k = 16h .. 16h + 15 of the 32-weight block / unit u) of row grow of a GGUF tensor, dequantized as gg_unit
 // does. The legacy Q4_0 keeps llama.cpp's nibble order (low nibbles = weights 0..15), so for it half h is the low and
 // high nibbles of bytes 8h .. 8h + 7 = weights 8h .. 8h + 7 (w[0..1]) and 16 + 8h .. 16 + 8h + 7 (w[2..3]).
-template <int QT>
+// With RAW (Q4_0 / Q8_0 only) the integers come back unscaled: the *_hmma kernels apply the scale in f32 (hm_exact).
+template <int QT, bool RAW = false>
 static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, int h, thread float4 *w) {
-    if (QT == GG_Q4_0 || QT == GG_Q8_0) {
+    if (QT >= GG_NEW) {      // natural order: weights 16 h .. 16 h + 15
+        gg_new<QT, 4>(wq, grow, nb, u, 4 * h, w);
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) {
         constexpr int BYTES = QT == GG_Q4_0 ? 18 : 34;
         device const uchar *blk = wq + (grow * nb + u) * BYTES;
-        const float d = float(*(device const half *)blk);
+        const float d = RAW ? 1.0f : float(*(device const half *)blk);
         device const ushort *p = (device const ushort *)(blk + 2);
         if (QT == GG_Q4_0) {
             for (int k = 0; k < 2; k++) {
@@ -3832,6 +4033,13 @@ static inline void gg_half(device const uchar *wq, ulong grow, int nb, int u, in
     }
 }
 
+// Formats whose weight is an integer times one f32 scale per 32-weight block: the integers are exact in half, so the
+// *_hmma kernels keep the half tile exact (the integers only) and apply the scale in f32 after the multiply-accumulates
+// of the block (hm_core: a diagonal scale matrix and one more MMA per accumulator and block). The k-quants have
+// sub-block scales and minimums; their half tile holds q * scale rounded to half (relative error <= 2^-11 per weight).
+template <int QT>
+static inline constexpr bool hm_exact() { return QT == 4 || QT == 8 || QT == GG_Q4_0 || QT == GG_Q8_0; }
+
 // The raw bytes of this thread's share of block b for the engine's own formats (Q4_0: 8 quant bytes, Q8_0: 16, plus
 // the f32 scale), loaded one k step ahead; the other formats are decoded straight from device memory by hm_weights.
 template <int QT>
@@ -3846,6 +4054,8 @@ static inline void hm_fetch(device const uchar *rwq, device const float *rws, ul
         device const uchar4 *q = (device const uchar4 *)(rwq + (grow * nb + b) * 32 + h * 16);
         for (int k = 0; k < 4; k++) rq[k] = q[k];
         rs = rws[grow * nb + b];
+    } else if (QT == GG_Q4_0 || QT == GG_Q8_0) { // only the block's f16 scale; hm_weights reads the quants
+        rs = float(*(device const half *)(rwq + (grow * nb + b) * (QT == GG_Q4_0 ? 18 : 34)));
     }
 }
 
@@ -3856,14 +4066,16 @@ static inline void hm_fetch(device const uchar *rwq, device const float *rws, ul
 template <int QT>
 static inline void hm_weights(device const uchar *rwq, ulong grow, int nb, int b, int h, thread const uchar4 *rq,
                               float rs, threadgroup half *wd) {
+    // exact formats: the tile holds the integers (exact in half); the scale goes to the diagonal matrices (hm_core)
+    const float f = hm_exact<QT>() ? 1.0f : rs;
     if (QT == 4) {
         for (int k = 0; k < 2; k++) {
-            *(threadgroup half4 *)(wd + h * 64 + k * 4) = half4((float4(rq[k] & uchar4(15)) - 8.0f) * rs);
-            *(threadgroup half4 *)(wd + (2 + h) * 64 + k * 4) = half4((float4(rq[k] >> uchar4(4)) - 8.0f) * rs);
+            *(threadgroup half4 *)(wd + h * 64 + k * 4) = half4((float4(rq[k] & uchar4(15)) - 8.0f) * f);
+            *(threadgroup half4 *)(wd + (2 + h) * 64 + k * 4) = half4((float4(rq[k] >> uchar4(4)) - 8.0f) * f);
         }
     } else if (QT == 8) {
         for (int k = 0; k < 4; k++) {
-            *(threadgroup half4 *)(wd + (2 * h + (k >> 1)) * 64 + (k & 1) * 4) = half4(float4(as_type<char4>(rq[k])) * rs);
+            *(threadgroup half4 *)(wd + (2 * h + (k >> 1)) * 64 + (k & 1) * 4) = half4(float4(as_type<char4>(rq[k])) * f);
         }
     } else {
         float4 w[4];
@@ -3872,7 +4084,7 @@ static inline void hm_weights(device const uchar *rwq, ulong grow, int nb, int b
         } else if (QT == 6) {
             q6k_sub_block(rwq, grow, (nb + 7) >> 3, 2 * b + h, w);
         } else {
-            gg_half<QT>(rwq, grow, nb, b, h, w);
+            gg_half<QT, hm_exact<QT>()>(rwq, grow, nb, b, h, w);
         }
         const int kb0 = QT == GG_Q4_0 ? h : 2 * h;
         const int kb1 = QT == GG_Q4_0 ? 2 + h : 2 * h + 1;
@@ -3894,6 +4106,7 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
                            bool direct, device float *dout, ulong ldo, bool accLoad, ushort tid, ushort sg) {
     threadgroup half *sa = (threadgroup half *)smem;
     threadgroup float *sb = smem + MMA_BR * QK / 2;
+    threadgroup float *dg = smem + MMA_BR * QK;   // exact formats: per 8-row band an 8 x 8 matrix, the row scales on its diagonal
     const ushort sr = sg & 1;   // rows 32 sr .. 32 sr + 31 of the tile
     const ushort st = sg >> 1;  // tokens 16 st .. 16 st + 15
     const int ni = clamp((ntv - int(st) * 16 + 7) / 8, 0, 2);   // 8-token blocks of the quarter holding valid tokens
@@ -3920,8 +4133,13 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
     hm_fetch<QT>(rwq, rws, rgrow, nb, 0, h, rq, rs);
     float4 x0 = xr[0];
     float4 x1 = xr[1];
+    if (hm_exact<QT>()) { // the off-diagonal entries stay zero for good
+        for (int i = tid; i < 8 * 64; i += MM_THREADS) dg[i] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     for (int b = 0; b < nb; b++) {
         hm_weights<QT>(rwq, rgrow, nb, b, h, rq, rs, wd);
+        if (hm_exact<QT>() && h == 0) dg[(lr >> 3) * 64 + (lr & 7) * 9] = rs;
         xd[0] = x0;
         xd[1] = x1;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3930,7 +4148,31 @@ static inline void hm_core(device const uchar *rwq, device const float *rws, ulo
             x0 = xr[(b + 1) * 8];
             x1 = xr[(b + 1) * 8 + 1];
         }
-        if (ni > 0) {
+        if (hm_exact<QT>()) {
+            // the block's integer products in f32 per (token block, row block), then acc += tmp * diag(scale): the
+            // scale is applied in f32, as the CPU and the scalar kernels do, instead of rounding q * scale to half
+            if (ni > 0) {
+                simdgroup_float8x8 a[2][4];
+                for (int kk = 0; kk < 4; kk++) {
+                    for (int i = 0; i < 2; i++) {
+                        if (i < ni) simdgroup_load(a[i][kk], sb + ((st * 2 + i) * 4 + kk) * 64, 8);
+                    }
+                }
+                for (int j = 0; j < 4; j++) {
+                    simdgroup_half8x8 w[4];
+                    for (int kk = 0; kk < 4; kk++) simdgroup_load(w[kk], sa + ((sr * 4 + j) * 4 + kk) * 64, 8, ulong2(0, 0), true);
+                    simdgroup_float8x8 dm;
+                    simdgroup_load(dm, dg + (sr * 4 + j) * 64, 8);
+                    for (int i = 0; i < 2; i++) {
+                        if (i < ni) {
+                            simdgroup_float8x8 t = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                            for (int kk = 0; kk < 4; kk++) simdgroup_multiply_accumulate(t, a[i][kk], w[kk], t);
+                            simdgroup_multiply_accumulate(acc[i * 4 + j], t, dm, acc[i * 4 + j]);
+                        }
+                    }
+                }
+            }
+        } else if (ni > 0) {
             for (int kk = 0; kk < 4; kk++) {
                 simdgroup_half8x8 w[4];
                 for (int j = 0; j < 4; j++) simdgroup_load(w[j], sa + ((sr * 4 + j) * 4 + kk) * 64, 8, ulong2(0, 0), true);
@@ -4173,6 +4415,15 @@ HM_INSTANTIATE("q4g", GG_Q4_0)
 HM_INSTANTIATE("q8g", GG_Q8_0)
 HM_INSTANTIATE("q4k", GG_Q4_K)
 HM_INSTANTIATE("q5k", GG_Q5_K)
+HM_INSTANTIATE("q41", GG_Q4_1)
+HM_INSTANTIATE("q50", GG_Q5_0)
+HM_INSTANTIATE("q51", GG_Q5_1)
+HM_INSTANTIATE("q3k", GG_Q3_K)
+HM_INSTANTIATE("iq4nl", GG_IQ4_NL)
+HM_INSTANTIATE("iq4xs", GG_IQ4_XS)
+HM_INSTANTIATE("mxfp4", GG_MXFP4)
+HM_INSTANTIATE("f16w", GG_F16)
+HM_INSTANTIATE("bf16w", GG_BF16)
 
 // ---------------------------------------------------------------------------------------------- 13. flash prefill, second form
 // attention_fb<KV, ST, D>: the online-softmax prefill attention of attention_fa (same grid, parameters, masking and
@@ -4333,3 +4584,586 @@ kernel void attention_fb(device const float *q [[buffer(0)]],
 FB_INSTANTIATE(64)
 FB_INSTANTIATE(128)
 FB_INSTANTIATE(256)
+
+
+// ---------------------------------------------------------------------------------------------- 14. q4 KV cache
+// backend.kv-dtype=q4 (Java: KvQ4, KvCache.Q4). A cache row (one position of K or V) is kvDim / 2 bytes of 4-bit
+// codes followed by kvDim / 32 half scales: kv head h, group i (values 32 i .. 32 i + 31 of the head) has its 16 bytes
+// at h * headDim / 2 + 16 i (byte j: value j in the low nibble, value j + 16 in the high one) and its scale at half
+// index h * headDim / 32 + i; a value is (code - 7.5) * scale (levels at the odd multiples of half a step). K rows are stored Walsh-Hadamard rotated (unnormalized,
+// blocks of the largest power of two dividing headDim); kv_store_q4 rotates the chunk's queries in place the same way
+// and the host divides the score scale by the block (a power of two), so (Hq).(Hk) / B = q.k and no inverse is needed.
+//
+// Recent window (backend.kv-q4-recent = R > 0): per layer a ring of ringCap = R + batch half rows (kr, vr: rotated K,
+// plain V, [ringCap][kvDim]) and a tag per slot (the position it holds, -1 none). A query at position P reads the keys
+// [exactFrom(P), P] from the ring and the older ones from the q4 rows, exactFrom(P) = the first position from
+// max(0, P - R + 1) on such that every slot up to P still holds its position (q4_held_from): the same rule as the CPU
+// cache, so both backends read the same values for every (query, key) pair.
+
+// Unnormalized Walsh-Hadamard transform of a head row held by one simdgroup (lane l owns values l + 32 i, i < per), in
+// blocks of B values: the butterflies (a, b) -> (a + b, a - b) of stride 1, 2, 4, ... in KvQ4.rotate's order, strides
+// below 32 between lanes, the others between registers. The same operations on the same operands as the Java loop.
+static inline void q4_rotate(thread float *x, int per, int B, ushort lane) {
+    for (int h = 1; h < 32; h <<= 1) {
+        for (int i = 0; i < MAX_PER; i++) {
+            if (i < per) {
+                const float o = simd_shuffle_xor(x[i], ushort(h));
+                x[i] = (lane & h) != 0 ? o - x[i] : x[i] + o;
+            }
+        }
+    }
+    for (int h = 1; h < B / 32; h <<= 1) {
+        for (int i = 0; i < MAX_PER; i++) {
+            if (i < per && (i & h) == 0) {
+                const float a = x[i];
+                const float b = x[i + h];
+                x[i] = a + b;
+                x[i + h] = a - b;
+            }
+        }
+    }
+}
+
+// The 4-bit code of this lane's value of a group held one value per lane, and the group's scale (KvQ4.quantize):
+// d = half(max|x| / 7.5), code = clamp(rint(x / d + 7.5), 0, 15) (8 for an all-zero group).
+static inline uint q4_code(float x, thread half &dh) {
+    const float amax = simd_max(fabs(x));
+    dh = half(amax / 7.5f);
+    const float d = float(dh);
+    return d == 0.0f ? 8u : uint(clamp(rint(x / d + 7.5f), 0.0f, 15.0f));
+}
+
+// Value c (0 .. headDim) of kv head kvh in a q4 cache row.
+static inline float q4_value(device const uchar *row, int kvDim, int kvh, int headDim, int c) {
+    const int i = c / 32;
+    const int j = c % 32;
+    const uchar b = row[kvh * headDim / 2 + i * 16 + (j & 15)];
+    const float d = float(((device const half *)(row + kvDim / 2))[kvh * (headDim / 32) + i]);
+    return (float(j < 16 ? (b & 15) : (b >> 4)) - 7.5f) * d;
+}
+
+// The first position p >= max(0, top - span + 1) such that the ring holds every position of [p, top] (top + 1 when it
+// does not hold top). One simdgroup, 32 positions per step, uniform control flow.
+static inline int q4_held_from(device const int *tags, int ringCap, int top, int span, ushort lane) {
+    const int lim = max(0, top - span + 1);
+    for (int base = top; base >= lim; base -= 32) {
+        const int s = base - int(lane);
+        const bool missing = s >= lim && tags[s % ringCap] != s;
+        const int last = simd_max(missing ? s : -1); // the highest position the ring lost in this step
+        if (last >= 0) return last + 1;
+    }
+    return lim;
+}
+
+struct KvStoreQ4Params {
+    int headDim;
+    int kvDim;       // values per position (nKvHeads * headDim)
+    int nKvHeads;
+    int qStride;     // q row stride (nHeads * headDim)
+    int stride;      // bytes per cache row: kvDim / 2 + kvDim / 16
+    int pos0;        // position of the chunk's first token
+    int ringCap;     // ring slots, 0 = no recent window
+    int rotate;      // 1: Hadamard-rotate k and the queries (always, except in the accuracy study: -Djllm.kv.q4.rotate=false)
+};
+
+// kv_store_q4: grid (2 * nKvHeads + nHeads, ntok), one simdgroup (32 threads) per row. x < nKvHeads: k head x rotated
+// and quantized into the cache; x < 2 * nKvHeads: v head x - nKvHeads quantized (not rotated); the others: query head
+// x - 2 * nKvHeads rotated in place. k / v are the f32 staging rows [ntok, kvDim] (k after QK-norm and RoPE); kc / vc
+// are bound at the row of the chunk's first position. With a ring the (rotated) rows also go to the ring as halves
+// and the k-head-0 row writes the slot's tag.
+kernel void kv_store_q4(device const float *k [[buffer(0)]],
+                        device const float *v [[buffer(1)]],
+                        device uchar *kc [[buffer(2)]],
+                        device uchar *vc [[buffer(3)]],
+                        device float *q [[buffer(4)]],
+                        device half *kr [[buffer(5)]],
+                        device half *vr [[buffer(6)]],
+                        device int *tags [[buffer(7)]],
+                        constant KvStoreQ4Params &p [[buffer(8)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_simdgroup]]) {
+    const int x = int(tgp.x);
+    const int t = int(tgp.y);
+    const int per = p.headDim / 32;
+    const int B = p.headDim & -p.headDim;
+    float r[MAX_PER];
+    if (x >= 2 * p.nKvHeads) {
+        device float *qr = q + (ulong)t * p.qStride + (x - 2 * p.nKvHeads) * p.headDim;
+        for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? qr[lane + i * 32] : 0.0f;
+        if (p.rotate == 0) return;
+        q4_rotate(r, per, B, lane);
+        for (int i = 0; i < MAX_PER; i++) if (i < per) qr[lane + i * 32] = r[i];
+        return;
+    }
+    const bool isV = x >= p.nKvHeads;
+    const int h = isV ? x - p.nKvHeads : x;
+    device const float *src = (isV ? v : k) + (ulong)t * p.kvDim + h * p.headDim;
+    for (int i = 0; i < MAX_PER; i++) r[i] = i < per ? src[lane + i * 32] : 0.0f;
+    if (!isV && p.rotate != 0) q4_rotate(r, per, B, lane);
+    device uchar *row = (isV ? vc : kc) + (ulong)t * p.stride;
+    device half *sc = (device half *)(row + p.kvDim / 2);
+    for (int i = 0; i < MAX_PER; i++) {
+        if (i < per) {
+            half dh;
+            const uint c = q4_code(r[i], dh);
+            const uint hi = simd_shuffle_down(c, ushort(16));
+            if (lane < 16) row[h * p.headDim / 2 + i * 16 + lane] = uchar(c | (hi << 4));
+            if (lane == 0) sc[h * per + i] = dh;
+        }
+    }
+    if (p.ringCap > 0) {
+        const int slot = (p.pos0 + t) % p.ringCap;
+        device half *rr = (isV ? vr : kr) + (ulong)slot * p.kvDim + h * p.headDim;
+        for (int i = 0; i < MAX_PER; i++) if (i < per) rr[lane + i * 32] = half(r[i]);
+        if (!isV && h == 0 && lane == 0) tags[slot] = p.pos0 + t;
+    }
+}
+
+// attention_q4_t<PER>: attention_t<KV, 1, PER, PER> over a q4 cache (head width PER * 32, or p.qkDim for PER = 0):
+// the queries were rotated by kv_store_q4 and p.scale divided by the Hadamard block; keys before exactFrom(P) are read
+// from the q4 rows, the others from the ring. Same phases and reductions as attention_t.
+struct AttnQ4Params {
+    int nHeads;
+    int nKvHeads;
+    int qkDim;       // head width (headDim)
+    int pos0;
+    int ctx;
+    float scale;     // the score scale divided by the Hadamard block
+    int qStride;     // q row stride (nHeads * headDim)
+    int stride;      // cache row bytes (kvDim / 2 + kvDim / 16)
+    int oStride;     // output row stride (nHeads * headDim)
+    int window;      // sliding-window length in tokens, 0 = full causal attention
+    int tokenOffset; // first token of this tile; the scores scratch is indexed by the tile-local token
+    float softcap;
+    int recent;      // R, 0 = no ring
+    int ringCap;
+};
+
+template <int PER>
+kernel void attention_q4_t(device const float *q [[buffer(0)]],
+                           device const uchar *kc [[buffer(1)]],
+                           device const uchar *vc [[buffer(2)]],
+                           device float *out [[buffer(3)]],
+                           device float *scores [[buffer(4)]],
+                           device const half *kr [[buffer(5)]],
+                           device const half *vr [[buffer(6)]],
+                           device const int *tags [[buffer(7)]],
+                           constant AttnQ4Params &p [[buffer(8)]],
+                           uint2 tgp [[threadgroup_position_in_grid]],
+                           ushort2 tid2 [[thread_position_in_threadgroup]],
+                           ushort2 tpg2 [[threads_per_threadgroup]],
+                           ushort sg [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           ushort nsg [[simdgroups_per_threadgroup]]) {
+    constexpr int M = PER > 0 ? PER : MAX_PER;
+    threadgroup float red[ATT_SIMDGROUPS];
+    threadgroup float part[ATT_SIMDGROUPS][MAX_PER * 32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int per = PER > 0 ? PER : p.qkDim / 32;
+    const int hd = per * 32;
+    const int kvDim = p.nKvHeads * hd;
+
+    const int h = int(tgp.x);
+    const int tl = int(tgp.y);
+    const int t = p.tokenOffset + tl;
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int len = p.pos0 + t + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    const int exact = p.recent > 0 ? max(first, q4_held_from(tags, p.ringCap, len - 1, p.recent, lane)) : len;
+    device float *sc = scores + ((ulong)tl * p.nHeads + h) * p.ctx;
+
+    float qr[M];
+    device const float *qv = q + (ulong)t * p.qStride + h * hd;
+    for (int i = 0; i < M; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+
+    float mx = -INFINITY;
+    for (int s = first + sg; s < len; s += nsg) {
+        float kv[M];
+        if (s >= exact) {
+            device const half *row = kr + (ulong)(s % p.ringCap) * kvDim + kvh * hd;
+            for (int i = 0; i < M; i++) kv[i] = i < per ? float(row[lane + i * 32]) : 0.0f;
+        } else {
+            device const uchar *row = kc + (ulong)s * p.stride;
+            for (int i = 0; i < M; i++) kv[i] = i < per ? q4_value(row, kvDim, kvh, hd, lane + i * 32) : 0.0f;
+        }
+        float d = 0.0f;
+        for (int i = 0; i < M; i++) if (i < per) d += qr[i] * kv[i];
+        d = simd_sum(d) * p.scale;
+        if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
+        if (lane == 0) sc[s] = d;
+        mx = max(mx, d);
+    }
+    {
+        float v = simd_max(mx);
+        if (lane == 0) red[sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = simd_max(lane < nsg ? red[lane] : -INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    float sum = 0.0f;
+    for (int s = first + tid; s < len; s += tpg) {
+        float e = exp(sc[s] - mx);
+        sc[s] = e;
+        sum += e;
+    }
+    {
+        float v = simd_sum(sum);
+        if (lane == 0) red[sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = simd_sum(lane < nsg ? red[lane] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    float o[M];
+    for (int i = 0; i < M; i++) o[i] = 0.0f;
+    for (int s = first + sg; s < len; s += nsg) {
+        const float pr = sc[s];
+        if (s >= exact) {
+            device const half *row = vr + (ulong)(s % p.ringCap) * kvDim + kvh * hd;
+            for (int i = 0; i < M; i++) if (i < per) o[i] += pr * float(row[lane + i * 32]);
+        } else {
+            device const uchar *row = vc + (ulong)s * p.stride;
+            for (int i = 0; i < M; i++) if (i < per) o[i] += pr * q4_value(row, kvDim, kvh, hd, lane + i * 32);
+        }
+    }
+    for (int i = 0; i < M; i++) if (i < per) part[sg][lane + i * 32] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / sum;
+    for (int d = tid; d < hd; d += tpg) {
+        float acc = 0.0f;
+        for (int k = 0; k < nsg; k++) acc += part[k][d];
+        out[(ulong)t * p.oStride + h * hd + d] = acc * inv;
+    }
+}
+
+template [[host_name("attention_q4")]] kernel decltype(attention_q4_t<0>) attention_q4_t<0>;
+template [[host_name("attention_g1_d64_q4")]] kernel decltype(attention_q4_t<2>) attention_q4_t<2>;
+template [[host_name("attention_g1_d128_q4")]] kernel decltype(attention_q4_t<4>) attention_q4_t<4>;
+template [[host_name("attention_g1_d256_q4")]] kernel decltype(attention_q4_t<8>) attention_q4_t<8>;
+
+// attention_split_q4: attention_split over a q4 cache (flash decoding of one token at pos0; the partials go to
+// attention_combine). The extra fields: the q4 row bytes, R and the ring size.
+struct AttnSplitQ4Params {
+    int nHeads;
+    int nKvHeads;
+    int headDim;
+    int pos0;
+    int ctx;
+    float scale;     // the score scale divided by the Hadamard block
+    int qStride;
+    int stride;      // cache row bytes
+    int window;
+    float softcap;
+    int nSplit;
+    int chunk;       // keys per split; <= 0: ceil(keys / nSplit), computed by the kernel
+    int recent;
+    int ringCap;
+};
+
+kernel void attention_split_q4(device const float *q [[buffer(0)]],
+                               device const uchar *kc [[buffer(1)]],
+                               device const uchar *vc [[buffer(2)]],
+                               device float *part [[buffer(3)]],
+                               device float *scores [[buffer(4)]],
+                               device const half *kr [[buffer(5)]],
+                               device const half *vr [[buffer(6)]],
+                               device const int *tags [[buffer(7)]],
+                               constant AttnSplitQ4Params &p [[buffer(8)]],
+                               uint2 tgp [[threadgroup_position_in_grid]],
+                               ushort2 tid2 [[thread_position_in_threadgroup]],
+                               ushort2 tpg2 [[threads_per_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]],
+                               ushort lane [[thread_index_in_simdgroup]],
+                               ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    threadgroup float red[ATT_SIMDGROUPS][ATT_THREADS];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+
+    const int h = int(tgp.x);
+    const int split = int(tgp.y);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int len = p.pos0 + 1;
+    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    // chunk <= 0: ceil(keys / nSplit), derived here so that a recorded decode step only patches the position
+    const int chunk = p.chunk > 0 ? p.chunk : (len - first + p.nSplit - 1) / p.nSplit;
+    const int s0 = first + split * chunk;
+    const int s1 = min(len, s0 + chunk);
+    const int per = p.headDim / 32;
+    const int kvDim = p.nKvHeads * p.headDim;
+    const int exact = p.recent > 0 ? max(first, q4_held_from(tags, p.ringCap, p.pos0, p.recent, lane)) : len;
+    device const float *qv = q + h * p.headDim;
+    device float *sc = scores + (ulong)h * p.ctx;
+    device float *po = part + ((ulong)h * p.nSplit + split) * (p.headDim + 2);
+
+    float qr[MAX_PER];
+    for (int i = 0; i < MAX_PER; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+
+    float mx = -INFINITY;
+    for (int s = s0 + sg; s < s1; s += nsg) {
+        float d = 0.0f;
+        if (s >= exact) {
+            device const half *row = kr + (ulong)(s % p.ringCap) * kvDim + kvh * p.headDim;
+            for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * float(row[lane + i * 32]);
+        } else {
+            device const uchar *row = kc + (ulong)s * p.stride;
+            for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * q4_value(row, kvDim, kvh, p.headDim, lane + i * 32);
+        }
+        d = simd_sum(d) * p.scale;
+        if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
+        if (lane == 0) sc[s] = d;
+        mx = max(mx, d);
+    }
+    mx = tg_max(mx, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (s0 >= s1) {
+        for (int d = tid; d < p.headDim; d += tpg) po[d] = 0.0f;
+        if (tid == 0) { po[p.headDim] = -INFINITY; po[p.headDim + 1] = 0.0f; }
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int s = s0 + tid; s < s1; s += tpg) {
+        float e = exp(sc[s] - mx);
+        sc[s] = e;
+        sum += e;
+    }
+    sum = tg_sum(sum, buf, sg, lane, nsg);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float o[MAX_PER];
+    for (int i = 0; i < MAX_PER; i++) o[i] = 0.0f;
+    for (int s = s0 + sg; s < s1; s += nsg) {
+        const float pr = sc[s];
+        if (s >= exact) {
+            device const half *row = vr + (ulong)(s % p.ringCap) * kvDim + kvh * p.headDim;
+            for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * float(row[lane + i * 32]);
+        } else {
+            device const uchar *row = vc + (ulong)s * p.stride;
+            for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * q4_value(row, kvDim, kvh, p.headDim, lane + i * 32);
+        }
+    }
+    for (int i = 0; i < MAX_PER; i++) if (i < per) red[sg][lane + i * 32] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = tid; d < p.headDim; d += tpg) {
+        float acc = 0.0f;
+        for (int g = 0; g < nsg; g++) acc += red[g][d];
+        po[d] = acc;
+    }
+    if (tid == 0) {
+        po[p.headDim] = mx;
+        po[p.headDim + 1] = sum;
+    }
+}
+
+// attention_fa_q4<D>: attention_fa over a q4 cache. The K and V blocks are staged dequantized from the q4 rows; where
+// a block holds keys some row reads exactly (the band [exactFrom(P), P] of its rows), two corrections follow: the band
+// scores are recomputed from the ring rows before the softmax, and after O += P V_q4 the band's share is added as
+// O += P_band (V_ring - V_q4), P_band being P with every entry outside the row's band zeroed.
+struct FlashQ4Params {
+    int nHeads;
+    int nKvHeads;
+    int pos0;        // position of the chunk's first token
+    int ntok;        // tokens in the chunk
+    float scale;     // the score scale divided by the Hadamard block
+    int qStride;     // q row stride (nHeads * D)
+    int stride;      // cache row bytes
+    int oStride;     // output row stride (nHeads * D)
+    int window;
+    float softcap;
+    int recent;
+    int ringCap;
+};
+
+template <int D>
+kernel void attention_fa_q4(device const float *q [[buffer(0)]],
+                            device const uchar *kc [[buffer(1)]],
+                            device const uchar *vc [[buffer(2)]],
+                            device float *out [[buffer(3)]],
+                            device const half *kr [[buffer(4)]],
+                            device const half *vr [[buffer(5)]],
+                            device const int *tags [[buffer(6)]],
+                            constant FlashQ4Params &p [[buffer(7)]],
+                            uint2 tgp [[threadgroup_position_in_grid]],
+                            ushort tid [[thread_index_in_threadgroup]],
+                            ushort sg [[simdgroup_index_in_threadgroup]],
+                            ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int BK = 4096 / D;
+    constexpr int NI = D / 8;
+    constexpr int NJ = BK / 8;
+    threadgroup float kvs[BK * D];
+    threadgroup float sb[FA_THREADS / 32][8 * BK];
+    threadgroup float st[FA_THREADS / 32][64];
+
+    const int h = int(tgp.x);
+    const int kvh = h / (p.nHeads / p.nKvHeads);
+    const int kvDim = p.nKvHeads * D;
+    const int t0 = int(tgp.y) * FA_ROWS;
+    const int r0 = t0 + int(sg) * 8;
+    const int tEnd = min(p.ntok, t0 + FA_ROWS);
+    const int firstKey = p.window > 0 ? max(0, p.pos0 + t0 + 1 - p.window) : 0;
+    const int lastKey = p.pos0 + tEnd;
+    // every row's band starts at max(held, P - R + 1); the threadgroup's band at bandLo. This equals exactFrom(P)
+    // because the ring cannot have lost a position of the chunk itself (ringCap >= R + batch), so the highest lost
+    // position below lastKey is below every row's own position
+    const int held = p.recent > 0 ? q4_held_from(tags, p.ringCap, lastKey - 1, p.recent + FA_ROWS, lane) : lastKey;
+    const int bandLo = p.recent > 0 ? max(held, p.pos0 + t0 - p.recent + 1) : lastKey;
+
+    simdgroup_float8x8 qm[NI];
+    for (int i = 0; i < NI; i++) {
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            st[sg][e] = t < p.ntok ? q[(ulong)t * p.qStride + h * D + i * 8 + e % 8] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(qm[i], &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_float8x8 om[NI];
+    for (int i = 0; i < NI; i++) om[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m[8];
+    float l[8];
+    for (int r = 0; r < 8; r++) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+    }
+
+    for (int k0 = firstKey / BK * BK; k0 < lastKey; k0 += BK) {
+        const bool band = k0 + BK > bandLo;   // some row of the threadgroup reads keys of this block exactly
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = tid; e < BK * D; e += FA_THREADS) {
+            const int key = k0 + e / D;
+            kvs[e] = key < lastKey ? q4_value(kc + (ulong)key * p.stride, kvDim, kvh, D, e % D) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, &kvs[j * 8 * D + i * 8], D, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s, qm[i], kt, s);
+            }
+            simdgroup_store(s, &sb[sg][j * 8], BK);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (band) { // the band's scores from the ring rows
+            for (int r = 0; r < 8; r++) {
+                const int t = r0 + r;
+                const int P = p.pos0 + t;
+                const int ex = max(held, P - p.recent + 1);
+                for (int c = lane; c < BK; c += 32) {
+                    const int key = k0 + c;
+                    if (t < p.ntok && key >= ex && key <= P) {
+                        device const float *qv = q + (ulong)t * p.qStride + h * D;
+                        device const half *kv = kr + (ulong)(key % p.ringCap) * kvDim + kvh * D;
+                        float d = 0.0f;
+                        for (int i = 0; i < D; i++) d += qv[i] * float(kv[i]);
+                        sb[sg][r * BK + c] = d;
+                    }
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (int r = 0; r < 8; r++) {
+            const int t = r0 + r;
+            const int len = p.pos0 + t + 1;
+            const int first = p.window > 0 ? max(0, len - p.window) : 0;
+            float mx = -INFINITY;
+            for (int c = lane; c < BK; c += 32) {
+                const int key = k0 + c;
+                float v = sb[sg][r * BK + c] * p.scale;
+                if (p.softcap > 0.0f) v = softcap_f(v, p.softcap);
+                if (t >= p.ntok || key < first || key >= len) v = -INFINITY;
+                sb[sg][r * BK + c] = v;
+                mx = max(mx, v);
+            }
+            mx = simd_max(mx);
+            const float mNew = max(m[r], mx);
+            float sum = 0.0f;
+            for (int c = lane; c < BK; c += 32) {
+                const float e = mNew == -INFINITY ? 0.0f : exp(sb[sg][r * BK + c] - mNew);
+                sb[sg][r * BK + c] = e;
+                sum += e;
+            }
+            sum = simd_sum(sum);
+            const float alpha = m[r] == -INFINITY ? 0.0f : exp(m[r] - mNew);
+            l[r] = l[r] * alpha + sum;
+            m[r] = mNew;
+            if (lane < 8) st[sg][r * 8 + lane] = int(lane) == r ? alpha : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dg;
+        simdgroup_load(dg, &st[sg][0], 8);
+        for (int i = 0; i < NI; i++) simdgroup_multiply(om[i], dg, om[i]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = tid; e < BK * D; e += FA_THREADS) {
+            const int key = k0 + e / D;
+            kvs[e] = key < lastKey ? q4_value(vc + (ulong)key * p.stride, kvDim, kvh, D, e % D) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = 0; j < NJ; j++) {
+            simdgroup_float8x8 pm;
+            simdgroup_load(pm, &sb[sg][j * 8], BK);
+            for (int i = 0; i < NI; i++) {
+                simdgroup_float8x8 vm;
+                simdgroup_load(vm, &kvs[j * 8 * D + i * 8], D);
+                simdgroup_multiply_accumulate(om[i], pm, vm, om[i]);
+            }
+        }
+        if (band) { // O += P_band (V_ring - V_q4)
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int r = 0; r < 8; r++) {
+                const int t = r0 + r;
+                const int P = p.pos0 + t;
+                const int ex = max(held, P - p.recent + 1);
+                for (int c = lane; c < BK; c += 32) {
+                    const int key = k0 + c;
+                    if (!(t < p.ntok && key >= ex && key <= P)) sb[sg][r * BK + c] = 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup); // every simdgroup is done with the q4 V block
+            for (int e = tid; e < BK * D; e += FA_THREADS) {
+                const int key = k0 + e / D;
+                if (key >= bandLo && key < lastKey) {
+                    kvs[e] = float(vr[(ulong)(key % p.ringCap) * kvDim + kvh * D + e % D]) - kvs[e];
+                } else {
+                    kvs[e] = 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int j = 0; j < NJ; j++) {
+                simdgroup_float8x8 pm;
+                simdgroup_load(pm, &sb[sg][j * 8], BK);
+                for (int i = 0; i < NI; i++) {
+                    simdgroup_float8x8 vm;
+                    simdgroup_load(vm, &kvs[j * 8 * D + i * 8], D);
+                    simdgroup_multiply_accumulate(om[i], pm, vm, om[i]);
+                }
+            }
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8) {
+        for (int r = 0; r < 8; r++) st[sg][r * 8 + lane] = int(lane) == r && l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, &st[sg][0], 8);
+    for (int i = 0; i < NI; i++) {
+        simdgroup_float8x8 o;
+        simdgroup_multiply(o, dg, om[i]);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(o, &st[sg][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = lane; e < 64; e += 32) {
+            const int t = r0 + e / 8;
+            if (t < p.ntok) out[(ulong)t * p.oStride + h * D + i * 8 + e % 8] = st[sg][e];
+        }
+    }
+}
+
+template [[host_name("attention_fa_d64_q4")]] kernel decltype(attention_fa_q4<64>) attention_fa_q4<64>;
+template [[host_name("attention_fa_d128_q4")]] kernel decltype(attention_fa_q4<128>) attention_fa_q4<128>;
+template [[host_name("attention_fa_d256_q4")]] kernel decltype(attention_fa_q4<256>) attention_fa_q4<256>;

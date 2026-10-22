@@ -263,9 +263,9 @@ public final class Qwen3NextChecks {
                 if (cpu != null) {
                     try (Backend k = cpu.open(w, 64, 16, dt)) {
                         if (!k.stateFormat().equals(b.stateFormat())) {
-                            // Metal keeps a q8 request in f16; the engine loads a file only into the same format
+                            // Metal keeps a q8 / q4 request in f16; the engine loads a file only into the same format
                             cross = ", cpu file not loaded (format " + k.stateFormat() + " vs " + b.stateFormat() + ")";
-                            crossOk = dt == KvDtype.Q8;
+                            crossOk = dt == KvDtype.Q8 || dt == KvDtype.Q4;
                         } else {
                             k.forward(PROMPT, 0, n, 0, null);
                             var cb = new ByteArrayOutputStream();

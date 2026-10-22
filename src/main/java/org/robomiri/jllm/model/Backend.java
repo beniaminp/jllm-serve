@@ -48,6 +48,50 @@ public interface Backend extends AutoCloseable {
     }
 
     /**
+     * Whether {@link #forwardEmbeds} works: the backend can start a forward pass from embedding vectors (the output
+     * of a vision encoder) instead of token ids.
+     */
+    default boolean supportsEmbeds() {
+        return false;
+    }
+
+    /**
+     * Like {@link #forward} for {@code n} positions {@code [pos, pos+n)} whose input is not looked up in the embedding
+     * table but given: {@code embeds[(off + i) * dim ..]} is the residual-stream input of position {@code pos + i}
+     * ({@code dim} = the model's hidden size, used as it is: no embedding scale). Used for image tokens. Only when
+     * {@link #supportsEmbeds}.
+     */
+    default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[] logits) {
+        forwardEmbeds(embeds, off, n, pos, null, logits);
+    }
+
+    /**
+     * {@link #forwardEmbeds(float[], int, int, int, float[])} with Qwen3-VL's deepstack: {@code deepstack[l]} (the same
+     * layout as {@code embeds}, rows {@code off ..}) is added to the hidden state of these positions after layer
+     * {@code l}, for {@code l < deepstack.length}; null = none.
+     */
+    default void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        throw new UnsupportedOperationException(name() + " cannot run from embeddings");
+    }
+
+    /**
+     * Replaces the rotary positions of cache slots {@code [from, contextLength)} with {@code p} (Qwen-VL's M-RoPE; see
+     * {@link RopePositions}), or with the plain {@code slot} when {@code p} is null. Keys already in the cache keep
+     * the rotation they were stored with. Returns false, changing nothing, when the backend cannot.
+     */
+    default boolean setRopePositions(int from, RopePositions p) {
+        return p == null;
+    }
+
+    /**
+     * Whether {@link #setRopePositions} has left non-plain rotary positions in some slots; such a backend cannot join
+     * {@link #forwardBatch} (the batch uses one backend's tables for all rows).
+     */
+    default boolean ropePositionsCustom() {
+        return false;
+    }
+
+    /**
      * Whether the state after tokens {@code [0, N)} can be rewound to an earlier position. A KV cache can (positions
      * past {@code pos} are simply overwritten); a recurrent state (Mamba) cannot, so the engine then reuses the
      * cache only when the new prompt extends everything that was fed before, and otherwise restarts at position 0.
@@ -74,6 +118,61 @@ public interface Backend extends AutoCloseable {
 
     default boolean supportsPrefixReuse() {
         return true;
+    }
+
+    // ------------------------------------------------------------------ multi-token prediction (Qwen3.5 GGUF)
+
+    /** Whether the model has a multi-token-prediction head this backend can run ({@link Qwen3NextMtp}). */
+    default boolean hasMtp() {
+        return false;
+    }
+
+    /**
+     * Turns the head on or off. While on, every {@link #forward} / {@link #forwardAll} also feeds the head (its own KV
+     * cache and the hidden state of the last position), at the cost of one extra transformer layer per token. Takes
+     * effect from the next prompt (position 0).
+     */
+    default void enableMtp(boolean on) {
+        throw new UnsupportedOperationException(name() + " has no multi-token-prediction head");
+    }
+
+    /** Whether {@link #mtpDraft} can be called now: the head follows every position passed so far. */
+    default boolean mtpReady() {
+        return false;
+    }
+
+    /**
+     * The head's guess for the token that will follow {@code token}, which the model has just chosen to follow the last
+     * position it processed and which is fed next: the head's logits (vocabulary-sized) go to {@code logits}.
+     */
+    default void mtpDraft(int token, float[] logits) {
+        throw new UnsupportedOperationException(name() + " has no multi-token-prediction head");
+    }
+
+    /**
+     * Whether {@link #checkpointState} / {@link #rollbackState} work: before a verification pass of two tokens the
+     * recurrent state is armed to be kept after the first of them, and when the draft (the second) is rejected the state
+     * is put back to that point (the KV cache needs nothing: later positions are overwritten).
+     */
+    default boolean supportsRollback() {
+        return false;
+    }
+
+    /**
+     * Arms the next pass ({@link #forwardAll} of two tokens): the recurrent state and the head's bookkeeping as they are
+     * after its <em>first</em> token can be restored by {@link #rollbackState}. One checkpoint is kept. A backend may
+     * save the state as it is now and replay, or have the pass save it on the way.
+     */
+    default void checkpointState() {
+        throw new UnsupportedOperationException(name() + " cannot checkpoint its state");
+    }
+
+    /**
+     * Puts the state to what it was after the first {@code keep} (= 1) tokens of the pass armed by
+     * {@link #checkpointState}, as if only they had been fed.
+     */
+    default void rollbackState(int keep) {
+        throw new UnsupportedOperationException(name() + " cannot roll back its state");
     }
 
     /**

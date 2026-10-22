@@ -19,12 +19,15 @@ ROWS, COLS = 4, 512
 SCALES = {
     T.Q4_0: [0], T.Q8_0: [0], T.Q4_1: [0, 2], T.Q5_0: [0], T.Q5_1: [0, 2],
     T.Q2_K: [80, 82], T.Q3_K: [108], T.Q4_K: [0, 2], T.Q5_K: [0, 2], T.Q6_K: [208],
+    T.IQ4_NL: [0], T.IQ4_XS: [0],
 }
+# type -> offsets of e8m0 exponent bytes (a random byte is a scale of 2^-127 .. 2^128: keep it in a sane range)
+E8M0 = {T.MXFP4: [0]}
 
 
 def main(out):
     rng = np.random.default_rng(12345)
-    for t, offs in SCALES.items():
+    for t, offs in list(SCALES.items()) + [(t, []) for t in E8M0]:
         block, size = gguf.GGML_QUANT_SIZES[t]
         nb = COLS // block
         data = rng.integers(0, 256, size=(ROWS, nb, size), dtype=np.uint8)
@@ -32,6 +35,11 @@ def main(out):
             f = rng.uniform(0.002, 0.05, size=(ROWS, nb)).astype(np.float16)
             data[:, :, o:o + 2] = f.view(np.uint8).reshape(ROWS, nb, 2)
         data = data.reshape(ROWS, nb * size)
+        for o in E8M0.get(t, []):
+            e = rng.integers(112, 124, size=(ROWS, nb)).astype(np.uint8)
+            data = data.reshape(ROWS, nb, size)
+            data[:, :, o] = e
+            data = data.reshape(ROWS, nb * size)
         ref = quants.dequantize(data, t).astype(np.float32)
         assert ref.shape == (ROWS, COLS), ref.shape
         assert np.isfinite(ref).all()

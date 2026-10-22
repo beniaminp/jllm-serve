@@ -9,13 +9,16 @@ Supported families (Hugging Face `model_type`): **Qwen3** dense and MoE (`qwen3`
 and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`mistral`), **GLM / GLM-4**
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
 **DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting), **Mamba** (`mamba`) and
-**Qwen3-Next** (`qwen3_next`: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
+**Qwen3-Next** (`qwen3_next`; also **Qwen3.5** from GGUF: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
 [docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)).
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
-conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
-place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)). Apple **MLX** quantized checkpoints
+conversion step: Qwen3 / Qwen3-MoE / Qwen2 / Llama architectures and the hybrid **Qwen3.5** (`qwen35`) and
+Qwen3-Next (`qwen3next`) ones, Q4_0, Q8_0, Q4_K, Q5_K and Q2_K blocks used in
+place from the memory-mapped file on both backends ([docs/16](docs/16-gguf.md)); a Qwen3.5 file's own
+multi-token-prediction layer can draft for speculative decoding (`--engine.speculative mtp`,
+[docs/16 §16.14](docs/16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model)). Apple **MLX** quantized checkpoints
 (`mlx-community/*-4bit`, `-8bit`, and the `mxfp4` / `mxfp8` modes) and block-quantized **FP8** checkpoints are read too:
 dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 
@@ -26,7 +29,7 @@ dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md
 | Byte-level and SentencePiece-style BPE tokenizers + per-family chat templates | `tokenizer/` | yes |
 | Typed model description (`Architecture`, `LayerSpec`, `RopeTable`, one parser per family) | `model/Architecture.java`, `model/Families.java`, ... | yes |
 | Q4_0 / Q8_0 / Q2_K block quantization + versioned, mmap'd quantized cache file, shard-by-shard resumable conversion | `model/QTensor.java`, `model/Q2K.java`, `model/QuantFile.java`, `model/ModelConverter.java` | yes |
-| GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q8_0, Q4_K, Q5_K; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `tokenizer/GgufTokenizer.java` | yes |
+| GGUF reader (memory-mapped, split files), ggml block formats read in place (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, MXFP4, F16, BF16; CPU + Metal kernels), architecture / tokenizer / tensor mapping from the file's metadata | `gguf/`, `model/Ggml.java`, `cpu/GgufKernels.java`, `cpu/GgufInt8Kernels.java`, `tokenizer/GgufTokenizer.java` | yes |
 | Forward pass on CPU: dense, MoE, MLA, Mamba (Vector API SIMD, int8 activations, custom thread pool, f32/f16/q8 KV cache) | `cpu/` | yes |
 | Forward pass on GPU: the same on Metal (fused kernels, Panama FFM bindings) | `metal/`, `src/main/native/` | yes |
 | Sampler (temperature, top-k, top-p, min-p, penalties) | `sampling/` | yes |
@@ -48,9 +51,10 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Conversations saved to disk | long prompts survive restarts: 21 s prefill → 0.9 s restore | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | Pipelined GPU decoding | the GPU picks the greedy token itself and runs the next step before the CPU has looked | [08 §8.16](docs/08-metal-backend.md#816-pipelined-greedy-decoding) |
 | Decode replay | a decode step's ~170 GPU dispatches are recorded once and replayed with one native call per token instead of one call per dispatch | [08 §8.22](docs/08-metal-backend.md#822-decode-replay-one-native-call-per-token) |
-| Multi-row decode matvec on Metal | the single-token matmuls give a simdgroup 4 rows that share the activations and the rmsnorm prologue: matvecs per token 6.76 → 5.52 ms, 0.6B decode 118 → 132 tok/s, GGUF Q4_0 105 → 133 (`-Djllm.metal.mvRows=1` for the old kernels) | [08 §8.27](docs/08-metal-backend.md#827-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_) |
-| Decode attention on Metal | independent simdgroups with online softmax in registers and K/V rows shared by a kv head's query heads, picked by the start-up check: ~2× at 3 000 tokens of context (63 → 93 tok/s; f16 / q8 caches 62 → 113) | [08 §8.28](docs/08-metal-backend.md#828-decode-attention-attention_dec) |
-| Prefill chunk `auto` | 256-token chunks for dense models on Metal (prefill 1 426 → 2 012 tok/s on Qwen3-0.6B), logits identical across chunk sizes | [08 §8.26](docs/08-metal-backend.md#826-the-prefill-chunk-backendbatchauto) |
+| Concurrent compute encoder | `-Djllm.metal.concurrent`: the Metal encoder lets independent dispatches overlap and the native layer inserts a barrier only where a kernel reads or overwrites what an earlier one wrote (found from the pipelines' reflection); bit-identical to the serial encoder, no gain for single-stream decode (every dispatch depends on the one before), no gain for single-stream decode or prefill (30B included), a few percent for three slots in shared passes, off by default | [08 §8.28](docs/08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before) |
+| Multi-row decode matvec on Metal | the single-token matmuls give a simdgroup 4 rows that share the activations and the rmsnorm prologue: matvecs per token 6.76 → 5.52 ms, 0.6B decode 118 → 132 tok/s, GGUF Q4_0 105 → 133 (`-Djllm.metal.mvRows=1` for the old kernels) | [08 §8.30](docs/08-metal-backend.md#830-several-output-rows-per-simdgroup-in-the-decode-matvec-mvnr_) |
+| Decode attention on Metal | independent simdgroups with online softmax in registers and K/V rows shared by a kv head's query heads, picked by the start-up check: ~2× at 3 000 tokens of context (63 → 93 tok/s; f16 / q8 caches 62 → 113) | [08 §8.31](docs/08-metal-backend.md#831-decode-attention-attention_dec) |
+| Prefill chunk `auto` | 256-token chunks for dense models on Metal (prefill 1 426 → 2 012 tok/s on Qwen3-0.6B), logits identical across chunk sizes | [08 §8.29](docs/08-metal-backend.md#829-the-prefill-chunk-backendbatchauto) |
 | Flash-attention prefill on Metal | 32 query rows share each block of keys, online softmax, no score buffer | [08 §8.13](docs/08-metal-backend.md#813-flash-attention-prefill-attention_fa) |
 | Kernel self-check at start-up | new kernels are compared with the established ones on your GPU and used only if correct and faster; cached per device | [08 §8.14](docs/08-metal-backend.md#814-the-kernel-self-check-metaltuner) |
 | Expert-grouped MoE prefill | tokens are sorted by expert so each expert's weights are read once per tile, not once per token; MoE models prefill in 256-token chunks so each expert serves ~16 tokens per read (CPU experts measured 1.6× faster per token) | [08 §8.15](docs/08-metal-backend.md#815-expert-grouped-moe-prefill) |
@@ -59,9 +63,14 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Stopping for a client that left | an agent that cancels a request frees its slot within one prefill chunk or one token, streaming or not, instead of generating to the end | [17 §17.6](docs/17-agent-speedups.md#176-noticing-a-client-that-left) |
 | Saving in the background, restoring part | a conversation is saved while the next turn already runs (the engine is held 0.3 ms instead of 3 s), and a saved file restores just the prefix a new prompt shares with it | [17 §17.3](docs/17-agent-speedups.md#173-saved-conversations) |
 | q8 KV cache | `backend.kv-dtype=q8`: int8 keys and values with one scale per row of a kv head, half of f16 (59 KB vs 115 KB per token for Qwen3-0.6B), on both backends, files interchangeable | [07](docs/07-cpu-backend.md#q8-int8-values-and-a-scale-per-row-kvcacheq8), [08](docs/08-metal-backend.md#q8) |
+| q4 KV cache | `backend.kv-dtype=q4`: Hadamard-rotated keys (the query is rotated too, so scores are unchanged), 4-bit groups of 32 with a half scale, and the latest `backend.kv-q4-recent` positions also kept as halves; 31.5 KB per token for Qwen3-0.6B (f16 115 KB, q8 59 KB), on both backends, decode replay, batched decoding and saved files included. Measured against f16 on Qwen3-0.6B it is clearly less accurate than q8 (the keys need about 5 bits), so it is opt-in | [07](docs/07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4), [08 §8.27](docs/08-metal-backend.md#827-the-q4-kv-cache-on-the-gpu-backendkv-dtypeq4), [11 §11.9](docs/11-performance.md#119-the-q4-kv-cache-measured) |
 | int8 or float, measured | `backend.cpu.int8-activations=auto` times one token's matmuls both ways at load and keeps the faster (int8 on ARM, often float on AVX-512) | [07 §7.10.1](docs/07-cpu-backend.md#7101-auto-measure-dont-guess) |
 | Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
+| Speech-to-text (Whisper) | `openai/whisper-tiny … large-v3-turbo` from the Hub: log-mel exactly as `transformers` computes it, encoder + decoder with cross-attention on the CPU (4x4 register tiles) and on Metal (own `audio.metal` kernels, encoder and decoder on the GPU), the OpenAI decoding protocol (language detection, timestamps, 30 s windows, temperature fallback), word timestamps by DTW over the alignment heads; identical token ids to `transformers`; `POST /v1/audio/transcriptions` and `/translations` | [21](docs/21-audio.md) |
+| Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |
+| Audio tab and editor | record or upload, transcribe (SRT/VTT/JSON, word times), text to speech, a waveform editor (cut, fade, normalize, silence removal, mix, undo; transcribe or replace a selection, edit audio by editing its transcript), dictation and read-aloud in the chat, `transcribe_audio` / `speak` tools | [21](docs/21-audio.md) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
+| Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL; the Gemma 3 projector) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
 
 The Metal items above (up to the M1 Pro measurement; decode replay and fusion, half-weight MMA prefill, Metal
 batched decoding and draft speculation were merged after it and are verified on the emulator only) were verified for correctness on the emulator (every family, CPU == Metal) and on an M1 Pro
@@ -98,6 +107,19 @@ repository, revision and commit the cache was made from: a cache from an older c
 reconverted automatically, and an interrupted conversion resumes where it stopped (`jllm-q4_0.partial.json`).
 Only the shards listed in the model's `model.safetensors.index.json` (or `model.safetensors`) are downloaded.
 
+### Audio
+
+```sh
+./jllm transcribe --model openai/whisper-small --audio talk.wav --format srt      # speech to text (Metal when available)
+./jllm speak --model OuteAI/OuteTTS-0.3-500M --prompt "Hello from jllm." --voice en_female_1 --out hello.wav
+./jllm serve --audio.stt-model openai/whisper-small --audio.tts-model OuteAI/OuteTTS-0.3-500M   # + /v1/audio/* endpoints
+curl localhost:8080/v1/audio/transcriptions -F file=@talk.wav -F response_format=verbose_json -F 'timestamp_granularities[]=word'
+curl localhost:8080/v1/audio/speech -H 'Content-Type: application/json' -d '{"input":"Hello.","voice":"en_male_1"}' -o hello.wav
+```
+
+Models load like text models (the console's Models page, `jllm.web.autoload`); WAV, AIFF and AU are read in pure Java, other formats through `ffmpeg` if installed
+(the console's Audio tab converts to WAV in the browser). Details, settings (`audio.*`) and measurements: [docs/21](docs/21-audio.md).
+
 ### Other models
 
 ```sh
@@ -122,11 +144,15 @@ Only the shards listed in the model's `model.safetensors.index.json` (or `model.
 A repository with several `.gguf` files needs `--gguf-quant` (a label such as `Q4_K_M`) or `--gguf-file` (exact name);
 without either the error lists the files. Only the chosen file (and the `-0000i-of-0000N` parts of a split model) is
 downloaded, with the usual resume and SHA-256 check. Nothing is converted or cached: the weights are read from the
-mapped file. Q4_0, Q8_0, Q2_K and the K-quants Q4_K / Q5_K / Q6_K (the usual `Q4_K_M` mix) are computed in place; on
-the CPU the K-quants use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11 tok/s on 4 AVX-512
-cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Other formats (Q3_K, Q4_1, Q5_0/1,
-F16/BF16) are requantized to Q8_0 in memory at load. See [docs/16](docs/16-gguf.md) for the file format, the llama q/k permutation, the zero-copy mapping
-and the verification.
+mapped file. Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, the K-quants Q4_K / Q5_K / Q6_K (the usual `Q4_K_M` mix), the
+non-linear 4-bit IQ4_NL / IQ4_XS, MXFP4 (gpt-oss) and F16 / BF16 matrices are computed in place, on both backends (a
+mixed file such as the `Q4_0` of Qwen3.8 with `ffn_down` in Q4_1 stays at its 4.5-5 bits per weight instead of being
+widened to 8.5); on the CPU most of them use int8-activation kernels like Q4_0 (Qwen3-0.6B `Q4_K_M` decodes at ~11
+tok/s on 4 AVX-512 cores, [docs/07](docs/07-cpu-backend.md#gguf-k-quants-kquantkernels)). Only F32 matrices (and
+whatever `-Djllm.gguf.requantize=<types>` lists, to compare with the old behaviour; the CPU backend requantizes
+Q5_1, Q3_K, F16 and BF16 by default because its in-place decode of those is more than 25% slower, `=none` keeps them in place) are
+requantized to Q8_0 in memory at load; IQ1-IQ3 and the ternary types are refused. See [docs/16](docs/16-gguf.md) for the file format, the type table
+(16.4.1), the llama q/k permutation, the zero-copy mapping and the verification.
 
 `--low-disk` downloads, quantizes and deletes the safetensors shards one at a time, so the 30B MoE (61 GB in
 bf16, ~20 GB quantized) converts on a machine with ~30 GB free. See [docs/12](docs/12-mixture-of-experts.md).
@@ -149,6 +175,24 @@ $JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=AL
      -cp target/classes org.robomiri.jllm.Main serve
 ```
 
+### Pictures (vision-language models)
+
+```sh
+./jllm run  --model ggml-org/SmolVLM-256M-Instruct-GGUF --gguf-quant Q8_0 --image photo.png --prompt "What is in this picture?"
+./jllm chat --model ggml-org/Qwen2.5-VL-3B-Instruct-GGUF --gguf-quant Q4_K_M --image a.png,b.jpg   # the pictures go with your first message
+./jllm serve --model ggml-org/Qwen3-VL-2B-Instruct-GGUF --gguf-quant Q8_0                          # image_url parts in /v1/chat/completions
+```
+
+A vision-language GGUF model is two files: the text model and its multimodal projector `mmproj-*.gguf` (found next to
+the model or in its Hub repository and downloaded with it, or named with `--mmproj`; `--vision.enabled false` loads
+text only). A chat request carries a picture as an OpenAI `image_url` content part (a `data:` URL, or an http(s) URL
+the server fetches, never from private addresses unless `vision.allow-private-urls`); the web console's chat box
+attaches, pastes or drops pictures; a text-only model can use a loaded vision model through the `describe_image` tool.
+Put the picture before the question. Settings: `vision.*` in [`jllm.properties`](src/main/resources/jllm.properties);
+the chapter is [docs/20](docs/20-vision.md). Not yet end to end: Gemma 3 (the `gemma3` GGUF text architecture and its
+bidirectional attention inside a picture are not in this build; its projector is implemented and checked) and
+`unsloth/Qwen3.8-27B-GGUF` (its projector runs; the hybrid text architecture takes no embeddings yet).
+
 ### API
 
 ```sh
@@ -158,7 +202,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
-`GET /health`, `GET /` (chat UI). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+`GET /health`, `GET /` (chat UI), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`, `logit_bias` (token id →
 −100…100, added to the logits). Also supported:
 
@@ -210,9 +254,14 @@ repository by its launcher).
   by date, exportable as Markdown); edit a message and resend, regenerate, copy; Markdown with tables and code blocks;
   Qwen3 thinking toggle (the `<think>` part is collapsible); per-chat sampling parameters and system prompt; tokens/s
   and a context-usage meter; light / dark theme.
+- **Pictures**: with a vision-language GGUF model (SmolVLM, Qwen2.5-VL, Qwen3-VL; the projector is loaded with it,
+  the load form can name another or none) the chat box takes pictures: the attach button, paste and drag and drop;
+  thumbnails stay in the browser, the model list shows a *vision* badge, and `image_url` parts work on `/v1/chat/completions`
+  and `/api/chat`. The built-in `describe_image` tool lets a text-only model ask a loaded vision model about a picture
+  (URL, `data:` URL or an id from `POST /api/images`). [docs/20](docs/20-vision.md)
 - **Tools**: pick per chat which functions the model may call. Built in: `web_search` (DuckDuckGo with no key,
   or a SearXNG instance, or the Brave Search API), `fetch_url` (a page as readable text; private addresses refused
-  unless allowed), `calculator` and `current_time`. **MCP servers** add their tools: stdio commands
+  unless allowed), `calculator`, `current_time` and `describe_image`. **MCP servers** add their tools: stdio commands
   (`npx -y @modelcontextprotocol/server-filesystem ~/notes`, `uvx mcp-server-fetch`, ...), Streamable HTTP and
   legacy SSE servers, with headers / environment for credentials; Claude Desktop / Cursor `mcpServers` JSON can be
   pasted as it is. The server runs the calls, feeds the results back and lets the model continue (up to a set number
@@ -346,8 +395,10 @@ Settings are validated strictly, before any weights are loaded: an unknown key, 
 number, a malformed boolean (booleans are `true|false|yes|no|on|off|1|0`; a stray `--think flase` is an error, not
 `false`) or an unknown `model.quant` / `backend.kv-dtype` / `backend` value stops the program with a message and
 exit status 2. `prompt`, `raw` and `config` are command line flags only and are rejected in a properties file.
-Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, or `q8`: int8 with a scale per row of a
-kv head, about a quarter of the f32 cache), `backend.cpu.int8-activations`
+Notable keys besides the usual ones: `backend.kv-dtype` (`f32`, `f16`, `q8`: int8 with a scale per row of a
+kv head, about a quarter of the f32 cache, or `q4`: Hadamard-rotated keys and 4-bit groups of 32 with a half scale,
+about an eighth, for long contexts), `backend.kv-q4-recent` (q4: the latest positions also kept in half precision,
+default 128, 0 = none), `backend.cpu.int8-activations`
 (default `auto`: times int8 and float activations on the loaded model once and keeps the faster; `true` quantizes
 activations to int8 for integer dot products, several times faster decode on ARM but ~1 % different numerics;
 `false` gives results identical to Metal), `backend.cpu.native` (default `auto`: the int8 decode dot products
@@ -355,6 +406,7 @@ run in the small C library `libjllm_cpu` when it is found and passes its self-ch
 AVX2 or ARM dotprod / NEON; `true` requires it, `false` keeps the Java kernels; build it with
 `scripts/build-native-cpu.sh`, which `./jllm` does when a C compiler is installed) and `backend.cpu.native-lib` (its
 path, default: `target/native`, next to the jar, `-Djllm.cpu.nativeLib`), `engine.max-prompt-bytes`, `hub.timeout-ms`
+`vision.*` (the multimodal projector, where the picture encoder runs, token budget, size limits: [docs/20](docs/20-vision.md#209-settings)),
 `engine.constrained-tools`, `engine.jump-forward` and `engine.constraint-masks` (constrained tool calls, text a constraint forces appended without sampling, and the allowed-token masks: each `false` keeps the old path, [17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)),
 `backend.metal.cpu-moe` (`auto`: when the model exceeds Metal's working set, its least used MoE experts run on
 the CPU; `off`, `all` or a number of whole layers), `backend.batch` (prefill chunk: `auto` = 256 for MoE models and for dense models on Metal, 64 otherwise; a number overrides) and the `server.*` limits listed under Security below.
@@ -370,7 +422,7 @@ Short flags:
 --low-disk            fetch + quantize + delete safetensors shards one by one (big models)
 --ctx N               context length / KV cache size (default 4096)
 --batch N|auto       prefill chunk size (default auto: 256 on Metal and for MoE models, 64 on the CPU)
---backend.kv-dtype f32|f16|q8   KV cache element type (no short alias)
+--backend.kv-dtype f32|f16|q8|q4   KV cache element type (no short alias); --backend.kv-q4-recent N
 --threads N           CPU threads
 --temp, --top-k, --top-p, --min-p, --rep-penalty, --seed, --max-tokens, --think, --system "..."
 --host, --port, --config <file>, --prompt "..." (run), --raw (run: no chat template)
@@ -443,6 +495,11 @@ $J.TokenizerFamiliesTest /tmp/jllm-tokenizers   # 4 239 checks: 14 tokenizer fam
 $J.ConverterTest --dir <scratch dir>            # converter, resume and cache-invalidation tests
 ```
 
+`VisionTest` (run by `mvn install`; plain `main`, no model download) checks pictures as input: resize against Pillow, request
+parts, the rotary positions, and tiny random Qwen2-VL / Qwen3-VL style models written as GGUF files (prompt layout,
+cache keyed by the picture, CPU == Metal). Comparing the encoders with llama.cpp needs a vision model and
+`libmtmd`; the numbers are in [docs/20.10](docs/20-vision.md#2010-verification).
+
 `TokenizerFamiliesTest` compares the tokenizers and chat templates of all families against fixtures generated
 with the reference `tokenizers`/`jinja2` libraries (`src/test/python/gen_tokenizer_fixtures.py`).
 `ConverterTest` deletes and rewrites cache files, so give it private copies of the models in a scratch directory
@@ -467,9 +524,11 @@ src/main/java/org/robomiri/jllm/
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
   engine/                generation loop, prefix cache, stop strings, KV cache files
+  vision/                pictures as input: preprocessing (Pillow-compatible resize), the vision transformer on CPU and Metal, chat-request parts, projector discovery
   server/                HTTP server, OpenAI-compatible API, web UI
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
+src/main/resources/org/robomiri/jllm/metal/vision.metal    GPU kernels of the vision encoder
 docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)

@@ -50,6 +50,12 @@ public final class ArchSmoke {
 
     private static final int[] PROMPT = {1, 7, 42, 99, 13, 5, 250, 8, 77, 31, 600, 9};
     private static final int NEW_TOKENS = 8;
+    /**
+     * -Djllm.smoke.q4=false leaves out the q4-cache comparisons. Only the forced-MMA pass of arch-smoke.sh sets it: with
+     * MMA prefill from 2 rows a batched pass and a lone step take different matmul kernels, and the q4 cache turns
+     * their rounding-level difference into a flipped 4-bit code (4e-3 on Phi3Mha); the default pass checks every q4 case.
+     */
+    private static final boolean Q4 = !"false".equals(System.getProperty("jllm.smoke.q4"));
 
     public static void main(String[] args) throws Exception {
         String lib = args[0].equals("-") ? null : args[0];
@@ -57,7 +63,10 @@ public final class ArchSmoke {
         if (!metal) {
             System.out.println("note: Metal unavailable, comparing nothing on the GPU");
         }
-        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K, QType.Q6_K);
+        // -Djllm.smoke.quants=Q4_0,Q8_0 limits the run to those formats (and drops the Q6_K-head variant unless Q6_K is listed)
+        String only = System.getProperty("jllm.smoke.quants");
+        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K, QType.Q6_K).stream()
+                .filter(q -> only == null || List.of(only.split(",")).contains(q.name())).toList();
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
@@ -70,7 +79,9 @@ public final class ArchSmoke {
             for (QType q : quants) {
                 failures += run(dir, cfg, q, QuantFile.DEFAULT_HEAD, metal, lib);
             }
-            failures += run(dir, cfg, QType.Q4_0, QType.Q6_K, metal, lib);
+            if (only == null || List.of(only.split(",")).contains("Q6_K")) {
+                failures += run(dir, cfg, QType.Q4_0, QType.Q6_K, metal, lib);
+            }
             if (cfg.core().modelType().equals("phi3")) {
                 failures += checkFusedSplit(dir, cfg);
             }
@@ -191,6 +202,7 @@ public final class ArchSmoke {
                 failures += recurrent ? stateChecks(b, cfg, "metal") : 0;
             }
             System.out.println("  metal " + Arrays.toString(gpu));
+            failures += concurrentCheck(w, lib, cfg, quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD);
             if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
@@ -204,13 +216,29 @@ public final class ArchSmoke {
                 failures += moeSplitCheck(w, lib, cfg, cpu, cpuLogits);
             }
             if (!mamba && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
-                failures += q8Check(w, lib, cfg, cpu);
+                failures += q8Check(w, lib, cfg, cpu, KvDtype.Q8, 0);
+                if (Q4) {
+                    failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 0);
+                    failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 4);
+                }
                 // f32 and q8 caches for every family; the f16 cache (its own mix of staging and cache rows) on the
                 // first dense and the first MoE family, to keep the emulator run's time in bounds
                 failures += replayCheck(w, lib, cfg, KvDtype.F32);
                 failures += replayCheck(w, lib, cfg, KvDtype.Q8);
                 failures += replayBatchCheck(w, lib, cfg, KvDtype.F32);
                 failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
+                // q4: without a window, and with one short enough that decode steps cross from the ring to the q4 rows
+                for (int recent : Q4 ? new int[]{0, 6} : new int[0]) {
+                    KvDtype.setQ4Recent(recent);
+                    try {
+                        failures += replayCheck(w, lib, cfg, KvDtype.Q4);
+                    } finally {
+                        KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
+                    }
+                }
+                if (Q4) {
+                    failures += replayBatchCheck(w, lib, cfg, KvDtype.Q4);
+                }
                 if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
                     failures += replayCheck(w, lib, cfg, KvDtype.F16);
                 }
@@ -218,7 +246,7 @@ public final class ArchSmoke {
             if (!mamba && cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
                 boolean latent = dec.attention() instanceof Attention.Mla;
                 for (KvDtype dt : KvDtype.values()) {
-                    if (!(latent && dt == KvDtype.Q8)) { // a q8 latent cache is not saved
+                    if (!(latent && (dt == KvDtype.Q8 || dt == KvDtype.Q4))) { // a q8 latent cache is not saved (q4 is served as q8 there)
                         failures += kvStateChecks(w, lib, cfg, dt);
                         failures += replayStateCheck(w, lib, cfg, dt);
                     }
@@ -478,6 +506,15 @@ public final class ArchSmoke {
      * tolerance).
      */
     private static int kvStateChecks(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
+        KvDtype.setQ4Recent(3); // q4: the saved window holds the last 3 of the prompt's rows, the others are 4-bit only
+        try {
+            return kvStateChecks0(w, lib, cfg, dt);
+        } finally {
+            KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
+        }
+    }
+
+    private static int kvStateChecks0(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
         int vocab = cfg.core().vocabSize();
         int n = PROMPT.length;
         int[] next = {PROMPT[3]};
@@ -502,6 +539,9 @@ public final class ArchSmoke {
             cpu.saveState(n, java.nio.channels.Channels.newChannel(cpuBytes));
             boolean sameFormat = cpu.stateFormat().equals(a.stateFormat()) && cpuBytes.size() == bytes.size();
             b.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+            var resaved = new java.io.ByteArrayOutputStream();
+            b.saveState(n, java.nio.channels.Channels.newChannel(resaved));
+            boolean sameBytes = Arrays.equals(resaved.toByteArray(), cpuBytes.toByteArray()); // rows (and window) taken in unchanged
             b.forward(next, 0, 1, n, got);
             float scale = 0;
             float diff = 0;
@@ -509,11 +549,38 @@ public final class ArchSmoke {
                 scale = Math.max(scale, Math.abs(want[i]));
                 diff = Math.max(diff, Math.abs(want[i] - got[i]));
             }
-            boolean crossOk = diff <= 1e-3f * scale + 1e-4f;
-            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e)%n", dt,
+            // The file's bytes must come back unchanged (sameBytes). Metal's own continuation (want) is compared with the
+            // CPU file's: both prefilled the prompt in their own float arithmetic, so a q4 value on a rounding edge of the
+            // 4-bit grid lands one step (1/7.5 of its group's largest value) apart in the two caches, and a tiny random
+            // model turns that into a logit difference a q8 edge flip (1/127) does not reach: 10x the tolerance for q4.
+            boolean crossOk = sameBytes && diff <= (dt == KvDtype.Q4 ? 1e-2f : 1e-3f) * scale + 1e-4f;
+            System.out.printf("  kv %s: saved+loaded %s, copied %s, cpu file in metal %s (max diff %.1e, bytes %s)%n", a.stateFormat(),
                     loaded ? "identical" : "DIFFERENT", copied ? "identical" : "DIFFERENT",
-                    sameFormat && crossOk ? "ok" : "MISMATCH", diff);
+                    sameFormat && crossOk ? "ok" : "MISMATCH", diff, sameBytes ? "unchanged" : "CHANGED");
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
+            if (dt == KvDtype.Q4) { // the first n - 2 positions of a longer state: the ring keeps only the window below them
+                int m = n - 2;
+                b.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+                cpu.loadState(m, n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(cpuBytes.toByteArray())));
+                var bOut = new java.io.ByteArrayOutputStream();
+                var cOut = new java.io.ByteArrayOutputStream();
+                b.saveState(m, java.nio.channels.Channels.newChannel(bOut));
+                cpu.saveState(m, java.nio.channels.Channels.newChannel(cOut));
+                boolean sameWindow = Arrays.equals(bOut.toByteArray(), cOut.toByteArray()); // rows and the part of the window kept
+                b.forward(next, 0, 1, m, got);
+                float[] cpuLogits = new float[vocab];
+                cpu.forward(next, 0, 1, m, cpuLogits);
+                float sc = 0;
+                float df = 0;
+                for (int i = 0; i < vocab; i++) {
+                    sc = Math.max(sc, Math.abs(cpuLogits[i]));
+                    df = Math.max(df, Math.abs(cpuLogits[i] - got[i]));
+                }
+                boolean prefixOk = sameWindow && df <= 1e-2f * sc + 1e-4f; // same file in both: only the new row's rounding differs
+                System.out.printf("  kv %s: first %d of %d saved positions, saved again %s on both, cpu vs metal max diff %.1e -> %s%n",
+                        a.stateFormat(), m, n, sameWindow ? "the same bytes" : "DIFFERENT bytes", df, prefixOk ? "ok" : "MISMATCH");
+                bad += prefixOk ? 0 : 1;
+            }
         }
         return bad;
     }
@@ -587,7 +654,8 @@ public final class ArchSmoke {
     }
 
     /**
-     * The q8 KV cache (int8 with a scale per row of a kv head; DeepSeek: per latent row) on both backends, teacher-forced
+     * The q8 KV cache (int8 with a scale per row of a kv head; DeepSeek: per latent row), or the q4 one (Hadamard-rotated
+     * K, 4-bit groups of 32; DeepSeek: q8) with a recent window of {@code recent} positions, on both backends, teacher-forced
      * through the prompt followed by the f32 CPU run's tokens: once as one 20-token chunk (the prefill kernels, flash
      * prefill where the tuner enabled it) and once as the prompt then token by token (decode). CPU q8 and Metal q8 must
      * agree within the usual CPU / Metal tolerance at every step. The distance of the q8 logits from the f32 cache's
@@ -595,9 +663,11 @@ public final class ArchSmoke {
      * tiny DeepSeeks turn the f16 cache's 0.2-0.4% of the largest logit into 13-25% for q8, the dense families stay
      * near 1%), so q8 is bounded relative to f16, by 200 times its distance (observed: 20-45 times for the dense
      * families, up to 115 for the DeepSeeks) plus 10^-3 of the largest logit: a broken dequantization is caught, the
-     * amplification is not.
+     * amplification is not. q4's step is about 16 times q8's (1/8 of a group's largest value against 1/254 of a row's,
+     * for typical values), so its bound is 16 times as wide.
      */
-    private static int q8Check(ModelWeights w, String lib, Architecture cfg, int[] tokens) throws Exception {
+    private static int q8Check(ModelWeights w, String lib, Architecture cfg, int[] tokens, KvDtype dt, int recent)
+            throws Exception {
         int[] seq = Arrays.copyOf(PROMPT, PROMPT.length + tokens.length);
         System.arraycopy(tokens, 0, seq, PROMPT.length, tokens.length);
         float[][] f32;
@@ -610,11 +680,16 @@ public final class ArchSmoke {
         try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.F16, false)) {
             f16 = forced(b, seq, cfg.core().vocabSize());
         }
-        try (Backend b = new CpuBackend(w, 64, 32, 4, KvDtype.Q8, false)) {
-            cpu = forced(b, seq, cfg.core().vocabSize());
-        }
-        try (Backend b = new MetalBackend(w, 64, 32, lib, KvDtype.Q8)) {
-            gpu = forced(b, seq, cfg.core().vocabSize());
+        KvDtype.setQ4Recent(recent);
+        try {
+            try (Backend b = new CpuBackend(w, 64, 32, 4, dt, false)) {
+                cpu = forced(b, seq, cfg.core().vocabSize());
+            }
+            try (Backend b = new MetalBackend(w, 64, 32, lib, dt)) {
+                gpu = forced(b, seq, cfg.core().vocabSize());
+            }
+        } finally {
+            KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
         }
         float scale = 0;
         float diff = 0;
@@ -629,14 +704,275 @@ public final class ArchSmoke {
             }
         }
         boolean agree = diff <= 1e-3f * scale + 1e-4f;
-        boolean close = drift <= 200 * drift16 + 1e-3f * scale;
-        System.out.printf("  kv q8: max|cpu-metal| = %.2e%s, max|q8-f32| = %.2e%s (f16: %.2e, max|logit| = %.2f)%n", diff,
-                agree ? "" : " MISMATCH", drift, close ? "" : " TOO FAR", drift16, scale);
+        boolean close = drift <= (dt == KvDtype.Q4 ? 3200 : 200) * drift16 + 1e-3f * scale;
+        String what = dt + (dt == KvDtype.Q4 ? " recent=" + recent : "");
+        System.out.printf("  kv %s: max|cpu-metal| = %.2e%s, max|%s-f32| = %.2e%s (f16: %.2e, ratio %.0f, max|logit| = %.2f)%n",
+                what, diff, agree ? "" : " MISMATCH", dt, drift, close ? "" : " TOO FAR", drift16, drift / drift16, scale);
         return (agree ? 0 : 1) + (close ? 0 : 1);
     }
 
     private static final int REPLAY_STEPS = 40;
     private static final java.util.Set<String> replayF16 = new java.util.HashSet<>();
+
+    // ------------------------------------------------------------------ the concurrent compute encoder (docs/08 8.26)
+
+    private static final int CONC_CHUNK = 40; // >= 32 tokens: the simdgroup-matrix prefill kernels too
+
+    /** Concurrent encoder on or off for a backend of any Metal family. */
+    private static void concurrent(Backend b, boolean on) {
+        if (b instanceof MetalBackend m) {
+            m.concurrent(on);
+        } else if (b instanceof MambaMetalBackend m) {
+            m.concurrent(on);
+        } else if (b instanceof Qwen3NextMetalBackend m) {
+            m.concurrent(on);
+        }
+    }
+
+    private static long barriers(Backend b) {
+        return b instanceof MetalBackend m ? m.barriers() : b instanceof MambaMetalBackend m ? m.barriers()
+                : b instanceof Qwen3NextMetalBackend m ? m.barriers() : 0;
+    }
+
+    /**
+     * Every kind of pass in a row, recording each logits vector: a 40-token prefill chunk (the simdgroup-matrix kernels), 10
+     * decode steps (replay, the pipelined path is {@link #concurrentPipe}), a 7-token chunk (the row kernels), and a
+     * 4-token {@code forwardAll} (draft verification's multi-token pass).
+     */
+    private static List<float[]> concurrentScenario(Backend b, int vocab) {
+        List<float[]> out = new ArrayList<>();
+        int[] tok = new int[CONC_CHUNK];
+        for (int i = 0; i < tok.length; i++) {
+            tok[i] = (i * 37 + 11) % vocab;
+        }
+        float[] l = new float[vocab];
+        b.forward(tok, 0, tok.length, 0, l);
+        out.add(l.clone());
+        int pos = tok.length;
+        for (int i = 0; i < 10; i++) {
+            b.forward(new int[]{argmax(l)}, 0, 1, pos++, l);
+            out.add(l.clone());
+        }
+        int[] chunk = new int[7];
+        for (int i = 0; i < chunk.length; i++) {
+            chunk[i] = (i * 53 + 5) % vocab;
+        }
+        b.forward(chunk, 0, chunk.length, pos, l);
+        out.add(l.clone());
+        pos += chunk.length;
+        float[] all = new float[4 * vocab];
+        b.forwardAll(new int[]{3, 77, 150, 21}, 0, 4, pos, all, vocab);
+        out.add(all);
+        return out;
+    }
+
+    private interface BackendMaker {
+        Backend make() throws Exception;
+    }
+
+    /**
+     * The concurrent compute encoder against the serial one on a backend of the same weights: the logits of every pass of
+     * {@link #concurrentScenario} must be bit-identical (the encoder only lets independent dispatches overlap, so any
+     * difference is a missing barrier). Races are intermittent, so the concurrent run is repeated {@code runs} times.
+     * With {@code full} (Q4_0): the f16 and q8 caches, experts split between CPU and GPU, pipelined greedy decoding and
+     * batched decoding of three slots too.
+     */
+    private static int concurrentCheck(ModelWeights w, String lib, Architecture cfg, boolean full) throws Exception {
+        if (!Metal.available(lib)) {
+            return 0;
+        }
+        int vocab = cfg.core().vocabSize();
+        boolean mamba = cfg instanceof MambaArch;
+        boolean hybrid = cfg instanceof Qwen3NextArch;
+        int bad = 0;
+        List<Object[]> cases = new ArrayList<>(); // label, maker
+        for (KvDtype dt : mamba ? new KvDtype[]{KvDtype.F32} : full ? KvDtype.values() : new KvDtype[]{KvDtype.F32}) {
+            if (hybrid && dt == KvDtype.Q8) {
+                continue; // no q8 cache for the hybrid
+            }
+            BackendMaker mk = () -> mamba ? new MambaMetalBackend(w, 64, CONC_CHUNK, lib)
+                    : hybrid ? new Qwen3NextMetalBackend(w, 64, CONC_CHUNK, lib, dt) : new MetalBackend(w, 64, CONC_CHUNK, lib, dt);
+            cases.add(new Object[]{"kv " + dt, mk});
+        }
+        java.nio.file.Path stats = null;
+        if (full && cfg instanceof Decoder d && d.anyMoe() && !hybrid) {
+            // experts on the CPU: the GPU's command buffer is submitted and waited for halfway through the layer, whole
+            // layers, and a layer split between the two (every other expert on the CPU)
+            boolean[][] alternate = new boolean[d.core().layers()][];
+            for (int l = 0; l < alternate.length; l++) {
+                if (d.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                    alternate[l] = new boolean[m.experts()];
+                    for (int e = 0; e < m.experts(); e += 2) {
+                        alternate[l][e] = true;
+                    }
+                }
+            }
+            stats = Files.createTempDirectory("jllm-expert-stats");
+            System.setProperty("jllm.metal.expertStatsDir", stats.toString());
+            Object[][] splits = {{"experts of 1 layer on the cpu", new MoeSplit(1, 4, false)},
+                    {"experts of all layers on the cpu", new MoeSplit(Integer.MAX_VALUE, 4, false)},
+                    {"every other expert on the cpu", MoeSplit.experts(alternate, 4, false)}};
+            for (Object[] s : splits) {
+                cases.add(new Object[]{"kv F32, " + s[0],
+                        (BackendMaker) () -> new MetalBackend(w, 64, CONC_CHUNK, lib, KvDtype.F32, (MoeSplit) s[1])});
+            }
+        }
+        try {
+            bad += concurrentCases(cases, vocab);
+        } finally {
+            if (stats != null) {
+                try (var files = Files.list(stats)) {
+                    for (Path f : files.toList()) {
+                        Files.delete(f);
+                    }
+                }
+                Files.delete(stats);
+                System.clearProperty("jllm.metal.expertStatsDir");
+            }
+        }
+        if (full && !mamba && !hybrid) {
+            bad += concurrentPipe(w, lib, cfg);
+            bad += concurrentBatch(w, lib, cfg);
+        }
+        return bad;
+    }
+
+    private static int concurrentCases(List<Object[]> cases, int vocab) throws Exception {
+        int bad = 0;
+        for (Object[] c : cases) {
+            BackendMaker mk = (BackendMaker) c[1];
+            List<float[]> want;
+            try (Backend b = mk.make()) {
+                concurrent(b, false);
+                want = concurrentScenario(b, vocab);
+            }
+            int runs = 3;
+            long barriers = 0;
+            boolean same = true;
+            for (int r = 0; r < runs; r++) {
+                try (Backend b = mk.make()) {
+                    concurrent(b, true);
+                    List<float[]> got = concurrentScenario(b, vocab);
+                    barriers = barriers(b);
+                    for (int i = 0; i < want.size(); i++) {
+                        if (!Arrays.equals(want.get(i), got.get(i))) {
+                            System.out.println("  concurrent encoder, " + c[0] + ": pass " + i + " differs (run " + r + ")");
+                            same = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            System.out.println("  concurrent encoder, " + c[0] + ": " + want.size() + " passes x " + runs
+                    + " runs, logits " + (same ? "bit-identical to serial" : "DIFFER") + " (" + barriers + " barriers)"
+                    + (same ? "" : "  CONCURRENT MISMATCH"));
+            bad += same ? 0 : 1;
+        }
+        return bad;
+    }
+
+    /** Pipelined greedy decoding (token ring, replay) with the concurrent encoder gives the serial encoder's tokens. */
+    private static int concurrentPipe(ModelWeights w, String lib, Architecture cfg) {
+        int vocab = cfg.core().vocabSize();
+        int[][] ids = new int[2][];
+        for (int mode = 0; mode < 2; mode++) {
+            try (MetalBackend b = new MetalBackend(w, 64, 16, lib)) {
+                b.concurrent(mode == 1);
+                Backend.GreedyPipe pipe = b.greedyPipe(vocab);
+                if (pipe == null) {
+                    return 0;
+                }
+                float[] l = new float[vocab];
+                b.forward(PROMPT, 0, PROMPT.length, 0, l);
+                int n = 20;
+                ids[mode] = new int[n];
+                pipe.submit(argmax(l), PROMPT.length);
+                for (int i = 0; i < n; i++) {
+                    if (i + 1 < n) {
+                        pipe.submit(-1, PROMPT.length + i + 1);
+                    }
+                    ids[mode][i] = pipe.next();
+                }
+                pipe.drain();
+            }
+        }
+        boolean ok = Arrays.equals(ids[0], ids[1]);
+        System.out.println("  concurrent encoder, pipelined greedy decoding: tokens " + (ok ? "same" : "DIFFERENT")
+                + (ok ? "" : "  CONCURRENT MISMATCH"));
+        return ok ? 0 : 1;
+    }
+
+    /**
+     * Batched decoding of three slots (per-row dispatches in independent groups) with the concurrent encoder: every row's
+     * logits in every shared pass are bit-identical to the serial encoder's, for the f32, f16 and q8 caches.
+     */
+    private static int concurrentBatch(ModelWeights w, String lib, Architecture cfg) throws Exception {
+        int vocab = cfg.core().vocabSize();
+        int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
+        int bad = 0;
+        for (KvDtype dt : KvDtype.values()) {
+            List<float[]> want = null;
+            boolean same = true;
+            long barriers = 0;
+            for (int mode = 0; mode < 4; mode++) { // serial once, then the concurrent encoder three times
+                List<float[]> got = new ArrayList<>();
+                MetalBackend[] b = new MetalBackend[3];
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        b[i] = new MetalBackend(w, 64, 16, lib, dt);
+                        b[i].concurrent(mode > 0);
+                    }
+                    int[] tok = new int[3];
+                    float[][] l = new float[3][vocab];
+                    for (int i = 0; i < 3; i++) {
+                        b[i].forward(prompts[i], 0, prompts[i].length, 0, l[i]);
+                        tok[i] = argmax(l[i]);
+                    }
+                    for (int s = 1; s < NEW_TOKENS; s++) {
+                        int lead = s % 3;
+                        Backend[] members = new Backend[3];
+                        int[] tokens = new int[3];
+                        int[] positions = new int[3];
+                        float[][] out = new float[3][];
+                        for (int r = 0; r < 3; r++) {
+                            int i = (lead + r) % 3;
+                            members[r] = b[i];
+                            tokens[r] = tok[i];
+                            positions[r] = prompts[i].length + s - 1;
+                            out[r] = l[i];
+                        }
+                        if (!b[lead].forwardBatch(members, tokens, positions, out)) {
+                            System.out.println("  concurrent encoder, batched decode kv " + dt + ": no batched pass  BATCH FAILED");
+                            return bad + 1;
+                        }
+                        for (int i = 0; i < 3; i++) {
+                            tok[i] = argmax(l[i]);
+                            got.add(l[i].clone());
+                        }
+                    }
+                    barriers = b[0].barriers();
+                } finally {
+                    for (MetalBackend x : b) {
+                        if (x != null) {
+                            x.close();
+                        }
+                    }
+                }
+                if (want == null) {
+                    want = got;
+                } else {
+                    for (int i = 0; i < want.size() && same; i++) {
+                        same &= Arrays.equals(want.get(i), got.get(i));
+                    }
+                }
+            }
+            System.out.println("  concurrent encoder, batched decode, 3 slots, kv " + dt + ": logits "
+                    + (same ? "bit-identical to serial" : "DIFFER") + " (" + barriers + " barriers on the first slot)"
+                    + (same ? "" : "  CONCURRENT MISMATCH"));
+            bad += same ? 0 : 1;
+        }
+        return bad;
+    }
 
     /**
      * Decode replay (a single-token step recorded once per shape, then re-run with its position patched in) against
@@ -903,6 +1239,9 @@ public final class ArchSmoke {
         int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
         List<Object[]> cases = new ArrayList<>();
         for (KvDtype dt : KvDtype.values()) {
+            if (dt == KvDtype.Q4 && !Q4) {
+                continue;
+            }
             cases.add(new Object[]{dt.toString(), dt, MoeSplit.OFF});
         }
         if (((Decoder) cfg).anyMoe()) {

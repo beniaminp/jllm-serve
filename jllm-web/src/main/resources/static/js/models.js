@@ -18,6 +18,10 @@ const Models = (() => {
     form.querySelectorAll('.gguf-only').forEach(e => e.classList.toggle('hidden', !opts.gguf || !opts.ggufFiles?.length));
     form.querySelectorAll('.st-only').forEach(e => e.classList.toggle('hidden', !!opts.gguf));
     form.querySelectorAll('.dl-only').forEach(e => e.classList.toggle('hidden', !opts.download));
+    // vision: the multimodal projector of a GGUF vision-language model
+    form.querySelectorAll('.mm-only').forEach(e => e.classList.toggle('hidden', !opts.gguf));
+    form.mmprojChoice.innerHTML = '<option value="">auto (mmproj next to the model)</option><option value="__none__">none (text only)</option>'
+      + (opts.mmprojs || []).map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
     form.id.placeholder = opts.defaultId || '(default)';
     if (opts.revision && opts.revision !== 'main') form.revision.value = opts.revision;
     if (opts.local) form.revision.closest('label').classList.add('hidden');
@@ -42,6 +46,10 @@ const Models = (() => {
       for (const el of form.elements) {
         if (!el.name || !el.name.includes('.') || el.closest('.hidden')) continue;
         if (el.type === 'checkbox') { if (el.checked) settings[el.name] = 'true'; } else if (el.value !== '') settings[el.name] = el.value;
+      }
+      if (!form.mmprojChoice.closest('.hidden')) { // vision: the chosen projector
+        const mm = form.mmprojChoice.value;
+        if (mm === '__none__') settings['vision.enabled'] = 'false'; else if (mm) settings['model.mmproj'] = mm;
       }
       // a model listed from a models folder is read from that folder (not downloaded into the default one)
       if (opts.modelDir && !settings['model.dir']) settings['model.dir'] = opts.modelDir;
@@ -76,7 +84,8 @@ const Models = (() => {
         ${info.files.length} files, ${fmtBytes(total)} · <a href="https://huggingface.co/${esc(info.repo)}" target="_blank" rel="noopener">model card ↗</a></p>
         ${info.gguf ? '' : '<p class="hint">Quantized once on first load into the model directory (Q4_0 by default), memory-mapped afterwards.</p>'}`;
       out.appendChild(loadForm({source, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
-        quant: info.quant, defaultId: info.defaultId, download: true}));
+        quant: info.quant, defaultId: info.defaultId, download: true,
+        mmprojs: info.files.map(f => f.name).filter(n => /(^|\/)mmproj[^/]*\.gguf$/i.test(n))})); // vision
     } catch (e) { out.innerHTML = `<p class="error">${esc(e.message)}</p>`; }
   }
 
@@ -87,6 +96,7 @@ const Models = (() => {
     box.innerHTML = `<table class="table"><tr><th>model</th><th>backend</th><th>context</th><th>weights</th><th>usage</th><th></th></tr>
       ${list.map(m => `<tr>
         <td><strong>${esc(m.id)}</strong><div class="hint">${esc(m.description)}</div><div class="hint">template ${esc(m.template)} · loaded ${fmtTime(m.loadedAt)} in ${m.loadSeconds.toFixed(1)} s</div>
+          ${m.vision ? `<div class="hint"><span class="badge info">vision</span> ${esc(m.projector || '')}</div>` : ''}
           <details data-id="${esc(m.id)}" ${open.has(m.id) ? 'open' : ''}><summary class="hint">load settings</summary><pre class="hint">${esc(Object.entries(m.settings).map(([k, v]) => k + ' = ' + v).join('\n'))}</pre></details></td>
         <td class="small">${esc(m.backend)}</td><td>${fmtTok(m.contextLength)}${m.slots > 1 ? `<div class="hint">${m.slots} slots${m.busy ? ', ' + m.busy + ' busy' : ''}</div>` : ''}</td><td>${esc(m.quant)}<div class="hint">${fmtBytes(m.weightBytes)}</div></td>
         <td>${m.requests} req${m.active ? ` <span class="badge load">${m.active} active</span>` : ''}<div class="hint">${m.generatedTokens} tokens${m.lastTokensPerSecond ? ' · ' + m.lastTokensPerSecond + ' tok/s' : ''}</div></td>
@@ -132,7 +142,8 @@ const Models = (() => {
       ${list.map((m, i) => `${folders.length > 1 && (i === 0 || list[i - 1].modelDir !== m.modelDir)
           ? `<tr class="folder-row"><td colspan="4"><span class="muted small">folder</span> <code>${esc(m.modelDir)}</code></td></tr>` : ''}
         <tr><td><strong>${esc(m.name)}</strong><div class="hint">${esc(m.path)}</div>
-          ${m.caches.length ? `<div class="hint">quantized: ${m.caches.map(esc).join(', ')}</div>` : ''}</td>
+          ${m.caches.length ? `<div class="hint">quantized: ${m.caches.map(esc).join(', ')}</div>` : ''}
+          ${m.mmprojs?.length ? `<div class="hint"><span class="badge info">vision</span> projector: ${m.mmprojs.map(esc).join(', ')}</div>` : ''}</td>
         <td><span class="badge">${esc(m.format)}</span></td><td>${fmtBytes(m.bytes)}</td>
         <td style="white-space:nowrap">${m.loadedAs.length ? '<span class="badge ok">loaded</span> ' : ''}<button class="small" data-load="${i}">load…</button>
           <button class="small danger" data-delete="${i}">delete</button></td></tr>`).join('')}</table>`;
@@ -146,7 +157,7 @@ const Models = (() => {
       td.colSpan = 4;
       const gguf = m.format === 'gguf';
       td.appendChild(loadForm({source: m.source, revision: m.revision, gguf, ggufFile: m.ggufFile, local: gguf && !m.ggufFile,
-        modelDir: gguf && !m.ggufFile ? null : m.modelDir,
+        modelDir: gguf && !m.ggufFile ? null : m.modelDir, mmprojs: m.mmprojs,
         defaultId: gguf && m.ggufFile ? m.source + ':' + m.ggufFile.replace(/\.gguf$/i, '').split('/').pop() : m.source}));
       tr.appendChild(td);
       row.after(tr);
@@ -174,6 +185,9 @@ const Models = (() => {
     try {
       const [loaded, jobs] = await Promise.all([refreshLoaded(), api('/api/jobs')]);
       renderLoaded(loaded); renderJobs(jobs);
+      // audio:begin
+      window.AudioUI?.renderModelsRows();
+      // audio:end
       const busy = jobs.some(j => j.state === 'RUNNING');
       // the disk listing is redrawn when asked or while jobs change it, never under an open load form
       if ((full || busy || Date.now() - lastLocal > 15000) && !$('#local-list .inline-form')) {

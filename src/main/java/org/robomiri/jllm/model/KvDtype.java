@@ -1,14 +1,17 @@
 package org.robomiri.jllm.model;
 
 /**
- * Element type of the KV cache ({@code backend.kv-dtype}): plain f32, f16 to halve its memory and traffic, or q8 to
- * quarter it: int8 values with one f32 scale per row of a kv head ({@code headDim} values of one position), symmetric,
- * {@code scale = max|x| / 127}, {@code q = rint(x / scale)}.
+ * Element type of the KV cache ({@code backend.kv-dtype}): plain f32, f16 to halve its memory and traffic, q8 to
+ * nearly quarter it: int8 values with one f32 scale per row of a kv head ({@code headDim} values of one position),
+ * symmetric, {@code scale = max|x| / 127}, {@code q = rint(x / scale)}; or q4, about an eighth: Walsh–Hadamard rotated
+ * keys, 4-bit codes and a half scale per group of 32 values ({@link KvQ4}), plus the latest
+ * {@code backend.kv-q4-recent} positions kept as halves.
  */
 public enum KvDtype {
     F32(4),
     F16(2),
-    Q8(1);
+    Q8(1),
+    Q4(1);
 
     /** Bytes per stored value, without q8's per-row scales (see {@link #rowBytes}). */
     public final int bytes;
@@ -22,7 +25,30 @@ public enum KvDtype {
      * scale per head. This is also the row stride of the Metal caches and of a saved cache.
      */
     public long rowBytes(int width, int heads) {
+        if (this == Q4) { // nibbles, then one half scale per group of 32 (KvQ4)
+            return width / 2 + 2L * (width / KvQ4.GROUP);
+        }
         return (long) width * bytes + (this == Q8 ? 4L * heads : 0);
+    }
+
+    /** Default of {@code backend.kv-q4-recent}. */
+    public static final int Q4_RECENT_DEFAULT = 128;
+
+    private static volatile int q4Recent = Q4_RECENT_DEFAULT;
+
+    /**
+     * Positions a q4 cache keeps exact besides their q4 rows ({@code backend.kv-q4-recent}): set once from the settings
+     * by the model loader, read when a backend creates its cache.
+     */
+    public static int q4Recent() {
+        return q4Recent;
+    }
+
+    public static void setQ4Recent(int recent) {
+        if (recent < 0) {
+            throw new IllegalArgumentException("backend.kv-q4-recent must be >= 0, got " + recent);
+        }
+        q4Recent = recent;
     }
 
     /** {@link #rowBytes} in units of the stored value: the row stride the Metal attention kernels take. */
@@ -48,7 +74,8 @@ public enum KvDtype {
             case "f32", "float32", "fp32" -> F32;
             case "f16", "float16", "fp16", "half" -> F16;
             case "q8", "int8" -> Q8;
-            default -> throw new IllegalArgumentException("backend.kv-dtype must be f32, f16 or q8, got '" + s + "'");
+            case "q4", "int4" -> Q4;
+            default -> throw new IllegalArgumentException("backend.kv-dtype must be f32, f16, q8 or q4, got '" + s + "'");
         };
     }
 

@@ -170,7 +170,9 @@ public final class ThreadPool implements AutoCloseable {
             try {
                 if (error.get() == null) {
                     int s = t * chunk;
-                    body.run(s, Math.min(n, s + chunk));
+                    if (s < n) { // the last tasks of a job can start past the end when chunk * tasks overshoots n (n = 896, 40 tasks)
+                        body.run(s, Math.min(n, s + chunk));
+                    }
                 }
             } catch (Throwable x) {
                 error.compareAndSet(null, x);

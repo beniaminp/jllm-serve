@@ -26,8 +26,18 @@ final class GgufArchitecture {
     enum Family {
         LLAMA("llama", "llama"),
         QWEN2("qwen2", "qwen2"),
+        /** Qwen2-VL / Qwen2.5-VL's text model: Qwen2 with multimodal RoPE sections ({@code rope.dimension_sections}). */
+        QWEN2VL("qwen2vl", "qwen2"),
         QWEN3("qwen3", "qwen3"),
-        QWEN3MOE("qwen3moe", "qwen3_moe");
+        /** Qwen3-VL's text model: Qwen3 with interleaved multimodal RoPE and deepstack features added after the first layers. */
+        QWEN3VL("qwen3vl", "qwen3"),
+        QWEN3MOE("qwen3moe", "qwen3_moe"),
+        /** Qwen3.5 dense hybrid (Gated DeltaNet + gated attention, tiled value heads): {@link GgufQwenNext}. */
+        QWEN35("qwen35", "qwen3_next"),
+        /** Qwen3-Next (80B-A3B MoE hybrid, grouped value heads): {@link GgufQwenNext}. */
+        QWEN3NEXT("qwen3next", "qwen3_next"),
+        /** Qwen3.5 MoE (35B-A3B...): Qwen3-Next's experts and gated shared expert with Qwen3.5's tiled value heads. */
+        QWEN35MOE("qwen35moe", "qwen3_next");
 
         final String ggufName;
         final String modelType;
@@ -35,6 +45,11 @@ final class GgufArchitecture {
         Family(String ggufName, String modelType) {
             this.ggufName = ggufName;
             this.modelType = modelType;
+        }
+
+        /** True for the Gated DeltaNet hybrids, whose tensors {@link GgufQwenNext} maps. */
+        boolean hybrid() {
+            return this == QWEN35 || this == QWEN3NEXT || this == QWEN35MOE;
         }
 
         static Family of(String ggufName) {
@@ -92,7 +107,8 @@ final class GgufArchitecture {
         long dim = need(g, p + "embedding_length");
         long heads = scalar(g, p + "attention.head_count");
         c.put("hidden_size", dim);
-        c.put("num_hidden_layers", need(g, p + "block_count"));
+        // a multi-token-prediction block (nextn) is stored after the model's layers: not one of them
+        c.put("num_hidden_layers", need(g, p + "block_count") - (family.hybrid() ? g.num(p + "nextn_predict_layers", 0) : 0));
         c.put("num_attention_heads", heads);
         c.put("num_key_value_heads", g.get(p + "attention.head_count_kv") == null ? heads : scalar(g, p + "attention.head_count_kv"));
         if (g.get(p + "attention.key_length") instanceof Number kl) {
@@ -139,6 +155,9 @@ final class GgufArchitecture {
                 c.put("model_type", "mistral");
             }
         }
+        if (family.hybrid()) {
+            hybrid(g, p, family, c);
+        }
         if (family == Family.QWEN3MOE) {
             c.put("num_experts", need(g, p + "expert_count"));
             c.put("num_experts_per_tok", need(g, p + "expert_used_count"));
@@ -146,10 +165,80 @@ final class GgufArchitecture {
             c.put("norm_topk_prob", true); // llama.cpp always normalizes the selected expert weights for qwen3moe
         }
         Map<String, Object> scaling = ropeScaling(g, p, family, headDim);
+        if (family == Family.QWEN2VL || family == Family.QWEN3VL) {
+            long[] sec = g.longs(p + "rope.dimension_sections");
+            if (sec == null || sec.length < 3) {
+                throw new IOException("GGUF metadata has no " + p + "rope.dimension_sections (Qwen-VL's rotary sections)");
+            }
+            scaling = scaling == null ? new LinkedHashMap<>() : scaling;
+            scaling.putIfAbsent("rope_type", "mrope");
+            List<Object> l = new ArrayList<>();
+            for (long s : sec) {
+                l.add(s);
+            }
+            scaling.put("mrope_section", l);
+            if (family == Family.QWEN3VL) {
+                scaling.put("mrope_interleaved", true);
+            }
+        }
         if (scaling != null) {
             c.put("rope_scaling", scaling);
         }
         return c;
+    }
+
+    /**
+     * The Qwen3-Next keys: the Gated DeltaNet sizes ({@code ssm.*}), the full-attention interval (or the per-layer
+     * {@code attention.recurrent_layers}), the experts of {@code qwen3next} (none for the dense {@code qwen35}) and the
+     * value-head order ({@link Architecture#GGUF_TILED_VALUE_HEADS}).
+     */
+    private static void hybrid(GgufFile g, String p, Family family, Map<String, Object> c) throws IOException {
+        long keyDim = need(g, p + "ssm.state_size");
+        long valueHeads = need(g, p + "ssm.time_step_rank");
+        if (need(g, p + "ssm.inner_size") != keyDim * valueHeads) {
+            throw new IOException(p + "ssm.inner_size " + g.get(p + "ssm.inner_size") + " is not state_size x time_step_rank ("
+                    + keyDim + " x " + valueHeads + "): value heads of another width than key heads are not supported");
+        }
+        c.put("linear_conv_kernel_dim", need(g, p + "ssm.conv_kernel"));
+        c.put("linear_key_head_dim", keyDim);
+        c.put("linear_value_head_dim", keyDim);
+        c.put("linear_num_key_heads", need(g, p + "ssm.group_count"));
+        c.put("linear_num_value_heads", valueHeads);
+        long layers = ((Number) c.get("num_hidden_layers")).longValue();
+        if (g.get(p + "attention.recurrent_layers") instanceof boolean[] rec) {
+            if (rec.length < layers) {
+                throw new IOException(p + "attention.recurrent_layers has " + rec.length + " entries for " + layers + " layers");
+            }
+            List<Object> types = new ArrayList<>();
+            for (int l = 0; l < layers; l++) {
+                types.add(rec[l] ? "linear_attention" : "full_attention");
+            }
+            c.put("layer_types", types);
+        } else {
+            c.put("full_attention_interval", g.num(p + "full_attention_interval", 4));
+        }
+        if (family != Family.QWEN3NEXT) { // the Qwen3.5 generation: value heads tiled
+            c.put(Architecture.GGUF_TILED_VALUE_HEADS, true);
+        }
+        if (family == Family.QWEN35) {
+            c.put("num_experts", 0L);
+        } else {
+            c.put("num_experts", need(g, p + "expert_count"));
+            c.put("num_experts_per_tok", need(g, p + "expert_used_count"));
+            c.put("moe_intermediate_size", need(g, p + "expert_feed_forward_length"));
+            c.put("shared_expert_intermediate_size", g.num(p + "expert_shared_feed_forward_length",
+                    ((Number) c.getOrDefault("intermediate_size", 0L)).longValue()));
+            c.put("norm_topk_prob", true);
+            c.put("decoder_sparse_step", 1L);
+            // llama.cpp's loader wants experts in every layer; a file with a dense layer between them still loads
+            List<Object> dense = new ArrayList<>();
+            for (long l = 0; l < layers; l++) {
+                if (!g.hasTensor("blk." + l + ".ffn_gate_inp.weight")) {
+                    dense.add(l);
+                }
+            }
+            c.put("mlp_only_layers", dense);
+        }
     }
 
     /** An attention head count must be one number for the whole model (some architectures store one per layer). */

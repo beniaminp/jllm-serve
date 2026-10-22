@@ -1,0 +1,16 @@
+/* Pictures in the chat (js/vision.js) */
+.attachments { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 2px 8px; }
+.vthumb { position: relative; display: inline-block; }
+.vthumb img { height: 64px; max-width: 120px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); cursor: zoom-in; display: block; }
+.vthumb .vx { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; padding: 0; border-radius: 50%; line-height: 1;
+              font-size: 11px; background: var(--panel); border: 1px solid var(--border); }
+.vthumb .vx:hover { border-color: var(--danger); color: var(--danger); }
+.attach-btn { margin-right: 6px; }
+.attach-btn.off { opacity: .45; }
+.chat.drop { outline: 2px dashed var(--accent); outline-offset: -6px; background: var(--accent-2); }
+.vimgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.vimgs:last-child { margin-bottom: 0; }
+.vimg { max-height: 150px; max-width: 220px; border-radius: 8px; border: 1px solid var(--border); cursor: zoom-in; display: block; object-fit: cover; }
+.vmissing { font-size: 12px; color: var(--muted); font-style: italic; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; }
+.vlightbox { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, .8); display: grid; place-items: center; cursor: zoom-out; }
+.vlightbox img { max-width: 94vw; max-height: 94vh; border-radius: 6px; box-shadow: 0 8px 40px rgba(0, 0, 0, .5); }

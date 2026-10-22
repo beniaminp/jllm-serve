@@ -75,6 +75,15 @@ public final class GgufMetalCheck {
             run(a, k, "Q8_0", QType.Q8_0G);
             run(a, k, "Q4_K", QType.Q4_K);
             run(a, k, "Q5_K", QType.Q5_K);
+            run(a, k, "Q4_1", QType.Q4_1);
+            run(a, k, "Q5_0", QType.Q5_0);
+            run(a, k, "Q5_1", QType.Q5_1);
+            run(a, k, "Q3_K", QType.Q3_K);
+            run(a, k, "IQ4_NL", QType.IQ4_NL);
+            run(a, k, "IQ4_XS", QType.IQ4_XS);
+            run(a, k, "MXFP4", QType.MXFP4);
+            runFloats(a, k, QType.F16);
+            runFloats(a, k, QType.BF16);
             mixed(a, k);
         }
         System.out.println("gguf metal kernels: " + passed + " checks passed, " + failed + " failed");
@@ -83,9 +92,32 @@ public final class GgufMetalCheck {
         }
     }
 
+    /** F16 / BF16 matrices as they are: random values, the reference is their exact widening. */
+    private static void runFloats(Arena a, MetalKernels k, QType qt) {
+        Random rnd = new Random(3);
+        byte[] blocks = new byte[ROWS * COLS * 2];
+        float[] ref = new float[ROWS * COLS];
+        java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(blocks).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < ref.length; i++) {
+            float v = (float) (rnd.nextGaussian() * (i % 13 == 0 ? 20 : 0.3));
+            if (qt == QType.F16) {
+                short h = Float.floatToFloat16(v);
+                bb.putShort(2 * i, h);
+                ref[i] = Float.float16ToFloat(h);
+            } else {
+                short h = (short) (Float.floatToRawIntBits(v) >>> 16);
+                bb.putShort(2 * i, h);
+                ref[i] = Float.intBitsToFloat((h & 0xFFFF) << 16);
+            }
+        }
+        run(a, k, qt.name(), qt, blocks, ref);
+    }
+
     private static void run(Arena a, MetalKernels k, String file, QType qt) throws IOException {
-        byte[] blocks = resource(file + ".blocks");
-        float[] ref = floats(resource(file + ".ref"));
+        run(a, k, file, qt, resource(file + ".blocks"), floats(resource(file + ".ref")));
+    }
+
+    private static void run(Arena a, MetalKernels k, String file, QType qt, byte[] blocks, float[] ref) {
         // 16 KiB pages plus an odd 32-byte-aligned offset: the tensor is a slice inside a larger mapping
         MemorySegment big = a.allocate(1 << 20, 16384).asSlice(0, 1 << 20);
         MemorySegment seg = big.asSlice(16384 + 96, blocks.length);

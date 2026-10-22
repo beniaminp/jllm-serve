@@ -122,14 +122,17 @@ public final class CpuBackend implements Backend {
         Attention a = arch.attention();
         switch (a) {
             case Attention.Gqa g -> {
-                kv = KvCache.create(kvDtype, c.layers(), g, ctx);
+                kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent());
                 mla = null;
                 kStage = new float[maxBatch * g.kvDim()];
                 vStage = new float[maxBatch * g.kvDim()];
             }
             case Attention.Mla m -> {
                 kv = null;
-                mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype);
+                if (kvDtype == KvDtype.Q4) {
+                    System.err.println("note: backend.kv-dtype=q4 is not implemented for DeepSeek's latent cache, using q8");
+                }
+                mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype == KvDtype.Q4 ? KvDtype.Q8 : kvDtype);
                 kStage = null; // MLA keeps its own cache and staging
                 vStage = null;
             }
@@ -377,12 +380,49 @@ public final class CpuBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
+    }
+
+    // ---- images (vision encoders feed embeddings; Qwen-VL needs its own rotary positions)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        this.deepstack = deepstack;
+        try {
+            run(null, embeds, off, n, pos, logits, 0);
+        } finally {
+            this.deepstack = null;
+        }
+    }
+
+    /** Qwen3-VL: per-layer features added to the hidden state after the first layers of the current {@link #run}. */
+    private float[][] deepstack;
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        for (int i = 0; i < ropes.length; i++) {
+            ropes[i].refill(arch.ropeTables().get(i), ctx, from, p);
+        }
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
     }
 
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
     }
 
     @Override
@@ -393,7 +433,8 @@ public final class CpuBackend implements Backend {
         }
         CpuBackend[] owners = new CpuBackend[n];
         for (int t = 0; t < n; t++) {
-            if (!(members[t] instanceof CpuBackend o) || o.w != w || o.kv == null || positions[t] >= o.ctx) {
+            if (!(members[t] instanceof CpuBackend o) || o.w != w || o.kv == null || positions[t] >= o.ctx
+                    || o.ropeCustomFrom != Integer.MAX_VALUE) { // a row with its own rotary table cannot share the lender's
                 return false;
             }
             owners[t] = o;
@@ -427,16 +468,23 @@ public final class CpuBackend implements Backend {
         return true;
     }
 
-    /** {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}). */
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    /**
+     * {@code stride == 0}: logits of the last token only, else of every token (row {@code i} at {@code i * stride}).
+     * With {@code embeds != null} the input rows are those embeddings (rows {@code off ..}) and {@code tokens} is unused.
+     */
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
         int dim = c.dim();
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+        if (embeds != null) {
+            System.arraycopy(embeds, off * dim, x, 0, n * dim); // image embeddings are used as they are
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+            }
         }
-        if (c.embedScale() != 1f) {
+        if (embeds == null && c.embedScale() != 1f) {
             float es = c.embedScale();
             pool.forRange(n, 1, (t0, t1) -> {
                 for (int i = t0 * dim, m = t1 * dim; i < m; i++) {
@@ -452,6 +500,15 @@ public final class CpuBackend implements Backend {
             p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
+            if (deepstack != null && l < deepstack.length) { // Qwen3-VL: x += this layer's picture features
+                float[] ds = deepstack[l];
+                int base = off * dim;
+                pool.forRange(n * dim, 4096, (i0, i1) -> {
+                    for (int i = i0; i < i1; i++) {
+                        x[i] += ds[base + i];
+                    }
+                });
+            }
         }
         if (logits != null && stride == 0) {
             rmsnormRow(x, (n - 1) * dim, xb, 0, w.finalNorm, dim);
