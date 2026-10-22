@@ -57,7 +57,10 @@ public final class ArchSmoke {
         if (!metal) {
             System.out.println("note: Metal unavailable, comparing nothing on the GPU");
         }
-        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K, QType.Q6_K);
+        // -Djllm.smoke.quants=Q4_0,Q8_0 limits the run to those formats (and drops the Q6_K-head variant unless Q6_K is listed)
+        String only = System.getProperty("jllm.smoke.quants");
+        List<QType> quants = List.of(QType.Q4_0, QType.Q8_0, QType.Q2_K, QType.Q6_K).stream()
+                .filter(q -> only == null || List.of(only.split(",")).contains(q.name())).toList();
         int failures = 0;
         for (int i = 1; i < args.length; i++) {
             Path dir = Path.of(args[i]);
@@ -70,7 +73,9 @@ public final class ArchSmoke {
             for (QType q : quants) {
                 failures += run(dir, cfg, q, QuantFile.DEFAULT_HEAD, metal, lib);
             }
-            failures += run(dir, cfg, QType.Q4_0, QType.Q6_K, metal, lib);
+            if (only == null || List.of(only.split(",")).contains("Q6_K")) {
+                failures += run(dir, cfg, QType.Q4_0, QType.Q6_K, metal, lib);
+            }
             if (cfg.core().modelType().equals("phi3")) {
                 failures += checkFusedSplit(dir, cfg);
             }

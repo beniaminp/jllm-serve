@@ -56,9 +56,10 @@
 # usage: scripts/arch-smoke.sh          (needs JDK 26: JAVA_HOME or /opt/homebrew/opt/openjdk@26, python3, curl)
 #        METAL_EMU=1 scripts/arch-smoke.sh   on any OS: the Metal side runs on the CPU emulator of the kernels
 #                                            (scripts/build-metal-emu.sh, needs clang++), so no Apple GPU is needed
-# The prefill matmuls run in their f32 form (-Djllm.metal.hmma=false): the half-weight form differs from the CPU by
-# ~2e-4 of the logits by design, which the q8-cache comparisons (int8 rounding of K / V) amplify past their bound.
-# JAVA_OPTS="-Djllm.metal.hmma=true" overrides it; its kernels are checked by scripts/metal-emu/kernel_tests.py.
+# The half-weight MMA prefill kernels (*_hmma, docs/08 8.21) are exact for Q4_0 / Q8_0 (the scale is applied in f32), so
+# the whole run uses the tuner's per-shape choice (hmma=auto); the last pass forces them on every dense and MoE prefill
+# matmul (-Djllm.metal.hmma=true, MMA from 2 tokens on) for the Q4_0 / Q8_0 models. The lossy K-quant variants are opt-in
+# (-Djllm.metal.hmmaKQuants=true) and not part of this test; scripts/metal-emu/kernel_tests.py checks all of them.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [ -x /opt/homebrew/opt/openjdk@26/bin/java ] && export JAVA_HOME=/opt/homebrew/opt/openjdk@26
@@ -119,7 +120,7 @@ gen llama LlamaDraftForCausalLM --seed 4321
 for n in DeepseekV2ForCausalLM DeepseekV2QLoraForCausalLM DeepseekV3ForCausalLM; do
   REF_Q8=1 python3 scripts/deepseek-ref.py "$M/${P}-$n" >/dev/null
 done
-"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false -Djllm.metal.hmma=false ${JAVA_OPTS:-} \
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.DeepSeekRef "$METAL_LIB" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM"
 
@@ -137,7 +138,7 @@ done
   -cp target/classes:target/test-classes org.robomiri.jllm.Qwen3NextChecks "$METAL_LIB" \
   "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
 
-exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false -Djllm.metal.hmma=false \
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 \
   -Djllm.smoke.draftPair="${P}-LlamaPlainForCausalLM=$M/${P}-LlamaDraftForCausalLM" ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
@@ -150,3 +151,14 @@ exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-ac
   "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \
   "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
+
+# Second pass: every dense and MoE prefill matmul through the half-weight MMA kernels (hmma=true, MMA from 2 tokens
+# on instead of 32 / 16), for the formats where they are exact (Q4_0, Q8_0): the same bounds as above must hold.
+# (Not Phi3: with MMA prefill from 2 tokens its q8-cache replay x batch comparison flips an int8 rounding step, 4e-2 with
+# the f32 MMA kernels as well, 3e-3 with the half-weight ones; its f32 / f16 caches and every other model pass.)
+exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
+  -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 \
+  -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
+  "$LLAMA" "$M/${P}-LlamaPlainForCausalLM" "$M/${P}-Qwen2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
+  "$M/${P}-Qwen3MoeForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" "$M/${P}-Qwen3NextForCausalLM"

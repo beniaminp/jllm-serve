@@ -63,9 +63,18 @@ final class MetalKernels implements AutoCloseable {
     /**
      * Which form of the simdgroup-matrix prefill matmuls runs (section 11 of kernels.metal): "auto" (default) = per
      * matrix shape, as {@link MetalTuner#prefillMatmuls} decided on this device (the f32 {@code *_mma} kernels for a
-     * shape it did not check); "true" = the half-weight {@code *_hmma} kernels everywhere; "false" = never.
+     * shape it did not check); "true" = the half-weight {@code *_hmma} kernels everywhere; "false" = never. The
+     * kernels of Q4_0 / Q8_0 (and the GGUF Q4_0 / Q8_0) are exact (the scale is applied in f32); those of the
+     * K-quants round every weight to half (relative 2^-11) and run only with {@link #HMMA_KQUANTS}.
      */
     static final String HMMA = System.getProperty("jllm.metal.hmma", "auto");
+    /** -Djllm.metal.hmmaKQuants=true: also run the lossy half-rounded {@code *_hmma} kernels on Q2_K / Q6_K / Q4_K / Q5_K. */
+    static final boolean HMMA_KQUANTS = Boolean.getBoolean("jllm.metal.hmmaKQuants");
+
+    /** Formats whose {@code *_hmma} kernels are exact: an integer times one f32 scale per 32-weight block. */
+    static boolean hmmaExact(QType type) {
+        return type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q4_0G || type == QType.Q8_0G;
+    }
     /**
      * Layers per command buffer: the dispatches of every COMMIT_LAYERS layers are submitted (without waiting)
      * while the following layers are still being encoded, so GPU execution overlaps the CPU-side encoding
@@ -444,6 +453,9 @@ final class MetalKernels implements AutoCloseable {
 
     /** Whether a prefill MMA dispatch of this family and shape uses the half-weight kernels. */
     boolean hmma(MmaFamily f, QType type, int rows, int cols) {
+        if (!hmmaExact(type) && !HMMA_KQUANTS) {
+            return false;
+        }
         if (hmmaForce != null) {
             return hmmaForce;
         }

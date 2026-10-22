@@ -94,6 +94,13 @@ bench "simdgroup-matrix prefill off" "$DENSE" "-Djllm.metal.mmaPrefill=false"
 # and attention_fa vs attention_fb; the 2000-token rows weigh attention more
 bench "half-weight MMA prefill forced on" "$DENSE" "-Djllm.metal.hmma=true"
 bench "half-weight MMA prefill off (f32 MMA)" "$DENSE" "-Djllm.metal.hmma=false"
+# the default 64-token chunk underfills the GPU; 256 tokens per chunk shows the matmul kernels' own throughput
+bench "half-weight MMA prefill forced on, --batch 256" "$DENSE" "-Djllm.metal.hmma=true" --batch 256
+bench "half-weight MMA prefill off, --batch 256" "$DENSE" "-Djllm.metal.hmma=false" --batch 256
+bench "GGUF $LLAMA_QUANT: half-weight MMA prefill forced on, --batch 256" "$LLAMA_DENSE" "-Djllm.metal.hmma=true" \
+  --gguf-quant "$LLAMA_QUANT" --batch 256
+bench "GGUF $LLAMA_QUANT: half-weight MMA prefill off, --batch 256" "$LLAMA_DENSE" "-Djllm.metal.hmma=false" \
+  --gguf-quant "$LLAMA_QUANT" --batch 256
 bench "flash prefill form fa" "$DENSE" "-Djllm.metal.flashPrefillKernel=fa"
 bench "flash prefill form fb" "$DENSE" "-Djllm.metal.flashPrefillKernel=fb"
 bench "~2000-token prompt: defaults" "$DENSE" "" --bench.prompt-repeat 200

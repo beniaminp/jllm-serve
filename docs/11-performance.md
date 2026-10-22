@@ -294,7 +294,8 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.prefillMinTokens` | 8 | smallest chunk that uses the tiled prefill matmuls |
 | `jllm.metal.mmaPrefill` | true | simdgroup-matrix prefill matmuls; `false` = the scalar tiled kernels (bit-identical to decode) |
 | `jllm.metal.mmaMinTokens` | 32 | smallest chunk that uses the simdgroup-matrix matmuls ([08 §8.10](08-metal-backend.md#810-the-tiled-prefill-matmuls)) |
-| `jllm.metal.hmma` | auto | which form of those matmuls: auto = per matrix shape, as the start-up check timed f32 `*_mma` against half-weight `*_hmma` on this chip; `true` / `false` = half-weight everywhere / nowhere ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
+| `jllm.metal.hmma` | auto | which form of those matmuls: auto = per matrix shape, as the start-up check timed f32 `*_mma` against half-weight `*_hmma` on this chip; `true` / `false` = half-weight everywhere (exact formats) / nowhere ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
+| `jllm.metal.hmmaKQuants` | false | also allow the lossy half-rounded `*_hmma` kernels for the K-quants (Q2_K, Q6_K, Q4_K, Q5_K); Q4_0 / Q8_0 (and GGUF Q4_0 / Q8_0) are exact and always allowed ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
 | `jllm.metal.flashPrefillKernel` | auto | flash prefill form `fa` or `fb` (K and V staged together, half staging for f16 / q8 caches); auto = the faster one that agrees ([08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) |
 | `jllm.metal.attnGroup` | 1 | query heads per attention threadgroup (2, 4, 8 measured no faster) |
 | `jllm.metal.flashPrefill` | auto | flash-attention prefill kernel `attention_fa` instead of `attention_t` (auto = start-up self-check decides; [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa)) |
@@ -360,7 +361,7 @@ Remaining, by expected payoff:
 | 2 | ~~Expert-grouped MoE prefill on Metal~~ (done: `moe_sort` + `moe_up_mma` / `moe_down_mma`, [08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)) | | |
 | 3 | **Speculative decoding** with a small draft model (e.g. 0.6B drafting for 30B-A3B), verified in one batched forward of the big model | 1.5–3× decode when the draft agrees often | new `Engine` loop, `Backend.forward` with verification of `k` tokens |
 | 4 | ~~Flash-style prefill attention~~ (done: `attention_fa`, and `attention_fb`, [08 §8.13](08-metal-backend.md#813-flash-attention-prefill-attention_fa), [§8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form)) | | |
-| 5 | ~~`simdgroup_matrix` prefill matmuls~~ (done: `*_mma`, and the half-weight `*_hmma` with the per-shape choice, [11.8](#118-the-prefill-kernels-against-llamacpps-design)); next: **measure `*_hmma` on a Mac**, then larger tiles (64 × 64 with 8 simdgroups) or Metal 4 tensor ops on M5-class GPUs | see 11.8 | `kernels.metal`, `MetalTuner` |
+| 5 | ~~`simdgroup_matrix` prefill matmuls~~ (done: `*_mma`, and the half-weight `*_hmma` with the per-shape choice, [11.8](#118-the-prefill-kernels-against-llamacpps-design)); measured on an M1 Pro: `*_hmma` gives no gain there (11.8), the start-up check keeps the f32 form; next: larger prefill chunks (`--batch 256`: +46 %), larger tiles (64 × 64 with 8 simdgroups) or Metal 4 tensor ops on M5-class GPUs | see 11.8 | `kernels.metal`, `MetalTuner` |
 | 6 | **Mixed-precision low-bit formats** (a Q2_K / Q3_K mix with higher-precision sensitive tensors) | smaller files and fewer bytes per token ([13](13-q2k-quantization.md)) | quantizer, `QType`, kernels |
 | 7 | Smaller items: fuse RMSNorm into the next matmul on CPU, wider threadgroups for small Metal matmuls, coalesced router weight reads, parallel shard downloads | each a few percent to 2× in its own corner | `CpuBackend`, `kernels.metal`, `HuggingFaceHub` |
 
@@ -540,8 +541,13 @@ tok/s quoted for this model elsewhere is the scalar `matmul_pf` path, `-Djllm.me
 the Q4_0 quantization error itself; the start-up check rejects the half-weight form for any shape where it
 differs from the f32 one by more than `1e-3 · max |y| + 1e-5`. `attention_fb` rounds nothing `attention_fa` keeps.
 
-**Not measurable here.** All of the above was checked for correctness on the CPU emulator
-([18](18-metal-emulator.md)), whose timings say nothing about a GPU (one CPU fiber per GPU thread). The deciding
-numbers are the `half-weight MMA prefill forced on / off` and `flash prefill form fa / fb` rows of
-`scripts/mac-validate.sh` (with `--moe` for the 30B, and the ~2 000-token rows), and `--vs-llama` for the gap that
-remains.
+**Measured on an Apple M1 Pro (prefill tok/s, 413-token prompt, Qwen3-0.6B q4, `./jllm bench --temp 0 --engine.speculative off`).**
+The estimates above did not come true on this GPU: f32 `*_mma` 1 436 tok/s at the default 64-token chunk and 2 092 at
+`--batch 256`; first-version `*_hmma` (weights rounded to half) 1 419 / 1 995 (no gain, -1 to -5 %); exact `*_hmma`
+(scale applied in f32, which is what the kernels are now for Q4_0 / Q8_0) 873 / 1 105 (-40 %). GGUF Q4_0: 1 361 / 1 950
+f32 against 1 368 / 1 954 first version and 853 / 1 106 exact; K-quants (Q4_K_M) with the lossy kernels 958 / 1 860 against
+949 / 1 815 (+1 %, noise). The start-up check therefore keeps the f32 kernels for every shape ("half-weight MMA for 0 of 4
+shapes"), and the speed ranking of the bigger lever is the chunk size: **`--batch 256` is +46 % prefill over the default
+64 on this model** (1 436 -> 2 092 tok/s). Details and the accuracy story in
+[08 §8.21](08-metal-backend.md#821-half-weight-mma-prefill-and-the-second-flash-prefill-form). The 30B MoE (grouped
+expert kernels, 2 000-token prompts, `fa` / `fb`) was not measured for this change.

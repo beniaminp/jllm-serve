@@ -1205,7 +1205,38 @@ is at least 3 % faster; the decision is cached like the others ([8.14](#814-the-
 the emulator, where nothing can be timed, the check still runs and logs its agreement but the more accurate f32 form
 is kept (the half-weight form only exists to be faster); `-Djllm.metal.hmma=true` runs it there.
 `-Djllm.metal.hmma=true|false` forces one form everywhere; shapes the check did not see (an LM head in a multi-token
-verification pass) keep the f32 kernels.
+verification pass) keep the f32 kernels. Only the formats whose half-weight kernels are exact (below) are candidates;
+`-Djllm.metal.hmmaKQuants=true` adds the lossy K-quant kernels (Q2_K, Q6_K, Q4_K, Q5_K), which are then timed and
+forced like the others.
+
+**Exact scales (the fix of the half-weight rounding).** The first version stored `fl16(q · s)` for every format. The
+rounding (`u / √3 ≈ 2.8e-4` of a dot product) is small against the quantization step but it is *systematic*: every
+prefill matmul of a model carries it and the decode kernels (f32) do not. On the real GPU, with `-Djllm.metal.hmma=true`
+and MMA from 2 tokens on, the tiny test models then differed from the CPU by 1.5e-3 to 4.5e-3 of the logits (max |logit|
+16–22; f32 MMA: 6e-6), batched decoding was no longer bit-identical to decoding alone (8.6e-3), the q8 KV cache
+comparisons moved by whole int8 steps (8e-2), and Qwen3-Next's chunking invariance bound (1e-4) failed at 4.8e-4. None of
+it is a bug of the kernels: `kernel_tests.py` matches numpy with weights rounded to half to 1e-6. (The `REBALANCE FAILED`
+and `moved 0 layers` of the first report did not reproduce on the GPU: with hmma forced and MMA from 2 tokens on, all
+families re-place 2–3 layers with CPU-vs-split differences equal to the logit differences above; the expert counting is
+the router's and does not depend on the matmul form.)
+
+For Q4_0 and Q8_0 (the engine's own, and the GGUF `Q4_0` / `Q8_0`) the rounding is avoidable: `q` (−8..7, −127..127) is
+exact in half, and the scale is one f32 per 32-weight block, i.e. per k step. So `hm_core` keeps **q** in the half tile
+and, per k step and per (token block, row block) accumulator pair, computes
+
+```
+tmp = Σ_kk  A_kk · Q_kk           (4 multiply-accumulates, f32 accumulation, starting from 0)
+acc += tmp · D                    (D = diag(s of the 8 rows of the block), an f32 8 × 8 matrix)
+```
+
+`D` lives in threadgroup memory (8 matrices of 64 floats; only the diagonal is rewritten per step, the rest stays 0, so
+`tmp · D` is exactly `tmp[t][r] · s[r]`). The scale is thus applied in f32 after the integer products, as the CPU and the
+scalar kernels do: measured 1e-7 relative to the exact weights in `kernel_tests.py` (was 1.5e-4 to 4.5e-4), 6e-6 of the
+logits on the GPU, bit-identical batched decoding, Qwen3-Next 150 tokens 9e-7. Costs: 25 % more multiply-accumulates
+(40 instead of 32 per k step and simdgroup) and 2 KB more threadgroup memory (10 KB). K-quants have scales per 16
+weights and minimums (`w = dl · q − ml`), which would need a second MMA per accumulator for the offset
+(`Σ x` of the group times `ml`) and 5 KB more threadgroup memory; they keep the half-rounded tile, are therefore not
+exact, and run only with `-Djllm.metal.hmmaKQuants=true` (error 1.5e-4 to 3e-4 as above).
 
 **The second flash prefill form, `attention_fb`.** The online softmax of [8.13](#813-flash-attention-prefill-attention_fa)
 is unchanged; the staging of keys and values is not:
@@ -1227,15 +1258,36 @@ scratch. The tuner checks both forms against `attention_t` and keeps the faster 
 layouts, with partial row tiles (96 rows), partial token tiles (37 and 7 tokens), full tiles taking the direct store
 with and without `accumulate`, bias, soft-cap, GeGLU, the f16 V output, and MoE tiles of 1, 3, 5, 16 and 32 slots
 scattered over the chunk; the old `*_mma` kernels are checked against the same decoders. `attention_fb` runs the
-`attention_fa` cases plus half and q8 caches at D = 64, 128 and 256. End to end (Qwen3-MoE tiny model, all five
-formats, MMA forced down to 2-token chunks on the emulator) the half-weight kernels keep the greedy tokens equal to
-the CPU's with final-logit differences of ~4e-3 at max |logit| ≈ 22 (f32 MMA: ~1e-5), inside the smoke test's
-`1e-3 · max + 1e-4` bound; only the q8-cache comparisons, which re-quantize K and V to int8 and so turn a 2e-4
-shift into whole rounding steps, exceed theirs. `arch-smoke.sh` therefore runs the f32 form
-(`-Djllm.metal.hmma=false`, overridable). **Speed is not measured here**: the emulator
-runs one GPU thread per CPU fiber, so its timings say nothing about a GPU. `scripts/mac-validate.sh` has the rows
-that measure it on a Mac (half-weight MMA forced on / off, `fa` / `fb`, a ~2 000-token prompt); the expected gains
-and their arithmetic are in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design).
+`attention_fa` cases plus half and q8 caches at D = 64, 128 and 256. End to end, `arch-smoke.sh` runs everything with the tuner's choice (hmma auto) and a last pass with the half-weight
+kernels forced on and MMA from 2-token chunks on (`-Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2
+-Djllm.metal.moeMmaMin=2`) for Q4_0 / Q8_0 on Llama, Qwen2, Gemma3, Phi3, Qwen3-MoE (also with experts on the CPU and
+re-placed while running), DeepSeek-V3 (MLA) and Qwen3-Next: same bounds as the f32 form (CPU-vs-Metal 4e-6 to 4e-5 of the
+logits, batched decoding bit-identical, q8 cache 7e-6 to 5e-5).
+
+**Measured on an Apple M1 Pro (10 cores, 32 GB), `./jllm bench --temp 0 --engine.speculative off
+--bench.max-tokens 16`, 413-token prompt, median of 3, under the heavy lock; `JAVA_OPTS` shown.** The half-weight
+form did not pay on this GPU, in either version:
+
+| prefill tok/s | `--batch 64` hmma=false (f32 MMA) | hmma=true, first version (half-rounded) | hmma=true, exact scales | `--batch 256` hmma=false | hmma=true first version | hmma=true exact |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B q4 | 1 436 | 1 419 | 873 | 2 092 | 1 995 | 1 101–1 110 |
+| Qwen3-0.6B q8 | 1 479 | 1 459 | 885 | 2 105 | 2 041 | 1 110 |
+| GGUF Q4_0 | 1 361 | 1 368 | 853 | 1 950 | 1 954 | 1 106 |
+| GGUF Q4_K_M (K-quants, `hmmaKQuants=true`) | 949 | 958 | – | 1 815 | 1 860 | – |
+
+The 64-token chunk underfills the GPU (2 092 vs 1 436 tok/s with `--batch 256` for the same f32 kernels), but the ranking
+is the same. The half tile (4 KB, up to four resident threadgroups instead of two) buys nothing here (not investigated further:
+the f32 kernels do not seem limited by threadgroup occupancy on this chip); the first version is within
+±5 % of the f32 kernels (the K-quant row +1 %, within the noise), the exact one is 40 % slower (the extra f32
+`tmp · D` multiply-accumulates and the longer dependency chain cost more than their 25 % of the arithmetic would suggest;
+not profiled). The start-up
+check measures it per shape (MATMUL3 Q4_0 4096 × 1024: 1.009 ms exact against 0.542 ms f32; MATMUL Q4_0 1024 × 2048:
+0.508 against 0.309) and keeps the f32 form for all 4 distinct shapes of Qwen3-0.6B ("half-weight MMA for 0 of 4
+shapes"), so the default is unchanged on this chip: the exact kernels are the safe candidate for GPUs where half MMA is
+faster (the M3/M4 generations were not available), and the reason the whole smoke can run with them on. `scripts/mac-validate.sh`
+has the rows (hmma forced on / off at the default chunk, at `--batch 256`, for the GGUF Q4_0, `fa` / `fb`, the 2 000-token
+prompt). The ~1.1–1.45× expected in [11 §11.8](11-performance.md#118-the-prefill-kernels-against-llamacpps-design) did not
+materialize on the M1 Pro.
 ---
 
 ## 8.22 Decode replay: one native call per token
