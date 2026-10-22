@@ -251,6 +251,12 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         }
         String[] g = require(name);
         if (g.length == 1) {
+            if (name.endsWith("mlp.gate_up")) {
+                return fusedGateUp(gguf.tensor(g[0]));
+            }
+            if (name.endsWith("experts.gate_up")) {
+                return fusedExperts(gguf.tensor(g[0]));
+            }
             return matrix(gguf.tensor(g[0]));
         }
         return name.endsWith("experts.gate_up") ? stackExperts(gguf.tensor(g[0]), gguf.tensor(g[1]))
@@ -443,6 +449,47 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         if (a.cols() != b.cols() || a.rows() != b.rows() || a.dims().length != b.dims().length) {
             throw new IllegalArgumentException(a + " and " + b + " differ in shape");
         }
+    }
+
+    /**
+     * Phi-3's / ChatGLM's {@code ffn_up}: gate rows then up rows in one tensor. The GPU's swiglu kernels read the up rows
+     * from a second buffer (the one the formats with separate scales use), so for the GGUF block types the stack is
+     * presented as a {@linkplain QTensor#split split} pair of two views of the same bytes, as for separate tensors.
+     */
+    private QTensor fusedGateUp(GgufFile.Tensor t) {
+        QType q = GgmlCodec.nativeType(t.type());
+        if (q == null || !q.gguf || colsOf(t) % q.blockSize != 0 || rowsOf(t) % 2 != 0) {
+            return matrix(t);
+        }
+        long half = t.rows() / 2;
+        viewedBytes += t.size();
+        return QTensor.split(matrix(sub(new Slice(t.name(), 0, half, false)), false),
+                matrix(sub(new Slice(t.name(), half, half, false)), false), 0);
+    }
+
+    /**
+     * {@code ffn_gate_up_exps} ({@code --fuse-gate-up-exps}): per expert the gate rows then the up rows, which is the
+     * engine's stacked layout. The GGUF block types' GPU kernels need two views (gate, up) interleaved per expert, which
+     * these rows are not, so they are copied apart (the one fused layout that costs memory).
+     */
+    private QTensor fusedExperts(GgufFile.Tensor t) {
+        QType q = GgmlCodec.nativeType(t.type());
+        if (t.dims().length != 3 || q == null || !q.gguf || colsOf(t) % q.blockSize != 0) {
+            return matrix(t);
+        }
+        int experts = Math.toIntExact(t.dims()[2]);
+        int m = Math.toIntExact(t.dims()[1] / 2);
+        long rb = t.rowBytes();
+        MemorySegment src = gguf.data(t);
+        MemorySegment gate = arena.allocate((long) experts * m * rb, 64);
+        MemorySegment up = arena.allocate((long) experts * m * rb, 64);
+        for (int e = 0; e < experts; e++) {
+            MemorySegment.copy(src, (long) e * 2 * m * rb, gate, (long) e * m * rb, (long) m * rb);
+            MemorySegment.copy(src, ((long) e * 2 + 1) * m * rb, up, (long) e * m * rb, (long) m * rb);
+        }
+        convertedBytes += t.size();
+        residentBytes += t.size();
+        return QTensor.split(QTensor.mapped(q, experts * m, colsOf(t), gate), QTensor.mapped(q, experts * m, colsOf(t), up), m);
     }
 
     /** One line about what was converted at load (empty when every tensor is used in place). */
