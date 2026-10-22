@@ -139,7 +139,11 @@ public final class LoadedModel {
                 if (!(slot.engine.backend() instanceof BatchGroup.Member mm) || !mm.requestPause()) {
                     return false;
                 }
-                mm.awaitPaused(PAUSE_WAIT_MS); // the blocks are back in the pool before the newcomer asks for its own
+                // the blocks are back in the pool before the newcomer asks for its own (unless the request ends meanwhile)
+                long end = System.nanoTime() + PAUSE_WAIT_MS * 1_000_000L;
+                while (System.nanoTime() < end && slot.engine.busy() && !mm.awaitPaused(25)) {
+                    // waiting for the generation to reach its next step boundary
+                }
                 return true;
             }
 

@@ -153,7 +153,9 @@ public class OpenAiController {
         } catch (LoadedModel.UnavailableException e) {
             ChatSupport.send(res, 503, ChatSupport.error(e.getMessage(), "server_error", "model_unavailable"));
         } catch (org.robomiri.jllm.engine.Admission.Abandoned e) {
-            // the client left while the request waited for a slot: nothing to answer
+            if (model.closing()) { // the model is being unloaded: the waiting request is told
+                ChatSupport.send(res, 503, ChatSupport.error("model " + model.id() + " is being unloaded", "server_error", "model_unavailable"));
+            } // else the client left while the request waited for a slot: nothing to answer
         }
     }
 
