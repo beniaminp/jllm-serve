@@ -3,6 +3,7 @@ package org.robomiri.jllm;
 import org.robomiri.jllm.cpu.CpuBackend;
 import org.robomiri.jllm.cpu.MambaCpuBackend;
 import org.robomiri.jllm.cpu.Qwen3NextCpuBackend;
+import org.robomiri.jllm.engine.Speculator;
 import org.robomiri.jllm.metal.MambaMetalBackend;
 import org.robomiri.jllm.metal.Metal;
 import org.robomiri.jllm.metal.MetalBackend;
@@ -31,9 +32,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Pipeline test for the model families on tiny random checkpoints: for each model directory and quantization
@@ -192,7 +195,9 @@ public final class ArchSmoke {
             if (!recurrent) {
                 failures += pipeCheck(w, lib, cfg, gpu, label);
             }
-            if (!recurrent && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            if (hybrid && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                failures += hybridBatchCheck(w, lib);
+            } else if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += batchCheck(w, lib, cfg);
                 failures += draftCheck(w, dir, lib, cfg);
             }
@@ -205,6 +210,8 @@ public final class ArchSmoke {
                 // first dense and the first MoE family, to keep the emulator run's time in bounds
                 failures += replayCheck(w, lib, cfg, KvDtype.F32);
                 failures += replayCheck(w, lib, cfg, KvDtype.Q8);
+                failures += replayBatchCheck(w, lib, cfg, KvDtype.F32);
+                failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
                 if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
                     failures += replayCheck(w, lib, cfg, KvDtype.F16);
                 }
@@ -214,6 +221,7 @@ public final class ArchSmoke {
                 for (KvDtype dt : KvDtype.values()) {
                     if (!(latent && dt == KvDtype.Q8)) { // a q8 latent cache is not saved
                         failures += kvStateChecks(w, lib, cfg, dt);
+                        failures += replayStateCheck(w, lib, cfg, dt);
                     }
                 }
             }
@@ -382,6 +390,24 @@ public final class ArchSmoke {
             System.out.printf("  experts re-placed while running: %d layers moved, %s max|cpu-split| = %.2e -> %s%n", moved,
                     Arrays.toString(got), diff, ok ? "ok" : "REBALANCE FAILED");
             bad += ok ? 0 : 1;
+            // Decode replay x re-placement: while experts are on the CPU a decode step is not replayed (it waits for the
+            // CPU halfway). With room for every expert the next re-placement moves the rest to the GPU, which makes
+            // the backend replayable (and drops recordings that bound the old expert buffers): the steps after it must be
+            // recorded, replayed, and still the CPU backend's.
+            System.setProperty("jllm.metal.workingSetGb", Double.toString((full + 100_000_000L) / 1e9));
+            boolean replayedBefore = b.replaying();
+            int moved2 = b.rebalanceExperts();
+            long r0 = b.replayedSteps();
+            float[] l2 = new float[cfg.core().vocabSize()];
+            int[] first = generate(b, l2);  // records the decode shapes
+            int[] second = generate(b, l2); // replays them
+            long replayed = b.replayedSteps() - r0;
+            float diff2 = maxDiff(cpuLogits, l2);
+            boolean ok2 = !replayedBefore && moved2 > 0 && b.replaying() && replayed > 0 && Arrays.equals(cpu, first)
+                    && Arrays.equals(cpu, second) && diff2 <= 1e-3f * maxAbs(cpuLogits) + 1e-4f;
+            System.out.printf("  experts re-placed onto the GPU, then replayed: %d layers moved, %d steps replayed, %s max|cpu-split| = %.2e -> %s%n",
+                    moved2, replayed, Arrays.toString(second), diff2, ok2 ? "ok" : "REPLAY x REBALANCE FAILED");
+            bad += ok2 ? 0 : 1;
         } finally {
             System.clearProperty("jllm.metal.workingSetGb");
             System.clearProperty("jllm.metal.expertStatsDir");
@@ -491,6 +517,74 @@ public final class ArchSmoke {
             bad += (loaded ? 0 : 1) + (copied ? 0 : 1) + (sameFormat && crossOk ? 0 : 1);
         }
         return bad;
+    }
+
+    /**
+     * Decode replay x saved caches: a slot that has been decoding with replay (so it holds recordings) gets another
+     * conversation's cache, loaded from a saved file and then copied from a live backend; its next decode steps, flash
+     * decoding forced on so they cross shapes, must be bit-identical to those of a backend with replay off that got the
+     * same cache, and must really be replayed (the recordings bind the cache buffers and a load writes their contents,
+     * so they must stay valid). The two ways of restoring the same cache must also continue identically.
+     */
+    private static int replayStateCheck(ModelWeights w, String lib, Architecture cfg, KvDtype dt) throws Exception {
+        int vocab = cfg.core().vocabSize();
+        int[] other = {5, 900, 17, 3, 44, 61, 2, 8, 19, 400, 3, 77, 100};
+        int n = other.length;
+        int steps = 14;
+        int[] toks = new int[steps];
+        for (int j = 0; j < steps; j++) {
+            toks[j] = (PROMPT[j % PROMPT.length] * 7 + j) % vocab;
+        }
+        try (MetalBackend on = new MetalBackend(w, 64, 16, lib, dt); MetalBackend ref = new MetalBackend(w, 64, 16, lib, dt);
+             MetalBackend src = new MetalBackend(w, 64, 16, lib, dt)) {
+            on.replay(true);
+            ref.replay(false);
+            src.replay(false);
+            on.flashDecodeThresholds(PROMPT.length + 6, 4);
+            ref.flashDecodeThresholds(PROMPT.length + 6, 4);
+            // a first conversation on both: `on` records its steps
+            continueSteps(on, PROMPT, steps, toks, vocab);
+            continueSteps(ref, PROMPT, steps, toks, vocab);
+            long recorded = on.recordedSteps();
+            src.forward(other, 0, n, 0, null);
+            var bytes = new java.io.ByteArrayOutputStream();
+            src.saveState(n, java.nio.channels.Channels.newChannel(bytes));
+            on.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(bytes.toByteArray())));
+            ref.loadState(n, java.nio.channels.Channels.newChannel(new java.io.ByteArrayInputStream(bytes.toByteArray())));
+            long before = on.replayedSteps();
+            float[][] loadedOn = tail(on, n, steps, toks, vocab);
+            float[][] loadedRef = tail(ref, n, steps, toks, vocab);
+            long replayedAfterLoad = on.replayedSteps() - before;
+            on.copyStateFrom(src, n);
+            ref.copyStateFrom(src, n);
+            before = on.replayedSteps();
+            float[][] copiedOn = tail(on, n, steps, toks, vocab);
+            float[][] copiedRef = tail(ref, n, steps, toks, vocab);
+            long replayedAfterCopy = on.replayedSteps() - before;
+            boolean loaded = Arrays.deepEquals(loadedOn, loadedRef);
+            boolean copied = Arrays.deepEquals(copiedOn, copiedRef);
+            boolean same = Arrays.deepEquals(loadedOn, copiedOn);
+            boolean ok = loaded && copied && same && recorded > 0 && replayedAfterLoad > 0 && replayedAfterCopy > 0;
+            System.out.printf("  replay x saved cache %s: after a load %s (%d steps replayed), after a copy %s (%d replayed), load == copy %s -> %s%n",
+                    dt, loaded ? "bit-identical" : "DIFFERENT", replayedAfterLoad, copied ? "bit-identical" : "DIFFERENT",
+                    replayedAfterCopy, same ? "yes" : "NO", ok ? "ok" : "REPLAY x STATE MISMATCH");
+            return ok ? 0 : 1;
+        }
+    }
+
+    /** Prefill {@code prompt}, then {@code steps} decode steps teacher-forced with {@code toks}. */
+    private static void continueSteps(MetalBackend b, int[] prompt, int steps, int[] toks, int vocab) {
+        b.forward(prompt, 0, prompt.length, 0, new float[vocab]);
+        tail(b, prompt.length, steps, toks, vocab);
+    }
+
+    /** {@code steps} decode steps from position {@code n} (the cache holds n positions), teacher-forced; their logits. */
+    private static float[][] tail(MetalBackend b, int n, int steps, int[] toks, int vocab) {
+        float[][] out = new float[steps][vocab];
+        for (int j = 0; j < steps; j++) {
+            b.forward(new int[]{toks[j]}, 0, 1, n + j, out[j]);
+        }
+        return out;
     }
 
     /**
@@ -884,6 +978,122 @@ public final class ArchSmoke {
         }
     }
 
+    /**
+     * Decode replay x batched decoding: three slots with replay on take single-token steps (recorded, then replayed with
+     * the position patched in) and batched passes ({@link MetalBackend#forwardBatch}: other kernels, other buffers, the
+     * rows written into each slot's cache) in turn, in a pattern that leaves a slot out of a batch now and then, with
+     * flash decoding forced on so the single steps keep changing shape. Three reference slots on the same weights
+     * decode the same tokens alone with replay off. Every step's logits must agree to rounding (a slot's recorded step
+     * must not see a stale binding or a cache row the batched pass wrote differently), the single steps' logits are
+     * counted as bit-identical, and the tokens are the same.
+     */
+    private static int replayBatchCheck(ModelWeights w, String lib, Architecture cfg, KvDtype dt) {
+        int vocab = cfg.core().vocabSize();
+        int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
+        int steps = 24;
+        MetalBackend[] on = new MetalBackend[3];
+        MetalBackend[] ref = new MetalBackend[3];
+        try {
+            for (int i = 0; i < 3; i++) {
+                on[i] = new MetalBackend(w, 64, 16, lib, dt);
+                ref[i] = new MetalBackend(w, 64, 16, lib, dt);
+                on[i].replay(true);
+                ref[i].replay(false);
+                // the same thresholds in every slot, as in a server: a batched pass decides flash or not for all its rows
+                // by the leader's
+                on[i].flashDecodeThresholds(prompts[1].length + 6, 4);
+                ref[i].flashDecodeThresholds(prompts[1].length + 6, 4);
+            }
+            if (!on[0].replaying()) {
+                System.out.println("  replay x batch " + dt + ": replay not available");
+                return 1;
+            }
+            float[][] lOn = new float[3][vocab];
+            float[][] lRef = new float[3][vocab];
+            int[] tok = new int[3];
+            for (int i = 0; i < 3; i++) {
+                on[i].forward(prompts[i], 0, prompts[i].length, 0, lOn[i]);
+                ref[i].forward(prompts[i], 0, prompts[i].length, 0, lRef[i]);
+                tok[i] = argmax(lRef[i]);
+            }
+            boolean batched = true;
+            boolean tokens = true;
+            int batchedSteps = 0;
+            int soloExact = 0;
+            int soloSteps = 0;
+            float diff = 0;
+            float scale = 0;
+            for (int s = 0; s < steps; s++) {
+                int[] pos = {prompts[0].length + s, prompts[1].length + s, prompts[2].length + s};
+                for (int i = 0; i < 3; i++) {
+                    ref[i].forward(new int[]{tok[i]}, 0, 1, pos[i], lRef[i]);
+                }
+                int mode = s % 4; // 0: all alone, 1 and 3: all three batched, 2: two batched and one alone
+                int lead = s % 3;
+                boolean[] inBatch = new boolean[3];
+                if (mode == 1 || mode == 3) {
+                    Arrays.fill(inBatch, true);
+                } else if (mode == 2) {
+                    Arrays.fill(inBatch, true);
+                    inBatch[(lead + 1) % 3] = false;
+                }
+                List<Integer> rows = new ArrayList<>();
+                for (int r = 0; r < 3; r++) {
+                    if (inBatch[(lead + r) % 3]) {
+                        rows.add((lead + r) % 3);
+                    }
+                }
+                for (int i = 0; i < 3; i++) {
+                    if (!inBatch[i]) {
+                        on[i].forward(new int[]{tok[i]}, 0, 1, pos[i], lOn[i]);
+                    }
+                }
+                if (!rows.isEmpty()) {
+                    Backend[] members = new Backend[rows.size()];
+                    int[] tokens1 = new int[rows.size()];
+                    int[] positions = new int[rows.size()];
+                    float[][] out = new float[rows.size()][];
+                    for (int r = 0; r < rows.size(); r++) {
+                        int i = rows.get(r);
+                        members[r] = on[i];
+                        tokens1[r] = tok[i];
+                        positions[r] = pos[i];
+                        out[r] = lOn[i];
+                    }
+                    batched &= on[rows.get(0)].forwardBatch(members, tokens1, positions, out);
+                    batchedSteps++;
+                }
+                for (int i = 0; i < 3; i++) {
+                    float d = maxDiff(lOn[i], lRef[i]);
+                    diff = Math.max(diff, d);
+                    scale = Math.max(scale, maxAbs(lRef[i]));
+                    tokens &= argmax(lOn[i]) == argmax(lRef[i]);
+                    if (!inBatch[i]) {
+                        soloSteps++;
+                        soloExact += d == 0 ? 1 : 0;
+                    }
+                    tok[i] = argmax(lRef[i]);
+                }
+            }
+            long replayed = on[0].replayedSteps() + on[1].replayedSteps() + on[2].replayedSteps();
+            // 1e-4 of the largest logit: the batched rows' rounding (docs/08 8.24), the same bound batchCheck uses
+            boolean ok = batched && tokens && replayed > 0 && diff <= 1e-4f * scale + 1e-5f;
+            System.out.printf("  replay x batch %s: %d steps (%d batched passes, %d single steps %d bit-identical, %d replayed),"
+                            + " max|replay+batch-alone| = %.1e, tokens %s -> %s%n", dt, steps, batchedSteps, soloSteps, soloExact,
+                    replayed, diff, tokens ? "same" : "DIFFERENT", ok ? "ok" : "REPLAY x BATCH MISMATCH");
+            return ok ? 0 : 1;
+        } finally {
+            for (int i = 0; i < 3; i++) {
+                if (on[i] != null) {
+                    on[i].close();
+                }
+                if (ref[i] != null) {
+                    ref[i].close();
+                }
+            }
+        }
+    }
+
     private static int argmax(float[] l) {
         int best = 0;
         for (int t = 1; t < l.length; t++) {
@@ -1030,7 +1240,7 @@ public final class ArchSmoke {
                             ok ? "ok" : "BATCH MISMATCH");
                     bad += ok ? 0 : 1;
                     if (dt == KvDtype.F32) {
-                        bad += groupCheck(b, prompts, aloneTok, vocab);
+                        bad += groupCheck(b, prompts, aloneTok, vocab, true);
                     }
                 } finally {
                     for (MetalBackend x : b) {
@@ -1052,32 +1262,72 @@ public final class ArchSmoke {
         return bad;
     }
 
-    /** The slots of {@code b} in a batch group, three threads decoding at once: each gets its own tokens of alone. */
-    private static int groupCheck(MetalBackend[] b, int[][] prompts, int[][] alone, int vocab) throws Exception {
+    /**
+     * Qwen3-Next (Gated DeltaNet states plus a KV cache for the full-attention layers) is not batched: its Metal
+     * backend has no {@code forwardBatch}, so a batch group runs the queued steps one after another. Verified here:
+     * three slots in one group, three threads decoding at once, give the tokens each gives alone, and no step runs in
+     * a shared pass (a pass that claimed to batch them would be unchecked code). Draft and prompt-lookup speculation
+     * are off for it as well: a recurrent state cannot roll back ({@code Speculator.supported}), and
+     * {@code ModelLoader.loadDraft} refuses it as a draft or a target.
+     */
+    private static int hybridBatchCheck(ModelWeights w, String lib) throws Exception {
+        int vocab = w.arch.core().vocabSize();
+        int[][] prompts = {PROMPT, Arrays.copyOf(PROMPT, 7), {5, 900, 17, 3, 44, 61, 2, 8, 19, 400}};
+        Qwen3NextMetalBackend[] b = new Qwen3NextMetalBackend[3];
+        int bad = 0;
+        try {
+            for (int i = 0; i < 3; i++) {
+                b[i] = new Qwen3NextMetalBackend(w, 64, 16, lib, KvDtype.F32);
+            }
+            int[][] alone = new int[3][];
+            for (int i = 0; i < 3; i++) {
+                alone[i] = decode(b[i], prompts[i], null, vocab);
+            }
+            for (int i = 0; i < 3; i++) { // the same slots again, from scratch: a group must reproduce the tokens
+                b[i].close();
+                b[i] = new Qwen3NextMetalBackend(w, 64, 16, lib, KvDtype.F32);
+            }
+            boolean spec = Speculator.supported(b[0]);
+            System.out.println("  qwen3-next speculation supported: " + spec + (spec ? " -> SPECULATION ON FOR A RECURRENT STATE" : " -> ok"));
+            bad += spec ? 1 : 0;
+            bad += groupCheck(b, prompts, alone, vocab, false);
+        } finally {
+            for (Qwen3NextMetalBackend x : b) {
+                if (x != null) {
+                    x.close();
+                }
+            }
+        }
+        return bad;
+    }
+
+    /**
+     * The slots of {@code b} in a batch group, three threads decoding at once: each gets its own tokens of alone.
+     * With {@code batchable}, steps must also have run in shared passes; without it (a backend that cannot batch),
+     * none may have.
+     */
+    private static int groupCheck(Backend[] b, int[][] prompts, int[][] alone, int vocab, boolean batchable) throws Exception {
         org.robomiri.jllm.engine.BatchGroup g = new org.robomiri.jllm.engine.BatchGroup();
         Backend[] m = new Backend[b.length];
         for (int i = 0; i < b.length; i++) {
             m[i] = g.join(b[i]);
         }
         ExecutorService ex = Executors.newFixedThreadPool(b.length);
+        // The threads meet before every decode step. Without it the outcome depends on the GPU's speed: the thread
+        // whose prefill ends first decodes all its steps alone while the others still wait for the device lock for their
+        // prefills (a leader only waits for slots that decoded within the last 200 ms), and on a fast GPU no step is ever
+        // shared. A server's slots behave like this (each samples a token between steps and comes right back), and it
+        // keeps what is verified: that steps really run in shared passes and give the tokens they give alone.
+        CyclicBarrier meet = new CyclicBarrier(b.length);
         try {
-            // Whether steps meet in a pass depends on the three threads being scheduled within the group's 2 ms window; on a
-            // busy machine they can run apart for a whole generation. The tokens must be right on every attempt, and
-            // some attempt (of up to 5) must have shared a pass.
+            List<Future<int[]>> fs = new ArrayList<>();
+            for (int i = 0; i < b.length; i++) {
+                int k = i;
+                fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab, meet)));
+            }
             boolean same = true;
             long[] st = g.stats();
-            for (int attempt = 0; attempt < 5 && same && st[1] == 0; attempt++) {
-                List<Future<int[]>> fs = new ArrayList<>();
-                for (int i = 0; i < b.length; i++) {
-                    int k = i;
-                    fs.add(ex.submit(() -> decode(m[k], prompts[k], null, vocab)));
-                }
-                for (int i = 0; i < b.length; i++) {
-                    same &= Arrays.equals(fs.get(i).get(), alone[i]);
-                }
-                st = g.stats();
-            }
-            boolean ok = same && st[1] > 0;
+            boolean ok = same && (batchable ? st[1] > 0 : st[1] == 0);
             System.out.printf("  batch group, 3 threads: tokens %s, %d decode steps in shared passes (%d passes) -> %s%n",
                     same ? "same" : "DIFFERENT", st[1], st[0], ok ? "ok" : "GROUP MISMATCH");
             return ok ? 0 : 1;
@@ -1088,6 +1338,11 @@ public final class ArchSmoke {
 
     /** Greedy: prefill {@code prompt}, then NEW_TOKENS - 1 decode steps; step s's logits to stepLogits[s] if not null. */
     private static int[] decode(Backend b, int[] prompt, float[][] stepLogits, int vocab) {
+        return decode(b, prompt, stepLogits, vocab, null);
+    }
+
+    /** As above; the threads sharing {@code meet} start every decode step together. */
+    private static int[] decode(Backend b, int[] prompt, float[][] stepLogits, int vocab, CyclicBarrier meet) {
         float[] logits = stepLogits != null ? stepLogits[0] : new float[vocab];
         b.forward(prompt, 0, prompt.length, 0, logits);
         int[] out = new int[NEW_TOKENS];
@@ -1096,6 +1351,13 @@ public final class ArchSmoke {
             if (s > 0) {
                 if (stepLogits != null) {
                     logits = stepLogits[s];
+                }
+                if (meet != null) {
+                    try {
+                        meet.await(60, TimeUnit.SECONDS);
+                    } catch (Exception e) {
+                        throw new IllegalStateException("the decoding threads did not meet", e);
+                    }
                 }
                 b.forward(new int[]{out[s - 1]}, 0, 1, pos++, logits);
             }
@@ -1152,10 +1414,16 @@ public final class ArchSmoke {
                     if (dt != KvDtype.F32 && d[1] == w) {
                         continue; // the f16 / q8 caches: the drafts that get rejected, which is what rolls back
                     }
-                    var dm = new org.robomiri.jllm.engine.DraftModel(new MetalBackend((ModelWeights) d[1], 64, 16, lib, dt), vocab,
-                            null);
-                    try (org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(new MetalBackend(w, 64, 16, lib, dt),
-                            tok, cfg, Set.of(), 0, fmt)) {
+                    // replay is on by default: the draft's pipelined steps are recorded once and replayed (docs/08 8.22), and
+                    // the output must still be the plain run's; the drafting for itself is also run with replay off
+                    // on both backends, to show that the two agree rather than both being wrong the same way
+                    for (boolean replay : d[1] == w && dt == KvDtype.F32 ? new boolean[]{true, false} : new boolean[]{true}) {
+                    MetalBackend draftBackend = new MetalBackend((ModelWeights) d[1], 64, 16, lib, dt);
+                    MetalBackend targetBackend = new MetalBackend(w, 64, 16, lib, dt);
+                    draftBackend.replay(replay);
+                    targetBackend.replay(replay);
+                    var dm = new org.robomiri.jllm.engine.DraftModel(draftBackend, vocab, null);
+                    try (org.robomiri.jllm.engine.Engine e = new org.robomiri.jllm.engine.Engine(targetBackend, tok, cfg, Set.of(), 0, fmt)) {
                         // a pass on every step (the emulator's timings would make the cost model pause speculation)
                         System.setProperty("jllm.engine.adaptiveDraft", "false");
                         try {
@@ -1166,9 +1434,12 @@ public final class ArchSmoke {
                         }
                         var r = e.generate(PROMPT, greedy, null, () -> false);
                         boolean same = Arrays.equals(plain, r.tokens());
-                        ok &= same && r.stats().draftedTokens() > 0;
-                        line.append(String.format(", %s draft %d/%d accepted%s", d[0], r.stats().acceptedTokens(),
-                                r.stats().draftedTokens(), same ? "" : " OUTPUT DIFFERS"));
+                        boolean replayed = !replay || draftBackend.replayedSteps() > 0;
+                        ok &= same && r.stats().draftedTokens() > 0 && replayed;
+                        line.append(String.format(", %s draft%s %d/%d accepted%s%s", d[0], replay ? "" : " (replay off)",
+                                r.stats().acceptedTokens(), r.stats().draftedTokens(), same ? "" : " OUTPUT DIFFERS",
+                                replayed ? "" : " DRAFT STEPS NOT REPLAYED"));
+                    }
                     }
                 }
                 System.out.printf("  draft speculation, kv %s: %d tokens%s -> %s%n", dt, plain.length, line,

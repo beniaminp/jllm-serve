@@ -889,7 +889,7 @@ public final class MetalBackend implements Backend {
             // flash form shares its partial-result buffer between rows and stays one after the other
             boolean anyFlash = false;
             for (int t = 0; t < n; t++) {
-                anyFlash |= flashDecode && positions[t] + 1 >= MetalKernels.FLASH_MIN_LEN;
+                anyFlash |= flashDecode && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
             }
             int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
             for (int t = 0; t < n; t++) {
@@ -898,7 +898,7 @@ public final class MetalBackend implements Backend {
                 int pos = positions[t];
                 long qOff = (long) t * g.qDim() * 4;
                 if (anyFlash) {
-                    if (flashDecode && pos + 1 >= MetalKernels.FLASH_MIN_LEN) {
+                    if (flashDecode && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                                 hd, pos, ctx, g.scale(), g.qDim(), stride, g.window(), g.softcap());
                         continue;

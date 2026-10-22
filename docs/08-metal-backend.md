@@ -1439,9 +1439,22 @@ within 10⁻⁴ of the largest, then runs the same slots in a three-thread `Batc
 alone. From 8 rows on the tiled prefill kernels (still bit-identical) and from 32 the simdgroup-matrix ones (rounding
 level, §8.10) take over.
 
-**What stays one at a time.** Mamba backends (a recurrent state per slot), and a batch whose members differ in weights
-or cache type (`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false`
-turns batched passes off.
+**What stays one at a time.** Mamba and Qwen3-Next backends (a recurrent state per slot; neither implements
+`forwardBatch`, so their slots in a group take turns on the device lock, which `ArchSmoke` checks: three threads, the
+tokens each gives alone, no step in a shared pass), and a batch whose members differ in weights or cache type
+(`forwardBatch` returns false and the group runs the steps one by one). `-Djllm.metal.batchDecode=false` turns batched
+passes off.
+
+**Together with replay and the rest.** `ArchSmoke` runs the combinations that are easy to break by one feature's change
+in another's state: decode replay x batched passes (three slots alternate recorded single steps and batched passes with
+a slot left out now and then, flash decoding forced on; versus three slots alone with replay off, within 10^-4 of the
+largest logit, the single steps counted as bit-identical), replay x saved caches (a slot with recordings gets another
+conversation's cache by `loadState` and by `copyStateFrom`: bit-identical to a replay-off slot, steps really replayed),
+replay x `rebalanceExperts` (the re-placement that moves the last experts onto the GPU makes the backend replayable;
+the steps after it are recorded, replayed and still the CPU backend's), and replay x draft pipelining (the draft's
+pipelined steps are replayed, and the output, with the draft or without it, is the same with replay on and off). The
+per-row flash attention of a batched pass takes the instance's thresholds (`flashMinLen`, `flashChunk`), as the
+single step does (the static defaults are the same numbers, so this only shows when a test lowers them).
 
 ---
 
