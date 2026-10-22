@@ -205,7 +205,11 @@ public final class ArchSmoke {
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
-            if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            if (PAGED && cfg instanceof Decoder sd && org.robomiri.jllm.cpu.CpuBackend.anySpecial(sd, 64)
+                    && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                // (gpt-oss / Llama 4: sinks, chunked attention or temperature read the flat cache; ModelLoader falls back to it)
+                System.out.println("  paged KV cache: not applicable to sinks / chunked attention / temperature tuning");
+            } else if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
                 boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
                 failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
