@@ -1543,7 +1543,13 @@ public final class SmokeTest {
                     "{\"type\":\"yarn\",\"factor\":40,\"mscale\":1.0,\"mscale_all_dim\":0.707,\"beta_fast\":16}"))).scaling();
             check(ms instanceof Scaling.Yarn y && y.betaFast() == 16 && Math.abs(Rope.amplitude(ms) - m) < 1e-12,
                     "yarn mscale / mscale_all_dim: " + ms);
-            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}", "{\"type\":\"yarn\",\"factor\":4,\"truncate\":false}"}) {
+            // truncate: false (gpt-oss) is read: the correction range stays fractional, so the frequencies differ from the default's
+            RopeTable ntt = rope(cfg(tmp, base.formatted("{\"type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768,"
+                    + "\"truncate\":false}")));
+            check(ntt.scaling() instanceof Scaling.Yarn y && !y.truncate() && t.scaling() instanceof Scaling.Yarn d && d.truncate()
+                            && !Arrays.equals(Rope.invFreq(ntt, 40960), Rope.invFreq(t, 40960)),
+                    "yarn truncate false is read and changes the frequencies: " + ntt.scaling());
+            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}"}) {
                 try {
                     cfg(tmp, base.formatted(bad));
                     check(false, "rejected yarn config " + bad);
