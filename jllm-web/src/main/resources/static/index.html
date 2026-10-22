@@ -6,6 +6,7 @@
 <title>jllm console</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b6cf6'/%3E%3Ctext x='16' y='22' font-family='sans-serif' font-size='16' font-weight='700' fill='white' text-anchor='middle'%3Ej%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
+<!-- images: begin --><link rel="stylesheet" href="images.css"><!-- images: end -->
 <link rel="stylesheet" href="css/vision.css"> <!-- vision: pictures in the chat -->
 <!-- audio:begin --><link rel="stylesheet" href="audio.css"><!-- audio:end -->
 <script>try { const t = localStorage.getItem('jllm.theme'); if (t && t !== '"auto"') document.documentElement.dataset.theme = JSON.parse(t); } catch {}</script>
@@ -22,6 +23,9 @@
       <button data-tab="settings"><svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Settings</span></button>
       <button data-tab="logs"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg><span>Logs</span></button>
       <button data-tab="api"><svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span>Connect</span></button>
+      <!-- images: begin -->
+      <button data-tab="images"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-8 9"/></svg><span>Images</span></button>
+      <!-- images: end -->
       <!-- audio:begin -->
       <button data-tab="audio"><svg viewBox="0 0 24 24"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 10v4M22 11v2"/></svg><span>Audio</span></button>
       <!-- audio:end -->
@@ -254,6 +258,9 @@
         <div class="row"><input id="api-key" type="password" placeholder="key"><button id="api-key-save" class="primary">Save</button></div>
       </div>
     </section>
+    <!-- images: begin -->
+    <section id="tab-images" class="tab page"></section>
+    <!-- images: end -->
     <!-- audio:begin -->
     <section id="tab-audio" class="tab page"></section>
     <!-- audio:end -->
@@ -268,6 +275,10 @@
       <label>Model id <input name="id" placeholder="(default)"></label>
       <label>Revision <input name="revision" placeholder="main"></label>
       <label class="gguf-only">GGUF file <select name="ggufFile"></select></label>
+      <!-- images: begin -->
+      <label class="img-only hidden">Image backend <select name="image.backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
+      <label class="img-only hidden">Image precision <select name="image.precision"><option value="">(default)</option><option>auto</option><option>f16</option><option>f32</option></select></label>
+      <!-- images: end -->
       <label class="mm-only" title="vision-language models see pictures through a second file, the multimodal projector (mmproj-*.gguf)">Projector (mmproj) <select name="mmprojChoice"></select></label> <!-- vision -->
       <label>Backend <select name="backend"><option value="">(default)</option><option>auto</option><option>cpu</option><option>metal</option></select></label>
       <label>Context length <input name="backend.ctx" type="number" min="16" step="256" placeholder="(default)"></label>
@@ -302,6 +313,13 @@
 <script src="js/chat.js"></script>
 <script src="js/models.js"></script>
 <script src="js/tools.js"></script>
+<!-- images: begin -->
+<script src="js/images-store.js"></script>
+<script src="js/images-gen.js"></script>
+<script src="js/images-run.js"></script>
+<script src="js/images-editor.js"></script>
+<script src="js/images.js"></script>
+<!-- images: end -->
 <script src="js/admin.js"></script>
 </body>
 </html>

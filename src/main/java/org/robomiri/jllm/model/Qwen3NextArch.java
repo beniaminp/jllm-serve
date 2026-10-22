@@ -216,7 +216,11 @@ public record Qwen3NextArch(Core core, List<Boolean> fullAttention, Attention.Gq
             rs = rp;
         }
         Scaling scaling = Families.parseRopeScaling(rs, c, rotaryDim);
-        RopeTable rope = new RopeTable(rotaryDim, theta, scaling, RopeTable.Pairing.HALF);
+        // Qwen3.5 (a vision-language model): interleaved multimodal sections over the rotary pairs, used when pictures
+        // give the tokens their own positions; text-only runs never read them
+        List<Integer> sections = Families.mropeSections(rs);
+        RopeTable rope = sections.isEmpty() ? new RopeTable(rotaryDim, theta, scaling, RopeTable.Pairing.HALF)
+                : new RopeTable(rotaryDim, theta, scaling, RopeTable.Pairing.HALF, sections, Json.bool(rs, "mrope_interleaved", false));
         Attention.Gqa attn = new Attention.Gqa(heads, kvHeads, headDim, 0, 0, true, false, false,
                 (float) (1.0 / Math.sqrt(headDim)), 0f);
 

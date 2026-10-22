@@ -1486,4 +1486,9 @@ split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
+if not ONLY:
+    # the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout
+    import kernel_tests_diffusion
+
+    kernel_tests_diffusion.run(E, check)
 sys.exit(1 if failures else 0)

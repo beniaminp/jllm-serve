@@ -265,6 +265,16 @@ public final class BatchGroup {
         }
 
         @Override
+        public boolean supportsBidirectionalSpan() {
+            return inner.supportsBidirectionalSpan();
+        }
+
+        @Override
+        public void forwardEmbedsBidirectional(float[] embeds, int off, int n, int pos, float[] logits) {
+            locked(() -> inner.forwardEmbedsBidirectional(embeds, off, n, pos, logits));
+        }
+
+        @Override
         public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
             boolean[] ok = new boolean[1];
             locked(() -> ok[0] = inner.setRopePositions(from, p));

@@ -258,6 +258,34 @@ if [ -n "$MOE" ]; then
   bench "$MOE with draft $DENSE, k 4 (adaptive)" "$MOE" "" --engine.speculative draft --engine.draft-model "$DENSE" \
     --engine.draft-tokens 4
 fi
+# image generation (docs/22): Stable Diffusion on the GPU, each switch on and off (needs the diffusers folder of a model in
+# models/, default stabilityai/sd-turbo; IMAGE_MODEL=<folder> to choose another)
+IMG="${IMAGE_MODEL:-models/stabilityai_sd-turbo}"
+if [ -f "$IMG/model_index.json" ]; then
+  imgbench() { # label java-opts backend precision steps
+    local label="$1" opts="$2" backend="$3" prec="$4" steps="$5"
+    # shellcheck disable=SC2086
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g $opts \
+      -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+      org.robomiri.jllm.diffusion.DiffusionBench "$IMG" "$backend" "$prec" "$steps" 512 512 3 > "$OUT/img.log" 2>&1 || {
+      echo "| $label | failed | | $(tail -1 "$OUT/img.log") |"; return; }
+    local line total unet vae
+    line=$(grep '^warm' "$OUT/img.log" | tail -1)
+    total=$(echo "$line" | sed 's/.*: \([0-9.]*\) s total.*/\1/')
+    unet=$(echo "$line" | sed 's/.*(\([0-9.]*\) s\/eval).*/\1/')
+    vae=$(echo "$line" | sed 's/.*+ vae \([0-9.]*\) .*/\1/')
+    echo "| $label | $total | $unet | $vae |"
+  }
+  echo
+  echo "| image generation, $(basename "$IMG") 512x512 | s per image | UNet s/eval | VAE s |"
+  echo "|---|---|---|---|"
+  imgbench "Metal f16, 1 step (defaults)" "" metal f16 1
+  imgbench "Metal f16, 4 steps" "" metal f16 4
+  imgbench "Metal f32, 4 steps" "" metal f32 4
+  imgbench "flash attention off (scores + softmax), 4 steps" "-Djllm.diffusion.flash=false" metal f16 4
+  imgbench "chunked group norm off, 4 steps" "-Djllm.diffusion.simpleNorm=true" metal f16 4
+  imgbench "CPU f32, 1 step" "" cpu f32 1
+fi
 # GGUF block types read in place against the old behaviour (dequantize at load, requantize to Q8_0): the same file, a
 # switch on the loader (-Djllm.gguf.requantize=all; a list of ggml type names limits it to those types)
 if [ -n "$GGUF_TYPES" ]; then
