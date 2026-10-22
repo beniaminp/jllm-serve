@@ -244,6 +244,46 @@ public final class LoadedModel {
         return a.lastUsed < b.lastUsed;
     }
 
+    private volatile Thread sweeper;
+
+    /**
+     * A paged model's slots keep their conversation's blocks referenced until they move on to another conversation. This
+     * gives the memory back (docs/24 §24.2.8): a slot that has been idle for {@code idleSeconds} releases its blocks (the
+     * conversation stays in the pool's prefix tree and is found again by the next prompt, or evicted when the memory is
+     * needed), and when the pool runs out of blocks it asks every idle slot at once. Does nothing for a flat cache.
+     */
+    public void enablePagedHousekeeping(long idleSeconds) {
+        org.robomiri.jllm.kv.KvSequence seq = loaded.engine().backend().kvSequence();
+        if (seq == null) {
+            return;
+        }
+        seq.pool().setReclaimer(() -> releaseIdle(0));
+        if (idleSeconds > 0) {
+            long idleMs = idleSeconds * 1000;
+            sweeper = Thread.ofVirtual().name("kv-idle-release").start(() -> {
+                try {
+                    while (!closing) {
+                        Thread.sleep(Math.max(100, Math.min(10_000, idleMs / 4)));
+                        releaseIdle(idleMs);
+                    }
+                } catch (InterruptedException e) {
+                    // unloading
+                }
+            });
+        }
+    }
+
+    /** Releases the blocks of the slots no request holds and whose engine has been idle for {@code minIdleMs}; true if any were freed. */
+    boolean releaseIdle(long minIdleMs) {
+        int freed = 0;
+        for (Slot s : slots) {
+            if (s.users.get() == 0) {
+                freed += s.engine.releaseKv(minIdleMs);
+            }
+        }
+        return freed > 0;
+    }
+
     public int slotCount() {
         return slots.size();
     }
@@ -294,6 +334,10 @@ public final class LoadedModel {
     /** Stops new requests, waits for the running ones (which see {@link #closing()}) and frees the model. */
     boolean close(long timeoutMs) throws InterruptedException {
         closing = true;
+        Thread sw = sweeper;
+        if (sw != null) {
+            sw.interrupt();
+        }
         if (!guard.writeLock().tryLock(timeoutMs, TimeUnit.MILLISECONDS)) {
             return false;
         }
