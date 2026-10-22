@@ -123,7 +123,11 @@ public final class ContextBudget {
                     ws / 1e9, weights / 1e9, others / 1e9, reserve / 1e9, spill > 0 ? String.format(Locale.ROOT, " + %.1f experts may move to the CPU", spill / 1e9) : "",
                     free / 1e9, 100 * SHARE);
             if (ram > 0) {
-                budget = Math.min(budget, (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights)));
+                long byRam = (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights));
+                if (byRam < budget) { // the weights are memory-mapped: they and the cache must also fit in RAM
+                    budget = byRam;
+                    basis += String.format(Locale.ROOT, "; physical memory %.1f GB leaves %.1f GB", ram / 1e9, byRam / 1e9);
+                }
             }
         } else {
             long heap = heapFree();

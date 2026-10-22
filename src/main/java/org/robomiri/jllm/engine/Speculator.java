@@ -220,7 +220,7 @@ public final class Speculator implements AutoCloseable {
             cooldown--;
             return false;
         }
-        if (best == 0 && ++unprofitable % PROBE_EVERY != 0) {
+        if (best == 0 && ++unprofitable % PROBE_EVERY != 0 && !strongMatch()) {
             cooldown = PLAIN_STEPS - 1; // plain steps (which also re-measure their cost), then look again
             return false;
         }                               // (every PROBE_EVERY-th time a pass is tried anyway: the text may have changed)
@@ -503,6 +503,20 @@ public final class Speculator implements AutoCloseable {
 
     public long accepted() {
         return acceptedTotal;
+    }
+
+    /**
+     * Prompt lookup under the gate: whether the longest suffix ({@code engine.ngram-max} tokens) already occurred earlier.
+     * Eight tokens repeating is strong evidence that the text is being copied (an edit of a file in the prompt), far
+     * stronger than the prior acceptance a new request starts from, so a paused lookup tries a pass.
+     */
+    private boolean strongMatch() {
+        int n = cfg.ngramMax();
+        if (!gated || len - 1 < n) {
+            return false;
+        }
+        int e = index.find(hist, len - 1, n);
+        return e >= 0 && (cfg.window() <= 0 || e > len - 1 - cfg.window());
     }
 
     /**

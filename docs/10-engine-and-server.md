@@ -845,99 +845,219 @@ backend and weights closed again.
 
 ## 10.13 The default context length (`backend.ctx=auto`)
 
-🧸 The model keeps a notebook (the KV cache) where it writes down everything it has read in this conversation, so that
-it does not have to read it again. A longer notebook lets it remember more, but it takes room on the desk, which is the
-computer's memory. Until now every model got a notebook with 4 096 pages, however big the desk. Now we look at the
-desk first: how much room is left after the model's own books and the notebooks of the other models, and we give it
-the longest notebook that fits in a bit more than half of that, up to 131 072 pages and never more pages than the
-model learnt to read. If you say how many pages you want, you get exactly that many.
+### In plain words
 
-📐 Setting `backend.ctx` (default `auto`; a number overrides, as before), capped by `backend.ctx-max` (default 131 072,
-what coding agents need without a runaway for models trained on 1M tokens). Code: `ContextBudget` (a pure function,
-tested without a device in `AgentDefaultsTest`), `ModelLoader.contextLength`, `MetalMemory`. The KV bytes of one position
-are `2 · layers · rowBytes(kvDim)` for attention models (`KvDtype.rowBytes`: 4 bytes a value at f32, 2 at f16, about 1
-at q8, about 0.56 at q4), `layers · rowBytes(kvLoraRank + rope)` for DeepSeek's latent cache, the full-attention layers
-only for the Qwen3-Next hybrids and 0 for Mamba. With `budget` the bytes the caches of all `slots` engines may take:
+🧸 While you talk to the model it keeps a notebook (the *KV cache*) where it writes down everything it has read so far,
+so that it never has to read it again. A longer notebook lets it remember a longer conversation or a bigger file, but the
+notebook lies on the computer's desk, which is its memory, and the desk is also needed for the model's own big books
+(its weights) and for the other models you have open.
 
-```
-ctx = min( backend.ctx-max,  max(max_position_embeddings, 4096),  floor(budget / slots / bytesPerToken) )
-ctx rounded down to a multiple of 1024 (256 below 4096), at least 1024
-budget(Metal) = 0.6 · max(0, workingSet − other models − weights − reserve [+ 10 % of workingSet for an MoE model])
-budget(CPU)   = 0.6 · free old generation of the Java heap            (the CPU backends keep the cache on the heap)
-both:           min(budget, 0.6 · max(0, 0.75 · physical memory − weights))
-draft model:    budget / 2        (the draft keeps a cache of the same length)
-```
+Until now every model got a notebook of 4 096 pages, whatever the desk looked like: far too short for a coding agent that
+sends a whole file and a long conversation each turn (agents need 32 000 to 128 000), and on a small desk even 4 096 could be
+too much. Now the program looks at the desk first. It measures how much room is free after the model's books and the other
+notebooks, gives the notebook a bit more than half of it (the rest is for scratch paper, the operating system and your other
+programs), and never makes it longer than the model learnt to read. It tells you what it picked and how it counted, and if
+you ask for a number of pages yourself, you get exactly that.
 
-`workingSet` is Metal's `recommendedMaxWorkingSetSize` (or `-Djllm.metal.workingSetGb`), `other models` what the open
-backends hold (`DeviceLedger`, so the second model loaded gets less than the first), `reserve` is
-`max(512 MB, workingSet / 32)` for activations and scratch. An MoE model whose experts may move to the CPU
-(`backend.metal.cpu-moe` not `off`) may displace up to 10 % of the working set of them to make room for the cache: the
-placement planner already counts the cache in its budget. The 60 % keeps the rest for activations, the operating system
-and the other programs; `-Djllm.ctx.share` changes it. A model trained on fewer than 4 096 positions keeps 4 096 as before
-(its RoPE positions beyond the training length are extrapolated, with the usual warning), and when even the floor does not fit,
-the load fails or warns as it did with a number that was too large. The choice and its arithmetic are logged at load:
+### How it works
+
+📐 **The settings.** `backend.ctx` is `auto` by default or a number of positions per slot; a number is used as it stands (as
+before). `backend.ctx-max` (default 131 072) caps `auto` only. Code: `ContextBudget` (`src/main/java/org/robomiri/jllm/ContextBudget.java`,
+a pure function so that it is tested without a device), `ModelLoader.contextLength` (called once by `ModelLoader.load` and handed
+to the backends and to the draft model; `extraEngine` reuses the first engine's `backend().contextLength()`, so all slots of a
+model agree), `MetalMemory` (`metal/MetalMemory.java`: the working set of the device, asked once with a one-kernel Metal
+context, and `DeviceLedger.total()`: what the open backends already hold).
+
+**Step 1: what one position costs.** `ContextBudget.bytesPerToken(arch, kvDtype)`:
 
 ```
-Context: 18432 tokens (backend.ctx=auto: KV 197 KB/token, Metal working set 26.8 GB - weights 19.4 - other models 0.0
-- reserve 0.8 + 2.7 experts may move to the CPU = 9.2 GB free, 60% for the cache; limited by memory); KV cache 3.62 GB per slot
+attention models  : 2 · layers · rowBytes(kvDim)           keys and values;  kvDim = kvHeads · headDim
+DeepSeek (MLA)    : layers · rowBytes(kvLoraRank + rope)    one latent row per position (q4 falls back to q8)
+Qwen3-Next hybrids: 2 · fullAttentionLayers · rowBytes(kvDim)   the Gated DeltaNet layers keep a fixed-size state
+Mamba             : 0
+rowBytes(w)       : f32 4w   f16 2w   q8 w + 4·kvHeads (one f32 scale per head row)   q4 w/2 + 2·w/32
 ```
 
-Every slot of a server gets the same context: `ModelLoader.load` decides it once, for `slots` engines, and
-`extraEngine` reuses the first engine's. The Metal caches are not zeroed, so a long context costs address space but only
-touches the pages that are written (measured below). Measured on the M1 Pro (32 GB, working set 26.8 GB; `./jllm run
---max-tokens 1`, bundled settings):
+**Step 2: what may be spent.** `budget`, the bytes the caches of all slots together may take:
+
+```
+Metal : free   = workingSet − otherModels − weights − reserve  [+ 0.10·workingSet if an MoE model may spill experts to the CPU]
+        budget = 0.6 · max(0, free)
+CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the CPU backends keep the cache on the heap)
+both  : budget = min(budget, 0.6 · max(0, 0.75 · physicalMemory − weights))   (weights are memory-mapped: they must fit in RAM too)
+a draft model (engine.speculative=draft) keeps a cache of the same length: budget = budget / 2
+```
+
+`workingSet` is Metal's `recommendedMaxWorkingSetSize` (or `-Djllm.metal.workingSetGb`); `otherModels` the GPU bytes of the
+backends already open (`DeviceLedger`); `weights` is `ModelWeights.byteSize()`; `reserve = max(512 MB, workingSet / 32)` pays
+for activations and scratch; the MoE term is there because `backend.metal.cpu-moe=auto` already moves the least used experts to
+the CPU when the model plus its caches exceed the working set (`MetalBackend.newPlacement` counts the cache in its budget), so a
+bigger cache displaces experts instead of failing; 0.6 is `ContextBudget.SHARE` (`-Djllm.ctx.share`), 0.75 is `RAM_SHARE`.
+
+**Step 3: the length.**
+
+```
+want = min( backend.ctx-max,  max(max_position_embeddings, 4096) )        a model trained on fewer than 4096 positions keeps 4096
+fit  = floor( budget / slots / bytesPerToken )
+ctx  = min(want, fit);  rounded down to a multiple of 1024 when ≥ 4096, of 256 below;  at least 1024
+```
+
+**Worked example: Qwen3-30B-A3B at f32 on this 32 GB M1 Pro** (`./jllm run --model Qwen/Qwen3-30B-A3B-Thinking-2507`, 1 slot).
+48 layers, 4 kv heads of 128: `kvDim = 512`, `rowBytes = 512 · 4 = 2 048`, `bytesPerToken = 2 · 48 · 2 048 = 196 608` (197 KB).
+Metal's working set is 26.8 GB, the weights 19.4 GB, no other model, `reserve = max(0.51, 26.8 / 32 = 0.84) = 0.84 GB`, and the
+experts may spill `0.10 · 26.8 = 2.7 GB`: `free = 26.8 − 19.4 − 0.84 + 2.7 = 9.2 GB`, `budget = 0.6 · 9.2 = 5.5 GB`. The RAM bound
+is tighter: `0.6 · (0.75 · 34.4 − 19.4) = 0.6 · 6.4 = 3.8 GB`, so `fit = 3.8e9 / 196 608 = 19 430`, rounded down to a multiple of
+1 024: **18 432** positions, a cache of 3.62 GB. With `backend.kv-dtype=f16` the position costs 98 304 bytes and the same
+3.8 GB give 37 888; with `q8` (`rowBytes = 512 + 4 · 4 = 528`, 50 688 per position) 74 752. For Qwen3-0.6B (28 layers, `kvDim`
+1 024, 229 376 bytes a position) the same arithmetic gives `fit = 66 000`, more than the trained 40 960, so the trained length wins.
+
+The choice and its arithmetic are logged at load, e.g.
+
+```
+Context: 18432 tokens (backend.ctx=auto: KV 197 KB/token, Metal working set 26.8 GB - weights 19.4 - other models 0.0 - reserve 0.8
++ 2.7 experts may move to the CPU = 9.2 GB free, 60% for the cache; physical memory 34.4 GB leaves 3.8 GB; limited by memory); KV cache 3.62 GB per slot
+```
+
+### Why this design
+
+- **A fixed bigger default (32 768)?** It would not load a big model on a small Mac (the 30B at 32k and f32 needs 6.5 GB of cache on top
+  of 19.4 GB of weights), and it would waste memory for nobody on a big one. The memory is the thing that varies, so it is measured.
+- **All the free memory instead of 60 %?** The activations, the placement planner's slack, other programs and the page cache of the
+  memory-mapped weights need room; filling the working set makes Metal page. The share is a `-D` knob rather than a setting because
+  no workload needed to move it.
+- **Ask the Metal device through the backend?** The backend does not exist yet (its buffers depend on the context). `MetalMemory`
+  builds a one-kernel Metal context for the question (a few milliseconds, once per process).
+- **Choose the cache dtype too?** Rejected: `backend.kv-dtype` is a quality decision (f32 is exact; f16, q8 and q4 are lossy, measured
+  in [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured)); `auto` sizes the context for the dtype the user chose and the log shows
+  what f16 would give. The cost: with the f32 default a 32k context is expensive (the 30B gets 18 432 here).
+- **Per-slot or per-process budget?** Per model with `slots` equal shares, because every slot has a cache of the same length
+  (`ModelLoader.load(…, slots)`); a model loaded later sees the earlier ones through `DeviceLedger` and gets less.
+
+### Settings
+
+| key | default | meaning |
+|---|---|---|
+| `backend.ctx` (`--ctx`) | `auto` | `auto` or the number of positions per slot; a number is never changed; set a number to get the old 4096 |
+| `backend.ctx-max` | `131072` | the most `auto` picks; does not limit a number |
+| `-Djllm.ctx.share` | `0.6` | the part of the free memory the caches may take |
+| `-Djllm.metal.workingSetGb` | device | pretend the working set is this size (leave memory to other programs) |
+| `backend.kv-dtype` | `f32` | what a position costs: f16 doubles, q8 quadruples what fits |
+
+### Measured
+
+M1 Pro (10 cores, 32 GB, Metal working set 26.8 GB), 2026-10-22, bundled settings, `./jllm run --model … --max-tokens 1 --prompt hi`,
+the `Context:` line of the load log (`scripts/mac-validate.sh` prints the same rows):
 
 | model | cache | `backend.ctx=auto` picks | limited by | KV per slot |
 |---|---|---|---|---|
 | Qwen3-0.6B (Metal) | f32 | 40 960 | trained length | 9.4 GB |
 | Qwen3-0.6B (Metal) | f16 | 40 960 | trained length | 4.7 GB |
 | Qwen3-0.6B GGUF Q4_0 (Metal) | f32 | 40 960 | trained length | 9.4 GB |
-| Qwen3-0.6B (CPU, `-Xmx4g`) | f32 | 7 168 | the free heap | 1.6 GB |
+| Qwen3-0.6B (CPU, `-Xmx4g`) | f32 | 7 168 | the free heap (2.8 GB) | 1.6 GB |
 | Qwen3.8-27B GGUF Q4_0 (hybrid, Metal) | f32 | 44 032 | memory | 5.8 GB |
 | Qwen3-30B-A3B-Thinking-2507 (Metal) | f32 | 18 432 | memory | 3.6 GB |
 | Qwen3-30B-A3B-Thinking-2507 (Metal) | f16 | 37 888 | memory | 3.7 GB |
 | Qwen3-30B-A3B-Thinking-2507 (Metal) | q8 | 74 752 | memory | 3.8 GB |
 
-Qwen3-0.6B, 91 tokens decoded after a 413-token prompt (`./jllm bench --engine.speculative off`, 2 passes of 3 rounds, interleaved): decode
-130.0 – 134.4 tok/s with `auto` (40 960) against 134.3 – 136.8 with `--ctx 4096` (medians 133.7 and 135.3: about 1 % lower, the size of
-the run-to-run noise), prefill 1 891 – 2 086 against 1 915 – 2 106 tok/s. The f32 default of `backend.kv-dtype` is what makes 32k contexts expensive (the 30B at 32k
-would need 6.5 GB at f32 and 3.2 GB at f16): an agent that wants the long contexts of the 30B on this Mac sets
-`backend.kv-dtype=f16` (37 888) or `q8`, whose accuracy cost is measured in [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured)
-and docs/08. A weights-bound case is honest rather than clever: when the weights leave no room, `auto` returns the 1 024-token floor and
-the log says what limited it. Not yet counted: the CPU backends' cache moves off the Java heap with the paged KV cache
-(then the physical-memory bound is the only one), and a draft model's own cache is only accounted for by halving.
+Does a 40 960-token context cost speed? Qwen3-0.6B, `./jllm bench --model Qwen/Qwen3-0.6B --temp 0 --bench.rounds 3 --engine.speculative off --ctx auto|4096`,
+two interleaved passes: decode 130.0 – 134.4 tok/s with `auto` against 134.3 – 136.8 with `--ctx 4096` (medians 133.7 and 135.3, about 1 %, the
+size of the run-to-run noise); prefill 1 891 – 2 086 against 1 915 – 2 106 tok/s. The Metal caches are not zeroed, so a long context
+costs address space and only touches the pages that get written.
+
+### Checks and limits
+
+- `AgentDefaultsTest` (in `mvn test`) checks the arithmetic: the bytes per position of Qwen3-0.6B at f32 / f16 / q8, plenty of memory
+  (trained length), a tight budget (8 192), two slots (halved), a starved model (the 1 024 floor), a negative budget, a model trained on
+  128 positions (4 096), the cap, a model without a KV cache, rounding, and the settings validation (`auto` / `AUTO` accepted, `lots`
+  and a `backend.ctx-max` below 1 024 rejected).
+- Not exact: the reserve is an estimate (activations grow with `backend.batch`); a draft model's cache is accounted for by halving; the
+  Mamba / hybrid state buffers are not counted (small); on the CPU the budget is the Java heap (`JLLM_XMX`, default 4 g), because the
+  KV cache lives on it; when the paged KV cache moves it off the heap only the physical-memory bound remains.
+- When the weights leave no room the result is the 1 024 floor and the log says "limited by memory"; set a number to override.
+- Saved conversations (`KvStore`) ignore `backend.ctx` in their compatibility key, and `Engine` refuses a saved cache longer than the
+  current context, so a changed `auto` does not invalidate or corrupt them.
 
 ---
 
 ## 10.14 Request priority
 
-🧸 A pharmacy has one counter. A person waiting with a headache and someone dropping off a big pile of prescriptions
-for next week both stand in line. The fair line is first come, first served, but then the headache waits behind the
-whole pile. Now the pile carries a sticker, "background": whenever someone without the sticker steps up, the pile
-waits one turn. Nobody is thrown out of the middle of a prescription; the pharmacist just chooses who is next.
+### In plain words
 
-📐 `"priority": "interactive" | "background"` is an extra field of `/v1/chat/completions` and `/v1/completions` (also the
-header `X-Jllm-Priority`, the body wins), a selector in the console's chat parameters and a property of
-`Engine.Decoding` (`Decoding.priority()`, default `INTERACTIVE`; `Priority` in `engine/`). `OpenAiFeatures.parse`
-validates it (a 400 for anything else), `Engine.generateChoices` makes it the thread's `Priority.current()` for the request,
-and the console's `/api/chat` does the same around its `generate` call. What it does today, and no more: it orders the wait
-for the device in `BatchGroup`, whose one lock every prefill chunk, verification pass, saved-cache access and decode batch
-takes (`engine.priority-order`, default true; `false` = the old behaviour, first come first served):
+🧸 A pharmacy has one counter. A person waiting with a headache and somebody dropping off a big pile of prescriptions for next
+week both stand in the line. The fair line is first come, first served, but then the headache waits behind the whole pile. Now the
+pile carries a sticker, "background". Whenever someone without a sticker steps up, the pile waits one turn. Nobody is thrown out
+in the middle of a prescription: the pharmacist finishes what he is doing and then chooses who is next. A pile that has waited a
+long time (two seconds here) goes ahead anyway, so it is never forgotten.
 
-- an interactive request counts itself as waiting while it queues for the lock or for a decode step;
-- a background request does not take the lock while that count is above zero: it polls (`tryLock` every 0.2 ms) instead
-  of joining the lock's queue, because a request already queued cannot be overtaken. It gives way for at most
-  `-Djllm.engine.backgroundMaxWaitMs` (2 000 ms), then queues, so a stream of interactive requests cannot starve it;
-- a decode step of a background request does not lead a batch while an interactive one waits (it may still ride in that
-  batch), and when more decode steps are queued than one pass takes, interactive ones are taken first.
+### How it works
 
-It does not preempt a pass that is running (a 256-token prefill chunk is about 125 ms for Qwen3-0.6B), does not choose the slot
-a request lands on and does nothing for a server whose model has a single slot and no concurrent requests. The scheduler
-of the agentic-serving plan (wip/NEXT-PROMPT.md, stage 1) is meant to read `Priority.current()` (or the `Decoding` field)
-for its priority classes, token budgets and pausing.
+📐 **What the client sends.** `"priority": "interactive" | "background"` in the body of `/v1/chat/completions` and `/v1/completions`,
+or the header `X-Jllm-Priority` (the body wins). Absent means `interactive`; anything else is a 400. The console's chat has a
+"priority" selector in its parameters drawer, and its `/api/chat` takes the same field.
 
-Measured (`PriorityBench`, M1 Pro, Qwen3-0.6B, two slots, a background job of a ~1 500-token prompt and 96 generated tokens
-starts, 150 ms later a short interactive request arrives on the other slot; median of 5 rounds):
+**How it travels** (each arrow is a file):
+
+```
+JSON body / header ─► OpenAiFeatures.parse        server/OpenAiFeatures.java   validates; Options.priority
+                  ─► Engine.Decoding.priority()   engine/Engine.java           per-request options record (default INTERACTIVE)
+                  ─► Engine.generateChoices       Priority.enter(d.priority()) makes it the request thread's Priority.current()
+                  ─► BatchGroup                   engine/BatchGroup.java       reads Priority.current() where the device is taken
+console: ChatController.run ─► Priority.enter(priority) around slot.engine().generate(...)
+```
+
+`Priority` (`engine/Priority.java`) is an enum with a `ThreadLocal`; a request runs on one thread from the HTTP handler down to
+`BatchGroup`, so the thread-local needs no change to the shared `Backend` interface. The scheduler of the agentic-serving plan can read
+`Priority.current()` or `Decoding.priority()` for its classes, budgets and pausing.
+
+**What it orders today.** One wait only: the device. `BatchGroup` has one lock, taken by every prefill chunk, verification pass,
+saved-cache access (`Member.locked`, `saveState`, `loadState` → `lockDevice()`) and decode batch (`decode` → `decodeStep`). With
+`engine.priority-order=true`:
+
+```
+interactiveWaiting : AtomicInteger — requests that are in lockDevice() (queued for the lock) or inside decode() (waiting for their step)
+
+INTERACTIVE  lockDevice():   interactiveWaiting++ ; device.lock() ; interactiveWaiting--
+BACKGROUND   lockDevice():   until 2000 ms are over:  if interactiveWaiting == 0 and device.tryLock(): done ; sleep 0.2 ms
+                             then device.lock()                           (so a background request is never starved)
+decode steps: a BACKGROUND step does not become the batch leader while interactiveWaiting > 0 (it can still ride in the leader's batch);
+              when more steps are queued than one pass takes, the leader sorts: its own step, then interactive ones, then background ones
+```
+
+**Worked example** (the measurement below). Slot A runs a background job: a 1 500-token prompt, 6 prefill chunks of 256 tokens, each
+about 125 ms on the device, then 96 decode steps. At t = 150 ms slot B receives a ~25-token interactive request.
+*Without ordering* (`engine.priority-order=false`): A's thread unlocks the device after a chunk and immediately locks it again for the next one; B's
+thread, parked in the lock's queue, has to be woken (tens of microseconds) and loses the race, because `ReentrantLock` is not fair, so B waits for
+the rest of A's prefill: its first token comes after 937 ms. *With ordering*: B counts itself in `interactiveWaiting` while it queues; A's next
+`lockDevice()` polls, sees the count and does not take the lock; B gets it as soon as the chunk in flight ends (≤ 125 ms) and its first token
+comes after 127 ms. A's job takes 1 809 ms instead of 1 814 ms.
+
+### Why this design
+
+- **A fair lock (`new ReentrantLock(true)`)** would end the barging, but is first come first served: it would not let the late interactive request
+  overtake the early background one that already queued. A background request must not sit in the lock's queue at all, which is why it polls.
+- **A priority queue with `Condition`s in `BatchGroup`** is the clean version and is what a scheduler will do; it rewrites the hot file the
+  paged-KV / scheduler work is changing. The counter keeps the diff to a few lines and the old path (flag off) byte for byte.
+- **Preempting a running pass** (cancel a chunk between layers) needs kernels and buffers that can be resumed; out of scope. The price: an
+  interactive request still waits for the chunk in flight (a 256-token chunk of Qwen3-0.6B is ~125 ms; of the 30B ~1 s). Smaller chunks for background
+  requests would shorten that and are left to the scheduler.
+- **Passing the priority through `Backend.forward`** would change a shared signature; the thread-local does not, and the web console and the
+  API both run a request on one thread.
+- **Cost:** a waiting background request polls every 0.2 ms (negligible CPU) and can be delayed by up to 2 s per device acquisition behind
+  interactive traffic. Servers with one slot and one client see no difference.
+
+### Settings
+
+| key | default | meaning |
+|---|---|---|
+| `engine.priority-order` | `true` | `false`: first come, first served, as before; the field is still accepted |
+| `-Djllm.engine.backgroundMaxWaitMs` | `2000` | the longest a background request lets interactive ones go first, per wait |
+| request `priority` / header `X-Jllm-Priority` | `interactive` | `background` for subagents and batch jobs |
+
+### Measured
+
+`PriorityBench`, M1 Pro, Qwen3-0.6B on Metal, two slots, bundled settings, 2026-10-22. A job (a ~1 500-token prompt, 96 generated tokens) starts on slot A;
+150 ms later a short interactive request (~25-token prompt, 24 generated) arrives on slot B. Median of 5 rounds:
+`java … org.robomiri.jllm.PriorityBench --model Qwen/Qwen3-0.6B --rounds 5 --engine.priority-order true|false`.
 
 | | interactive request: first token | whole request | the job |
 |---|---|---|---|
@@ -946,7 +1066,14 @@ starts, 150 ms later a short interactive request arrives on the other slot; medi
 | `engine.priority-order=true`, job also interactive | 118 ms | 1 086 ms | 1 746 ms |
 | `engine.priority-order=false`, job also interactive | 128 ms | 1 097 ms | 1 746 ms |
 
-Without ordering, the job's chunk loop releases the device and takes it again before the parked interactive thread wakes up
-(the lock is not fair), so the short request waits for most of the prompt; with the job marked background it waits for the
-chunk in flight (the first token comes 7x sooner) and the job loses nothing measurable. All-interactive traffic behaves
-exactly as before (rows 3 and 4: the same within noise). `AgentDefaultsTest` checks the order with a scripted backend.
+The first token comes 7x sooner and the job loses nothing measurable; with both requests interactive (rows 3 and 4) the order does not change
+anything, as intended. `scripts/mac-validate.sh` prints rows 1 and 2.
+
+### Checks and limits
+
+- `AgentDefaultsTest`: `Priority.parse` / scopes (nested, restored), the OpenAI field (`background`, the header, the body winning, a bad value and a
+  non-string value rejected), `Decoding.withPriority` / `withConstraint` keep the priority, and a scripted backend shows the interactive request taking the
+  device before a background one that queued first, and first come first served with `engine.priority-order=false`.
+- Not done: no preemption of a running pass; the slot a request lands on is not chosen by priority; with one slot the engine's own lock
+  (`Engine.acquire`, fair, FIFO) still orders requests for that slot; speculative verification and saved-cache access are ordered like prefill, but a
+  background request's *decode step* can still ride in an interactive leader's batch (that is a gain, not a delay).

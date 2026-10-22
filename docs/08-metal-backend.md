@@ -1997,48 +1997,91 @@ short contexts (fewer workers), 16-byte loads for q8 (the rows are only 4-byte a
 
 ## 8.32 Should the prefill chunk come from the tuner? (`backend.batch=auto` stays at 256)
 
-🧸 Section 8.29 found that a bigger bag of shopping means fewer trips, up to the size one can lift. Different shoppers can
-lift different amounts, so one could let every shopper try a few bag sizes on the first day and write the best one on a
-card. We looked at whether that is worth it. Here the answer is no: for this shopper the bags 256 and 512 are as good as
-each other, a try on a busy day can write a wrong number on the card, and a bigger bag has to be paid for with space
-whichever size ends up on the card. So the card says 256, and anyone who knows better can overrule it.
+### In plain words
 
-📐 `MetalTuner` already times candidates at start-up and caches the verdict per device, kernel source and shape (the
-attention forms, the decode threadgroup size, the half-weight MMA kernels). A prefill chunk size would be one more of
-them, and the question is whether it picks reliably and cheaply.
+🧸 Section 8.29 found that a bigger bag of shopping means fewer, fuller trips, up to the size one can lift. Different shoppers can
+lift different amounts, so one could let every shopper try a few bag sizes on the first day and write the best size on a card
+(that is what `MetalTuner` already does for other choices). We looked at whether that is worth it. For this shopper bags of 256
+and 512 are about as good as each other; a try on a busy day (when someone else is also using the shop's cart) can write a wrong
+number on the card, and the card is never looked at again; and a bigger bag has to be paid for with space whichever size the
+card says. So the card says 256, and a shopper who knows better can overrule it.
 
-**Measured** (M1 Pro, 16 GPU cores, `./jllm bench --batch N --engine.speculative off`, 413-token prompt unless noted, 3
-rounds, two passes, tok/s of the prefill; decode is the same at every size, 26 tok/s for the 30B):
+### How it works
+
+📐 **What a chunk is.** The engine feeds a prompt of `P` tokens to `Backend.forward` in chunks of at most `maxBatch` tokens
+(`backend.batch`); each chunk is one pass over all the weights with `n` token rows at once. `backend.batch=auto` is
+`ModelLoader.batch(settings, arch)` (`src/main/java/org/robomiri/jllm/ModelLoader.java`): 256 for MoE models and for dense decoders on
+Metal, 64 for the CPU backends, Mamba and the Qwen3-Next dense layers; Gemma 3 at least 256 (a picture's tokens go through in one chunk).
+`-Djllm.metal.autoBatch=N` changes what `auto` means on Metal; `--batch N` pins a number.
+
+**Why the chunk matters (the grid).** Each projection of a chunk runs as a grid of simdgroup-matrix threadgroups (8.10):
+`threadgroups = ceil(rows / 64) · ceil(n / 32)`. Qwen3-0.6B's 1 024-row `o_proj`:
+
+```
+n  =  64 :  16 · 2  =  32 threadgroups      16 GPU cores, each holds a few threadgroups at a time → under-filled
+n  = 128 :  16 · 4  =  64
+n  = 256 :  16 · 8  = 128                   enough work for every core
+n  = 512 :  16 · 16 = 256                   more of the same: the throughput stops rising
+```
+
+and every chunk reads all the weights again (`ceil(P / n)` passes: a 413-token prompt is 7 passes at 64, 2 at 256). A GPU with
+40 cores would need roughly 2.5x the threadgroups to stay full, so the best chunk depends on the chip. A model of throughput that fits the
+dense numbers below is `rate(n) ≈ R · min(1, threadgroups(n) / T)` with `T` around 128 on the M1 Pro (R ≈ 2 100 tok/s for the 0.6B): 64 → 0.68 R,
+128 → 0.79 R, 256 → 0.98 R. The MoE model has a second term, since the grouped expert kernels give each expert `n · topK / experts` tokens
+(128 experts, top-8: 4 tokens per expert at n = 64, 16 at n = 256, 32 at n = 512), so it keeps gaining longer.
+
+**What a tuner would be.** One more entry in `MetalTuner` (`src/main/java/org/robomiri/jllm/metal/MetalTuner.java`), cached per device |
+kernel source | model shape in `~/.cache/jllm/metal-tuning.properties`: build the backend with the largest candidate (512) so its scratch
+(`x`, `xb`, `hidden`, the staging rows) is big enough, run a forward pass of random tokens at 128, 256 and 512, and keep the smallest chunk whose
+throughput is within 3 % of the best. Cost on the M1 Pro: three passes of `n` tokens, 0.06 + 0.12 + 0.24 s for the 0.6B, 1.7 s for one 512-token pass
+of the 30B; plus the scratch of 512 kept for the life of the backend. It was not built (below).
+
+### Why this design (and why not the tuner)
+
+- **Little to gain here.** Against the fixed 256 the best candidate is within the noise for the dense models (512 gains 2 – 4 % against a 3 – 5 %
+  run-to-run spread) and +6 – 12 % for the MoE model, bought with twice the scratch on every model that loads.
+- **The verdict would be cached and the measurements are noisy.** While this was measured another program on the Mac slowed the GPU by up to 3x for
+  minutes at a time (decode 137 → 44 tok/s in one pass; the tables are the clean passes). The other tuner decisions compare kernels that give the same
+  result and differ by a few percent, so a wrong pick is cheap; a chunk of 128 instead of 256 costs 10 – 25 %, and a timing taken in a bad moment
+  would stay in the cache file until it is deleted.
+- **The chunk is a shape of the buffers.** The scratch is allocated for the largest chunk when the backend is created, before any timing could run on
+  its kernels. Either the backend is built at 512 and used with less (memory kept for nothing), or stand-in matrices are timed (which says little: the
+  whole forward pass, with attention and the KV writes, decides, not one matmul), and both cost a second or more at the first load on a new chip.
+- **It cannot be checked here.** The only chip available is the M1 Pro, so the tuner's choice on any other GPU would be untested code, and the fixed
+  value is the one measured.
+- **The formula alternative** (chunk from the GPU's core count) needs the core count, which `MTLDevice` does not expose; reading it from IOKit means
+  new native code for a guess.
+
+The way to change it on a bigger or smaller GPU is a number: `--batch N` / `backend.batch=N` or `-Djllm.metal.autoBatch=N`, and
+`scripts/mac-validate.sh` has rows at 64 and 512 to take on a new Mac.
+
+### Settings
+
+| key | default | when to change |
+|---|---|---|
+| `backend.batch` (`--batch`) | `auto` | a number to pin the chunk, e.g. 512 on a Mac with 32+ GPU cores or for MoE models when memory allows |
+| `-Djllm.metal.autoBatch` | 256 | what `auto` means for dense decoders on Metal |
+
+### Measured
+
+M1 Pro (16 GPU cores, 32 GB), 2026-10-22, tok/s of the prefill, decode unchanged at every size (0.6B 130 – 137, 30B 26 tok/s), bundled settings, speculation off.
+Command, for each N in 64 128 256 512 (under the benchmark lock): `./jllm bench --model Qwen/Qwen3-0.6B --temp 0 --bench.rounds 3
+--bench.prompt-repeat 40 --engine.speculative off --batch N` (`--model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q4_0` and `--model Qwen/Qwen3-30B-A3B-Thinking-2507` for the other rows;
+`--bench.prompt-repeat 200` for the 2 000-token prompt). The ranges are the 3 rounds of the passes taken while the GPU was not shared:
 
 | `--batch` | 64 | 128 | 256 | 512 |
 |---|---|---|---|---|
 | Qwen3-0.6B (safetensors Q4_0 cache) | 1 410 – 1 466 | 1 578 – 1 671 | 1 932 – 2 107 | 1 996 – 2 185 |
-| Qwen3-0.6B GGUF Q4_0 (one pass) | 1 350 – 1 369 | 1 518 | 1 881 – 1 953 | 2 018 – 2 054 |
-| Qwen3-0.6B, 2 000-token prompt | 1 006 – 1 018 | 1 128 – 1 186 | 1 157 – 1 239 | 1 177 – 1 281 |
+| Qwen3-0.6B GGUF Q4_0 | 1 350 – 1 369 | 1 518 | 1 881 – 1 953 | 2 018 – 2 054 |
+| Qwen3-0.6B, ~2 000-token prompt | 1 006 – 1 018 | 1 128 – 1 186 | 1 157 – 1 239 | 1 177 – 1 281 |
 | Qwen3-30B-A3B Q4_0 cache (MoE) | 158 – 160 | 206 – 208 | 262 – 267 | 293 – 306 |
-| Qwen3-30B-A3B, 2 000-token prompt | | 204 | 229 – 231 | 240 – 248 |
+| Qwen3-30B-A3B, ~2 000-token prompt | | 204 | 229 – 231 | 240 – 248 |
 
-The curve flattens at 256 for the dense model (512 gains 2 – 4 %, inside the 3 – 5 % run-to-run spread) and keeps rising
-slowly for the MoE model (+12 % at 413 tokens, +6 % at 2 000), whose grouped kernels give each expert fewer tokens per
-chunk. The knee comes from the grid of 8.29: a 1 024-row projection is `16 · ceil(n / 32)` threadgroups, 32 at n = 64, 64
-at 128, 128 at 256, 256 at 512, against 16 cores that each hold a few at a time; a GPU with 40 cores would want more
-tokens per chunk to stay full, so the best chunk does depend on the chip. Why it is nevertheless not tuned:
+Worked reading: for the 0.6B, 256 is +33 % over 128 and 512 is +4 % over 256 (2 107 → 2 185 at best); for the 30B, 256 is +27 % over 128 and
+512 is +12 % over 256 at 413 tokens, +6 % at 2 000.
 
-- **Little to gain here.** Against the fixed 256 the best candidate is within the noise for the dense models and
-  +6 – 12 % for the MoE model, and that is bought with twice the scratch on every model that loads.
-- **The verdict would be cached, and the measurements are noisy.** While this was measured another program on the Mac
-  slowed the GPU by up to 3x for minutes at a time (decode 137 → 44 tok/s in one pass; the tables above are the clean
-  passes). A start-up timing taken in such a moment would be written to `~/.cache/jllm/metal-tuning.properties` and stay
-  there. The other tuner decisions compare kernels that give the same result and differ by a few percent; a chunk of 128
-  instead of 256 costs 10 – 25 %.
-- **The chunk is a shape of the buffers.** The scratch (`x`, `xb`, `hidden`, the staging rows) is allocated for the
-  largest chunk when the backend is created, before any timing could run on its kernels. Timing it means building the
-  backend at 512 and using less afterwards, or timing stand-in matrices (which says little: the whole forward pass
-  decides, not one matmul), and either way costs a second or more at the first load on a new chip (a 512-token pass of the
-  30B is 1.7 s, four candidates 7 s).
-- **It cannot be checked here.** The only chip available is the M1 Pro, so a tuner's choice on any other GPU would be
-  untested code.
+### Checks and limits
 
-So `backend.batch=auto` keeps its fixed values (`ModelLoader.batch`: 256 for MoE models and for dense decoders on Metal, 64
-elsewhere), and the way to change it on a bigger or smaller GPU is `--batch N` or `-Djllm.metal.autoBatch=N`.
-`scripts/mac-validate.sh` has rows at 64 and 512 to take on a new Mac.
+- Logits are bit-identical across chunk sizes whose last piece is at least `MMA_MIN_TOKENS` (32), checked by `ChunkCheck` (8.29); nothing changed in the
+  kernels in this section, only the decision not to tune was made and measured.
+- Not done: any per-chip choice; the numbers are one chip's. The MoE model would gain 6 – 12 % at 512 on this Mac; `--batch 512` does that when the extra scratch is acceptable.
