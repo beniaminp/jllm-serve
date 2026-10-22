@@ -1600,7 +1600,7 @@ equal bit for bit, three times (races are intermittent); for Q4_0 also with the 
 batched decoding of three slots (f32 / f16 / q8: the groups), and the experts of one layer, of all layers, and every other
 expert on the CPU. As a control the same check with `-Djllm.metal.concurrent=unsafe` (no barriers) fails on the first
 pass of every family, so the check does see races on these tiny models. `scripts/arch-smoke.sh` ends `arch smoke passed`
-with the flag off and with `JAVA_OPTS=-Djllm.metal.concurrent=true`, and the haiku gate gives the same md5.
+with the flag off and with `JAVA_OPTS=-Djllm.metal.concurrent=true`, and the haiku gate (`scripts` md5gate, CPU and Metal) prints `79472f69...` with `concurrent` false, true and batch.
 
 **Measured** (M1 Pro, `./jllm bench --temp 0 --engine.speculative off`, 4 rounds, alternating on and off; tok/s):
 
