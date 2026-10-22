@@ -365,7 +365,7 @@ public final class ModelLoader {
             pool.setSharing(s.getBool("backend.kv-prefix-share"));
             if (tier != null && pool.spill() == null) {
                 try {
-                    String fp = s.get("model") + "|" + s.get("model.quant") + "|" + weights.byteSize() + "|" + kvDtype;
+                    String fp = weights.arch + "|" + s.get("model.quant") + "|" + weights.byteSize() + "|" + kvDtype;
                     org.robomiri.jllm.kv.KvTier.attach(pool, tier, fp, tier.dir().resolve("blocks"),
                             (long) (s.getLong("backend.kv-tier-max-gb") * 1e9));
                 } catch (java.io.IOException e) {

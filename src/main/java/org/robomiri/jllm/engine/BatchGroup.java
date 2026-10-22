@@ -406,6 +406,11 @@ public final class BatchGroup {
         }
 
         @Override
+        public java.util.Map<String, Object> memoryReport() {
+            return inner.memoryReport();
+        }
+
+        @Override
         public StateSnapshot snapshotState(int n) {
             StateSnapshot[] r = new StateSnapshot[1];
             locked(() -> r[0] = inner.snapshotState(n));
