@@ -54,6 +54,21 @@ public final class VectorKernels {
                 : dotQ8(w.data, w.rowOffset(r), w.scaleOffset(r), nb, x, xo);
     }
 
+    /**
+     * The lanes of {@code v} added in a fixed order, adjacent pairs first: {@code ((l0 + l1) + (l2 + l3))} on NEON. Used
+     * instead of {@code reduceLanes(ADD)}, whose order is unspecified: the Java fallback that the interpreter and C1 run
+     * adds the lanes one after the other, the C2 code on NEON in pairs, so a kernel summed differently until C2 took over
+     * and two runs of the same prompt (or the CPU experts of the Metal split, whose first pass runs cold) differed in the
+     * last bit. This order is the one C2 uses on 128-bit NEON, so steady-state results are unchanged.
+     */
+    static float laneSum(FloatVector v) {
+        return switch (FL) {
+            case 4 -> (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
+            case 8 -> ((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7)));
+            default -> v.reduceLanes(VectorOperators.ADD);
+        };
+    }
+
     private static float dotQ4(MemorySegment seg, long q, long s, int nb, float[] x, int xo) {
         FloatVector acc = FloatVector.zero(F);
         for (int b = 0; b < nb; b++) {
@@ -64,7 +79,7 @@ public final class VectorKernels {
             int xb = xo + b * QType.BLOCK;
             acc = halfDot(lo, x, xb).add(halfDot(hi, x, xb + 16)).fma(scale, acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return laneSum(acc);
     }
 
     private static float dotQ8(MemorySegment seg, long q, long s, int nb, float[] x, int xo) {
@@ -77,7 +92,7 @@ public final class VectorKernels {
             int xb = xo + b * QType.BLOCK;
             acc = halfDot(v0, x, xb).add(halfDot(v1, x, xb + 16)).fma(scale, acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return laneSum(acc);
     }
 
     /**
@@ -256,10 +271,10 @@ public final class VectorKernels {
 
     private static void store4(float[] out, int oo, FloatVector s0, FloatVector s1, FloatVector s2, FloatVector s3,
                                boolean acc) {
-        float r0 = s0.reduceLanes(VectorOperators.ADD);
-        float r1 = s1.reduceLanes(VectorOperators.ADD);
-        float r2 = s2.reduceLanes(VectorOperators.ADD);
-        float r3 = s3.reduceLanes(VectorOperators.ADD);
+        float r0 = laneSum(s0);
+        float r1 = laneSum(s1);
+        float r2 = laneSum(s2);
+        float r3 = laneSum(s3);
         if (acc) {
             out[oo] += r0;
             out[oo + 1] += r1;

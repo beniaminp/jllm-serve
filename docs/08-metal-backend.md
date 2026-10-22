@@ -2019,6 +2019,88 @@ Qwen3-Next save two to three barriers per layer. Neither is worth changing the d
 any future kernel split that has independent branches (for example a shared expert beside the routed ones, once they add
 into separate buffers).
 
+**A flaky check that was not the encoder (the CPU experts' first pass).** Now and then `ArchSmoke.concurrentCheck` printed
+`concurrent encoder, kv F32, experts of 1 layer on the cpu: pass 0 differs` for the tiny Qwen3-MoE and passed on the
+rerun. The check is part of every gate run, so a real race here would have made the whole gate flaky. This section is what
+the problem turned out to be, because it looks like a race in the encoder and is not one.
+
+🧸 What the concurrent encoder overlaps: the kitchen has one cook per job, and the old rule was "a cook starts when the cook
+before has finished". The new rule lets two cooks work at once when their jobs do not touch the same bowl, and a helper puts up
+a red flag ("wait") only where one cook needs a bowl the other is still filling. What could go wrong: a flag the helper forgot.
+Then a cook reads a bowl half full, and the soup tastes a little different, now and then, depending on who was faster. That
+is what we suspected, because the check compares the soup of the old kitchen with the soup of the new one, and "a little
+different, now and then" is how a forgotten flag behaves. The real reason: the soup was not different because of the
+flags. The kitchen with the old rule was cooked on a cold stove for its first few minutes, the new one on a warm stove; one
+cook (the CPU) measures his salt in a slightly different way when the stove is cold. We always cooked the old kitchen's soup
+first.
+
+📐 **The suspicion.** With the experts of a layer on the CPU (`MoeSplit(1, …)`: the last MoE layer), one pass crosses between
+the GPU and the CPU in the middle, and the CPU writes into buffers that the GPU reads, which the reflection-based tracker
+([8.28](#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) knows nothing about. In time
+order (`G` the GPU, `C` the CPU thread pool and the Java thread; `|` a synchronization point):
+
+```
+time ->   command buffer 1 (concurrent encoder)               CPU                         command buffer 2 (new encoder)
+G   embed, layers 0..2, GPU experts, layer 3: router ----+                                     +--- final norm, LM head
+        writes xb (normalized x), assign, routeWeight    |                                     |       reads x, writes logits
+                                                         v                                     |
+C                                         jm_commit_wait: the GPU is idle      cpuRouted: read xb, assign, routeWeight
+                                                                               experts: gate/up, silu, down -> cpuY
+                                                                               addToX:  x += cpuY (CPU writes the shared x)
+                                                                                        |
+                                                                               jm_begin + dispatches: GPU reads x ---------+
+```
+
+Both crossings are full synchronizations, not overlaps. The GPU's writes (`xb`, `assign`, `routeWeight`) are complete and
+visible when `jm_commit_wait` returns, before `cpuRouted` reads any of them; the CPU's writes (`cpuY`, then `x`) are all
+done before `jm_begin` opens the next encoder, whose tracker starts empty. The tracker is never asked about a CPU write, and
+nothing is in flight while the CPU works (with shared experts or a hot / cold split the GPU does run beside the CPU, but that
+is neither this tiny model nor this case, and `x` is only touched by the CPU after the final `commitAndWait`). So there is
+no hazard for a barrier to cover, in the serial encoder or the concurrent one.
+
+**What the data said.** Looping just this case (`-Djllm.smoke.only=concurrent -Djllm.smoke.case='experts of 1 layer'
+-Djllm.smoke.concRuns=2`; `-Djllm.smoke.serialRuns=N` repeats the serial encoder instead) failed in 7 of 200 fresh JVMs
+(and 2 of 100 for another mix of cases), always the *first* case of the process and always identically: pass 0 (the 40-token
+prefill), 496 of 1000 logits, the first at index 6, the largest difference 2.4e-6, a single last-bit step. A failing case
+now also runs the serial encoder a second time: it equals the *concurrent* run. The reference was the odd one out, and the
+reference is the first user of the CPU experts in the process. Taking the GPU away reproduces it: `MoeExperts.batched` called
+40 times in a fresh JVM on fixed weights and inputs gives one result for its first calls and another from about the fifth on
+(the same for `MoeExperts.token`, the decode steps); with `-Xint` or C1 only it gives the first result always, and with a
+1-thread pool it behaves the same, so it is not a data race either.
+
+**The cause.** The expert matmuls end in `FloatVector.reduceLanes(ADD)`, whose summation order the API leaves open
+([7.14](07-cpu-backend.md), "the JIT tier"): the Java fallback that the interpreter and C1 run adds the four NEON lanes one
+after the other, `((l0 + l1) + l2) + l3`, and the C2 code adds them in pairs, `(l0 + l1) + (l2 + l3)`. A kernel's first calls
+in a process thus round differently from the rest. The check's serial reference runs first, so it ran its CPU experts
+partly interpreted or on C1, and the concurrent runs after it ran them on C2, when C2 had finished compiling in between (in
+the other JVMs the reference and the later runs happened to use the same tier, and agreed).
+
+```
+reference (serial encoder)     CPU experts:  interpreter / C1: lanes summed ((l0+l1)+l2)+l3       -> logits A
+                                                      |  (C2 finishes compiling dot4x4 / dotQ4)
+concurrent run 1, 2, ...       CPU experts:  C2:               lanes summed (l0+l1)+(l2+l3)       -> logits B
+                                             check: A == B bit for bit?   no, 1 ulp in some hidden values
+```
+
+**The fix.** `VectorKernels.laneSum` adds the lanes in the pairs-first order that C2 uses on 128-bit NEON (8 lanes: the same
+recursion; other widths keep `reduceLanes`) and replaces `reduceLanes` in `dotQ4`, `dotQ8` and `store4`: the Q4_0 / Q8_0
+row dots and the 4-row and 4 x 4 tiles of the prefill matmuls and of the MoE experts. As the order is the one C2 already
+used, the steady-state result is unchanged bit for bit: the CPU probe gives the old C2 result in the interpreter, C1 and C2
+alike, and the serial results of the Metal backend (which only the CPU experts reach) and the haiku gate (md5 below) did not
+move; only the cold first calls changed. No encoder code was touched. Not covered: the Q2_K, Q6_K, GGUF and int8 dots, the
+float `dot` and the softmax sums still call `reduceLanes`, so a CPU run first in a process can differ from a later one in the
+last bit there (the smoke runs the CPU split on Q4_0 only).
+
+**The check that would have caught it.** `JitStableKernelsTest` (a unit test in `mvn test`, no model, fresh JVM): the Q4_0
+and Q8_0 row dots, `dot4` and `dot4x4` on fixed data; it records the first, interpreted result, runs the kernels 40 000 more
+times through C1 and C2, and every result must equal the first. Before the fix it fails in every fresh JVM (3 of 3, at round
+375 to 477: `FAIL Q8_0: result 16 of round 477 is 0.81299704, the first call gave 0.812997`), after it passes in 3 of 3.
+In arch smoke, a mismatch of the concurrent check now prints the size of the differences and whether a second serial run
+equals the first or the concurrent one, which tells a missing barrier (the serial runs agree) from an unstable reference
+(they do not) at once.
+
+**Result.** The same loop that failed 7 of 200 times: 0 failures in 300 fresh JVMs on the merged tree (the `ArchSmoke` loop above, one JVM per iteration, under the heavy lock).
+
 ## 8.29 The prefill chunk (`backend.batch=auto`)
 
 🧸 Carrying shopping home in a tiny bag means many trips, and on each trip you walk the same road. A bigger bag
