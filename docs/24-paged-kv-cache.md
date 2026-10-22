@@ -259,6 +259,11 @@ layer:  [ K region | V region ]
  q8   K: byte  [kvHead][headDim][B]  +  float scale [kvHead][B]      V: byte [B][kvDim] + float scale [B][kvHead]
 ```
 
+With `backend.kv-q8-rotate` (the shipped default for q8, docs 07 §7.13) the keys are Walsh–Hadamard rotated before they are
+quantized and the queries are rotated at attention time with the score scale divided by the Hadamard block: `CpuKvStorage.storeRow`
+rotates a key head before `q8` and `PagedKv.attention` rotates the queries, exactly as `KvCache.Q8` does, and the saved-cache format
+string says `q8 rot` in both. The pool is created for one setting (it is part of its key and of its spill fingerprint).
+
 The keys keep the flat cache's **transposed** layout (a vector load holds one head element of consecutive keys), with the block's
 `B` keys as the "chunk" instead of the flat cache's fixed 32. Every byte offset is a `long`.
 
@@ -304,8 +309,9 @@ after the buffers, so the existing buffer indexes did not move).
 of a chunk are contiguous. In a block table they are not (a 256-token chunk spans 17 blocks at arbitrary places), so a paged step
 stages every cache type the way the q8 cache already did: the projection writes f32 rows, `rope` rotates k in place, and a store
 kernel writes the chunk into the table's rows — `kv_store_q8` (now paged too: parameters `pos`, `pageShift`) or the new `kv_store_pg`
-(f32 copy, or rounding to half with the same round-to-nearest-even as the `*_h` projection and `rope_h`). That is one extra dispatch
-per layer; the fused `rope_store_q8` is left out of paged steps.
+(f32 copy, or rounding to half with the same round-to-nearest-even as the `*_h` projection and `rope_h`); with rotated q8 keys
+`kv_store_q8r` (rotates k and the chunk's queries in place, then quantizes; paged the same way: parameters `pos`, `pageShift`, the
+table). That is one extra dispatch per layer; the fused `rope_store_q8` / `rope_store_q8r` are left out of paged steps.
 
 **Decode replay: patchable, so it stays on.** A recorded decode step re-uses its dispatches and patches only the position into the
 parameter structs and the position-indexed byte offsets of the cache buffers. A paged step has **no position-dependent buffer offset**:
@@ -474,7 +480,7 @@ paged engine in one process):
 | CPU q8 | 242 | 239 | 15.3 | 13.3 | 0.87 |
 | CPU f32, gather (`-Djllm.cpu.pagedGather=true`) | 234 | 236 | 15.5 | 12.3 | 0.79 |
 
-On Metal the page table costs 2–3 % of decode and 2–7 % of prefill (a lookup per key row, one more dispatch per layer for the store); replay on
+(The q8 rows were measured with plain q8 keys, before `backend.kv-q8-rotate` became the default; the rotation adds the same Hadamard transform of each key row and query to the flat and the paged cache.) On Metal the page table costs 2–3 % of decode and 2–7 % of prefill (a lookup per key row, one more dispatch per layer for the store); replay on
 or off makes no difference to the ratio. On the CPU f32 decode lost 43 % with the gather in a quiet-machine run (46.6 → 26.8 tok/s) and now
 loses 9 %; f16 / q8 lose 13–17 % (a gathered chunk is assembled from two 16-key blocks).
 
@@ -497,15 +503,16 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
 * `PagedEngineTest` (Qwen3-0.6B, CPU, deterministic): logits and greedy answers equal for f32 / f16 / q8; two slots share a prefix (11 blocks
   for the first, 4 more for the second), a fork at token 123, a retry, copy on write counted; eviction to a spill directory and reload; n-gram
   speculation; three slots in shared passes; flat ↔ paged saved caches and a background save from a snapshot while the engine serves.
-* `ArchSmoke` → `PagedKvChecks`, for every attention family, CPU and the real GPU (or the emulator), f32 / q8 and f16 on the first dense and
-  MoE: scripted prefill, decode (Metal: recorded and replayed), rewind into a block, a verification chunk with every row's logits; adoption,
+* `ArchSmoke` → `PagedKvChecks`, for every attention family, CPU and the real GPU (or the emulator), f32 / q8 (plain and with rotated keys) and
+  f16 on the first dense and MoE: scripted prefill, decode (Metal: recorded and replayed), rewind into a block, a verification chunk with every row's logits; adoption,
   fork, rewind in a shared block; eviction and reload; three rows in one batched pass; saved bytes both ways and a snapshot. All compare
-  **bit for bit** with the flat cache. (A kernel's first, cold calls can round differently from its later ones — the flat cache then differs
-  from itself — so these comparisons repeat up to three times; a paging error fails every attempt.)
+  **bit for bit** with the flat cache. (The vector reductions of the kernels, `reduceLanes`, may add in another order in the interpreter, in C1 and in C2, so a call's last bit
+  can change while the JVM warms up — the flat cache then differs from itself. These comparisons therefore repeat until the flat run agrees
+  with itself, at most a few times; a paging error fails every attempt.)
 * `scripts/metal-emu/kernel_tests.py`: every changed kernel with a shuffled pool and a table (garbage in the unused blocks) against numpy:
   `attention_t` (f32, q8, all widths), `attention_split_q8`, `attention_dec` (f32 / f16 / q8, splits, window, soft-cap), `attention_fa` /
-  `attention_fb` (f32 / f16 / q8, window, soft-cap, chunk starts inside a block), `kv_store_q8` and `kv_store_pg` (f32 and half), block
-  sizes 16 / 32 / 64.
+  `attention_fb` (f32 / f16 / q8, window, soft-cap, chunk starts inside a block), `kv_store_q8`, `kv_store_q8r` and `kv_store_pg` (f32 and
+  half), block sizes 16 / 32 / 64.
 * `jllm-web` `PagedSlotsTest`: two conversations with a shared 4 000-token prefix store it once (the pool's resident bytes are counted: both
   together take under 1.1× one conversation and about half of two flat slots), the second prefills only its tail, and a conversation
   pushed out of a small pool comes back from the block store.

@@ -1456,7 +1456,8 @@ def kv_store_q8r(hd, n_kv=2, n_heads=4, ntok=5, pos0=3, ctx=12, page=0):
     kv_dim = n_kv * hd
     k = (rng.standard_normal((ntok, kv_dim)) * rng.random((ntok, 1)) * 4).astype(np.float32)
     k[:, 5] *= 20  # an outlier channel
-    k[1, :hd] = 0  # an all-zero row: scale 0, values 0
+    if ntok > 1:
+        k[1, :hd] = 0  # an all-zero row: scale 0, values 0
     v = rng.standard_normal((ntok, kv_dim)).astype(np.float32)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     q0 = q.copy()

@@ -74,11 +74,6 @@ public final class PagedEngineTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
-        // A kernel's first calls (interpreted, or compiled at a lower tier) can round differently from its later ones: the flat
-        // cache differs from itself there. The first round only warms the JVM up; its logits comparison is not counted.
-        int warmFailures = failures;
-        sameAsFlat(dir, "f32");
-        failures = warmFailures;
         for (String dt : new String[]{"f32", "f16", "q8"}) {
             sameAsFlat(dir, dt);
         }
@@ -104,34 +99,55 @@ public final class PagedEngineTest {
             check(bf.stateFormat().equals(bp.stateFormat()), dt + ": the same saved-cache format " + bf.stateFormat());
             int[] ids = text(flat.engine(), 0, 150);
             int vocab = flat.weights().arch.core().vocabSize();
-            float[] lf = new float[vocab];
-            float[] lp = new float[vocab];
-            boolean same = true;
-            for (int pos = 0; pos < ids.length; pos += 64) {
-                int n = Math.min(64, ids.length - pos);
-                bf.forward(ids, pos, n, pos, lf);
-                bp.forward(ids, pos, n, pos, lp);
-                same &= Arrays.equals(lf, lp);
+            // The vector reductions of the kernels (reduceLanes) may add in another order in the interpreter, in C1 and in C2,
+            // so the same call can differ in the last bit while the JVM warms up, even on the flat cache. The script runs on
+            // the flat cache twice; once those two agree the JVM is warm for this code, and the paged run must equal them.
+            boolean same = false;
+            boolean warm = false;
+            for (int attempt = 0; attempt < 12 && !warm; attempt++) {
+                List<float[]> f1 = script(bf, ids, vocab);
+                List<float[]> f2 = script(bf, ids, vocab);
+                warm = sameLogits(f1, f2);
+                if (warm) {
+                    same = sameLogits(f1, script(bp, ids, vocab));
+                }
             }
-            int pos = ids.length;
-            int[] one = new int[1];
-            for (int i = 0; i < 12 && same; i++) { // decode, then a rewind of 5 positions and a verification-shaped chunk
-                one[0] = argmax(lf);
-                bf.forward(one, 0, 1, pos, lf);
-                bp.forward(one, 0, 1, pos, lp);
-                same &= Arrays.equals(lf, lp);
-                pos++;
-            }
-            int[] chunk = Arrays.copyOfRange(ids, 20, 25);
-            bf.forward(chunk, 0, 5, pos - 5, lf);
-            bp.forward(chunk, 0, 5, pos - 5, lp);
-            same &= Arrays.equals(lf, lp);
-            check(same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
+            check(warm && same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
             int[] prompt = text(flat.engine(), 7, 100);
             Engine.Result rf = flat.engine().generate(prompt, GREEDY, null, () -> false);
             Engine.Result rp = paged.engine().generate(prompt, GREEDY, null, () -> false);
             check(Arrays.equals(rf.tokens(), rp.tokens()), dt + ": the engine's greedy answer is the same (" + abbreviate(rp.text()) + ")");
         }
+    }
+
+    /** Prefill in chunks of 64, 12 greedy decode steps, a rewind of 5 positions and a verification-shaped chunk: every call's logits. */
+    private static List<float[]> script(Backend b, int[] ids, int vocab) {
+        List<float[]> out = new ArrayList<>();
+        float[] l = new float[vocab];
+        for (int pos = 0; pos < ids.length; pos += 64) {
+            b.forward(ids, pos, Math.min(64, ids.length - pos), pos, l);
+            out.add(l.clone());
+        }
+        int pos = ids.length;
+        int[] one = new int[1];
+        for (int i = 0; i < 12; i++) {
+            one[0] = argmax(l);
+            b.forward(one, 0, 1, pos, l);
+            out.add(l.clone());
+            pos++;
+        }
+        b.forward(Arrays.copyOfRange(ids, 20, 25), 0, 5, pos - 5, l);
+        out.add(l.clone());
+        return out;
+    }
+
+    private static boolean sameLogits(List<float[]> a, List<float[]> b) {
+        for (int i = 0; i < a.size(); i++) {
+            if (!Arrays.equals(a.get(i), b.get(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Two slots with a shared prefix store it once; a fork in the middle of a block, a retry; all give the flat answers. */
