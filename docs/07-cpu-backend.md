@@ -645,7 +645,7 @@ In order of expected payoff on this CPU:
 
 ## 7.13 The f16 KV cache (`KvCache`)
 
-`backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation, `q8` (below) nearly quarters it. The
+`backend.kv-dtype=f16` (default `f32`) halves the biggest heap allocation, `q8` (below) nearly quarters it, `q4` (below) takes an eighth. The
 storage lives in `cpu/KvCache.java` with three implementations; `CpuBackend` only knows `kv.store(...)` and
 `kv.attention(...)`:
 
@@ -757,6 +757,208 @@ its RMS, at worst 11×; V rows 3.6×), so the step `max / 127` is coarse for the
 error is 1.6 % of a K row's RMS and 0.8 % of a V row's, against ~0.02 % for f16. Greedy text diverges early (as it
 does for any change at a near-tie; f32 vs f16 diverges at token 76) but remains coherent. Use q8 when the cache
 size is what limits the context or the number of slots, f16 otherwise.
+
+### q4: rotated keys, 4-bit groups and a recent window (`KvCache.Q4`, `KvQ4`)
+
+#### 🧸 The idea
+
+Think of the cache as a long shelf of photographs, one per word the model has read. q8 keeps every photograph as a
+fairly good JPEG. q4 keeps them as small thumbnails, so the shelf holds about twice as many. Two tricks keep the
+thumbnails useful:
+
+- **A shaking trick for the keys.** A key is a list of 128 numbers, and in Qwen3 a few of them are huge while most are
+  small. A thumbnail that has to fit the huge numbers has no room left for the small ones. So before shrinking we
+  *shake* the list with a fixed recipe (the Walsh–Hadamard transform) that mixes every number into every other one;
+  afterwards no number is much bigger than the rest, and the thumbnail wastes nothing. The question the model asks
+  (the query) is shaken with the same recipe, so the answer to "how much does this key match my question?" does not
+  change: a shaken question against a shaken key gives the same match as before.
+- **A sharp photo of the last few pages.** The words just before the one being written matter most, so the newest
+  positions are also kept as full photographs (halves), in a small ring that always holds the latest
+  `backend.kv-q4-recent` of them; older ones are only thumbnails.
+
+The honest part, measured below on Qwen3-0.6B: the thumbnails of the **keys** are too rough for this small model. A
+window of 128 sharp positions helps a lot, 512 more, but q4 stays clearly worse than q8, and it stays **opt-in**
+(`backend.kv-dtype=q4`). The values (the other half of the shelf) take 4 bits almost for free.
+
+#### 📐 The math
+
+**Rotation.** For a power of two `B`, the Walsh–Hadamard matrix is `H₁ = [1]`, `H₂ₙ = [[Hₙ, Hₙ], [Hₙ, −Hₙ]]`, with
+entries ±1 and `Hᵀ H = B·I`. `KvQ4.rotate` applies it to each kv head's K row after QK-norm and RoPE, in place, as
+`log₂ B` butterfly passes `(a, b) → (a + b, a − b)` of stride 1, 2, 4, …, i.e. `B log₂ B` additions and no
+multiplications. `B` is the largest power of two dividing `headDim` (the whole row for 64 / 128 / 256, three blocks of
+32 for 96). The matrix is *not* normalized, so for a query `q` and a key `k` of a block
+
+```
+(H q) · (H k) = qᵀ Hᵀ H k = B · (q · k)        so the score is   s = (Hq)·(Hk) / (B · √headDim)
+```
+
+`B` is a power of two, so dividing the attention scale by it is exact in float; `kv_store_q4` / `KvCache.Q4.attention`
+rotate the queries of the chunk the same way (V is not rotated). Why it helps: the RMS rounding error of a group grows
+with the group's largest value, and Qwen3's keys have outlier channels (largest value 7.3× the row's RMS on average).
+After the rotation each entry is a ±1 sum of `B` entries, so it is close to Gaussian and a group's largest value is
+about 2–2.5 RMS. Measured below: without the rotation the keys at 4 bits make the model unusable (perplexity ×600).
+
+**Quantization.** Each rotated K row and each V row of a kv head is cut into groups of 32 values:
+
+```
+d      = half( max|x| / 7.5 )                    (the scale, an IEEE half; 0 for an all-zero group)
+code   = clamp( rint( x / d + 7.5 ), 0, 15 )     (4 bits; 8 if d = 0)
+x̂      = ( code − 7.5 ) · d                      (levels at ±0.5 d, ±1.5 d, …, ±7.5 d)
+|x − x̂| ≤ d / 2 = max|x| / 15
+```
+
+The 16 levels sit at the odd multiples of half a step (mid-rise): both signs reach ±max|x|, which a Q4_0-style
+`d = m / −8` does not (it clips the side opposite to the largest value to 7 levels, and measured clearly worse). A group
+is 16 bytes (byte `j`: value `j` in the low nibble, value `j + 16` in the high one, the Q4_0 order) and one half scale.
+A row is `kvDim / 2` bytes of nibbles followed by `kvDim / 32` halves — **0.5625 B per value**:
+
+```
+bytes per token = 2 · L · (kvDim / 2 + kvDim / 16) = 2 · 28 · 576 = 32 256 B ≈ 31.5 KB   (Qwen3-0.6B)
+                  f16 115 KB,  q8 59 KB                                                     at --ctx 4096: 132 MB
+```
+
+**The recent window.** With `R = backend.kv-q4-recent > 0`, each layer also keeps a ring of `R + chunk` slots
+(`chunk` = the prefill batch, so one chunk never evicts a row a query of the same chunk reads) holding the *rotated* K
+and the V rows of the latest positions as halves, each slot tagged with the position it holds. A query at position
+`P` reads the keys `[P − R + 1, P]` from the ring and older ones from the 4-bit rows; the same for V. If a slot has
+lost a position (after a rollback, or a partial copy), `exactFrom(P)` moves the boundary up so that the exact part is
+a contiguous suffix: which representation a (query, key) pair uses depends only on `P` and on the ring, so prefill
+and decode stay bit-identical. The ring costs `2 · L · (R + chunk) · kvDim · 2` bytes (22 MB for R = 128, 66 MB for
+R = 512 on Qwen3-0.6B) whatever the context.
+
+**Saved caches** (`kv q4 recent=R layers=… kvDim=… headDim=…`): per layer, per position, the K row then the V row in the
+row layout above (the stored nibbles and scales themselves, nothing is rounded again), then — with a window — for
+each layer the positions `[n − R, n)`: an int (1: the ring holds it) and its K and V rows as `kvDim` halves each. Both
+backends write the same bytes (`ArchSmoke.kvStateChecks`: saved and loaded, copied, a CPU file in the Metal backend,
+and the first `n − 2` of `n` stored positions, for which the ring keeps the part of the saved window below `n − 2`).
+
+#### 📐 Measured accuracy (Qwen3-0.6B Q4_0 weights, against the f16 cache of the same model)
+
+Metal backend, `-Djllm.kv.q4.rotate=false` for the rows without rotation (a switch for this study only).
+`scripts`-free: the harness is `src/test/java/org/robomiri/jllm/KvStudy.java`. For each of three prompts f16 generates
+300 greedy tokens (stop tokens excluded); a cache type is then run (1) free: its own 300 greedy tokens, compared
+position by position (first divergence, fraction identical), and (2) *teacher-forced* on f16's tokens, comparing its
+logits with f16's at each of the 300 steps (mean and largest absolute difference over the 151 936 logits, KL divergence
+of the softmax, how often the arg max is the same). Prompts: a Python task (44 prompt tokens), an essay (34), and a
+3 031-token document (the text of this chapter) to summarize. f32 is included as the noise floor of "another rounding".
+
+| prompt | cache | keys rotated | first divergence | identical tokens | mean \|Δlogit\| | max \|Δlogit\| | mean KL (nats) | arg max agreement |
+|---|---|---|---|---|---|---|---|---|
+| code | f32 | – | none in 300 | 100.0% (300/300) | 0.0019 | 0.043 | 0.00000 | 100.0% |
+| code | q8 | – | 61 | 22.3% (67/300) | 0.2595 | 5.807 | 0.00976 | 98.3% |
+| code | q4, no window | yes | 0 | 1.0% (3/300) | 1.6745 | 19.390 | 0.41592 | 81.7% |
+| code | q4, no window | no | 0 | 1.3% (4/300) | 3.8783 | 36.272 | 9.55709 | 0.7% |
+| code | q4, window 32 | yes | 70 | 25.0% (75/300) | 0.4049 | 8.064 | 0.03462 | 95.3% |
+| code | q4, window 128 | yes | 91 | 37.7% (113/300) | 0.2062 | 4.309 | 0.01014 | 97.0% |
+| code | q4, window 128 | no | 85 | 29.3% (88/300) | 3.1384 | 35.074 | 6.61516 | 30.7% |
+| code | q4, window 512 | yes | none in 300 | 100.0% (300/300) | 0.0031 | 0.193 | 0.00000 | 100.0% |
+| code | q4, window 512 | no | none in 300 | 100.0% (300/300) | 0.0009 | 0.011 | 0.00000 | 100.0% |
+| prose | f32 | – | none in 300 | 100.0% (300/300) | 0.0013 | 0.017 | 0.00000 | 100.0% |
+| prose | q8 | – | 27 | 12.3% (37/300) | 0.3097 | 18.378 | 0.03714 | 93.3% |
+| prose | q4, no window | yes | 7 | 5.3% (16/300) | 2.1319 | 18.874 | 0.48584 | 69.3% |
+| prose | q4, no window | no | 0 | 0.0% (0/300) | 4.2361 | 30.011 | 9.40324 | 0.7% |
+| prose | q4, window 32 | yes | 34 | 12.3% (37/300) | 0.3690 | 6.523 | 0.03777 | 88.7% |
+| prose | q4, window 128 | yes | 114 | 39.0% (117/300) | 0.1567 | 6.500 | 0.01006 | 95.0% |
+| prose | q4, window 128 | no | 98 | 33.3% (100/300) | 3.2830 | 30.186 | 6.16766 | 33.3% |
+| prose | q4, window 512 | yes | none in 300 | 100.0% (300/300) | 0.0026 | 0.043 | 0.00000 | 100.0% |
+| prose | q4, window 512 | no | none in 300 | 100.0% (300/300) | 0.0005 | 0.011 | 0.00000 | 100.0% |
+| long document | f32 | – | none in 300 | 100.0% (300/300) | 0.0019 | 0.096 | 0.00000 | 100.0% |
+| long document | q8 | – | 79 | 27.0% (81/300) | 0.3570 | 7.575 | 0.03315 | 95.0% |
+| long document | q4, no window | yes | 0 | 0.3% (1/300) | 1.7132 | 18.129 | 0.80457 | 71.7% |
+| long document | q4, no window | no | 0 | 0.3% (1/300) | 3.2358 | 36.912 | 8.72698 | 0.7% |
+| long document | q4, window 32 | yes | 1 | 16.0% (48/300) | 0.5989 | 10.094 | 0.11199 | 85.3% |
+| long document | q4, window 128 | yes | 44 | 15.7% (47/300) | 0.4628 | 7.954 | 0.07976 | 89.3% |
+| long document | q4, window 128 | no | 0 | 0.0% (0/300) | 3.1754 | 36.116 | 10.01039 | 0.0% |
+| long document | q4, window 512 | yes | 0 | 2.3% (7/300) | 0.3732 | 5.915 | 0.04263 | 90.7% |
+| long document | q4, window 512 | no | 0 | 0.0% (0/300) | 3.2555 | 34.473 | 8.78728 | 2.3% |
+
+
+Perplexity-like check: the first 4 096 tokens of `README.md`, run through the prefill path in chunks of 64 (so the
+cache of a position is read by the later chunks), the log-probability of each next token under each cache:
+
+| cache | keys rotated | mean log-prob | perplexity | mean log-prob difference vs f16 | mean \|difference\| per token | largest per-token difference |
+|---|---|---|---|---|---|---|
+| f16 (reference) | – | -3.0550 | 21.2222 | 0 | 0 | 0 |
+| f32 | – | -3.0550 | 21.2204 | +0.00008 | 0.00114 | 0.0206 |
+| q8 | – | -3.0832 | 21.8289 | -0.02819 | 0.22144 | 5.5597 |
+| q4, no window | yes | -3.9652 | 52.7325 | -0.91018 | 1.39991 | 18.2425 |
+| q4, no window | no | -9.5223 | 13661.3970 | -6.46728 | 6.65765 | 21.7886 |
+| q4, window 32 | yes | -3.4242 | 30.6991 | -0.36919 | 0.75999 | 12.2370 |
+| q4, window 128 | yes | -3.3241 | 27.7746 | -0.26908 | 0.61262 | 14.1912 |
+| q4, window 128 | no | -10.5225 | 37141.2243 | -7.46743 | 7.60207 | 23.4083 |
+| q4, window 512 | yes | -3.2069 | 24.7019 | -0.15183 | 0.41106 | 10.8422 |
+| q4, window 512 | no | -9.7493 | 17142.4890 | -6.69427 | 6.83814 | 26.5581 |
+
+
+What the numbers say:
+
+- **Rotation is necessary.** Without it the keys at 4 bits destroy the model (perplexity in the tens of thousands,
+  the arg max is right in 1 % of the steps); with it q4 is merely degraded.
+- **q4 is much less accurate than q8 on this model**, and the window is what recovers it: no window costs +0.91 nats
+  per token (perplexity ×2.5); 32, 128 and 512 positions cost +0.37, +0.27 and +0.15, against q8's +0.03.
+  A prompt that fits the window (the first two prompts at window 512: 344 and 334 positions) is exact.
+- **Where the error comes from** (CPU simulation of the same quantizer, no window, the first 2 048 tokens of the same
+  text; f16 perplexity 23.72): only the keys.
+
+  | what is quantized | perplexity |
+  |---|---|
+  | V at 4 bits, K exact | 24.18 (−0.019 nats per token) |
+  | K at 4 bits rotated, V exact | 57.5 (−0.886) |
+  | K and V at 4 bits rotated | 59.1 (−0.913) |
+  | K at 4 bits **not** rotated | 25 128 (−6.97) |
+  | K at 5 bits rotated | 25.0 (−0.052) |
+  | K at 6 bits rotated | 24.0 (−0.012) |
+  | K at 8 bits, groups of 32, rotated | 23.72 (+0.0001) |
+  | K at 8 bits, one scale per row (q8's format), **not** rotated | 24.37 (−0.027) |
+  | K and V at 8 bits per row, not rotated (q8) | 24.27 (−0.023) |
+  | K at 4 bits, groups of 16 / 8 / asymmetric groups of 32 | 70.0 / 60.7 / 53.9 (no better) |
+  | K and V at 4 bits, the first 1 / 4 positions (attention sinks) kept exact | 58.9 / 60.6 (no better) |
+
+  Qwen3-0.6B's keys need about 5 bits: 4 bits is a cliff, not a slope (smaller groups or an asymmetric scale do not
+  move it, and keeping the attention-sink positions exact does not either). The values are not the problem. Rotating
+  the keys of the *q8* cache would also make it about 15× more accurate (K at 8 bits rotated: −0.0015 nats against
+  −0.027 unrotated); that is a change of the q8 format and not made here.
+
+#### 📐 Needle in a haystack
+
+A five-digit pass key ("The pass key is 48213. Remember it. 48213 is the pass key.") is hidden among sentences like
+"Note 51730: the quiet harbor was repainted until spring." at the start, the middle and the end of the prompt, three
+different keys at each depth (9 questions per cell); the question "What is the pass key mentioned in the text above?
+Answer with only the number." is a chat turn, answered greedily with 14 tokens; found = the key is in the answer.
+Metal backend, `--ctx 32768`, prefill chunks of 256, the same haystacks for every cache. Qwen3-0.6B is a poor retriever
+even with the f16 cache, so a cell is noisy: a difference of one or two of nine means little.
+
+| prompt tokens | cache | keys rotated | pass key found (of 9) | by depth: start / middle / end (3 each) |
+|---|---|---|---|---|
+| 4097 | f16 | – | 9/9 | 3/3 / 3/3 / 3/3 |
+| 4097 | q8 | – | 9/9 | 3/3 / 3/3 / 3/3 |
+| 4097 | q4, no window | yes | 5/9 | 2/3 / 1/3 / 2/3 |
+| 4097 | q4, window 128 | yes | 8/9 | 3/3 / 2/3 / 3/3 |
+| 4097 | q4, window 512 | yes | 8/9 | 3/3 / 2/3 / 3/3 |
+| 8360 | f16 | – | 6/9 | 1/3 / 2/3 / 3/3 |
+| 8360 | q8 | – | 8/9 | 2/3 / 3/3 / 3/3 |
+| 8360 | q4, no window | yes | 8/9 | 3/3 / 3/3 / 2/3 |
+| 8360 | q4, window 128 | yes | 9/9 | 3/3 / 3/3 / 3/3 |
+| 8360 | q4, window 512 | yes | 9/9 | 3/3 / 3/3 / 3/3 |
+| 16769 | f16 | – | 8/9 | 3/3 / 2/3 / 3/3 |
+| 16769 | q8 | – | 9/9 | 3/3 / 3/3 / 3/3 |
+| 16769 | q4, no window | yes | 5/9 | 1/3 / 1/3 / 3/3 |
+| 16769 | q4, window 128 | yes | 6/9 | 3/3 / 1/3 / 2/3 |
+| 16769 | q4, window 512 | yes | 7/9 | 3/3 / 1/3 / 3/3 |
+
+Over the three lengths (27 questions per cache): f16 23, q8 26, q4 without a window 18, q4 with window 128 23, with window
+512 24. So: with a window q4 retrieves as often as f16 within this test's noise at 4 k and 8 k tokens (the 0.6B model
+itself misses a third of the questions at 8 k with f16), at 16.8 k tokens it finds 6–7 of 9 against f16's 8 and q8's 9,
+and without the window it is clearly worse (5 of 9 at 4 k and at 16.8 k). The longest context tested is 16.8 k tokens: a
+30 000-token run was started and dropped because the shared GPU's job queue made it take hours, and a run with
+unrotated keys was not made (their perplexity above, in the tens of thousands, already decides it).
+
+
+**Speed** on both backends, and what the window costs: [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured).
+**Defaults:** `backend.kv-dtype` stays `f32` (f16 and q8 are the choices to make for memory); q4 is opt-in. The keys are
+always rotated (there is no setting; `-Djllm.kv.q4.rotate=false` exists only to reproduce the study), and
+`backend.kv-q4-recent` stays 128: it recovers most of what the window can (+0.27 nats against +0.91 without, +0.15 at
+512) for 16 % of prefill speed at 2 000 tokens on the GPU; 512 buys the last part for another 13 percentage points of it.
 
 ---
 

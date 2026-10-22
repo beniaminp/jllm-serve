@@ -417,8 +417,12 @@ public final class KvStudy {
                             if (p.length + 24 > ctx) {
                                 throw new IllegalStateException("prompt of " + p.length + " tokens does not fit ctx " + ctx);
                             }
+                            long t0 = System.nanoTime();
                             int[] out = generate(b, p, 14, null);
                             String ans = tok.decode(out);
+                            System.out.printf(Locale.ROOT, "# %s len %d trial %d (depth %d): %s in %.1f s%n", v, len, i,
+                                    depthIdx.get(i), ans.contains(keys.get(i)) ? "found" : "missed", (System.nanoTime() - t0) / 1e9);
+                            System.out.flush();
                             if (ans.contains(keys.get(i))) {
                                 found++;
                                 byDepth[depthIdx.get(i)]++;
