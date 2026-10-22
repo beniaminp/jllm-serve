@@ -160,14 +160,30 @@ public final class Main {
         double encodeMs = engine.vision().lastEncodeMs();
         System.err.printf("%d image(s) -> %d prompt tokens, %.0f ms to encode (%d new)%n", images.size(), mp.length(), encodeMs,
                 engine.vision().lastEncodedImages());
-        Engine.Result r = engine.generate(mp, s.sampling(), Engine.Decoding.NONE, 1, new Engine.ChoiceSink() {
-            @Override
-            public void text(int index, String t) {
-                System.out.print(t);
-                System.out.flush();
-            }
-        }, () -> false).getFirst();
+        boolean debug = Boolean.getBoolean("jllm.vision.debug"); // with it: the first position's top-5 log-probs and the token ids
+        Engine.Result r = engine.generate(mp, s.sampling(), debug ? new Engine.Decoding(null, true, 5, false, null) : Engine.Decoding.NONE, 1,
+                new Engine.ChoiceSink() {
+                    @Override
+                    public void text(int index, String t) {
+                        System.out.print(t);
+                        System.out.flush();
+                    }
+                }, () -> false).getFirst();
         System.out.println();
+        if (debug) {
+            org.robomiri.jllm.engine.TokenLogprob first = r.logprobs().getFirst();
+            StringBuilder sb = new StringBuilder("top5 at the first position:");
+            for (int i = 0; i < first.topTokens().length; i++) {
+                sb.append(String.format("%n  %d %.5f '%s'", first.topTokens()[i], first.topLogprobs()[i],
+                        engine.tokenizer().decode(new int[]{first.topTokens()[i]})));
+            }
+            System.err.println(sb);
+            StringBuilder ids = new StringBuilder("tokens:");
+            for (int t : r.tokens()) {
+                ids.append(' ').append(t);
+            }
+            System.err.println(ids);
+        }
         System.err.println(statsLine(r.stats()) + ", finish=" + r.finishReason() + ", total " + (System.nanoTime() - t0) / 1_000_000 + " ms");
     }
 

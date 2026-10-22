@@ -360,7 +360,43 @@ public final class Qwen3NextMetalBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
+    }
+
+    // ---- images (docs/20): the vision encoder feeds embeddings; Qwen3.5 has its own rotary positions (interleaved M-RoPE)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        if (deepstack != null) {
+            throw new UnsupportedOperationException("deepstack features belong to Qwen3-VL, not to the Qwen3-Next family");
+        }
+        run(null, embeds, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        int half = arch.rope().rotaryDim() / 2;
+        float[] cos = new float[(ctx - from) * half];
+        float[] sin = new float[(ctx - from) * half];
+        Rope.rows(arch.rope(), ctx, from, p, cos, sin);
+        // the tables are shared host memory the kernels read in place; no work is in flight (the engine is idle)
+        MemorySegment.copy(cos, 0, ropeCos.contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, cos.length);
+        MemorySegment.copy(sin, 0, ropeSin.contents(), ValueLayout.JAVA_FLOAT, (long) from * half * 4, sin.length);
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
     }
 
     /** Logits of every row (the verification of drafts): at most {@link #MAX_ALL_ROWS} rows per call. */
@@ -370,7 +406,7 @@ public final class Qwen3NextMetalBackend implements Backend {
             Backend.super.forwardAll(tokens, off, n, pos, logitsOut, stride);
             return;
         }
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
     }
 
     private static final int MAX_ALL_ROWS = 16;
@@ -379,11 +415,11 @@ public final class Qwen3NextMetalBackend implements Backend {
     private boolean capture;
 
     /** {@code stride == 0}: the logits of the last row into {@code logits}; else row i to {@code logits[i * stride ..)}. */
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
         }
-        capture = armed && n == 2 && stride > 0;
+        capture = armed && n == 2 && stride > 0 && tokens != null;
         armed = false;
         captured = capture;
         capturedPos = pos;
@@ -398,9 +434,13 @@ public final class Qwen3NextMetalBackend implements Backend {
         statePos = -1;
         int dim = c.dim();
         float[] row = new float[dim];
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], row, 0);
-            MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+        if (embeds != null) {
+            MemorySegment.copy(embeds, off * dim, x.contents(), ValueLayout.JAVA_FLOAT, 0, n * dim);
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], row, 0);
+                MemorySegment.copy(row, 0, x.contents(), ValueLayout.JAVA_FLOAT, (long) t * dim * 4, dim);
+            }
         }
         k.begin();
         boolean committed = false;
@@ -458,7 +498,8 @@ public final class Qwen3NextMetalBackend implements Backend {
         }
         statePos = pos + n;
         if (feeder != null && feeder.enabled()) {
-            feeder.afterPass(tokens, off, n, pos, hid);
+            // (a picture's rows have no token: the head sees token 0 there, which only costs it some draft quality)
+            feeder.afterPass(tokens != null ? tokens : new int[off + n], off, n, pos, hid);
         }
     }
 

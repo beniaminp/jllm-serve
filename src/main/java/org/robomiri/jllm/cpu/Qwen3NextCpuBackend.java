@@ -199,17 +199,51 @@ public final class Qwen3NextCpuBackend implements Backend {
 
     @Override
     public void forward(int[] tokens, int off, int n, int pos, float[] logits) {
-        run(tokens, off, n, pos, logits, 0);
+        run(tokens, null, off, n, pos, logits, 0);
     }
 
     @Override
     public void forwardAll(int[] tokens, int off, int n, int pos, float[] logitsOut, int stride) {
-        run(tokens, off, n, pos, logitsOut, stride);
+        run(tokens, null, off, n, pos, logitsOut, stride);
     }
 
-    private void run(int[] tokens, int off, int n, int pos, float[] logits, int stride) {
+    // ---- images (docs/20): the vision encoder feeds embeddings; Qwen3.5 has its own rotary positions (interleaved M-RoPE)
+
+    /** First slot whose rotary rows are not the plain ones ({@link #setRopePositions}); MAX_VALUE = none. */
+    private int ropeCustomFrom = Integer.MAX_VALUE;
+
+    @Override
+    public boolean supportsEmbeds() {
+        return true;
+    }
+
+    @Override
+    public void forwardEmbeds(float[] embeds, int off, int n, int pos, float[][] deepstack, float[] logits) {
+        if (deepstack != null) {
+            throw new UnsupportedOperationException("deepstack features belong to Qwen3-VL, not to the Qwen3-Next family");
+        }
+        run(null, embeds, off, n, pos, logits, 0);
+    }
+
+    @Override
+    public boolean setRopePositions(int from, org.robomiri.jllm.model.RopePositions p) {
+        rope.refill(arch.rope(), ctx, from, p);
+        ropeCustomFrom = p != null ? Math.min(ropeCustomFrom, from) : (from <= ropeCustomFrom ? Integer.MAX_VALUE : ropeCustomFrom);
+        return true;
+    }
+
+    @Override
+    public boolean ropePositionsCustom() {
+        return ropeCustomFrom != Integer.MAX_VALUE;
+    }
+
+    /** {@code tokens} are looked up in the embedding table, or (null) the rows of {@code embeds} from row {@code off} are the input. */
+    private void run(int[] tokens, float[] embeds, int off, int n, int pos, float[] logits, int stride) {
         if (n < 1 || n > maxBatch || pos + n > ctx) {
             throw new IllegalArgumentException("bad forward(n=" + n + ", pos=" + pos + ")");
+        }
+        if (armed && tokens == null) { // (only text passes are verification passes)
+            armed = false;
         }
         if (armed) { // a verification pass: its tokens are kept so that rollbackState can replay the first ones
             armed = false;
@@ -228,8 +262,12 @@ public final class Qwen3NextCpuBackend implements Backend {
         }
         statePos = -1;
         int dim = c.dim();
-        for (int t = 0; t < n; t++) {
-            w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+        if (embeds != null) {
+            System.arraycopy(embeds, off * dim, x, 0, n * dim);
+        } else {
+            for (int t = 0; t < n; t++) {
+                w.embed.dequantizeRow(tokens[off + t], x, t * dim);
+            }
         }
         for (int l = 0; l < c.layers(); l++) {
             Qwen3NextLayer L = w.qwen3NextLayer(l);
@@ -274,7 +312,8 @@ public final class Qwen3NextCpuBackend implements Backend {
         }
         statePos = pos + n;
         if (mtpOn) {
-            feeder.afterPass(tokens, off, n, pos, hid);
+            // (a picture's rows have no token: the head sees token 0 there, which only costs it some draft quality)
+            feeder.afterPass(tokens != null ? tokens : new int[off + n], off, n, pos, hid);
         }
     }
 
@@ -382,7 +421,7 @@ public final class Qwen3NextCpuBackend implements Backend {
         if (feeder != null) {
             feeder.restore();
         }
-        run(armedTokens, 0, keep, armedPos, null, 0); // the first tokens again: the state after them, and the head's rows
+        run(armedTokens, null, 0, keep, armedPos, null, 0); // the first tokens again: the state after them, and the head's rows
     }
 
     // ------------------------------------------------------------------ Gated DeltaNet

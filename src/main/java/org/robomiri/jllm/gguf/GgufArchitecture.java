@@ -165,7 +165,10 @@ final class GgufArchitecture {
             c.put("norm_topk_prob", true); // llama.cpp always normalizes the selected expert weights for qwen3moe
         }
         Map<String, Object> scaling = ropeScaling(g, p, family, headDim);
-        if (family == Family.QWEN2VL || family == Family.QWEN3VL) {
+        // Qwen3.5 is a vision-language family too (its projector is qwen3vl_merger): interleaved sections when the file has them
+        boolean qwen35Sections = (family == Family.QWEN35 || family == Family.QWEN35MOE)
+                && g.longs(p + "rope.dimension_sections") != null && g.longs(p + "rope.dimension_sections").length >= 3;
+        if (family == Family.QWEN2VL || family == Family.QWEN3VL || qwen35Sections) {
             long[] sec = g.longs(p + "rope.dimension_sections");
             if (sec == null || sec.length < 3) {
                 throw new IOException("GGUF metadata has no " + p + "rope.dimension_sections (Qwen-VL's rotary sections)");
@@ -177,7 +180,7 @@ final class GgufArchitecture {
                 l.add(s);
             }
             scaling.put("mrope_section", l);
-            if (family == Family.QWEN3VL) {
+            if (family == Family.QWEN3VL || qwen35Sections) {
                 scaling.put("mrope_interleaved", true);
             }
         }

@@ -240,6 +240,9 @@ public final class ModelLoader {
                 s.getInt("vision.cache-mb"), s.opt("backend.metal.lib"));
     }
 
+    /** Gemma 3: the tokens of one picture (docs/20.12); {@code backend.batch} at its default is raised to this. */
+    static final int GEMMA3_PICTURE_BATCH = 256;
+
     /** Prefill chunk for mixture-of-experts models when {@code backend.batch} is left at its default. */
     static final int MOE_BATCH = 256;
 
@@ -253,6 +256,9 @@ public final class ModelLoader {
         int batch = s.getInt("backend.batch");
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe();
+        if (arch.core().modelType().startsWith("gemma3") && "default".equals(s.source("backend.batch"))) {
+            return Math.max(batch, GEMMA3_PICTURE_BATCH); // a picture's 256 tokens attend to each other and go through in one pass
+        }
         return moe && "default".equals(s.source("backend.batch")) ? Math.max(batch, MOE_BATCH) : batch;
     }
 
@@ -495,7 +501,7 @@ public final class ModelLoader {
             return switch (backendName) {
                 case "cpu" -> new Qwen3NextCpuBackend(weights, ctx, batch,
                         threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                        s.getBool("backend.cpu.int8-activations"));
+                        hybridInt8(s, weights, threads));
                 case "metal" -> new Qwen3NextMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
@@ -596,6 +602,20 @@ public final class ModelLoader {
         // no fallback to token 0: config.json's eos_token_id is already in the core's eosTokenIds, and the chat
         // template adds its own end-of-turn ids in Engine; a model without any simply stops at max_tokens
         return ids;
+    }
+
+    /**
+     * {@code backend.cpu.int8-activations} for a Gated DeltaNet hybrid: {@code auto} is the measurement of the dense
+     * backends when it can be taken on these weights, else the float path (which is what the checks compare with).
+     */
+    private static boolean hybridInt8(Settings s, org.robomiri.jllm.model.ModelWeights weights, int threads) {
+        try {
+            return int8(s, weights, threads);
+        } catch (IllegalArgumentException e) {
+            throw e; // a malformed setting
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /** {@code backend.cpu.int8-activations} for {@code weights} ({@code auto} measures both paths once per model). */
