@@ -206,7 +206,7 @@ mixedtest "mixed scheduler: answers equal those alone, a paused generation conti
 mixedtest "mixed scheduler, concurrent encoder on" "-Djllm.metal.concurrent=true"
 schedbench() { # label scheduler-settings...
   local label="$1"; shift
-  (cd jllm-web && mvn -o -q test -Dtest=SchedulerBench -Dbench.model="../models/$(echo "$DENSE" | tr / _)" -Dbench.label="$label" \
+  (cd jllm-web && mvn -o -q test -Dtest=SchedulerBench -Djllm.metal.lib="$PWD/../target/native/libjllm_metal.dylib" -Dbench.model="$DENSE" -Dbench.dir=../models -Dbench.label="$label" \
     -Dbench.args="--backend metal --engine.speculative off $*" > "$OUT/schedbench.log" 2>&1) || {
     echo "| $label | failed | | $(tail -1 "$OUT/schedbench.log") |"; return; }
   echo "| $label | $(grep -o 'agents finished in [0-9.]* s' "$OUT/schedbench.log") | $(grep -o '[0-9.]* tok/s over' "$OUT/schedbench.log" | head -1) | $(grep 'chat ' "$OUT/schedbench.log" | grep -o 'TTFT p50 *[0-9]* ms  p95 *[0-9]* ms') |"

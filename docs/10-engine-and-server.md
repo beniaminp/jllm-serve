@@ -736,6 +736,11 @@ CPU: equal to rounding, the CPU's batched expert kernels add in another order). 
 states) fall back to running the queued steps one after another; they have no draft-model or prompt-lookup speculation
 either (a recurrent state cannot be rolled back).
 
+**The scheduler.** With `engine.scheduler=mixed` ([chapter 25](25-scheduler.md)) the slots stop waiting for each other at a lock: a prefill chunk, the next
+token of every generating slot and every speculative draft to verify go into *one* forward pass (`Backend.forwardMixed`), the requests wait in one
+queue per model instead of at a slot chosen on arrival, and a background generation can be paused (its blocks spilled) for an interactive one.
+`BatchGroup` is the same class with a mixed mode; `slots` (this section) stays the default.
+
 ## 10.10 Configuration
 
 Every tunable is a key in the bundled `src/main/resources/jllm.properties`, each with a comment. `Settings.load`
@@ -1014,8 +1019,8 @@ console: ChatController.run ─► Priority.enter(priority) around slot.engine()
 ```
 
 `Priority` (`engine/Priority.java`) is an enum with a `ThreadLocal`; a request runs on one thread from the HTTP handler down to
-`BatchGroup`, so the thread-local needs no change to the shared `Backend` interface. The scheduler of the agentic-serving plan can read
-`Priority.current()` or `Decoding.priority()` for its classes, budgets and pausing.
+`BatchGroup`, so the thread-local needs no change to the shared `Backend` interface. The mixed scheduler ([25](25-scheduler.md)) reads
+`Priority.current()` for its queue classes, the order of work inside a pass, the cap on background chunks and who may be paused.
 
 **What it orders today.** One wait only: the device. `BatchGroup` has one lock, taken by every prefill chunk, verification pass,
 saved-cache access (`Member.locked`, `saveState`, `loadState` → `lockDevice()`) and decode batch (`decode` → `decodeStep`). With

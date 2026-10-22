@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * (docs/25). Only runs with {@code -Dbench.model=<model dir>}:
  *
  * <pre>
- *   cd jllm-web && mvn -o test -Dtest=SchedulerBench -Dbench.model=../models/Qwen_Qwen3-0.6B -Dbench.args="--backend metal ..."
+ *   cd jllm-web && mvn -o test -Dtest=SchedulerBench -Dbench.model=Qwen/Qwen3-0.6B -Dbench.args="--backend metal ..."
  * </pre>
  *
  * <p>{@code agents} clients each run {@code turns} turns of a coding-agent conversation: every turn resends the whole
@@ -58,11 +58,12 @@ class SchedulerBench {
         boolean agentsBackground = Boolean.getBoolean("bench.agentsBackground");
         String label = System.getProperty("bench.label", "run");
 
-        Path dir = Path.of(model).toAbsolutePath();
-        List<String> args = new ArrayList<>(List.of("--model.dir", dir.getParent().toString()));
+        // bench.model is the repository id (Qwen/Qwen3-0.6B), as `--model` of the launcher; the folder is bench.dir/Qwen_Qwen3-0.6B
+        Path models = Path.of(System.getProperty("bench.dir", "../models")).toAbsolutePath();
+        List<String> args = new ArrayList<>(List.of("--model.dir", models.toString()));
         args.addAll(Arrays.asList(extra));
         Settings st = Settings.load(args.toArray(new String[0]));
-        try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), dir.getFileName().toString(), slots)) {
+        try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), model, slots)) {
             List<Engine> more = new ArrayList<>();
             for (int i = 1; i < slots; i++) {
                 more.add(ModelLoader.extraEngine(st, l));

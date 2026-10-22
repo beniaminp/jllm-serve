@@ -10,8 +10,8 @@ package org.robomiri.jllm.engine;
  * verification passes and decode batches). A background request never goes first while an interactive one waits for the
  * device (at most {@link BatchGroup#BACKGROUND_MAX_WAIT_MS} behind it, so it cannot starve), and in a decode batch its
  * step is the last to be taken when more steps are queued than fit. It does not preempt a pass that is running, does not
- * touch which slot serves the request and is ignored by the CPU-only engine without a batch group. The scheduler
- * (wip/NEXT-PROMPT.md, stage 1 agent 2) is meant to build its priority classes on {@link #current()}.
+ * touch which slot serves the request and is ignored by the CPU-only engine without a batch group. The mixed scheduler
+ * (docs/25, {@code engine.scheduler=mixed}) builds its queue classes, pass order and pausing on {@link #current()}.
  */
 public enum Priority {
     INTERACTIVE,
