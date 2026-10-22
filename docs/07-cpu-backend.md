@@ -1081,9 +1081,9 @@ q8 finds three more, which is the 0.6B model's noise (it misses a third of the q
 study says the same of a difference of one or two in nine). Plain q8's extra hits are errors in its favour, not a
 sign of accuracy: the rotated cache is the one that reproduces f16.
 
-**Speed** (Metal, M1 Pro, under the heavy lock): within 1–2 % of plain q8 in prefill and decode, see
+**Speed** (Metal, M1 Pro, under the heavy lock): about 1 % slower than plain q8 in prefill and about 3 % in decode, see
 [11 §11.10](11-performance.md#1110-the-q8-cache-with-rotated-keys-measured). **Default:** `backend.kv-q8-rotate=true` in the shipped
-`jllm.properties` (q8 itself stays opt-in): the accuracy gain is large, the memory and speed are the same to 1–2 %, the
+`jllm.properties` (q8 itself stays opt-in): the accuracy gain is large, the memory is the same and the speed cost is 1–3 %, the
 only cost is that saved q8 caches of the old format are refused and have to be rebuilt (**existing q8 users:** a saved q8
 cache file from before this default is refused with "the saved cache has another layout", the console deletes it and prefills
 afresh; set `backend.kv-q8-rotate=false` to keep the old format and keep using those files). `false` restores the previous format;
