@@ -177,7 +177,7 @@ class KvStoreTest {
                 + "\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":128,\"vocab_size\":"
                 + tok.vocabSize() + ",\"eos_token_id\":" + tok.tokenId("<|im_end|>") + "}"));
         Path dir = Files.createTempDirectory("kvstore-test");
-        WebProperties props = new WebProperties("x", "", List.of(), 100, "y", "deepseek", true, dir.toString(), 1.0, 512, 0, List.of());
+        WebProperties props = new WebProperties("x", "", List.of(), 100, "y", "deepseek", true, dir.toString(), 1.0, 512, 0, List.of(), true, 1.0);
         KvStore store = new KvStore(props);
         StateBackend backend = new StateBackend();
         Engine engine = new Engine(backend, tok, cfg, Set.of(), 0, ChatTemplate.forModelType("qwen3"));

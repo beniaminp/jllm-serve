@@ -77,6 +77,12 @@ public final class AgentDefaultsTest {
         ContextBudget.Plan odd = ContextBudget.plan(per, 40960, 131072, 3_000_000_000L, 1, "test");
         check(odd.ctx() % 1024 == 0 && odd.ctx() * per <= 3_000_000_000L, "rounded down to a multiple of 1024 that fits: " + odd.ctx());
 
+        Settings paged = Settings.load(new String[]{"--backend.kv-paged", "true"});
+        check(ContextBudget.pagedOffHeap(paged, arch, KvDtype.F32) && ContextBudget.pagedOffHeap(paged, arch, KvDtype.Q8),
+                "paged KV cache: the CPU budget is off-heap (physical memory), not the Java heap");
+        check(!ContextBudget.pagedOffHeap(paged, arch, KvDtype.Q4) && !ContextBudget.pagedOffHeap(Settings.load(new String[]{}), arch, KvDtype.F32),
+                "a q4 cache, or paging off, stays on the heap budget");
+
         Settings s = Settings.load(new String[]{});
         check(s.get("backend.ctx").equals("auto") && !ModelLoader.explicitCtx(s), "backend.ctx is auto by default");
         Settings n = Settings.load(new String[]{"--ctx", "2048"});

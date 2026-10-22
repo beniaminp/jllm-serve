@@ -333,7 +333,12 @@ public final class Engine implements AutoCloseable {
         while (i < n && c[i] == prompt[i]) {
             i++;
         }
-        return !backend.supportsPrefixReuse() && i < cachedLen ? 0 : i;
+        int own = !backend.supportsPrefixReuse() && i < cachedLen ? 0 : i;
+        org.robomiri.jllm.kv.KvSequence kvs = backend.kvSequence();
+        if (kvs != null && backend.supportsPrefixReuse() && prompt.length > 1) {
+            own = Math.max(own, kvs.match(prompt, prompt.length - 1)); // blocks of any slot or conversation (a paged cache)
+        }
+        return own;
     }
 
     public Result generate(String prompt, SamplingParams p, TextSink sink) {
@@ -505,6 +510,19 @@ public final class Engine implements AutoCloseable {
             reuse = 0; // every prompt position's logits are needed
             promptLp.add(null); // nothing predicts the first token
         }
+        org.robomiri.jllm.kv.KvSequence kvs = backend.kvSequence(); // a paged cache: blocks other slots computed can be taken over
+        if (kvs != null) {
+            boolean plain = media == null && !ropeDirty && promptLp == null && !backend.ropePositionsCustom();
+            kvs.setShareable(plain); // pictures, custom rotary positions: rows are not a function of the token ids alone
+            if (plain && backend.supportsPrefixReuse()) {
+                int found = kvs.match(prompt, prompt.length - 1);
+                if (found > reuse) {
+                    cachedLen = 0;
+                    reuse = kvs.adopt(prompt, found); // shared blocks are retained, not copied
+                    cached = java.util.Arrays.copyOf(prompt, reuse);
+                }
+            }
+        }
         awaitSave(reuse); // positions from reuse on are rewritten: a save still reading them finishes first
         // the KV cache is about to be overwritten: should forward() (or the sink) throw, nothing of it can be
         // trusted, so the bookkeeping stays invalid until this request completes and sets it again below
@@ -525,6 +543,9 @@ public final class Engine implements AutoCloseable {
                 // prompt (agents retry after a timeout) continues from here instead of starting over
                 cached = java.util.Arrays.copyOf(prompt, pos);
                 cachedLen = pos;
+                if (kvs != null) {
+                    kvs.publish(cached, pos);
+                }
                 return new Result("", new int[0], "cancelled",
                         new Stats(prompt.length, reuse, 0, (System.nanoTime() - t0) / 1e6, 0));
             }
@@ -562,6 +583,9 @@ public final class Engine implements AutoCloseable {
             pos += n;
         }
         long t1 = System.nanoTime();
+        if (kvs != null) {
+            kvs.publish(prompt, prompt.length); // the prompt's blocks are final: other slots may share them from now on
+        }
         if (choices != null) {
             choices.prefilled(index, promptLp);
         }
@@ -709,6 +733,9 @@ public final class Engine implements AutoCloseable {
             cached[prompt.length + i] = out.get(i);
         }
         cachedLen = fed;
+        if (kvs != null) {
+            kvs.publish(cached, fed);
+        }
 
         int[] tokens = out.stream().mapToInt(Integer::intValue).toArray();
         Stats stats = new Stats(prompt.length, reuse, tokens.length, (t1 - t0) / 1e6, (t2 - t1) / 1e6,
@@ -918,11 +945,18 @@ public final class Engine implements AutoCloseable {
         private final java.nio.file.Path file;
         private final CacheFile.Header header;
         private boolean finished;
+        /** A paged cache's frozen blocks (nothing is pinned then: later requests copy a block before writing it); else null. */
+        private final Backend.StateSnapshot snapshot;
 
         private PendingSave(java.nio.file.Path file, CacheFile.Header header, boolean finished) {
+            this(file, header, finished, null);
+        }
+
+        private PendingSave(java.nio.file.Path file, CacheFile.Header header, boolean finished, Backend.StateSnapshot snapshot) {
             this.file = file;
             this.header = header;
             this.finished = finished;
+            this.snapshot = snapshot;
         }
 
         /** The saved tokens. */
@@ -949,9 +983,16 @@ public final class Engine implements AutoCloseable {
             }
             try {
                 int n = header.tokens().length;
-                CacheFile.write(file, header, ch -> backend.saveStateWhileServing(n, ch));
+                if (snapshot != null) {
+                    CacheFile.write(file, header, snapshot::write);
+                } else {
+                    CacheFile.write(file, header, ch -> backend.saveStateWhileServing(n, ch));
+                }
                 return n;
             } finally {
+                if (snapshot != null) {
+                    snapshot.close();
+                }
                 synchronized (saveMonitor) {
                     savingUpTo = 0;
                     saveMonitor.notifyAll();
@@ -1000,6 +1041,11 @@ public final class Engine implements AutoCloseable {
                     return null;
                 }
                 CacheFile.Header h = new CacheFile.Header(fingerprint, format, java.util.Arrays.copyOf(cached, n));
+                Backend.StateSnapshot snap = backend.snapshotState(n);
+                if (snap != null) { // paged: the blocks are retained, the rows are written later without pinning anything
+                    handedOver = true;
+                    return new PendingSave(file, h, false, snap);
+                }
                 if (!backend.canSaveWhileServing()) {
                     CacheFile.write(file, h, ch -> backend.saveState(n, ch));
                     return new PendingSave(file, h, true);
@@ -1091,6 +1137,10 @@ public final class Engine implements AutoCloseable {
             });
             cached = java.util.Arrays.copyOf(h.tokens(), loaded[0]);
             cachedLen = loaded[0];
+            org.robomiri.jllm.kv.KvSequence kvs = backend.kvSequence();
+            if (kvs != null) {
+                kvs.publish(cached, cachedLen); // the restored rows are final: other slots may share them
+            }
             return cachedLen;
         } finally {
             lock.unlock();

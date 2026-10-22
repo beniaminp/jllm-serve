@@ -66,6 +66,10 @@ public class OpenAiController {
         this.images = images;
     }
 
+    // loaded video models are listed too (kind: "video")
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.video.VideoService videos;
+
     // loaded speech-to-text / text-to-speech models are listed too (kind: "speech-to-text" / "text-to-speech")
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private org.robomiri.jllm.web.audio.AudioService audio;
@@ -80,6 +84,13 @@ public class OpenAiController {
             var v = m.view();
             data.add(Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve", "kind", "image",
                     "backend", v.backend(), "defaults", v.defaults(), "size_multiple", v.sizeMultiple(), "inpainting_unet", v.inpaintUnet()));
+        }
+        if (videos != null) {
+            for (var m : videos.loaded()) {
+                var v = m.view();
+                data.add(Json.obj("id", v.id(), "object", "model", "created", v.loadedAt() / 1000, "owned_by", "jllm-serve", "kind", "video",
+                        "backend", v.backend(), "defaults", v.defaults(), "size_multiple", v.sizeMultiple()));
+            }
         }
         if (audio != null) {
             data.addAll(org.robomiri.jllm.audio.AudioApi.modelObjects(audio.models()));

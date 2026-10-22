@@ -81,6 +81,31 @@ The management API can download models and delete files. Keep the key, or publis
 with `-p 127.0.0.1:8090:8090`. For access from other machines put a TLS reverse proxy in front: the console speaks
 plain HTTP.
 
+## 19.3 Pictures, audio, images and video in the container
+
+The console also has tabs for pictures as input ([20](20-vision.md)), speech ([21](21-audio.md)), image generation ([22](22-image-generation.md))
+and video generation ([23](23-video-generation.md)). They load through the same **Models** tab, download into `/data/models/`, and run on the CPU kernels
+in the image (`vision.backend`, `audio.backend`, `image.backend` and `video.backend` are `auto`; a container has no Metal library, so `auto` resolves to the CPU). What differs from running natively on a Mac:
+
+* **Speed.** Not measured in a container. The CPU numbers of the chapters are from the M1 Pro's ten cores (for example, 512 x 512 sd-turbo in float32 takes 12.2 s for one step and
+  24.3 s for four on the CPU against 1.68 s / 2.92 s in float16 on the GPU, [22 §22.14](22-image-generation.md#2214-measured-speed-and-memory)); a container on other hardware will differ.
+* **Memory.** The image weights are mapped or held outside the Java heap (sd-turbo in float32: 4.3 GB outside the heap, 2 - 2.7 GB of heap in use at 512 x 512), so size
+  `--memory` for weights plus the heap, as in 19.1; `JLLM_HEAP_PERCENT` still sets only the heap.
+* **No ffmpeg in the image.** Without it only WAV, AIFF and AU can be uploaded as audio (the console converts other formats to WAV in the browser; the API says 400),
+  speech comes out as WAV or raw PCM, and a video is a lossless animated WebP or a GIF instead of an MP4 (`output_format: mp4` is a 400). To get the rest, derive an image:
+
+  ```dockerfile
+  FROM <you>/jllm-serve:latest
+  USER root
+  RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+  USER jllm
+  ```
+
+  `audio.ffmpeg` and `video.ffmpeg` are `auto` (look it up on the PATH) in the bundled `jllm.properties`; a path or `off` can be set from the console's Settings page. This is documented from the chapters'
+  descriptions of those settings; a derived image has not been built here.
+* **Downloads.** Image and video models come from Hugging Face like any other (`HF_TOKEN`, the proxy and CA settings above apply) and land in the same volume.
+
+
 ---
 
 ## 19.2 For you: build and push

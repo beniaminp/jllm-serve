@@ -59,7 +59,11 @@ public final class ModelLoader {
             try {
                 engine.close();
             } finally {
-                weights.close();
+                try {
+                    org.robomiri.jllm.kv.KvPools.release(weights); // the model's pool of KV blocks (its buffers) goes with it
+                } finally {
+                    weights.close();
+                }
             }
         }
     }
@@ -172,7 +176,8 @@ public final class ModelLoader {
             throw e;
         }
         System.err.println("Backend: " + backend.name() + ", ctx=" + ctx + ", batch=" + batch + ", kv=" + KvDtype.parse(s.get("backend.kv-dtype"))
-                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : ""));
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q4 ? " recent=" + s.getInt("backend.kv-q4-recent") : "")
+                + (KvDtype.parse(s.get("backend.kv-dtype")) == KvDtype.Q8 && s.getBool("backend.kv-q8-rotate") ? " rotated keys" : ""));
         try {
             Engine engine = new Engine(backend, tok, arch, eosIds(p.dir(), tok, arch), s.getLong("server.queue-timeout-ms"),
                     chatFormat(p, arch, tok));
@@ -308,7 +313,7 @@ public final class ModelLoader {
 
     /**
      * The speculation settings for this model: prompt lookup is the default for every model, mixture-of-experts ones
-     * included (it was off for them until docs/11 section 11.10 measured it again on agent-like prompts: +68 % on a code
+     * included (it was off for them until docs/11 section 11.11 measured it again on agent-like prompts: +68 % on a code
      * edit, -10 % to -1 % on tool calls and prose on the 30B, because prompt lookup now pauses when its drafts do not pay).
      * A model with a multi-token-prediction head drafts with it unless {@code engine.speculative} was set explicitly.
      */
@@ -333,6 +338,30 @@ public final class ModelLoader {
     static void constraints(Settings s, Engine engine) {
         engine.setJumpForward(s.getBool("engine.jump-forward"));
         org.robomiri.jllm.sampling.JsonConstraint.setFastMasks(s.getBool("engine.constraint-masks"));
+    }
+
+    /**
+     * The pool of KV blocks the CPU slots of {@code weights} share when {@code backend.kv-paged} is on (docs/24), made
+     * by the first slot; null when the flat cache is wanted or the model cannot be paged.
+     */
+    private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int ctx, int slots,
+                                                      boolean metal) {
+        if (!s.getBool("backend.kv-paged")) {
+            return null;
+        }
+        int block = s.getInt("backend.kv-block");
+        long tokens = s.getLong("backend.kv-pool-tokens");
+        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens;
+        org.robomiri.jllm.kv.KvPool pool = org.robomiri.jllm.kv.KvPools.get(weights, key,
+                () -> metal ? org.robomiri.jllm.metal.MetalBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens,
+                        s.opt("backend.metal.lib")) : CpuBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens));
+        if (pool == null) {
+            System.err.println("note: backend.kv-paged is not available for this model on " + (metal ? "Metal" : "the CPU") + " ("
+                    + (kvDtype == KvDtype.Q4 ? "q4 cache" : "latent attention") + "), using the flat KV cache");
+        } else {
+            pool.setSharing(s.getBool("backend.kv-prefix-share"));
+        }
+        return pool;
     }
 
     /** The batch group of each loaded model's weights (engine.batch-decode); weak: gone with the weights. */
@@ -535,7 +564,12 @@ public final class ModelLoader {
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
+        KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
         boolean mamba = arch instanceof MambaArch;
+        if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
+            System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
+                    + ": a recurrent state is a function of every earlier token and cannot be shared per block, so the flat cache is used");
+        }
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
         }
@@ -556,16 +590,17 @@ public final class ModelLoader {
                     : member && group(s, weights) != null // a group's slots share one pool: they never compute at once
                     ? new CpuBackend(weights, ctx, batch, group(s, weights).cpuPool(
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors()), kvDtype,
-                            int8(s, weights, threads))
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null)
                     : new CpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                            int8(s, weights, threads));
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null);
             case "metal" -> mamba
                     ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                     : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
                             new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
                                     threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
-                                    int8(s, weights, threads), null, Math.max(1, slots)));
+                                    int8(s, weights, threads), null, Math.max(1, slots)),
+                            member ? kvPool(s, weights, kvDtype, ctx, slots, true) : null);
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }

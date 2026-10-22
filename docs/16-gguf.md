@@ -289,7 +289,7 @@ formulas of the types that are new here are in [06 §6.12](06-quantization.md#61
 | IQ4_NL | 18 / 32 | 4.5 | **in place** | V I N | yes |
 | IQ4_XS | 136 / 256 | 4.25 | **in place** | V I N | yes |
 | MXFP4 | 17 / 32 | 4.25 | **in place** | V I N | yes |
-| Q3_K | 110 / 256 | 3.4375 | **in place** | V | yes |
+| Q3_K | 110 / 256 | 3.4375 | **in place** | V I N | yes |
 | Q2_K | 84 / 256 | 2.625 | **in place** | V | yes |
 | IQ1\*, IQ2\*, IQ3\*, TQ1_0, TQ2_0, Q8_K, Q8_1 | | | refused (named in the error) | | |
 
@@ -307,6 +307,44 @@ everything in place on the CPU as well (the choice for a model that only fits in
 `-Djllm.gguf.requantize=Q4_1,Q5_0,Q5_1` is the opt-out for those three types.
 Requantizing F16 / BF16 to Q8_0 is lossy (about 0.5% per weight): the CPU default trades that for speed and memory, and
 `-Djllm.gguf.requantize=none` keeps the full precision of the file.
+
+**Worked example: what one matrix costs in each type.** The `gate_proj` of Qwen3-0.6B has 3 072 rows of 1 024 columns. A row is
+`1024 / weights-per-block` blocks of `typeSize` bytes, so:
+
+```
+type     bytes/row   whole matrix      (row = 1024 / 32 or 1024 / 256 blocks x typeSize)
+F16        2 048     6.00 MiB          F16: 1024 x 2 B
+Q8_0       1 088     3.19 MiB          32 x 34 B            <- what "requantized" means for every type below
+Q6_K         840     2.46 MiB          4 x 210 B
+Q5_1         768     2.25 MiB          32 x 24 B
+Q5_K         704     2.06 MiB          4 x 176 B
+Q5_0         704     2.06 MiB          32 x 22 B
+Q4_1         640     1.88 MiB          32 x 20 B
+Q4_0         576     1.69 MiB          32 x 18 B
+Q4_K         576     1.69 MiB          4 x 144 B
+IQ4_NL       576     1.69 MiB          32 x 18 B
+IQ4_XS       544     1.59 MiB          4 x 136 B
+MXFP4        544     1.59 MiB          32 x 17 B
+Q3_K         440     1.29 MiB          4 x 110 B
+Q2_K         336     0.98 MiB          4 x 84 B
+```
+
+Decoding one token streams the whole matrix once, so on a memory-bound GPU the time per matrix is about proportional to these sizes: a Q3_K file
+moves 40 % of the bytes of its Q8_0 requantization, an IQ4_XS or MXFP4 file half, which is what "in place" buys (16.9.1 measures what that is worth on a
+0.6B model, where decode is not bandwidth bound, and what it costs on the CPU).
+
+### Why in place, the settings, the limits
+
+* **Why not requantize everything to Q8_0.** One kernel family for all, but 8.5 bits per weight whatever the file used, and a second rounding on top of the file's
+  own (in the llama.cpp comparison of 16.9.1, 3 of 22 greedy runs changed their text on each backend, none did in place). The Metal backend reads every type in
+  place; the CPU backend requantizes the four types whose in-place kernels are more than 25 % slower than Q8_0's.
+* **Settings.** `-Djllm.gguf.requantize=<types>|all|none` as described above; `-Djllm.cpu.native=false` measures the Java int8 kernels instead of `libjllm_cpu`;
+  nothing else changes with the type: the file is simply memory-mapped.
+* **Checks.** `GgufKernelsCheck` (dequantizers bit for bit against `gguf.quants` and `ggml-quants.c`), `GgufBackendsTest` (CPU == Metal on random models of every type),
+  `scripts/metal-emu/kernel_tests.py <formats>`, `scripts/mac-validate.sh --gguf-types DIR` (in place against requantized, per file).
+* **Limits.** The 256-entry-grid IQ types, TQ1_0 / TQ2_0, Q8_K and Q8_1 are refused by name; Q2_K, F16 and BF16 have no int8-activation CPU kernel; the x86-64 native
+  library covers only the formats of the first set (the Java int8 kernels serve the rest there).
+
 
 ---
 
@@ -567,20 +605,35 @@ requantize path changes the text in 3 of 22 runs on each backend (Q4_1 prompt 1 
 closer to llama.cpp than Q8_0 requantization is. (Two first Metal runs died with `Impacting Interactivity`, the GPU watchdog, while other jobs were using the GPU; run
 alone they produced llama.cpp's text.)
 
+**Command lines and what is not measured.** One row of the table is, for a file `F` made with `llama-quantize --allow-requantize --pure <TYPE>`:
+
+```sh
+# Metal, in place (the default) / requantized to Q8_0 (the old behaviour; name the type or use "all")
+JAVA_OPTS="" ./jllm bench --model F --temp 0 --bench.rounds 5 --engine.speculative off
+JAVA_OPTS="-Djllm.gguf.requantize=<TYPE>" ./jllm bench --model F --temp 0 --bench.rounds 5 --engine.speculative off
+# CPU: add --backend cpu and --bench.rounds 3; "native = in place" needs -Djllm.gguf.requantize=none for the four types the CPU requantizes by default
+scripts/mac-validate.sh --gguf-types DIR        # the same pair of rows for every .gguf in DIR, medians in a table
+```
+
+All of them under the heavy lock on the Apple M1 Pro (10 cores, 32 GB). **Not measured:** x86-64 (the Java-only figures above, `-Djllm.cpu.native=false`: Q4_1 29 tok/s, IQ4_NL 68, Q8_0 26 - 29, were taken on the M1 Pro), models larger than 0.6B (where the memory saving matters most), BF16 speed, and CPUs without the `sdot` instruction.
+**What the table means in one line each:** *memory* is the file size against 670 MB of Q8_0 (every type but F16 is smaller); *Metal* is equal or within the lookup cost of the table formats;
+*CPU* is faster for the shuffle-based formats, 7 - 9 % slower for Q4_1 / Q5_0 and more than 25 % slower for Q5_1, Q3_K and F16, hence the CPU default.
+
+
 ---
 
 ## 16.10 Limits and what is next
 
-* **Architectures**: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen3next` and `qwen35moe` (16.13). Gemma 2/3, Phi-3, GLM-4,
-  DeepSeek-2 and Mamba are supported from safetensors (14) but their GGUF tensor naming, norm and rotary conventions are
-  not mapped yet (unless a later section says so).
+* **Architectures**: `llama`, `mistral3`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen3next`, `qwen35moe` (16.13), `gemma2`,
+  `gemma3`, `phi3`, `chatglm`, `glm4`, `mamba` and `deepseek2` (16.15). Other architectures are refused, with the reason where
+  it is known (16.15).
 * **Formats**: IQ1\*, IQ2\*, IQ3\* and the ternary TQ\* types are refused (the 16-entry-codebook IQ4 types are in place; the
-  others use 256-entry grids and are not done); Q2_K, Q3_K, F16 and BF16 have no int8-activation CPU kernel; the x86-64
+  others use 256-entry grids and are not done); Q2_K, F16 and BF16 have no int8-activation CPU kernel (Q3_K has Java and native ones, 07 §7.10); the x86-64
   native library has no kernels for the formats added in 16.4.1 (the Java int8 kernels serve them there).
 * **RoPE**: `linear`, `yarn` (16.2.1), Llama 3 and a longrope-style table are mapped; YaRN's `truncate = false`
   variant and `dynamic` scaling are not.
 * **MoE** layouts are tested on tiny models only (no MoE GGUF fits the download budget used here); shared experts
-  (Qwen2-MoE, DeepSeek) are not mapped.
+  of DeepSeek are mapped (16.15); the gated shared expert of Qwen2-MoE is not.
 * **Tokenizer**: the pre-tokenizers that are not a list of regexes (`kimi-k2`, `afmoe`, `tiny_aya`, `superbpe`, `chameleon`,
   the SPM-style BPE `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`) and `exaone-moe` need the original repository's
   `tokenizer.json`; `tokenizer.ggml.add_eos_token` and the WordPiece (`bert`) vocabularies are not applied (16.12).
@@ -592,7 +645,7 @@ alone they produced llama.cpp's text.)
 `mvn test` runs the checks that need no download: `GgufFileTest` (reader, malformed files), `GgufKernelsCheck`
 (block formats against the `gguf.quants` fixtures, SIMD against scalar, int8 activations), `GgufMetalCheck` (every
 Metal dispatch family; `GgufMetalBench` times them), `NativeCpuCheck` (the native int8 kernels against the Java ones), `GgufModelTest` (tiny models of four families written as safetensors and as GGUF, the llama
-permutation, metadata mapping), `GgufQwenNextTest` (tiny Qwen3.5 and Qwen3-Next hybrids, 16.13), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
+permutation, metadata mapping), `GgufFamiliesCheck` (24 tiny models of the other families, 16.15), `GgufQwenNextTest` (tiny Qwen3.5 and Qwen3-Next hybrids, 16.13), `GgufBackendsTest` (CPU == Metal on random GGUF models), `GgufHubTest` (file
 selection, settings) and `GgufTokenizerTest` (three of llama.cpp's vocabulary fixtures and the stored llama.cpp ids of 29 generated
 vocabularies, 16.12). With the Qwen3-0.6B files downloaded by
 `./jllm download --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q8_0` (and `Q4_K_M`, `Q4_0`), run by hand:
@@ -672,6 +725,55 @@ on 29 vocabularies (`synthetic-llama-cpp.txt.gz`, 68 KB), so `mvn test` needs no
   leftmost. SentencePiece with special tokens not parsed: control tokens stay text here, llama.cpp merges them back.
 * `add_eos_token`, WordPiece (`bert`) and the pre values that are not regex lists (`kimi-k2`, `afmoe`, `tiny_aya`,
   `superbpe`, `chameleon`, `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`; `exaone-moe` would overflow the regex stack) are refused.
+
+**A worked example: the same text, three cutting rules.** The first step of every tokenizer here is the cut, so the same sentence
+becomes different pieces, and therefore different ids, depending on `tokenizer.ggml.pre`. These are the pieces that the rules
+(`tokenizer/GgufPre.java`: `LLAMA3`, `STABLELM2` (the `qwen2` value) and `GPT2`, run through `java.util.regex` as the engine does) return for two
+strings; a leading space belongs to the piece after it, shown here as a space inside the brackets:
+
+```
+text:    It's 12345 miles, isn't it?
+llama3:  [It] ['s] [ ] [123] [45] [ miles] [,] [ isn] ['t] [ it] [?]
+qwen2:   [It] ['s] [ ] [1] [2] [3] [4] [5] [ miles] [,] [ isn] ['t] [ it] [?]
+gpt2:    [It] ['s] [ 12345] [ miles] [,] [ isn] ['t] [ it] [?]
+
+text:    x = 3.14159;
+llama3:  [x] [ =] [ ] [3] [.] [141] [59] [;]
+qwen2:   [x] [ =] [ ] [3] [.] [1] [4] [1] [5] [9] [;]
+gpt2:    [x] [ =] [ 3] [.] [14159] [;]
+```
+
+Llama 3 cuts a number into groups of at most three digits from the left (`\p{N}{1,3}`), Qwen one digit at a time (`\p{N}`),
+GPT-2 keeps the whole number with its space (` ?\p{N}+`). Each piece is then spelled in bytes (a space is the byte `0x20`, shown as
+`Ġ` in a vocabulary) and merged by the BPE merges of the file into tokens; a piece that is itself a token is taken whole when
+`ignore_merges` is set (Llama 3). A model trained with one of these rules sees ids it never saw in training if the cut is wrong, and answers
+slightly worse without any error: the reason for copying the exact rule of each name.
+
+### Why this design
+
+* **llama.cpp's rules, verbatim, not the original repository's `tokenizer.json`.** The file is the model; asking another repository
+  for its tokenizer needs a network and may be a different revision. Reproducing llama.cpp also reproduces its choices (no NFC
+  normalization, `</s>` a control token), which is what every GGUF user's other tools do.
+* **The regex lists as data, with four translations**, not a hand-written splitter per family: 81 names share 24 lists, a table
+  can be compared with `llama-vocab.cpp` line by line, and the translations (`\p{Lu}` etc. read as "any letter", non-ASCII whitespace
+  never matched by a class without `\p{..}`, `$` as end of piece, look-ahead groups as one class) are the only code.
+* **Refuse the unknown.** A value that is not in the table, or is not a regex list (`kimi-k2`, `afmoe`, `tiny_aya`, `superbpe`, `chameleon`,
+  `gemma4`, `sarvam-moe`, `mmbert`, `whitespace`, `exaone-moe`), is refused with its name and the loader then looks for the original
+  repository's `tokenizer.json` (16.7), instead of guessing the nearest rule.
+* **Cost.** The table has to follow llama.cpp (b11669 here); new names appear with every release.
+
+### Settings
+
+No switch: the rule is read from `tokenizer.ggml.pre` (absent or `default` is llama.cpp's default, which is not GPT-2's), and `add_bos_token`
+from the key, else llama.cpp's per-family default. `scripts/gguf-tokenizer-check.sh` re-runs the whole comparison with `llama-tokenize`;
+`mvn test` keeps the stored ids (`GgufTokenizerTest`).
+
+### Measured and limits
+
+The comparisons are the table's last column and the paragraphs above: 14 871 strings per pre value, 47 / 47 on llama.cpp's own vocabularies,
+19 691 stored ids on 29 vocabularies in `mvn test`. What is not covered: the differences listed under "Differences that remain" (characters assigned after
+llama.cpp's Unicode tables; two overlapping special tokens; WordPiece; the non-regex pre values).
+
 
 ---
 
@@ -798,6 +900,51 @@ Gated DeltaNet recurrence runs token by token in prefill on Metal (no chunked ke
 `ffn_down` tensors were requantized to Q8_0 in these runs (Q4_1 is read in place since 16.4.1). On the CPU the 27B is not
 usable (it was only run on tiny models).
 
+### 16.13.6 A worked example, the design, the settings, the limits
+
+**Worked example: which key head does value head `p` read?** The 27B has `nk = 16` key heads and `nv = 48` value heads, so each
+key head serves `r = nv / nk = 3` value heads. Hugging Face (and `qwen3next` files) number them **grouped**: value head `j` reads
+key head `⌊j / 3⌋`. llama.cpp's Qwen3.5 converter writes them **tiled**: position `p = i·nk + g` holds the old head `g·r + i`, and
+reads key head `p mod nk`:
+
+```
+position p      0  1  2 ... 15 | 16 17 18 ... 31 | 32 33 ... 47          (i = p div 16, g = p mod 16)
+old head g*3+i  0  3  6 ... 45 |  1  4  7 ... 46 |  2  5 ... 47
+key head        0  1  2 ... 15 |  0  1  2 ... 15 |  0  1 ... 15           = p mod 16  (tiled)
+grouped, for comparison:  j = 0 1 2 | 3 4 5 | ... read key head 0 0 0 | 1 1 1 | ...        = j div 3
+check p = 17: i = 1, g = 1 -> old head 1*3 + 1 = 4, whose key head is 4 div 3 = 1 = 17 mod 16
+```
+
+A matrix indexed by value head in its *rows* (`attn_qkv`'s `v` part: `nv·dk = 6144` rows, `attn_gate`, `ssm_beta` / `ssm_alpha`) could be
+permuted by moving rows, but `ssm_out` has them in its **columns**: a Q5_K row is cut into blocks of 256 columns = two heads of
+`dk = 128`, so moving a head means unpacking and packing the blocks again, which rounds a second time. jllm moves nothing and changes the
+lookup instead (`keyHeadOf(h) = h mod nk` when `tiled`, `h / r` otherwise), in the CPU recurrence and in `gdn_rule`.
+
+Sizes for the same model: `attn_qkv` has `2·nk·dk + nv·dk = 4096 + 6144 = 10 240` rows of 5 120 columns (were it Q4_0, a row would be `5120/32 · 18 = 2 880` B, so
+29.5 MB per layer, used in place); `attn_q` of an attention layer has `2·H·hd = 2 · 24 · 256 = 12 288` rows, which are gathered into `q_proj` (6 144 rows)
+and `q_gate` (6 144 rows) at load.
+
+**Why this design.**
+
+* *Tiled lookup, not a permuted copy:* a permuted copy would give up the in-place mapping of most of the file's 14.9 GB, and a permutation of quantized columns is lossy. The
+  recurrence is the same, only its indexing differs, and `kernel_tests.py` checks `gdn_rule` with `tiled` against numpy.
+* *Gather only the small, awkward tensors:* the interleaved q / q-gate matrix is copied (16 attention layers, page aligned for Metal), the f32
+  `b` / `a` matrices become one Q8_0 matrix; everything big stays a view of the file (14 893 MB of the 16 056 MB file are used in place).
+* *Not the Hugging Face checkpoint's layout for the input:* the cache fuses `[q k v | z | b a]` into one matrix; the file's three tensors are
+  read in place and three matmuls go to three buffers, which avoids a 2.3 GB copy for the 27B.
+* *Costs:* decode 44 % and prefill 52 % of llama.cpp's speed (16.13.5), the recurrence runs token by token in prefill on Metal, and the CPU
+  path is only exercised on tiny models.
+
+**Settings.** No switch of its own: the architecture is read from the file; `engine.speculative` (16.14) picks the draft source,
+`backend.kv-dtype` the cache of the attention layers (on Metal q8 / q4 requests are served as f16 for these hybrids), `--ctx` the length (the
+whiteboards have a fixed size, so only the 16 attention layers' cache grows).
+
+**Checks and limits.** Checked as in 16.13.4: the 27B against llama.cpp (greedy ids 32 of 32 and log-probabilities within 1e-3 - 4e-2), tiny hybrids written the way the
+converter does against `llama-debug` (top-5 log-probabilities to 1e-3, 36 of 36 ids), and in `mvn test` against the Hugging Face layout (3e-6 for F32). Not done:
+a chunked Gated DeltaNet kernel on Metal (prefill is token by token), the 27B on the CPU, MoE (`qwen35moe`) on real weights (tiny models only), llama.cpp's activation
+quantization (the 1e-3 - 4e-2 differences are that).
+
+
 
 ---
 
@@ -875,3 +1022,187 @@ here (a reading of the kernel, not a measurement of it); the draft (one head row
 a cycle takes `353 + 20` ms for `1 + a` tokens against 232 ms per token: break-even at `a = 0.61`, `+18 %` at the 90 %
 measured on the 27B (`1.9 / 373 ms = 5.1 tok/s`), `+26 %` at 100 % (the table). The lever is the cost of a two-token pass:
 the head is cheap, the verification is not yet.
+
+### 16.14.1 A worked example, the design, the settings, the limits
+
+**Worked example: one cycle, and what acceptance buys.** Two tokens, `A` (just sampled) and `d1` (the head's guess for what follows `A`),
+go through the 27B in one pass. The pass costs 347 ms (353 ms with the head's two rows) where a plain step costs 231.6 ms (234.7 ms with the head),
+and the guess itself costs 20 ms, so a cycle takes `353 + 20 = 373 ms` and yields `1 + a` tokens, where `a` is the share of cycles in which `d1`
+was right (the target's argmax):
+
+```
+cycle, d1 right (prob a):   emit d1 and the token sampled after it from row 1  ->  2 tokens in 373 ms
+cycle, d1 wrong (1 - a):    rollback(1), emit the target's own token  ->  1 token in 373 ms
+tok/s = (1 + a) / 0.373 s      a = 0 : 2.68     a = 0.61 : 4.32     a = 0.90 : 5.09     a = 1 : 5.36     plain decode: 1 / 0.2316 = 4.32
+```
+
+So the head pays from `a = 0.61` (where the line crosses the plain 4.3 tok/s), and the 111 hits in 124 guesses measured on the 27B (`a = 0.90`)
+give +18 % (the figure the table gives: `1.9 / 373 ms = 5.1 tok/s`); the 26 % of the table is `a = 1` on the 82-token function, where all 41 guesses were right.
+A wrong guess costs a whole cycle for one token: at `a = 0` a cycle takes 373 ms for the token a plain step makes in 232 ms (61 % longer), which is
+what the engine's cost model and its back-off (`Speculator`: after a pass that gained nothing, 1, 3, 7, 15 plain steps follow) are for.
+
+**Why this design.**
+
+* *The model's own head instead of a second model:* no second download, no second set of weights (the head is one layer, about a sixtieth of the model),
+  and its guesses are trained on the model's own hidden state (90 % right on the 27B). A separate draft model is `engine.speculative=draft` ([10.9](10-engine-and-server.md#109-speculative-decoding)).
+* *Not prompt lookup for a hybrid:* a Gated DeltaNet layer's state is overwritten by every token it reads, so a wrong draft cannot be undone by
+  overwriting KV positions; prompt lookup needs that, the MTP mode checkpoints the state instead.
+* *Snapshot on Metal, replay on the CPU:* `gdn_conv` / `gdn_rule` write the state after token 0 of the pass into a second set of buffers while they compute token 1
+  (48 layers x 3.1 MB); a rejection swaps the two sets, with no copy and no replay. The CPU copies the state before the pass and replays the kept token on a rejection.
+* *One draft per step:* a pass of `m + 1` tokens costs 1.5 plain steps for two tokens already (the matmul kernels spend the dot products per token),
+  so a second draft token would have to be right far more often to pay.
+* *Greedy and sampled decoding share the rule* of the other speculation modes: the guess is deterministic, so a sampled run accepts `d1` with probability `p(d1)` and otherwise draws from `p`
+  with `d1`'s mass removed (`Sampler.verify`), which leaves the output distribution exactly the target's.
+
+**Settings.**
+
+| setting | default | meaning |
+|---|---|---|
+| `engine.speculative` | `ngram` (`jllm.properties`); `mtp` for a model with a head when the setting is left at its default | `off`, `ngram`, `draft`, `mtp`; `off` to compare, or when the guesses are right less than about 61 % of the time on your workload |
+| `--engine.speculative mtp` | | forces the mode; it needs a backend with the head, rollback support and `maxBatch >= 2` (`Speculator.supported`) |
+
+**Checks and limits.** The text equals the non-speculative text (`GgufQwenNextTest`: an oracle head right two times out of three, so both paths run; the real head on CPU and
+Metal), the head's guesses equal llama.cpp's on the tiny file (60 of 60 positions) and 111 of 124 on the 27B. Limits: Qwen3.5 / Qwen3-Next files that carry a head only; one draft per
+step; a 2-token pass costs 1.5 steps, so the gain is +18 % at the measured acceptance and +26 % when every guess is right, on this machine (`mtp` is not worth it on a model whose guesses are right less than 61 % of the time); measured on
+the 27B only, and on a prompt that repeats itself, which flatters every speculation mode a little.
+
+
+---
+
+## 16.15 Gemma 2/3, Phi-3, GLM, Mamba, DeepSeek-V2/V3 and Mistral 3 as GGUF files
+
+Code: `gguf/GgufFamilies.java` (the metadata of each family), `gguf/GgufArchitecture.java` (the `Family` enum),
+`gguf/GgufWeights.java` (names, fused tensors), `model/AttnWeights.java` (`Mla`: split `kv_b`); tests
+`src/test/java/org/robomiri/jllm/HfToGguf.java`, `GgufFamiliesCheck.java`, `GgufArchSmoke.java`,
+`scripts/gguf-llamacpp-check.sh`.
+
+🧸 A GGUF file is a box that llama.cpp packed. Until now we knew how to unpack four kinds of box (Llama, Qwen2, Qwen3,
+Qwen3-MoE). Every other family we can already run from a Hugging Face folder has its own way of being packed: Gemma adds 1
+to its norms and keeps two kinds of layers, Phi-3 glues two matrices into one, Mamba stores a different number, DeepSeek
+cuts one matrix in two and turns half of it around. To be sure that we unpack each of them the way llama.cpp packed it, we
+did the packing ourselves following llama.cpp's own recipe, on tiny random models, and then asked **llama.cpp** to unpack
+the same box and run it: both programs give the same numbers to the last digits.
+
+📐 **Status** (`general.architecture` → what jllm runs; the numbers are from `GgufFamiliesCheck` /
+`scripts/gguf-llamacpp-check.sh` on tiny models of that family written as `convert_hf_to_gguf.py` writes them; the last
+column is `GgufArchSmoke` on the real GPU: CPU and Metal generate the same 8 greedy tokens from the Q8_0 file):
+
+| GGUF architecture | jllm family (`model_type`) | F32 GGUF vs safetensors | jllm vs llama.cpp (`llama-debug` logits, same file, same ids) | Metal == CPU |
+|---|---|---|---|---|
+| `llama` (Llama 2/3.x, Mistral 7B, TinyLlama, DeepSeek-R1 Llama distills; Llama-3 `rope_freqs`, linear/YaRN scaling, q/k/v/o biases, fused `attn_qkv`) | `llama` / `mistral` | 2.4e-7 | 2.0e-7 … 3.0e-7 | yes |
+| `mistral3` (Mistral Small 3.x, Ministral without attention temperature, Devstral) | `mistral` | 2.2e-7 | 2.6e-7 | yes (as `llama`) |
+| `qwen2`, `qwen3moe` (and `qwen3`) | as before | ≤ 3e-7 | 2.5e-7 … 3.1e-7 | yes |
+| `gemma2` | `gemma2` | 0 | 6.7e-5 | yes |
+| `gemma3` (also from the text part of the multimodal checkpoint) | `gemma3_text` | 0 | 1.8e-5 | yes |
+| `phi3` (long, short and no LongRoPE factors) | `phi3` | ≤ 4e-7 | 2.0e-7 … 1.1e-6 | yes |
+| `chatglm` (`GlmForCausalLM`: GLM-4-9B-chat-hf, GLM-Edge) | `glm` | 0 | 2.8e-7 | yes |
+| `glm4` (GLM-4-0414) | `glm4` | 0 | 4.7e-7 | yes |
+| `mamba` (Mamba v1) | `mamba` | ≤ 3e-7 | 7.5e-7, 1.1e-6 | yes |
+| `deepseek2` (V2-Lite shape without query low-rank, V2 with, V2-236B router, V3/R1) | `deepseek_v2` / `deepseek_v3` | ≤ 9e-7 (unsplit `kv_b`) | 1.4e-6 … 1.9e-5 | yes |
+
+(Relative logit differences: the largest absolute difference of the last prompt token's logits over the largest logit.
+"jllm vs llama.cpp" uses the file holding the Q8_0-rounded weights as F32, so both engines multiply the same numbers; llama.cpp
+runs on the CPU with an f32 cache and no flash attention, `llama-debug --save-logits`, build b11669.)
+
+Refused with a message that names the reason (math the engine does not have): `granite*` (scales the embeddings, residual
+branches and logits), `olmo2` (norms after the attention and the MLP, full-width q/k norm), `smollm3` (layers without RoPE),
+`qwen2moe` (a sigmoid-gated shared expert in a decoder layer), the LayerNorm families (`stablelm`, `phi2`, `starcoder2`,
+`command-r`, `cohere2`, `falcon`, `olmo`), Gemma 1, Mamba 2, and `internlm2` / `exaone*` (llama-like, but no chat template
+here). `mistral3` with `attention.temperature_scale` (Ministral 3's position-dependent query scaling) is refused too.
+
+### 16.15.1 What each converter writes, and how it is read
+
+The tensor name table of 16.3 holds; these are the differences. All of them were taken from llama.cpp's converter
+(`conversion/*.py`, `gguf-py/gguf/constants.py`, `tensor_mapping.py`) and loader (`src/models/*.cpp`) at tag b11669, then
+checked by running that loader.
+
+| family | what the file has | read as |
+|---|---|---|
+| Gemma 2/3 | every norm is stored as `w + 1`; `post_attention_norm` is the norm on the attention *output*, `ffn_norm` the one before the MLP, `post_ffw_norm` the one after it; no `output.weight` (tied); `rope.freq_base_swa`, `attention.sliding_window`, optional `attention.sliding_window_pattern` (an int, default 2 / 6, or a bool array); `attn_logit_softcapping` / `final_logit_softcapping`; **no `query_pre_attn_scalar`** | the cache's convention already (the `+1` is folded), so the floats are used as they are. The scale is `1/sqrt(head_dim)` as in llama.cpp (only the 27B shapes, 46 / 62 layers, use `1/sqrt(dim/heads)`); the embedding is multiplied by `sqrt(dim)` *in float* (llama.cpp's `ggml_scale`), with no rounding to bf16; a file without a window has no local layers |
+| Phi-3 | `attn_qkv` (q, k, v rows in this order) and `ffn_up` (**gate rows, then up rows**, `2 × ff`); `rope_factors_long/short.weight` + `rope.scaling.attn_factor` for LongRoPE (the long table when the context exceeds `rope.scaling.original_context_length`, as llama.cpp does); `rope.dimension_count = partial_rotary_factor × head`; llama.cpp ignores the sliding window | q, k, v are row slices of `attn_qkv`, `mlp.gate_up` is `ffn_up` (on the GPU two views of its halves). The engine *applies* `attention.sliding_window` when the file has one (as transformers does; llama.cpp does not) |
+| ChatGLM / GLM-4 | `ffn_up` fused as Phi-3's; q/k/v biases; `rope.dimension_count = 0.5 × head`, no `key_length` for ChatGLM (so `head_dim` must be `hidden / heads`; the converter reads `layernorm_epsilon`, default 1e-5, and ignores `rms_norm_eps`); GLM-4 adds `post_attention_norm` (= `post_self_attn_layernorm`) and `post_ffw_norm` and keeps `key_length`; RoPE type NORM on the *unpermuted* rows | the family's interleaved pairing; `attention_bias` is set from the presence of `attn_q.bias` |
+| Mamba | `ssm_in`, `ssm_conv1d` (`[d_conv, d_inner]`: the HF `[d_inner, 1, d_conv]` squeezed), `ssm_x`, `ssm_dt` (+`.bias`), **`ssm_a` = `-exp(A_log)`** and `ssm_d` (no `.weight`), `ssm_out`; `head_count 0`, `feed_forward_length 0`, `context_length 2^20`; the output is dropped when equal to the embedding | `mixer.A` is `ssm_a` as it is (the cache stores `-exp(A_log)` too); `dt_proj` and the conv are F32/F16 (a `dt_rank` below 32 cannot be block-quantized, so the converter writes F16); Falcon-Mamba (`ssm.dt_b_c_rms`) is refused |
+| DeepSeek-2 | MLA written as MQA: `head_count_kv 1`, `key_length = kv_lora + rope`, `value_length = kv_lora`, **`key_length_mla = nope + rope`, `value_length_mla = v`**; `attn_kv_a_mqa` (latent rows then the rotary key rows), `attn_kv_a_norm`, `attn_q_a` / `attn_q_a_norm` / `attn_q_b` or `attn_q`, **`attn_k_b` `[nope, kv_lora, heads]` (the key half of `kv_b`, transposed) and `attn_v_b` `[kv_lora, v, heads]`**; `leading_dense_block_count`, `expert_*`, `expert_gating_func` (1 softmax, 2 sigmoid), `expert_group_count` / `_used_count`, `expert_weights_scale` (absent = 1), `expert_weights_norm`, `exp_probs_b.bias` (V3's selection bias), shared experts as `ffn_*_shexp`; `rope.scaling.yarn_log_multiplier = 0.1 × mscale_all_dim` | the MLA of 14.11 with `attn_k_b` / `attn_v_b` in the layouts the absorbed kernels want (`AttnWeights.Mla.kB / vB`, no transposing copy of the key half); a file with only `key_length` / `value_length` and an unsplit `attn_kv_b` (before March 2025) is read as the checkpoint is. `mscale = mscale_all_dim` (what V2 and V3 ship; llama.cpp cannot store another), so the rotary amplitude is 1 and the softmax scale gets `yarn_get_mscale(factor, mscale_all_dim)²` |
+| Mistral 3 | the llama architecture under another name | as `llama` |
+
+Fused variants that llama.cpp's converter writes with `--fuse-qkv` / `--fuse-gate-up-exps` (`attn_qkv` with its fused bias,
+`ffn_gate_up_exps`: per expert the gate rows, then the up rows, which is the engine's layout) are read for every family;
+`ffn_gate_up_exps` of the GGUF block types is copied apart once at load (the GPU kernels read two interleaved views).
+
+**Two judgement calls where the file is silent.** (1) DeepSeek's group routing: llama.cpp scores a group by the sum of its two
+best experts (V3's rule) for every file with `expert_group_count > 1`; V2-236B's `group_limited_greedy` scores by the best. The
+engine uses V3's rule when the file has the `exp_probs_b` bias and V2's rule when it has not. (2) V2's router scales its
+weights only when it does not normalize them, V3's after normalizing; llama.cpp always normalizes if asked and then scales, so a
+file with both `expert_weights_norm` and a scale ≠ 1 gets V3's rule (real V2 files never have both).
+
+### 16.15.2 How the layouts were checked
+
+`HfToGguf` is a Java port of the converter's rules (names, `+1`, `-exp`, `permute`, the split of `kv_b`, merged experts,
+`rope_freqs` / `rope_factors_*`, the tensors forced to F32, the Q8_0 quantization of `gguf.quants.Q8_0` and its F16 fallback for
+rows that are not a multiple of 32) applied to the tiny random checkpoints of `scripts/make-tiny-model.py` (with `--set key=json`
+overrides for the variants llama.cpp can express), plus a synthetic byte-level vocabulary so that llama.cpp can load the file.
+It refuses what the real converter cannot express (a GLM-Edge `head_dim` ≠ `hidden / heads`, Qwen3-MoE with dense layers,
+DeepSeek with `mscale ≠ mscale_all_dim`). `GgufFamiliesCheck` then checks, for 24 tiny variants (the families above with and
+without bias, windows, fused tensors, all three Phi-3 rope modes and four DeepSeek routers):
+
+1. the F32 GGUF and the safetensors load (converted to Q8_0) of the same weights give the same logits: ≤ 9e-7 relative; this
+   pins the metadata mapping and every tensor layout;
+2. the Q8_0 file read in place equals the F32 file of its dequantized values (≤ 4e-6) and is within quantization noise of the
+   safetensors load (≤ 4e-3; for DeepSeek 2e-2, see below);
+3. llama.cpp's logits for the same ids, table above (`scripts/gguf-llamacpp-check.sh`; skipped when `llama-debug` is absent).
+
+llama.cpp pads `-c 64` to 256, which decides the short / long LongRoPE table (`n_ctx > original`): the short-table variant
+therefore has `original_max_position_embeddings = 256`. llama.cpp recognises "lite" DeepSeek models by their layer count
+(26 / 27), so the tiny V2 without query low-rank has 27 layers.
+
+**The DeepSeek quantization floor.** The unsplit and the split form are the same weights, but the Q8_0 blocks of `attn_k_b` run
+along `nope` and the checkpoint's `kv_b` along `kv_lora`, so a Q8_0 GGUF differs from the Q8_0 conversion of the safetensors by
+more than usual: 2e-2 of the largest logit on these tiny, very sensitive models (4 layers; 0.2 with 27), against 1e-3 for the
+unsplit form. The check prints the same figure for llama.cpp itself (float weights against jllm's Q8_0: 4e-2 … 2e-1), so it is
+the models' sensitivity to quantization, not the layout: with the same numbers in both engines the difference is 1e-6.
+
+### 16.15.3 Running them
+
+```sh
+scripts/gguf-llamacpp-check.sh                   # every tiny family against llama.cpp (needs llama-debug on PATH, python3)
+scripts/gguf-llamacpp-check.sh gemma3 glm4       # some
+mvn -o test                                      # GgufFamiliesCheck runs without llama.cpp (16 s)
+scripts/arch-smoke.sh                            # ends with GgufArchSmoke: Q8_0 GGUFs of the families, CPU == Metal
+```
+
+Limits: no real Gemma / Phi / GLM / Mamba / DeepSeek GGUF was used (no weights are downloaded for this work), so what is proved
+is the layout against llama.cpp's own loader, not a model's text; the `tokenizer.ggml.pre` values of these families are covered
+by 16.12. DeepSeek's group-limited routing for V2 files and the sliding window of Phi-3 follow the model, not llama.cpp.
+### 16.15.4 Worked examples, the design, the settings, the limits
+
+**Worked examples** (each number follows from the layouts of 16.15.1; the DeepSeek sizes are those of V2-Lite in [14 §14.11](14-model-families.md)):
+
+```
+Gemma 2/3 norm      the checkpoint's weight w = 0.25            the file stores w + 1 = 1.25           the engine's cache holds 1 + w too: 1.25 as it is
+Mamba A             A_log = ln 2 = 0.6931                       the file stores -exp(A_log) = -2        the engine's cache stores -exp(A_log) too: -2 as it is
+Phi-3 ffn_up        2·ff rows: rows 0 .. ff-1 = gate, rows ff .. 2ff-1 = up                -> mlp.gate_up (on the GPU two views of the halves)
+Phi-3 attn_qkv      (heads + 2 kvHeads)·head_dim rows, q first (heads·head_dim rows), then k, then v   (row slices, no copy)
+DeepSeek-V2-Lite    kv_b_proj [4096, 512] = [H (nope + v), kv_lora] with H = 16, nope = 128, v = 128, kv_lora = 512
+                    attn_k_b  ne = [nope, kv_lora, H] = [128, 512, 16] = 1 048 576 weights;  element (n, c, h) = kv_b_proj[h·256 + n, c]
+                    attn_v_b  ne = [kv_lora, v, H]    = [512, 128, 16] = 1 048 576 weights;  element (c, r, h) = kv_b_proj[h·256 + 128 + r, c]
+                    together 2 097 152 = 4096 x 512: the same weights, the key half transposed so that the absorbed kernel reads it in the layout it wants
+```
+
+**Why this design.**
+
+* *Write the converter, don't trust the metadata.* No real Gemma / Phi / GLM / Mamba / DeepSeek GGUF is downloaded for this work, so the layouts were
+  proved by **re-implementing llama.cpp's converter rules** (`HfToGguf`) on tiny random checkpoints and asking llama.cpp itself to load and run the result:
+  a wrong permutation, a missing `+1` or a transposed `kv_b` shows up as a logit difference far above the 1e-7 - 2e-5 the checks end with.
+* *Keep the file's layout where the kernels can use it* (fused `attn_qkv` and `ffn_up` as views, `attn_k_b` / `attn_v_b` as the absorbed MLA wants them), instead of
+  splitting and re-stacking: no copy of a compressed matrix, and the quantization stays the file's.
+* *Refuse what the engine cannot do* (Granite's scalings, OLMo-2's post-norms, SmolLM3's NoPE layers, Qwen2-MoE's gated shared expert, LayerNorm families, Gemma 1, Mamba 2, Falcon-Mamba, Ministral 3's temperature scale), with the reason, rather than run the closest family and produce plausible wrong text.
+* *Follow the model where llama.cpp and transformers differ and the file is silent* (V2-236B group routing, the sliding window of Phi-3): these two are documented
+  as judgement calls in 16.15.1.
+* *Costs:* the DeepSeek Q8_0 floor (2e-2 of the largest logit on tiny models, because the blocks of `attn_k_b` run along `nope` instead of `kv_lora`), the families' tokenizers
+  only as good as 16.12, and a table that must follow llama.cpp's converter.
+
+**Settings.** None of their own: `general.architecture` selects the family (`GgufFamilies`), `-Djllm.gguf.requantize` applies as everywhere (16.4.1), and the fused-tensor options of
+llama.cpp's converter (`--fuse-qkv`, `--fuse-gate-up-exps`) are accepted without a switch.
+
+**Checks and limits.** The table above (F32 GGUF vs safetensors 0 - 9e-7, jllm vs llama.cpp 2e-7 - 1.9e-5 of the largest logit, Metal == CPU for the same 8 greedy tokens) and 16.15.2; limits as
+stated in 16.15.3: no real files of these families were run, so what is proved is the layout against llama.cpp's own loader, not a model's text.

@@ -14,7 +14,7 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Speculative decoding on agent-like prompts instead of the repeating bench prompt (docs/10 §10.9, docs/11 §11.10): the three
+ * Speculative decoding on agent-like prompts instead of the repeating bench prompt (docs/10 §10.9, docs/11 §11.11): the three
  * kinds of turn a coding agent produces, each sent as a chat conversation and generated greedily, with the speculation
  * mode the settings name ({@code --engine.speculative off|ngram|draft}). One line per scenario with the median decode
  * speed of the timed rounds, the drafted / accepted counts and the md5 of the text (greedy output must be the same in

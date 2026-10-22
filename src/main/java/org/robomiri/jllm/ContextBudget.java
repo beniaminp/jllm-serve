@@ -16,7 +16,8 @@ import java.util.Locale;
  * <p>The size is {@code min(cap, max(max_position_embeddings, 4096), floor(budget / (slots * bytesPerToken)))}, rounded
  * down to a multiple of 1024 (256 below 4096), with a floor of 1024. {@code budget} is {@link #SHARE} of what is free:
  * on Metal the device's recommended working set minus what the open backends and this model's weights hold (and a
- * reserve for activations); on the CPU backends the free Java heap, which holds their KV caches. Both are capped by a
+ * reserve for activations); on the CPU backends the free Java heap, which holds their flat KV caches, or, with the
+ * paged cache ({@code backend.kv-paged}, docs/24), whose blocks are off-heap, the physical memory alone. Both are capped by a
  * share of the physical memory. A mixture-of-experts model whose experts may go to the CPU
  * ({@code backend.metal.cpu-moe}) may also push up to {@link #MOE_SPILL} of the working set of its experts out for
  * the cache. The planner is a pure function ({@link #plan}) so it is tested without a device; {@link ModelLoader}
@@ -129,6 +130,12 @@ public final class ContextBudget {
                     basis += String.format(Locale.ROOT, "; physical memory %.1f GB leaves %.1f GB", ram / 1e9, byRam / 1e9);
                 }
             }
+        } else if (ram > 0 && pagedOffHeap(s, arch, kv)) {
+            // the paged KV cache (backend.kv-paged, docs/24) keeps the CPU blocks in off-heap MemorySegment slabs: the Java heap
+            // does not bound the cache, only the physical memory does (the pool never takes more than the flat caches would)
+            budget = (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights));
+            basis = String.format(Locale.ROOT, "paged KV cache, off the Java heap: physical memory %.1f GB - weights %.1f GB, %.0f%% for the cache",
+                    ram / 1e9, weights / 1e9, 100 * SHARE);
         } else {
             long heap = heapFree();
             budget = (long) (SHARE * heap);
@@ -149,6 +156,12 @@ public final class ContextBudget {
             basis += "; " + slots + " slots";
         }
         return plan(per, arch.core().maxPositions(), s.getInt("backend.ctx-max"), budget, slots, basis);
+    }
+
+    /** Whether this model's CPU KV cache is the paged, off-heap pool: {@code backend.kv-paged} on an attention model with f32 / f16 / q8. */
+    static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
+        return s.getBool("backend.kv-paged") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa
+                && kv != KvDtype.Q4;
     }
 
     /** Free space of the Java heap's old generation (where the CPU KV caches live), as {@code KvCache.checkHeap} sees it. */

@@ -570,7 +570,7 @@ Decoding streams every weight once per token, so a token costs the same whether 
 several. Speculative decoding exploits that: guess the next few tokens, feed *all* of them in one pass, and keep
 the guesses the model itself would have produced. Code: `engine/Speculator.java`, `engine/DraftModel.java`,
 `Sampler.verify`, `Backend.forwardAll`. Prompt lookup is on by default for every model (`engine.speculative=ngram`; `off` disables
-it, measurements below, in [17](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) and in [11 §11.10](11-performance.md#1110-agent-defaults-measured)).
+it, measurements below, in [17](17-agent-speedups.md#171-prompt-lookup-tuned-for-agents) and in [11 §11.11](11-performance.md#1111-agent-defaults-measured)).
 
 ```
 tok  = sample(logits)                       # a normal step: the next token is always the target's own choice
@@ -685,7 +685,7 @@ the length stays what the text supports): it learns the acceptance rate of the r
 request) and the cost of a pass, and while no draft length would beat plain decoding it takes 16 plain steps, trying a pass
 every fourth time to notice a change of text, and at once when the full 8-token suffix has occurred earlier (a copy is under way). Copying text is unaffected; free text and tool calls stop paying for failed
 passes (CPU, Qwen3-0.6B: −40 % on prose became −4 %, −37 % on a tool call became −5 %, the code edit keeps +44 %). `-Djllm.engine.adaptiveNgram=false` drafts at every match,
-`-Djllm.engine.specDebug=true` traces the model. Measured in [11 §11.10](11-performance.md#1110-agent-defaults-measured).
+`-Djllm.engine.specDebug=true` traces the model. Measured in [11 §11.11](11-performance.md#1111-agent-defaults-measured).
 
 ---
 
@@ -794,7 +794,7 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `engine.priority-order` | `true` | a request with `"priority": "background"` gives way to interactive ones at the device ([10.14](#1014-request-priority)) |
 | `engine.max-prompt-bytes` | `0` | refuse longer prompts before tokenizing; 0 = 16 × `backend.ctx` |
 | `engine.prompt-cache-mb` | `64` | memory for the ids of recently rendered chat prompts: a resent conversation is tokenized only from where it is new, with the ids of a full tokenization ([17 §17.5](17-agent-speedups.md#175-tokenizing-only-what-is-new)); 0 = off |
-| `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. On for every model; prompt lookup pauses by itself while it does not pay ([11 §11.10](11-performance.md#1110-agent-defaults-measured)) |
+| `engine.speculative` | `ngram` | `off`, `ngram` (prompt lookup) or `draft` (draft model), [10.9](#109-speculative-decoding); flag `--speculative`. On for every model; prompt lookup pauses by itself while it does not pay ([11 §11.11](11-performance.md#1111-agent-defaults-measured)) |
 | `engine.draft-model` | empty | Hub repo of the draft model for `draft` (same tokenizer); flag `--draft-model` |
 | `engine.draft-tokens` | `16` | most tokens proposed per verification pass (prompt lookup adapts below it); flag `--draft-tokens` |
 | `engine.ngram-max` / `engine.ngram-min` / `engine.ngram-window` | `8` / `3` / `0` | prompt lookup: longest / shortest suffix matched, how many recent tokens may be copied from (0 = all) |
@@ -883,7 +883,9 @@ rowBytes(w)       : f32 4w   f16 2w   q8 w + 4·kvHeads (one f32 scale per head 
 ```
 Metal : free   = workingSet − otherModels − weights − reserve  [+ 0.10·workingSet if an MoE model may spill experts to the CPU]
         budget = 0.6 · max(0, free)
-CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the CPU backends keep the cache on the heap)
+CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the flat CPU cache lives on the heap)
+CPU, backend.kv-paged=true (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
+        the paged pool (docs/24) is off-heap MemorySegment slabs, so -Xmx no longer bounds the cache, only the RAM does
 both  : budget = min(budget, 0.6 · max(0, 0.75 · physicalMemory − weights))   (weights are memory-mapped: they must fit in RAM too)
 a draft model (engine.speculative=draft) keeps a cache of the same length: budget = budget / 2
 ```
@@ -971,8 +973,14 @@ costs address space and only touches the pages that get written.
   128 positions (4 096), the cap, a model without a KV cache, rounding, and the settings validation (`auto` / `AUTO` accepted, `lots`
   and a `backend.ctx-max` below 1 024 rejected).
 - Not exact: the reserve is an estimate (activations grow with `backend.batch`); a draft model's cache is accounted for by halving; the
-  Mamba / hybrid state buffers are not counted (small); on the CPU the budget is the Java heap (`JLLM_XMX`, default 4 g), because the
-  KV cache lives on it; when the paged KV cache moves it off the heap only the physical-memory bound remains.
+  Mamba / hybrid state buffers are not counted (small); on the CPU the flat cache lives on the Java heap, so the budget is the heap
+  (`JLLM_XMX`, default 4 g). With `backend.kv-paged=true` the CPU blocks are off-heap ([24 §24.2.6](24-paged-kv-cache.md#2426-the-cpu-backend)),
+  so `auto` counts the physical memory instead (`ContextBudget.pagedOffHeap`; the log says "paged KV cache, off the Java heap"): for
+  Qwen3-0.6B at f32 on this 32 GB Mac that is `0.6 · (0.75 · 34.4 − 0.5) = 15.2 GB`, i.e. the trained 40 960 positions instead of the heap-bound
+  7 168. The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
+  costs address space until conversations fill it. On Metal the paged pool is Metal buffers counted against the working set exactly like the
+  flat caches, so the Metal arithmetic is unchanged. A model that cannot be paged (q4, DeepSeek, Mamba, Qwen3-Next) keeps the heap budget on the CPU.
+  An explicit `backend.kv-pool-tokens` smaller than the context is not taken into account.
 - When the weights leave no room the result is the 1 024 floor and the log says "limited by memory"; set a number to override.
 - Saved conversations (`KvStore`) ignore `backend.ctx` in their compatibility key, and `Engine` refuses a saved cache longer than the
   current context, so a changed `auto` does not invalidate or corrupt them.

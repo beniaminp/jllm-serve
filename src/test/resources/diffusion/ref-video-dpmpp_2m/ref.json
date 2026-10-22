@@ -1,0 +1,13 @@
+{
+ "prompt": "a red balloon floating over a green hill, clouds moving",
+ "negative": "blurry, low quality",
+ "width": 64,
+ "height": 64,
+ "frames": 3,
+ "steps": 4,
+ "guidance": 7.5,
+ "seed": 5,
+ "scheduler": "dpmpp_2m",
+ "cfg": true,
+ "t0": 999.0
+}

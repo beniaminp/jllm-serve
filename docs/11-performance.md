@@ -492,7 +492,7 @@ position streams its own experts) and on the CPU, and no setting was a win every
 tokens, drafts that grow to 16 tokens while they are accepted. On the CPU (4-core AVX-512, Qwen3-0.6B, greedy) rewriting
 an 80-line file from the prompt went from 19.9 to 81.2 tok/s (98 % of drafts accepted), and a free-form story cost about 4 %
 (23.3–23.4 vs 24.4 tok/s; 2-token matches cost 8 %, hence `engine.ngram-min=3`). MoE models keep it off unless it is set
-explicitly, for the reason above (**since [11.10](#1110-agent-defaults-measured) it is on for them too**: prompt lookup now pauses when its
+explicitly, for the reason above (**since [11.11](#1111-agent-defaults-measured) it is on for them too**: prompt lookup now pauses when its
 drafts do not pay, and on agent-like prompts the 30B gains 68 % on a code edit and loses 1 – 10 % elsewhere). Enable `ngram` for editing, extraction
 and quoting workloads on dense models; `draft` needs a draft model that agrees with the target on 80 % or more of the tokens and
 a backend whose multi-token pass is much cheaper than K single steps, which the Metal kernels of this repository are not yet.
@@ -651,10 +651,46 @@ ring and lose only 7.5 % of prefill speed against f16 (accepting about 3× the e
 
 ---
 
-## 11.10 Agent defaults, measured
+## 11.10 The q8 cache with rotated keys, measured
+
+🧸 Shaking the keys before the one-byte shrink makes the answers much closer to the full-size shelf's, and it costs almost
+nothing: the same memory and a few percent of speed.
+
+📐 **Memory** is q8's (59 KB per token, 242 MB at `--ctx 4096` for Qwen3-0.6B): the rows and scales are the same, nothing is added.
+
+**Speed on the current tree** (with the decode attention `attention_dec` ([08 §8.31](08-metal-backend.md#831-decode-attention-attention_dec))
+chosen by the start-up check for the q8 cache of this model, the multi-row matvecs, and `backend.batch=auto` = 256 on Metal; M1 Pro,
+Qwen3-0.6B Q4_0, `./jllm bench --model Qwen/Qwen3-0.6B --temp 0 --bench.rounds 3 --engine.speculative off --backend.kv-dtype f16|q8
+--backend.kv-q8-rotate false|true [--bench.prompt-repeat 200]`, median of 3 rounds, under the heavy lock, two passes alternating the
+configurations, shown as pass 1 / pass 2; 413 or 2 013 prompt tokens, decode 128 tokens):
+
+| configuration | prompt tokens | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| Metal, f16 | 413 | 2112.5 / 2081.6 | 142.5 / 142.8 |
+| Metal, q8 (plain keys) | 413 | 2064.8 / 2073.6 | 142.9 / 143.7 |
+| Metal, **q8, rotated keys** | 413 | 2039.0 / 2042.4 | 139.1 / 138.8 |
+| Metal, f16 | 2013 | 1202.5 / 1190.9 | 121.0 / 121.0 |
+| Metal, q8 (plain keys) | 2013 | 1213.4 / 1213.6 | 126.8 / 126.9 |
+| Metal, **q8, rotated keys** | 2013 | 1206.5 / 1201.2 | 122.9 / 123.0 |
+
+The rotated cache costs 1.2–1.5 % of prefill at 413 tokens and 0.6–1 % at 2 013, and 2.7–3.4 % of decode at 413 and 3.1 % at 2 013 against
+plain q8. The rotated query and `scale / B` go to `attention_dec` like to every other attention kernel, so that cost is the rotation
+itself (a Hadamard transform of 8 k heads and 16 q heads per layer in the fused rope-and-store kernel), not a slower attention.
+Accuracy: [07 §7.13](07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate). Commands for the accuracy and needle tables:
+`KvStudy accuracy … variants=f32,q8,q8r` and `KvStudy needle … lens=4096,8192,16384 variants=f16,q8,q8r`
+(`src/test/java/org/robomiri/jllm/KvStudy.java`).
+
+*Before `attention_dec` and the multi-row matvecs* (the branch's first measurement; prefill chunk 64, `attention_t`): q8 plain 1457 / 1467 tok/s
+prefill and 116.6 / 118.4 decode at 413 tokens, rotated 1453 / 1452 and 116.5 / 114.5 (0.3–1 % and 0–3 %); at 2 013 tokens plain 1050 / 1049
+and 80.7 / 80.5, rotated 1038 / 1041 and 80.3 / 80.3 (1 % and 0.4 %). The first version, with the rotation as a separate dispatch (`rope` +
+`kv_store_q8r`), cost 3–6 % of decode at 413 tokens and 2 % of prefill, which is why the rotation lives in `rope_store_q8r`.
+
+---
+
+## 11.11 Agent defaults, measured
 
 Four defaults for agent serving were re-examined on the Apple M1 Pro (10 cores, 32 GB), bundled settings, under the machine-wide benchmark
-lock, on 2026-10-22. The prefill chunk is [08 §8.32](08-metal-backend.md#832-should-the-prefill-chunk-come-from-the-tuner-backendbatchauto-stays-at-256)
+lock, on 2026-10-22. The prefill chunk is [08 §8.33](08-metal-backend.md#833-should-the-prefill-chunk-come-from-the-tuner-backendbatchauto-stays-at-256)
 (stays 256), the default context length is [10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto) (now `auto`),
 request priority is [10 §10.14](10-engine-and-server.md#1014-request-priority) (new). This section is the fourth: **prompt lookup on agent-like
 prompts, and the cost-model gate that makes it safe to leave on.**
@@ -777,7 +813,7 @@ java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+
 - The greedy text is the same in every mode on Metal (the md5 column of the harness is equal across the rows (edit, tool and prose alike)). On the CPU the int8 single-token path and the float
   multi-token path differ in the last bits, so the tool and prose answers can differ between runs with different speculation decisions (documented in 11.6).
 
-The other three defaults, measured the same day: the prefill chunk 64 / 128 / 256 / 512 for the 0.6B and the 30B in 8.32 (256 stays); the context `auto` picks
+The other three defaults, measured the same day: the prefill chunk 64 / 128 / 256 / 512 for the 0.6B and the 30B in 8.33 (256 stays); the context `auto` picks
 for the 0.6B, the 27B GGUF and the 30B in 10.13 (and that it costs about 1 % of decode); the priority in 10.14 (the first token of a short interactive request
 while a long background job runs: 127 ms against 937 ms). `scripts/mac-validate.sh` has rows for all four.
 

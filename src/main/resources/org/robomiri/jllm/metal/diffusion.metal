@@ -28,6 +28,7 @@ using namespace metal;
 #define ACT_SILU 1
 #define ACT_GELU 2
 #define ACT_QUICK_GELU 3
+#define ACT_GELU_TANH 4
 
 static inline float df_tg_sum(float v, threadgroup float *buf, ushort sg, ushort lane, ushort nsg) {
     v = simd_sum(v);
@@ -80,6 +81,7 @@ static inline float df_act(float v, int act) {
     if (act == ACT_SILU) return df_silu(v);
     if (act == ACT_GELU) return df_gelu(v);
     if (act == ACT_QUICK_GELU) return v / (1.0f + exp(-1.702f * v));
+    if (act == ACT_GELU_TANH) return 0.5f * v * (1.0f + tanh(clamp(0.7978845608028654f * (v + 0.044715f * v * v * v), -15.0f, 15.0f))); // the clamp: tanh of a huge argument is inf / inf = NaN under fast math
     return v;
 }
 
@@ -544,6 +546,31 @@ kernel void df_layernorm(device const T *x [[buffer(0)]],
     }
 }
 
+// RMS norm: one simdgroup per row, x * rsqrt(mean(x^2) + eps) * gamma (the qk norm and the text-free norms of the Wan transformer)
+template <typename T>
+kernel void df_rmsnorm(device const T *x [[buffer(0)]],
+                       device const float *gamma [[buffer(1)]],
+                       device T *out [[buffer(2)]],
+                       constant DfNormParams &p [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]],
+                       ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const long row = (long)tg * (DF_ROW_THREADS / 32) + sg;
+    if (row >= p.hw) return;
+    device const T *xr = x + row * p.c;
+    float q = 0.0f;
+    for (int i = lane; i < p.c; i += 32) {
+        const float v = float(xr[i]);
+        q += v * v;
+    }
+    const float rstd = rsqrt(simd_sum(q) / float(p.c) + p.eps);
+    for (int i = lane; i < p.c; i += 32) {
+        float v = float(xr[i]) * rstd;
+        if (p.hasAffine != 0) v = v * gamma[i];
+        out[row * p.c + i] = T(v);
+    }
+}
+
 // Group norm of a large tensor in three steps, so that the whole GPU works on it instead of one threadgroup per group:
 //   df_gn_stats    (chunks, groups, batch): the mean and the sum of squared deviations of one chunk of pixels of one group
 //   df_gn_combine  (groups, batch): the chunks' statistics merged (Chan et al.: M2 = sum(M2_c + n_c (mean_c - mean)^2)) into
@@ -651,6 +678,8 @@ template [[host_name("df_gn_stats_f")]] kernel decltype(df_gn_stats<float>) df_g
 template [[host_name("df_gn_stats_h")]] kernel decltype(df_gn_stats<half>) df_gn_stats<half>;
 template [[host_name("df_gn_apply_f")]] kernel decltype(df_gn_apply<float>) df_gn_apply<float>;
 template [[host_name("df_gn_apply_h")]] kernel decltype(df_gn_apply<half>) df_gn_apply<half>;
+template [[host_name("df_rmsnorm_f")]] kernel decltype(df_rmsnorm<float>) df_rmsnorm<float>;
+template [[host_name("df_rmsnorm_h")]] kernel decltype(df_rmsnorm<half>) df_rmsnorm<half>;
 template [[host_name("df_layernorm_f")]] kernel decltype(df_layernorm<float>) df_layernorm<float>;
 template [[host_name("df_layernorm_h")]] kernel decltype(df_layernorm<half>) df_layernorm<half>;
 
@@ -907,11 +936,124 @@ kernel void df_concat(device const T *x [[buffer(0)]], device const T *y [[buffe
     out[gid] = c < p.a ? x[row * p.a + c] : y[row * p.b + (c - p.a)];
 }
 
+// swap two axes: x read as [outer, d1, d2, C] -> out [outer, d2, d1, C]; p.a = d1, p.b = d2, p.c = C
+template <typename T>
+kernel void df_swap_axes(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
+                         constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const int c = int(gid % p.c);
+    long r = gid / p.c;                 // output row = (o, j2, j1)
+    const int j1 = int(r % p.a);
+    r /= p.a;
+    const int j2 = int(r % p.b);
+    const long o = r / p.b;
+    out[gid] = x[((o * p.a + j1) * p.b + j2) * p.c + c];
+}
+
+// out = x + table[row mod period]: p.a = C, p.b = period; the table is float32 [>= period, C] (the temporal positions of a video UNet)
+template <typename T>
+kernel void df_add_rows(device const T *x [[buffer(0)]], device const float *table [[buffer(1)]], device T *out [[buffer(2)]],
+                        constant DfEwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const long row = gid / p.a;
+    const int c = int(gid - row * p.a);
+    out[gid] = T(float(x[gid]) + table[(row % p.b) * p.a + c]);
+}
+
+// Wan transformer layers --------------------------------------------------------------------------------------------------
+// rotary embedding: x [rows, heads * 2 * half]; one thread per pair; p.a = heads, p.b = half, p.c = period; cos / sin tables float [period, half]
+template <typename T>
+kernel void df_rope(device const T *x [[buffer(0)]], device const float *cs [[buffer(1)]], device const float *sn [[buffer(2)]], device T *out [[buffer(3)]],
+                    constant DfEwParams &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const int i = int(gid % p.b);
+    long r = gid / p.b;
+    const int h = int(r % p.a);
+    r /= p.a;
+    const long ti = (r % p.c) * p.b + i;
+    const long o = r * p.a * 2 * p.b + (long)h * 2 * p.b + 2 * i;
+    const float a = float(x[o]);
+    const float b = float(x[o + 1]);
+    const float c = cs[ti];
+    const float s = sn[ti];
+    out[o] = T(c * a - s * b);
+    out[o + 1] = T(s * a + c * b);
+}
+
+struct DfModParams {
+    long n;         // output elements
+    int c;          // channels
+    int per;        // rows per batch item
+    int tstride;    // elements per batch item of tproj
+    int t1;         // offsets (elements) of the scale (or gate) and shift chunks in tproj and in the table
+    int t2;
+    int a1;
+    int a2;
+};
+
+// x * (1 + scale) + shift, scale / shift = table[...] + tproj[b][...]
+template <typename T>
+kernel void df_modulate(device const T *x [[buffer(0)]], device const T *tp [[buffer(1)]], device const float *tab [[buffer(2)]], device T *out [[buffer(3)]],
+                        constant DfModParams &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const int c = int(gid % p.c);
+    const long row = gid / p.c;
+    const long b = row / p.per;
+    const float sc = tab[p.a1 + c] + float(tp[b * p.tstride + p.t1 + c]);
+    const float sh = tab[p.a2 + c] + float(tp[b * p.tstride + p.t2 + c]);
+    out[gid] = T(float(x[gid]) * (1.0f + sc) + sh);
+}
+
+// res + y * gate, gate = table[a1 ...] + tproj[b][t1 ...]
+template <typename T>
+kernel void df_gated_add(device const T *res [[buffer(0)]], device const T *y [[buffer(1)]], device const T *tp [[buffer(2)]], device const float *tab [[buffer(3)]],
+                         device T *out [[buffer(4)]], constant DfModParams &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const int c = int(gid % p.c);
+    const long row = gid / p.c;
+    const long b = row / p.per;
+    const float g = tab[p.t2 + c] + float(tp[b * p.tstride + p.t1 + c]);
+    out[gid] = T(float(res[gid]) + float(y[gid]) * g);
+}
+
+// causal shift along the first dimension: p.a = elements per frame, p.b = shift
+template <typename T>
+kernel void df_frame_shift(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
+                           constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    const long t = gid / p.a;
+    out[gid] = t < p.b ? T(0.0f) : x[gid - (long)p.b * p.a];
+}
+
+// a slice of the first dimension: p.a = elements per entry, p.b = first entry
+template <typename T>
+kernel void df_rows(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],
+                    constant DfEwParams &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    out[gid] = x[gid + (long)p.b * p.a];
+}
+
+// concatenation along the first dimension: p.a = elements of the first tensor
+template <typename T>
+kernel void df_stack(device const T *x [[buffer(0)]], device const T *y [[buffer(1)]], device T *out [[buffer(2)]],
+                     constant DfEwParams &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if ((long)gid >= p.n) return;
+    out[gid] = (long)gid < p.a ? x[gid] : y[gid - p.a];
+}
+
 #define DF_INST_EW(SUF, T) \
     template [[host_name("df_add" SUF)]] kernel decltype(df_add<T>) df_add<T>; \
     template [[host_name("df_silu" SUF)]] kernel decltype(df_silu_k<T>) df_silu_k<T>; \
     template [[host_name("df_geglu" SUF)]] kernel decltype(df_geglu<T>) df_geglu<T>; \
     template [[host_name("df_upsample2x" SUF)]] kernel decltype(df_upsample2x<T>) df_upsample2x<T>; \
-    template [[host_name("df_concat" SUF)]] kernel decltype(df_concat<T>) df_concat<T>;
+    template [[host_name("df_concat" SUF)]] kernel decltype(df_concat<T>) df_concat<T>; \
+    template [[host_name("df_swap_axes" SUF)]] kernel decltype(df_swap_axes<T>) df_swap_axes<T>; \
+    template [[host_name("df_add_rows" SUF)]] kernel decltype(df_add_rows<T>) df_add_rows<T>; \
+    template [[host_name("df_rope" SUF)]] kernel decltype(df_rope<T>) df_rope<T>; \
+    template [[host_name("df_modulate" SUF)]] kernel decltype(df_modulate<T>) df_modulate<T>; \
+    template [[host_name("df_gated_add" SUF)]] kernel decltype(df_gated_add<T>) df_gated_add<T>; \
+    template [[host_name("df_frame_shift" SUF)]] kernel decltype(df_frame_shift<T>) df_frame_shift<T>; \
+    template [[host_name("df_rows" SUF)]] kernel decltype(df_rows<T>) df_rows<T>; \
+    template [[host_name("df_stack" SUF)]] kernel decltype(df_stack<T>) df_stack<T>;
 DF_INST_EW("_f", float)
 DF_INST_EW("_h", half)
