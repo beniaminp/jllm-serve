@@ -137,7 +137,14 @@ public final class Engine implements AutoCloseable {
     private final Tokenizer tokenizer;
     private final Architecture.Core model;
     private final Set<Integer> eosIds;
-    private final ReentrantLock lock = new ReentrantLock(true);
+    private final ReentrantLock lock = new ReentrantLock(true) {
+        @Override
+        public void unlock() {
+            lastActive = System.nanoTime(); // the time the engine was last used (releaseKv)
+            super.unlock();
+        }
+    };
+    private volatile long lastActive = System.nanoTime();
     private final long queueTimeoutMs;
     private final int emptyPromptToken;
 
@@ -881,6 +888,34 @@ public final class Engine implements AutoCloseable {
             }
         } finally {
             first.lock.unlock();
+        }
+    }
+
+    /**
+     * Gives back the KV blocks of an idle slot (a paged cache, docs/24): when no request is running and the engine has been
+     * idle for at least {@code minIdleMs}, its conversation's full blocks are published (they stay in the pool's prefix
+     * tree, findable and evictable) and its block table is cleared, so the slot no longer pins the memory; the next prompt
+     * finds the conversation again through the tree. Never waits: a busy engine is left alone.
+     *
+     * @return the number of blocks the slot gave up (0: nothing to release, busy, or a flat cache)
+     */
+    public int releaseKv(long minIdleMs) {
+        org.robomiri.jllm.kv.KvSequence kvs = backend.kvSequence();
+        if (kvs == null || !lock.tryLock()) {
+            return 0;
+        }
+        try {
+            int had = kvs.blocks();
+            if (had == 0 || System.nanoTime() - lastActive < minIdleMs * 1_000_000L) {
+                return 0;
+            }
+            kvs.publish(cached, Math.min(cachedLen, cached.length));
+            kvs.clear();
+            cachedLen = 0;
+            cached = new int[0];
+            return had;
+        } finally {
+            lock.unlock();
         }
     }
 

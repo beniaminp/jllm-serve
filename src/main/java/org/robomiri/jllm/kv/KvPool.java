@@ -161,6 +161,23 @@ public final class KvPool implements AutoCloseable {
         return new KvSequence(this, maxPositions);
     }
 
+    /**
+     * Asked for memory when every block is held by a sequence and none can be evicted: frees blocks held by sequences
+     * nobody is using (an idle slot's conversation, which stays findable in the tree) and says whether it freed any.
+     * Called with the pool's monitor held, so it must not wait for other locks (try-lock only).
+     */
+    @FunctionalInterface
+    public interface Reclaimer {
+        boolean reclaim();
+    }
+
+    private volatile Reclaimer reclaimer;
+
+    /** Registers who can give blocks back under memory pressure ({@link Reclaimer}); null = nobody. */
+    public void setReclaimer(Reclaimer r) {
+        this.reclaimer = r;
+    }
+
     /** Where evicted blocks go; null = they are dropped. */
     public void setSpill(KvSpill spill) {
         this.spill = spill;
@@ -201,17 +218,24 @@ public final class KvPool implements AutoCloseable {
     /** A fresh block with one reference (the caller's), private. Evicts the least recently used cached block if needed. */
     synchronized int alloc() {
         int b;
-        if (freeCount > 0) {
-            b = free[--freeCount];
-        } else if (highWater < maxBlocks) {
-            b = highWater++;
-            storage.grow(highWater);
-        } else {
-            b = evictOne();
-            if (b < 0) {
-                throw new KvPoolExhausted("the KV pool is full: all " + maxBlocks + " blocks of " + B + " positions are in"
-                        + " use by running sequences; raise backend.kv-pool-tokens or lower the context / slots");
+        for (;;) {
+            if (freeCount > 0) {
+                b = free[--freeCount];
+            } else if (highWater < maxBlocks) {
+                b = highWater++;
+                storage.grow(highWater);
+            } else {
+                b = evictOne();
+                if (b < 0) {
+                    Reclaimer rc = reclaimer;
+                    if (rc != null && rc.reclaim()) { // idle holders gave blocks back: start over (they may be free ones)
+                        continue;
+                    }
+                    throw new KvPoolExhausted("the KV pool is full: all " + maxBlocks + " blocks of " + B + " positions are in"
+                            + " use by running sequences; raise backend.kv-pool-tokens or lower the context / slots");
+                }
             }
+            break;
         }
         refs[b] = 1;
         owner[b] = null;
