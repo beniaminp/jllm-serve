@@ -331,6 +331,9 @@ public final class ImagePipeline implements AutoCloseable {
                 maskedLatents = sampleLatents(vae.encode(black, 1, h, w), rng, lc, lh, lw);
             }
         }
+        if (inpaintHook != null && nine) {
+            inpaintHook.accept(latentMask, maskedLatents);
+        }
         Ops ops = devices.main();
         int total = sched.steps() - start;
         if (listener != null) {
@@ -394,6 +397,9 @@ public final class ImagePipeline implements AutoCloseable {
                 pv = LatentPreview.render(sched.predictOriginal(guided, i, x), lh, lw, xl);
             }
             x = prev;
+            if (stepHook != null) {
+                stepHook.accept(i - start, x);
+            }
             if (listener != null) {
                 listener.progress(index, i + 1 - start, total, pv);
             }
@@ -425,6 +431,12 @@ public final class ImagePipeline implements AutoCloseable {
 
     /** Time spent in the last {@link #generate} call: text encoders, UNet evaluations, VAE (encode and decode), everything. */
     public volatile long textNs, unetNs, vaeNs, totalNs;
+
+    /** Debugging: called with the latent-resolution mask and the masked image's latents (NHWC) of a 9-channel inpainting run. */
+    public volatile java.util.function.BiConsumer<float[], float[]> inpaintHook;
+
+    /** Debugging: called with the latents (NHWC) after every sampler step. */
+    public volatile java.util.function.BiConsumer<Integer, float[]> stepHook;
 
     /** Diagnostics of the last image: the final latents (NHWC) and the decoded pixels before clamping (-1..1). */
     public volatile float[] lastLatents;

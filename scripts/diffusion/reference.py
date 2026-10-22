@@ -111,6 +111,7 @@ def main():
     ap.add_argument('--skip-pipeline', action='store_true')
     ap.add_argument('--clip-skip', type=int, default=None)
     ap.add_argument('--mode', default='txt2img')
+    ap.add_argument('--dump-steps', action='store_true', help='also write the latents after every step (step_N.f32)')
     ap.add_argument('--strength', type=float, default=0.6)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -226,6 +227,15 @@ def main():
                 m.randn_tensor = fake_randn
         common = dict(prompt=a.prompt, negative_prompt=a.negative, num_inference_steps=a.steps, guidance_scale=a.guidance,
                       output_type='latent')
+        if a.dump_steps:
+            def dump(pipeline, i, t, kw):
+                save(a.out, 'step_%d.f32' % i, kw['latents'].float().cpu().numpy())
+                if i == 0 and 'mask' in kw and kw['mask'] is not None:   # inpainting: the extra UNet inputs
+                    save(a.out, 'inp_mask.f32', kw['mask'].float().cpu().numpy())
+                    save(a.out, 'inp_masked_latents.f32', kw['masked_image_latents'].float().cpu().numpy())
+                return kw
+            common['callback_on_step_end'] = dump
+            common['callback_on_step_end_tensor_inputs'] = ['latents'] + (['mask', 'masked_image_latents'] if a.mode == 'inpaint' else [])
         if a.clip_skip is not None:
             common['clip_skip'] = a.clip_skip
         from PIL import Image

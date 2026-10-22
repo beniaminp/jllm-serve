@@ -262,6 +262,38 @@ public final class DiffusionCompare {
                     }
                     ImagePipeline.Request r = new ImagePipeline.Request(prompt, negative, w, h, steps, guidance, seed, scheduler,
                             0, init, mask, w, h, strength);
+                    if (has(ref, "inp_mask.f32")) { // the extra inputs of a 9-channel inpainting UNet (batch of 2 with guidance: the first)
+                        pipe.inpaintHook = (m, ml) -> {
+                            try {
+                                float[] wantMask = floats(ref.resolve("inp_mask.f32"));
+                                float[] wantMl = nchwToNhwc(java.util.Arrays.copyOf(floats(ref.resolve("inp_masked_latents.f32")), 4 * lh * lw), 1, 4, lh, lw);
+                                report("inp_mask", m, java.util.Arrays.copyOf(wantMask, lh * lw));
+                                report("inp_masked", ml, wantMl);
+                            } catch (IOException e) {
+                                throw new IllegalStateException(e);
+                            }
+                        };
+                    }
+                    if (has(ref, "step_0.f32")) { // per-step latents of the reference (reference.py --dump-steps)
+                        pipe.stepHook = (i, xs) -> {
+                            try {
+                                report("step " + i, xs, nchwToNhwc(floats(ref.resolve("step_" + i + ".f32")), 1, 4, lh, lw));
+                                if (System.getProperty("compare.dump") != null) { // the latents as NCHW floats, for looking at them in numpy
+                                    float[] nchw = new float[xs.length];
+                                    for (int ch = 0; ch < 4; ch++) {
+                                        for (int px = 0; px < lh * lw; px++) {
+                                            nchw[ch * lh * lw + px] = xs[px * 4 + ch];
+                                        }
+                                    }
+                                    java.nio.ByteBuffer bb = java.nio.ByteBuffer.allocate(nchw.length * 4).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                                    bb.asFloatBuffer().put(nchw);
+                                    Files.write(Path.of(System.getProperty("compare.dump"), "java_step_" + i + ".f32"), bb.array());
+                                }
+                            } catch (IOException e) {
+                                throw new IllegalStateException(e);
+                            }
+                        };
+                    }
                     pipe.generate(r, 1, null);
                     say(String.format("pipeline %-9s %.2f s", mode, (System.nanoTime() - p0) / 1e9));
                     report("latents", pipe.lastLatents, nchwToNhwc(floats(ref.resolve("latents.f32")), 1, 4, lh, lw));

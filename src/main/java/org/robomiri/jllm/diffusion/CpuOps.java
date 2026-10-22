@@ -62,6 +62,7 @@ public final class CpuOps implements Ops {
         return packed.get();
     }
     private final ThreadLocal<float[]> scratch = ThreadLocal.withInitial(() -> new float[0]);
+    private final ThreadLocal<float[]> panelBuf = ThreadLocal.withInitial(() -> new float[0]);
 
     @Override
     public String name() {
@@ -182,19 +183,22 @@ public final class CpuOps implements Ops {
         int fill(int m0, int m1, float[] dst);
     }
 
-    private static void micro(float[] a, int o0, int o1, int o2, int o3, int k, MemorySegment w, long wByte, float[] tmp) {
+    /**
+     * The 4-row x NR-column register tile over one packed weight panel. The panel is a heap array (copied from the off-heap
+     * store by the caller): {@code FloatVector.fromMemorySegment} is not compiled to vector loads by this JVM (the loop ran
+     * at 0.3 GFLOP/s, a hundredth of {@code fromArray}), so the panel is staged through a small thread-local array instead.
+     */
+    private static void micro(float[] a, int o0, int o1, int o2, int o3, int k, float[] w, float[] tmp) {
         FloatVector c00 = FloatVector.zero(SP), c01 = c00, c02 = c00, c03 = c00;
         FloatVector c10 = c00, c11 = c00, c12 = c00, c13 = c00;
         FloatVector c20 = c00, c21 = c00, c22 = c00, c23 = c00;
         FloatVector c30 = c00, c31 = c00, c32 = c00, c33 = c00;
-        final long step = (long) NR * 4;
-        final long l4 = (long) L * 4;
         for (int q = 0; q < k; q++) {
-            long p = wByte + q * step;
-            FloatVector w0 = FloatVector.fromMemorySegment(SP, w, p, NATIVE);
-            FloatVector w1 = FloatVector.fromMemorySegment(SP, w, p + l4, NATIVE);
-            FloatVector w2 = FloatVector.fromMemorySegment(SP, w, p + 2 * l4, NATIVE);
-            FloatVector w3 = FloatVector.fromMemorySegment(SP, w, p + 3 * l4, NATIVE);
+            int p = q * NR;
+            FloatVector w0 = FloatVector.fromArray(SP, w, p);
+            FloatVector w1 = FloatVector.fromArray(SP, w, p + L);
+            FloatVector w2 = FloatVector.fromArray(SP, w, p + 2 * L);
+            FloatVector w3 = FloatVector.fromArray(SP, w, p + 3 * L);
             FloatVector a0 = FloatVector.broadcast(SP, a[o0 + q]);
             c00 = a0.fma(w0, c00);
             c01 = a0.fma(w1, c01);
@@ -301,8 +305,13 @@ public final class CpuOps implements Ops {
                 ld = k;
             }
             float[] tmp = new float[4 * NR];
+            float[] panel = panelBuf.get();
+            if (panel.length < k * NR) {
+                panel = new float[k * NR];
+                panelBuf.set(panel);
+            }
             for (int p = pt * pg; p < Math.min(panels, (pt + 1) * pg); p++) {
-                long wByte = (long) p * k * NR * 4L;
+                MemorySegment.copy(w.seg, F32, (long) p * k * NR * 4L, panel, 0, k * NR);
                 int c0 = p * NR;
                 int nc = Math.min(NR, w.n - c0);
                 for (int r = m0; r < m1; r += 4) {
@@ -311,7 +320,7 @@ public final class CpuOps implements Ops {
                     int o1 = mr > 1 ? o0 + ld : o0;
                     int o2 = mr > 2 ? o0 + 2 * ld : o0;
                     int o3 = mr > 3 ? o0 + 3 * ld : o0;
-                    micro(a, o0, o1, o2, o3, k, w.seg, wByte, tmp);
+                    micro(a, o0, o1, o2, o3, k, panel, tmp);
                     for (int i = 0; i < mr; i++) {
                         store(e, r + i, c0, nc, tmp, i * NR);
                     }

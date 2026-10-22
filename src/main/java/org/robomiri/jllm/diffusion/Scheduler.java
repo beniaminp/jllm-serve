@@ -64,7 +64,11 @@ public final class Scheduler {
         double bs = Json.dbl(config, "beta_start", 0.00085);
         double be = Json.dbl(config, "beta_end", 0.012);
         String sched = Json.str(config, "beta_schedule", "scaled_linear");
-        String sp = spacingOverride != null ? spacingOverride : Json.str(config, "timestep_spacing", "linspace");
+        // a config without "timestep_spacing" means the class's own default in diffusers: "leading" for the PNDM / DDIM / DDPM
+        // schedulers Stable Diffusion 1.x repositories ship (which diffusers' Euler / DPM++ then inherit), "linspace" otherwise
+        String cls = Json.str(config, "_class_name", "");
+        String classDefault = cls.startsWith("PNDM") || cls.startsWith("DDIM") || cls.startsWith("DDPM") ? "leading" : "linspace";
+        String sp = spacingOverride != null ? spacingOverride : Json.str(config, "timestep_spacing", classDefault);
         spacing = sp;
         stepsOffset = (int) Json.num(config, "steps_offset", 0);
         String pred = Json.str(config, "prediction_type", "epsilon");

@@ -11,20 +11,20 @@ public final class KernelBench {
         String precision = a.length > 0 ? a[0] : "f16";
         int iters = a.length > 1 ? Integer.parseInt(a[1]) : 20;
         String only = a.length > 2 ? a[2] : "linear,conv,attention,groupnorm"; // sections to run
-        try (Devices dev = Devices.open("metal", precision, false)) {
+        try (Devices dev = Devices.open(System.getProperty("bench.backend", "metal"), precision, false)) {
             Ops ops = dev.main();
             java.util.Random rnd = new java.util.Random(1);
             // linear: rows x K times K x N
             for (int[] s : only.contains("linear") ? new int[][]{{4096, 1280, 1280}, {4096, 320, 320}, {1024, 5120, 1280}, {16384, 320, 1280}} : new int[0][]) {
                 Tn x = ops.upload(rand(rnd, s[0] * s[2]), s[0], s[2]);
-                Tn w = ops.upload(rand(rnd, s[1] * s[2]), s[1], s[2]);
+                Tn w = weight(ops, rnd, new long[]{s[1], s[2]}, Ops.Kind.LINEAR);
                 double sec = time(ops, iters, () -> ops.free(ops.linear(x, w, null, null, Ops.Act.NONE)));
                 System.out.printf("linear %5d x %4d x %4d: %7.2f ms  %7.1f GFLOP/s%n", s[0], s[2], s[1], sec * 1e3, 2.0 * s[0] * s[1] * s[2] / sec / 1e9);
             }
             // convolution 3x3: [1,h,w,c] with [c,3,3,c]
             for (int[] s : !only.contains("conv") ? new int[0][] : new int[][]{{64, 64, 320, 320}, {32, 32, 640, 640}, {16, 16, 1280, 1280}, {128, 128, 512, 512}, {256, 256, 256, 256}, {512, 512, 128, 128}}) {
                 Tn x = ops.upload(rand(rnd, s[0] * s[1] * s[2]), 1, s[0], s[1], s[2]);
-                Tn w = ops.upload(rand(rnd, s[3] * 9 * s[2]), s[3], 3, 3, s[2]);
+                Tn w = weight(ops, rnd, new long[]{s[3], s[2], 3, 3}, Ops.Kind.CONV);
                 double sec = time(ops, Math.max(3, iters / 4), () -> ops.free(ops.conv2d(x, w, null, 1, 1, 1, 1, 1, null, null)));
                 System.out.printf("conv3x3 %3dx%3d c=%4d->%4d: %7.2f ms  %7.1f GFLOP/s%n", s[0], s[1], s[2], s[3], sec * 1e3,
                         2.0 * s[0] * s[1] * s[2] * s[3] * 9 / sec / 1e9);
@@ -56,6 +56,19 @@ public final class KernelBench {
             seg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i, 1f);
         }
         return new org.robomiri.jllm.safetensors.SafeTensors.Tensor("g", org.robomiri.jllm.safetensors.SafeTensors.DType.F32, new long[]{n}, seg);
+    }
+
+    /** A random weight in the checkpoint's layout; the CPU device packs its own panels from it, Metal takes it as it comes. */
+    private static Tn weight(Ops ops, java.util.Random rnd, long[] shape, Ops.Kind kind) {
+        long n = 1;
+        for (long d : shape) {
+            n *= d;
+        }
+        java.lang.foreign.MemorySegment seg = java.lang.foreign.Arena.ofAuto().allocate(n * 4L);
+        for (long i = 0; i < n; i++) {
+            seg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i, (float) (rnd.nextGaussian() * 0.1));
+        }
+        return ops.weight(new org.robomiri.jllm.safetensors.SafeTensors.Tensor("w", org.robomiri.jllm.safetensors.SafeTensors.DType.F32, shape, seg), kind);
     }
 
     private static float[] rand(java.util.Random r, int n) {
