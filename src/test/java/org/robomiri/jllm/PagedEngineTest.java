@@ -74,6 +74,14 @@ public final class PagedEngineTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args[0]);
+        String repeat = System.getProperty("paged.repeat"); // -Dpaged.repeat=N:dtype runs only that check N times (diagnosis)
+        if (repeat != null) {
+            String[] r = repeat.split(":");
+            for (int i = 0; i < Integer.parseInt(r[0]); i++) {
+                sameAsFlat(dir, r[1]);
+            }
+            System.exit(failures > 0 ? 1 : 0);
+        }
         for (String dt : new String[]{"f32", "f16", "q8"}) {
             sameAsFlat(dir, dt);
         }
@@ -104,15 +112,23 @@ public final class PagedEngineTest {
             // the flat cache twice; once those two agree the JVM is warm for this code, and the paged run must equal them.
             boolean same = false;
             boolean warm = false;
-            for (int attempt = 0; attempt < 12 && !warm; attempt++) {
+            int attempts = 0;
+            String why = "";
+            for (int attempt = 0; attempt < 12 && !(warm && same); attempt++) {
+                attempts++;
                 List<float[]> f1 = script(bf, ids, vocab);
                 List<float[]> f2 = script(bf, ids, vocab);
                 warm = sameLogits(f1, f2);
-                if (warm) {
-                    same = sameLogits(f1, script(bp, ids, vocab));
+                List<float[]> p1 = script(bp, ids, vocab);
+                same = sameLogits(f1, p1);
+                why = "attempt " + attempt + ": flat twice " + (warm ? "agree" : "differ at " + firstDifference(f1, f2))
+                        + ", paged vs flat " + (same ? "agree" : "differ at " + firstDifference(f1, p1));
+                if (!warm || !same) {
+                    System.out.println("     (" + why + ")");
                 }
             }
-            check(warm && same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache");
+            check(warm && same, dt + ": prefill, decode and a rewind give bit-identical logits on the flat and the paged cache"
+                    + (attempts > 1 ? " (" + attempts + " attempts)" : ""));
             int[] prompt = text(flat.engine(), 7, 100);
             Engine.Result rf = flat.engine().generate(prompt, GREEDY, null, () -> false);
             Engine.Result rp = paged.engine().generate(prompt, GREEDY, null, () -> false);
@@ -139,6 +155,21 @@ public final class PagedEngineTest {
         b.forward(Arrays.copyOfRange(ids, 20, 25), 0, 5, pos - 5, l);
         out.add(l.clone());
         return out;
+    }
+
+    /** "call i, index j: x vs y (max |diff| d)" of the first call whose logits differ. */
+    private static String firstDifference(List<float[]> a, List<float[]> b) {
+        for (int i = 0; i < a.size(); i++) {
+            int j = Arrays.mismatch(a.get(i), b.get(i));
+            if (j >= 0) {
+                float max = 0;
+                for (int k = 0; k < a.get(i).length; k++) {
+                    max = Math.max(max, Math.abs(a.get(i)[k] - b.get(i)[k]));
+                }
+                return "call " + i + ", index " + j + ": " + a.get(i)[j] + " vs " + b.get(i)[j] + " (max |diff| " + max + ")";
+            }
+        }
+        return "-";
     }
 
     private static boolean sameLogits(List<float[]> a, List<float[]> b) {
