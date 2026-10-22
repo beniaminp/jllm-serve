@@ -301,6 +301,30 @@ if [ -f "$VBASE/model_index.json" ] && [ -f "$VADAPT/config.json" ]; then
   vidbench "chunked group norm off, 256x256, 16 frames, 2 steps" "-Djllm.diffusion.simpleNorm=true" metal f16 2 256 16
   vidbench "CPU f32, 128x128, 8 frames, 1 step" "" cpu f32 1 128 8
 fi
+# Wan 2.1 (docs/23 section 23.12): the transformer and the VAE decoder on random inputs (the text encoder is not needed for timing); needs the
+# transformer and vae folders of Wan-AI/Wan2.1-T2V-1.3B-Diffusers in models/ (WAN_MODEL=<folder> to choose another)
+WANM="${WAN_MODEL:-models/Wan-AI_Wan2.1-T2V-1.3B-Diffusers}"
+if [ -f "$WANM/transformer/config.json" ] && [ -f "$WANM/vae/config.json" ]; then
+  wanbench() { # label java-opts backend precision latent-frames h w
+    local label="$1" opts="$2" backend="$3" prec="$4" f="$5" h="$6" w="$7"
+    # shellcheck disable=SC2086
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g $opts \
+      -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+      org.robomiri.jllm.diffusion.WanBench "$WANM" "$backend" "$prec" "$f" "$h" "$w" 2 > "$OUT/wan.log" 2>&1 || {
+      echo "| $label | failed | | $(tail -1 "$OUT/wan.log") |"; return; }
+    local dit vae
+    dit=$(grep '^warm  transformer' "$OUT/wan.log" | sed 's/.*: \([0-9.]*\) s per.*/\1/')
+    vae=$(grep '^warm  vae' "$OUT/wan.log" | sed 's/.*: \([0-9.]*\) s$/\1/')
+    echo "| $label | $dit | $vae |"
+  }
+  echo
+  echo "| Wan 2.1 1.3B, 5 latent frames of 24 x 40 (1200 tokens; 17 frames of 192 x 320) | transformer s per evaluation | VAE decode s |"
+  echo "|---|---|---|"
+  wanbench "Metal f32 (defaults)" "" metal f32 5 24 40
+  wanbench "Metal f16" "" metal f16 5 24 40
+  wanbench "flash attention off (scores + softmax), f32" "-Djllm.diffusion.flash=false" metal f32 5 24 40
+  wanbench "chunked group norm off, f32" "-Djllm.diffusion.simpleNorm=true" metal f32 5 24 40
+fi
 # GGUF block types read in place against the old behaviour (dequantize at load, requantize to Q8_0): the same file, a
 # switch on the loader (-Djllm.gguf.requantize=all; a list of ggml type names limits it to those types)
 if [ -n "$GGUF_TYPES" ]; then
