@@ -9,6 +9,8 @@ import org.robomiri.jllm.model.QuantFile;
 import org.robomiri.jllm.diffusion.DiffusersRepo;
 import org.robomiri.jllm.diffusion.ImageModels;
 import org.robomiri.jllm.diffusion.ImagePipeline;
+import org.robomiri.jllm.diffusion.VideoModels;
+import org.robomiri.jllm.diffusion.VideoPipeline;
 import org.robomiri.jllm.web.WebProperties;
 import org.robomiri.jllm.web.images.ImageService;
 import org.robomiri.jllm.web.settings.SettingsService;
@@ -77,7 +79,7 @@ public class ModelManager implements DisposableBean {
     /** What a link resolves to on the Hub: the repository's files and, for a GGUF repository, the model files. */
     public record RepoInfo(String repo, String revision, String file, String quant, String defaultId, boolean gguf,
                            List<HuggingFaceHub.RepoFile> files, List<HuggingFaceHub.RepoFile> ggufFiles,
-                           boolean diffusers, List<HuggingFaceHub.RepoFile> imageFiles) {
+                           boolean diffusers, List<HuggingFaceHub.RepoFile> imageFiles, boolean video) {
     }
 
     /** Where a request points, after the link and the explicit fields are combined. */
@@ -102,6 +104,10 @@ public class ModelManager implements DisposableBean {
         this.kvStore = kvStore;
         this.images = images;
     }
+
+    // --- video (an AnimateDiff motion adapter is held by VideoService; it is used with a Stable Diffusion 1.x base model)
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.robomiri.jllm.web.video.VideoService video;
 
     // --- audio (speech-to-text / text-to-speech models are held by AudioService; a downloaded Whisper or OuteTTS
     // checkpoint is recognised after the download and loaded there instead of as a text model)
@@ -159,6 +165,10 @@ public class ModelManager implements DisposableBean {
     public void unload(String id) throws InterruptedException {
         if (images.has(id)) {
             images.unload(id);
+            return;
+        }
+        if (video != null && video.has(id)) {
+            video.unload(id);
             return;
         }
         if (audio != null && audio.has(id)) {
@@ -220,6 +230,14 @@ public class ModelManager implements DisposableBean {
         Map<String, String> extra = settingsFor(t, r.settings());
         locate(t, extra);
         Settings s = settings.with(extra); // validates before the job is queued
+        if (isVideoModel(t, s)) {
+            Job videoJob = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
+            submit(downloads, videoJob, () -> {
+                videoJob.phase = "downloading";
+                downloadVideoModel(videoJob, s, t);
+            });
+            return videoJob.view();
+        }
         if (isImageModel(t, s)) {
             Job imageJob = newJob(Job.Kind.DOWNLOAD, t.id(), r.source());
             submit(downloads, imageJob, () -> {
@@ -245,6 +263,9 @@ public class ModelManager implements DisposableBean {
         Map<String, String> extra = settingsFor(t, r.settings());
         locate(t, extra);
         Settings s = settings.with(extra);
+        if (isVideoModel(t, s)) {
+            return loadVideoModel(t, s);
+        }
         if (isImageModel(t, s)) {
             return loadImageModel(t, s, extra);
         }
@@ -253,7 +274,7 @@ public class ModelManager implements DisposableBean {
             throw new IllegalArgumentException("slots must be 1 to 8");
         }
         synchronized (this) {
-            if (loaded.containsKey(t.id()) || images.has(t.id())) {
+            if (loaded.containsKey(t.id()) || images.has(t.id()) || (video != null && video.has(t.id()))) {
                 throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
             }
             for (Job j : jobs.values()) {
@@ -320,6 +341,125 @@ public class ModelManager implements DisposableBean {
             }
             System.err.println("Loaded " + t.id() + ": " + l.engine().backend().name() + ", ctx="
                     + l.engine().backend().contextLength() + (slots > 1 ? ", " + slots + " slots" : ""));
+        });
+        return job.view();
+    }
+
+    // ------------------------------------------------------------------ video models (AnimateDiff motion adapters on a Stable Diffusion 1.x base)
+
+    /** A motion adapter: a local folder whose config.json is a MotionAdapter's, or a Hub repository with such a config.json. */
+    private boolean isVideoModel(Target t, Settings s) {
+        if (t.local() || video == null) {
+            return false;
+        }
+        Path dir = repoDir(s, t.model());
+        if (VideoModels.isAdapterDir(dir)) {
+            return true;
+        }
+        if (Files.isDirectory(dir)) {
+            return false; // a model already on disk that is not an adapter
+        }
+        try {
+            HuggingFaceHub hub = ModelLoader.hub(s);
+            List<HuggingFaceHub.RepoFile> listing = hub.listFiles(t.model(), s.get("model.revision"));
+            if (!looksLikeAdapter(listing)) {
+                return false;
+            }
+            Path tmp = Files.createTempDirectory("jllm-adapter");
+            try {
+                hub.ensure(t.model(), s.get("model.revision"), tmp, "config.json");
+                return VideoModels.isAdapterDir(tmp);
+            } finally {
+                deleteTree(tmp);
+            }
+        } catch (Exception e) {
+            return false; // the Hub is unreachable: the normal path reports it
+        }
+    }
+
+    /** A config.json next to diffusers weights at the top level and no pipeline index: only then is it worth fetching the config to see its class. */
+    private static boolean looksLikeAdapter(List<HuggingFaceHub.RepoFile> files) {
+        return files.stream().anyMatch(f -> f.name().equals("config.json")) && files.stream().noneMatch(f -> f.name().equals("model_index.json"))
+                && files.stream().anyMatch(f -> f.name().startsWith("diffusion_pytorch_model") && f.name().endsWith(".safetensors"));
+    }
+
+    private static void deleteTree(Path dir) {
+        try (Stream<Path> st = Files.walk(dir)) {
+            for (Path x : st.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(x);
+            }
+        } catch (IOException e) {
+            // a temporary folder: left for the system to clean up
+        }
+    }
+
+    /** Fetches the adapter (small) and then its base model (a diffusers repository), with a progress estimate for each. */
+    private void downloadVideoModel(Job job, Settings s, Target t) throws Exception {
+        HuggingFaceHub hub = ModelLoader.hub(s);
+        Path dir = repoDir(s, t.model());
+        boolean adapterReady = VideoModels.isAdapterDir(dir) && (Files.isRegularFile(dir.resolve("diffusion_pytorch_model.fp16.safetensors"))
+                || Files.isRegularFile(dir.resolve("diffusion_pytorch_model.safetensors")));
+        if (!adapterReady) {
+            Map<String, Long> sizes = new LinkedHashMap<>();
+            for (HuggingFaceHub.RepoFile f : hub.listFiles(t.model(), s.get("model.revision"))) {
+                if (f.name().equals("config.json") || f.name().equals("diffusion_pytorch_model.fp16.safetensors")) {
+                    sizes.put(f.name(), f.size());
+                }
+            }
+            job.expect(dir, sizes);
+            VideoModels.resolveAdapter(s, hub, t.model());
+        }
+        checkInterrupted();
+        String base = s.get("video.base-model");
+        Path baseDir = ImageModels.folder(s, base); // a Hub repository under model.dir, or a local diffusers folder
+        if (!(DiffusersRepo.isDiffusersDir(baseDir) && DiffusersRepo.missingWeights(baseDir).isEmpty())) {
+            List<HuggingFaceHub.RepoFile> listing = hub.listFiles(base, s.get("model.revision"));
+            Files.createDirectories(baseDir);
+            hub.ensure(base, s.get("model.revision"), baseDir, "model_index.json");
+            Map<String, Object> index = Json.parseObject(Files.readString(baseDir.resolve("model_index.json")));
+            Map<String, Long> sizes = new LinkedHashMap<>();
+            DiffusersRepo.select(listing, index).forEach((n, f) -> sizes.put(n, f.size()));
+            job.expect(baseDir, sizes);
+            ImageModels.resolve(s, hub, base);
+        }
+        writeMarker(s, t);
+    }
+
+    private Job.View loadVideoModel(Target t, Settings s) {
+        synchronized (this) {
+            if (loaded.containsKey(t.id()) || images.has(t.id()) || video.has(t.id())) {
+                throw new IllegalStateException("a model named '" + t.id() + "' is already loaded: unload it first or choose another id");
+            }
+            for (Job j : jobs.values()) {
+                if (j.kind == Job.Kind.LOAD && !j.finished() && j.model.equals(t.id())) {
+                    throw new IllegalStateException("'" + t.id() + "' is already being loaded (job " + j.id + ")");
+                }
+            }
+        }
+        if (!s.getBool("video.enabled")) {
+            throw new IllegalStateException("video generation is switched off (video.enabled=false)");
+        }
+        Job job = newJob(Job.Kind.LOAD, t.id(), t.model());
+        submit(loads, job, () -> {
+            long t0 = System.nanoTime();
+            job.phase = "downloading";
+            downloadVideoModel(job, s, t);
+            checkInterrupted();
+            job.phase = "loading";
+            System.err.println("Loading video model " + t.id() + " (" + t.model() + " on " + s.get("video.base-model") + ")");
+            VideoPipeline p = VideoModels.load(s, ModelLoader.hub(s), t.model());
+            if (Thread.currentThread().isInterrupted()) {
+                p.close();
+                throw new CancellationException();
+            }
+            Map<String, String> snapshot = new LinkedHashMap<>();
+            for (String k : s.keys()) {
+                if (k.startsWith("video.") && !s.get(k).isEmpty() && SettingsService.scope(k) == SettingsService.Scope.LOAD) {
+                    snapshot.put(k, s.get(k));
+                }
+            }
+            video.register(t.id(), t.model(), s.get("video.base-model"), p, snapshot, (System.nanoTime() - t0) / 1e9);
+            System.err.println("Loaded video model " + t.id() + ": " + p.description());
         });
         return job.view();
     }
@@ -515,7 +655,9 @@ public class ModelManager implements DisposableBean {
             Path dir = root.resolve(name);
             try {
                 boolean st = Files.isRegularFile(dir.resolve("config.json"));
-                boolean diffusers = Files.isRegularFile(dir.resolve("model_index.json")); // an image model: usable as it is
+                boolean diffusers = Files.isRegularFile(dir.resolve("model_index.json")) // an image model: usable as it is
+                        || (VideoModels.isAdapterDir(dir) && (Files.isRegularFile(dir.resolve("diffusion_pytorch_model.fp16.safetensors"))
+                        || Files.isRegularFile(dir.resolve("diffusion_pytorch_model.safetensors")))); // a video motion adapter
                 List<String> gguf = HuggingFaceHub.localGgufNames(dir);
                 if (!st && !diffusers && gguf.isEmpty()) {
                     continue;
@@ -664,6 +806,25 @@ public class ModelManager implements DisposableBean {
         List<HuggingFaceHub.RepoFile> files = ModelLoader.hub(s).listFiles(t.model(), rev);
         boolean diffusers = DiffusersRepo.isDiffusers(files);
         List<HuggingFaceHub.RepoFile> imageFiles = List.of();
+        boolean adapter = false;
+        if (!diffusers && video != null && looksLikeAdapter(files)) { // an AnimateDiff motion adapter?
+            try {
+                Path tmp = Files.createTempDirectory("jllm-adapter");
+                try {
+                    ModelLoader.hub(s).ensure(t.model(), rev, tmp, "config.json");
+                    adapter = VideoModels.isAdapterDir(tmp);
+                } finally {
+                    deleteTree(tmp);
+                }
+            } catch (IOException | RuntimeException e) {
+                adapter = false;
+            }
+            if (adapter) {
+                boolean half = files.stream().anyMatch(f -> f.name().equals("diffusion_pytorch_model.fp16.safetensors"));
+                imageFiles = files.stream().filter(f -> f.name().equals("config.json")
+                        || f.name().equals(half ? "diffusion_pytorch_model.fp16.safetensors" : "diffusion_pytorch_model.safetensors")).toList();
+            }
+        }
         if (diffusers) {
             try {
                 Path tmp = Files.createTempDirectory("jllm-index");
@@ -682,12 +843,12 @@ public class ModelManager implements DisposableBean {
                 imageFiles = List.of();
             }
         }
-        boolean gguf = !diffusers && (link.file() != null || link.quant() != null || HuggingFaceHub.isGgufRepo(files));
+        boolean gguf = !diffusers && !adapter && (link.file() != null || link.quant() != null || HuggingFaceHub.isGgufRepo(files));
         List<HuggingFaceHub.RepoFile> ggufFiles = files.stream()
                 .filter(f -> HuggingFaceHub.isGgufModelFile(f.name()))
                 .filter(f -> !f.name().matches(".*-0000[2-9]-of-.*|.*-000[1-9][0-9]-of-.*")) // split parts after the first
                 .toList();
-        return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles, diffusers, imageFiles);
+        return new RepoInfo(t.model(), rev, link.file(), link.quant(), t.id(), gguf, files, ggufFiles, diffusers, imageFiles, adapter);
     }
 
     /** The models in {@code model.dir} and {@code jllm.web.model-dirs}: safetensors checkpoints and GGUF files. */
@@ -698,6 +859,11 @@ public class ModelManager implements DisposableBean {
         }
         for (ImageService.Loaded m : images.loaded()) {
             users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+        }
+        if (video != null) {
+            for (var m : video.loaded()) {
+                users.computeIfAbsent(m.source(), k -> new ArrayList<>()).add(m.id());
+            }
         }
         if (audio != null) {
             for (var a : audio.loaded()) {
@@ -733,6 +899,10 @@ public class ModelManager implements DisposableBean {
             List<String> loadedAs = users.getOrDefault(repo, List.of());
             if (DiffusersRepo.isDiffusersDir(p)) {
                 out.add(new LocalModel(repo, "diffusers", repo, repoRev[1], null, p.toString(), dirSize(p), List.of(), loadedAs, rootName, List.of()));
+                continue;
+            }
+            if (VideoModels.isAdapterDir(p)) {
+                out.add(new LocalModel(repo, "video-adapter", repo, repoRev[1], null, p.toString(), dirSize(p), List.of(), loadedAs, rootName, List.of()));
                 continue;
             }
             if (Files.isRegularFile(p.resolve("config.json"))) {

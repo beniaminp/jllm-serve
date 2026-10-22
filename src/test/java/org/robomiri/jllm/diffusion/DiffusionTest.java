@@ -350,7 +350,7 @@ public final class DiffusionTest {
         check(store.get(a) == null && store.get(b) != null && store.get(c) != null && a.length() == 24, "picture store: oldest evicted beyond its limits, 24-hex ids");
     }
 
-    private static org.robomiri.jllm.safetensors.SafeTensors.Tensor tensor(float[] data, long... shape) {
+    static org.robomiri.jllm.safetensors.SafeTensors.Tensor tensor(float[] data, long... shape) {
         java.lang.foreign.MemorySegment seg = java.lang.foreign.Arena.ofAuto().allocate(data.length * 4L);
         java.lang.foreign.MemorySegment.copy(data, 0, seg, java.lang.foreign.ValueLayout.JAVA_FLOAT_UNALIGNED, 0, data.length);
         return new org.robomiri.jllm.safetensors.SafeTensors.Tensor("t", org.robomiri.jllm.safetensors.SafeTensors.DType.F32, shape, seg);

@@ -23,7 +23,11 @@ multi-token-prediction layer can draft for speculative decoding (`--engine.specu
 dequantized once while converting ([docs/03 §3.7, §3.8](docs/03-safetensors.md#37-mlx-quantized-checkpoints)).
 It also draws: **Stable Diffusion** image generation (SD 1.x, SD 2.x / SD-Turbo, SDXL / SDXL-Turbo, from the Hugging Face
 diffusers layout) as text to image, image to image, inpainting, outpainting and upscaling, on Metal or the CPU, with an
-OpenAI-compatible `/v1/images` API and an Images tab in the web console ([docs/22](docs/22-image-generation.md)).
+OpenAI-compatible `/v1/images` API and an Images tab in the web console ([docs/22](docs/22-image-generation.md)). And it makes
+short **videos**: AnimateDiff (a motion adapter on Stable Diffusion 1.5) writes 8–32 frame clips as MP4 (with `ffmpeg`), animated
+WebP or GIF, with a `/v1/videos/generations` API, `./jllm video`, a Video tab with a frame-strip editor (trim, reverse, speed, export)
+and a `generate_video` chat tool ([docs/23](docs/23-video-generation.md)); the building blocks of Wan 2.1 (diffusion transformer,
+causal 3-D VAE, UMT5 text encoder, flow sampler) are written and checked against diffusers too.
 
 | Piece | Where | Written from scratch |
 |---|---|---|
@@ -74,6 +78,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |
 | Audio tab and editor | record or upload, transcribe (SRT/VTT/JSON, word times), text to speech, a waveform editor (cut, fade, normalize, silence removal, mix, undo; transcribe or replace a selection, edit audio by editing its transcript), dictation and read-aloud in the chat, `transcribe_audio` / `speak` tools | [21](docs/21-audio.md) |
 | Metal emulator | the GPU kernels and the unchanged Metal backend run on any CPU, so every change is checked against the CPU backend without a Mac | [18](docs/18-metal-emulator.md) |
+| Video generation | AnimateDiff written from scratch on the image stack: the motion adapter's 21 temporal transformers (group norm over the whole clip, attention along the frame axis of every pixel, sinusoidal frame positions) inside the SD 1.5 UNet with the frames in the batch, DDIM and the linear schedule it was trained with, the VAE per frame; animated GIF (median-cut palette, dithering, LZW), lossless animated WebP (VP8L: predictors, back references, prefix codes) and MP4 through ffmpeg, all written in Java; `/v1/videos/generations` and `/encode` (streaming progress and previews), `./jllm video`, a Video tab with gallery and frame-strip editor, `generate_video` chat tool; new kernels (axis swap, row table add; RMS norm, rotary, modulation, frame shift for Wan). Equal to diffusers' `AnimateDiffPipeline` on the same noise: UNet within 8·10⁻⁶ relative, 16-frame clips at 78–87 dB PSNR (float16: 45 dB). Wan 2.1 (DiT, causal 3-D VAE, UMT5 with int8 weights, UniPC) checked against diffusers on tiny pipelines (130 dB) and on the real transformer and VAE | [23](docs/23-video-generation.md) |
 | Image generation | Stable Diffusion 1.x / 2.x / Turbo and SDXL written from scratch (CLIP tokenizer and text encoders, UNet, VAE with tiled decoding, Euler / Euler-ancestral / DPM++ 2M, classifier-free guidance, image to image, inpainting with blending or a 9-channel UNet, outpainting, upscaling); on Metal in float16 with its own kernels (implicit-GEMM convolution, flash attention, chunked group norm) and on the CPU; `/v1/images/generations` and `/edits` (streaming progress and previews), `./jllm image`, an Images tab with gallery and canvas editor, `generate_image` / `edit_image` chat tools. Equal to Hugging Face diffusers stage by stage on the same noise: float32 UNet within 5·10⁻⁶ relative, final images at 74–137 dB PSNR (float16: 50–77 dB) | [22](docs/22-image-generation.md) |
 | Pictures as input | vision-language GGUF models (SmolVLM, Qwen2.5-VL, Qwen3-VL; the Gemma 3 projector) see `image_url` parts of a chat request, `--image` files and the console's attached pictures: the vision transformer of the `mmproj-*.gguf` runs on the GPU (own Metal kernels) or the CPU, its embeddings replace the placeholder tokens, Qwen's two-coordinate M-RoPE and Qwen3-VL's deepstack work by rewriting rotary table rows and adding features, and the KV cache is keyed by a hash of the pixels; compared with llama.cpp's `libmtmd` (same prompt ids, embeddings to 2·10⁻³ … 6·10⁻³) | [20](docs/20-vision.md) |
 
@@ -152,6 +157,24 @@ SD-Turbo makes a 512 × 512 picture in 1–4 steps without guidance; `stable-dif
 keys are in [`jllm.properties`](src/main/resources/jllm.properties). Details, the math of diffusion and the measured speed
 against diffusers: [docs/22](docs/22-image-generation.md).
 
+### Video
+
+```sh
+./jllm video --video-model guoyww/animatediff-motion-adapter-v1-5-2 --prompt "a red balloon floating over a green hill, clouds moving, photo" --out balloon.mp4
+./jllm video --video-model guoyww/animatediff-motion-adapter-v1-5-2 --prompt "waves" --frames 16 --fps 8 --width 256 --height 256 --out waves.gif   # 4x faster at 256
+./jllm serve --video-model guoyww/animatediff-motion-adapter-v1-5-2 --model none      # POST /v1/videos/generations and /v1/videos/encode
+./jllm-web/run.sh                                                                      # Models: load the adapter; then the Video tab
+```
+
+The adapter (1.8 GB) and the Stable Diffusion 1.5 base it works with (2.6 GB, fp16 files) are downloaded once into `models/`. MP4 needs `ffmpeg`
+on the PATH (`video.ffmpeg`); without it clips are animated WebP (lossless) or GIF. `video.enabled=false` switches the endpoints, the console tab
+and the chat tool off. All `video.*` keys are in [`jllm.properties`](src/main/resources/jllm.properties); how it works, the API shape (OpenAI has no
+video endpoint: it follows `/v1/images/generations`), the editor, accuracy against diffusers and the measured speed: [docs/23](docs/23-video-generation.md).
+Quality note: the `v1-5-2` adapter on the plain Stable Diffusion 1.5 gives poor clips (the same ones diffusers makes: the tests compare the numbers, not
+the taste); point `video.base-model` at a fine-tuned SD 1.5 checkpoint in diffusers format for good ones. Wan 2.1 is wired into
+`./jllm video --video-model <local folder>` (tested on a tiny random pipeline), but its 22.7 GB float32 text encoder was beyond this work's download budget, so only the
+transformer and the VAE were verified on the real weights.
+
 ### GGUF files
 
 ```sh
@@ -223,7 +246,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/completions` (both support `"stream": true`), `GET /v1/models`,
-`GET /health`, `GET /` (chat UI), with an image model loaded `POST /v1/images/generations` and `/v1/images/edits` ([docs/22](docs/22-image-generation.md#2212-api-command-line-console-and-chat-tools)), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
+`GET /health`, `GET /` (chat UI), with an image model loaded `POST /v1/images/generations` and `/v1/images/edits` ([docs/22](docs/22-image-generation.md#2212-api-command-line-console-and-chat-tools)), with a video model loaded `POST /v1/videos/generations` and `/v1/videos/encode` ([docs/23](docs/23-video-generation.md#239-api-command-line-console-and-chat-tool)), and with audio models loaded `POST /v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/audio/speech` ([docs/21](docs/21-audio.md)). Sampling fields: `temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`,
 `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop`, `enable_thinking`, `logit_bias` (token id →
 −100…100, added to the logits). Also supported:
 
@@ -305,6 +328,11 @@ repository by its launcher).
   rotate / flip, resize, brightness / contrast / saturation, a brush and eraser that paint an inpainting mask, outpainting
   (extend the canvas and inpaint the border), undo / redo, PNG export and image-to-image / inpaint requests with a strength
   slider. The chat tools `generate_image` and `edit_image` let a model draw and change pictures, shown inline in the chat.
+- **Video**: clips from a video model (AnimateDiff; load the motion adapter on the Models page, which fetches the Stable Diffusion base too):
+  prompt, negative prompt, size, frames, fps, steps, guidance, scheduler, file format, seed; a progress bar per step with a live preview of the
+  first frame; a clip editor (canvas player with scrubber, frame strip, trim start / end, delete or hold a frame, reverse, ping-pong, speed,
+  loop / ping-pong / once playback, export as MP4 / WebP / GIF); a gallery kept in the browser (IndexedDB). The chat tool `generate_video`
+  shows the clip inline in the conversation.
 - **Settings**: every key of `jllm.properties` with its documentation, its default and where its value comes
   from. Changes are validated and stored in `jllm-web.properties` (on top of `$JLLM_CONFIG` /
   `./jllm.properties`, as for the CLI). Sampling and chat defaults apply to the next request; backend, context and
@@ -520,6 +548,11 @@ REAL_PYTHON=<venv>/bin/python scripts/real-weights-check.sh Qwen/Qwen2.5-0.5B-In
 GPU (`scripts/diffusion/make-tiny.py`, `reference.py`; the real-model checks and the speed comparison are in
 [docs/22](docs/22-image-generation.md#2213-verified-against-diffusers)).
 
+`mvn test` also runs `VideoTest` (a tiny random AnimateDiff pipeline against diffusers' `AnimateDiffPipeline` for DDIM / Euler / DPM++ on the CPU and
+the GPU, the GIF / animated-WebP / MP4 writers by round trips, the video API and the adapter download from a fake Hub; `scripts/diffusion/make-tiny-video.py`,
+`reference_video.py`) and `WanTest` (a tiny random Wan 2.1 pipeline, its UMT5 encoder, tokenizer, transformer, VAE and UniPC sampler against diffusers and
+transformers; `make-tiny-wan.py`, `reference_wan.py`); the real-model checks are in [docs/23](docs/23-video-generation.md#2310-verified-against-diffusers).
+
 `mvn test` also runs `ToolCallTest` (constrained tool calls, jump-forward and speculation under the constraint, on a scripted model and on Qwen3-0.6B) and `ConstraintBench` in its quick mode (the token masks against a brute-force oracle); `scripts/tool-call-check.sh` checks on the CPU and on Metal that the constrained greedy output is the same with speculation off, prompt lookup and draft models ([docs/17 §17.7](docs/17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)). `mvn test` needs `models/Qwen_Qwen3-0.6B` (run `./jllm download` first); `ServerTest` checks the HTTP server
 against a fake backend (settings validation, bad requests, keep-alive, slow, stalled and disconnected clients). Two more checks are run by hand:
 
@@ -559,7 +592,7 @@ src/main/java/org/robomiri/jllm/
   metal/                 FFM bindings + Metal forward pass
   sampling/              sampling parameters and sampler
   engine/                generation loop, prefix cache, stop strings, KV cache files
-  diffusion/             image generation: CLIP tokenizer + text encoders, UNet, VAE, samplers, pipelines, Ops (CPU, Metal), image API
+  diffusion/             image and video generation: CLIP tokenizer + text encoders, UNet (with AnimateDiff motion modules), VAE, samplers, pipelines, Wan 2.1 (transformer, 3-D VAE, UMT5), file writers (GIF, WebP, MP4), Ops (CPU, Metal), image and video API
   vision/                pictures as input: preprocessing (Pillow-compatible resize), the vision transformer on CPU and Metal, chat-request parts, projector discovery
   server/                HTTP server, OpenAI-compatible API, web UI
 src/main/native/jllm_metal.m                       Objective-C shim exposing a C ABI over Metal
@@ -576,6 +609,7 @@ jllm-web/                Spring Boot web console + OpenAI API (separate Maven pr
     mcp/                 MCP client: stdio, Streamable HTTP and SSE transports, server manager
     openai/              /v1 endpoints
     images/              image models in memory, /v1/images/generations and /edits, the pictures served by link
+    video/               video models in memory, /v1/videos/generations and /encode, the clips served by link
     settings/            jllm.properties view and persisted overrides
     api/                 /api management, tools and integrations (opencode, Continue, aider, Cline) endpoints, API key filter
     logs/                captured engine output

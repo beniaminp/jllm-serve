@@ -27,7 +27,7 @@ public interface Ops extends AutoCloseable {
     }
 
     enum Act {
-        NONE, SILU, GELU, QUICK_GELU
+        NONE, SILU, GELU, QUICK_GELU, GELU_TANH
     }
 
     String name();
@@ -54,6 +54,9 @@ public interface Ops extends AutoCloseable {
     default void trim(long keepBytes) {
     }
 
+    /** A persistent float32 vector or table (a {@link Kind#VECTOR} weight) made from host data; freed with {@link #free}. */
+    Tn vector(float[] data, int... shape);
+
     /** Loads a checkpoint tensor as a weight of the given kind (converted to this device's format). */
     Tn weight(SafeTensors.Tensor t, Kind kind);
 
@@ -73,7 +76,16 @@ public interface Ops extends AutoCloseable {
     Tn conv2d(Tn x, Tn w, Tn bias, int stride, int padT, int padL, int padB, int padR, Tn chanBias, Tn residual);
 
     /** Group normalisation over {@code [B, H, W, C]} (or {@code [B, L, C]}), optionally followed by SiLU. */
-    Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu);
+    default Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu) {
+        return groupNorm(x, gamma, beta, groups, eps, silu, x.dim(0));
+    }
+
+    /**
+     * Group normalisation where the tensor is read as {@code samples} independent items of {@code rows / samples} positions
+     * each: the statistics of a group are taken over all positions of one item. The video networks use it to normalise over
+     * the frames of a clip too ({@code [B·F, H, W, C]} with {@code samples = B}).
+     */
+    Tn groupNorm(Tn x, Tn gamma, Tn beta, int groups, float eps, boolean silu, int samples);
 
     /** Layer normalisation over the last dimension. */
     Tn layerNorm(Tn x, Tn gamma, Tn beta, float eps);
@@ -108,6 +120,48 @@ public interface Ops extends AutoCloseable {
 
     /** Concatenation along the channel dimension of two {@code [B, H, W, *]} tensors. */
     Tn concat(Tn a, Tn b);
+
+    /**
+     * Swaps two axes: {@code x} read as {@code [outer, d1, d2, C]} becomes {@code [outer, d2, d1, C]}, returned with the given
+     * shape (any shape of the same size). The video networks move between "frames of one pixel" and "pixels of one frame" with it.
+     */
+    Tn swapAxes(Tn x, int outer, int d1, int d2, int... shape);
+
+    /** RMS normalisation over the last dimension: {@code x · rsqrt(mean(x²) + eps) · gamma} ({@code gamma} may be null). */
+    Tn rmsNorm(Tn x, Tn gamma, float eps);
+
+    /**
+     * Rotary position embedding on {@code x [rows, heads·hd]}: the pair {@code (x[2i], x[2i+1])} of every head of row {@code r} is
+     * rotated by the angle whose cosine and sine are {@code cos[r mod period, i]} and {@code sin[r mod period, i]} (float tables
+     * {@code [period, hd/2]}): {@code (c·a − s·b, s·a + c·b)}.
+     */
+    Tn rope(Tn x, Tn cos, Tn sin, int heads, int period);
+
+    /**
+     * Adaptive layer-norm modulation of {@code x [B, L, C]}: {@code x · (1 + scale) + shift} with, for batch item b,
+     * {@code scale[c] = table[spec[3] + c] + tproj[b·spec[0] + spec[1] + c]} and {@code shift[c] = table[spec[4] + c] + tproj[b·spec[0] + spec[2] + c]}
+     * ({@code spec = {tprojStride, tprojScaleOffset, tprojShiftOffset, tableScaleOffset, tableShiftOffset}}; {@code tproj [B, ...]}
+     * an activation, {@code table} a float vector).
+     */
+    Tn modulate(Tn x, Tn tproj, Tn table, int[] spec, int batch);
+
+    /** {@code res + y · gate} with {@code gate[c] = table[tableOffset + c] + tproj[b·tprojStride + tprojOffset + c]} for {@code [B, L, C]} tensors. */
+    Tn gatedAdd(Tn res, Tn y, Tn tproj, Tn table, int tprojStride, int tprojOffset, int tableOffset, int batch);
+
+    /** A weight of the given kind from host data already in its final layout ({@code [out, in]} or {@code [Cout, kh, kw, Cin]}). */
+    Tn matrix(float[] data, Kind kind, int... shape);
+
+    /** {@code [T, ...]}: {@code out[t] = x[t − shift]}, zero for {@code t < shift} (a causal shift along the first dimension). */
+    Tn frameShift(Tn x, int shift);
+
+    /** {@code count} entries of the first dimension of {@code x} from {@code start}. */
+    Tn rows(Tn x, int start, int count);
+
+    /** Concatenation along the first dimension of two tensors with equal trailing dimensions. */
+    Tn stack(Tn a, Tn b);
+
+    /** {@code out[r, :] = x[r, :] + table[r mod period, :]} for {@code x [rows, C]} and a float vector table {@code [>= period, C]}. */
+    Tn addRows(Tn x, Tn table, int period);
 
     @Override
     void close();

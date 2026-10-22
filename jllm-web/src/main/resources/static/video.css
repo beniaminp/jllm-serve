@@ -1,0 +1,58 @@
+/* jllm console: the Video tab (create, clip editor, gallery). Reuses the variables and controls of app.css. */
+
+.vd-page > * { max-width: 1560px; }
+.vd-create { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 16px; align-items: start; margin-bottom: 16px; }
+.vd-form { display: flex; flex-direction: column; gap: 10px; }
+.vd-form textarea { resize: vertical; width: 100%; }
+.vd-form .hint { margin: 0; }
+.vd-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.vd-grid2 input, .vd-grid2 select { width: 100%; }
+.vd-seedrow { display: flex; gap: 6px; }
+.vd-seedrow input { flex: 1; min-width: 0; }
+.vd-result h2 { margin-bottom: 8px; }
+.vd-run { margin: 4px 0 10px; }
+.vd-run .progress { min-width: 0; height: 8px; }
+.vd-run .progress div { transition: width .2s; }
+.vd-preview { display: block; margin-top: 8px; width: 192px; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+
+/* player */
+.vd-player { background: #0b0d11; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; justify-content: center; }
+.vd-player canvas { display: block; max-width: 100%; max-height: 62vh; width: auto; height: auto; }
+.vd-bar { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.vd-bar input[type=range] { flex: 1; min-width: 0; padding: 0; accent-color: var(--accent); }
+.vd-bar button { min-width: 38px; }
+.vd-tools { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin: 4px 0 8px; }
+.vd-tools label, .vd-export label { flex-direction: row; align-items: center; gap: 8px; margin: 0; }
+.vd-tools input[type=range] { width: 160px; padding: 0; accent-color: var(--accent); }
+
+/* frame strip */
+.vd-strip { display: flex; gap: 6px; overflow-x: auto; padding: 4px 2px 8px; }
+.vd-th { position: relative; flex: 0 0 auto; padding: 0; height: 74px; border-radius: 6px; overflow: hidden; background: var(--panel-2); border: 2px solid transparent; }
+.vd-th img { display: block; height: 100%; width: auto; }
+.vd-th span { position: absolute; left: 3px; bottom: 2px; font-size: 10px; padding: 0 4px; border-radius: 6px; background: rgba(20, 22, 28, .75); color: #fff; }
+.vd-th.now { border-color: var(--border); }
+.vd-th.on { border-color: var(--accent); }
+.vd-th:focus-visible, .vd-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.vd-edit, .vd-export { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+.vd-meta { margin-top: 8px; }
+.vd-meta dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 6px 0; font-size: 12.5px; }
+.vd-meta dt { color: var(--muted); } .vd-meta dd { margin: 0; overflow-wrap: anywhere; }
+.vd-prompt { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
+
+/* gallery */
+.vd-gallery h2 { margin-bottom: 10px; }
+.vd-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.vd-tile { position: relative; padding: 0; aspect-ratio: 1; overflow: hidden; border-radius: 8px; background: var(--panel-2); }
+.vd-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.vd-tile:hover, .vd-tile.on { border-color: var(--accent); }
+.vd-tile-badge { position: absolute; left: 4px; bottom: 4px; font-size: 10px; padding: 0 6px; border-radius: 8px; background: rgba(20, 22, 28, .75); color: #fff; }
+.vd-tiles .empty { grid-column: 1 / -1; }
+
+/* clips inside the chat */
+.tc-vid { display: block; max-width: 100%; max-height: 360px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel-2); }
+.md-vid { display: block; max-width: 100%; max-height: 420px; border-radius: 10px; border: 1px solid var(--border); margin: 6px 0; }
+
+@media (max-width: 900px) {
+  .vd-create { grid-template-columns: 1fr; }
+  .vd-tools input[type=range] { width: 110px; }
+}

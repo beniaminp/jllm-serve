@@ -78,6 +78,10 @@ public final class DiffusionCompare {
         return new double[]{max, sum / got.length, ref};
     }
 
+    int failureCount() {
+        return failures;
+    }
+
     private void say(String s) {
         if (!quiet) {
             System.out.println(s);
