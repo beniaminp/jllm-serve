@@ -1761,6 +1761,326 @@ split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
+# ---------------------------------------------------------------------------------------------- sparse decode attention (docs/26)
+# kv_summary, sparse_score, sparse_select and attention_dec_sp: the block summaries of a paged cache, the Quest bound, the
+# top-k selection and the attention over the selected blocks, each against numpy, then the four in a row against a numpy
+# implementation of the whole step.
+
+def half_down(x):
+    """The largest half <= x (float32 x clamped to the finite halves): KvSummary.down."""
+    x = np.clip(x, -65504, 65504).astype(np.float32)
+    h = x.astype(np.float16)
+    with np.errstate(over='ignore'):
+        return np.where(h.astype(np.float32) > x, np.nextafter(h, np.float16(-np.inf)), h).astype(np.float16)
+
+
+def half_up(x):
+    x = np.clip(x, -65504, 65504).astype(np.float32)
+    h = x.astype(np.float16)
+    with np.errstate(over='ignore'):
+        return np.where(h.astype(np.float32) < x, np.nextafter(h, np.float16(np.inf)), h).astype(np.float16)
+
+
+def kv_cache_rows(kind, k0, n_kv, hd, rotate=False):
+    """The key rows of a cache of `kind` ('f32', 'f16', 'q8') as the engine stores them for the float rows k0, with the
+    row stride in elements and the dequantized values; `rotate`: q8 of Hadamard-rotated keys."""
+    if kind == 'q8':
+        if rotate:
+            k0 = q4_rotate(k0.reshape(len(k0), n_kv, hd)).reshape(len(k0), -1)
+        rows, deq = q8_rows(k0, n_kv, hd)
+        return rows, n_kv * hd + 4 * n_kv, deq, '_q8'
+    if kind == 'f16':
+        h = k0.astype(np.float16)
+        return h, n_kv * hd, h.astype(np.float32), '_h'
+    return k0, n_kv * hd, k0, ''
+
+
+def summary_ref(deq, n_kv, hd, lo_row, hi_row):
+    """Per kv head, channel min / max over rows [lo_row, hi_row) of the dequantized keys, rounded outwards to halves:
+    ([n_kv, hd] lo, [n_kv, hd] hi)."""
+    x = deq[lo_row:hi_row].reshape(hi_row - lo_row, n_kv, hd)
+    return half_down(x.min(axis=0)), half_up(x.max(axis=0))
+
+
+def kv_summary(kind, hd, n_kv=2, pos=13, n=70, ctx=128, page=4, rotate=False):
+    rng = np.random.default_rng(31 + hd + page)
+    k0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    k0[:, 3] *= 9
+    k0[:, hd + 5] *= 0.001
+    k0[7, 2] = 70000.0 if kind == 'f32' else k0[7, 2]  # beyond the largest half: clamped
+    rows, stride, deq, suffix = kv_cache_rows(kind, k0, n_kv, hd, rotate)
+    block = 1 << page
+    nb = (ctx + block - 1) // block
+    kc, tbl = paged([rows], page)
+    total = len(kc) // block
+    sums = np.full(total * n_kv * 2 * hd, 0x7BFF, np.uint16)   # garbage (a large half) where nothing is written
+    first, last = pos >> page, (pos + n - 1) >> page
+    E.dispatch('kv_summary' + suffix, [kc, sums, tbl], pack('iiiiii', hd, n_kv, stride, pos, n, page), (n_kv, last - first + 1), (hd,))
+    ok = True
+    for lb in range(nb):
+        phys = tbl[lb]
+        got = sums[phys * n_kv * 2 * hd:(phys + 1) * n_kv * 2 * hd].reshape(n_kv, 2, hd)
+        if first <= lb <= last:
+            lo, hi = summary_ref(deq, n_kv, hd, lb * block, min((lb + 1) * block, pos + n))
+            ok &= bool((got[:, 0].view(np.uint16) == lo.view(np.uint16)).all() and (got[:, 1].view(np.uint16) == hi.view(np.uint16)).all())
+        else:
+            ok &= bool((got == 0x7BFF).all())
+    check(ok, 'kv_summary%s hd=%d%s, rows %d..%d in blocks of %d: bit for bit the outward-rounded min / max of the valid rows'
+          % (suffix, hd, ' (rotated q8)' if rotate else '', pos, pos + n - 1, block))
+
+
+for _hd in (64, 128, 256):
+    for _kind in ('f32', 'f16', 'q8'):
+        kv_summary(_kind, _hd)
+kv_summary('q8', 128, rotate=True)
+kv_summary('f16', 128, pos=0, n=1)                  # a decode step on the first position
+kv_summary('f32', 64, pos=47, n=1, page=5)          # a decode step inside a block of 32
+kv_summary('q8', 64, pos=100, n=3, page=3)          # blocks of 8
+kv_summary('f32', 128, pos=64, n=64, page=6)        # one whole block
+
+
+def sparse_summaries(deq, n_kv, hd, block, nb, upto):
+    """lo / hi halves of every block of the first `upto` rows: [nb, n_kv, 2, hd] float16."""
+    out = np.zeros((nb, n_kv, 2, hd), np.float16)
+    for lb in range(nb):
+        hi_row = min((lb + 1) * block, upto)
+        if hi_row > lb * block:
+            lo, hi = summary_ref(deq, n_kv, hd, lb * block, hi_row)
+            out[lb, :, 0], out[lb, :, 1] = lo, hi
+    return out
+
+
+def bound_ref(q, sm, n_heads, n_kv, hd, nblocks):
+    """The bound of every block j < nblocks for each kv head: the largest over the group of sum_c max(q_c lo_c, q_c hi_c)."""
+    grp = n_heads // n_kv
+    out = np.zeros((n_kv, nblocks), np.float64)
+    for g in range(n_kv):
+        for j in range(nblocks):
+            lo, hi = sm[j, g, 0].astype(np.float64), sm[j, g, 1].astype(np.float64)
+            out[g, j] = max(np.maximum(q[(g * grp + r) * hd:(g * grp + r + 1) * hd] * lo,
+                                       q[(g * grp + r) * hd:(g * grp + r + 1) * hd] * hi).sum() for r in range(grp))
+    return out
+
+
+def sparse_score(hd, n_heads=8, n_kv=2, pos=600, ctx=800, page=4, per_group=8, seed=0):
+    rng = np.random.default_rng(41 + hd + n_heads + seed)
+    block = 1 << page
+    nb = (ctx + block - 1) // block
+    q = rng.standard_normal(n_heads * hd).astype(np.float32)
+    k0 = (rng.standard_normal((ctx, n_kv * hd)) * rng.random(n_kv * hd) * 3).astype(np.float32)
+    sm = sparse_summaries(k0, n_kv, hd, block, nb, ctx)
+    # the pool: the summaries at the blocks' physical places, garbage elsewhere
+    total = nb + 3
+    ids = np.random.default_rng(page * 7919 + ctx).permutation(total)[:nb].astype(np.int32)
+    pool = np.full((total, n_kv, 2, hd), 0x7BFF, np.uint16).view(np.float16)
+    for lb in range(nb):
+        pool[ids[lb]] = sm[lb]
+    nblocks = (pos >> page) + 1
+    stride = nb
+    scores = np.full(n_kv * stride, np.nan, np.float32)
+    groups = (nb + per_group - 1) // per_group
+    E.dispatch('sparse_score_d%d' % hd, [q, pool, ids, scores], pack('iiiiii', n_heads, n_kv, pos, page, stride, per_group),
+               (groups, n_kv), (128,))
+    ref = bound_ref(q, sm, n_heads, n_kv, hd, nblocks)
+    got = scores.reshape(n_kv, stride)[:, :nblocks].astype(np.float64)
+    err = np.abs(got - ref).max() / (np.abs(ref).max() + 1e-9)
+    untouched = np.isnan(scores.reshape(n_kv, stride)[:, nblocks:]).all()
+    check(err < 1e-5 and untouched, 'sparse_score_d%d, %d heads over %d kv heads, %d blocks: max relative error %.1e, later blocks untouched %s'
+          % (hd, n_heads, n_kv, nblocks, err, untouched))
+
+
+for _hd in (64, 128, 256):
+    sparse_score(_hd)
+sparse_score(128, n_heads=4, n_kv=4)                 # one query head per kv head
+sparse_score(128, n_heads=8, n_kv=1)                 # a group of eight
+sparse_score(64, pos=37, ctx=64, per_group=4)        # three blocks
+sparse_score(128, pos=0, ctx=64)                     # one block
+sparse_score(128, pos=799, ctx=800, per_group=64)    # last position, big groups
+
+
+def select_ref(scores, tbl, nblocks, sink, win, topk):
+    c1 = nblocks - win
+    cand = np.arange(sink, c1)
+    order = np.lexsort((cand, -scores[cand].astype(np.float64)))     # higher score first, the lower block on a tie
+    top = np.sort(cand[order[:topk]])
+    return np.concatenate([tbl[:sink], tbl[top], tbl[c1:nblocks]]).astype(np.int32)
+
+
+def sparse_select(nblocks, sink, win, topk, kind='random', n_kv=2, page=4, seed=0):
+    rng = np.random.default_rng(51 + nblocks + topk + seed)
+    nb = nblocks + 5
+    stride = nb
+    if kind == 'ties':       # a handful of distinct values: most candidates tie with the k-th
+        sc = rng.integers(-2, 3, (n_kv, stride)).astype(np.float32)
+    elif kind == 'equal':    # every candidate equal: the lowest blocks win
+        sc = np.full((n_kv, stride), 1.5, np.float32)
+    elif kind == 'wide':     # magnitudes over many powers of two, both signs
+        sc = ((rng.standard_normal((n_kv, stride)) * 10.0 ** rng.integers(-6, 6, (n_kv, stride)))).astype(np.float32)
+    else:
+        sc = rng.standard_normal((n_kv, stride)).astype(np.float32)
+    sc = np.ascontiguousarray(sc)
+    sel_stride = sink + topk + win + 3
+    tbl = np.random.default_rng(page * 7919 + nb).permutation(nb + 7)[:nb].astype(np.int32)
+    sel = np.full(n_kv * sel_stride, -1, np.int32)
+    pos = (nblocks - 1) * (1 << page) + 5
+    E.dispatch('sparse_select', [sc.reshape(-1), tbl, sel], pack('iiiiiiii', n_kv, pos, page, sink, win, topk, stride, sel_stride),
+               (n_kv,), (256,))
+    got = sel.reshape(n_kv, sel_stride)
+    ok = True
+    for g in range(n_kv):
+        ref = select_ref(sc[g], tbl, nblocks, sink, win, topk)
+        ok &= bool((got[g, :len(ref)] == ref).all()) and bool((got[g, len(ref):] == -1).all())
+    check(ok, 'sparse_select, %d blocks, sink %d, window %d, top %d, %s scores: sinks, the chosen blocks ascending, the window'
+          % (nblocks, sink, win, topk, kind))
+
+
+for _kind in ('random', 'ties', 'equal', 'wide'):
+    sparse_select(300, 1, 4, 16, _kind)
+    sparse_select(40, 1, 2, 8, _kind)
+sparse_select(5000, 2, 16, 64, 'random')
+sparse_select(5000, 1, 16, 64, 'ties', seed=1)
+sparse_select(90, 1, 2, 1, 'random')                  # top one
+sparse_select(90, 0, 1, 7, 'random')                  # no sinks, one window block
+sparse_select(30, 1, 2, 26, 'random')                 # nearly every candidate
+
+
+def sparse_dec(hd, G, kind='f32', n_heads=8, n_kv=2, pos0=600, n_split=1, softcap=0.0, ctx=640, page=4, sel_blocks=24, rotate=False,
+               seed=0):
+    """attention_dec_sp over a random selection of `sel_blocks` blocks (always the one holding pos0, last), against the
+    float64 attention over the selected positions of the dequantized cache."""
+    rng = np.random.default_rng(61 + hd + G + seed)
+    block = 1 << page
+    q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
+    k0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    v0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    krows, stride, kd, suffix = kv_cache_rows(kind, k0, n_kv, hd, rotate)
+    vrows, _, vd, _ = kv_cache_rows(kind, v0, n_kv, hd)
+    nblocks = (pos0 >> page) + 1
+    last = nblocks - 1
+    sels = []
+    for g in range(n_kv):
+        pick = np.sort(rng.choice(last, sel_blocks - 1, replace=False))
+        sels.append(np.concatenate([pick, [last]]))
+    kc, vc, tbl = paged([krows, vrows], page)
+    sel_stride = sel_blocks + 2
+    sel = np.full(n_kv * sel_stride, -1, np.int32)
+    for g in range(n_kv):
+        sel[g * sel_stride:g * sel_stride + sel_blocks] = tbl[sels[g]]
+    keys = (sel_blocks - 1) * block + (pos0 & (block - 1)) + 1
+    part = np.zeros(n_heads * n_split * (hd + 2), np.float32)
+    out = np.zeros((1, n_heads * hd), np.float32)
+    scale = 1 / np.sqrt(hd)
+    # AttnDecSpParams: AttnSplitParams (nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk pageShift) + selStride selBlocks
+    E.dispatch('attention_dec_sp_g%d_d%d%s' % (G, hd, suffix), [q, kc, vc, part, out, sel],
+               pack('iiiiifiiifiiiii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, 0, softcap, n_split, 0, page,
+                    sel_stride, sel_blocks), (n_heads // G, (n_split + 3) // 4), (128,))
+    if n_split > 1:
+        E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+    grp = n_heads // n_kv
+    ref = np.zeros((1, n_heads * hd), np.float64)
+    for h in range(n_heads):
+        g = h // grp
+        pos = np.concatenate([np.arange(b * block, min((b + 1) * block, pos0 + 1)) for b in sels[g]])
+        assert len(pos) == keys
+        s = kd[pos][:, g * hd:(g + 1) * hd].astype(np.float64) @ q[0, h * hd:(h + 1) * hd].astype(np.float64) * scale
+        if softcap > 0:
+            s = np.tanh(s / softcap) * softcap
+        p = np.exp(s - s.max())
+        p /= p.sum()
+        ref[0, h * hd:(h + 1) * hd] = p @ vd[pos][:, g * hd:(g + 1) * hd].astype(np.float64)
+    err = np.abs(out - ref).max()
+    check(err < 1e-4, 'attention_dec_sp_g%d_d%d%s, %d selected keys, %d split(s)%s%s: max err %.2e'
+          % (G, hd, suffix, keys, n_split, ', softcap' if softcap else '', ', blocks of %d' % block, err))
+
+
+for _hd in (64, 128, 256):
+    for _kind in ('f32', 'f16', 'q8'):
+        for _g in (1, 2) if _hd == 256 else (1, 2, 4):
+            sparse_dec(_hd, _g, _kind)
+            sparse_dec(_hd, _g, _kind, n_split=3, pos0=611)
+sparse_dec(128, 2, 'q8', rotate=True, n_split=3)
+sparse_dec(64, 2, 'f32', softcap=3.0, n_split=5)
+sparse_dec(128, 2, 'f16', page=5, pos0=1000, ctx=1024, sel_blocks=12, n_split=2)
+sparse_dec(128, 2, 'f32', page=4, pos0=16 * 40, ctx=704, sel_blocks=10)             # the token is the first row of its block
+sparse_dec(128, 2, 'f32', page=4, pos0=16 * 40 + 15, ctx=704, sel_blocks=10)        # ... and the last
+
+
+def sparse_step(hd, kind, n_heads=8, n_kv=2, pos=1003, ctx=1024, page=4, sink=1, win=3, topk=20, rotate=False, needle=700):
+    """The four kernels in a row, as MetalKernels.sparseDecodeAttention dispatches them, against a numpy step: summaries of
+    the block of the token, bounds of every block, selection, attention over the selection. A key along the first query head
+    is planted at `needle`; its block must be among the chosen."""
+    rng = np.random.default_rng(71 + hd)
+    block = 1 << page
+    grp = n_heads // n_kv
+    q = rng.standard_normal(n_heads * hd).astype(np.float32)
+    k0 = (rng.standard_normal((ctx, n_kv * hd)) * (1 + 0.5 * rng.random(n_kv * hd))).astype(np.float32)
+    v0 = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
+    for g in range(n_kv):
+        k0[needle, g * hd:(g + 1) * hd] = 2.0 * q[g * grp * hd:(g * grp + 1) * hd]
+    # a rotated cache scores the rotated query against rotated keys: the host hands the kernels the rotated query
+    qq = q
+    if rotate:
+        qq = q4_rotate(q.reshape(n_heads, hd)).reshape(-1)
+    krows, stride, kd, suffix = kv_cache_rows(kind, k0, n_kv, hd, rotate)
+    vrows, _, vd, _ = kv_cache_rows(kind, v0, n_kv, hd)
+    nb = (ctx + block - 1) // block
+    kc, vc, tbl = paged([krows, vrows], page)
+    total = len(kc) // block
+    sums = np.full(total * n_kv * 2 * hd, 0x7BFF, np.uint16)
+    # summaries of every block below the token's: written earlier (here by the same kernel), then the token's block alone
+    nblocks = (pos >> page) + 1
+    E.dispatch('kv_summary' + suffix, [kc, sums, tbl], pack('iiiiii', hd, n_kv, stride, 0, pos + 1, page), (n_kv, nblocks), (hd,))
+    E.dispatch('kv_summary' + suffix, [kc, sums, tbl], pack('iiiiii', hd, n_kv, stride, pos, 1, page), (n_kv, 1), (hd,))
+    scores = np.full(n_kv * nb, np.nan, np.float32)
+    per_group = 8
+    E.dispatch('sparse_score_d%d' % hd, [qq, sums.view(np.float16), tbl, scores],
+               pack('iiiiii', n_heads, n_kv, pos, page, nb, per_group), ((nb + per_group - 1) // per_group, n_kv), (128,))
+    nsel = sink + topk + win
+    sel_stride = nsel
+    sel = np.full(n_kv * sel_stride, -1, np.int32)
+    E.dispatch('sparse_select', [scores, tbl, sel], pack('iiiiiiii', n_kv, pos, page, sink, win, topk, nb, sel_stride), (n_kv,), (256,))
+    part = np.zeros(n_heads * 3 * (hd + 2), np.float32)
+    out = np.zeros((1, n_heads * hd), np.float32)
+    scale = np.float32(1 / np.sqrt(hd))
+    if rotate:
+        scale = np.float32(scale / (hd & -hd))
+    n_split = 3
+    E.dispatch('attention_dec_sp_g2_d%d%s' % (hd, suffix), [qq.reshape(1, -1), kc, vc, part, out, sel],
+               pack('iiiiifiiifiiiii', n_heads, n_kv, hd, pos, ctx, scale, n_heads * hd, stride, 0, 0.0, n_split, 0, page,
+                    sel_stride, nsel), (n_heads // 2, (n_split + 3) // 4), (128,))
+    E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
+    # numpy: the same step
+    sm = sparse_summaries(kd, n_kv, hd, block, nb, pos + 1)
+    bound = bound_ref(qq, sm, n_heads, n_kv, hd, nblocks)
+    ref = np.zeros((1, n_heads * hd), np.float64)
+    chosen = []
+    ok_sel = True
+    for g in range(n_kv):
+        cand = np.arange(sink, nblocks - win)
+        order = np.lexsort((cand, -bound[g, cand]))
+        top = np.sort(cand[order[:topk]])
+        blocks = np.concatenate([np.arange(sink), top, np.arange(nblocks - win, nblocks)])
+        chosen.append(blocks)
+        ok_sel &= bool((sel.reshape(n_kv, sel_stride)[g] == tbl[blocks]).all())
+        for r in range(grp):
+            h = g * grp + r
+            pos_l = np.concatenate([np.arange(b * block, min((b + 1) * block, pos + 1)) for b in blocks])
+            s = kd[pos_l][:, g * hd:(g + 1) * hd].astype(np.float64) @ qq[h * hd:(h + 1) * hd].astype(np.float64) * float(scale)
+            p = np.exp(s - s.max())
+            p /= p.sum()
+            ref[0, h * hd:(h + 1) * hd] = p @ vd[pos_l][:, g * hd:(g + 1) * hd].astype(np.float64)
+    found = all((needle >> page) in c for c in chosen)
+    err = np.abs(out - ref).max()
+    check(ok_sel and found and err < 1e-4, 'sparse step%s hd=%d%s: selection equals numpy %s, planted key found %s, attention max err %.2e'
+          % (suffix, hd, ' (rotated q8)' if rotate else '', ok_sel, found, err))
+
+
+for _hd in (64, 128, 256):
+    for _kind in ('f32', 'f16', 'q8'):
+        sparse_step(_hd, _kind)
+sparse_step(128, 'q8', rotate=True)
+
+
 if not ONLY:
     # the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout
     import kernel_tests_diffusion

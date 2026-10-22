@@ -1849,17 +1849,23 @@ static inline void ldw(device const half *p, thread float4 *o) {
 template <int W>
 static inline void ldw(device const char *p, thread float4 *o) { o[0] = float4(*(device const char4 *)p); }
 
-template <typename KV, int G, int D, int W>
-kernel void attention_dec(device const float *q [[buffer(0)]],
-                          device const KV *kc [[buffer(1)]],
-                          device const KV *vc [[buffer(2)]],
-                          device float *part [[buffer(3)]],
-                          device float *out [[buffer(4)]],
-                          device const int *tbl [[buffer(5)]],
-                          constant AttnSplitParams &p [[buffer(6)]],
-                          uint2 tgp [[threadgroup_position_in_grid]],
-                          ushort sg [[simdgroup_index_in_threadgroup]],
-                          ushort lane [[thread_index_in_simdgroup]]) {
+// The body of attention_dec, shared by the dense kernel and the sparse one (docs/26): with SP the "cache" is the list of
+// blocks sparse_select chose for each kv head (tbl + kvh * selStride, physical block ids in ascending logical order,
+// the last one holding the token), so a key s of the virtual sequence of selBlocks blocks is row
+// (tb[s >> pageShift] << pageShift) | (s & mask) of the pool. P is AttnSplitParams or AttnDecSpParams.
+template <typename KV, int G, int D, int W, bool SP, typename P>
+static inline void dec_body(device const float *q,
+                            device const KV *kc,
+                            device const KV *vc,
+                            device float *part,
+                            device float *out,
+                            device const int *tbl,
+                            constant P &p,
+                            int selStride,
+                            int selBlocks,
+                            uint2 tgp,
+                            ushort sg,
+                            ushort lane) {
     constexpr int NP = W / 4;                   // float4 per chunk
     constexpr int NC = D / (8 * W);             // chunks of a key row per lane
     constexpr int NV = NC * NP;                 // float4 of a key row per lane
@@ -1869,8 +1875,10 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
     const ushort ty = lane >> 3;
     const int hq0 = int(tgp.x) * G;
     const int kvh = hq0 / (p.nHeads / p.nKvHeads);
-    const int len = p.pos0 + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    // sparse (SP): the keys are the selected blocks, the last of which holds the token's position (a partial block)
+    const int len = SP ? (selBlocks - 1) * (1 << p.pageShift) + (p.pos0 & ((1 << p.pageShift) - 1)) + 1 : p.pos0 + 1;
+    const int first = (!SP && p.window > 0) ? max(0, len - p.window) : 0;
+    device const int *tb = tbl + (SP ? kvh * selStride : 0);   // SP: this kv head's selected blocks (physical ids)
     const int chunk = p.chunk > 0 ? p.chunk : (((len - first + p.nSplit - 1) / p.nSplit + 31) & ~31);
     const int s0 = first + split * chunk;
     const int s1 = min(len, s0 + chunk);
@@ -1907,7 +1915,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             const int key = base + 4 * j + ty;
             for (int g = 0; g < G; g++) ps[g][j] = 0.0f;
             if (key < s1) {
-                device const KV *kr = kb + kv_row(tbl, p.pageShift, key) * p.kvStride;
+                device const KV *kr = kb + kv_row(tb, p.pageShift, key) * p.kvStride;
                 for (int c = 0; c < NC; c++) {
                     float4 kk[NP];
                     ldw<W>(kr + W * (tx + 8 * c), kk);
@@ -1937,7 +1945,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
         }
         const int mykey = base + 4 * tx + ty;
         float ks = 0.0f;
-        if (mykey < s1) ks = p.scale * kv_scale(kc + kv_row(tbl, p.pageShift, mykey) * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+        if (mykey < s1) ks = p.scale * kv_scale(kc + kv_row(tb, p.pageShift, mykey) * p.kvStride, p.kvStride, p.nKvHeads, kvh);
         // 2. online softmax over the 32 keys of the block
         float pe[G];
         for (int g = 0; g < G; g++) {
@@ -1959,7 +1967,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             for (int g = 0; g < G; g++) pj[g] = simd_shuffle(pe[g], ushort(ty * 8 + j));
             const int key = base + 4 * j + ty;
             if (key < s1) {
-                const ulong rv = kv_row(tbl, p.pageShift, key);
+                const ulong rv = kv_row(tb, p.pageShift, key);
                 device const KV *vr = vb + rv * p.kvStride;
                 const float vs = kv_scale(vc + rv * p.kvStride, p.kvStride, p.nKvHeads, kvh);
                 for (int c = 0; c < NC; c++) {
@@ -1996,17 +2004,319 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
     }
 }
 
+template <typename KV, int G, int D, int W>
+kernel void attention_dec(device const float *q [[buffer(0)]],
+                          device const KV *kc [[buffer(1)]],
+                          device const KV *vc [[buffer(2)]],
+                          device float *part [[buffer(3)]],
+                          device float *out [[buffer(4)]],
+                          device const int *tbl [[buffer(5)]],
+                          constant AttnSplitParams &p [[buffer(6)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]]) {
+    dec_body<KV, G, D, W, false, AttnSplitParams>(q, kc, vc, part, out, tbl, p, 0, 0, tgp, sg, lane);
+}
+
+// attention_dec over the blocks sparse_select chose (docs/26): tbl is the selection (nKvHeads rows of selStride block ids),
+// selBlocks the number of selected blocks. Buffers: q(0) kc(1) vc(2) part(3) out(4) sel(5), AttnDecSpParams(6).
+struct AttnDecSpParams {
+    int nHeads;
+    int nKvHeads;
+    int headDim;
+    int pos0;
+    int ctx;
+    float scale;
+    int qStride;
+    int kvStride;
+    int window;      // unused (sparse layers have no window)
+    float softcap;
+    int nSplit;
+    int chunk;
+    int pageShift;
+    int selStride;   // block ids per kv head in the selection
+    int selBlocks;   // blocks in the selection (the keys are the first selBlocks * 2^pageShift - (rest of the last block))
+};
+
+template <typename KV, int G, int D, int W>
+kernel void attention_dec_sp(device const float *q [[buffer(0)]],
+                             device const KV *kc [[buffer(1)]],
+                             device const KV *vc [[buffer(2)]],
+                             device float *part [[buffer(3)]],
+                             device float *out [[buffer(4)]],
+                             device const int *tbl [[buffer(5)]],
+                             constant AttnDecSpParams &p [[buffer(6)]],
+                             uint2 tgp [[threadgroup_position_in_grid]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]]) {
+    dec_body<KV, G, D, W, true, AttnDecSpParams>(q, kc, vc, part, out, tbl, p, p.selStride, p.selBlocks, tgp, sg, lane);
+}
+
 // float / q8 caches: 4 elements per lane chunk; half: 8 (16-byte loads), and "_h4" with 4 for an A/B run (-Djllm.metal.decWide=false)
 #define DEC_INST(KV, G, D, W, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_dec<KV, G, D, W>) attention_dec<KV, G, D, W>;
+#define DEC_INST_SP(KV, G, D, W, NAME) \
+    template [[host_name(NAME)]] kernel decltype(attention_dec_sp<KV, G, D, W>) attention_dec_sp<KV, G, D, W>;
 #define DEC_INST_KV(G, D) \
     DEC_INST(float, G, D, 4, "attention_dec_g" #G "_d" #D) \
     DEC_INST(half, G, D, 8, "attention_dec_g" #G "_d" #D "_h") \
     DEC_INST(half, G, D, 4, "attention_dec_g" #G "_d" #D "_h4") \
-    DEC_INST(char, G, D, 4, "attention_dec_g" #G "_d" #D "_q8")
+    DEC_INST(char, G, D, 4, "attention_dec_g" #G "_d" #D "_q8") \
+    DEC_INST_SP(float, G, D, 4, "attention_dec_sp_g" #G "_d" #D) \
+    DEC_INST_SP(half, G, D, 8, "attention_dec_sp_g" #G "_d" #D "_h") \
+    DEC_INST_SP(char, G, D, 4, "attention_dec_sp_g" #G "_d" #D "_q8")
 DEC_INST_KV(1, 64) DEC_INST_KV(2, 64) DEC_INST_KV(4, 64)
 DEC_INST_KV(1, 128) DEC_INST_KV(2, 128) DEC_INST_KV(4, 128)
 DEC_INST_KV(1, 256) DEC_INST_KV(2, 256)
+
+// ---------------------------------------------------------------------------------------------- 4c. sparse decode attention
+// Sparse attention while decoding (docs/26, backend.kv-sparse; Quest-style block selection on the paged cache). Per pool
+// block, kv head and layer a SUMMARY of the block's keys is kept: for every channel the minimum and the maximum over the
+// block's valid rows, as halves rounded outwards (the minimum down, the maximum up), layout [block][kv head][lo[D], hi[D]].
+// For a query q and a block with summary (lo, hi): every key k of the block has lo_i <= k_i <= hi_i, and q_i k_i is linear in
+// k_i, so q.k <= sum_i max(q_i lo_i, q_i hi_i), an upper bound of the block's best score. A decode step
+//   1. kv_summary      recomputes the summary of the blocks the step just wrote (exact over their valid rows),
+//   2. sparse_score    bounds every block with the step's (for a rotated q8 cache: rotated) query, the largest over the
+//                      group's query heads, into scores[kv head][block],
+//   3. sparse_select   chooses per kv head the sinks, the topK best candidates and the recent window, as physical block ids
+//                      in ascending logical order (the last is the block of the token),
+//   4. attention_dec_sp  attends exactly over the chosen blocks (attention_dec reading its rows through the selection).
+
+struct KvSummaryParams {
+    int headDim;
+    int nKvHeads;
+    int stride;      // cache row stride in elements (as the attention kernels' kvStride)
+    int pos;         // first position of the chunk just written
+    int n;           // rows of the chunk
+    int pageShift;
+};
+
+// The largest half <= x and the smallest half >= x (x clamped to the finite halves): KvSummary.down / up in Java.
+static inline ushort half_down(float x) {
+    x = clamp(x, -65504.0f, 65504.0f);
+    const half h = half(x);
+    ushort b = as_type<ushort>(h);
+    if (float(h) > x) b = b == 0 ? ushort(0x8001) : ((b & 0x8000) == 0 ? ushort(b - 1) : ushort(b + 1));
+    return b;
+}
+static inline ushort half_up(float x) {
+    x = clamp(x, -65504.0f, 65504.0f);
+    const half h = half(x);
+    ushort b = as_type<ushort>(h);
+    if (float(h) < x) b = (b == 0 || b == 0x8000) ? ushort(1) : ((b & 0x8000) == 0 ? ushort(b + 1) : ushort(b - 1));
+    return b;
+}
+
+// kv_summary<KV>: grid (nKvHeads, touched blocks), headDim threads (one per channel). The touched blocks are the logical
+// blocks (pos >> pageShift) .. ((pos + n - 1) >> pageShift); block lb is summarised over its rows below pos + n (every
+// row for a full block), read through the block table, dequantized (q8: int8 * the row's scale, as the attention kernels
+// do). The summary is of the keys as STORED (for a rotated q8 cache, the rotated, quantized ones), so the bound holds for
+// the scores the attention kernels compute.
+template <typename KV>
+kernel void kv_summary(device const KV *kc [[buffer(0)]],
+                       device ushort *sum [[buffer(1)]],
+                       device const int *tbl [[buffer(2)]],
+                       constant KvSummaryParams &p [[buffer(3)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort tid [[thread_position_in_threadgroup]]) {
+    const int D = p.headDim;
+    if (int(tid) >= D) return;
+    const int B = 1 << p.pageShift;
+    const int lb = (p.pos >> p.pageShift) + int(tgp.y);
+    const int rows = min(B, p.pos + p.n - lb * B);
+    const int kvh = int(tgp.x);
+    const int phys = tbl[lb];
+    float lo = INFINITY;
+    float hi = -INFINITY;
+    for (int r = 0; r < rows; r++) {
+        device const KV *rp = kc + ((ulong(phys) << p.pageShift) | ulong(r)) * p.stride;
+        const float x = float(rp[kvh * D + int(tid)]) * kv_scale(rp, p.stride, p.nKvHeads, kvh);
+        lo = min(lo, x);
+        hi = max(hi, x);
+    }
+    device ushort *dst = sum + (ulong(phys) * p.nKvHeads + kvh) * 2 * D;
+    dst[tid] = half_down(lo);
+    dst[D + int(tid)] = half_up(hi);
+}
+
+template [[host_name("kv_summary")]] kernel decltype(kv_summary<float>) kv_summary<float>;
+template [[host_name("kv_summary_h")]] kernel decltype(kv_summary<half>) kv_summary<half>;
+template [[host_name("kv_summary_q8")]] kernel decltype(kv_summary<char>) kv_summary<char>;
+
+struct SparseScoreParams {
+    int nHeads;
+    int nKvHeads;
+    int pos;
+    int pageShift;
+    int scoreStride;  // floats per kv head in scores
+    int perGroup;     // blocks per threadgroup (4 simdgroups, a block each at a time)
+};
+
+// sparse_score<D>: scores[kv head][j] = max over the kv head's query heads h of sum_c max(q_hc lo_c, q_hc hi_c) for the
+// logical block j of the token at pos (every block 0 .. pos >> pageShift; the caller ignores the forced ones). Grid
+// (ceil(blocks of the context / perGroup), nKvHeads), 128 threads; a simdgroup takes a block, lane l the channels
+// l * D/32 .. +D/32 (contiguous halves). Threadgroups past the token's last block return at once, so the grid, which is
+// fixed by the context, does not depend on the position.
+template <int D>
+kernel void sparse_score(device const float *q [[buffer(0)]],
+                         device const half *sum [[buffer(1)]],
+                         device const int *tbl [[buffer(2)]],
+                         device float *scores [[buffer(3)]],
+                         constant SparseScoreParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort sg [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NPL = D / 32;
+    constexpr int MAXG = 8;
+    const int nBlocks = (p.pos >> p.pageShift) + 1;
+    const int j0 = int(tgp.x) * p.perGroup;
+    if (j0 >= nBlocks) return;
+    const int j1 = min(nBlocks, j0 + p.perGroup);
+    const int kvh = int(tgp.y);
+    const int grp = p.nHeads / p.nKvHeads;
+    float qv[MAXG][NPL];
+    for (int g = 0; g < MAXG; g++) {
+        for (int e = 0; e < NPL; e++) qv[g][e] = g < grp ? q[(kvh * grp + g) * D + int(lane) * NPL + e] : 0.0f;
+    }
+    for (int j = j0 + int(sg); j < j1; j += DEC_SG) {
+        device const half *s = sum + (ulong(tbl[j]) * p.nKvHeads + kvh) * 2 * D;
+        float lo[NPL];
+        float hi[NPL];
+        for (int e = 0; e < NPL; e++) {
+            lo[e] = float(s[int(lane) * NPL + e]);
+            hi[e] = float(s[D + int(lane) * NPL + e]);
+        }
+        float best = -INFINITY;
+        for (int g = 0; g < MAXG; g++) {
+            if (g >= grp) break;
+            float acc = 0.0f;
+            for (int e = 0; e < NPL; e++) acc += max(qv[g][e] * lo[e], qv[g][e] * hi[e]);
+            best = max(best, simd_sum(acc));
+        }
+        if (lane == 0) scores[ulong(kvh) * p.scoreStride + j] = best;
+    }
+}
+
+template [[host_name("sparse_score_d64")]] kernel decltype(sparse_score<64>) sparse_score<64>;
+template [[host_name("sparse_score_d128")]] kernel decltype(sparse_score<128>) sparse_score<128>;
+template [[host_name("sparse_score_d256")]] kernel decltype(sparse_score<256>) sparse_score<256>;
+
+struct SparseSelectParams {
+    int nKvHeads;
+    int pos;
+    int pageShift;
+    int sink;         // leading blocks always selected
+    int win;          // trailing blocks always selected (the token's own block among them)
+    int topK;         // candidates chosen by their score
+    int scoreStride;  // floats per kv head in scores
+    int selStride;    // ints per kv head in the selection
+};
+
+// The key of a float in the unsigned order of the floats (larger float, larger key).
+static inline uint sort_key(float s) {
+    const uint u = as_type<uint>(s);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// sparse_select: per kv head (one 256-thread threadgroup) the topK candidate blocks (logical blocks sink .. nBlocks - win - 1)
+// with the highest scores, ties going to the lower block (KvSummary.rank in Java), written with the sinks and the window as
+//   sel[kv head][0 .. sink)  the first blocks,  [sink .. sink + topK)  the chosen candidates in ascending order,
+//   [sink + topK .. + win)   the last blocks,
+// as PHYSICAL block ids (tbl[j]). The k-th highest key is found by four 8-bit radix passes with a threadgroup histogram; the
+// candidates above it, and the first of those equal to it, are then written in index order by an exclusive scan of the
+// threads' counts. The caller dispatches it only when the context has more than sink + topK + win blocks.
+kernel void sparse_select(device const float *scores [[buffer(0)]],
+                          device const int *tbl [[buffer(1)]],
+                          device int *sel [[buffer(2)]],
+                          constant SparseSelectParams &p [[buffer(3)]],
+                          uint kvh [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_position_in_threadgroup]]) {
+    threadgroup atomic_uint hist[256];
+    threadgroup uint cntA[256];
+    threadgroup uint cntT[256];
+    threadgroup uint pick[2];
+    const int nBlocks = (p.pos >> p.pageShift) + 1;
+    const int c0 = p.sink;
+    const int c1 = nBlocks - p.win;
+    const int per = (c1 - c0 + 255) / 256;
+    const int mb = c0 + int(tid) * per;
+    const int me = min(c1, mb + per);
+    device const float *sc = scores + ulong(kvh) * p.scoreStride;
+    device int *dst = sel + ulong(kvh) * p.selStride;
+
+    uint prefix = 0u;
+    uint remaining = uint(p.topK);
+    for (int pass = 0; pass < 4; pass++) {
+        const int shift = 24 - 8 * pass;
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = mb; j < me; j++) {
+            const uint key = sort_key(sc[j]);
+            if (pass == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) {
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint cum = 0u;
+            uint digit = 0u;
+            uint rem = remaining;
+            for (int b = 255; b >= 0; b--) {
+                const uint h = atomic_load_explicit(&hist[b], memory_order_relaxed);
+                if (cum + h >= remaining) {
+                    digit = uint(b);
+                    rem = remaining - cum;
+                    break;
+                }
+                cum += h;
+            }
+            pick[0] = digit;
+            pick[1] = rem;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= pick[0] << shift;
+        remaining = pick[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix is the key of the topK-th best candidate; `remaining` of the candidates equal to it are taken, lowest block first
+    uint above = 0u;
+    uint equal = 0u;
+    for (int j = mb; j < me; j++) {
+        const uint key = sort_key(sc[j]);
+        above += key > prefix ? 1u : 0u;
+        equal += key == prefix ? 1u : 0u;
+    }
+    cntA[tid] = above;
+    cntT[tid] = equal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint outAt = 0u;
+        uint tiesSeen = 0u;
+        for (int t = 0; t < 256; t++) {
+            const uint a = cntA[t];
+            const uint e = cntT[t];
+            const uint take = min(e, remaining > tiesSeen ? remaining - tiesSeen : 0u);
+            cntA[t] = outAt;      // where thread t starts writing
+            cntT[t] = take;       // how many of its ties it takes
+            outAt += a + take;
+            tiesSeen += e;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint at = cntA[tid];
+    uint take = cntT[tid];
+    for (int j = mb; j < me; j++) {
+        const uint key = sort_key(sc[j]);
+        if (key > prefix) {
+            dst[p.sink + at++] = tbl[j];
+        } else if (key == prefix && take > 0u) {
+            take--;
+            dst[p.sink + at++] = tbl[j];
+        }
+    }
+    for (int i = int(tid); i < p.sink; i += 256) dst[i] = tbl[i];
+    for (int i = int(tid); i < p.win; i += 256) dst[p.sink + p.topK + i] = tbl[c1 + i];
+}
 
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
