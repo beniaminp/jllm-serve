@@ -88,7 +88,7 @@ public final class GgufMetalBench {
                 QTensor t = QTensor.mapped(qt, rows, cols, seg);
                 Metal.Buffer w = k.wrap(seg);
                 StringBuilder line = new StringBuilder(String.format("%-7s %dx%d %6.1f MB", qt, rows, cols, blk.length / 1e6));
-                for (int n : new int[]{1, 64}) {
+                for (int n : new int[]{1, Integer.getInteger("n", 64)}) {
                     double best = Double.MAX_VALUE;
                     for (int trial = 0; trial < 9; trial++) {
                         k.begin();
@@ -102,6 +102,35 @@ public final class GgufMetalBench {
                     line.append(String.format("   n=%-2d %8.0f us (%5.1f GB/s, %5.2f ns per 1000 weights)", n, best / 1e3,
                             blk.length / best, best / ((double) rows * cols) * 1000));
                 }
+                // the fused families at n = 64: gate|up as a split pair (matmul_swiglu) and q|k|v (matmul3, three tensors of rows / 2 rows)
+                int hr = rows / 2;
+                long half = (long) hr * (cols / qt.blockSize) * qt.blockBytes;
+                QTensor gate = QTensor.mapped(qt, hr, cols, seg.asSlice(0, half));
+                QTensor up = QTensor.mapped(qt, hr, cols, seg.asSlice(half, half));
+                QTensor gu = QTensor.split(gate, up, 0);
+                Metal.Buffer wg = k.wrap(gate.data);
+                Metal.Buffer sw = k.scratch(64L * hr * 4);
+                Metal.Buffer o2 = k.scratch(64L * hr * 4);
+                Metal.Buffer o3 = k.scratch(64L * hr * 4);
+                double bs = Double.MAX_VALUE;
+                double b3 = Double.MAX_VALUE;
+                for (int trial = 0; trial < 9; trial++) {
+                    k.begin();
+                    long t0 = System.nanoTime();
+                    for (int rep = 0; rep < 20; rep++) {
+                        k.swiglu(gu, wg, in, null, sw, false, 64);
+                    }
+                    k.commitAndWait();
+                    bs = Math.min(bs, (System.nanoTime() - t0) / 20.0);
+                    k.begin();
+                    t0 = System.nanoTime();
+                    for (int rep = 0; rep < 20; rep++) {
+                        k.matmul3(gate, wg, gate, wg, gate, wg, in, null, sw, o2, 0, o3, 0, false, null, null, null, 64);
+                    }
+                    k.commitAndWait();
+                    b3 = Math.min(b3, (System.nanoTime() - t0) / 20.0);
+                }
+                line.append(String.format("   swiglu n=64 %7.0f us   matmul3 n=64 %7.0f us", bs / 1e3, b3 / 1e3));
                 System.out.println(line);
             }
         }

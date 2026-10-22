@@ -2713,27 +2713,23 @@ static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int
         device const uchar *blk = wq + (grow * nb + u) * (Q5 ? 24 : 20);
         const float2 dm = float2(as_type<half2>(*(device const uint *)blk));
         const uint qh = Q5 ? *(device const uint *)(blk + 4) : 0u;
-        device const uchar4 *q = (device const uchar4 *)(blk + (Q5 ? 8 : 4));
+        device const uint *q = (device const uint *)(blk + (Q5 ? 8 : 4));
         for (int k = 0; k < NV; k++) {
             const int v = v0 + k;
-            uchar4 n = (q[v & 3] >> uchar4(uchar((v >> 2) << 2))) & uchar4(15);
-            if (Q5) {
-                const uint t = qh >> (((v >> 2) << 4) + ((v & 3) << 2));
-                n |= uchar4(t & 1u, (t >> 1) & 1u, (t >> 2) & 1u, (t >> 3) & 1u) << uchar4(4);
-            }
-            w[k] = float4(n) * dm.x + dm.y;
+            // four nibbles of a uint at once; the four fifth bits spread to one per byte by a multiply (SWAR, few registers)
+            uint n = (q[v & 3] >> ((v >> 2) << 2)) & 0x0F0F0F0Fu;
+            if (Q5) n |= ((((qh >> (((v >> 2) << 4) + ((v & 3) << 2))) & 15u) * 0x204081u) & 0x01010101u) << 4;
+            w[k] = float4(as_type<uchar4>(n)) * dm.x + dm.y;
         }
     } else if (QT == GG_Q5_0) {
         device const uchar *blk = wq + (grow * nb + u) * 22;
-        device const ushort *p = (device const ushort *)blk;
         const float d = float(*(device const half *)blk);
-        const uint qh = uint(p[1]) | (uint(p[2]) << 16);
+        const uint qh = as_type<uint>(*(device const packed_uchar4 *)(blk + 2));
         for (int k = 0; k < NV; k++) {
             const int v = v0 + k;
-            uchar4 n = (gg_ld4(p, 3 + 2 * (v & 3)) >> uchar4(uchar((v >> 2) << 2))) & uchar4(15);
-            const uint t = qh >> (((v >> 2) << 4) + ((v & 3) << 2));
-            n |= uchar4(t & 1u, (t >> 1) & 1u, (t >> 2) & 1u, (t >> 3) & 1u) << uchar4(4);
-            w[k] = (float4(n) - 16.0f) * d;
+            uint n = (as_type<uint>(*(device const packed_uchar4 *)(blk + 6 + 4 * (v & 3))) >> ((v >> 2) << 2)) & 0x0F0F0F0Fu;
+            n |= ((((qh >> (((v >> 2) << 4) + ((v & 3) << 2))) & 15u) * 0x204081u) & 0x01010101u) << 4;
+            w[k] = (float4(as_type<uchar4>(n)) - 16.0f) * d;
         }
     } else if (QT == GG_Q3_K) {
         const int nsb = nb >> 3;
@@ -2747,11 +2743,11 @@ static inline void gg_new(device const uchar *wq, ulong grow, int nb, int u, int
         const int qbase = 16 + 16 * (uu >> 2);                 // ushort index of qs[32 n]
         for (int k = 0; k < NV; k++) {
             const int v = v0 + k;
-            const uchar4 qv = gg_ld4(p, qbase + 2 * v);
-            const uchar4 hv = gg_ld4(p, 2 * v);
-            const int4 c = int4((qv >> uchar4(sh)) & uchar4(3));
-            const int4 m = int4((hv >> uchar4(uchar(uu))) & uchar4(1));
-            w[k] = float4(c - 4 + (m << 2)) * (v < 4 ? dl0 : dl1);
+            const uint qw = uint(p[qbase + 2 * v]) | (uint(p[qbase + 2 * v + 1]) << 16);
+            const uint hw = uint(p[2 * v]) | (uint(p[2 * v + 1]) << 16);
+            // per byte: 2-bit code + 4 where the mask bit is set (always below 8), minus 4
+            const uint c = ((qw >> sh) & 0x03030303u) + (((hw >> uu) & 0x01010101u) << 2);
+            w[k] = (float4(as_type<uchar4>(c)) - 4.0f) * (v < 4 ? dl0 : dl1);
         }
     } else if (QT == GG_IQ4_NL) {
         device const uchar *blk = wq + (grow * nb + u) * 18;

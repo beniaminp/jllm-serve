@@ -414,8 +414,19 @@ final class MetalKernels implements AutoCloseable {
      * format has an MMA instantiation ({@code matmul_mma_q4/q8/q2k/q6k} and the GGUF ones).
      */
     private static boolean useMma(int n, QType type) {
-        return MMA_PREFILL && n >= MMA_MIN_TOKENS
+        return MMA_PREFILL && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
                 && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
+    }
+
+    /**
+     * Formats whose tiled prefill kernels ({@code matmul_pf} and its fused forms, chunks of {@link #PREFILL_MIN_TOKENS} to
+     * {@link #MMA_MIN_TOKENS} tokens) are 3 - 4x slower than the matrix-unit ones even for those short chunks (measured with
+     * {@code GgufMetalBench}, 1024 x 3072 matrix, 8 / 16 / 24 tokens: Q4_K 394 / 815 / 1081 us against 240 / 243 / 248 us on the
+     * matrix units; Q5_K, Q5_0 and Q3_K alike, the other formats are within 10% either way): the 32-weight unit decode of these
+     * bit-field formats is done per lane and per row in the tile kernel. They use the matrix units from 8 tokens on.
+     */
+    static boolean tiledIsSlow(QType t) {
+        return t == QType.Q4_K || t == QType.Q5_K || t == QType.Q5_0 || t == QType.Q3_K;
     }
 
     /** The MMA prefill families whose two forms ({@code <family>_mma}, {@code <family>_hmma}) are chosen per shape. */
