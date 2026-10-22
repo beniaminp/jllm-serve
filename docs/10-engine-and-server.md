@@ -702,8 +702,9 @@ the CPU ([08 §8.24](08-metal-backend.md#824-batched-decoding-across-slots-metal
 the leader's command queue and activation buffers, and each row's RoPE, cache store and attention are dispatched
 against its own slot's cache buffers. Below 8 slots those kernels compute each row exactly as the slot's own step, so on
 Metal the batched logits were bit-identical to the alone ones in every family tested on the emulator (with experts on the
-CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba falls back
-to running the queued steps one after another.
+CPU: equal to rounding, the CPU's batched expert kernels add in another order). Mamba and Qwen3-Next (recurrent
+states) fall back to running the queued steps one after another; they have no draft-model or prompt-lookup speculation
+either (a recurrent state cannot be rolled back).
 
 ## 10.10 Configuration
 
