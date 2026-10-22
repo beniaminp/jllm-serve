@@ -191,12 +191,22 @@ ggen deepseek_v3 deepseek-v3-fused-exps
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \
   "$M/${P}-Qwen3NextForCausalLM" "$M/${P}-Qwen3Next2ForCausalLM"
 
+# attention_dec (docs/08 8.31) forced on for the checkpoints whose head size it handles (64, 256; the self-check would
+# otherwise decide, and the 32-wide tiny models never use it): every cache type, including the q8 cache with rotated keys
+# (backend.kv-q8-rotate: the rotated query and scale / B go to attention_dec like the other kernels), in single steps,
+# batched rows, replay, speculation and short verification chunks.
+"$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
+  -Djllm.metal.decodeAttention=true -Djllm.smoke.quants=Q4_0 ${JAVA_OPTS:-} \
+  -cp target/classes:target/test-classes org.robomiri.jllm.ArchSmoke "$METAL_LIB" \
+  "$LLAMA" "$M/${P}-Phi3MhaForCausalLM" "$M/${P}-Gemma2Hd256ForCausalLM"
+
 # Second pass: every dense and MoE prefill matmul through the half-weight MMA kernels (hmma=true, MMA from 2 tokens
 # on instead of 32 / 16), for the formats where they are exact (Q4_0, Q8_0): the same bounds as above must hold.
 # (Not Phi3: with MMA prefill from 2 tokens its q8-cache replay x batch comparison flips an int8 rounding step, 4e-2 with
 # the f32 MMA kernels as well, 3e-3 with the half-weight ones; its f32 / f16 caches and every other model pass.)
 # The q4-cache cases are left out of this pass (-Djllm.smoke.q4=false) for the same reason: a batched pass of 3 rows and a
 # lone step take different matmul kernels here, and a 4-bit code flips (4e-3 on Phi3Mha); the first pass checks them all.
+# So is the replay x batch case of the q8 cache with rotated keys (backend.kv-q8-rotate): its codes flip the same way.
 exec "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false \
   -Djllm.metal.hmma=true -Djllm.metal.mmaMinTokens=2 -Djllm.metal.moeMmaMin=2 -Djllm.smoke.quants=Q4_0,Q8_0 -Djllm.smoke.q4=false \
   -Djllm.metal.expertCountEvery=1 -Djllm.metal.cpuMoeSyncUs=0 ${JAVA_OPTS:-} \

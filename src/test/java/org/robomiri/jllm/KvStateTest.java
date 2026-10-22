@@ -66,8 +66,18 @@ public final class KvStateTest {
             Architecture cfg = Architecture.load(dir);
             String kind = ((Decoder) cfg).attention() instanceof Attention.Mla ? "mla" : "gqa";
             try (ModelWeights w = ModelWeights.load(dir, cfg, QType.Q8_0, ShardProvider.local(dir))) {
-                for (KvDtype dt : List.of(KvDtype.F32, KvDtype.F16)) {
-                    String label = dir.getFileName() + " (" + kind + ", " + dt + ")";
+                // q8 with plain and with Hadamard-rotated keys (backend.kv-q8-rotate) for standard attention; a q8 latent
+                // cache is not saved
+                List<Object[]> dtypes = new java.util.ArrayList<>(List.of(new Object[]{KvDtype.F32, false}, new Object[]{KvDtype.F16, false}));
+                if (kind.equals("gqa")) {
+                    dtypes.add(new Object[]{KvDtype.Q8, false});
+                    dtypes.add(new Object[]{KvDtype.Q8, true});
+                }
+                for (Object[] dr : dtypes) {
+                    KvDtype dt = (KvDtype) dr[0];
+                    boolean rot = (Boolean) dr[1];
+                    KvDtype.setQ8Rotate(rot);
+                    String label = dir.getFileName() + " (" + kind + ", " + dt + (rot ? " rotated keys" : "") + ")";
                     warmUp(new CpuBackend(w, 64, 16, 4, dt, false), cfg);
                     backendChecks(label + " cpu", () -> new CpuBackend(w, 64, 16, 4, dt, false), cfg);
                     if (lib != null) {
@@ -78,6 +88,10 @@ public final class KvStateTest {
                     if (tok != null) {
                         engineChecks(label, w, cfg, tok, dt);
                     }
+                    KvDtype.setQ8Rotate(false);
+                }
+                if (kind.equals("gqa") && tok != null) {
+                    rotateRefusal(dir.getFileName().toString(), w, cfg, tok);
                 }
             }
         }
@@ -191,6 +205,51 @@ public final class KvStateTest {
                 diff = Math.max(diff, Math.abs(want[i] - got[i]));
             }
             check(diff <= 1e-3f * scale + 1e-4f, String.format("%s: cpu state continued on metal (max diff %.1e)", label, diff));
+        }
+    }
+
+    /**
+     * A saved q8 cache of rotated keys has another layout than a plain q8 one ({@code backend.kv-q8-rotate}): each is
+     * refused by an engine of the other kind, and loads into one of its own.
+     */
+    private static void rotateRefusal(String label, ModelWeights w, Architecture cfg, Tokenizer tok) throws Exception {
+        ChatTemplate.Format fmt = ChatTemplate.forModelType(cfg.core().modelType(), tok);
+        SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 4, List.of());
+        Path dir = Files.createTempDirectory("kvstate-rot");
+        try {
+            for (boolean saveRot : new boolean[]{true, false}) {
+                Path file = dir.resolve(saveRot ? "rot.kv" : "plain.kv");
+                KvDtype.setQ8Rotate(saveRot);
+                try (Engine a = new Engine(new CpuBackend(w, 64, 16, 4, KvDtype.Q8, false), tok, cfg, Set.of(), 0, fmt)) {
+                    a.generate(PROMPT, greedy, null, () -> false);
+                    Engine.PendingSave p = a.beginSave(file, "fp");
+                    p.write();
+                }
+                KvDtype.setQ8Rotate(!saveRot);
+                boolean refused = false;
+                try (Engine b = new Engine(new CpuBackend(w, 64, 16, 4, KvDtype.Q8, false), tok, cfg, Set.of(), 0, fmt)) {
+                    try {
+                        b.loadCache(file, "fp");
+                    } catch (java.io.IOException e) {
+                        refused = e.getMessage().contains("another layout");
+                    }
+                }
+                KvDtype.setQ8Rotate(saveRot);
+                boolean loaded = false;
+                try (Engine b = new Engine(new CpuBackend(w, 64, 16, 4, KvDtype.Q8, false), tok, cfg, Set.of(), 0, fmt)) {
+                    loaded = b.loadCache(file, "fp") > 0;
+                }
+                check(refused && loaded, label + ": a q8 cache saved " + (saveRot ? "with" : "without") + " rotated keys is refused by "
+                        + (saveRot ? "a plain" : "a rotating") + " q8 backend and loads into its own kind");
+            }
+        } finally {
+            KvDtype.setQ8Rotate(false);
+            try (var files = Files.list(dir)) {
+                for (Path f : files.toList()) {
+                    Files.delete(f);
+                }
+            }
+            Files.delete(dir);
         }
     }
 

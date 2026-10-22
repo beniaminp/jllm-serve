@@ -1992,3 +1992,78 @@ The 30B MoE (decode dominated by its experts): 25.0 → 27.0 tok/s with the mult
 
 What did not pay and was left out: 4 query heads per threadgroup for 128-wide heads (registers), 64 keys per simdgroup for
 short contexts (fewer workers), 16-byte loads for q8 (the rows are only 4-byte aligned).
+
+## 8.32 The q8 KV cache with rotated keys on the GPU (`backend.kv-q8-rotate`)
+
+### 🧸 In plain words
+
+The one-byte shelf ([8.9](#89-the-f16-kv-cache), [07 §7.13](07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate)) now
+shakes every key with the q4 recipe before it shrinks it, and shakes the question the same way. On the GPU the shaking is
+done by the kernel that already stored the key (rope and quantize in one go), so a step has the same number of dispatches
+as before and costs about the same time. The attention kernels are the old q8 ones: they never learn that the numbers
+are shaken, they just get a question that was shaken too.
+
+### 📐 Design
+
+| step | q8 with rotated keys |
+|---|---|
+| 2 `matmul3` | as q8: k into `kStage`, v into `vStage` (f32) |
+| 3 `rope_store_q8r` / `rope_il_store_q8r` | `rope_store_q8` with a template flag `ROT`: after the QK-norm and RoPE of a head the threadgroup applies the Walsh–Hadamard butterflies `(a, b) → (a + b, a − b)` of stride 1, 2, 4, … `< B` to the head held in threadgroup memory (`headDim / 2` butterflies per stage spread over the `rotHalf` threads, a barrier between stages: the same operations on the same operands as `KvQ4.rotate`, so any thread layout gives the same bits), then a q head is written back rotated, a k head is quantized (scale from a threadgroup max, `q8_value`) into the cache row; v heads as before |
+| 3 (unfused: `-Djllm.metal.fuse=false`, batched rows) `rope` + `kv_store_q8r` | `kv_store_q8r`: grid `(2·kvHeads + heads, n)`, one simdgroup per row; k head → `q4_rotate` (registers and shuffles, shared with q4) → `q8_value`, v head as `kv_store_q8`, query head rotated in place; bytes identical to the fused kernel |
+| 4 attention | the unchanged `attention_*_q8`, `attention_split_q8`, `attention_fa/fb_d*_q8` and the decode attention `attention_dec_g*_d*_q8` ([8.31](#831-decode-attention-attention_dec)), with the score scale handed in as `scale / B` |
+
+Cache rows, strides and scales are q8's, so the replay machinery (`rowIndexed` cache bindings, the position variable), flash
+decoding and flash prefill, the tuner's synthetic checks and the batched kernels need no change. `attention_dec` is **not
+excluded** for the rotated cache: it reads the query from `q` and takes the score scale as a parameter, like every other
+attention kernel, so the host rotates the query in the store step before it (`rope_store_q8r` / `kv_store_q8r`, in place) and
+passes `scale / B` to `decodeAttention` in all three places that call it (the single-token step, the short-chunk loop of a
+verification pass, and the per-row loop of batched rows). `MetalTuner.decodeAttention` still decides per cache type on
+synthetic unrotated data: rotation changes the numbers in the rows, not the kernel's work, so the choice carries over.
+`kernel_tests.py` has `attention_dec_g{2,4}_d{64,128,256}_q8` over rotated rows with merged partials (1 and 3 splits), and
+`scripts/arch-smoke.sh` runs Phi3Mha (head size 64) and Gemma2Hd256 (256) with `-Djllm.metal.decodeAttention=true`, which
+the 32-wide tiny models never take on their own, through every check below.
+
+**Decode replay.** `rope_store_q8r` and `kv_store_q8r` bind the cache at the step's row exactly as the q8 kernels do (the position
+patch is generic), and `ArchSmoke.replayCheck` / `replayBatchCheck` run the rotated cache: 40 recorded decode steps bit-identical
+to the unrecorded ones, three slots with batched passes in between.
+
+**Batched rows** (`GqaStep.runRows`, with `beginIndependent` groups): the rows' q, k and v come from one projection, so the
+rope is the per-row `ropeRow` (the fused kernel needs the staging layout of a single sequence); then, for every row,
+`kvStoreQ8RotRow` rotates and stores k and v into the *owner's* cache rows and rotates the row's own query in place (rows are
+independent: other q, other staging row, other owner's cache, so they sit in one independent group), and each row's
+attention takes `scale / B`. `ArchSmoke.batchCheck` has a rotated q8 case: the tokens equal each slot's own and the logits equal
+its own decode step to rounding.
+
+**CPU against Metal.** Both backends compute k in f32 with rounding differences of ~10⁻⁷, so now and then a code of the
+rotated row that sits on a rounding edge lands one step apart (on the Qwen2 smoke checkpoint: one flip in layer 0 and, through
+the later layers of the tiny random model, 71 of 6 144 codes in all; plain q8 had none there; a rotated entry is a sum of 32 terms,
+so its rounding noise is larger in code units than an unrotated entry's). The kernels agree bit for bit on equal inputs (`kernel_tests.py`), and a
+file saved by either backend loads unchanged into the other; the smoke test's logit comparison for this cache is
+therefore 10× as wide as for plain q8 (1.5·10⁻³ of the largest logit observed, bound 10⁻²), as q4's.
+
+**Draft speculation.** Target and draft backends are built from the same settings, so both hold rotated keys; the rolled-back
+positions are simply stored again (rotated) by the next pass. `ArchSmoke.draftCheck` has a rotated q8 round: the greedy output
+with a draft equals the output without.
+
+**Saved caches.** `stateFormat()` is `kv q8 rot layers=… kvDim=… headDim=…` (the CPU backend's string); the rows are the CPU
+cache's, so a file moves between the backends (`ArchSmoke.kvStateChecks` with `backend.kv-q8-rotate`, `KvStateTest`), and a plain
+q8 file is refused (`CacheFile` compares the strings). **If you used `backend.kv-dtype=q8` before this default:** the cache
+files you saved (the console's `kv-cache` store, `engine.prompt-cache` files) carry the old string `kv q8 layers=…` and are
+refused with "the saved cache has another layout"; the console logs `kv-cache: cannot restore …` and deletes the file, and the
+prompt is prefilled afresh, so nothing breaks, you lose the saved prefills. To keep reading them, set
+`backend.kv-q8-rotate=false` (`--backend.kv-q8-rotate false` or in `jllm.properties`): the old format, and old files, work
+as before.
+
+**DeepSeek's latent cache** is not rotated ([07 §7.13](07-cpu-backend.md#q8-with-rotated-keys-backendkv-q8-rotate)):
+`attention_mla_q8` is untouched and `stateFormat()` stays `mla …`. A head size that is not a multiple of 32 also stays plain,
+as `q4_rotate` needs whole simdgroup rows.
+
+**Kernel tests** (`scripts/metal-emu/kernel_tests.py`): `kv_store_q8r` bit for bit against numpy (head widths 64, 96, 128, 256; the
+rotated queries too); `rope_store_q8r` / `rope_il_store_q8r` byte for byte against `rope` + `kv_store_q8r` (full and partial
+rotary, with and without QK-norm); the q8 attention kernels over rotated rows with rotated queries and `scale / B` against the
+float64 reference on the dequantized rows (≈ 7·10⁻⁷) and, with outlier channels in the keys, closer to the f32 attention than
+the same kernels over plain q8 rows.
+
+**Speed** (Qwen3-0.6B Q4_0, `./jllm bench`, speculation off): [11 §11.10](11-performance.md#1110-the-q8-cache-with-rotated-keys-measured).
+Fusing the rotation into the rope kernel is what keeps it there: the first version (`rope` + `kv_store_q8r`, one more dispatch
+per layer) cost 3–6 % of decode at 413 tokens and 2 % of prefill.

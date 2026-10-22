@@ -5,7 +5,8 @@ package org.robomiri.jllm.model;
  * nearly quarter it: int8 values with one f32 scale per row of a kv head ({@code headDim} values of one position),
  * symmetric, {@code scale = max|x| / 127}, {@code q = rint(x / scale)}; or q4, about an eighth: Walsh–Hadamard rotated
  * keys, 4-bit codes and a half scale per group of 32 values ({@link KvQ4}), plus the latest
- * {@code backend.kv-q4-recent} positions kept as halves.
+ * {@code backend.kv-q4-recent} positions kept as halves. q8 optionally rotates the keys like q4
+ * ({@code backend.kv-q8-rotate}).
  */
 public enum KvDtype {
     F32(4),
@@ -49,6 +50,28 @@ public enum KvDtype {
             throw new IllegalArgumentException("backend.kv-q4-recent must be >= 0, got " + recent);
         }
         q4Recent = recent;
+    }
+
+    /**
+     * What a backend built without the settings (library use, tests) does: the plain q8 format. The shipped
+     * {@code jllm.properties} sets {@code backend.kv-q8-rotate=true} (docs/07 §7.13).
+     */
+    public static final boolean Q8_ROTATE_DEFAULT = false;
+
+    private static volatile boolean q8Rotate = Q8_ROTATE_DEFAULT;
+
+    /**
+     * Whether a q8 cache stores Walsh–Hadamard rotated keys ({@code backend.kv-q8-rotate}, see {@link KvQ4#block}): set
+     * once from the settings by the model loader, read when a backend creates its cache. It only applies to
+     * grouped-query attention with a head size that is a multiple of {@link KvQ4#GROUP}; elsewhere (DeepSeek's latent
+     * cache, other head sizes) the cache stays plain q8.
+     */
+    public static boolean q8Rotate() {
+        return q8Rotate;
+    }
+
+    public static void setQ8Rotate(boolean rotate) {
+        q8Rotate = rotate;
     }
 
     /** {@link #rowBytes} in units of the stored value: the row stride the Metal attention kernels take. */
