@@ -69,6 +69,11 @@ public final class VectorKernels {
         };
     }
 
+    /** {@link #laneSum} for a 128-bit (four lane) vector whatever the preferred width is: {@code (l0 + l1) + (l2 + l3)}. */
+    static float laneSum4(FloatVector v) {
+        return (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
+    }
+
     private static float dotQ4(MemorySegment seg, long q, long s, int nb, float[] x, int xo) {
         FloatVector acc = FloatVector.zero(F);
         for (int b = 0; b < nb; b++) {

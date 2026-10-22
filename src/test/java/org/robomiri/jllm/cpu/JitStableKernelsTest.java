@@ -38,6 +38,9 @@ public final class JitStableKernelsTest {
         for (int i = 0; i < w.length; i++) {
             w[i] = rnd.nextFloat() - 0.5f;
         }
+        short[] xq = new short[cols]; // the int8 activation path of the decode matmuls
+        float[] xs = new float[cols / QType.BLOCK];
+        Int8Kernels.quantize(x, 0, cols, xq, xs);
         try (Arena arena = Arena.ofShared()) {
             for (QType type : new QType[]{QType.Q4_0, QType.Q8_0}) {
                 Random r = new Random(7);
@@ -48,7 +51,7 @@ public final class JitStableKernelsTest {
                 });
                 float[] first = null;
                 for (int round = 0; round < 40_000; round++) {
-                    float[] got = run(t, x, w, cols);
+                    float[] got = run(t, x, w, cols, xq, xs);
                     if (first == null) {
                         first = got;
                     } else if (!Arrays.equals(first, got)) {
@@ -72,8 +75,8 @@ public final class JitStableKernelsTest {
     }
 
     /** Every result of the kernels under test, in one vector. */
-    private static float[] run(QTensor t, float[] x, float[] w, int cols) {
-        float[] out = new float[t.rows + 4 + 16 + 4 + 2 + 77];
+    private static float[] run(QTensor t, float[] x, float[] w, int cols, short[] xq, float[] xs) {
+        float[] out = new float[t.rows + 4 + 16 + 4 + 2 + 77 + t.rows];
         for (int r = 0; r < t.rows; r++) {
             out[r] = VectorKernels.dotRow(t, r, x, 0);
         }
@@ -90,6 +93,10 @@ public final class JitStableKernelsTest {
         out[o++] = VectorKernels.softmaxExp(sc, 0, 77, 0.5f);
         out[o++] = VectorKernels.softmaxExp(sc, 0, 16, 0.25f);
         System.arraycopy(sc, 0, out, o, 77);
+        o += 77;
+        for (int r = 0; r < t.rows; r++) {
+            out[o++] = Int8Kernels.dotRow(t, r, xq, xs, 0);
+        }
         return out;
     }
 }
