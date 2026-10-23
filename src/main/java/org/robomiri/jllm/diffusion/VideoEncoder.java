@@ -279,7 +279,9 @@ public final class VideoEncoder {
         }
         for (int i = 0; i < frames.size(); i++) {
             o.writeBytes(new byte[]{0x21, (byte) 0xF9, 0x04, 0x04});
-            le16(o, Math.max(2, delay(i, fps, 100))); // browsers treat delays below 2 cs as 10 cs
+            // GIF counts in whole centiseconds: above 50 fps some frames are 1 cs. Keep the requested rate rather than clamping
+            // every such frame to 2 cs (which made the clip play slower); 1 is the smallest delay a viewer can be told about.
+            le16(o, Math.max(1, delay(i, fps, 100)));
             o.write(0);
             o.write(0);
             o.write(0x2C);

@@ -310,6 +310,7 @@ public final class Settings {
         require(get("image.backend").equals("cpu") || get("image.backend").equals("metal") || get("image.backend").equals("auto"),
                 "image.backend", "must be cpu, metal or auto");
         require(get("image.precision").matches("auto|f16|f32"), "image.precision", "must be auto, f16 or f32");
+        require(get("image.turbo").matches("(?i)auto|true|false"), "image.turbo", "must be auto, true or false");
         require(getInt("image.steps") >= 0 && getInt("image.steps") <= 200, "image.steps", "must be 0 (model default) .. 200");
         require(getInt("image.width") >= 0 && getInt("image.height") >= 0, "image.width", "and image.height must be 0 (model default) or positive");
         require(getInt("image.count") >= 1 && getInt("image.count") <= 64, "image.count", "must be 1..64");
@@ -320,6 +321,8 @@ public final class Settings {
         require(getInt("image.vae-tile-overlap") >= 1 && getInt("image.vae-tile-overlap") < getInt("image.vae-tile"),
                 "image.vae-tile-overlap", "must be at least 1 and below image.vae-tile");
         getBool("video.enabled");
+        require(!get("video.base-model").isBlank(), "video.base-model",
+                "must be a Stable Diffusion 1.x repository or local diffusers folder");
         require(get("video.backend").matches("cpu|metal|auto"), "video.backend", "must be cpu, metal or auto");
         require(get("video.precision").matches("auto|f16|f32"), "video.precision", "must be auto, f16 or f32");
         require(get("video.format").matches("(?i)auto|mp4|webp|gif"), "video.format", "must be auto, mp4, webp or gif");

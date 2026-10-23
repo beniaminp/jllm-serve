@@ -36,6 +36,17 @@ public final class VideoCli {
     }
 
     /**
+     * Wan's frame count: 13 when {@code video.frames} was left at its default (16 would round to the same 13 anyway), and the
+     * requested count rounded down to 4k + 1 when it was given explicitly.
+     */
+    static int wanFrames(Settings s) {
+        if (s.source("video.frames").equals("default")) {
+            return 13;
+        }
+        return (Math.max(1, s.getInt("video.frames")) - 1) / 4 * 4 + 1;
+    }
+
+    /**
      * Wan 2.1 text-to-video from a local folder (docs/23 section 23.12): frames must be 4k + 1 (rounded down), sizes multiples of 16, the
      * text encoder is quantized to int8 on the CPU while it is read, the transformer runs in float32 on the GPU unless
      * {@code video.precision} says f16.
@@ -44,7 +55,7 @@ public final class VideoCli {
         String prompt = s.has("prompt") ? s.get("prompt") : "a red balloon floating over a green hill, white clouds moving, photo";
         String ffmpeg = VideoEncoder.resolveFfmpeg(s.get("video.ffmpeg"));
         String prec = s.get("video.precision").equals("auto") ? "f32" : s.get("video.precision");
-        int frames = (Math.max(1, s.getInt("video.frames")) - 1) / 4 * 4 + 1;
+        int frames = wanFrames(s);
         int steps = Integer.parseInt(pick(s, "image.steps", "video.steps"));
         double guidance = Double.parseDouble(pick(s, "image.guidance", "video.guidance"));
         long seed = Long.parseLong(pick(s, "image.seed", "video.seed"));
