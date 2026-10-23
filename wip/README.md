@@ -156,6 +156,27 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - The §24.2.6 claim that the older (ternary) f16 version cost 4× must be confirmed or softened from those numbers.
   - **Do not merge this commit as it is: it has placeholders.**
 
+### 6. Gemma 4 (12B) — `wip/gemma4`
+
+- **Branch:** `wip/gemma4`, merged to `main` as `d7b388e` ("Add Gemma 4 (12B): per-layer head shapes, K = V,
+  proportional RoPE") and `bcec1eb` (the GGUF tokenizer fallback), after all six gates passed.
+- **Gemma 4 is not a Gemma-3 config variant.** It needs:
+  - per-layer head shapes: local 256-wide with 8 KV heads, full-attention 512-wide with 1 KV head;
+  - `attention_k_eq_v` (V = K) plus a parameterless V-norm;
+  - proportional RoPE (`partial_rotary_factor 0.25`, so 64 of 256 pairs are live, offset `i+256`);
+  - plain norm gains (the stored `w`, not `1+w`), and unscaled attention (`queryScalar` 1.0);
+  - a per-layer `layer_scalar` and a final soft-cap of 30;
+  - `model_type gemma4_unified_text` / `Gemma4UnifiedForCausalLM` (wrapper `gemma4_unified`).
+- **CPU-only for now:** the Metal backend rejects it (the 512-wide full-attention heads exceed the 256 `headDim`
+  cap), and the paged, batched and mixed KV passes are not offered (there is no shared row across per-layer shapes).
+  Explicitly rejected: Gemma 4 E2B/E4B per-layer embeddings, the 26B-A4B MoE, `num_kv_shared_layers>0` and
+  `use_double_wide_mlp`.
+- **Tokenizer:** GGUF `tokenizer.ggml.model=gemma4` is an SPM-style BPE that falls back to the original repository's
+  `tokenizer.json` (the same fallback serves sarvam-moe, mmbert and whitespace).
+- **Verified:** the tiny-random arch smoke and `SmokeTest`, a pure-Python reference (max logit diff 2.4e-4), and the
+  real 12B (`unsloth/gemma-4-12b-it-GGUF` Q4_K_M, 7.1 GB) loaded and generated coherent text end to end on the CPU
+  backend.
+
 ## Not started (small follow-ups found along the way)
 
 - **Docs:**

@@ -298,8 +298,9 @@ public final class ModelLoader {
         }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe() || arch instanceof HybridArch h && h.anyMoe();
-        int auto = moe ? MOE_BATCH
-                : arch instanceof org.robomiri.jllm.model.Decoder && resolveBackend(s).equals("metal") ? METAL_DENSE_BATCH : DEFAULT_BATCH;
+        boolean metal = resolveBackend(s).equals("metal")
+                && (!(arch instanceof org.robomiri.jllm.model.Decoder d2) || d2.uniformShape());
+        int auto = moe ? MOE_BATCH : metal ? METAL_DENSE_BATCH : DEFAULT_BATCH;
         if (arch.core().modelType().startsWith("gemma3")) {
             return Math.max(auto, GEMMA3_PICTURE_BATCH); // a picture's 256 tokens attend to each other and go through in one pass
         }
@@ -365,6 +366,10 @@ public final class ModelLoader {
                                                       boolean metal, org.robomiri.jllm.kv.KvTierConfig tier) {
         // the paged cache when it is wanted, and always when the mixed scheduler, sparse attention or the KV tiers need it
         if (!paged(s, weights, slots) && !mixedWanted(s, weights.arch) && !s.getBool("backend.kv-sparse") && tier == null) {
+            return null;
+        }
+        if (weights.arch instanceof org.robomiri.jllm.model.Decoder dec && !dec.uniformShape()) {
+            System.err.println("note: backend.kv-paged does not apply to Gemma 4's per-layer attention head shapes: the flat KV cache is used");
             return null;
         }
         if (weights.arch instanceof org.robomiri.jllm.model.Decoder dec && CpuBackend.anySpecial(dec, ctx)) {
@@ -437,7 +442,8 @@ public final class ModelLoader {
      */
     static boolean mixedWanted(Settings s, Architecture arch) {
         return "mixed".equalsIgnoreCase(s.get("engine.scheduler").trim()) && s.getBool("engine.batch-decode")
-                && arch instanceof org.robomiri.jllm.model.Decoder d && d.attention() instanceof org.robomiri.jllm.model.Attention.Gqa
+                && arch instanceof org.robomiri.jllm.model.Decoder d && d.uniformShape()
+                && d.attention() instanceof org.robomiri.jllm.model.Attention.Gqa
                 && KvDtype.parse(s.get("backend.kv-dtype")) != KvDtype.Q4;
     }
 
@@ -449,6 +455,9 @@ public final class ModelLoader {
 
     /** The batch group of {@code weights}, or null with engine.batch-decode off. */
     private static org.robomiri.jllm.engine.BatchGroup group(Settings s, ModelWeights weights) {
+        if (weights.arch instanceof org.robomiri.jllm.model.Decoder d && !d.uniformShape()) {
+            return null; // Gemma 4 keeps one cache per layer shape: no shared batched pass
+        }
         return s.getBool("engine.batch-decode")
                 ? GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup(s.getBool("engine.priority-order"))) : null;
     }
@@ -643,6 +652,11 @@ public final class ModelLoader {
             batch += s.getInt("engine.mixed-reserve"); // room for the tokens that ride with a full prefill chunk (BatchGroup.Member hides it)
         }
         String backendName = resolveBackend(s);
+        if (backendName.equals("metal") && arch instanceof org.robomiri.jllm.model.Decoder d && !d.uniformShape()) {
+            System.err.println("note: Gemma 4's full-attention layers use a 512-wide head, which the Metal attention kernels "
+                    + "do not support; using the CPU backend (the flat KV cache)");
+            backendName = "cpu";
+        }
         int threads = s.getInt("backend.threads");
         // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)
         // (-Djllm.cpu.native, as the Docker image's JLLM_CPU_NATIVE sets it, stands in for an unset backend.cpu.native)

@@ -97,8 +97,8 @@ def paged_rows(pool, tbl, page, first, n):
     return np.stack([pool[tbl[p // block] * block + p % block] for p in range(first, first + n)])
 
 
-def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False, window=0, chunk=0, sinks=False,
-              temp_floor=0, temp_scale=0.0, softcap=0.0, page=0):
+def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False, half=False, window=0, chunk=0,
+              sinks=False, temp_floor=0, temp_scale=0.0, softcap=0.0, page=0):
     rng = np.random.default_rng(1)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     kc = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
@@ -106,6 +106,9 @@ def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False
     stride = n_kv * hd
     if q8:  # the kernel reads int8 * scale; the reference sees the same dequantized values
         (kc, kd), (vc, vd), stride = q8_rows(kc, n_kv, hd), q8_rows(vc, n_kv, hd), n_kv * hd + 4 * n_kv
+    elif half:  # the kernel reads halves; the reference sees the same rounded values
+        kc, vc = kc.astype(np.float16), vc.astype(np.float16)
+        kd, vd = kc.astype(np.float32), vc.astype(np.float32)
     else:
         kd, vd = kc, vc
     out = np.zeros((ntok, n_heads * hd), np.float32)
@@ -228,6 +231,11 @@ if not ONLY:
     attention('attention_g1_d64', 64)
     attention('attention_g1_d128', 128)
     attention('attention_g1_d256', 256)
+    # 512-wide heads (Gemma 4's full-attention layers, one KV head): MAXP = 16 makes part[] 512 wide
+    attention('attention_g1_d512', 512, n_kv=1)
+    attention('attention_g1_d512_h', 512, n_kv=1, half=True)
+    attention('attention_g1_d512_q8', 512, n_kv=1, q8=True)
+    attention('attention_g1_d512_q8', 512, n_kv=1, q8=True, ctx=24, pos0=9, ntok=4, page=4)
     attention('attention', 96)
     attention('attention_g1_d128_q8', 128, q8=True)
     attention('attention_g1_d64_q8', 64, q8=True)
@@ -293,6 +301,11 @@ if not ONLY:
     flash(64, softcap=5.0)
     flash(128, n_heads=8, n_kv=1, ntok=7)
     flash(256, ntok=33)
+    # 512-wide heads (Gemma 4): fa stages one 16 KB K or V block (BK = 8 keys); fb stages both in half (BK = 8)
+    flash(512, n_kv=1, pos0=7, ntok=9, ctx=16)
+    flash(512, n_kv=1, pos0=7, ntok=9, ctx=16, half=True)
+    flash(512, n_kv=1, pos0=7, ntok=9, ctx=16, q8=True)
+    flash(512, n_kv=1, pos0=7, ntok=9, ctx=16, q8=True, page=4)
     flash(128, q8=True)
     flash(64, window=20, pos0=60, ntok=40, q8=True)
     # attention_fb (K and V staged together, half staging for the f16 / q8 caches, padded rows): the same cases
@@ -300,7 +313,9 @@ if not ONLY:
                {'hd': 128, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 64, 'softcap': 5.0},
                {'hd': 128, 'n_heads': 8, 'n_kv': 1, 'ntok': 7}, {'hd': 256, 'ntok': 33}, {'hd': 256, 'ntok': 33, 'half': True},
                {'hd': 64, 'half': True, 'window': 20, 'pos0': 60, 'ntok': 40}, {'hd': 128, 'q8': True},
-               {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9}):
+               {'hd': 64, 'window': 20, 'pos0': 60, 'ntok': 40, 'q8': True}, {'hd': 256, 'q8': True, 'ntok': 9},
+               {'hd': 512, 'n_kv': 1, 'pos0': 7, 'ntok': 9, 'ctx': 16, 'half': True},
+               {'hd': 512, 'n_kv': 1, 'pos0': 7, 'ntok': 9, 'ctx': 16, 'q8': True}):
         flash(kind='fb', **kw)
     # the paged cache: both forms, every cache type, windows and soft-caps, chunk starts inside a block
     for _kind in ('fa', 'fb'):
@@ -310,7 +325,7 @@ if not ONLY:
         flash(64, kind=_kind, page=6, pos0=100, ntok=45, ctx=192)
 
 
-def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, page=0):
+def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, page=0, kernel='attention_split_q8'):
     """Flash decoding (attention_split_q8 + attention_combine) of one token over a q8 cache."""
     rng = np.random.default_rng(5)
     q = rng.standard_normal((1, n_heads * hd)).astype(np.float32)
@@ -325,19 +340,20 @@ def split_q8(hd, n_heads=4, n_kv=2, pos0=300, ctx=320, n_split=5, page=0):
     scale = 1 / np.sqrt(hd)
     # AttnSplitParams: nHeads nKvHeads headDim pos0 ctx scale qStride kvStride window softcap nSplit chunk pageShift
     kc, vc, tbl = paged([kc, vc], page)
-    E.dispatch('attention_split_q8', [q, kc, vc, part, scores, tbl],
+    E.dispatch(kernel, [q, kc, vc, part, scores, tbl],
                pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, scale, n_heads * hd, stride, 0, 0.0, n_split, chunk, page),
                (n_heads, n_split), (256,))
     E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
     ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, 1, scale)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, 'attention_split_q8 hd=%d, %d splits%s: max err %.2e' % (hd, n_split, ', paged' if page else '', err))
+    check(err < 1e-4, '%s hd=%d, %d splits%s: max err %.2e' % (kernel, hd, n_split, ', paged' if page else '', err))
 
 
 if not ONLY:
     split_q8(128)
     split_q8(128, page=4)
     split_q8(64, page=5, pos0=250, n_split=3)
+    split_q8(512, n_kv=1, pos0=80, ctx=96, n_split=3, kernel='attention_split_d512_q8')
 
 
 def attention_dec(hd, G, kv='f32', n_heads=8, n_kv=2, pos0=100, n_split=1, window=0, softcap=0.0, ctx=320, wide=True, page=0):
@@ -395,6 +411,13 @@ for _hd in (64, 128, 256):                                              # the pa
 attention_dec(128, 2, pos0=300, window=64, page=4)
 attention_dec(64, 2, pos0=250, n_split=7, softcap=3.0, page=6)
 attention_dec(128, 2, pos0=0, page=4)
+# 512-wide heads (Gemma 4's full-attention layers, one KV head): G = 1 keeps the per-lane query / accumulator arrays
+# at 16 float4 each
+for _kv in ('f32', 'f16', 'q8'):
+    attention_dec(512, 1, _kv, n_kv=1)                       # 101 keys: three full blocks and a partial one
+    attention_dec(512, 1, _kv, n_kv=1, pos0=300, n_split=3)  # merged partials
+    attention_dec(512, 1, _kv, n_kv=1, page=4)               # the paged cache
+attention_dec(512, 1, 'f32', n_kv=1, pos0=250, n_split=7, softcap=3.0)
 
 
 def gdn_conv(channels=40, kc=4, ntok=6, in_stride=50):
@@ -836,7 +859,7 @@ if not ONLY:
             moe_test(fmt, kind, 64, 128, clamp=2.0, alpha=1.702, bias=True)
             moe_test(fmt, kind, 64, 128, win=True)
         moe_test('q4', kind, 64, 128, clamp=0.5, alpha=1.702)
-def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0):
+def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0, kernel='attention_split'):
     """attention_split with chunk = 0 (the keys per split derived in the kernel, as a recorded decode step passes it)
     gives the bytes of the explicit ceil(keys / nSplit)."""
     rng = np.random.default_rng(6)
@@ -852,19 +875,20 @@ def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0
         out = np.zeros((1, n_heads * hd), np.float32)
         p = pack('iiiiifiiifiii', n_heads, n_kv, hd, pos0, ctx, 1 / np.sqrt(hd), n_heads * hd, n_kv * hd, window, 0.0,
                  n_split, chunk, 0)
-        E.dispatch('attention_split', [q, kc, vc, part, scores, np.zeros(1, np.int32)], p, (n_heads, n_split), (256,))
+        E.dispatch(kernel, [q, kc, vc, part, scores, np.zeros(1, np.int32)], p, (n_heads, n_split), (256,))
         E.dispatch('attention_combine', [part, out], pack('iii', n_heads, hd, n_split), (n_heads,), (256,))
         outs.append(out)
     ref = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, 1, 1 / np.sqrt(hd), window)
     err = np.abs(outs[1] - ref).max()
     check(np.array_equal(outs[0], outs[1]) and err < 1e-4,
-          'attention_split chunk derived in the kernel (window %d): %s the explicit chunk, max err %.2e'
-          % (window, 'same bytes as' if np.array_equal(outs[0], outs[1]) else 'DIFFERENT from', err))
+          '%s chunk derived in the kernel (window %d): %s the explicit chunk, max err %.2e'
+          % (kernel, window, 'same bytes as' if np.array_equal(outs[0], outs[1]) else 'DIFFERENT from', err))
 
 
 if not ONLY:
     split_chunk()
     split_chunk(window=50)
+    split_chunk(hd=512, n_heads=4, n_kv=1, pos0=80, ctx=96, n_split=3, kernel='attention_split_d512')
 
 
 def rope_ref(h, cos, sin, pos, rot_off, rot_half, adjacent, w=None, eps=1e-6):

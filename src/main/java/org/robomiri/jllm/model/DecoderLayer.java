@@ -10,9 +10,12 @@ package org.robomiri.jllm.model;
  * @param postMlpNorm  the norm on the MLP output, null unless the layer's norms are a sandwich
  * @param wo           {@code o_proj [dim, attn.outDim()]}
  * @param bo           {@code o_proj.bias [dim]}, null unless the attention spec has {@link Attention#outBias}
+ * @param mlp          the feed-forward block
+ * @param layerScalar  multiplier of the layer's output (Gemma 4's {@code layer_scalar}), 1 when absent
  */
 public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNorm, float[] postMlpNorm,
-                           AttnWeights attn, QTensor wo, float[] bo, MlpWeights mlp) implements LayerWeights {
+                           AttnWeights attn, QTensor wo, float[] bo, MlpWeights mlp, float layerScalar)
+        implements LayerWeights {
 
     static DecoderLayer load(TensorSource f, String p, LayerSpec s) {
         LayerSpec.Norms n = s.norms();
@@ -24,7 +27,8 @@ public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNo
                 AttnWeights.load(f, p + "self_attn.", s.attn()),
                 f.tensor(p + "self_attn.o_proj.weight"),
                 s.attn().outBias() ? f.floats(p + "self_attn.o_proj.bias") : null,
-                MlpWeights.load(f, p, s.mlp()));
+                MlpWeights.load(f, p, s.mlp()),
+                f.has(p + "layer_scalar") ? f.floats(p + "layer_scalar")[0] : 1f);
     }
 
     /** Every shape a backend relies on: a mismatch here would otherwise surface as a silent out-of-bounds read. */
@@ -35,7 +39,8 @@ public record DecoderLayer(float[] attnNorm, float[] ffnNorm, float[] postAttnNo
                 && attn.matches(s.attn(), dim)
                 && wo.rows == dim && wo.cols == s.attn().outDim()
                 && s.attn().outBias() == (bo != null) && (bo == null || bo.length == dim)
-                && mlp.matches(s.mlp(), dim);
+                && mlp.matches(s.mlp(), dim)
+                && Float.isFinite(layerScalar);
     }
 
     /** The grouped-query projections; throws if this is a latent-attention layer. */

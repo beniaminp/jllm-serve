@@ -17,10 +17,10 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
     }
 
     /**
-     * Grouped-query attention: {@code q_proj [qDim, dim]}, {@code k_proj} / {@code v_proj [kvDim, dim]}, the
-     * q/k/v biases when the spec has them (all three or none), the per-head {@code q_norm} / {@code k_norm}
-     * gains {@code [headDim]} when it has QK-norm (both or none), and the per-head {@code sinks [heads]} logits when it
-     * has attention sinks.
+     * Grouped-query attention: {@code q_proj [qDim, dim]}, {@code k_proj} / {@code v_proj [kvDim, dim]} ({@code v_proj}
+     * is absent when the layer reuses the key projection as the value, Gemma 4), the q/k/v biases when the spec has
+     * them (all three or none), the per-head {@code q_norm} / {@code k_norm} gains {@code [headDim]} when it has QK-norm
+     * (both or none), and the per-head {@code sinks [heads]} logits when it has attention sinks.
      */
     record Gqa(QTensor wq, QTensor wk, QTensor wv, float[] bq, float[] bk, float[] bv, float[] qNorm, float[] kNorm,
                float[] sinks) implements AttnWeights {
@@ -31,7 +31,8 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
         }
 
         static Gqa load(TensorSource f, String a, Attention.Gqa g) {
-            return new Gqa(f.tensor(a + "q_proj.weight"), f.tensor(a + "k_proj.weight"), f.tensor(a + "v_proj.weight"),
+            return new Gqa(f.tensor(a + "q_proj.weight"), f.tensor(a + "k_proj.weight"),
+                    g.kEqV() ? null : f.tensor(a + "v_proj.weight"),
                     g.bias() ? f.floats(a + "q_proj.bias") : null,
                     g.bias() ? f.floats(a + "k_proj.bias") : null,
                     g.bias() ? f.floats(a + "v_proj.bias") : null,
@@ -54,7 +55,7 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
             }
             return wq.rows == g.qDim() && wq.cols == dim
                     && wk.rows == g.kvDim() && wk.cols == dim
-                    && wv.rows == g.kvDim() && wv.cols == dim
+                    && (g.kEqV() ? wv == null : wv != null && wv.rows == g.kvDim() && wv.cols == dim)
                     && g.bias() == (bq != null) && g.bias() == (bk != null) && g.bias() == (bv != null)
                     && (bq == null || (bq.length == g.qDim() && bk.length == g.kvDim() && bv.length == g.kvDim()))
                     && (g.qkNorm() || g.l2Norm()) == (qNorm != null) && (g.qkNorm() || g.l2Norm()) == (kNorm != null)
@@ -64,7 +65,7 @@ public sealed interface AttnWeights permits AttnWeights.Gqa, AttnWeights.Mla {
 
         @Override
         public int maxCols() {
-            return Math.max(Math.max(wq.cols, wk.cols), wv.cols);
+            return Math.max(Math.max(wq.cols, wk.cols), wv != null ? wv.cols : 0);
         }
     }
 

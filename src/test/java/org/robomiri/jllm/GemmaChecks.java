@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.GemmaMath;
 import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.Mlp;
+import org.robomiri.jllm.model.Rope;
 import org.robomiri.jllm.model.Scaling;
 
 import java.nio.file.Files;
@@ -16,8 +17,9 @@ import static org.robomiri.jllm.SmokeTest.gqa;
 import static org.robomiri.jllm.SmokeTest.rope;
 
 /**
- * Gemma 2 / 3 checks that need no model: the scalar math against hand-computed values and the config parsing
- * against the real Hub configs (unsloth/gemma-2-2b-it, unsloth/gemma-3-1b-it, unsloth/gemma-3-4b-it).
+ * Gemma 2 / 3 / 4 checks that need no model: the scalar math against hand-computed values and the config parsing
+ * against the real Hub configs (unsloth/gemma-2-2b-it, unsloth/gemma-3-1b-it, unsloth/gemma-3-4b-it,
+ * google/gemma-4-12b-it).
  */
 final class GemmaChecks {
 
@@ -135,6 +137,65 @@ final class GemmaChecks {
             check(gqa(g5, 0).window() == 8 && gqa(g5, 1).window() == 0 && gqa(g5, 2).window() == 0 && gqa(g5, 3).window() == 8
                     && rope(g5).theta() == 1e6 && rope(g5).scaling() instanceof Scaling.Linear l5 && l5.factor() == 4.0
                     && gqa(g5, 3).ropeTable() == 1, "gemma3 layer_types / rope_parameters");
+
+            // google/gemma-4-12b-it: the encoder-free multimodal wrapper; the decoder is Gemma4UnifiedTextConfig
+            Architecture g6 = cfg(tmp, """
+                    {"architectures":["Gemma4UnifiedForConditionalGeneration"],"bos_token_id":2,"eos_token_id":[1,106],
+                     "model_type":"gemma4_unified","tie_word_embeddings":true,"dtype":"bfloat16",
+                     "text_config":{"attention_bias":false,"attention_k_eq_v":true,"bos_token_id":2,"eos_token_id":1,
+                       "final_logit_softcapping":30.0,"global_head_dim":512,"head_dim":256,
+                       "hidden_activation":"gelu_pytorch_tanh","hidden_size":3840,"hidden_size_per_layer_input":0,
+                       "intermediate_size":15360,"max_position_embeddings":262144,
+                       "model_type":"gemma4_unified_text","num_attention_heads":16,
+                       "num_global_key_value_heads":1,"num_hidden_layers":48,"num_key_value_heads":8,
+                       "num_kv_shared_layers":0,"rms_norm_eps":1e-6,
+                       "layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","full_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","full_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","full_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","full_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","full_attention","sliding_attention","sliding_attention",
+                         "sliding_attention","sliding_attention","sliding_attention","full_attention"],
+                       "rope_parameters":{"full_attention":{"partial_rotary_factor":0.25,"rope_theta":1000000.0,
+                                                            "rope_type":"proportional"},
+                                          "sliding_attention":{"rope_theta":10000.0,"rope_type":"default"}},
+                       "sliding_window":1024,"tie_word_embeddings":true,"vocab_size":262144,
+                       "vocab_size_per_layer_input":262144}}""");
+            check(g6.core().modelType().equals("gemma4_unified_text") && g6.core().dim() == 3840 && g6.core().layers() == 48
+                    && g6.core().vocabSize() == 262144 && !g6.core().normPlusOne() && g6.core().tiedEmbeddings()
+                    && g6.core().finalSoftcap() == 30f && g6.core().embedScale() == 62f,
+                    "gemma4 12b wrapper, tied head, bf16(sqrt(3840)) = 62, plain (not 1+w) norms");
+            check(g6.core().eosTokenIds().equals(List.of(1, 106)), "gemma4 wrapper eos list is kept");
+            // 5 local : 1 full, ending full
+            boolean pat4 = true;
+            for (int l = 0; l < 48; l++) {
+                boolean global = l % 6 == 5;
+                pat4 &= (gqa(g6, l).window() == (global ? 0 : 1024)) && ((gqa(g6, l).ropeTable() == 1) == !global);
+            }
+            check(pat4 && gqa(g6, 47).window() == 0, "gemma4 5 local : 1 full, last layer full");
+            check(gqa(g6, 0).headDim() == 256 && gqa(g6, 0).kvHeads() == 8 && gqa(g6, 0).qkNorm()
+                    && !gqa(g6, 0).kEqV() && gqa(g6, 0).vNorm() && gqa(g6, 0).scale() == 1f
+                    && gqa(g6, 0).softcap() == 0f,
+                    "gemma4 local layers: 256-wide head, 8 KV heads, q/k norm, v_proj + V norm, unscaled attention");
+            check(gqa(g6, 5).headDim() == 512 && gqa(g6, 5).kvHeads() == 1 && gqa(g6, 5).kEqV()
+                    && gqa(g6, 5).vNorm(), "gemma4 full layers: 512-wide head, one KV head, K = V, V norm");
+            check(decoder(g6).ropeTables().size() == 2
+                    && decoder(g6).ropeTables().get(0).rotaryDim() == 512
+                    && decoder(g6).ropeTables().get(0).activePairs() == 64
+                    && decoder(g6).ropeTables().get(0).theta() == 1e6
+                    && decoder(g6).ropeTables().get(1).rotaryDim() == 256
+                    && decoder(g6).ropeTables().get(1).activePairs() == 128
+                    && decoder(g6).ropeTables().get(1).theta() == 1e4,
+                    "gemma4 proportional RoPE: 64 of 256 pairs on the full head, plain local table");
+            check(!decoder(g6).uniformShape(), "gemma4 layers have different attention head shapes");
+            double[] inv = Rope.invFreq(decoder(g6).ropeTables().get(0), 16);
+            check(inv.length == 256 && inv[0] == 1.0 && inv[63] > 0 && inv[64] == 0.0 && inv[255] == 0.0,
+                    "gemma4 proportional RoPE frequencies: 64 live pairs, then the unrotated tail");
         } finally {
             Files.deleteIfExists(tmp.resolve("config.json"));
             Files.deleteIfExists(tmp);

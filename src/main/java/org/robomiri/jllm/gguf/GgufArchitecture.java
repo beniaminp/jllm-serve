@@ -42,6 +42,10 @@ final class GgufArchitecture {
         GEMMA2("gemma2", "gemma2"),
         /** Gemma 3 (text; the vision tower of the bigger sizes is a separate mmproj file): {@link GgufFamilies#gemma}. */
         GEMMA3("gemma3", "gemma3_text"),
+        /** Gemma 4 (E2B / E4B / 26B / 31B): per-layer head shapes, K = V on full layers, proportional RoPE. */
+        GEMMA4("gemma4", "gemma4_text"),
+        /** Gemma 4 12B "unified": the same decoder in the encoder-free multimodal wrapper. */
+        GEMMA4_UNIFIED("gemma4_unified", "gemma4_unified_text"),
         /** Phi-3 / 3.5 / 4-mini / Phi-4: fused {@code attn_qkv} and {@code ffn_up}, LongRoPE tables. */
         PHI3("phi3", "phi3"),
         /** {@code GlmForCausalLM} (GLM-4-9B-chat-hf, GLM-Edge): fused {@code ffn_up}, interleaved partial RoPE. */
@@ -74,7 +78,12 @@ final class GgufArchitecture {
         }
 
         boolean gemma() {
-            return this == GEMMA2 || this == GEMMA3;
+            return this == GEMMA2 || this == GEMMA3 || gemma4();
+        }
+
+        /** Gemma 4 (E2B / E4B / 12B / 26B / 31B): per-layer attention shapes and proportional RoPE. */
+        boolean gemma4() {
+            return this == GEMMA4 || this == GEMMA4_UNIFIED;
         }
 
         static Family of(String ggufName) {
@@ -160,9 +169,28 @@ final class GgufArchitecture {
         // a multi-token-prediction block (nextn) is stored after the model's layers: not one of them
         c.put("num_hidden_layers", need(g, p + "block_count") - (family.hybrid() ? g.num(p + "nextn_predict_layers", 0) : 0));
         c.put("num_attention_heads", heads);
-        c.put("num_key_value_heads", g.get(p + "attention.head_count_kv") == null ? heads : scalar(g, p + "attention.head_count_kv"));
+        Object kvRaw = g.get(p + "attention.head_count_kv");
+        long kvHeads = kvRaw == null ? heads : kvRaw instanceof long[] arr ? (arr.length > 0 ? arr[0] : heads)
+                : scalar(g, p + "attention.head_count_kv");
+        c.put("num_key_value_heads", kvHeads);
         if (g.get(p + "attention.key_length") instanceof Number kl) {
             c.put("head_dim", kl.longValue());
+        }
+        if (family.gemma4()) {
+            // Gemma 4 stores one KV-head count per layer (8 on the sliding layers, 1 on the full ones) and a narrower
+            // head for the sliding layers. The family parser reads the full layer's values from these keys.
+            long[] perLayer = g.longs(p + "attention.head_count_kv");
+            if (perLayer != null && perLayer.length > 0) {
+                long local = 0;
+                for (long v : perLayer) {
+                    local = Math.max(local, v);
+                }
+                c.put("num_key_value_heads", local);
+                c.put("num_global_key_value_heads", perLayer[perLayer.length - 1]); // the last layer is always full
+            }
+            if (g.get(p + "attention.key_length_swa") instanceof Number swa) {
+                c.put("head_dim", swa.longValue());
+            }
         }
         if (g.get(p + "feed_forward_length") instanceof Number ff) {
             c.put("intermediate_size", ff.longValue());

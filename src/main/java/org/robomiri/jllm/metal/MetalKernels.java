@@ -801,6 +801,20 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /**
+     * q and k projections of {@code in} for a layer whose value is the key projection itself (Gemma 4's
+     * {@code attention_k_eq_v}: no {@code v_proj}): the fused dispatch computes k twice, writing the k rows to
+     * {@code kOut} at {@code kOff} and to {@code vOut} at {@code vOff}, so v is the pre-RoPE k projection bit for bit.
+     * V is left float (a parameterless V-norm follows it before the cache store). Such layers have no attention bias
+     * ({@link AttnWeights.Gqa} only loads {@code v_proj.bias} when a {@code v_proj} exists), so the k bias, if any,
+     * is not added to the v rows: {@code bv} is null.
+     */
+    void matmulQkEqV(QTensor wq, Metal.Buffer bwq, QTensor wk, Metal.Buffer bwk, Metal.Buffer in, Metal.Buffer norm,
+                     Metal.Buffer qOut, Metal.Buffer kOut, long kOff, Metal.Buffer vOut, long vOff,
+                     Metal.Buffer bq, Metal.Buffer bk, int n) {
+        matmul3(wq, bwq, wk, bwk, wk, bwk, in, norm, qOut, kOut, kOff, vOut, vOff, false, bq, bk, null, n);
+    }
+
+    /**
      * One projection of {@link #matmul3} as a dispatch of its own: {@code which} 0 / 1 = q / k (float output at
      * {@code out}, {@code outOff}), 2 = v (rows past the first two ranges, written to {@code vOut} at {@code vOff} as half when
      * {@code vHalf}). The unused weight bindings point at the same buffer; their row ranges are empty.
@@ -1182,7 +1196,7 @@ final class MetalKernels implements AutoCloseable {
 
     /** Whether {@code attention_fa} exists for this head width. */
     static boolean flashPrefillFits(int headDim) {
-        return headDim == 64 || headDim == 128 || headDim == 256;
+        return headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512;
     }
 
     /**
@@ -1245,11 +1259,14 @@ final class MetalKernels implements AutoCloseable {
 
     /** Whether {@code attention_dec} exists for this head width. */
     static boolean decodeAttentionFits(int headDim) {
-        return headDim == 64 || headDim == 128 || headDim == 256;
+        return headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512;
     }
 
     /** Query heads per attention_dec threadgroup: they share each K/V row; bounded by the registers (o and q per head). */
     static int decGroup(int nHeads, int nKvHeads, int headDim) {
+        if (headDim == 512) {
+            return 1; // only the G = 1 d512 decode instantiations exist (G = 2 would double 16 float4 per lane)
+        }
         int ratio = nHeads / nKvHeads;
         int max = DEC_GROUP > 0 ? DEC_GROUP : (headDim <= 64 ? 4 : 2);
         int g = 1;
@@ -1678,6 +1695,13 @@ final class MetalKernels implements AutoCloseable {
         dispatch("vec_zero", 1, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
     }
 
+    /** x[i] *= s for i < n (vec_scale): Gemma 4's per-layer {@code layer_scalar}. */
+    void vecScale(Metal.Buffer x, int n, float s) {
+        bind(0, x, 0);
+        p.reset(KernelParams.VEC).i(n).f(s);
+        dispatch("vec_scale", 1, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
     /** y[i] = relu(x[i])^2 for i < n (relu2; x and y may be one buffer). */
     void relu2(Metal.Buffer x, Metal.Buffer y, int n) {
         bind(0, x, 0);
@@ -1993,6 +2017,19 @@ final class MetalKernels implements AutoCloseable {
         bind(1, dst, dstOff);
         p.reset(KernelParams.KV_PUT).i(kvDim).i(kvDim);
         dispatch(half ? "kv_put_h" : "kv_put", 2, 0, channelGrid(kvDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /**
+     * {@code kv_put} for {@code n} contiguous f32 rows: row {@code t} at {@code srcOff + t * kvDim} elements of
+     * {@code src} into the cache row at {@code dstOff + t * rowStride} elements of {@code dst}, rounded to half when
+     * {@code half}. Used for Gemma 4's V-normed rows (normalized in f32, then stored).
+     */
+    void kvPutRows(boolean half, Metal.Buffer src, long srcOff, Metal.Buffer dst, long dstOff, int kvDim, int rowStride,
+                   int n) {
+        bind(0, src, srcOff);
+        bind(1, dst, dstOff);
+        p.reset(KernelParams.KV_PUT).i(kvDim).i(rowStride);
+        dispatch(half ? "kv_put_h" : "kv_put", 2, 0, channelGrid(kvDim), n, 1, CHANNEL_THREADS, 1, 1);
     }
 
     /** {@link #mlaLatStore} of one token: its latent row at byte latOff, its k_pe row at kpeOff, its cache row at off. */

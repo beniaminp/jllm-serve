@@ -36,6 +36,9 @@ final class Families {
             Map.entry("phi3", "Phi3ForCausalLM"),
             Map.entry("gemma2", "Gemma2ForCausalLM"),
             Map.entry("gemma3_text", "Gemma3ForCausalLM"),
+            Map.entry("gemma4", "Gemma4ForCausalLM"),
+            Map.entry("gemma4_text", "Gemma4ForCausalLM"),
+            Map.entry("gemma4_unified_text", "Gemma4UnifiedForCausalLM"),
             Map.entry("mamba", "MambaForCausalLM"),
             Map.entry("deepseek_v2", "DeepseekV2ForCausalLM"),
             Map.entry("deepseek_v3", "DeepseekV3ForCausalLM"),
@@ -48,6 +51,7 @@ final class Families {
 
     /** A multimodal wrapper whose {@code text_config} is a supported decoder (vision tensors are never read). */
     private static final Map<String, String> WRAPPERS = Map.of("gemma3_text", "Gemma3ForConditionalGeneration",
+            "gemma4_unified_text", "Gemma4UnifiedForConditionalGeneration",
             "llama4_text", "Llama4ForConditionalGeneration");
 
     static Architecture parse(Map<String, Object> c) {
@@ -58,18 +62,35 @@ final class Families {
             // Multimodal wrapper (Gemma 3 4B+): the decoder's hyper-parameters live in text_config; the
             // wrapper-level ids and dtype fill in what the text config leaves out.
             Map<String, Object> merged = new LinkedHashMap<>(text);
-            for (String k : new String[]{"bos_token_id", "eos_token_id", "torch_dtype"}) {
+            for (String k : new String[]{"bos_token_id", "torch_dtype"}) {
                 if (merged.get(k) == null && c.get(k) != null) {
                     merged.put(k, c.get(k));
                 }
             }
+            // a wrapper's eos list may add stops the text config does not list (Gemma 4: [1, 106])
+            List<Integer> stops = new ArrayList<>(intList(merged, "eos_token_id"));
+            for (int id : intList(c, "eos_token_id")) {
+                if (!stops.contains(id)) {
+                    stops.add(id);
+                }
+            }
+            if (!stops.isEmpty()) {
+                merged.put("eos_token_id", stops);
+            }
             if (!(merged.get("model_type") instanceof String) || "gemma3".equals(merged.get("model_type"))) {
                 merged.put("model_type", "gemma3_text");
+            } else if ("gemma4".equals(merged.get("model_type"))) {
+                merged.put("model_type", "gemma4_text");
+            } else if ("gemma4_unified".equals(merged.get("model_type"))) {
+                merged.put("model_type", "gemma4_unified_text");
             }
             c = merged;
         } else if ("gemma3".equals(c.get("model_type"))) {
             c = new LinkedHashMap<>(c);
             c.put("model_type", "gemma3_text");
+        } else if ("gemma4".equals(c.get("model_type")) || "gemma4_unified".equals(c.get("model_type"))) {
+            c = new LinkedHashMap<>(c);
+            c.put("model_type", "gemma4".equals(c.get("model_type")) ? "gemma4_text" : "gemma4_unified_text");
         }
         String modelType = Json.str(c, "model_type", null);
         if (modelType == null && declaredArch != null) {
@@ -98,6 +119,7 @@ final class Families {
             case "phi3" -> phi3(new Draft(c, modelType, arch));
             case "gemma2" -> gemma(new Draft(c, modelType, arch), false);
             case "gemma3_text" -> gemma(new Draft(c, modelType, arch), true);
+            case "gemma4", "gemma4_text", "gemma4_unified_text" -> gemma4(new Draft(c, modelType, arch));
             case "deepseek_v2" -> deepseek(new Draft(c, modelType, arch), false);
             case "deepseek_v3" -> deepseek(new Draft(c, modelType, arch), true);
             case "gpt_oss" -> gptOss(new Draft(c, modelType, arch));
@@ -229,6 +251,110 @@ final class Families {
         d.finalSoftcap = (float) softcap(c, "final_logit_softcapping", g3 ? 0 : 30);
         d.queryScalar = Json.dbl(c, "query_pre_attn_scalar", 256);
         d.localTheta = g3 ? Json.dbl(c, "rope_local_base_freq", Json.dbl(d.localRope, "rope_theta", 1e4)) : 0;
+        return d.build();
+    }
+
+    /**
+     * Gemma 4 (12B "unified" and the plain text models): as Gemma 3's sandwich decoder, but the norm gains are the
+     * stored weights (no {@code 1 + w}), attention is unscaled ({@code self.scaling = 1.0}), every layer has a
+     * parameterless RMS norm on its values, and the 5:1 local / full pattern changes the head shape: full layers use
+     * {@code global_head_dim} (512) with {@code num_global_key_value_heads} (1) and take the value from the key
+     * projection ({@code attention_k_eq_v}), while local layers keep {@code head_dim} (256) and
+     * {@code num_key_value_heads} (8). The full layers rotate only {@code partial_rotary_factor} (0.25) of their head
+     * with proportional RoPE: the pair offset is the whole head, the remaining pairs have zero frequency.
+     */
+    private static Decoder gemma4(Draft d) {
+        Map<String, Object> c = d.c;
+        String ga = Json.str(c, "hidden_activation", Json.str(c, "hidden_act", "gelu_pytorch_tanh"));
+        if (!ga.equals("gelu_pytorch_tanh") && !ga.equals("gelu_new") && !ga.equals("gelu_tanh")) {
+            throw new IllegalArgumentException("unsupported hidden_activation '" + ga + "': Gemma needs gelu_pytorch_tanh");
+        }
+        if (Json.num(c, "num_kv_shared_layers", 0) > 0) {
+            throw new IllegalArgumentException("Gemma 4 with num_kv_shared_layers > 0 is not supported");
+        }
+        if (Json.num(c, "hidden_size_per_layer_input", 0) > 0) {
+            throw new IllegalArgumentException("Gemma 4 with per-layer input embeddings (hidden_size_per_layer_input > 0) "
+                    + "is not supported");
+        }
+        if (Json.bool(c, "enable_moe_block", false) || Json.num(c, "num_experts", 0) > 0) {
+            throw new IllegalArgumentException("Gemma 4's mixture-of-experts blocks are not supported (the 12B is dense)");
+        }
+        if (Json.bool(c, "use_double_wide_mlp", false)) {
+            throw new IllegalArgumentException("Gemma 4 with use_double_wide_mlp is not supported");
+        }
+        d.gemma = true;
+        d.bias = Draft.Bias.CONFIG_QKVO; // q, k and o_proj follow attention_bias; v_proj is absent on full layers
+        d.act = Activation.GELU_TANH;
+        d.norms = Norms.SANDWICH_GEMMA;
+        d.tiedDefault = true;
+        d.qkNorm = true;
+        d.thetaDefault = 1e6;
+        d.window = Draft.Window.PER_LAYER;
+        d.local = new boolean[d.layers];
+        List<Object> types = Json.list(c, "layer_types");
+        if (types != null && types.size() < d.layers) {
+            throw new IllegalArgumentException("config.json: layer_types has " + types.size() + " entries for "
+                    + d.layers + " layers");
+        }
+        for (int l = 0; l < d.layers; l++) {
+            if (types == null) {
+                d.local[l] = (l + 1) % 6 != 0;
+            } else {
+                Object t = types.get(l);
+                if (!"sliding_attention".equals(t) && !"full_attention".equals(t)) {
+                    throw new IllegalArgumentException("config.json: unsupported layer_types[" + l + "] = " + t
+                            + " (sliding_attention, full_attention)");
+                }
+                d.local[l] = "sliding_attention".equals(t);
+            }
+        }
+        d.local[d.layers - 1] = false; // transformers forces the last layer to full attention
+        int localHd = (int) Json.num(c, "head_dim", d.headDim);
+        int fullHd = (int) Json.num(c, "global_head_dim", localHd);
+        int localKv = (int) Json.num(c, "num_key_value_heads", d.kvHeads);
+        int fullKv = (int) Json.num(c, "num_global_key_value_heads", localKv);
+        boolean kEqV = Json.bool(c, "attention_k_eq_v", false);
+        double fullPartial = Json.dbl(d.globalRope, "partial_rotary_factor", 1.0);
+        double localPartial = Json.dbl(d.localRope, "partial_rotary_factor", 1.0);
+        if (localHd <= 0 || fullHd <= 0 || localKv <= 0 || fullKv <= 0 || d.heads % localKv != 0 || d.heads % fullKv != 0) {
+            throw new IllegalArgumentException("invalid Gemma 4 head shapes: head_dim=" + localHd + " global_head_dim="
+                    + fullHd + " num_key_value_heads=" + localKv + " num_global_key_value_heads=" + fullKv);
+        }
+        int fullPairs = (int) Math.floor(fullHd * fullPartial / 2.0);
+        int localPairs = (int) Math.floor(localHd * localPartial / 2.0);
+        if (fullPairs <= 0 || localPairs <= 0) {
+            throw new IllegalArgumentException("invalid Gemma 4 partial_rotary_factor: full=" + fullPartial
+                    + " local=" + localPartial);
+        }
+        d.headDim = localHd;
+        d.kvHeads = localKv;
+        d.layerHeadDim = new int[d.layers];
+        d.layerKvHeads = new int[d.layers];
+        d.layerKEqV = new boolean[d.layers];
+        d.layerVNorm = new boolean[d.layers];
+        d.layerRopeDim = new int[d.layers];
+        d.layerActivePairs = new int[d.layers];
+        for (int l = 0; l < d.layers; l++) {
+            d.layerHeadDim[l] = d.local[l] ? localHd : fullHd;
+            d.layerKvHeads[l] = d.local[l] ? localKv : fullKv;
+            d.layerKEqV[l] = kEqV && !d.local[l];
+            d.layerVNorm[l] = true;
+            d.layerRopeDim[l] = d.local[l] ? localHd : fullHd;
+            d.layerActivePairs[l] = d.local[l] ? localPairs : fullPairs;
+        }
+        d.perLayerTables = true;
+        d.localTheta = Json.dbl(c, "rope_local_base_freq", Json.dbl(d.localRope, "rope_theta", 1e4));
+        d.queryScalar = 1.0; // Gemma4TextAttention: self.scaling = 1.0 (no pre-attention scaling)
+        d.attnSoftcap = 0f;
+        d.finalSoftcap = (float) softcap(c, "final_logit_softcapping", 0);
+        String dtype = Json.str(c, "torch_dtype", Json.str(c, "dtype", "bfloat16"));
+        float embedScale = (float) Math.sqrt(d.dim);
+        if (dtype.equals("bfloat16")) {
+            embedScale = Float.intBitsToFloat(roundBf16(Float.floatToIntBits(embedScale)));
+        } else if (dtype.equals("float16")) {
+            embedScale = Float.float16ToFloat(Float.floatToFloat16(embedScale));
+        }
+        d.embedScale = embedScale;
         return d.build();
     }
 
@@ -540,6 +666,15 @@ final class Families {
         boolean tiedDefault;
         boolean normPlusOne;
         boolean gemma;
+        /** Gemma 4: per-layer head shapes, K = V, the parameterless V norm, and the pair layout of each rope table. */
+        int[] layerHeadDim;
+        int[] layerKvHeads;
+        boolean[] layerKEqV;
+        boolean[] layerVNorm;
+        int[] layerRopeDim;
+        int[] layerActivePairs;
+        /** Gemma 4: build the two rope tables from the per-layer full / local widths instead of one shared width. */
+        boolean perLayerTables;
         float embedScale = 1f;
         float attnSoftcap;
         float finalSoftcap;
@@ -652,7 +787,7 @@ final class Families {
                 }
             }
             Map<String, Object> scalingMap = this.scalingMap != null ? this.scalingMap : scalingDefault;
-            Scaling scaling = mla != null ? Scaling.NONE : parseRopeScaling(scalingMap, c, rotaryDim);
+            Scaling scaling = perLayerTables || mla != null ? Scaling.NONE : parseRopeScaling(scalingMap, c, rotaryDim);
             List<Integer> eos = intList(c, "eos_token_id");
             Set<Integer> mlpOnlyLayers = Set.copyOf(intList(c, "mlp_only_layers"));
             double normEps = Json.dbl(c, "rms_norm_eps", normEpsDefault);
@@ -679,17 +814,42 @@ final class Families {
             }
 
             List<RopeTable> tables = new ArrayList<>(2);
-            tables.add(mla != null ? new RopeTable(mla.rope(), ropeTheta, yarn != null ? yarn : Scaling.NONE, Pairing.INTERLEAVED)
-                    : new RopeTable(rotaryDim, ropeTheta, scaling, pairing, mropeSections(scalingMap),
-                    scalingMap != null && Json.bool(scalingMap, "mrope_interleaved", false)));
             boolean anyLocal = false;
             if (localTheta > 0 && local != null) {
                 for (boolean b : local) {
                     anyLocal |= b;
                 }
             }
-            if (anyLocal) {
-                tables.add(new RopeTable(rotaryDim, localTheta, Scaling.NONE, pairing));
+            if (perLayerTables) {
+                // Gemma 4: the full-attention table pairs across the whole (wide) head and zeroes all but the
+                // proportional part; the local table is a plain one over the narrow head.
+                int full = 0;
+                int loc = 0;
+                for (int l = 0; l < layers; l++) {
+                    if (!local[l]) {
+                        full = l;
+                        break;
+                    }
+                }
+                for (int l = 0; l < layers; l++) {
+                    if (local[l]) {
+                        loc = l;
+                        break;
+                    }
+                }
+                tables.add(new RopeTable(layerRopeDim[full], ropeTheta, scaling, pairing, List.of(), false,
+                        layerActivePairs[full]));
+                if (anyLocal) {
+                    tables.add(new RopeTable(layerRopeDim[loc], localTheta, Scaling.NONE, pairing, List.of(), false,
+                            layerActivePairs[loc]));
+                }
+            } else {
+                tables.add(mla != null ? new RopeTable(mla.rope(), ropeTheta, yarn != null ? yarn : Scaling.NONE, Pairing.INTERLEAVED)
+                        : new RopeTable(rotaryDim, ropeTheta, scaling, pairing, mropeSections(scalingMap),
+                        scalingMap != null && Json.bool(scalingMap, "mrope_interleaved", false)));
+                if (anyLocal) {
+                    tables.add(new RopeTable(rotaryDim, localTheta, Scaling.NONE, pairing));
+                }
             }
             int noPeTable = -1;
             for (int l = 0; noPe != null && l < layers; l++) {
@@ -704,11 +864,14 @@ final class Families {
             for (int l = 0; l < layers; l++) {
                 boolean windowed = sw > 0 && (window == Window.PER_LAYER ? local[l] : l >= windowFrom);
                 boolean nope = noPe != null && noPe[l];
+                int lHeadDim = layerHeadDim != null ? layerHeadDim[l] : headDim;
+                int lKvHeads = layerKvHeads != null ? layerKvHeads[l] : kvHeads;
                 Attention attn = mla != null ? mla
-                        : new Attention.Gqa(heads, kvHeads, headDim, windowed ? sw : 0,
+                        : new Attention.Gqa(heads, lKvHeads, lHeadDim, windowed ? sw : 0,
                         nope ? noPeTable : anyLocal && local[l] ? 1 : 0, qkNorm, attnBias, outBias, scale, attnSoftcap,
                         sinks, chunked != null && chunked[l] ? chunkSize : 0, l2Norm && !nope,
-                        nope ? tempFloor : 0, nope ? tempScale : 0f);
+                        nope ? tempFloor : 0, nope ? tempScale : 0f,
+                        layerKEqV != null && layerKEqV[l], layerVNorm != null && layerVNorm[l]);
                 Mlp mlp = isMoe[l] ? new Mlp.Moe(numExperts, topK, moeDim, normTopK, router, shared, expertSpec)
                         : new Mlp.Dense(hiddenDim, act);
                 specs.add(new LayerSpec(attn, mlp, norms));
@@ -728,10 +891,12 @@ final class Families {
                     + (windowFrom > 0 ? "@" + windowFrom : "") : "")
                     + (!(scaling instanceof Scaling.None) ? " rope=" + scalingKey(scaling) + "x" + scalingFactor(scaling) : "")
                     + (pairing == Pairing.INTERLEAVED ? " rope=interleaved/" + rotaryDim : "")
-                    + (pairing != Pairing.INTERLEAVED && rotaryDim != headDim ? " rotary=" + rotaryDim : "")
+                    + (pairing != Pairing.INTERLEAVED && !perLayerTables && rotaryDim != headDim ? " rotary=" + rotaryDim : "")
                     + (norms.post() ? " postnorms" : "")
                     + (gemma ? " gemma(softcap=" + attnSoftcap + "/" + finalSoftcap + " qscalar=" + queryScalar
                     + " localRope=" + localTheta + " layers=" + localLayerString() + ")" : "")
+                    + (perLayerTables ? " gemma4(fullDim=" + fullShapeDim() + " fullKv=" + fullShapeKv()
+                    + " proportional=" + fullShapePairs() + ")" : "")
                     + (sinks ? " sinks layers=" + localLayerString() : "")
                     + (expertSpec.special() ? String.format(" experts(%s%s%s)", expertSpec.clamped()
                     ? "clamp" + expertSpec.clampLimit() + "/" + expertSpec.alpha() + " " : "",
@@ -748,6 +913,27 @@ final class Families {
                     Json.bool(c, "tie_word_embeddings", tiedDefault), (int) Json.num(c, "bos_token_id", -1), eos,
                     (int) Json.num(c, "max_position_embeddings", 4096), embedScale, finalSoftcap, normPlusOne, description);
             return new Decoder(core, specs, tables);
+        }
+
+        private int firstFullLayer() {
+            for (int l = 0; l < layers; l++) {
+                if (!local[l]) {
+                    return l;
+                }
+            }
+            return 0;
+        }
+
+        private int fullShapeDim() {
+            return layerHeadDim[firstFullLayer()];
+        }
+
+        private int fullShapeKv() {
+            return layerKvHeads[firstFullLayer()];
+        }
+
+        private int fullShapePairs() {
+            return layerActivePairs[firstFullLayer()];
         }
 
         private String localLayerString() {

@@ -333,6 +333,9 @@ public final class ModelConverter {
             for (String n : layerNorms(p)) {
                 rules.add(norm(n));
             }
+            if (shardOf.containsKey(p + "layer_scalar")) {
+                rules.add(f32(p + "layer_scalar", p + "layer_scalar"));
+            }
             switch (spec.attn()) {
                 case Attention.Gqa g -> {
                     if (g.bias()) {
@@ -351,7 +354,9 @@ public final class ModelConverter {
                         rules.add(splitRows(p + "self_attn.v_proj.weight", qkv, quant, q + kv, kv, q + 2 * kv, dim));
                         rules.add(quantize(p + "self_attn.o_proj.weight", quant));
                     } else {
-                        for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                        // Gemma 4's full-attention layers have no v_proj: the value is the key projection's output
+                        for (String n : g.kEqV() ? new String[]{"q_proj", "k_proj", "o_proj"}
+                                : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
                             rules.add(quantize(p + "self_attn." + n + ".weight", quant));
                         }
                     }

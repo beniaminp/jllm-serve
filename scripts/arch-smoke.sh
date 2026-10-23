@@ -25,6 +25,10 @@
 #                                                         attention + final soft-capping, local/global alternation
 #   hf-internal-testing_tiny-random-Gemma3ForCausalLM     generated: q/k norm, 5 local + 1 global layers, two RoPE bases
 #   hf-internal-testing_tiny-random-Gemma3MMForCausalLM   generated: the same decoder in the multimodal wrapper layout
+#   hf-internal-testing_tiny-random-Gemma4ForCausalLM     generated: Gemma 4 (256/512-wide heads per layer type, K = V
+#                                                         on the full layers, parameterless V norm, proportional RoPE,
+#                                                         per-layer output scalar, plain norms); CPU only (Metal has no
+#                                                         512-wide attention kernel), paged checks skipped
 #   hf-internal-testing_tiny-random-Gemma{2,3}Hd256ForCausalLM  generated: head_dim 256, the largest Metal supports
 #   hf-internal-testing_tiny-random-Gemma2BiasForCausalLM generated: Gemma 2 with attention_bias (the o_proj bias
 #                                                         before the post-attention norm)
@@ -122,6 +126,7 @@ gen phi3mha Phi3MhaForCausalLM
 gen gemma2 Gemma2ForCausalLM
 gen gemma3 Gemma3ForCausalLM
 gen gemma3mm Gemma3MMForCausalLM
+gen gemma4 Gemma4ForCausalLM
 gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
 gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
 gen gemma2 Gemma2BiasForCausalLM --attention-bias
@@ -211,7 +216,7 @@ ggen deepseek_v3 deepseek-v3-fused-exps
   "$M/${P}-LlamaBiasForCausalLM" "$M/${P}-Gemma2BiasForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
-  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" \
+  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" "$M/${P}-Gemma4ForCausalLM" \
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
   "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \

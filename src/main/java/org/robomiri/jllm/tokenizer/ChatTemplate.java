@@ -81,7 +81,7 @@ public final class ChatTemplate {
 
     /**
      * @param modelType config.json {@code model_type}: qwen3, qwen2, llama, mistral, gemma2, gemma3(_text),
-     *                  phi3, glm (GLM-Edge), glm4, mamba. Also accepted: phi4, deepseek.
+     *                  gemma4(_text, _unified_text), phi3, glm (GLM-Edge), glm4, mamba. Also accepted: phi4, deepseek.
      * @param tok       optional; lets the factory tell apart families that share a model_type: Phi-3 (SentencePiece
      *                  tokenizer, newline-delimited roles) vs Phi-4-mini (byte-level, no newlines), and
      *                  DeepSeek-R1-Distill (a qwen2 or llama model whose vocabulary has {@code <｜User｜>})
@@ -123,6 +123,8 @@ public final class ChatTemplate {
                 return MISTRAL;
             case "gemma", "gemma2", "gemma3", "gemma3_text":
                 return GEMMA;
+            case "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text":
+                return GEMMA4;
             case "phi3", "phimoe": // Phi-3.5-MoE uses the Phi-3 SentencePiece tokenizer and newline template
                 if (tok != null && tok.tokenId("<|im_sep|>") >= 0) {
                     return PHI4_14B;
@@ -605,6 +607,33 @@ public final class ChatTemplate {
             o.ctl("<start_of_turn>model\n");
         }
     }, "<end_of_turn>", "<eos>");
+
+    /**
+     * Gemma 4 instruct: {@code <bos><|turn>user\n...<turn|>\n<|turn>model\n}, with the thought channel already
+     * closed when thinking is off (the official template's default), as in the 12B's {@code chat_template.jinja}.
+     */
+    private static final Format GEMMA4 = new Family("gemma4", (m, gen, think, o) -> {
+        o.ctl("<bos>");
+        int first = 0;
+        if (!m.isEmpty() && "system".equals(m.get(0).role())) {
+            o.ctl("<|turn>system\n");
+            o.txt(pyTrim(content(m.get(0))));
+            o.ctl("<turn|>\n");
+            first = 1;
+        }
+        for (int i = first; i < m.size(); i++) {
+            String role = role(m.get(i), "system", "user", "assistant");
+            if (role.equals("user") != ((i - first) % 2 == 0)) {
+                throw new IllegalArgumentException("Conversation roles must alternate user/assistant/user/assistant/...");
+            }
+            o.ctl("<|turn>" + (role.equals("assistant") ? "model" : role) + "\n");
+            o.txt(pyTrim(content(m.get(i))));
+            o.ctl("<turn|>\n");
+        }
+        if (gen) {
+            o.ctl("<|turn>model\n<|channel>thought\n<channel|>");
+        }
+    }, "<turn|>", "<eos>");
 
     /** Phi-3 (SentencePiece vocabulary): {@code <|user|>\n...<|end|>\n}; ends with EOS when not prompting. */
     private static final Format PHI3 = new Family("phi3", (m, gen, think, o) -> {

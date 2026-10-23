@@ -25,6 +25,10 @@ import org.robomiri.jllm.model.Router;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Decoder forward pass (Llama, Mistral, Qwen2, Qwen3, Gemma, GLM, Phi, DeepSeek) on the GPU via Metal. Owns
@@ -41,11 +45,26 @@ public final class MetalBackend implements Backend {
     private final int maxBatch;
     final MetalKernels k;
 
-    private String attnKernel;         // attention_t instantiation for headDim / attnGroup / cache type
-    private int attnGroup;             // query heads per attention threadgroup
-    private boolean flashDecode;       // flash decoding for long decode steps (decided by MetalTuner, dense attention only)
-    private boolean decodeAttn;        // attention_dec for every single-token step (decided by MetalTuner, dense attention only)
-    private boolean flashPrefill;      // attention_fa for prefill chunks (decided by MetalTuner)
+    /**
+     * The attention kernels and tuner decisions of one layer shape: every layer with the same head shape shares them.
+     * Gemma 4 mixes 256- and 512-wide heads, so there is one entry per distinct shape (see {@link #attnChoices}).
+     */
+    private record AttnChoice(String kernel, int group, boolean flashPrefill, boolean flashDecode, boolean decodeAttn,
+                              String prefillKernel) {
+    }
+
+    /** Attention choices by layer head shape ({@link #shapeKey}); filled once in {@link #init}. */
+    private final Map<String, AttnChoice> attnChoices = new HashMap<>();
+    /** Per-layer shape maxima: the scratch buffers are sized for the largest layer. */
+    private int maxQDim;
+    private int maxKvDim;
+    private int maxHeads;
+    private int maxHeadDim;
+    // flash decoding for long decode steps / attention_dec for single-token steps: any layer's decision, for stepKey
+    private boolean flashDecode;
+    private boolean decodeAttn;
+    /** Tests force flash decoding on every layer ({@link #flashDecodeThresholds}); the layers' own decisions stay. */
+    private boolean forceFlashDecode;
     private Metal.Buffer flashPart;
     // f16 KV cache (backend.kv-dtype=f16): matmul3's *_h variants write v straight into the half cache, k goes
     // through an f32 staging row and rope_h rounds it into the cache after the rotation, attention_h
@@ -96,6 +115,8 @@ public final class MetalBackend implements Backend {
     private int keyedVocab = -1;       // the pipe's vocabulary the recorded pipe steps were made with
     private Metal.Buffer kStage;
     private Metal.Buffer vStage;
+    /** All-ones RMS-norm gains for Gemma 4's parameterless V-norm, one buffer per distinct head width. */
+    private final Map<Integer, Metal.Buffer> vNormOnes = new HashMap<>();
 
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
@@ -327,9 +348,9 @@ public final class MetalBackend implements Backend {
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
                                    String metalLib, KvTierConfig tier) {
         Decoder arch = w.decoder();
-        if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4 || blockTokens < 16
-                || Integer.bitCount(blockTokens) != 1) {
-            return null;
+        if (!arch.uniformShape() || !(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4
+                || blockTokens < 16 || Integer.bitCount(blockTokens) != 1) {
+            return null; // per-layer head shapes need one flat cache per layer (no shared row to page)
         }
         long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
         long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
@@ -352,7 +373,7 @@ public final class MetalBackend implements Backend {
 
     /** KV bytes of one position (every layer, keys and values) for {@code w} with cache type {@code kvDtype}; 0 without grouped-query attention. */
     public static long kvBytesPerPosition(ModelWeights w, KvDtype kvDtype) {
-        if (!(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+        if (!w.decoder().uniformShape() || !(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
             return 0;
         }
         return (long) w.decoder().core().layers() * 2 * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
@@ -429,19 +450,31 @@ public final class MetalBackend implements Backend {
     public static final int PLAN_INITIAL_POSITIONS = 8192;
 
     private static Metal open(Decoder d, String metalLib) {
+        boolean grouped = false;
+        for (LayerSpec s : d.layers()) {
+            if (!(s.attn() instanceof Attention.Gqa g)) {
+                continue;
+            }
+            int hd = g.headDim();
+            if (hd % 32 != 0 || hd > 512) {
+                throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 512");
+            }
+            grouped |= attnGroupOverride(g) > 1;
+        }
         int hd = d.attention().headDim();
-        if (hd % 32 != 0 || hd > 256) {
-            throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");
+        if (hd % 32 != 0 || hd > 512) {
+            throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 512");
         }
         // the grouped attention instantiations (G = 2, 4, 8) are only compiled when the override asks for them
-        return Metal.create(metalLib, attnGroupOverride(d.attention()) > 1 ? "#define JLLM_ATTN_GROUPS 1\n" : "");
+        return Metal.create(metalLib, grouped ? "#define JLLM_ATTN_GROUPS 1\n" : "");
     }
 
     /**
      * Query heads per attention threadgroup. Sharing K/V rows across the group (> 1) measured no faster on
      * Qwen3-0.6B (G=2) and slower on Qwen3-30B-A3B (G=4/8: 20-22 tok/s vs 25 with G=1) because only kvHeads
      * threadgroups run per decode token and each one's serial work grows with the group, so the default is 1;
-     * -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads; headDim 64, 128 or 256 only).
+     * -Djllm.metal.attnGroup=2|4|8 overrides (it must divide heads / kvHeads; headDim 64, 128 or 256 only). The
+     * 512-wide heads have only the G = 1 instantiations, so they always use one query head per threadgroup.
      */
     private static int attnGroupOverride(Attention a) {
         if (!(a instanceof Attention.Gqa g)) {
@@ -464,9 +497,10 @@ public final class MetalBackend implements Backend {
         this.c = arch.core();
         this.ctx = ctx;
         this.maxBatch = maxBatch;
-        if (kvDtype == KvDtype.Q4 && !(arch.attention() instanceof Attention.Gqa g && KvQ4.supports(g.headDim()))) {
-            System.err.println("note: backend.kv-dtype=q4 needs grouped-query attention with a head size that is a "
-                    + "multiple of " + KvQ4.GROUP + " (not DeepSeek's latent cache), using q8");
+        if (kvDtype == KvDtype.Q4 && (!arch.uniformShape()
+                || !(arch.attention() instanceof Attention.Gqa g && KvQ4.supports(g.headDim())))) {
+            System.err.println("note: backend.kv-dtype=q4 needs grouped-query attention with one head shape whose size is "
+                    + "a multiple of " + KvQ4.GROUP + " (not DeepSeek's latent cache or Gemma 4's per-layer heads), using q8");
             kvDtype = KvDtype.Q8;
         }
         if (kvDtype == KvDtype.Q4 && specialAttention(arch, ctx)) {
@@ -475,15 +509,17 @@ public final class MetalBackend implements Backend {
             kvDtype = KvDtype.Q8;
         }
         this.kvDtype = kvDtype;
-        // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
-        this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
-                && KvQ4.supports(ga.headDim());
+        // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head
+        // sizes, and not for per-layer shapes (the rotation store kernels cap the head at 256; the 512-wide layers
+        // would have to store unrotated rows anyway)
+        this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.uniformShape()
+                && arch.attention() instanceof Attention.Gqa ga && KvQ4.supports(ga.headDim());
         this.kvHalf = kvDtype == KvDtype.F16;
-        this.seq = kvPool != null && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4
-                ? kvPool.newSequence(ctx) : null;
+        this.seq = kvPool != null && arch.uniformShape() && arch.attention() instanceof Attention.Gqa
+                && kvDtype != KvDtype.Q4 ? kvPool.newSequence(ctx) : null;
         this.tier = tier;
         this.streaming = tier != null && tier.stream() == KvTierConfig.Stream.FORCE && seq == null
-                && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4;
+                && arch.uniformShape() && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -507,13 +543,41 @@ public final class MetalBackend implements Backend {
         return false;
     }
 
+    /** Whether some layer normalizes its value heads (Gemma 4): an f16 cache then stages v in f32 for the norm. */
+    private boolean anyVNorm() {
+        for (LayerSpec s : arch.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.vNorm()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** All-ones gains for a parameterless V-norm of {@code headDim}-wide head rows (uploaded once per width). */
+    private Metal.Buffer vNormGains(int headDim) {
+        return vNormOnes.computeIfAbsent(headDim, n -> {
+            float[] ones = new float[n];
+            java.util.Arrays.fill(ones, 1f);
+            return k.upload(ones);
+        });
+    }
+
     private void init(KvDtype kvDtype) {
         Attention a = arch.attention();
-        // Attention specialised on headDim (64 / 128 / 256) and the group size, see attnGroupOverride
-        attnGroup = kvDtype == KvDtype.Q4 ? 1 : attnGroupOverride(a); // q4: no grouped instantiations
-        int hd = a.headDim();
-        String vh = MetalKernels.kvSuffix(kvDtype);
-        attnKernel = hd == 64 || hd == 128 || hd == 256 ? "attention_g" + attnGroup + "_d" + hd + vh : "attention" + vh;
+        // Gemma 4 mixes 256- and 512-wide heads: every layer keeps its own cache and attention kernel, and the scratch
+        // buffers are sized for the widest layer.
+        maxHeadDim = a.headDim();
+        maxHeads = a.heads();
+        maxQDim = a.qDim();
+        maxKvDim = a instanceof Attention.Gqa g0 ? g0.kvDim() : 0;
+        for (LayerSpec s : arch.layers()) {
+            if (s.attn() instanceof Attention.Gqa g) {
+                maxHeadDim = Math.max(maxHeadDim, g.headDim());
+                maxHeads = Math.max(maxHeads, g.heads());
+                maxQDim = Math.max(maxQDim, g.qDim());
+                maxKvDim = Math.max(maxKvDim, g.kvDim());
+            }
+        }
         if (arch.maxExperts() > MetalConstants.MAX_EXPERTS) {
             throw new IllegalArgumentException("Metal router kernel supports at most " + MetalConstants.MAX_EXPERTS + " experts");
         }
@@ -562,46 +626,46 @@ public final class MetalBackend implements Backend {
                 streamed = new StreamedKv(c.layers(), ctx, rowBytes, wk, wv, tier.hostBytes(),
                         tier.dir() != null ? tier.dir().resolve("stream") : null);
             } else {
-                long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+                // one flat cache per layer, each with its own row layout (Gemma 4's local and full layers differ)
                 for (int l = 0; l < c.layers(); l++) {
+                    if (!(arch.layers().get(l).attn() instanceof Attention.Gqa gl)) {
+                        continue;
+                    }
+                    long rowBytes = kvDtype.rowBytes(gl.kvDim(), gl.kvHeads());
+                    long kvBytes = ctx * rowBytes;
                     keyCache[l] = k.scratch(kvBytes);
                     valCache[l] = k.scratch(kvBytes);
-                    k.rowIndexed(keyCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads())); // for decode replay
-                    k.rowIndexed(valCache[l], kvDtype.rowBytes(g.kvDim(), g.kvHeads()));
+                    k.rowIndexed(keyCache[l], rowBytes); // for decode replay
+                    k.rowIndexed(valCache[l], rowBytes);
                 }
             }
-            // f32 k rows before RoPE (f16, q8, q4, paged) and v rows before the quantization / the paged store
-            kStage = kvDtype != KvDtype.F32 || seq != null ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
-            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 || seq != null ? k.scratch((long) maxBatch * g.kvDim() * 4) : null;
+            // f32 k rows before RoPE (f16, q8, q4, paged) and v rows before the quantization / the paged store; Gemma 4's
+            // V-norm also needs an f32 v row for the f16 cache (the norm runs before the single rounding into half)
+            kStage = kvDtype != KvDtype.F32 || seq != null ? k.scratch((long) maxBatch * maxKvDim * 4) : null;
+            boolean vNorm = kvDtype == KvDtype.F16 && anyVNorm();
+            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 || seq != null || vNorm
+                    ? k.scratch((long) maxBatch * maxKvDim * 4) : null;
             int recent = Math.min(KvDtype.q4Recent(), ctx);
             if (kvDtype == KvDtype.Q4 && recent > 0) {
                 // recent + batch slots: a chunk never evicts a row one of its own queries reads (as KvCache.Q4)
                 int cap = Math.min(ctx, recent + maxBatch);
                 q4Rings = new MetalKernels.Q4Ring[c.layers()];
                 for (int l = 0; l < c.layers(); l++) {
+                    int kvDim = ((Attention.Gqa) arch.layers().get(l).attn()).kvDim();
                     Metal.Buffer tags = k.scratch((long) cap * 4);
                     tags.contents().fill((byte) -1); // -1: no position
-                    q4Rings[l] = new MetalKernels.Q4Ring(k.scratch((long) cap * g.kvDim() * 2),
-                            k.scratch((long) cap * g.kvDim() * 2), tags, recent, cap);
+                    q4Rings[l] = new MetalKernels.Q4Ring(k.scratch((long) cap * kvDim * 2),
+                            k.scratch((long) cap * kvDim * 2), tags, recent, cap);
                 }
             }
         }
         x = k.scratch((long) maxBatch * c.dim() * 4);
         xb = k.scratch((long) maxBatch * c.dim() * 4);
-        q = k.scratch((long) maxBatch * a.qDim() * 4);
-        att = k.scratch((long) maxBatch * Math.max(a.qDim(), a.outDim()) * 4);
+        q = k.scratch((long) maxBatch * maxQDim * 4);
+        att = k.scratch((long) maxBatch * Math.max(maxQDim, a.outDim()) * 4);
         hidden = k.scratch((long) maxBatch * arch.maxMlpDim() * 4);
-        scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * a.heads() * ctx * 4);
+        scores = k.scratch((long) Math.min(MetalConstants.ATT_TILE, maxBatch) * maxHeads * ctx * 4);
         logitsBuf = k.scratch((long) w.lmHead.rows * 4);
-        if (a instanceof Attention.Gqa g) {
-            MetalTuner.Decision d = MetalTuner.decide(k, g, kvDtype, attnKernel, attnGroup,
-                    q4Rings == null ? 0 : q4Rings[0].recent());
-            flashPrefill = d.flashPrefill();
-            flashDecode = d.flashDecode();
-            System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
-                    + (flashDecode ? "on" : "off") + " (" + d.note() + ")");
-            decodeAttn = kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(g.headDim()) && MetalTuner.decodeAttention(k, g, kvDtype, attnKernel, attnGroup);
-        }
         if (KvSparse.get().enabled()) {
             if (seq != null && a instanceof Attention.Gqa gs && kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(gs.headDim())
                     && ((MetalKvStorage) seq.pool().storage()).hasSummaries()) {
@@ -617,9 +681,13 @@ public final class MetalBackend implements Backend {
                         + " with head size 64, 128 or 256, an f32, f16 or q8 paged cache), using dense attention");
             }
         }
-        flashPart = flashDecode || decodeAttn
-                ? k.scratch((long) a.heads() * (decodeAttn ? MetalConstants.FLASH_MAX_SPLITS : MetalKernels.FLASH_SPLITS) * (hd + 2) * 4)
-                : null;
+        if (a instanceof Attention.Gqa) { // after the sparse decision, which forces attention_dec for every layer
+            chooseAttentionKernels(kvDtype);
+            // sized for the widest layer: heads * splits * (headDim + 2) floats
+            flashPart = k.scratch((long) maxHeads * MetalConstants.FLASH_MAX_SPLITS * (maxHeadDim + 2) * 4);
+        } else {
+            flashPart = null;
+        }
         if (arch.anyMoe()) {
             int slots = maxBatch * arch.maxTopK();
             assign = k.scratch((long) slots * 4);
@@ -670,6 +738,48 @@ public final class MetalBackend implements Backend {
                             + "when the first slot loads)" : "");
         }
         logLoadPlan();
+    }
+
+    /** Key of a layer's attention shape: layers with equal keys share the kernel and the tuner decisions. */
+    private static String shapeKey(Attention.Gqa g) {
+        return g.headDim() + "x" + g.heads() + "/" + g.kvHeads();
+    }
+
+    /**
+     * Chooses every distinct layer head shape's attention kernel ({@code attention_g<group>_d<headDim>}) and runs the
+     * {@link MetalTuner} self-checks once per shape. Uniform models have one shape; Gemma 4 has two (256-wide local
+     * layers with 8 KV heads and 512-wide full layers with one). The flash prefill form is captured per shape because
+     * {@link MetalKernels#flashPrefillKernel} is a single field: each step restores its layer's form before dispatching.
+     */
+    private void chooseAttentionKernels(KvDtype kvDtype) {
+        Set<String> seen = new HashSet<>();
+        for (LayerSpec s : arch.layers()) {
+            if (!(s.attn() instanceof Attention.Gqa g) || !seen.add(shapeKey(g))) {
+                continue;
+            }
+            int group = kvDtype == KvDtype.Q4 ? 1 : attnGroupOverride(g); // q4: no grouped instantiations
+            int hd = g.headDim();
+            String vh = MetalKernels.kvSuffix(kvDtype);
+            // 512-wide heads only have G = 1 instantiations, and attnGroupOverride already clamps them to 1
+            String kernel = hd == 64 || hd == 128 || hd == 256 || hd == 512
+                    ? "attention_g" + group + "_d" + hd + vh : "attention" + vh;
+            int recent = q4Rings == null ? 0 : q4Rings[0].recent();
+            MetalTuner.Decision d = MetalTuner.decide(k, g, kvDtype, kernel, group, recent);
+            String prefillKernel = k.flashPrefillKernel;
+            boolean decode = kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(hd)
+                    && MetalTuner.decodeAttention(k, g, kvDtype, kernel, group);
+            if (sparseOn) {
+                decode = true; // the sparse kernel is attention_dec's: the dense rows of a sparse run take it too
+            }
+            attnChoices.put(shapeKey(g),
+                    new AttnChoice(kernel, group, d.flashPrefill(), d.flashDecode(), decode, prefillKernel));
+            flashDecode |= d.flashDecode();
+            decodeAttn |= decode;
+            System.err.println("Metal kernels: head " + hd + "/" + g.kvHeads() + " (" + kernel + "), flash prefill "
+                    + (d.flashPrefill() ? "on [" + prefillKernel + "]" : "off") + ", flash decode "
+                    + (d.flashDecode() ? "on" : "off") + ", decode attention " + (decode ? "on" : "off") + " ("
+                    + d.note() + ")");
+        }
     }
 
     // ------------------------------------------------------------------ experts on the CPU
@@ -1051,6 +1161,13 @@ public final class MetalBackend implements Backend {
         /** gpt-oss / Llama 4: the layer needs the generic attention kernel with its extras (sinks, chunk, temperature). */
         private final boolean special;
         private final MetalKernels.AttnExtra extra;
+        /** This layer shape's attention_t instantiation, query heads per threadgroup and tuner decisions. */
+        private final String attnKernel;
+        private final int attnGroup;
+        private final boolean flashPrefill;
+        private final boolean flashDecode;
+        private final boolean decodeAttn;
+        private final String prefillKernel;
 
         GqaStep(Attention.Gqa g, AttnWeights.Gqa w, Metal.Buffer attnNorm) {
             this.g = g;
@@ -1058,6 +1175,16 @@ public final class MetalBackend implements Backend {
             this.special = eg.special();
             this.extra = special ? new MetalKernels.AttnExtra(k.upload(MetalKernels.AttnExtra.words(eg.chunk(), w.sinks(),
                     eg.tempFloor(), eg.tempScale()))) : MetalKernels.AttnExtra.NONE;
+            AttnChoice choice = attnChoices.get(shapeKey(g));
+            if (choice == null) {
+                throw new IllegalStateException("no attention choice for layer head shape " + shapeKey(g));
+            }
+            this.attnKernel = choice.kernel();
+            this.attnGroup = choice.group();
+            this.flashPrefill = choice.flashPrefill();
+            this.flashDecode = choice.flashDecode();
+            this.decodeAttn = choice.decodeAttn();
+            this.prefillKernel = choice.prefillKernel();
             this.table = arch.ropeTables().get(g.ropeTable());
             this.attnNorm = attnNorm;
             wq = w.wq();
@@ -1065,7 +1192,7 @@ public final class MetalBackend implements Backend {
             wv = w.wv();
             bwq = k.wrap(wq.data);
             bwk = k.wrap(wk.data);
-            bwv = k.wrap(wv.data);
+            bwv = wv != null ? k.wrap(wv.data) : null; // Gemma 4's attention_k_eq_v layers have no v_proj
             bq = w.bq() != null ? k.upload(w.bq()) : null;
             bk = w.bk() != null ? k.upload(w.bk()) : null;
             bv = w.bv() != null ? k.upload(w.bv()) : null;
@@ -1078,6 +1205,11 @@ public final class MetalBackend implements Backend {
             if (!fullRotation && (g.qkNorm() || g.l2Norm())) {
                 throw new IllegalArgumentException("partial rotary embedding combined with q/k norm is not implemented");
             }
+        }
+
+        /** Flash decoding for this layer's shape, or forced on by {@link MetalBackend#flashDecodeThresholds}. */
+        private boolean flashDecodeOn() {
+            return flashDecode || forceFlashDecode;
         }
 
         @Override
@@ -1094,6 +1226,15 @@ public final class MetalBackend implements Backend {
             long kOff = kvDtype != KvDtype.F32 || paged ? 0 : cacheOff;
             Metal.Buffer vDst = staged ? vStage : valCache[layer];
             long vOff = staged ? 0 : cacheOff;
+            int hd = g.headDim();
+            boolean vNorm = g.vNorm();
+            // Gemma 4's parameterless V-norm is an f32 RMS norm before the store: an f16 cache stages v in f32 as well
+            // (and attention_k_eq_v's v must stay float until that norm), so the rows are rounded once by the store.
+            boolean floatV = vNorm || g.kEqV();
+            boolean stageV = floatV && kvHalf && !staged;
+            Metal.Buffer vProj = stageV ? vStage : vDst;
+            long vProjOff = stageV ? 0 : vOff;
+            boolean vProjHalf = !floatV && kvHalf && !paged;
             Metal.Buffer in = x;
             Metal.Buffer norm = attnNorm;
             if (!fuseNorm) {
@@ -1101,14 +1242,23 @@ public final class MetalBackend implements Backend {
                 in = xb;
                 norm = null;
             }
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vDst, vOff, kvHalf && !paged, bq, bk, bv, n);
+            if (g.kEqV()) { // V = the key projection (pre-RoPE), written to both the k and v outputs
+                k.matmulQkEqV(wq, bwq, wk, bwk, in, norm, q, kDst, kOff, vProj, vProjOff, bq, bk, n);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vProj, vProjOff, vProjHalf, bq, bk, bv, n);
+            }
+            if (vNorm) { // one RMS norm per value head (headDim-wide rows), all-ones gains, in place in the f32 v rows
+                k.rmsnormTo(vProj, vProjOff, vNormGains(hd), vProj, vProjOff, n * g.kvHeads(), hd);
+            }
+            if (stageV) { // the f32 v rows into the f16 cache rows (V = K or the normalized v projection)
+                k.kvPutRows(true, vStage, 0, valCache[layer], cacheOff, kvDim, kvDim, n);
+            }
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
             // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
             // into the staging rows, which kv_store_q8 then quantizes together with v)
             boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
-            int hd = g.headDim();
             if (q4) {
                 k.rope(adjacent, kvHalf, q, kDst, kOff, kStage, 0, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
@@ -1116,7 +1266,7 @@ public final class MetalBackend implements Backend {
                 k.kvStoreQ4(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, q, ring, hd, g.kvHeads(),
                         g.heads(), pos, n);
                 float scale = g.scale() / KvQ4.scaleDivisor(hd); // (Hq)·(Hk) = B q·k
-                if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
+                if (flashDecodeOn() && n == 1 && pos + 1 >= k.flashMinLen) {
                     k.flashAttentionQ4(q, keyCache[layer], valCache[layer], flashPart, scores, att, ring, g.heads(),
                             g.kvHeads(), hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                 } else if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
@@ -1190,12 +1340,13 @@ public final class MetalBackend implements Backend {
                         pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n, extra);
                 return;
             }
-            if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
+            if (flashDecodeOn() && n == 1 && pos + 1 >= k.flashMinLen) {
                 k.flashAttention(kvDtype, q, keyCache[layer], valCache[layer], flashPart, scores, att, g.heads(), g.kvHeads(),
                         hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                 return;
             }
             if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
+                k.flashPrefillKernel = prefillKernel; // this layer shape's form (attention_fa / _fb; no f32 d512 fb)
                 k.flashPrefill(kvDtype, hd, q, keyCache[layer], valCache[layer], att, g.heads(), g.kvHeads(), pos, n,
                         scale, g.qDim(), stride, g.qDim(), g.window(), g.softcap());
                 return;
@@ -1223,7 +1374,14 @@ public final class MetalBackend implements Backend {
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, n, dim);
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
+            if (g.kEqV()) { // V = the pre-RoPE key projection, in the f32 rowV staging rows
+                k.matmulQkEqV(wq, bwq, wk, bwk, xb, null, q, rowK, 0, rowV, 0, bq, bk, n);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
+            }
+            if (g.vNorm()) {
+                k.rmsnorm(rowV, 0, vNormGains(hd), rowV, n * g.kvHeads(), hd);
+            }
             boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
@@ -1256,7 +1414,7 @@ public final class MetalBackend implements Backend {
                     long kvOff = (long) t * kvDim * 4;
                     k.kvStoreQ4Row(rowK, kvOff, rowV, kvOff, kc, vc, pos * rowBytes, q, qOff, ring, hd, g.kvHeads(),
                             g.heads(), pos);
-                    if (flashDecode && pos + 1 >= k.flashMinLen) {
+                    if (flashDecodeOn() && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionQ4Row(q, qOff, kc, vc, flashPart, scores, att, qOff, ring, g.heads(), g.kvHeads(), hd,
                                 pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                     } else {
@@ -1300,7 +1458,7 @@ public final class MetalBackend implements Backend {
             // flash form shares its partial-result buffer between rows and stays one after the other
             boolean anyFlash = false;
             for (int t = 0; t < n; t++) {
-                anyFlash |= flashDecode && !special && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
+                anyFlash |= flashDecodeOn() && !special && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
             }
             int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
             for (int t = 0; t < n; t++) {
@@ -1310,7 +1468,7 @@ public final class MetalBackend implements Backend {
                 long qOff = (long) t * g.qDim() * 4;
                 k.page(owners[t].pageTbl, owners[t].pageShift);
                 if (anyFlash) {
-                    if (flashDecode && !special && pos + 1 >= k.flashMinLen) {
+                    if (flashDecodeOn() && !special && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                                 hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
@@ -1346,7 +1504,14 @@ public final class MetalBackend implements Backend {
             boolean q8 = kvDtype == KvDtype.Q8;
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, rows, dim);
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, rows);
+            if (g.kEqV()) { // V = the pre-RoPE key projection, in the f32 rowV staging rows
+                k.matmulQkEqV(wq, bwq, wk, bwk, xb, null, q, rowK, 0, rowV, 0, bq, bk, rows);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, rows);
+            }
+            if (g.vNorm()) {
+                k.rmsnorm(rowV, 0, vNormGains(hd), rowV, rows * g.kvHeads(), hd);
+            }
             boolean useNorm = !partial && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
@@ -1416,6 +1581,7 @@ public final class MetalBackend implements Backend {
                                 ctx, scale, stride, g.window(), g.softcap());
                     }
                 } else if (flashPrefill && n >= MetalKernels.FLASH_PREFILL_MIN) {
+                    k.flashPrefillKernel = prefillKernel; // this layer shape's form (attention_fa / _fb; no f32 d512 fb)
                     k.flashPrefillAt(kvDtype, hd, q, qOff, kc, vc, att, qOff, g.heads(), g.kvHeads(), pos, n, scale, qDim,
                             stride, qDim, g.window(), g.softcap());
                 } else {
@@ -1441,7 +1607,7 @@ public final class MetalBackend implements Backend {
                 } else {
                     boolean anyFlash = false;
                     for (int s = 0; s < m; s++) {
-                        anyFlash |= counts[s] == 1 && flashDecode && positions[s] + 1 >= k.flashMinLen;
+                        anyFlash |= counts[s] == 1 && flashDecodeOn() && positions[s] + 1 >= k.flashMinLen;
                     }
                     int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
                     int t = 0;
@@ -1455,7 +1621,7 @@ public final class MetalBackend implements Backend {
                         long qOff = (long) rowStart[s] * qDim * 4;
                         k.page(owners[s].pageTbl, owners[s].pageShift);
                         if (anyFlash) {
-                            if (flashDecode && pos + 1 >= k.flashMinLen) {
+                            if (flashDecodeOn() && pos + 1 >= k.flashMinLen) {
                                 k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                                         hd, pos, ctx, scale, qDim, stride, g.window(), g.softcap());
                                 continue;
@@ -1992,6 +2158,15 @@ public final class MetalBackend implements Backend {
         if (deepstack != null && l < deepstack.length) {
             addDeepstack(l, n);
         }
+        scaleLayerOutput(l, n);
+    }
+
+    /** Gemma 4's per-layer {@code layer_scalar}: after the layer, x *= the layer's scalar (the residual stream included). */
+    private void scaleLayerOutput(int layer, int rows) {
+        float s = w.decoderLayer(layer).layerScalar();
+        if (s != 1f) {
+            k.vecScale(x, rows * c.dim(), s);
+        }
     }
 
     // ------------------------------------------------------------------ decode replay
@@ -2108,9 +2283,10 @@ public final class MetalBackend implements Backend {
             return;
         }
         if (flashPart == null) {
-            flashPart = k.scratch((long) arch.attention().heads() * MetalKernels.FLASH_SPLITS * (arch.attention().headDim() + 2) * 4);
+            flashPart = k.scratch((long) maxHeads * MetalKernels.FLASH_SPLITS * (maxHeadDim + 2) * 4);
         }
         flashDecode = true;
+        forceFlashDecode = true;
         k.flashMinLen = minLen;
         k.flashChunk = chunk;
         k.invalidatePrograms();
@@ -2365,9 +2541,9 @@ public final class MetalBackend implements Backend {
                 owners[t].seq.beginWrite(positions[t], 1);
             }
         }
-        if (arch.attention() instanceof Attention.Gqa g && rowK == null) {
-            rowK = k.scratch((long) maxBatch * g.kvDim() * 4);
-            rowV = k.scratch((long) maxBatch * g.kvDim() * 4);
+        if (arch.attention() instanceof Attention.Gqa && rowK == null) {
+            rowK = k.scratch((long) maxBatch * maxKvDim * 4); // the widest layer's rows
+            rowV = k.scratch((long) maxBatch * maxKvDim * 4);
         }
         if (logitsAllBuf == null || logitsAllRows < n) {
             logitsAllRows = Math.min(maxBatch, Math.max(n, 16)); // lives until the backend closes: size once
@@ -2404,6 +2580,7 @@ public final class MetalBackend implements Backend {
                     k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias());
                 }
                 L.ffn().run(l, n, false);
+                scaleLayerOutput(l, n);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit();
                 }
@@ -2526,6 +2703,7 @@ public final class MetalBackend implements Backend {
                     k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, rows, true, null, 0f, L.woBias());
                 }
                 L.ffn().run(l, rows, false);
+                scaleLayerOutput(l, rows);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit();
                 }
@@ -2922,6 +3100,9 @@ public final class MetalBackend implements Backend {
      */
     @Override
     public String stateFormat() {
+        if (!arch.uniformShape()) {
+            return null; // per-layer row layouts: no single saved format (as the CPU backend)
+        }
         if (arch.attention() instanceof Attention.Gqa g) {
             return "kv " + kvDtype + (q8Rot ? " rot" : "") + (q4Rings != null ? " recent=" + q4Rings[0].recent() : "") + " layers=" + c.layers()
                     + " kvDim=" + g.kvDim() + " headDim=" + g.headDim();

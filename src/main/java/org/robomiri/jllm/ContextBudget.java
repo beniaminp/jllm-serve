@@ -4,6 +4,7 @@ import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.Qwen3NextArch;
 
@@ -66,7 +67,9 @@ public final class ContextBudget {
     public static long bytesPerToken(Architecture arch, KvDtype kv) {
         return switch (arch) {
             case Decoder d -> switch (d.attention()) {
-                case Attention.Gqa g -> 2L * d.core().layers() * kv.rowBytes(g.kvDim(), g.kvHeads());
+                case Attention.Gqa g -> d.uniformShape()
+                        ? 2L * d.core().layers() * kv.rowBytes(g.kvDim(), g.kvHeads())
+                        : perLayerKvBytes(d, kv);
                 case Attention.Mla m -> (long) d.core().layers()
                         * (kv == KvDtype.Q4 ? KvDtype.Q8 : kv).rowBytes(m.kvLoraRank() + m.rope(), 1);
             };
@@ -75,6 +78,17 @@ public final class ContextBudget {
             case org.robomiri.jllm.model.HybridArch h -> h.attention() == null ? 0L
                     : 2L * h.attentionLayers() * kv.rowBytes(h.attention().kvDim(), h.attention().kvHeads());
         };
+    }
+
+    /** KV bytes per position when every layer has its own head shape (Gemma 4). */
+    private static long perLayerKvBytes(Decoder d, KvDtype kv) {
+        long n = 0;
+        for (LayerSpec s : d.layers()) {
+            if (s.attn() instanceof Attention.Gqa g) {
+                n += 2L * kv.rowBytes(g.kvDim(), g.kvHeads());
+            }
+        }
+        return n;
     }
 
     /**
@@ -110,7 +124,8 @@ public final class ContextBudget {
                          int slots, boolean draft) {
         KvDtype kv = KvDtype.parse(s.get("backend.kv-dtype"));
         long per = bytesPerToken(arch, kv);
-        if (s.getBool("backend.kv-sparse") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa g) {
+        if (s.getBool("backend.kv-sparse") && arch instanceof Decoder d && d.uniformShape()
+                && d.attention() instanceof Attention.Gqa g) {
             // sparse decode attention (docs/27): every block also keeps a min / max key summary of halves per layer and kv head
             per += (long) d.core().layers() * g.kvHeads() * 2 * g.headDim() * 2 / s.getInt("backend.kv-block");
         }
@@ -118,7 +133,9 @@ public final class ContextBudget {
         long ram = physicalMemory();
         long budget;
         String basis;
-        long ws = ModelLoader.resolveBackend(s).equals("metal") ? org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib")) : 0;
+        boolean metal = ModelLoader.resolveBackend(s).equals("metal")
+                && (!(arch instanceof Decoder d) || d.uniformShape()); // Gemma 4 runs on the CPU: its 512-wide heads
+        long ws = metal ? org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib")) : 0;
         if (tierManaged(s, arch, kv)) {
             // tiered KV storage (docs/26): the cache is not bounded by the GPU's share. A slot that does not fit the hot tier keeps its
             // rows in host memory and streams them (backend.kv-stream), the planner (backend.memory-plan) grows the pool and moves
@@ -183,7 +200,8 @@ public final class ContextBudget {
      * share and the Metal arithmetic above applies.)
      */
     static boolean tierManaged(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
-        return s.getBool("backend.kv-tier") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4
+        return s.getBool("backend.kv-tier") && arch instanceof Decoder d && d.uniformShape()
+                && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4
                 && (!s.get("backend.kv-stream").trim().equalsIgnoreCase("off") || s.getBool("backend.memory-plan")
                 || s.getLong("backend.kv-hot-mb") > 0);
     }
@@ -200,7 +218,7 @@ public final class ContextBudget {
     }
 
     private static boolean pageable(Architecture arch, KvDtype kv) {
-        return arch instanceof Decoder d && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4;
+        return arch instanceof Decoder d && d.uniformShape() && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4;
     }
 
     /** Free space of the Java heap's old generation (where the CPU KV caches live), as {@code KvCache.checkHeap} sees it. */

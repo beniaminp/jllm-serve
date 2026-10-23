@@ -32,6 +32,7 @@ final class GgufFamilies {
      */
     static void gemma(GgufFile g, Family family, String p, Map<String, Object> c, long dim, long heads, long headDim, long layers) {
         boolean g3 = family == Family.GEMMA3;
+        boolean g4 = family.gemma4();
         c.put("hidden_act", "gelu_pytorch_tanh");
         c.put("hidden_activation", "gelu_pytorch_tanh");
         c.put("torch_dtype", "float32"); // llama.cpp scales by sqrtf(n_embd) with no rounding to the checkpoint's dtype
@@ -39,7 +40,7 @@ final class GgufFamilies {
         long window = g.num(p + "attention.sliding_window", 0);
         List<Object> types = new ArrayList<>();
         Object pattern = g.get(p + "attention.sliding_window_pattern");
-        long n = g.num(p + "attention.sliding_window_pattern", g3 ? 6 : 2);
+        long n = g.num(p + "attention.sliding_window_pattern", g3 || g4 ? 6 : 2);
         for (int l = 0; l < layers; l++) {
             boolean local;
             if (window <= 0) {
@@ -58,12 +59,66 @@ final class GgufFamilies {
         if (g3) {
             c.put("rope_local_base_freq", g.dbl(p + "rope.freq_base_swa", 10000.0));
         }
+        if (g4) {
+            // Gemma 4: the full layers use proportional RoPE over the whole (wide) head; the sliding layers a plain
+            // table at the local base. llama.cpp writes the proportional part as a rope_freqs table whose factors
+            // beyond the rotated pairs are 1e30 (a zero frequency); its finite prefix gives partial_rotary_factor.
+            double theta = g.dbl(p + "rope.freq_base", 1_000_000.0);
+            double localTheta = g.dbl(p + "rope.freq_base_swa", 10_000.0);
+            long fullHeadDim = g.num(p + "attention.key_length", headDim);
+            c.put("global_head_dim", fullHeadDim);
+            c.putIfAbsent("num_global_key_value_heads", 1L);
+            double partial = proportionalFactor(g, fullHeadDim);
+            Map<String, Object> full = new LinkedHashMap<>();
+            full.put("rope_type", "proportional");
+            full.put("rope_theta", theta);
+            full.put("partial_rotary_factor", partial);
+            Map<String, Object> local = new LinkedHashMap<>();
+            local.put("rope_type", "default");
+            local.put("rope_theta", localTheta);
+            Map<String, Object> ropes = new LinkedHashMap<>();
+            ropes.put("full_attention", full);
+            ropes.put("sliding_attention", local);
+            c.put("rope_parameters", ropes);
+            // K = V when the full-attention layers have no attn_v tensor (the 12B); keep the projection otherwise
+            boolean kEqV = true;
+            for (int l = 0; l < types.size(); l++) {
+                if (!"sliding_attention".equals(types.get(l)) && g.hasTensor("blk." + l + ".attn_v.weight")) {
+                    kEqV = false;
+                    break;
+                }
+            }
+            c.put("attention_k_eq_v", kEqV);
+        }
         for (String k : new String[]{"attn_logit_softcapping", "final_logit_softcapping"}) {
             if (g.get(p + k) instanceof Number s) {
                 c.put(k, s.doubleValue());
             } else if (g3) {
                 c.put(k, null); // llama.cpp's loader switches Gemma 3's caps off when the keys are absent
             }
+        }
+    }
+
+    /**
+     * The rotated fraction of a Gemma 4 full-attention head from its {@code rope_freqs.weight}: the factors before the
+     *1e30 tail (llama.cpp's zero frequency) divided by {@code headDim / 2}; 0.25 when the file has no table.
+     */
+    private static double proportionalFactor(GgufFile g, long headDim) {
+        if (!g.hasTensor("rope_freqs.weight") || headDim <= 0) {
+            return 0.25;
+        }
+        try {
+            List<Object> f = table(g, g.tensor("rope_freqs.weight"));
+            int active = 0;
+            for (Object v : f) {
+                if (((Number) v).doubleValue() < 1e20) {
+                    active++;
+                }
+            }
+            double p = 2.0 * active / headDim;
+            return p > 0 && p <= 1 ? p : 0.25;
+        } catch (IOException | RuntimeException e) {
+            return 0.25; // an unusual table: the released 12B's 0.25
         }
     }
 

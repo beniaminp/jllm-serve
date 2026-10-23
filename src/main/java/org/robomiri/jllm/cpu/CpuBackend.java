@@ -46,8 +46,13 @@ public final class CpuBackend implements Backend {
     /** One table per {@link Decoder#ropeTables()} entry. */
     private final Rope[] ropes;
 
-    /** The key/value cache of the grouped-query layers; null for a latent-attention model. */
+    /** The key/value cache of the grouped-query layers; null for a latent-attention model or a per-layer-shape one. */
     private final KvCache kv;
+    /**
+     * One cache per layer when the layers do not share a head shape (Gemma 4); null otherwise. A paged or batched pass
+     * is not available in that case.
+     */
+    private final KvCache[] kvs;
 
     /** For tests and studies (docs/27): the blocks the last sparse row selected per kv head, if {@code record} was asked of {@link #recordSparseSelection}. */
     public int[][] lastSparseSelection() {
@@ -154,8 +159,8 @@ public final class CpuBackend implements Backend {
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
                                    boolean rotateQ8, org.robomiri.jllm.kv.KvTierConfig tier) {
         Decoder arch = w.decoder();
-        if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
-            return null;
+        if (!arch.uniformShape() || !(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+            return null; // Gemma 4's per-layer head shapes have no shared paged row
         }
         CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8,
                 org.robomiri.jllm.model.KvSparse.get().enabled());
@@ -199,41 +204,72 @@ public final class CpuBackend implements Backend {
                     + c.maxPositions() + "); RoPE positions beyond the training length are extrapolated");
         }
         Attention a = arch.attention();
-        switch (a) {
-            case Attention.Gqa g -> {
-                if (kvDtype == KvDtype.Q4 && anySpecial(arch, ctx)) {
-                    // the cache format is the same on both backends (a saved cache loads into either), and the GPU's q4
-                    // attention kernels have no sinks, chunks or temperature
-                    System.err.println("note: backend.kv-dtype=q4 is not implemented for attention sinks, chunked attention or "
-                            + "attention temperature (gpt-oss, Llama 4), using q8");
-                    kvDtype = KvDtype.Q8;
-                }
-                if (kvPool != null) {
-                    seq = kvPool.newSequence(ctx);
-                    kv = new PagedKv(c.layers(), g, ctx, (CpuKvStorage) kvPool.storage(), seq);
-                } else {
-                    seq = null;
-                    kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
-                }
-                mla = null;
-                kStage = new float[maxBatch * g.kvDim()];
-                vStage = new float[maxBatch * g.kvDim()];
+        int qWidth = a.qDim();
+        int outWidth = a.outDim();
+        int kvWidth = a instanceof Attention.Gqa gg ? gg.kvDim() : 0;
+        if (!arch.uniformShape()) {
+            // Gemma 4: the full-attention layers have a wider head and one KV head. One flat cache per layer keeps
+            // each layer's own layout; paging and batched passes need a shared row and are not offered.
+            if (!(a instanceof Attention.Gqa)) {
+                throw new IllegalArgumentException("per-layer attention shapes are only implemented for grouped-query attention");
             }
-            case Attention.Mla m -> {
-                seq = null;
-                kv = null;
-                if (kvDtype == KvDtype.Q4) {
-                    System.err.println("note: backend.kv-dtype=q4 is not implemented for DeepSeek's latent cache, using q8");
+            if (kvDtype == KvDtype.Q4 && anySpecial(arch, ctx)) {
+                kvDtype = KvDtype.Q8;
+            }
+            seq = null;
+            kv = null;
+            mla = null;
+            kvs = new KvCache[c.layers()];
+            qWidth = 0;
+            outWidth = 0;
+            kvWidth = 0;
+            for (int l = 0; l < c.layers(); l++) {
+                Attention.Gqa g = (Attention.Gqa) arch.layers().get(l).attn();
+                kvs[l] = KvCache.create(kvDtype, 1, g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
+                qWidth = Math.max(qWidth, g.qDim());
+                outWidth = Math.max(outWidth, g.outDim());
+                kvWidth = Math.max(kvWidth, g.kvDim());
+            }
+            kStage = new float[maxBatch * kvWidth];
+            vStage = new float[maxBatch * kvWidth];
+        } else {
+            kvs = null;
+            switch (a) {
+                case Attention.Gqa g -> {
+                    if (kvDtype == KvDtype.Q4 && anySpecial(arch, ctx)) {
+                        // the cache format is the same on both backends (a saved cache loads into either), and the GPU's q4
+                        // attention kernels have no sinks, chunks or temperature
+                        System.err.println("note: backend.kv-dtype=q4 is not implemented for attention sinks, chunked attention or "
+                                + "attention temperature (gpt-oss, Llama 4), using q8");
+                        kvDtype = KvDtype.Q8;
+                    }
+                    if (kvPool != null) {
+                        seq = kvPool.newSequence(ctx);
+                        kv = new PagedKv(c.layers(), g, ctx, (CpuKvStorage) kvPool.storage(), seq);
+                    } else {
+                        seq = null;
+                        kv = KvCache.create(kvDtype, c.layers(), g, ctx, maxBatch, KvDtype.q4Recent(), KvDtype.q8Rotate());
+                    }
+                    mla = null;
+                    kStage = new float[maxBatch * g.kvDim()];
+                    vStage = new float[maxBatch * g.kvDim()];
                 }
-                mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype == KvDtype.Q4 ? KvDtype.Q8 : kvDtype);
-                kStage = null; // MLA keeps its own cache and staging
-                vStage = null;
+                case Attention.Mla m -> {
+                    seq = null;
+                    kv = null;
+                    if (kvDtype == KvDtype.Q4) {
+                        System.err.println("note: backend.kv-dtype=q4 is not implemented for DeepSeek's latent cache, using q8");
+                    }
+                    mla = new MlaCpu(this, w, m, ropes[m.ropeTable()], ctx, maxBatch, kvDtype == KvDtype.Q4 ? KvDtype.Q8 : kvDtype);
+                    kStage = null; // MLA keeps its own cache and staging
+                    vStage = null;
+                }
             }
         }
         x = new float[maxBatch * c.dim()];
         xb = new float[maxBatch * c.dim()];
-        q = new float[maxBatch * a.qDim()];
-        att = new float[maxBatch * Math.max(a.qDim(), a.outDim())];
+        q = new float[maxBatch * qWidth];
+        att = new float[maxBatch * Math.max(qWidth, outWidth)];
         gateUp = new float[maxBatch * 2 * arch.maxMlpDim()];
         hidden = new float[maxBatch * arch.maxMlpDim()];
         if (arch.anyMoe()) {
@@ -328,12 +364,23 @@ public final class CpuBackend implements Backend {
         return new LayerPlan(L, attention, residual, ffn);
     }
 
+    /** The cache of {@code layer}: the shared one, or the per-layer cache of a model with differing head shapes. */
+    private KvCache cache(int layer) {
+        return kvs != null ? kvs[layer] : kv;
+    }
+
+    /** The layer index inside {@link #cache(int)} (0 for a one-layer cache). */
+    private int cacheLayer(int layer) {
+        return kvs != null ? 0 : layer;
+    }
+
     /** Grouped-query attention: q/k/v projections (+ bias), QK-norm and RoPE, store into the cache, attend. */
     private final class GqaStep implements AttnStep {
         private final Attention.Gqa g;
         private final AttnWeights.Gqa w;
         private final RopeTable table;
         private final Rope rope;
+        private float[] vUnit;
 
         GqaStep(Attention.Gqa g, AttnWeights.Gqa w) {
             this.g = g;
@@ -346,30 +393,66 @@ public final class CpuBackend implements Backend {
         public void run(int layer, int n, int pos) {
             matmul(w.wq(), xb, q, 0, n, false);
             matmul(w.wk(), xb, kStage, 0, n, false);
-            matmul(w.wv(), xb, vStage, 0, n, false);
+            if (w.wv() != null) {
+                matmul(w.wv(), xb, vStage, 0, n, false);
+            } else {
+                System.arraycopy(kStage, 0, vStage, 0, n * g.kvDim()); // Gemma 4: the value is the key projection
+            }
             if (w.bq() != null) {
                 addBias(q, 0, w.bq(), n);
                 addBias(kStage, 0, w.bk(), n);
-                addBias(vStage, 0, w.bv(), n);
+                if (w.wv() != null) {
+                    addBias(vStage, 0, w.bv(), n);
+                }
             }
             normRope(q, 0, g.qDim(), g.heads(), w.qNorm(), n, pos);
             normRope(kStage, 0, g.kvDim(), g.kvHeads(), w.kNorm(), n, pos);
+            normV(vStage, 0, g.kvDim(), g.kvHeads(), n);
             temperature(q, 0, n, pos);
-            kv.store(layer, pos, kStage, vStage, n);
+            KvCache c = cache(layer);
+            int cl = cacheLayer(layer);
+            c.store(cl, pos, kStage, vStage, n);
             if (bidirectional && n > 1) {
                 // every row attends to all rows of the picture: with all n keys stored, each is a "last row" at pos + n - 1
                 int qDim = g.qDim();
-                int outDim = arch.attention().outDim();
+                int outDim = g.outDim();
                 float[] qRow = new float[qDim];
                 float[] aRow = new float[outDim];
                 for (int t = 0; t < n; t++) {
                     System.arraycopy(q, t * qDim, qRow, 0, qDim);
-                    kv.attention(pool, layer, 1, pos + n - 1, qRow, aRow, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
+                    c.attention(pool, cl, 1, pos + n - 1, qRow, aRow, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
                     System.arraycopy(aRow, 0, att, t * outDim, outDim);
                 }
                 return;
             }
-            kv.attention(pool, layer, n, pos, q, att, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
+            c.attention(pool, cl, n, pos, q, att, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
+        }
+
+        /** Gemma 4's parameterless RMS norm on every value head of {@code n} rows. */
+        private void normV(float[] v, int base, int stride, int nHeads, int n) {
+            if (!g.vNorm()) {
+                return;
+            }
+            if (vUnit == null) {
+                vUnit = new float[g.headDim()];
+                java.util.Arrays.fill(vUnit, 1f);
+            }
+            int hd = g.headDim();
+            if (n == 1) {
+                for (int h = 0; h < nHeads; h++) {
+                    int o = base + h * hd;
+                    rmsnormRow(v, o, v, o, vUnit, hd);
+                }
+                return;
+            }
+            pool.forRange(n * nHeads, 4, (i0, i1) -> {
+                for (int i = i0; i < i1; i++) {
+                    int t = i / nHeads;
+                    int h = i - t * nHeads;
+                    int o = base + t * stride + h * hd;
+                    rmsnormRow(v, o, v, o, vUnit, hd);
+                }
+            });
         }
 
         /** Llama 4's attention temperature: row {@code t} of the queries at {@code v[base ..]} times {@code g.tempFactor(pos + t)}. */
@@ -388,24 +471,34 @@ public final class CpuBackend implements Backend {
 
         @Override
         public boolean runRows(int layer, CpuBackend[] owners, int[] positions) {
+            if (kvs != null) {
+                return false; // per-layer caches cannot be handed between backends row by row
+            }
             int n = owners.length;
             matmul(w.wq(), xb, q, 0, n, false);
             matmul(w.wk(), xb, kStage, 0, n, false);
-            matmul(w.wv(), xb, vStage, 0, n, false);
+            if (w.wv() != null) {
+                matmul(w.wv(), xb, vStage, 0, n, false);
+            } else {
+                System.arraycopy(kStage, 0, vStage, 0, n * g.kvDim());
+            }
             if (w.bq() != null) {
                 addBias(q, 0, w.bq(), n);
                 addBias(kStage, 0, w.bk(), n);
-                addBias(vStage, 0, w.bv(), n);
+                if (w.wv() != null) {
+                    addBias(vStage, 0, w.bv(), n);
+                }
             }
             int qDim = g.qDim();
             int kvDim = g.kvDim();
-            int outDim = arch.attention().outDim();
+            int outDim = g.outDim();
             for (int t = 0; t < n; t++) {
                 // row t at its own position, into its own cache, through that backend's (idle) staging rows
                 CpuBackend o = owners[t];
                 int pos = positions[t];
                 normRopeHeads(q, t * qDim, qDim, g.heads(), w.qNorm(), pos, 0, g.heads());
                 normRopeHeads(kStage, t * kvDim, kvDim, g.kvHeads(), w.kNorm(), pos, 0, g.kvHeads());
+                normV(vStage, t * kvDim, kvDim, g.kvHeads(), 1);
                 temperature(q, t * qDim, 1, pos);
                 System.arraycopy(kStage, t * kvDim, o.kStage, 0, kvDim);
                 System.arraycopy(vStage, t * kvDim, o.vStage, 0, kvDim);
@@ -419,18 +512,27 @@ public final class CpuBackend implements Backend {
 
         @Override
         public boolean runSegments(int layer, CpuBackend[] owners, int[] rowStart, int[] counts, int[] positions) {
+            if (kvs != null) {
+                return false; // per-layer caches cannot be handed between backends segment by segment
+            }
             int rows = rowStart[owners.length - 1] + counts[owners.length - 1];
             matmul(w.wq(), xb, q, 0, rows, false);
             matmul(w.wk(), xb, kStage, 0, rows, false);
-            matmul(w.wv(), xb, vStage, 0, rows, false);
+            if (w.wv() != null) {
+                matmul(w.wv(), xb, vStage, 0, rows, false);
+            } else {
+                System.arraycopy(kStage, 0, vStage, 0, rows * g.kvDim());
+            }
             if (w.bq() != null) {
                 addBias(q, 0, w.bq(), rows);
                 addBias(kStage, 0, w.bk(), rows);
-                addBias(vStage, 0, w.bv(), rows);
+                if (w.wv() != null) {
+                    addBias(vStage, 0, w.bv(), rows);
+                }
             }
             int qDim = g.qDim();
             int kvDim = g.kvDim();
-            int outDim = arch.attention().outDim();
+            int outDim = g.outDim();
             for (int s = 0; s < owners.length; s++) {
                 // the segment at its own position, into its own cache, through this (the lender's) staging rows; the
                 // statements are those of run(n = counts[s]) on the segment's rows
@@ -440,6 +542,7 @@ public final class CpuBackend implements Backend {
                 int r0 = rowStart[s];
                 normRope(q, r0 * qDim, qDim, g.heads(), w.qNorm(), cnt, pos);
                 normRope(kStage, r0 * kvDim, kvDim, g.kvHeads(), w.kNorm(), cnt, pos);
+                normV(vStage, r0 * kvDim, kvDim, g.kvHeads(), cnt);
                 System.arraycopy(kStage, r0 * kvDim, mixK, 0, cnt * kvDim);
                 System.arraycopy(vStage, r0 * kvDim, mixV, 0, cnt * kvDim);
                 System.arraycopy(q, r0 * qDim, mixQ, 0, cnt * qDim);
@@ -665,6 +768,9 @@ public final class CpuBackend implements Backend {
             p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
+            if (L.layerScalar() != 1f) {
+                scaleRows(n, L.layerScalar());
+            }
         }
         int vocab = w.lmHead.rows;
         float[] all = new float[n * vocab];
@@ -753,6 +859,9 @@ public final class CpuBackend implements Backend {
             p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), rows);
             rmsnorm(x, xb, L.ffnNorm(), rows, dim);
             p.ffn().run(rows);
+            if (L.layerScalar() != 1f) {
+                scaleRows(rows, L.layerScalar());
+            }
         }
         if (selected > 0) {
             // the final norm and the LM head over the rows whose logits are wanted only (a prefill chunk's other rows need none)
@@ -826,6 +935,9 @@ public final class CpuBackend implements Backend {
             p.residual().add(L.wo(), L.bo(), att, L.postAttnNorm(), n);
             rmsnorm(x, xb, L.ffnNorm(), n, dim);
             p.ffn().run(n);
+            if (L.layerScalar() != 1f) {
+                scaleRows(n, L.layerScalar());
+            }
             if (deepstack != null && l < deepstack.length) { // Qwen3-VL: x += this layer's picture features
                 float[] ds = deepstack[l];
                 int base = off * dim;
@@ -882,6 +994,16 @@ public final class CpuBackend implements Backend {
     }
 
     // ------------------------------------------------------------------ layers
+
+    /** Gemma 4's per-layer output scalar: {@code x *= s} over {@code n} rows of the residual stream. */
+    private void scaleRows(int n, float s) {
+        int dim = c.dim();
+        pool.forRange(n * dim, 4096, (i0, i1) -> {
+            for (int i = i0; i < i1; i++) {
+                x[i] *= s;
+            }
+        });
+    }
 
     void rmsnorm(float[] in, float[] out, float[] weight, int n, int width) {
         if (n == 1) {
