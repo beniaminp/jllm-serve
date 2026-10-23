@@ -167,8 +167,11 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - plain norm gains (the stored `w`, not `1+w`), and unscaled attention (`queryScalar` 1.0);
   - a per-layer `layer_scalar` and a final soft-cap of 30;
   - `model_type gemma4_unified_text` / `Gemma4UnifiedForCausalLM` (wrapper `gemma4_unified`).
-- **CPU-only for now:** the Metal backend rejects it (the 512-wide full-attention heads exceed the 256 `headDim`
-  cap), and the paged, batched and mixed KV passes are not offered (there is no shared row across per-layer shapes).
+- **Metal is supported:** merged as `238941c` ("metal: V-norm the f32 cache rows at their own offset") with 512-wide
+  attention kernels (the `d512` family) and per-layer head-shape dispatch, so Gemma 4 runs on the CPU and the GPU;
+  `attention_k_eq_v` (V = the pre-RoPE key projection), the parameterless per-head V-norm and the per-layer
+  `layer_scalar` are applied on the GPU too. The paged, batched, mixed and tiered KV passes, q4 KV and rotated q8 are
+  still not offered (there is no shared row across per-layer shapes).
   Explicitly rejected: Gemma 4 E2B/E4B per-layer embeddings, the 26B-A4B MoE, `num_kv_shared_layers>0` and
   `use_double_wide_mlp`.
 - **Tokenizer:** GGUF `tokenizer.ggml.model=gemma4` is an SPM-style BPE that falls back to the original repository's

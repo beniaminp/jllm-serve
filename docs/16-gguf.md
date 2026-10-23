@@ -1094,7 +1094,7 @@ column is `GgufArchSmoke` on the real GPU: CPU and Metal generate the same 8 gre
 | `qwen2`, `qwen3moe` (and `qwen3`) | as before | ≤ 3e-7 | 2.5e-7 … 3.1e-7 | yes |
 | `gemma2` | `gemma2` | 0 | 6.7e-5 | yes |
 | `gemma3` (also from the text part of the multimodal checkpoint) | `gemma3_text` | 0 | 1.8e-5 | yes |
-| `gemma4` / `gemma4_unified` (the 12B is `gemma4`) | `gemma4_text` / `gemma4_unified_text` | metadata of the real 12B file read; no full-file run | — | CPU only (the 512-wide full-attention heads exceed the Metal kernels) |
+| `gemma4` / `gemma4_unified` (the 12B is `gemma4`) | `gemma4_text` / `gemma4_unified_text` | metadata of the real 12B file read; no full-file run | — | yes (512-wide heads) |
 | `phi3` (long, short and no LongRoPE factors) | `phi3` | ≤ 4e-7 | 2.0e-7 … 1.1e-6 | yes |
 | `chatglm` (`GlmForCausalLM`: GLM-4-9B-chat-hf, GLM-Edge) | `glm` | 0 | 2.8e-7 | yes |
 | `glm4` (GLM-4-0414) | `glm4` | 0 | 4.7e-7 | yes |

@@ -27,8 +27,10 @@
 #   hf-internal-testing_tiny-random-Gemma3MMForCausalLM   generated: the same decoder in the multimodal wrapper layout
 #   hf-internal-testing_tiny-random-Gemma4ForCausalLM     generated: Gemma 4 (256/512-wide heads per layer type, K = V
 #                                                         on the full layers, parameterless V norm, proportional RoPE,
-#                                                         per-layer output scalar, plain norms); CPU only (Metal has no
-#                                                         512-wide attention kernel), paged checks skipped
+#                                                         per-layer output scalar, plain norms); runs on the CPU and
+#                                                         Metal (512-wide attention kernels, per-layer shape dispatch);
+#                                                         only the paged, mixed, tier, q4 and rotated-q8 checks are
+#                                                         skipped for its per-layer head shapes
 #   hf-internal-testing_tiny-random-Gemma{2,3}Hd256ForCausalLM  generated: head_dim 256, the largest Metal supports
 #   hf-internal-testing_tiny-random-Gemma2BiasForCausalLM generated: Gemma 2 with attention_bias (the o_proj bias
 #                                                         before the post-attention norm)

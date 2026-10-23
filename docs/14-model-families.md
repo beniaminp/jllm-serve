@@ -33,7 +33,7 @@ means the value comes from `config.json`; defaults are those of the family's tra
 | `phi3` | `Phi3ForCausalLM` | no | no | `sliding_window` on every layer | `HALF`; `longrope` (short/long factors), `partial_rotary_factor` | `PRE` | dense SiLU; fused `qkv_proj`, `gate_up_proj` | no | config | eps default 1e-5; 14.9 |
 | `gemma2` | `Gemma2ForCausalLM` | as `llama` | no | layers `i % 2 == 0` are local (`sliding_window`), the rest global | `HALF`; one table, theta default 1e4 | `SANDWICH_GEMMA`, gains `1 + w` | dense **GeLU-tanh** | yes | **default true** | embedding × `bf16(√dim)`, attention soft-cap 50, final soft-cap 30, `query_pre_attn_scalar`; 14.10 |
 | `gemma3_text` (also inside `gemma3`) | `Gemma3ForCausalLM` (wrapper `Gemma3ForConditionalGeneration`) | as `llama` | **yes** | 5 local + 1 global (`sliding_window_pattern` 6, or `layer_types`) | `HALF`; global theta default 1e6 + `rope_scaling`, local table `rope_local_base_freq` (1e4) without scaling | `SANDWICH_GEMMA`, gains `1 + w` | dense GeLU-tanh | yes | default true | soft-caps off unless set; text part only; 14.10 |
-| `gemma4_text` / `gemma4_unified_text` (also inside `gemma4` / `gemma4_unified`) | `Gemma4ForCausalLM` / `Gemma4UnifiedForCausalLM` (wrappers `Gemma4ForConditionalGeneration` / `Gemma4UnifiedForConditionalGeneration`) | as `llama` (no `v_proj` on full layers: K = V) | **yes** (+ a parameterless V norm) | 5 local + 1 full, the last always full (`layer_types`) | per layer: local `head_dim` 256 / full `global_head_dim` 512; full layers use proportional RoPE (a quarter of the head) at theta 1e6, local layers a plain table at `rope_freq_base_swa` (1e4) | `SANDWICH_GEMMA`, gains are the stored `w` (**no** `1 + w`) | dense GeLU-tanh | yes | default true | unscaled attention (`scale = 1`), per-layer `layer_scalar`, final soft-cap 30; 12B dense, CPU only; 14.10.7 |
+| `gemma4_text` / `gemma4_unified_text` (also inside `gemma4` / `gemma4_unified`) | `Gemma4ForCausalLM` / `Gemma4UnifiedForCausalLM` (wrappers `Gemma4ForConditionalGeneration` / `Gemma4UnifiedForConditionalGeneration`) | as `llama` (no `v_proj` on full layers: K = V) | **yes** (+ a parameterless V norm) | 5 local + 1 full, the last always full (`layer_types`) | per layer: local `head_dim` 256 / full `global_head_dim` 512; full layers use proportional RoPE (a quarter of the head) at theta 1e6, local layers a plain table at `rope_freq_base_swa` (1e4) | `SANDWICH_GEMMA`, gains are the stored `w` (**no** `1 + w`) | dense GeLU-tanh | yes | default true | unscaled attention (`scale = 1`), per-layer `layer_scalar`, final soft-cap 30; 12B dense, CPU and Metal (512-wide heads; paged/batched KV not offered); 14.10.7 |
 | `deepseek_v2` | `DeepseekV2ForCausalLM` | rejected | no | none | MLA rotary slice `INTERLEAVED`, `yarn` | `PRE` | dense for the first `first_k_dense_replace` layers, then MoE + shared experts; `Router.DeepSeek` softmax, `greedy` / `group_limited_greedy` | yes | config (false) | MLA latent KV cache; 14.11 |
 | `deepseek_v3` | `DeepseekV3ForCausalLM` | rejected | no | none | as V2 | `PRE` | as V2; sigmoid, `noaux_tc` (8 groups keep 4), scaling 2.5, `norm_topk_prob` default true | tokenizer rule | config (false) | FP8 checkpoints dequantized by the converter (14.11.7) |
 | `mamba` | `MambaForCausalLM` | n/a | n/a | n/a (no attention) | none (no positions) | one RMSNorm per block | no MLP: conv + selective scan mixer | no | default true | `MambaArch`; chapter 15 |
@@ -611,9 +611,12 @@ Gemma 4 is not a Gemma 3 variant with new defaults; five things change:
 | 5 | norm gains are the stored weights (no `1 + w`), and each layer ends with a learned scalar `x *= layer_scalar` | gains `1 + w`, no layer scalar |
 
 The 12B is dense with no per-layer input embeddings (`hidden_size_per_layer_input` 0); the parser rejects the E2B / E4B
-(PLE) and 26B-A4B (MoE) shapes rather than loading them wrongly. The Metal attention kernels take a head width up to
-256, so a Gemma 4 model is loaded on the CPU backend (the paged, batched and mixed passes are skipped: each layer keeps
-its own flat KV cache). GGUF files name the same decoder `gemma4` (E2B / E4B / 26B / 31B) or `gemma4_unified` (12B).
+(PLE) and 26B-A4B (MoE) shapes rather than loading them wrongly. The 12B runs on the CPU and on Metal: the backend has
+512-wide attention kernels (`attention_g1_d512` / `_h` / `_q8`, `attention_dec_g1_d512`, `attention_fa` / `_fb_d512`,
+`attention_split_d512`) and per-layer head-shape dispatch, and it applies `attention_k_eq_v` (V = the pre-RoPE key
+projection), the parameterless per-head V-norm and the per-layer `layer_scalar` on the GPU. The paged, batched, mixed
+and tiered KV passes, q4 KV and rotated q8 are not offered (each layer keeps its own flat KV cache). GGUF files name
+the same decoder `gemma4` (E2B / E4B / 26B / 31B) or `gemma4_unified` (12B).
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
