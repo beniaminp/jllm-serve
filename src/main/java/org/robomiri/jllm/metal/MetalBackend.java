@@ -1248,7 +1248,7 @@ public final class MetalBackend implements Backend {
                 k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vProj, vProjOff, vProjHalf, bq, bk, bv, n);
             }
             if (vNorm) { // one RMS norm per value head (headDim-wide rows), all-ones gains, in place in the f32 v rows
-                k.rmsnorm(vProj, vProjOff, vNormGains(hd), vProj, n * g.kvHeads(), hd);
+                k.rmsnormTo(vProj, vProjOff, vNormGains(hd), vProj, vProjOff, n * g.kvHeads(), hd);
             }
             if (stageV) { // the f32 v rows into the f16 cache rows (V = K or the normalized v projection)
                 k.kvPutRows(true, vStage, 0, valCache[layer], cacheOff, kvDim, kvDim, n);
@@ -2159,13 +2159,6 @@ public final class MetalBackend implements Backend {
             addDeepstack(l, n);
         }
         scaleLayerOutput(l, n);
-        if (System.getProperty("jllm.debug.layers") != null) {
-            k.commitAndWait();
-            MemorySegment dbg = x.contents();
-            System.err.printf("DBG metal L%d %.9g %.9g %.9g%n", l,
-                    dbg.getAtIndex(ValueLayout.JAVA_FLOAT, 0), dbg.getAtIndex(ValueLayout.JAVA_FLOAT, 1),
-                    dbg.getAtIndex(ValueLayout.JAVA_FLOAT, dim - 1));
-        }
     }
 
     /** Gemma 4's per-layer {@code layer_scalar}: after the layer, x *= the layer's scalar (the residual stream included). */
