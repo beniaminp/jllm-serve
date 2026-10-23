@@ -561,4 +561,4 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
   checks do not use them (they run Q4_0 / Q8_0 weights), but a GGUF K-quant model can differ in the last bit between its first calls and the rest.
 * The flat-cache attention on Metal needs a scores scratch of `tile · heads · ctx` floats, so the Metal paged cache reaches a million tokens
   in storage but not through `attention_t`; the decode kernels (`attention_dec`, `attention_split`) have no such limit.
-* No scheduler; sparse decode attention on this cache, tiered (host / SSD) storage, streamed KV and the memory planner are chapter 26. This chapter is the foundation they need.
+* No scheduler; sparse decode attention on this cache is chapter 27, while tiered (host / SSD) storage, streamed KV and the memory planner are chapter 26. This chapter is the foundation they need.
