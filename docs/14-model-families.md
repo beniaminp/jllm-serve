@@ -72,8 +72,8 @@ it for the first two; DeepSeek would also bias `q_a_proj` / `kv_a_proj_with_mqa`
 `longrope`; `yarn` follows 14.11.2 in every family) is rejected at load time with a message naming the field.
 
 Other requirements: `hidden_size`, `intermediate_size` and `num_heads × head_dim` must be multiples of 32 (the
-quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 256
-(Llama 3, Mistral, Qwen2.5 and DeepSeek-Coder all have 64 or 128; DeepSeek's MLA has its own limits, 14.11.1).
+quantization block), and the Metal backend additionally needs `head_dim` to be a multiple of 32 and at most 512
+(Llama 3, Mistral, Qwen2.5 and DeepSeek-Coder all have 64 or 128, Gemma 4's full-attention layers 512; DeepSeek's MLA has its own limits, 14.11.1).
 
 ## 14.2 What differs from Qwen3
 
