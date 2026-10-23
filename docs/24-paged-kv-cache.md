@@ -275,13 +275,25 @@ of FMAs over the head elements, each output adds the keys in ascending order). T
 cache reads K and V in place, and a first measurement showed the price: decode at 2 000 tokens of context ran at 57 % of the flat
 speed (46.6 → 26.8 tok/s), prefill did not notice (237 tok/s both ways: its tiles reuse each gathered block).
 
-**Decode straight from the blocks (f32).** So a single-token step over f32 blocks skips the gather
-(`PagedKv.attentionDecodeDirect`): the scores of a block's `B` keys are `headDim` FMAs over the block's `[headDim][B]` floats, loaded
-from the segment with `FloatVector.fromMemorySegment` (`scores4` / `scores2` / `scores1`, the flat `score4/2/1` with the chunk
-width `B`); the softmax is the flat kernel's; the outputs add each block's V rows in ascending key order into the head's accumulator
-(`accumulate`, the flat `accumulate1` over a segment). It needs `B` to be a multiple of two vector lengths (16 on NEON and AVX2; on
-AVX-512 with `B = 16` the gather stays), and `-Djllm.cpu.pagedGather=true` brings the gather back for comparisons. The f16 and q8 flat
-kernels expand into scratch as well, so for them paged and flat do the same work.
+**Decode straight from the blocks (f32, f16, q8).** So a single-token step skips the gather (`PagedKv.attentionDecodeDirect`): the
+scores of a block's `B` keys are `headDim` FMAs over the block's keys, loaded from the segment with vector loads, the softmax is the
+flat kernel's, and the outputs add each block's V rows in ascending key order into the head's accumulator. For f32 these are `scores4` /
+`scores2` / `scores1` (the flat `score4/2/1` with the chunk width `B`) and `accumulate` (the flat `accumulate1` over a segment); for
+f16 and q8 the same loops convert as they load (`cpu/PagedKernels`):
+
+| | keys (`[kvHead][..][B]`) | values |
+|---|---|---|
+| f16 | ints `[pairs][B]`: element `2p` of key `t` in the low half of int `(g·pairs + p)·B + t`, `2p + 1` in the high half; `IntVector` load, `F16.lowHalf` / `highHalf`, FMA with the broadcast query element | ints `[B/2][kvDim]`: key `2j` low, `2j + 1` high; per key one `IntVector` load of the row `r >> 1`, the half picked by `r & 1` (outside the vector math), FMA with the broadcast probability |
+| q8 | bytes `[hd][B]` and a float scale per key: `ByteVector` load widened to float, times the scale vector, FMA | bytes `[B][kvDim]` and a scale per key and head: widened, times the key's scale, FMA |
+
+The converted operands, the order of the FMAs over the head elements (ascending) and the order of the keys are those of the flat
+cache's expand-then-`score4`, so the results are **bit for bit the flat cache's** (`PagedKvTest` compares them for n = 1 steps over
+f16, q8 and rotated q8). The half selection is written out straight-line (no `h == 0 ? lowHalf : highHalf` inside the loops): the
+first version had the ternaries inside the loop and the JIT boxed the vectors, which made that build's decode about 4× slower than the
+straight-line path; that is a development measurement of the discarded version, not what §24.5 measures, where f16 paged decode is
+level with flat (9.7 → 9.9 tok/s). The direct path needs `B` to be a multiple of two vector lengths (16 on NEON and AVX2; on AVX-512
+with `B = 16` the gather stays), and `-Djllm.cpu.pagedGather=true` brings the gather back for comparisons (prefill and multi-token
+chunks always gather: their tiles reuse each gathered block).
 
 ### 24.2.7 The Metal backend
 
@@ -341,6 +353,14 @@ kernels, which have no scores scratch, are the ones to use.
   cache's, so files are interchangeable between flat and paged and between CPU and Metal. `copyStateFrom` shares blocks, `loadState`
   writes into freshly allocated blocks, and a background save takes a `snapshotState` (the blocks are retained; whoever writes one
   afterwards copies it first).
+* **Idle slots.** A slot's block table holds references to its conversation's blocks, so a slot nobody is talking to would pin the
+  memory until it moved to another conversation. `Engine.releaseKv(minIdleMs)` publishes the slot's full blocks into the prefix tree and
+  clears its table (the conversation stays findable: the next prompt adopts the blocks again, or the pool evicts them when it needs
+  the memory); it only try-locks, so a busy engine is never touched, and it refuses before `minIdleMs` of idleness (`lastActive` is
+  stamped by every unlock of the engine lock). `KvPool.setReclaimer` is the additive hook for pressure: when `alloc` finds no free
+  block and nothing evictable it asks the reclaimer, and only then throws `KvPoolExhausted`. In the web console `LoadedModel.
+  enablePagedHousekeeping` registers the reclaimer (release every slot no request holds, at once) and starts a virtual-thread sweeper
+  that releases slots idle for `jllm.web.kv-idle-release-seconds` (default 120, `0` = pressure only); unloading stops it.
 * **Pictures, custom rotary positions** (Qwen-VL M-RoPE): rows are not a function of the token ids, so the sequence is not shareable
   for that request.
 * **The web console.** `LoadedModel` picks any idle slot (the engine pulls shared blocks from the pool whichever slot runs the prompt,
@@ -399,9 +419,10 @@ compares with a float64 reference computed from the stored values.
 * **Sharing is an engine feature, not a backend one.** Backends only keep a table valid; `match` / `adopt` / `publish` live in the
   engine, so a new backend gets sharing, eviction, spill and snapshots for free by implementing `KvStorage` and the `beginWrite` contract.
 
-**Costs.** One table lookup per key row on the GPU (decode −2 … −3 %, prefill −2 … −7 % measured); CPU f16 / q8 decode −13 … −17 % (smaller
-gathers per block); f32 decode −9 %; a second `Metal` context and a reserved address range per model; q4 is not paged; idle slots keep
-their blocks referenced (they are not evictable until the slot moves on).
+**Costs.** One table lookup per key row on the GPU (decode −2 … −3 %, prefill −2 … −7 % measured); CPU decode about −3 % at q8
+(41.4 → 39.9 tok/s) and f32 (36.0 → 34.9), free at f16 (9.7 → 9.9, within noise), the blocks read in place (before that path the gather
+cost f32 43 % and f16 / q8 13–17 %); a second `Metal` context and a reserved address range per model; q4 is not paged; idle slots keep
+their blocks referenced until the caller or the console's sweeper releases them.
 
 ---
 
@@ -409,13 +430,14 @@ their blocks referenced (they are not evictable until the slot moves on).
 
 | key | default | |
 |---|---|---|
-| `backend.kv-paged` | `false` | the paged cache. Attention models on the CPU and Metal with f32 / f16 / q8; Mamba, Qwen3-Next / Qwen3.5, DeepSeek's latent attention and q4 keep their flat caches (a note says so). Bit-identical to the flat cache, so switching changes nothing but memory and speed |
+| `backend.kv-paged` | `auto` | `auto`, `true` or `false`. `auto` = paged for a model loaded with **two or more slots** (the console's Models page, `slots`), flat for one slot (`run`, `chat`, `bench`, `serve` with a single slot), which has nothing to share. The decision is made once per model by `ModelLoader.paged` (the first `load` knows the slot count; `extraEngine` finds it again in a weak map keyed by the weights). Attention models on the CPU and Metal with f32 / f16 / q8; Mamba, Qwen3-Next / Qwen3.5, DeepSeek's latent attention and q4 keep their flat caches (a note is printed when `true` was asked for). Bit-identical to the flat cache, so switching changes nothing but memory and speed |
 | `backend.kv-block` | `16` | positions per block, a power of two ≥ 16. Larger blocks mean fewer table entries and bigger spill files but more waste in a conversation's last block and coarser sharing granularity for the *table* (the engine still reuses to the token); change only to test (`64` measured the same) |
 | `backend.kv-pool-tokens` | `0` | most positions all slots of a model keep in the pool (0 = every slot's `backend.ctx` plus two spare blocks each, i.e. never more memory than the flat caches). Raise it to cache more conversations than there are slots (they are evicted least recently used first); the pool allocates only what is used, on Metal as address range |
 | `backend.kv-prefix-share` | `true` | adopt and publish blocks; `false` pages without sharing (each conversation keeps its own blocks, like the flat cache) |
 | `jllm.web.kv-spill` | `true` | web console, paged models only: evicted blocks go to `<jllm.web.kv-cache-dir>/blocks/<fingerprint>/` |
 | `jllm.web.kv-spill-max-gb` | `10` | disk budget of those block files (least recently used files go first) |
-| `-Djllm.cpu.pagedGather=true` | off | CPU f32 decode through the gather instead of in place (for comparisons) |
+| `jllm.web.kv-idle-release-seconds` | `120` | web console, paged models only: a slot idle this long gives its blocks back to the pool (the conversation stays in the tree); `0` = only when the pool runs out |
+| `-Djllm.cpu.pagedGather=true` | off | CPU decode through the gather instead of in place (for comparisons) |
 
 `backend.ctx` is `auto` by default ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)); `ModelLoader` decides it
 once per model, before the pool is created, and the pool key and size use that number. With paging on, the CPU budget `auto` uses is the
@@ -425,14 +447,16 @@ physical memory (the blocks are off the Java heap) instead of the free heap of t
 
 ## 24.5 Measured
 
-Machine: Apple M1 Pro, 10 cores, 32 GB, macOS (Darwin 27.2), 2026-10-22, other agents' jobs running at times (load average 5–11 while the
-CPU rows ran, so absolute CPU decode figures vary between runs from 12 to 47 tok/s with `backend.cpu.int8-activations=auto`'s choice and
-the load; **compare the pairs, which run in the same process, alternating**). Model Qwen3-0.6B (Q4_0 weights), `backend.ctx 8192`, greedy,
-`engine.speculative off`, under the heavy-job lock. Tool: `src/test/java/org/robomiri/jllm/PagedKvBench.java`.
+Machine: Apple M1 Pro, 10 cores, 32 GB, macOS (Darwin 27.2), 2026-10-22. The memory and time-to-first-token CPU rows ran while other
+agents' jobs were running at times (load average 5–11, so their absolute figures vary); the CPU speed rows were re-measured on a quiet
+machine with JDK 26 and an empty `JLLM_CONFIG`. Model Qwen3-0.6B (Q4_0 weights), `backend.ctx 8192`, greedy, `engine.speculative off`,
+under the heavy-job lock. **Compare the pairs, which run in the same process, alternating.** Tool:
+`src/test/java/org/robomiri/jllm/PagedKvBench.java`.
 
 ```sh
 JAVA="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Djllm.metal.lib=target/native/libjllm_metal.dylib"
 $JAVA -cp target/classes:target/test-classes org.robomiri.jllm.PagedKvBench models/Qwen_Qwen3-0.6B --backend cpu     # memory, ttft, speed
+$JAVA -cp target/classes:target/test-classes org.robomiri.jllm.PagedKvBench models/Qwen_Qwen3-0.6B --backend cpu --backend.kv-dtype <dt> --backend.kv-paged true  # CPU speed rows, <dt> = f16 / q8 / f32
 $JAVA -cp target/classes:target/test-classes org.robomiri.jllm.PagedKvBench models/Qwen_Qwen3-0.6B --backend metal [--backend.kv-dtype f16]
 $JAVA -Dbench.only=speed ...                                                                                        # one section
 ```
@@ -479,20 +503,18 @@ paged engine in one process):
 | Metal f16 | 1 136 | 1 091 | 124.5 | 121.5 | 0.98 |
 | Metal q8 | 1 139 | 1 118 | 127.4 | 123.0 | 0.97 |
 | Metal f32, decode replay off | 1 053 | 993 | 109.0 | 107.4 | 0.99 |
-| CPU f32 | 235 | 236 | 12.5 | 11.4 | 0.91 |
-| CPU f16 | 223 | 220 | 35.5 | 29.3 | 0.83 |
-| CPU q8 | 242 | 239 | 15.3 | 13.3 | 0.87 |
-| CPU f32, gather (`-Djllm.cpu.pagedGather=true`) | 234 | 236 | 15.5 | 12.3 | 0.79 |
+| CPU f32 | 202 | 202 | 36.0 | 34.9 | 0.97 |
+| CPU f16 | 193 | 203 | 9.7 | 9.9 | 1.02 |
+| CPU q8 | 188 | 188 | 41.4 | 39.9 | 0.96 |
 
 (The q8 rows were measured with plain q8 keys, before `backend.kv-q8-rotate` became the default; the rotation adds the same Hadamard transform of each key row and query to the flat and the paged cache.) On Metal the page table costs 2–3 % of decode and 2–7 % of prefill (a lookup per key row, one more dispatch per layer for the store); replay on
-or off makes no difference to the ratio. On the CPU f32 decode lost 43 % with the gather in a quiet-machine run (46.6 → 26.8 tok/s) and now
-loses 9 %; f16 / q8 lose 13–17 % (a gathered chunk is assembled from two 16-key blocks).
+or off makes no difference to the ratio. On the CPU the blocks are read in place: decode costs about 3 % at q8 (41.4 → 39.9 tok/s) and f32 (36.0 → 34.9) and is level at f16 (9.7 → 9.9, within noise); prefill is unchanged. Before the in-place path the gather cost f32 43 % in a quiet run (46.6 → 26.8 tok/s) and f16 / q8 13–17 % (a gathered chunk is assembled from two 16-key blocks).
 
-**Proposal for the default.** The paged cache gives the same logits and greedy tokens as the flat one on every family of `ArchSmoke`
-(CPU and Metal; §24.6), so the choice is about speed and memory: for the server (`jllm serve` / the console) with two or more slots, or
-with agents that resend long prefixes, paged wins by an order of magnitude in memory and time to first token for a 2–3 % decode cost on
-Metal, so `backend.kv-paged=true` should be the server default once the CPU f16 / q8 decode gap is closed; a single-slot command line
-(`run`, `chat`, `bench`) gains nothing from sharing and should stay flat. Not changed in this branch.
+**The default.** The paged cache gives the same logits and greedy tokens as the flat one on every family of `ArchSmoke` (CPU and
+Metal; §24.6), so the choice is about speed and memory: with two or more slots, or with agents that resend long prefixes, paged wins by
+an order of magnitude in memory and time to first token for a 2–3 % decode cost on Metal and about 3 % (q8, f32; f16 free) on the CPU, so
+`backend.kv-paged=auto` (the default) pages a model loaded with two or more slots; a single-slot command line gains nothing from sharing
+and stays flat. `true` / `false` force either.
 
 ---
 
@@ -510,9 +532,11 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
 * `ArchSmoke` → `PagedKvChecks`, for every attention family, CPU and the real GPU (or the emulator), f32 / q8 (plain and with rotated keys) and
   f16 on the first dense and MoE: scripted prefill, decode (Metal: recorded and replayed), rewind into a block, a verification chunk with every row's logits; adoption,
   fork, rewind in a shared block; eviction and reload; three rows in one batched pass; saved bytes both ways and a snapshot. All compare
-  **bit for bit** with the flat cache. (The vector reductions of the kernels, `reduceLanes`, may add in another order in the interpreter, in C1 and in C2, so a call's last bit
-  can change while the JVM warms up — the flat cache then differs from itself. These comparisons therefore repeat until the flat run agrees
-  with itself, at most a few times; a paging error fails every attempt.)
+  **bit for bit** with the flat cache. Each comparison runs once, from a cold JVM: the float `dot` and the softmax sum used `reduceLanes(ADD)`, which adds the lanes
+  in another order in the interpreter and C1 than in C2, so the first calls of a fresh JVM differed in the last bit, even the flat cache from
+  itself (an intermittent failure of the f16 check, about one run in thirty). They now add through `VectorKernels.laneSum`, one fixed
+  order that equals C2's on NEON, so steady-state results did not change, and `cpu/JitStableKernelsTest` covers `dot`, `sumSquares`,
+  `softmaxExp` and the int8-activation dot next to the quantized dots (it fails on the old `reduceLanes` code in a fresh JVM). The checks used to repeat until the flat run agreed with itself; that workaround is gone.
 * `scripts/metal-emu/kernel_tests.py`: every changed kernel with a shuffled pool and a table (garbage in the unused blocks) against numpy:
   `attention_t` (f32, q8, all widths), `attention_split_q8`, `attention_dec` (f32 / f16 / q8, splits, window, soft-cap), `attention_fa` /
   `attention_fb` (f32 / f16 / q8, window, soft-cap, chunk starts inside a block), `kv_store_q8`, `kv_store_q8r` and `kv_store_pg` (f32 and
@@ -530,8 +554,11 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
 * DeepSeek's latent cache, Mamba and Qwen3-Next / Qwen3.5 keep flat caches (24.2.8).
 * ~~The Metal pool is not counted in `DeviceLedger`~~: fixed in chapter 26 (§26.2.1): every Metal pool registers `hotCap · blockBytes`, so the MoE expert placement leaves room for it.
 * On AVX-512 with `B = 16` the f32 decode gathers (no direct kernel for one-vector-wide blocks).
-* An idle slot keeps its conversation's blocks referenced; they are evicted only when the slot moves to another conversation (sharing does not
-  need the slot, the pool would, so a pool smaller than `slots · ctx` can run out: `KvPoolExhausted`).
+* An idle slot gives its blocks back only in the web console (`jllm.web.kv-idle-release-seconds`, or when the pool is full); a bare `Engine` on a
+  paged backend keeps them until the slot moves on, unless the caller calls `releaseKv`. A pool holding more than its blocks of *running*
+  sequences still ends in `KvPoolExhausted`.
+* The GGUF K-quant kernels (`KQuantKernels`, `Q2KKernels`, `Q6KKernels`, `GgufKernels`) still sum lanes with `reduceLanes`; the paged-versus-flat
+  checks do not use them (they run Q4_0 / Q8_0 weights), but a GGUF K-quant model can differ in the last bit between its first calls and the rest.
 * The flat-cache attention on Metal needs a scores scratch of `tile · heads · ctx` floats, so the Metal paged cache reaches a million tokens
   in storage but not through `attention_t`; the decode kernels (`attention_dec`, `attention_split`) have no such limit.
 * No scheduler; sparse decode attention on this cache, tiered (host / SSD) storage, streamed KV and the memory planner are chapter 26. This chapter is the foundation they need.
