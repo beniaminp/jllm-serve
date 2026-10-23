@@ -949,6 +949,11 @@ public final class ArchSmoke {
                 }
                 continue;
             }
+            // warm up the serial encoder: the first run may be partly cold (JIT), so the reference is a second run
+            try (Backend b = mk.make()) {
+                concurrent(b, false);
+                concurrentScenario(b, vocab); // discarded: warms the JIT
+            }
             List<float[]> want;
             try (Backend b = mk.make()) {
                 concurrent(b, false);
