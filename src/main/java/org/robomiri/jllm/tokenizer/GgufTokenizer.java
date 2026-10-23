@@ -131,10 +131,14 @@ public final class GgufTokenizer {
         if (s.tokens() == null || s.tokens().length == 0) {
             throw new IllegalArgumentException("the GGUF file has no tokenizer.ggml.tokens");
         }
-        return switch (s.model() == null ? "" : s.model()) {
+        String model = s.model() == null ? "" : s.model();
+        return switch (model) {
             case "gpt2" -> byteLevel(s);
             case "llama" -> sentencePiece(s);
             case "t5" -> unigram(s);
+            case "gemma4", "sarvam-moe", "mmbert", "whitespace" -> throw new UnsupportedPreTokenizer(
+                    "the tokenizer.ggml.model '" + model + "' (an SPM-style BPE) cannot be rebuilt from the GGUF file;"
+                            + " the original repository's tokenizer.json is needed");
             default -> throw new IllegalArgumentException("unsupported tokenizer.ggml.model '" + s.model()
                     + "' (supported: gpt2, llama, t5)");
         };
