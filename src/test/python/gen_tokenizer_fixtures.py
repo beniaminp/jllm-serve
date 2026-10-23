@@ -21,7 +21,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
 
 NAMES = ["qwen3", "qwen2", "llama3", "mistral", "gemma3", "gemma2", "phi3", "phi4", "glmedge", "glm4", "dsr1", "mamba",
-         "dsv2", "phi4_14b"]
+         "dsv2", "phi4_14b", "gptoss", "llama4", "granite"]
 # tokenizers of other model types (Unigram, WordPiece) that no supported model family uses; no chat template.
 # They get the EXTRA strings too. Generate only these with: ... <out dir> 60 other
 OTHER_NAMES = ["t5", "albert", "xlmr", "bert", "mbert"]
@@ -143,6 +143,9 @@ CONVS = {
 TOOL_FAMILIES = {"qwen3", "qwen2"}
 
 
+GPTOSS_DATE = "2025-08-05"
+
+
 def cfg_token(cfg, key):
     v = cfg.get(key)
     if isinstance(v, dict):
@@ -158,6 +161,7 @@ def make_env():
 
     env.globals["raise_exception"] = raise_exception
     env.policies["json.dumps_kwargs"] = {"ensure_ascii": False}
+    env.globals["strftime_now"] = lambda fmt: GPTOSS_DATE  # gpt-oss prints the date of the render: pinned for the fixtures
     return env
 
 
@@ -206,12 +210,16 @@ def main(src, dst, n_random=60, which="all"):
         fixture["idseqs"] = [{"ids": q, "decoded": tk.decode(q, skip_special_tokens=False)}
                              for q in id_sequences(tk, 40, 7)]
         template = cfg.get("chat_template")
+        if template is None and os.path.isfile(os.path.join(d, "chat_template.jinja")):  # gpt-oss keeps it in its own file
+            template = open(os.path.join(d, "chat_template.jinja"), encoding="utf-8").read()
         if isinstance(template, list):
             template = next(t["template"] for t in template if t.get("name") == "default")
         if template:
             tpl = env.from_string(template)
             think_variants = [None]
             if name == "qwen3":
+                think_variants = [True, False]
+            if name == "gptoss":  # think=False is the engine's low-effort form with the final channel already open
                 think_variants = [True, False]
             for cname, msgs in CONVS.items():
                 if cname.startswith("tool") and name not in TOOL_FAMILIES:
@@ -220,13 +228,17 @@ def main(src, dst, n_random=60, which="all"):
                     for think in think_variants:
                         kw = dict(messages=msgs, add_generation_prompt=gen, bos_token=cfg_token(cfg, "bos_token"),
                                   eos_token=cfg_token(cfg, "eos_token"))
-                        if think is not None:
+                        if name == "gptoss" and think is False:
+                            kw["reasoning_effort"] = "low"
+                        elif think is not None:
                             kw["enable_thinking"] = think
                         try:
                             rendered = tpl.render(**kw)
                         except jinja2.exceptions.TemplateError as e:
                             print(f"{name}/{cname}: template refused ({e}); skipped")
                             continue
+                        if name == "gptoss" and think is False and gen:
+                            rendered += "<|channel|>final<|message|>"
                         ids = tk.encode(rendered, add_special_tokens=False).ids
                         fixture["chat"].append({"conv": cname, "messages": msgs, "gen": gen, "think": think,
                                                 "rendered": rendered, "ids": ids})

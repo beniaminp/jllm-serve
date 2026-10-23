@@ -16,6 +16,10 @@ public enum KernelParams {
     ROPE_Q8("RopeQ8Params", "iiiiifiiiii"),
     ATTN("AttnParams", "iiiiiifiiiiiifi"),
     ATTN_SPLIT("AttnSplitParams", "iiiiifiiifiii"),
+    ATTN_DEC_SP("AttnDecSpParams", "iiiiifiiifiiiii"),
+    KV_SUMMARY("KvSummaryParams", "iiiiii"),
+    SPARSE_SCORE("SparseScoreParams", "iiiiii"),
+    SPARSE_SELECT("SparseSelectParams", "iiiiiiii"),
     ATTN_COMBINE("AttnCombineParams", "iii"),
     FLASH("FlashParams", "iiiifiiiifi"),
     KV_STORE("KvStoreParams", "iiiiii"),
@@ -31,6 +35,7 @@ public enum KernelParams {
     ROUTER_DS("RouterDsParams", "iiiiiiiiifi"),
     ROUTER_DS_NORM("RouterDsNormParams", "iiiiiiiiifif"),
     MOE("MoeParams", "iii"),
+    MOE_X("MoeXParams", "iiiiff"),
     MOE_SORT("MoeSortParams", "iii"),
     EMBED("EmbedParams", "iif"),
     ARGMAX("ArgmaxParams", "ii"),
@@ -40,7 +45,12 @@ public enum KernelParams {
     GDN_CONV("GdnConvParams", "iiiiii"),
     GDN_RULE("GdnRuleParams", "iiiiiiiifii"),
     GDN_NORM("GdnNormParams", "iiiif"),
-    GATE("GateParams", "i");
+    GATE("GateParams", "i"),
+    VEC("VecParams", "if"),
+    M2_CONV("M2ConvParams", "iiiii"),
+    M2_SCAN("M2ScanParams", "iiiiiiiiiff"),
+    M2_NORM("M2NormParams", "iiiif"),
+    RMS3("Rms3Params", "iiiif");
 
     /** The struct's name in kernels.metal. */
     public final String struct;

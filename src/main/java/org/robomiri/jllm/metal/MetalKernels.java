@@ -2,6 +2,7 @@ package org.robomiri.jllm.metal;
 
 import org.robomiri.jllm.model.Attention;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvSparse;
 import org.robomiri.jllm.model.KvQ4;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
@@ -532,6 +533,12 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /** Releases {@code buf} (a wrap of {@code t}) and the wrap of t's second view, if any: t is no longer used. */
+    /** Frees a buffer made by {@link #upload} (recorded steps may bind it, so they are dropped). */
+    void release(Metal.Buffer buf) {
+        invalidatePrograms();
+        metal.release(buf);
+    }
+
     void release(QTensor t, Metal.Buffer buf) {
         invalidatePrograms(); // recorded steps may bind it
         metal.release(buf);
@@ -552,11 +559,28 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /**
+     * Set while the rows of a batched decode step are encoded (docs/10): a few rows (fewer than {@link #PREFILL_MIN_TOKENS})
+     * then take the matrix-vector kernels, as a lone decode step does, instead of the simdgroup-matrix ones that
+     * {@code -Djllm.metal.mmaMinTokens} / {@code moeMmaMin} may allow for short chunks, so that a row computes exactly what its
+     * own step would (the default thresholds never put 8 or fewer rows on the matrix kernels anyway).
+     */
+    private boolean singleRows;
+
+    void singleRows(boolean on) {
+        singleRows = on;
+    }
+
+    /** Whether the expert-grouped matrix kernels serve a pass of n rows (not the few rows of a batched decode step). */
+    boolean moeGrouped(int n) {
+        return MOE_MMA && n >= MOE_MMA_MIN && !(singleRows && n < PREFILL_MIN_TOKENS);
+    }
+
+    /**
      * True if a chunk of n tokens of weights of type {@code type} runs on the simdgroup-matrix prefill kernels: every
      * format has an MMA instantiation ({@code matmul_mma_q4/q8/q2k/q6k} and the GGUF ones).
      */
-    private static boolean useMma(int n, QType type) {
-        return MMA_PREFILL && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
+    private boolean useMma(int n, QType type) {
+        return MMA_PREFILL && !(singleRows && n < PREFILL_MIN_TOKENS) && n >= (tiledIsSlow(type) ? Math.min(MMA_MIN_TOKENS, PREFILL_MIN_TOKENS) : MMA_MIN_TOKENS)
                 && (type == QType.Q4_0 || type == QType.Q8_0 || type == QType.Q2_K || type == QType.Q6_K || type.gguf);
     }
 
@@ -943,17 +967,46 @@ final class MetalKernels implements AutoCloseable {
     void attention(String kernel, int groups, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
                    Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim, int pos, int ctx, float scale,
                    int qStride, int kStride, int vStride, int oStride, int window, float softcap, int n) {
+        attention(kernel, groups, q, kc, vc, out, scores, nHeads, nKvHeads, qkDim, vDim, pos, ctx, scale, qStride, kStride,
+                vStride, oStride, window, softcap, n, AttnExtra.NONE);
+    }
+
+    /**
+     * What gpt-oss and Llama 4 add to {@code attention_t}, as the constant buffer(5) of a layer ({@code ext} in
+     * kernels.metal): the chunk length of chunked attention (0 = none), whether the layer has sinks, the temperature tuning
+     * of the queries (0 = off) and the per-head sink logits; null for a layer without any of them.
+     */
+    record AttnExtra(Metal.Buffer ext) {
+        static final AttnExtra NONE = new AttnExtra(null);
+
+        static float[] words(int chunk, float[] sinks, int tempFloor, float tempScale) {
+            float[] w = new float[4 + (sinks == null ? 0 : sinks.length)];
+            w[0] = Float.intBitsToFloat(chunk);
+            w[1] = Float.intBitsToFloat(sinks != null ? 1 : 0);
+            w[2] = Float.intBitsToFloat(tempFloor);
+            w[3] = tempScale;
+            if (sinks != null) {
+                System.arraycopy(sinks, 0, w, 4, sinks.length);
+            }
+            return w;
+        }
+    }
+
+    void attention(String kernel, int groups, Metal.Buffer q, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer out,
+                   Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim, int pos, int ctx, float scale,
+                   int qStride, int kStride, int vStride, int oStride, int window, float softcap, int n, AttnExtra ex) {
         bind(0, q, 0);
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, out, 0);
         bind(4, scores, 0);
-        bindOrDummy(5, pageTbl);
+        bindOrDummy(5, ex.ext());
+        bindOrDummy(6, pageTbl);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).iv(DecodeProgram.VAR_POS, pos).i(ctx)
                     .f(scale)
                     .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap).i(pageShift);
-            dispatch(kernel, 6, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
+            dispatch(kernel, 7, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
     }
 
@@ -1243,6 +1296,79 @@ final class MetalKernels implements AutoCloseable {
         }
     }
 
+
+    // ---------------------------------------------------------------- sparse decode attention (docs/27)
+
+    /** Blocks one {@code sparse_score} threadgroup scores (four simdgroups, two blocks each). */
+    static final int SPARSE_PER_GROUP = 8;
+
+    /**
+     * Recomputes the key summaries ({@code kv_summary}) of the blocks that hold the {@code n} positions starting at
+     * {@code pos}, from their valid rows, into {@code sums} (one layer's summary buffer). Run after the keys are stored.
+     */
+    void kvSummary(KvDtype kv, Metal.Buffer kc, Metal.Buffer sums, int headDim, int nKvHeads, int stride, int pos, int n) {
+        int shift = pageShift;
+        int touched = ((pos + n - 1) >> shift) - (pos >> shift) + 1;
+        bind(0, kc, 0);
+        bind(1, sums, 0);
+        bindOrDummy(2, pageTbl);
+        p.reset(KernelParams.KV_SUMMARY).i(headDim).i(nKvHeads).i(stride).iv(DecodeProgram.VAR_POS, pos).i(n).i(shift);
+        dispatch("kv_summary" + kvSuffix(kv), 3, 0, nKvHeads, touched, 1, headDim, 1, 1);
+    }
+
+    /** Splits of {@code attention_dec_sp}: the selection always has the same number of blocks, so the grid is fixed. */
+    int sparseSplits(int selBlocks, int blockTokens) {
+        return Math.max(1, Math.min(DEC_MAX_SPLITS, (selBlocks * blockTokens + decChunk - 1) / decChunk));
+    }
+
+    /**
+     * Attention of the token at {@code pos} over the blocks its query selects (docs/27): {@code sparse_score} bounds every
+     * block with the query, {@code sparse_select} picks the sinks, the best {@code cfg.blocks()} candidates and the window
+     * per kv head, and {@code attention_dec_sp} attends over them (partials in {@code part}, merged by
+     * {@code attention_combine}). The caller has run {@link #kvSummary} for this position and checked that the context has
+     * more blocks than {@code cfg.budget(B)}. {@code scores}: {@code nKvHeads * ctxBlocks} floats, {@code sel}:
+     * {@code nKvHeads * budget} ints, scratch shared by the layers.
+     */
+    void decodeAttentionSparse(KvDtype kv, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc, Metal.Buffer sums,
+                               Metal.Buffer scores, Metal.Buffer sel, Metal.Buffer part, Metal.Buffer out, long outOff,
+                               int nHeads, int nKvHeads, int headDim, int pos, int ctx, float scale, int kvStride, float softcap,
+                               KvSparse cfg) {
+        int shift = pageShift;
+        int blockTokens = 1 << shift;
+        int ctxBlocks = (ctx + blockTokens - 1) / blockTokens;
+        int budget = cfg.budget(blockTokens);
+        bind(0, q, qOff);
+        bind(1, sums, 0);
+        bindOrDummy(2, pageTbl);
+        bind(3, scores, 0);
+        p.reset(KernelParams.SPARSE_SCORE).i(nHeads).i(nKvHeads).iv(DecodeProgram.VAR_POS, pos).i(shift).i(ctxBlocks).i(SPARSE_PER_GROUP);
+        dispatch("sparse_score_d" + headDim, 4, 0, (ctxBlocks + SPARSE_PER_GROUP - 1) / SPARSE_PER_GROUP, nKvHeads, 1, DEC_THREADS, 1, 1);
+        bind(0, scores, 0);
+        bindOrDummy(1, pageTbl);
+        bind(2, sel, 0);
+        p.reset(KernelParams.SPARSE_SELECT).i(nKvHeads).iv(DecodeProgram.VAR_POS, pos).i(shift).i(cfg.sinkBlocks(blockTokens))
+                .i(cfg.windowBlocks(blockTokens)).i(cfg.blocks()).i(ctxBlocks).i(budget);
+        dispatch("sparse_select", 3, 0, nKvHeads, 1, 1, 256, 1, 1);
+        int nSplit = sparseSplits(budget, blockTokens);
+        int group = decGroup(nHeads, nKvHeads, headDim);
+        bind(0, q, qOff);
+        bind(1, kc, 0);
+        bind(2, vc, 0);
+        bind(3, part, 0);
+        bind(4, out, outOff);
+        bind(5, sel, 0);
+        p.reset(KernelParams.ATTN_DEC_SP).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
+                .i(nHeads * headDim).i(kvStride).i(0).f(softcap).i(nSplit).i(0).i(shift).i(budget).i(budget);
+        dispatch("attention_dec_sp_g" + group + "_d" + headDim + kvSuffix(kv), 6, 0, nHeads / group,
+                (nSplit + DEC_SG - 1) / DEC_SG, 1, DEC_THREADS, 1, 1);
+        if (nSplit > 1) {
+            bind(0, part, 0);
+            bind(1, out, outOff);
+            p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
+            dispatch("attention_combine", 2, 0, nHeads, 1, 1, ROW_THREADS, 1, 1);
+        }
+    }
+
     // ---------------------------------------------------------------- mixture of experts
 
     /**
@@ -1323,6 +1449,25 @@ final class MetalKernels implements AutoCloseable {
     /** Per-slot gate/up projections with SwiGLU: out[slot, :] for the n * topK slots of assign (moe_up). */
     void moeUp(QTensor gateUp, Metal.Buffer wbuf, Metal.Buffer x, Metal.Buffer assign, Metal.Buffer out, int moeDim,
                int topK, int n) {
+        moeUp(gateUp, wbuf, x, assign, out, moeDim, topK, n, MoeMath.NONE, null);
+    }
+
+    /**
+     * The arithmetic of the experts beyond the plain SwiGLU weighted at the output ({@code MoeXParams} in kernels.metal):
+     * the flags, the clamp, the gate/up and down bias buffers (gpt-oss) and the routing weight on the input (Llama 4).
+     */
+    record MoeMath(int flags, float limit, float alpha, Metal.Buffer gub, Metal.Buffer dnb) {
+        static final MoeMath NONE = new MoeMath(0, 0f, 0f, null, null);
+
+        static MoeMath of(org.robomiri.jllm.model.Mlp.ExpertSpec es, Metal.Buffer gub, Metal.Buffer dnb) {
+            return new MoeMath((es.clamped() ? 1 : 0) | (es.bias() ? 2 : 0) | (es.weightInput() ? 4 : 0), es.clampLimit(),
+                    es.alpha(), gub, dnb);
+        }
+    }
+
+    /** {@link #moeUp(QTensor, Metal.Buffer, Metal.Buffer, Metal.Buffer, Metal.Buffer, int, int, int)} with the experts' arithmetic; {@code rw} is read for the weight on the input. */
+    void moeUp(QTensor gateUp, Metal.Buffer wbuf, Metal.Buffer x, Metal.Buffer assign, Metal.Buffer out, int moeDim,
+               int topK, int n, MoeMath mm, Metal.Buffer rw) {
         bind(0, wbuf, 0);
         if (gateUp.isSplit()) {
             bind(1, upBuffer(gateUp), 0);   // the up experts' view of a GGUF file
@@ -1332,8 +1477,10 @@ final class MetalKernels implements AutoCloseable {
         bind(2, x, 0);
         bind(3, assign, 0);
         bind(4, out, 0);
-        p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK); // rows per expert: gate | up
-        dispatch(kernel("moe_up", gateUp.type, ""), 5, 0, rowGrid(moeDim), n * topK, 1, MM_THREADS, 1, 1);
+        bindOrDummy(5, mm.gub());
+        bindOrDummy(6, rw);
+        p.reset(KernelParams.MOE_X).i(2 * moeDim).i(gateUp.cols).i(topK).i(mm.flags()).f(mm.limit()).f(mm.alpha()); // rows per expert: gate | up
+        dispatch(kernel("moe_up", gateUp.type, ""), 7, 0, rowGrid(moeDim), n * topK, 1, MM_THREADS, 1, 1);
     }
 
     /**
@@ -1355,6 +1502,13 @@ final class MetalKernels implements AutoCloseable {
     void moeGrouped(QTensor gateUp, Metal.Buffer bGateUp, QTensor down, Metal.Buffer bDown, Metal.Buffer xb,
                     Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer order, Metal.Buffer tiles, Metal.Buffer hidden,
                     Metal.Buffer ys, Metal.Buffer x, int experts, int moeDim, int dim, int topK, int n) {
+        moeGrouped(gateUp, bGateUp, down, bDown, xb, assign, rw, order, tiles, hidden, ys, x, experts, moeDim, dim, topK, n,
+                MoeMath.NONE);
+    }
+
+    void moeGrouped(QTensor gateUp, Metal.Buffer bGateUp, QTensor down, Metal.Buffer bDown, Metal.Buffer xb,
+                    Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer order, Metal.Buffer tiles, Metal.Buffer hidden,
+                    Metal.Buffer ys, Metal.Buffer x, int experts, int moeDim, int dim, int topK, int n, MoeMath mm) {
         int slots = n * topK;
         int maxTiles = moeMaxTiles(slots, experts);
         bind(0, assign, 0);
@@ -1362,8 +1516,8 @@ final class MetalKernels implements AutoCloseable {
         bind(2, tiles, 0);
         p.reset(KernelParams.MOE_SORT).i(slots).i(experts).i(maxTiles);
         dispatch("moe_sort", 3, 0, 1, 1, 1, ROW_THREADS, 1, 1);
-        moeUpTiles(gateUp, bGateUp, xb, order, tiles, hidden, moeDim, topK, maxTiles);
-        moeDownTiles(down, bDown, hidden, order, tiles, rw, ys, dim, topK, maxTiles);
+        moeUpTiles(gateUp, bGateUp, xb, order, tiles, hidden, moeDim, topK, maxTiles, mm, rw);
+        moeDownTiles(down, bDown, hidden, order, tiles, rw, ys, dim, topK, maxTiles, mm);
 
         bind(0, ys, 0);
         bind(1, assign, 0);
@@ -1378,6 +1532,11 @@ final class MetalKernels implements AutoCloseable {
      */
     void moeUpTiles(QTensor gateUp, Metal.Buffer bGateUp, Metal.Buffer xb, Metal.Buffer order, Metal.Buffer tiles,
                     Metal.Buffer hidden, int moeDim, int topK, int maxTiles) {
+        moeUpTiles(gateUp, bGateUp, xb, order, tiles, hidden, moeDim, topK, maxTiles, MoeMath.NONE, null);
+    }
+
+    void moeUpTiles(QTensor gateUp, Metal.Buffer bGateUp, Metal.Buffer xb, Metal.Buffer order, Metal.Buffer tiles,
+                    Metal.Buffer hidden, int moeDim, int topK, int maxTiles, MoeMath mm, Metal.Buffer rw) {
         bind(0, bGateUp, 0);
         if (gateUp.isSplit()) {
             bind(1, upBuffer(gateUp), 0);
@@ -1388,14 +1547,21 @@ final class MetalKernels implements AutoCloseable {
         bind(3, order, 0);
         bind(4, tiles, 0);
         bind(5, hidden, 0);
-        p.reset(KernelParams.MOE).i(2 * moeDim).i(gateUp.cols).i(topK);
-        dispatch(mmaKernel("moe_up", MmaFamily.MOE_UP, gateUp.type, moeDim, gateUp.cols, ""), 6, 0,
+        bindOrDummy(6, mm.gub());
+        bindOrDummy(7, rw);
+        p.reset(KernelParams.MOE_X).i(2 * moeDim).i(gateUp.cols).i(topK).i(mm.flags()).f(mm.limit()).f(mm.alpha());
+        dispatch(mmaKernel("moe_up", MmaFamily.MOE_UP, gateUp.type, moeDim, gateUp.cols, ""), 8, 0,
                 mmaGrid(moeDim, MetalConstants.MMA_BR / 2), maxTiles, 1, MM_THREADS, 1, 1);
     }
 
     /** ys[s] = rw[s] * W_e . hidden[s] for the slots of the expert tiles: moe_down_mma or moe_down_hmma. */
     void moeDownTiles(QTensor down, Metal.Buffer bDown, Metal.Buffer hidden, Metal.Buffer order, Metal.Buffer tiles,
                       Metal.Buffer rw, Metal.Buffer ys, int dim, int topK, int maxTiles) {
+        moeDownTiles(down, bDown, hidden, order, tiles, rw, ys, dim, topK, maxTiles, MoeMath.NONE);
+    }
+
+    void moeDownTiles(QTensor down, Metal.Buffer bDown, Metal.Buffer hidden, Metal.Buffer order, Metal.Buffer tiles,
+                      Metal.Buffer rw, Metal.Buffer ys, int dim, int topK, int maxTiles, MoeMath mm) {
         bind(0, bDown, 0);
         bind(1, bDown, scaleOff(down));
         bind(2, hidden, 0);
@@ -1403,22 +1569,29 @@ final class MetalKernels implements AutoCloseable {
         bind(4, tiles, 0);
         bind(5, rw, 0);
         bind(6, ys, 0);
-        p.reset(KernelParams.MOE).i(dim).i(down.cols).i(topK);
-        dispatch(mmaKernel("moe_down", MmaFamily.MOE_DOWN, down.type, dim, down.cols, ""), 7, 0,
+        bindOrDummy(7, mm.dnb());
+        p.reset(KernelParams.MOE_X).i(dim).i(down.cols).i(topK).i(mm.flags()).f(mm.limit()).f(mm.alpha());
+        dispatch(mmaKernel("moe_down", MmaFamily.MOE_DOWN, down.type, dim, down.cols, ""), 8, 0,
                 mmaGrid(dim, MetalConstants.MMA_BR), maxTiles, 1, MM_THREADS, 1, 1);
     }
 
     /** x[t] += sum_k rw[t, k] * W_assign[t, k] . h[t * topK + k] (moe_down). */
     void moeDown(QTensor down, Metal.Buffer wbuf, Metal.Buffer h, Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer x,
                  int dim, int topK, int n) {
+        moeDown(down, wbuf, h, assign, rw, x, dim, topK, n, MoeMath.NONE);
+    }
+
+    void moeDown(QTensor down, Metal.Buffer wbuf, Metal.Buffer h, Metal.Buffer assign, Metal.Buffer rw, Metal.Buffer x,
+                 int dim, int topK, int n, MoeMath mm) {
         bind(0, wbuf, 0);
         bind(1, wbuf, scaleOff(down));
         bind(2, h, 0);
         bind(3, assign, 0);
         bind(4, rw, 0);
         bind(5, x, 0);
-        p.reset(KernelParams.MOE).i(dim).i(down.cols).i(topK);
-        dispatch(kernel("moe_down", down.type, ""), 6, 0, rowGrid(dim), n, 1, MM_THREADS, 1, 1);
+        bindOrDummy(6, mm.dnb());
+        p.reset(KernelParams.MOE_X).i(dim).i(down.cols).i(topK).i(mm.flags()).f(mm.limit()).f(mm.alpha());
+        dispatch(kernel("moe_down", down.type, ""), 7, 0, rowGrid(dim), n, 1, MM_THREADS, 1, 1);
     }
 
     // ---------------------------------------------------------------- DeepSeek MLA
@@ -1486,6 +1659,79 @@ final class MetalKernels implements AutoCloseable {
         bind(8, y, 0);
         p.reset(KernelParams.MAMBA_SCAN).i(dInner).i(dState).i(dtRank).i(n);
         dispatch("mamba_scan", 9, 0, channelGrid(dInner), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    // ---------------------------------------------------------------- attention / state-space hybrids
+
+    /** x[i] += s * y[i] for i < n (vec_axpy). */
+    void vecAxpy(Metal.Buffer y, Metal.Buffer x, int n, float s) {
+        bind(0, y, 0);
+        bind(1, x, 0);
+        p.reset(KernelParams.VEC).i(n).f(s);
+        dispatch("vec_axpy", 2, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** x[i] = 0 for i < n (vec_zero). */
+    void vecZero(Metal.Buffer x, int n) {
+        bind(0, x, 0);
+        p.reset(KernelParams.VEC).i(n).f(0f);
+        dispatch("vec_zero", 1, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** y[i] = relu(x[i])^2 for i < n (relu2; x and y may be one buffer). */
+    void relu2(Metal.Buffer x, Metal.Buffer y, int n) {
+        bind(0, x, 0);
+        bind(1, y, 0);
+        p.reset(KernelParams.VEC).i(n).f(0f);
+        dispatch("relu2", 2, 0, (n + ROW_THREADS - 1) / ROW_THREADS, 1, 1, ROW_THREADS, 1, 1);
+    }
+
+    /**
+     * Mamba-2's causal conv + SiLU over the channels that start at float {@code projOff} of every row of {@code proj} (rows
+     * of {@code projStride} floats), with the carried conv state; the result goes to {@code out} ({@code [n, convDim]}).
+     */
+    void m2Conv(Metal.Buffer proj, Metal.Buffer w, Metal.Buffer bias, Metal.Buffer state, Metal.Buffer out, int convDim,
+                int kernelWidth, int projStride, int projOff, int n) {
+        bind(0, proj, 0);
+        bind(1, w, 0);
+        bind(2, bias, 0);
+        bind(3, state, 0);
+        bind(4, out, 0);
+        p.reset(KernelParams.M2_CONV).i(convDim).i(kernelWidth).i(n).i(projStride).i(projOff);
+        dispatch("m2_conv", 5, 0, channelGrid(convDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** Mamba-2's recurrence over the n tokens (m2_scan); y is {@code [n, dInner]}. */
+    void m2Scan(Metal.Buffer conv, Metal.Buffer proj, Metal.Buffer dtBias, Metal.Buffer a, Metal.Buffer d,
+                Metal.Buffer state, Metal.Buffer y, int heads, int headDim, int groups, int ssmState, int projStride,
+                int dtOff, int convDim, int dInner, float dtMin, float dtMax, int n) {
+        bind(0, conv, 0);
+        bind(1, proj, 0);
+        bind(2, dtBias, 0);
+        bind(3, a, 0);
+        bind(4, d, 0);
+        bind(5, state, 0);
+        bind(6, y, 0);
+        p.reset(KernelParams.M2_SCAN).i(heads).i(headDim).i(groups).i(ssmState).i(n).i(projStride).i(dtOff).i(convDim)
+                .i(dInner).f(dtMin).f(dtMax);
+        dispatch("m2_scan", 7, 0, channelGrid(heads * headDim), 1, 1, CHANNEL_THREADS, 1, 1);
+    }
+
+    /** Mamba-2's gated group RMSNorm of y in place (m2_gnorm); z is read from the rows of {@code proj}. */
+    void m2Gnorm(Metal.Buffer y, Metal.Buffer proj, Metal.Buffer w, int dInner, int groupSize, int projStride, float eps, int n) {
+        bind(0, y, 0);
+        bind(1, proj, 0);
+        bind(2, w, 0);
+        p.reset(KernelParams.M2_NORM).i(dInner).i(groupSize).i(n).i(projStride).f(eps);
+        dispatch("m2_gnorm", 3, 0, dInner / groupSize, n, 1, ROW_THREADS, 1, 1);
+    }
+
+    /** Jamba's norms of dt, B and C in the rows of x_proj's output, in place (rms3); w = [dt | B | C] gains. */
+    void rms3(Metal.Buffer x, Metal.Buffer w, int rank, int state, float eps, int n) {
+        bind(0, x, 0);
+        bind(1, w, 0);
+        p.reset(KernelParams.RMS3).i(rank).i(state).i(rank + 2 * state).i(n).f(eps);
+        dispatch("rms3", 2, 0, 3, n, 1, ROW_THREADS, 1, 1);
     }
 
     // ---------------------------------------------------------------- Qwen3-Next
@@ -1612,15 +1858,24 @@ final class MetalKernels implements AutoCloseable {
                       Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
                       int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
                       float softcap) {
+        attentionRow(kernel, groups, q, qOff, kc, vc, out, outOff, scores, nHeads, nKvHeads, qkDim, vDim, pos, ctx, scale,
+                qStride, kStride, vStride, oStride, window, softcap, AttnExtra.NONE);
+    }
+
+    void attentionRow(String kernel, int groups, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
+                      Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
+                      int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
+                      float softcap, AttnExtra ex) {
         bind(0, q, qOff);
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, out, outOff);
         bind(4, scores, rowScoresOff);
-        bindOrDummy(5, pageTbl);
+        bindOrDummy(5, ex.ext());
+        bindOrDummy(6, pageTbl);
         p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx).f(scale)
                 .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(0).f(softcap).i(pageShift);
-        dispatch(kernel, 6, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
+        dispatch(kernel, 7, 0, nHeads / groups, 1, 1, ATT_THREADS, 1, 1);
     }
 
     /** {@link #flashAttention} of the one token at pos whose q row starts at byte qOff; its output row goes to outOff. */

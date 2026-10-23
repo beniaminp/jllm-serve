@@ -31,6 +31,14 @@ public interface KvStorage extends AutoCloseable {
      */
     void grow(int blocks);
 
+    /**
+     * The codec that stores this storage's blocks in the on-disk format {@code f} (docs/26 §26.2.4), or null when the
+     * storage cannot say (the block files then hold the canonical rows as they are).
+     */
+    default KvBlockCodec codec(KvBlockCodec.Format f) {
+        return null;
+    }
+
     /** Copies the first {@code rows} positions of every layer of block {@code src} into block {@code dst}. */
     void copy(int src, int dst, int rows);
 

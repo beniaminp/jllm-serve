@@ -153,6 +153,25 @@ bench "paged KV cache, 64-token blocks" "$DENSE" "" --backend.kv-paged true --ba
 bench "~3000-token prompt: flat KV cache" "$DENSE" "" --bench.prompt-repeat 300 --engine.speculative off
 bench "~3000-token prompt: paged KV cache" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
 bench "~3000-token prompt: paged KV cache, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
+# sparse decode attention on the paged cache (docs/27): a decode step bounds q.k of every block with its key summary and
+# attends over the best blocks, the first block and the recent window; off by default. Same prompts, dense paged against
+# sparse (16 chosen blocks: the context passes the budget of 33 blocks at ~530 positions; the default 64 blocks at ~1300)
+bench "~3000-token prompt: paged KV cache, dense attention" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
+bench "~3000-token prompt: sparse decode attention (16 blocks)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-sparse true --backend.kv-sparse-blocks 16 --engine.speculative off
+bench "~3000-token prompt: sparse decode attention (default 64 blocks)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-sparse true --engine.speculative off
+bench "~8000-token prompt: paged KV cache, dense attention" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-paged true --engine.speculative off
+bench "~8000-token prompt: sparse decode attention (default 64 blocks)" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-sparse true --engine.speculative off
+bench "~8000-token prompt: sparse decode attention, f16 cache" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-sparse true --backend.kv-dtype f16 --engine.speculative off
+bench "~8000-token prompt: sparse decode attention, q8 cache (rotated keys)" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-sparse true --backend.kv-dtype q8 --engine.speculative off
+bench "~3000-token prompt: sparse decode attention, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-sparse true --backend.kv-sparse-blocks 16 --engine.speculative off
+# tiered KV storage (docs/26): a hot tier limited to 70 MB (38 blocks of f16), host tier 4 MB, files behind it; the 3000-token prompts
+# need 340 MB of f16 KV, so the 2 MB rows keep the cache on the host and stream it layer by layer (kv-stream auto) against the same
+# f16 prompt fully resident
+bench "~3000-token prompt: f16 KV resident (reference for the tier rows)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --engine.speculative off
+bench "~3000-token prompt: tiered KV, 70 MB hot tier (streamed, f16)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 70 --backend.kv-host-mb 4 --engine.speculative off
+bench "~3000-token prompt: tiered KV, 2 MB hot tier (streamed, f16, layers in mapped files)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 2 --backend.kv-host-mb 100 --engine.speculative off
+bench "tiered KV, pool tier only (no stream, hot tier 400 MB, f16)" "$DENSE" "" --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 400 --backend.kv-stream off --engine.speculative off
+bench "tiered KV, memory planner on (f16)" "$DENSE" "" --backend.kv-dtype f16 --backend.kv-tier true --backend.memory-plan true --engine.speculative off
 bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 0 --engine.speculative off
 bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
 bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200

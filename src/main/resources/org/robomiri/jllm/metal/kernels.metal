@@ -1494,6 +1494,15 @@ struct AttnParams {
     int pageShift;   // paged cache: log2 of the block size (positions) and tbl the block table; 0 = flat (see kv_row)
 };
 
+// What gpt-oss and Llama 4 add to attention_t, per layer and constant: buffer(5) of attention_t holds the words
+//   [0] chunk       Llama 4 chunked attention: a query sees only the keys of its own chunk of `chunk` positions, 0 = off
+//   [1] hasSinks    gpt-oss: one sink logit per query head (words 4 ..) joins the softmax, with a zero value
+//   [2] tempFloor   Llama 4 temperature tuning: q *= 1 + tempScale * ln(1 + floor((pos + 1) / tempFloor)), 0 = off
+//   [3] tempScale   (a float)
+//   [4 + h] sink of query head h
+// (a zeroed buffer for the layers without any of them; the parameter struct stays within the 64 bytes of a recorded step)
+
+
 // The q8 cache (backend.kv-dtype=q8, KV = char): a position's row of the cache is its kvDim int8 values followed by
 // one f32 scale per kv head (stride = kvDim + 4 * nKvHeads bytes; DeepSeek's latent row: aw values, one scale), so
 // value i of kv head h at position s is row[h * headDim + i] * scale[h]. kv_scale(row, stride, nKvHeads, h) is that
@@ -1511,8 +1520,9 @@ kernel void attention_t(device const float *q [[buffer(0)]],
                         device const KV *vc [[buffer(2)]],
                         device float *out [[buffer(3)]],
                         device float *scores [[buffer(4)]],
-                        device const int *tbl [[buffer(5)]],
-                        constant AttnParams &p [[buffer(6)]],
+                        device const float *ext [[buffer(5)]],  // chunk, hasSinks, tempFloor (ints), tempScale, sinks per head
+                        device const int *tbl [[buffer(6)]],    // (the other attention kernels take the page table at 5)
+                        constant AttnParams &p [[buffer(7)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort2 tid2 [[thread_position_in_threadgroup]],
                         ushort2 tpg2 [[threads_per_threadgroup]],
@@ -1535,16 +1545,22 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     const int t = p.tokenOffset + tl;
     const int kvh = h0 / (p.nHeads / p.nKvHeads);
     const int len = p.pos0 + t + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    const int chunk = as_type<int>(ext[0]);
+    const bool hasSinks = as_type<int>(ext[1]) != 0;
+    const int tempFloor = as_type<int>(ext[2]);
+    int first = p.window > 0 ? max(0, len - p.window) : 0;
+    if (chunk > 0) first = max(first, ((len - 1) / chunk) * chunk);
     device const KV *kb = kc + kvh * qkDim;
     device const KV *vb = vc + kvh * vDim;
     device float *sc[G];
     for (int g = 0; g < G; g++) sc[g] = scores + ((ulong)tl * p.nHeads + h0 + g) * p.ctx;
 
+    // Llama 4's temperature tuning scales the query by a function of its position (= len - 1)
+    const float tf = tempFloor > 0 ? precise::log(1.0f + floor(float(len) / float(tempFloor))) * ext[3] + 1.0f : 1.0f;
     float qr[G][MK];
     for (int g = 0; g < G; g++) {
         device const float *qv = q + (ulong)t * p.qStride + (h0 + g) * qkDim;
-        for (int i = 0; i < MK; i++) qr[g][i] = i < perK ? qv[lane + i * 32] : 0.0f;
+        for (int i = 0; i < MK; i++) qr[g][i] = i < perK ? (tempFloor > 0 ? qv[lane + i * 32] * tf : qv[lane + i * 32]) : 0.0f;
     }
 
     // 1. scores: each K row is read once per threadgroup and dotted with the G query heads
@@ -1574,6 +1590,11 @@ kernel void attention_t(device const float *q [[buffer(0)]],
         float r = lane < nsg ? red[g * 8 + lane] : -INFINITY;
         mx[g] = simd_max(r);
     }
+    float sk[G]; // the sink logit of each head joins the maximum and the denominator
+    for (int g = 0; g < G; g++) {
+        sk[g] = hasSinks ? ext[4 + h0 + g] : -INFINITY;
+        mx[g] = max(mx[g], sk[g]);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     // 2. softmax numerators
@@ -1594,6 +1615,7 @@ kernel void attention_t(device const float *q [[buffer(0)]],
     for (int g = 0; g < G; g++) {
         float r = lane < nsg ? red[g * 8 + lane] : 0.0f;
         sum[g] = simd_sum(r);
+        if (hasSinks) sum[g] += exp(sk[g] - mx[g]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
@@ -1849,17 +1871,23 @@ static inline void ldw(device const half *p, thread float4 *o) {
 template <int W>
 static inline void ldw(device const char *p, thread float4 *o) { o[0] = float4(*(device const char4 *)p); }
 
-template <typename KV, int G, int D, int W>
-kernel void attention_dec(device const float *q [[buffer(0)]],
-                          device const KV *kc [[buffer(1)]],
-                          device const KV *vc [[buffer(2)]],
-                          device float *part [[buffer(3)]],
-                          device float *out [[buffer(4)]],
-                          device const int *tbl [[buffer(5)]],
-                          constant AttnSplitParams &p [[buffer(6)]],
-                          uint2 tgp [[threadgroup_position_in_grid]],
-                          ushort sg [[simdgroup_index_in_threadgroup]],
-                          ushort lane [[thread_index_in_simdgroup]]) {
+// The body of attention_dec, shared by the dense kernel and the sparse one (docs/27): with SP the "cache" is the list of
+// blocks sparse_select chose for each kv head (tbl + kvh * selStride, physical block ids in ascending logical order,
+// the last one holding the token), so a key s of the virtual sequence of selBlocks blocks is row
+// (tb[s >> pageShift] << pageShift) | (s & mask) of the pool. P is AttnSplitParams or AttnDecSpParams.
+template <typename KV, int G, int D, int W, bool SP, typename P>
+static inline void dec_body(device const float *q,
+                            device const KV *kc,
+                            device const KV *vc,
+                            device float *part,
+                            device float *out,
+                            device const int *tbl,
+                            constant P &p,
+                            int selStride,
+                            int selBlocks,
+                            uint2 tgp,
+                            ushort sg,
+                            ushort lane) {
     constexpr int NP = W / 4;                   // float4 per chunk
     constexpr int NC = D / (8 * W);             // chunks of a key row per lane
     constexpr int NV = NC * NP;                 // float4 of a key row per lane
@@ -1869,8 +1897,10 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
     const ushort ty = lane >> 3;
     const int hq0 = int(tgp.x) * G;
     const int kvh = hq0 / (p.nHeads / p.nKvHeads);
-    const int len = p.pos0 + 1;
-    const int first = p.window > 0 ? max(0, len - p.window) : 0;
+    // sparse (SP): the keys are the selected blocks, the last of which holds the token's position (a partial block)
+    const int len = SP ? (selBlocks - 1) * (1 << p.pageShift) + (p.pos0 & ((1 << p.pageShift) - 1)) + 1 : p.pos0 + 1;
+    const int first = (!SP && p.window > 0) ? max(0, len - p.window) : 0;
+    device const int *tb = tbl + (SP ? kvh * selStride : 0);   // SP: this kv head's selected blocks (physical ids)
     const int chunk = p.chunk > 0 ? p.chunk : (((len - first + p.nSplit - 1) / p.nSplit + 31) & ~31);
     const int s0 = first + split * chunk;
     const int s1 = min(len, s0 + chunk);
@@ -1907,7 +1937,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             const int key = base + 4 * j + ty;
             for (int g = 0; g < G; g++) ps[g][j] = 0.0f;
             if (key < s1) {
-                device const KV *kr = kb + kv_row(tbl, p.pageShift, key) * p.kvStride;
+                device const KV *kr = kb + kv_row(tb, p.pageShift, key) * p.kvStride;
                 for (int c = 0; c < NC; c++) {
                     float4 kk[NP];
                     ldw<W>(kr + W * (tx + 8 * c), kk);
@@ -1937,7 +1967,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
         }
         const int mykey = base + 4 * tx + ty;
         float ks = 0.0f;
-        if (mykey < s1) ks = p.scale * kv_scale(kc + kv_row(tbl, p.pageShift, mykey) * p.kvStride, p.kvStride, p.nKvHeads, kvh);
+        if (mykey < s1) ks = p.scale * kv_scale(kc + kv_row(tb, p.pageShift, mykey) * p.kvStride, p.kvStride, p.nKvHeads, kvh);
         // 2. online softmax over the 32 keys of the block
         float pe[G];
         for (int g = 0; g < G; g++) {
@@ -1959,7 +1989,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
             for (int g = 0; g < G; g++) pj[g] = simd_shuffle(pe[g], ushort(ty * 8 + j));
             const int key = base + 4 * j + ty;
             if (key < s1) {
-                const ulong rv = kv_row(tbl, p.pageShift, key);
+                const ulong rv = kv_row(tb, p.pageShift, key);
                 device const KV *vr = vb + rv * p.kvStride;
                 const float vs = kv_scale(vc + rv * p.kvStride, p.kvStride, p.nKvHeads, kvh);
                 for (int c = 0; c < NC; c++) {
@@ -1996,17 +2026,320 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
     }
 }
 
+template <typename KV, int G, int D, int W>
+kernel void attention_dec(device const float *q [[buffer(0)]],
+                          device const KV *kc [[buffer(1)]],
+                          device const KV *vc [[buffer(2)]],
+                          device float *part [[buffer(3)]],
+                          device float *out [[buffer(4)]],
+                          device const int *tbl [[buffer(5)]],
+                          constant AttnSplitParams &p [[buffer(6)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          ushort sg [[simdgroup_index_in_threadgroup]],
+                          ushort lane [[thread_index_in_simdgroup]]) {
+    dec_body<KV, G, D, W, false, AttnSplitParams>(q, kc, vc, part, out, tbl, p, 0, 0, tgp, sg, lane);
+}
+
+// attention_dec over the blocks sparse_select chose (docs/27): tbl is the selection (nKvHeads rows of selStride block ids),
+// selBlocks the number of selected blocks. Buffers: q(0) kc(1) vc(2) part(3) out(4) sel(5), AttnDecSpParams(6).
+struct AttnDecSpParams {
+    int nHeads;
+    int nKvHeads;
+    int headDim;
+    int pos0;
+    int ctx;
+    float scale;
+    int qStride;
+    int kvStride;
+    int window;      // unused (sparse layers have no window)
+    float softcap;
+    int nSplit;
+    int chunk;
+    int pageShift;
+    int selStride;   // block ids per kv head in the selection
+    int selBlocks;   // blocks in the selection (the keys are the first selBlocks * 2^pageShift - (rest of the last block))
+};
+
+template <typename KV, int G, int D, int W>
+kernel void attention_dec_sp(device const float *q [[buffer(0)]],
+                             device const KV *kc [[buffer(1)]],
+                             device const KV *vc [[buffer(2)]],
+                             device float *part [[buffer(3)]],
+                             device float *out [[buffer(4)]],
+                             device const int *tbl [[buffer(5)]],
+                             constant AttnDecSpParams &p [[buffer(6)]],
+                             uint2 tgp [[threadgroup_position_in_grid]],
+                             ushort sg [[simdgroup_index_in_threadgroup]],
+                             ushort lane [[thread_index_in_simdgroup]]) {
+    dec_body<KV, G, D, W, true, AttnDecSpParams>(q, kc, vc, part, out, tbl, p, p.selStride, p.selBlocks, tgp, sg, lane);
+}
+
 // float / q8 caches: 4 elements per lane chunk; half: 8 (16-byte loads), and "_h4" with 4 for an A/B run (-Djllm.metal.decWide=false)
 #define DEC_INST(KV, G, D, W, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_dec<KV, G, D, W>) attention_dec<KV, G, D, W>;
+#define DEC_INST_SP(KV, G, D, W, NAME) \
+    template [[host_name(NAME)]] kernel decltype(attention_dec_sp<KV, G, D, W>) attention_dec_sp<KV, G, D, W>;
 #define DEC_INST_KV(G, D) \
     DEC_INST(float, G, D, 4, "attention_dec_g" #G "_d" #D) \
     DEC_INST(half, G, D, 8, "attention_dec_g" #G "_d" #D "_h") \
     DEC_INST(half, G, D, 4, "attention_dec_g" #G "_d" #D "_h4") \
-    DEC_INST(char, G, D, 4, "attention_dec_g" #G "_d" #D "_q8")
+    DEC_INST(char, G, D, 4, "attention_dec_g" #G "_d" #D "_q8") \
+    DEC_INST_SP(float, G, D, 4, "attention_dec_sp_g" #G "_d" #D) \
+    DEC_INST_SP(half, G, D, 8, "attention_dec_sp_g" #G "_d" #D "_h") \
+    DEC_INST_SP(char, G, D, 4, "attention_dec_sp_g" #G "_d" #D "_q8")
 DEC_INST_KV(1, 64) DEC_INST_KV(2, 64) DEC_INST_KV(4, 64)
 DEC_INST_KV(1, 128) DEC_INST_KV(2, 128) DEC_INST_KV(4, 128)
 DEC_INST_KV(1, 256) DEC_INST_KV(2, 256)
+
+// ---------------------------------------------------------------------------------------------- 4c. sparse decode attention
+// Sparse attention while decoding (docs/27, backend.kv-sparse; Quest-style block selection on the paged cache). Per pool
+// block, kv head and layer a SUMMARY of the block's keys is kept: for every channel the minimum and the maximum over the
+// block's valid rows, as halves rounded outwards (the minimum down, the maximum up), layout [block][kv head][lo[D], hi[D]].
+// For a query q and a block with summary (lo, hi): every key k of the block has lo_i <= k_i <= hi_i, and q_i k_i is linear in
+// k_i, so q.k <= sum_i max(q_i lo_i, q_i hi_i), an upper bound of the block's best score. A decode step
+//   1. kv_summary      recomputes the summary of the blocks the step just wrote (exact over their valid rows),
+//   2. sparse_score    bounds every block with the step's (for a rotated q8 cache: rotated) query, the largest over the
+//                      group's query heads, into scores[kv head][block],
+//   3. sparse_select   chooses per kv head the sinks, the topK best candidates and the recent window, as physical block ids
+//                      in ascending logical order (the last is the block of the token),
+//   4. attention_dec_sp  attends exactly over the chosen blocks (attention_dec reading its rows through the selection).
+
+struct KvSummaryParams {
+    int headDim;
+    int nKvHeads;
+    int stride;      // cache row stride in elements (as the attention kernels' kvStride)
+    int pos;         // first position of the chunk just written
+    int n;           // rows of the chunk
+    int pageShift;
+};
+
+// The largest half <= x and the smallest half >= x (x clamped to the finite halves): KvSummary.down / up in Java.
+static inline ushort half_down(float x) {
+    x = clamp(x, -65504.0f, 65504.0f);
+    const half h = half(x);
+    ushort b = as_type<ushort>(h);
+    if (float(h) > x) b = b == 0 ? ushort(0x8001) : ((b & 0x8000) == 0 ? ushort(b - 1) : ushort(b + 1));
+    return b;
+}
+static inline ushort half_up(float x) {
+    x = clamp(x, -65504.0f, 65504.0f);
+    const half h = half(x);
+    ushort b = as_type<ushort>(h);
+    if (float(h) < x) b = (b == 0 || b == 0x8000) ? ushort(1) : ((b & 0x8000) == 0 ? ushort(b + 1) : ushort(b - 1));
+    return b;
+}
+
+// kv_summary<KV>: grid (nKvHeads, touched blocks), headDim threads (one per channel). The touched blocks are the logical
+// blocks (pos >> pageShift) .. ((pos + n - 1) >> pageShift); block lb is summarised over its rows below pos + n (every
+// row for a full block), read through the block table, dequantized (q8: int8 * the row's scale, as the attention kernels
+// do). The summary is of the keys as STORED (for a rotated q8 cache, the rotated, quantized ones), so the bound holds for
+// the scores the attention kernels compute.
+template <typename KV>
+kernel void kv_summary(device const KV *kc [[buffer(0)]],
+                       device ushort *sum [[buffer(1)]],
+                       device const int *tbl [[buffer(2)]],
+                       constant KvSummaryParams &p [[buffer(3)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       ushort2 tid2 [[thread_position_in_threadgroup]]) {
+    const int D = p.headDim;
+    const int tid = int(tid2.x);
+    if (tid >= D) return;
+    const int B = 1 << p.pageShift;
+    const int lb = (p.pos >> p.pageShift) + int(tgp.y);
+    const int rows = min(B, p.pos + p.n - lb * B);
+    const int kvh = int(tgp.x);
+    const int phys = tbl[lb];
+    float lo = INFINITY;
+    float hi = -INFINITY;
+    for (int r = 0; r < rows; r++) {
+        device const KV *rp = kc + ((ulong(phys) << p.pageShift) | ulong(r)) * p.stride;
+        const float x = float(rp[kvh * D + tid]) * kv_scale(rp, p.stride, p.nKvHeads, kvh);
+        lo = min(lo, x);
+        hi = max(hi, x);
+    }
+    device ushort *dst = sum + (ulong(phys) * p.nKvHeads + kvh) * 2 * D;
+    dst[tid] = half_down(lo);
+    dst[D + tid] = half_up(hi);
+}
+
+template [[host_name("kv_summary")]] kernel decltype(kv_summary<float>) kv_summary<float>;
+template [[host_name("kv_summary_h")]] kernel decltype(kv_summary<half>) kv_summary<half>;
+template [[host_name("kv_summary_q8")]] kernel decltype(kv_summary<char>) kv_summary<char>;
+
+struct SparseScoreParams {
+    int nHeads;
+    int nKvHeads;
+    int pos;
+    int pageShift;
+    int scoreStride;  // floats per kv head in scores
+    int perGroup;     // blocks per threadgroup (4 simdgroups, a block each at a time)
+};
+
+// sparse_score<D>: scores[kv head][j] = max over the kv head's query heads h of sum_c max(q_hc lo_c, q_hc hi_c) for the
+// logical block j of the token at pos (every block 0 .. pos >> pageShift; the caller ignores the forced ones). Grid
+// (ceil(blocks of the context / perGroup), nKvHeads), 128 threads; a simdgroup takes a block, lane l the channels
+// l * D/32 .. +D/32 (contiguous halves). Threadgroups past the token's last block return at once, so the grid, which is
+// fixed by the context, does not depend on the position.
+template <int D>
+kernel void sparse_score(device const float *q [[buffer(0)]],
+                         device const half *sum [[buffer(1)]],
+                         device const int *tbl [[buffer(2)]],
+                         device float *scores [[buffer(3)]],
+                         constant SparseScoreParams &p [[buffer(4)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         ushort sg [[simdgroup_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int NPL = D / 32;
+    constexpr int MAXG = 8;
+    const int nBlocks = (p.pos >> p.pageShift) + 1;
+    const int j0 = int(tgp.x) * p.perGroup;
+    if (j0 >= nBlocks) return;
+    const int j1 = min(nBlocks, j0 + p.perGroup);
+    const int kvh = int(tgp.y);
+    const int grp = p.nHeads / p.nKvHeads;
+    float qv[MAXG][NPL];
+    for (int g = 0; g < MAXG; g++) {
+        for (int e = 0; e < NPL; e++) qv[g][e] = g < grp ? q[(kvh * grp + g) * D + int(lane) * NPL + e] : 0.0f;
+    }
+    for (int j = j0 + int(sg); j < j1; j += DEC_SG) {
+        device const half *s = sum + (ulong(tbl[j]) * p.nKvHeads + kvh) * 2 * D;
+        float lo[NPL];
+        float hi[NPL];
+        for (int e = 0; e < NPL; e++) {
+            lo[e] = float(s[int(lane) * NPL + e]);
+            hi[e] = float(s[D + int(lane) * NPL + e]);
+        }
+        float best = -INFINITY;
+        for (int g = 0; g < MAXG; g++) {
+            if (g >= grp) break;
+            float acc = 0.0f;
+            for (int e = 0; e < NPL; e++) acc += max(qv[g][e] * lo[e], qv[g][e] * hi[e]);
+            best = max(best, simd_sum(acc));
+        }
+        if (lane == 0) scores[ulong(kvh) * p.scoreStride + j] = best;
+    }
+}
+
+template [[host_name("sparse_score_d64")]] kernel decltype(sparse_score<64>) sparse_score<64>;
+template [[host_name("sparse_score_d128")]] kernel decltype(sparse_score<128>) sparse_score<128>;
+template [[host_name("sparse_score_d256")]] kernel decltype(sparse_score<256>) sparse_score<256>;
+
+struct SparseSelectParams {
+    int nKvHeads;
+    int pos;
+    int pageShift;
+    int sink;         // leading blocks always selected
+    int win;          // trailing blocks always selected (the token's own block among them)
+    int topK;         // candidates chosen by their score
+    int scoreStride;  // floats per kv head in scores
+    int selStride;    // ints per kv head in the selection
+};
+
+// The key of a float in the unsigned order of the floats (larger float, larger key).
+static inline uint sort_key(float s) {
+    const uint u = as_type<uint>(s);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// sparse_select: per kv head (one 256-thread threadgroup) the topK candidate blocks (logical blocks sink .. nBlocks - win - 1)
+// with the highest scores, ties going to the lower block (KvSummary.rank in Java), written with the sinks and the window as
+//   sel[kv head][0 .. sink)  the first blocks,  [sink .. sink + topK)  the chosen candidates in ascending order,
+//   [sink + topK .. + win)   the last blocks,
+// as PHYSICAL block ids (tbl[j]). The k-th highest key is found by four 8-bit radix passes with a threadgroup histogram; the
+// candidates above it, and the first of those equal to it, are then written in index order by an exclusive scan of the
+// threads' counts. The caller dispatches it only when the context has more than sink + topK + win blocks.
+kernel void sparse_select(device const float *scores [[buffer(0)]],
+                          device const int *tbl [[buffer(1)]],
+                          device int *sel [[buffer(2)]],
+                          constant SparseSelectParams &p [[buffer(3)]],
+                          uint kvh [[threadgroup_position_in_grid]],
+                          ushort tid [[thread_position_in_threadgroup]]) {
+    threadgroup atomic_uint hist[256];
+    threadgroup uint cntA[256];
+    threadgroup uint cntT[256];
+    threadgroup uint pick[2];
+    const int nBlocks = (p.pos >> p.pageShift) + 1;
+    const int c0 = p.sink;
+    const int c1 = nBlocks - p.win;
+    const int per = (c1 - c0 + 255) / 256;
+    const int mb = c0 + int(tid) * per;
+    const int me = min(c1, mb + per);
+    device const float *sc = scores + ulong(kvh) * p.scoreStride;
+    device int *dst = sel + ulong(kvh) * p.selStride;
+
+    uint prefix = 0u;
+    uint remaining = uint(p.topK);
+    for (int pass = 0; pass < 4; pass++) {
+        const int shift = 24 - 8 * pass;
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int j = mb; j < me; j++) {
+            const uint key = sort_key(sc[j]);
+            if (pass == 0 || (key >> (shift + 8)) == (prefix >> (shift + 8))) {
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint cum = 0u;
+            uint digit = 0u;
+            uint rem = remaining;
+            for (int b = 255; b >= 0; b--) {
+                const uint h = atomic_load_explicit(&hist[b], memory_order_relaxed);
+                if (cum + h >= remaining) {
+                    digit = uint(b);
+                    rem = remaining - cum;
+                    break;
+                }
+                cum += h;
+            }
+            pick[0] = digit;
+            pick[1] = rem;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= pick[0] << shift;
+        remaining = pick[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix is the key of the topK-th best candidate; `remaining` of the candidates equal to it are taken, lowest block first
+    uint above = 0u;
+    uint equal = 0u;
+    for (int j = mb; j < me; j++) {
+        const uint key = sort_key(sc[j]);
+        above += key > prefix ? 1u : 0u;
+        equal += key == prefix ? 1u : 0u;
+    }
+    cntA[tid] = above;
+    cntT[tid] = equal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint outAt = 0u;
+        uint tiesSeen = 0u;
+        for (int t = 0; t < 256; t++) {
+            const uint a = cntA[t];
+            const uint e = cntT[t];
+            const uint take = min(e, remaining > tiesSeen ? remaining - tiesSeen : 0u);
+            cntA[t] = outAt;      // where thread t starts writing
+            cntT[t] = take;       // how many of its ties it takes
+            outAt += a + take;
+            tiesSeen += e;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint at = cntA[tid];
+    uint take = cntT[tid];
+    for (int j = mb; j < me; j++) {
+        const uint key = sort_key(sc[j]);
+        if (key > prefix) {
+            dst[p.sink + at++] = tbl[j];
+        } else if (key == prefix && take > 0u) {
+            take--;
+            dst[p.sink + at++] = tbl[j];
+        }
+    }
+    for (int i = int(tid); i < p.sink; i += 256) dst[i] = tbl[i];
+    for (int i = int(tid); i < p.win; i += 256) dst[p.sink + p.topK + i] = tbl[c1 + i];
+}
 
 // Optional half-precision cache (backend.kv-dtype=f16). v is rounded once by the projection's epilogue
 // (matmul3<.., half> writes half(v + bias) straight into the cache row); k is projected into an f32 staging
@@ -2395,13 +2728,56 @@ struct MoeParams {
     int topK;
 };
 
+// The parameters of the expert kernels (moe_up / moe_down and their mma / hmma forms): MoeParams plus the arithmetic
+// of gpt-oss's and Llama 4's experts. flags: 1 = clamped SwiGLU (limit, alpha), 2 = the experts have a gate/up bias
+// (added before the activation, buffer `gub`: [experts * 2 * m] gate then up per expert) and a down bias (added to the
+// expert's output before the routing weight, buffer `dnb`: [experts * dim]), 4 = the routing weight multiplies the
+// expert's input (so gate and up before the activation) and not its output. flags 0 is the plain SwiGLU of
+// Qwen3-MoE / DeepSeek with the weight on the output: exactly the arithmetic of these kernels before the flags existed.
+struct MoeXParams {
+    int rowsPerExpert;
+    int cols;
+    int topK;
+    int flags;
+    float limit;
+    float alpha;
+};
+
+// h = act(g, u) of slot s (expert e, unit `unit` of m): see MoeXParams. rw is the slot's routing weight.
+static inline float moe_act(float g, float u, constant MoeXParams &p, device const float *gub, float rws, int e, int unit,
+                            int m) {
+    if (p.flags == 0) return g / (1.0f + exp(-g)) * u;
+    if (p.flags & 2) {
+        g += gub[(ulong)e * 2 * m + unit];
+        u += gub[(ulong)e * 2 * m + m + unit];
+    }
+    if (p.flags & 4) {
+        g *= rws;
+        u *= rws;
+    }
+    if (p.flags & 1) {
+        g = min(g, p.limit);
+        u = max(-p.limit, min(p.limit, u));
+        return (u + 1.0f) * (g / (1.0f + exp(-p.alpha * g)));
+    }
+    return g / (1.0f + exp(-g)) * u;
+}
+
+// y = rw * (dot + down bias): the weighted output of an expert (the weight is 1 when it went into the input).
+static inline float moe_out(float dot, constant MoeXParams &p, device const float *dnb, float rws, int e, int row, int dim) {
+    if (p.flags == 0) return rws * dot;
+    return ((p.flags & 4) ? 1.0f : rws) * (dot + ((p.flags & 2) ? dnb[(ulong)e * dim + row] : 0.0f));
+}
+
 template <int QT>
 kernel void moe_up(device const uchar *wq [[buffer(0)]],
                    device const float *ws [[buffer(1)]],
                    device const float *x [[buffer(2)]],
                    device const int *assign [[buffer(3)]],
                    device float *out [[buffer(4)]],
-                   constant MoeParams &p [[buffer(5)]],
+                   device const float *gub [[buffer(5)]],
+                   device const float *rw [[buffer(6)]],
+                   constant MoeXParams &p [[buffer(7)]],
                    uint2 tgp [[threadgroup_position_in_grid]],
                    ushort sg [[simdgroup_index_in_threadgroup]],
                    ushort lane [[thread_index_in_simdgroup]],
@@ -2426,7 +2802,7 @@ kernel void moe_up(device const uchar *wq [[buffer(0)]],
     }
     g = simd_sum(g);
     u = simd_sum(u);
-    if (lane == 0) out[(ulong)s * m + row] = g / (1.0f + exp(-g)) * u;
+    if (lane == 0) out[(ulong)s * m + row] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, assign[s], row, m);
 }
 
 // moe_down: x[t, row] += sum_k rw[t,k] * (W_{assign[t,k]}[row] . h[t*topK + k]). rowsPerExpert = dim.
@@ -2440,7 +2816,8 @@ kernel void moe_down(device const uchar *wq [[buffer(0)]],
                      device const int *assign [[buffer(3)]],
                      device const float *rw [[buffer(4)]],
                      device float *x [[buffer(5)]],
-                     constant MoeParams &p [[buffer(6)]],
+                     device const float *dnb [[buffer(6)]],
+                     constant MoeXParams &p [[buffer(7)]],
                      uint2 tgp [[threadgroup_position_in_grid]],
                      ushort sg [[simdgroup_index_in_threadgroup]],
                      ushort lane [[thread_index_in_simdgroup]],
@@ -2457,7 +2834,7 @@ kernel void moe_down(device const uchar *wq [[buffer(0)]],
         device const float4 *h4 = (device const float4 *)(h + (ulong)s * p.cols);
         float acc = 0.0f;
         for (int b = lane; b < nb; b += 32) acc += block_dot<QT>(wq, ws, grow, nb, b, h4 + b * 8);
-        total += rw[s] * simd_sum(acc);
+        total += moe_out(simd_sum(acc), p, dnb, rw[s], assign[s], row, p.rowsPerExpert);
     }
     if (lane == 0) x[(ulong)t * p.rowsPerExpert + row] += total;
 }
@@ -2537,7 +2914,9 @@ kernel void moe_up_mma(device const uchar *wq [[buffer(0)]],
                        device const int *order [[buffer(3)]],
                        device const int *tiles [[buffer(4)]],
                        device float *out [[buffer(5)]],
-                       constant MoeParams &p [[buffer(6)]],
+                       device const float *gub [[buffer(6)]],
+                       device const float *rw [[buffer(7)]],
+                       constant MoeXParams &p [[buffer(8)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]],
                        ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -2563,7 +2942,8 @@ kernel void moe_up_mma(device const uchar *wq [[buffer(0)]],
         if (t < cnt && unit0 + j < m) {
             const float g = sa[t * MMA_BR + j];
             const float u = sa[t * MMA_BR + 32 + j];
-            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+            const int s = order[start + t];
+            out[(ulong)s * m + unit0 + j] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, e, unit0 + j, m);
         }
     }
 }
@@ -2577,7 +2957,8 @@ kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
                          device const int *tiles [[buffer(4)]],
                          device const float *rw [[buffer(5)]],
                          device float *ys [[buffer(6)]],
-                         constant MoeParams &p [[buffer(7)]],
+                         device const float *dnb [[buffer(7)]],
+                         constant MoeXParams &p [[buffer(8)]],
                          uint2 tgp [[threadgroup_position_in_grid]],
                          ushort tid [[thread_index_in_threadgroup]],
                          ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -2597,7 +2978,7 @@ kernel void moe_down_mma(device const uchar *wq [[buffer(0)]],
         const int t = i / MMA_BR, j = i % MMA_BR;
         if (t < cnt && row0 + j < p.rowsPerExpert) {
             const int s = order[start + t];
-            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * sa[t * MMA_BR + j];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = moe_out(sa[t * MMA_BR + j], p, dnb, rw[s], e, row0 + j, p.rowsPerExpert);
         }
     }
 }
@@ -2670,7 +3051,7 @@ static inline void router_ds_row(device const float *xv, device const float *w, 
         for (int i = lane; i < n4; i += 32) d += dot(w4[i], x4[i]);
         for (int i = n4 * 4 + lane; i < p.dim; i += 32) d += wv[i] * xv[i]; // dim % 4 tail
         d = simd_sum(d);
-        if (lane == 0) scores[e] = d;
+        if (lane == 0) scores[e] = p.method == 3 ? d + bias[e] : d; // method 3: gpt-oss's router has a linear bias
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (p.sigmoidScore) {
@@ -2693,7 +3074,7 @@ static inline void router_ds_row(device const float *xv, device const float *w, 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid != 0) return;
 
-    if (p.method != 0) {
+    if (p.method == 1 || p.method == 2) {
         const int gs = ne / p.nGroup;
         float gsc[MAX_GROUPS];
         bool keep[MAX_GROUPS];
@@ -4418,7 +4799,9 @@ kernel void moe_up_hmma(device const uchar *wq [[buffer(0)]],
                         device const int *order [[buffer(3)]],
                         device const int *tiles [[buffer(4)]],
                         device float *out [[buffer(5)]],
-                        constant MoeParams &p [[buffer(6)]],
+                        device const float *gub [[buffer(6)]],
+                        device const float *rw [[buffer(7)]],
+                        constant MoeXParams &p [[buffer(8)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         ushort tid [[thread_index_in_threadgroup]],
                         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -4442,7 +4825,8 @@ kernel void moe_up_hmma(device const uchar *wq [[buffer(0)]],
         if (t < cnt && unit0 + j < m) {
             const float g = smem[t * MMA_BR + j];
             const float u = smem[t * MMA_BR + 32 + j];
-            out[(ulong)order[start + t] * m + unit0 + j] = g / (1.0f + exp(-g)) * u;
+            const int s = order[start + t];
+            out[(ulong)s * m + unit0 + j] = moe_act(g, u, p, gub, p.flags & 4 ? rw[s] : 0.0f, e, unit0 + j, m);
         }
     }
 }
@@ -4455,7 +4839,8 @@ kernel void moe_down_hmma(device const uchar *wq [[buffer(0)]],
                           device const int *tiles [[buffer(4)]],
                           device const float *rw [[buffer(5)]],
                           device float *ys [[buffer(6)]],
-                          constant MoeParams &p [[buffer(7)]],
+                          device const float *dnb [[buffer(7)]],
+                          constant MoeXParams &p [[buffer(8)]],
                           uint2 tgp [[threadgroup_position_in_grid]],
                           ushort tid [[thread_index_in_threadgroup]],
                           ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -4475,7 +4860,7 @@ kernel void moe_down_hmma(device const uchar *wq [[buffer(0)]],
         const int t = i / MMA_BR, j = i % MMA_BR;
         if (t < cnt && row0 + j < p.rowsPerExpert) {
             const int s = order[start + t];
-            ys[(ulong)s * p.rowsPerExpert + row0 + j] = rw[s] * smem[t * MMA_BR + j];
+            ys[(ulong)s * p.rowsPerExpert + row0 + j] = moe_out(smem[t * MMA_BR + j], p, dnb, rw[s], e, row0 + j, p.rowsPerExpert);
         }
     }
 }
@@ -5307,3 +5692,219 @@ kernel void attention_fa_q4(device const float *q [[buffer(0)]],
 template [[host_name("attention_fa_d64_q4")]] kernel decltype(attention_fa_q4<64>) attention_fa_q4<64>;
 template [[host_name("attention_fa_d128_q4")]] kernel decltype(attention_fa_q4<128>) attention_fa_q4<128>;
 template [[host_name("attention_fa_d256_q4")]] kernel decltype(attention_fa_q4<256>) attention_fa_q4<256>;
+
+// ---------------------------------------------------------------------------------------------- 15. attention / state-space hybrids
+// The pieces Granite 4, Nemotron-H and Jamba add to the kernels above (HybridMetalBackend; the CPU twin is HybridCpuBackend):
+// three element-wise kernels (x += s * y for the residual multipliers, zeroing, relu(x)^2 of Nemotron-H's MLP), the Mamba-2
+// conv, the SSD recurrence and its gated group norm, and Jamba's norms of the dt / B / C outputs of x_proj. Mamba-1 reuses
+// mamba_conv / mamba_scan (section 6).
+
+struct VecParams {
+    int n;
+    float s;
+};
+
+// x[i] += s * y[i]
+kernel void vec_axpy(device const float *y [[buffer(0)]],
+                     device float *x [[buffer(1)]],
+                     constant VecParams &p [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    x[gid] += p.s * y[gid];
+}
+
+// x[i] = 0
+kernel void vec_zero(device float *x [[buffer(0)]],
+                     constant VecParams &p [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    x[gid] = 0.0f;
+}
+
+// y[i] = relu(x[i])^2 (x and y may be the same buffer)
+kernel void relu2(device const float *x [[buffer(0)]],
+                  device float *y [[buffer(1)]],
+                  constant VecParams &p [[buffer(2)]],
+                  uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    const float v = max(x[gid], 0.0f);
+    y[gid] = v * v;
+}
+
+struct M2ConvParams {
+    int convDim;
+    int kernelWidth; // <= MAMBA_MAX_CONV
+    int ntok;
+    int projStride;  // floats per token row of the in_proj output
+    int projOff;     // where the conv channels [x | B | C] start in a row
+};
+
+// Mamba-2's depthwise causal conv + SiLU over the channels [x | B | C] of the in_proj output (the z part before and the dt
+// part after them are left alone), one thread per channel running the tokens in order; the state (the last width-1 inputs of
+// the channel, oldest first) is advanced past the chunk. The sum is taken in the CPU's order: bias, the taps over the state,
+// the tap of the new input.
+kernel void m2_conv(device const float *proj [[buffer(0)]],
+                    device const float *w [[buffer(1)]],
+                    device const float *bias [[buffer(2)]],
+                    device float *state [[buffer(3)]],
+                    device float *out [[buffer(4)]],
+                    constant M2ConvParams &p [[buffer(5)]],
+                    uint gid [[thread_position_in_grid]]) {
+    const int ch = int(gid);
+    if (ch >= p.convDim) return;
+    const int dc = p.kernelWidth;
+    device float *st = state + (ulong)ch * (dc - 1);
+    device const float *wc = w + (ulong)ch * dc;
+    float win[MAMBA_MAX_CONV - 1];
+    float wr[MAMBA_MAX_CONV];
+    for (int k = 0; k < dc - 1; k++) win[k] = st[k];
+    for (int k = 0; k < dc; k++) wr[k] = wc[k];
+    const float b = bias[ch];
+    for (int t = 0; t < p.ntok; t++) {
+        const float u = proj[(ulong)t * p.projStride + p.projOff + ch];
+        float sum = b;
+        for (int k = 0; k < dc - 1; k++) sum += wr[k] * win[k];
+        sum += wr[dc - 1] * u;
+        for (int k = 0; k + 1 < dc - 1; k++) win[k] = win[k + 1];
+        if (dc > 1) win[dc - 2] = u;
+        out[(ulong)t * p.convDim + ch] = sum / (1.0f + precise::exp(-sum));
+    }
+    for (int k = 0; k < dc - 1; k++) st[k] = win[k];
+}
+
+struct M2ScanParams {
+    int heads;
+    int headDim;
+    int groups;
+    int state;       // SSM states per (head, p)
+    int ntok;
+    int projStride;
+    int dtOff;       // where the heads' dt values start in an in_proj row
+    int convDim;
+    int dInner;
+    float dtMin;
+    float dtMax;
+};
+
+// log(1 + exp(x)), linear above 20 like torch's softplus; the small-argument series keeps the digits log(1 + e) would lose.
+static inline float softplus_f(float x) {
+    if (x > 20.0f) return x;
+    const float e = precise::exp(x);
+    return e < 1e-3f ? e * (1.0f - e * (0.5f - e * 0.33333334f)) : precise::log(1.0f + e);
+}
+
+// Mamba-2's recurrence (SSD in its token loop), one thread per (head, p) channel running the tokens in order with its row of
+// `state` values in device memory:
+//   dt = clamp(softplus(dt_raw + dt_bias[h]), dtMin, dtMax);  dA = exp(dt A[h])
+//   S[n] = dA S[n] + dt x B[g][n];   y = sum_n S[n] C[g][n] + D[h] x
+// x, B, C come from the conv output row [x (dInner) | B (groups * state) | C (groups * state)], g = h / (heads / groups).
+kernel void m2_scan(device const float *conv [[buffer(0)]],
+                    device const float *proj [[buffer(1)]],
+                    device const float *dtBias [[buffer(2)]],
+                    device const float *A [[buffer(3)]],
+                    device const float *D [[buffer(4)]],
+                    device float *state [[buffer(5)]],
+                    device float *y [[buffer(6)]],
+                    constant M2ScanParams &p [[buffer(7)]],
+                    uint gid [[thread_position_in_grid]]) {
+    const int hp = int(gid);
+    if (hp >= p.heads * p.headDim) return;
+    const int h = hp / p.headDim;
+    const int g = h / (p.heads / p.groups);
+    const int N = p.state;
+    device float *s = state + (ulong)hp * N;
+    const float a = A[h];
+    const float db = dtBias[h];
+    const float dd = D[h];
+    for (int t = 0; t < p.ntok; t++) {
+        float dt = softplus_f(proj[(ulong)t * p.projStride + p.dtOff + h] + db);
+        dt = min(max(dt, p.dtMin), p.dtMax);
+        const float dA = precise::exp(dt * a);
+        device const float *row = conv + (ulong)t * p.convDim;
+        const float xv = row[hp];
+        const float dtx = dt * xv;
+        device const float *B = row + p.dInner + g * N;
+        device const float *C = row + p.dInner + p.groups * N + g * N;
+        float acc = 0.0f;
+        for (int n = 0; n < N; n++) {
+            const float sv = s[n] * dA + dtx * B[n];
+            s[n] = sv;
+            acc += sv * C[n];
+        }
+        y[(ulong)t * p.dInner + hp] = acc + dd * xv;
+    }
+}
+
+struct M2NormParams {
+    int dInner;
+    int groupSize;   // channels one normalization covers (dInner / normGroups)
+    int ntok;
+    int projStride;
+    float eps;
+};
+
+// Mamba-2's gated RMSNorm in place: y' = w * rmsnorm(y * silu(z)) over each group of `groupSize` channels, z = the first
+// dInner values of the token's in_proj row. Grid: (groups, ntok), one threadgroup per (token, group).
+kernel void m2_gnorm(device float *y [[buffer(0)]],
+                     device const float *proj [[buffer(1)]],
+                     device const float *w [[buffer(2)]],
+                     constant M2NormParams &p [[buffer(3)]],
+                     uint2 tgp [[threadgroup_position_in_grid]],
+                     ushort2 tid2 [[thread_position_in_threadgroup]],
+                     ushort2 tpg2 [[threads_per_threadgroup]],
+                     ushort sg [[simdgroup_index_in_threadgroup]],
+                     ushort lane [[thread_index_in_simdgroup]],
+                     ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int g = int(tgp.x);
+    const int t = int(tgp.y);
+    device float *yr = y + (ulong)t * p.dInner + g * p.groupSize;
+    device const float *zr = proj + (ulong)t * p.projStride + g * p.groupSize;
+    float ss = 0.0f;
+    for (int j = tid; j < p.groupSize; j += tpg) {
+        const float z = zr[j];
+        const float v = yr[j] * (z / (1.0f + precise::exp(-z)));
+        yr[j] = v;
+        ss += v * v;
+    }
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float inv = 1.0f / sqrt(ss / float(p.groupSize) + p.eps);
+    device const float *wg = w + g * p.groupSize;
+    for (int j = tid; j < p.groupSize; j += tpg) yr[j] = wg[j] * (yr[j] * inv);
+}
+
+struct Rms3Params {
+    int rank;
+    int state;
+    int stride;      // floats per token row of x_proj's output: rank + 2 * state
+    int ntok;
+    float eps;
+};
+
+// Jamba's RMS norms of the three outputs of x_proj, in place: [dt (rank) | B (state) | C (state)] of every token row, with
+// the gains w = [dt_norm (rank) | b_norm (state) | c_norm (state)]. Grid: (3, ntok).
+kernel void rms3(device float *x [[buffer(0)]],
+                 device const float *w [[buffer(1)]],
+                 constant Rms3Params &p [[buffer(2)]],
+                 uint2 tgp [[threadgroup_position_in_grid]],
+                 ushort2 tid2 [[thread_position_in_threadgroup]],
+                 ushort2 tpg2 [[threads_per_threadgroup]],
+                 ushort sg [[simdgroup_index_in_threadgroup]],
+                 ushort lane [[thread_index_in_simdgroup]],
+                 ushort nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float buf[32];
+    const ushort tid = tid2.x;
+    const ushort tpg = tpg2.x;
+    const int part = int(tgp.x);
+    const int off = part == 0 ? 0 : part == 1 ? p.rank : p.rank + p.state;
+    const int width = part == 0 ? p.rank : p.state;
+    device float *xr = x + (ulong)tgp.y * p.stride + off;
+    device const float *wr = w + off;
+    float ss = 0.0f;
+    for (int j = tid; j < width; j += tpg) ss += xr[j] * xr[j];
+    ss = tg_sum(ss, buf, sg, lane, nsg);
+    const float inv = 1.0f / sqrt(ss / float(width) + p.eps);
+    for (int j = tid; j < width; j += tpg) xr[j] = xr[j] * inv * wr[j];
+}

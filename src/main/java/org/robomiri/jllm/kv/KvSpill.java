@@ -31,6 +31,16 @@ public interface KvSpill {
     /** Deletes the block, if stored. */
     void remove(long pathHash);
 
+    /**
+     * A hint that the block will be read soon (a prompt that will adopt it is being prepared): a store with several
+     * tiers may start moving it to its fastest one in the background. Never blocks, never fails; the default does nothing.
+     *
+     * @param tokens       the block's tokens (the lower tiers compare them)
+     * @param payloadBytes {@link KvStorage#spillBytes()}
+     */
+    default void prefetch(long pathHash, int[] tokens, int payloadBytes) {
+    }
+
     /** Number of stored blocks. */
     int files();
 

@@ -265,7 +265,7 @@ and the scalar `exp` / `silu` loops are still visible here (fast math, now the d
 | KV cache at `--ctx 4096` | 940 MB | 805 MB |
 | KV cache with `backend.kv-dtype=f16` (2 B per element) | 117 MB per 1 024 tokens; **470 MB** at `--ctx 4096` | 101 MB per 1 024 tokens; **403 MB** at `--ctx 4096` |
 | KV cache with `backend.kv-dtype=q8` (1 B per element + 4 B per `headDim` row) | 61 MB per 1 024 tokens; **242 MB** at `--ctx 4096` | 52 MB per 1 024 tokens; **208 MB** at `--ctx 4096` |
-| KV cache with `backend.kv-dtype=q4` (0.5625 B per element: nibbles + a half scale per 32 values; plus a ring of `backend.kv-q4-recent + batch` half rows per layer) | 33 MB per 1 024 tokens; **132 MB** at `--ctx 4096` (+ 22 MB ring at R = 128) | 28 MB per 1 024 tokens; **113 MB** at `--ctx 4096` (+ 19 MB ring) |
+| KV cache with `backend.kv-dtype=q4` (0.5625 B per element: nibbles + a half scale per 32 values; plus a ring of `backend.kv-q4-recent + backend.batch` half rows per layer) | 33 MB per 1 024 tokens; **132 MB** at `--ctx 4096` (+ 44 MB ring at R = 128 with `backend.batch=auto` = 256 on Metal; 22 MB with 64-token chunks) | 28 MB per 1 024 tokens; **113 MB** at `--ctx 4096` (+ 38 MB ring) |
 | KV cache, DeepSeek-V2-Lite (MLA latent cache, [14 §14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)) | 27 layers × 1024 × (512 + 64) × 4 B = 64 MB per 1 024 tokens; **255 MB** at `--ctx 4096`, 127 MB at f16 (the expanded per-head cache of the first version was 553 KB per token, 2.2 GB at `--ctx 4096`); plus 216 MB of dequantized `kv_b_proj` halves | — |
 | KV cache + fixed state, Qwen3-Next-80B-A3B (12 attention + 36 Gated DeltaNet layers, [14 §14.14](14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)) | — | 12 × 1024 × 512 × 8 B = **50 MB per 1 024 tokens** (a quarter of the 30B's 201 MB with the same attention shape), 201 MB at `--ctx 4096` (100 MB at f16), plus **79 MB** of DeltaNet state (36 × (2 MB recurrent + 96 KB conv)) whatever the context |
 | attention score scratch (Metal) `min(32, batch) × heads × ctx × 4 B` | 32 × 16 × 4096 × 4 = 8.4 MB | 32 × 32 × 2048 × 4 = 8.4 MB |
@@ -595,19 +595,26 @@ long conversation, or many conversations at once, needs. The price is paid in tw
 away from the f16 ones more than they do with q8 (the accuracy tables are in [07 §7.13](07-cpu-backend.md#q4-rotated-keys-4-bit-groups-and-a-recent-window-kvcacheq4-kvq4)),
 and the GPU has a little more to do for each page it reads, because the newest pages are kept twice, sharp and small.
 
-📐 **Memory** (Qwen3-0.6B, 28 layers, `kvDim` 1 024; the ring of the recent window is extra and fixed):
+📐 **Memory** (Qwen3-0.6B, 28 layers, `kvDim` 1 024; the ring of the recent window is extra and independent of the context):
 
-| cache | per token | at `--ctx 4096` | at `--ctx 32768` | ring of the window (R = 128 / 512, batch 64) |
+| cache | per token | at `--ctx 4096` | at `--ctx 32768` | ring of the window (R = 128 / 512; `backend.batch=auto` = 256 on Metal) |
 |---|---|---|---|---|
 | f32 | 229 KB | 940 MB | 7.5 GB | – |
 | f16 | 115 KB | 470 MB | 3.76 GB | – |
 | q8 | 59 KB | 242 MB | 1.94 GB | – |
-| q4 | **31.5 KB** | **132 MB** | **1.06 GB** | 22 MB / 66 MB |
+| q4 | **31.5 KB** | **132 MB** | **1.06 GB** | 44 MB / 88 MB |
+
+The ring holds `R + backend.batch` positions per layer: the prefill chunk is added so that one chunk never evicts a
+row that a query of the same chunk reads. It therefore grows with `backend.batch`, not just with the window — 44 MB at
+R = 128 and 88 MB at R = 512 for Qwen3-0.6B with `backend.batch=auto` = 256 on Metal, against 22 MB / 66 MB with the
+old 64-token chunks.
 
 **Speed** (M1 Pro, Qwen3-0.6B Q4_0, `./jllm bench --temp 0 --bench.rounds 3 --engine.speculative off`, median of 3
 rounds, under the heavy lock of the validation run; the speculation is off because with it on a different greedy text
 changes how often the n-gram drafter hits, which once faked a 2× "q8 speedup"). Window 128 unless stated. The prompt is
-the 413-token bench prompt, or ~2 000 tokens (`--bench.prompt-repeat 200`); decode is 128 tokens after it.
+the 413-token bench prompt, or ~2 000 tokens (`--bench.prompt-repeat 200`); decode is 128 tokens after it. The table
+predates the `backend.batch=auto` default: its prefill figures are for 64-token chunks, not the 256-token chunks Metal
+uses now.
 
 | configuration | prompt tokens | prefill tok/s | decode tok/s |
 |---|---|---|---|

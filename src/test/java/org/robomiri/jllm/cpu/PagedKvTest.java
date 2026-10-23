@@ -105,21 +105,12 @@ public final class PagedKvTest {
 
     static void scenario(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap,
                          boolean rot) throws Exception {
-        // A kernel's first calls (interpreted, or compiled at a lower tier) can round differently from its later ones: the
-        // flat cache then differs from itself on a repeat of the same call. A real paging error fails every attempt;
-        // such a cold-start difference passes the next one.
-        for (int attempt = 0; ; attempt++) {
-            int f0 = failures;
-            int c0 = checks;
-            pending.clear();
-            scenario0(pool, dt, hd, kvHeads, group, block, window, cap, rot);
-            if (failures == f0 || attempt == 3) {
-                pending.forEach(System.out::println);
-                return;
-            }
-            failures = f0;
-            checks = c0;
-        }
+        // One run, from a cold JVM if need be: the lane sums of the kernels (dot, softmaxExp, the quantized dots) add in one
+        // fixed order in every JIT tier (VectorKernels.laneSum, JitStableKernelsTest), so a repeat of the same call gives the
+        // same bits whether the interpreter, C1 or C2 runs it.
+        pending.clear();
+        scenario0(pool, dt, hd, kvHeads, group, block, window, cap, rot);
+        pending.forEach(System.out::println);
     }
 
     private static void scenario0(ThreadPool pool, KvDtype dt, int hd, int kvHeads, int group, int block, int window, float cap,
@@ -161,6 +152,7 @@ public final class PagedKvTest {
                 paged.attention(pool, l, n, pos, q, ap2, window, a.scale(), cap);
                 if (!Arrays.equals(af, af2) || !Arrays.equals(ap, ap2)) {
                     note("  repeat differs: flat " + Arrays.equals(af, af2) + " paged " + Arrays.equals(ap, ap2));
+                    same = false;
                 }
                 if (!Arrays.equals(af, ap)) {
                     int bad = Arrays.mismatch(af, ap);

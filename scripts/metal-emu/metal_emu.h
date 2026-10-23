@@ -177,6 +177,14 @@ static inline T atomic_fetch_add_explicit(P p, T v, memory_order) {
     *p = old + v;
     return old;
 }
+template <typename P>
+static inline auto atomic_load_explicit(P p, memory_order) {
+    return *p;
+}
+template <typename P, typename T>
+static inline void atomic_store_explicit(P p, T v, memory_order) {
+    *p = v;
+}
 static inline void simdgroup_barrier(mem_flags) { // every live lane of the simdgroup arrives
     char none = 0, all[32];
     emu_simd_exchange(&none, all, 1);

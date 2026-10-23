@@ -336,6 +336,7 @@ public class ModelManager implements DisposableBean {
             if (kvStore != null) {
                 kvStore.attachSpill(m); // a paged model's evicted blocks go to the block store
             }
+            m.enablePagedHousekeeping(props.kvIdleReleaseSeconds()); // idle slots give their blocks back (paged models)
             synchronized (this) {
                 loaded.put(t.id(), m);
             }

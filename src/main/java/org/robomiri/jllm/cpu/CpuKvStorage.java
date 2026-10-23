@@ -23,6 +23,13 @@ import java.nio.ByteOrder;
  *      then K scales float [kvHead][B]     V scales float [B][kvHead]
  * </pre>
  *
+ * With sparse decode attention ({@code backend.kv-sparse}, docs/27) every layer of a block ends with a third region, the
+ * block's <em>key summary</em>: per kv head the minimum then the maximum of each key channel over the block's rows, as
+ * halves rounded outwards ({@link org.robomiri.jllm.kv.KvSummary}), packed two channels to an {@code int} like the f16
+ * keys: {@code int [kvHead][2][pairs]} (all minima, then all maxima). It is computed from the values <em>as stored</em>
+ * (dequantized, and for rotated q8 in the rotated basis the queries are scored in), so the bound is on the scores the
+ * attention would compute. A block copy copies it with the rows.
+ *
  * The keys keep the transposed layout of {@link KvCache} (a vector load holds one head element of consecutive keys),
  * with the block's {@code B} keys as the "chunk": the gather in {@link PagedKv} puts {@code CHUNK / B} blocks' worth side
  * by side into the tile kernels' scratch, so every score and output is computed by the same operations as with the flat
@@ -45,6 +52,10 @@ final class CpuKvStorage implements KvStorage {
     /** Where the scales start inside the K / V region (q8). */
     final long kScaleOff;
     final long vScaleOff;
+    /** Sparse decode attention: every layer of a block carries its key summary after the V region. */
+    final boolean summaries;
+    /** Bytes of one layer's key summary (0 without {@link #summaries}). */
+    final long sumBytes;
     final long layerBytes;
     final long blockBytes;
     private final int slabShift;
@@ -65,6 +76,10 @@ final class CpuKvStorage implements KvStorage {
     }
 
     CpuKvStorage(KvDtype dtype, int layers, Attention.Gqa a, int blockTokens, boolean rotateQ8) {
+        this(dtype, layers, a, blockTokens, rotateQ8, false);
+    }
+
+    CpuKvStorage(KvDtype dtype, int layers, Attention.Gqa a, int blockTokens, boolean rotateQ8, boolean summaries) {
         if (dtype == KvDtype.Q4) {
             throw new IllegalArgumentException("the paged CPU cache has no q4 blocks yet");
         }
@@ -99,7 +114,11 @@ final class CpuKvStorage implements KvStorage {
                 vBytes = vScaleOff + round64((long) B * kvHeads * 4);
             }
         }
-        layerBytes = kBytes + vBytes;
+        this.summaries = summaries;
+        final int bt = blockTokens;
+        sumScratch = ThreadLocal.withInitial(() -> new float[bt]);
+        sumBytes = summaries ? round64((long) kvHeads * 2 * pairs * 4) : 0;
+        layerBytes = kBytes + vBytes + sumBytes;
         blockBytes = layerBytes * layers;
         long perSlab = Math.max(1, Math.min(1024, (16L << 20) / blockBytes));
         int shift = 63 - Long.numberOfLeadingZeros(perSlab);
@@ -123,6 +142,11 @@ final class CpuKvStorage implements KvStorage {
     }
 
     @Override
+    public org.robomiri.jllm.kv.KvBlockCodec codec(org.robomiri.jllm.kv.KvBlockCodec.Format f) {
+        return new org.robomiri.jllm.kv.KvBlockCodec(f, dtype, layers, B, kvHeads, headDim);
+    }
+
+    @Override
     public long residentBytes() {
         return blockBytes;
     }
@@ -140,9 +164,58 @@ final class CpuKvStorage implements KvStorage {
             }
             MemorySegment[] next = java.util.Arrays.copyOf(cur, need);
             for (int i = cur.length; i < need; i++) {
-                next[i] = arena.allocate(slabBytes, 64);
+                if (i >= hotSlabs && coldDir != null) {
+                    next[i] = mapSlab();
+                } else {
+                    next[i] = arena.allocate(slabBytes, 64);
+                    hotCount++;
+                }
             }
             slabs = next;
+        }
+    }
+
+    // ------------------------------------------------------------------ the SSD tier (docs/26 §26.2.3)
+
+    private int hotSlabs = Integer.MAX_VALUE;
+    private java.nio.file.Path coldDir;
+    private int hotCount;
+    private int coldCount;
+
+    /**
+     * Keeps at most {@code hotBytes} of slabs in the process's own memory: the slabs past that many are memory-mapped
+     * files in {@code dir} (unlinked at once: they live as long as the mapping), so the operating system pages them between RAM and the
+     * SSD. The blocks in them are read and written exactly like the others (same code, same bytes), so results do not
+     * change. Call before the first block is handed out.
+     */
+    void setHotBudget(long hotBytes, java.nio.file.Path dir) {
+        if (slabs.length > 0) {
+            throw new IllegalStateException("the hot budget must be set before the pool grows");
+        }
+        this.hotSlabs = (int) Math.max(0, Math.min(Integer.MAX_VALUE, hotBytes / Math.max(1, slabBytes)));
+        this.coldDir = dir;
+    }
+
+    /** Slabs in the process's memory and slabs that are mapped files (the SSD tier), for the console. */
+    synchronized int[] slabCounts() {
+        return new int[]{hotCount, coldCount};
+    }
+
+    private MemorySegment mapSlab() {
+        try {
+            java.nio.file.Files.createDirectories(coldDir);
+            java.nio.file.Path f = java.nio.file.Files.createTempFile(coldDir, "kvslab", ".bin");
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(f, java.nio.file.StandardOpenOption.READ,
+                    java.nio.file.StandardOpenOption.WRITE)) {
+                MemorySegment m = ch.map(java.nio.channels.FileChannel.MapMode.READ_WRITE, 0, slabBytes, arena);
+                java.nio.file.Files.deleteIfExists(f); // unlinked while mapped: the space goes back with the mapping, even after a crash
+                coldCount++;
+                return m;
+            }
+        } catch (java.io.IOException e) {
+            System.err.println("warning: no memory-mapped KV slab in " + coldDir + " (" + e.getMessage() + "), using memory");
+            hotCount++;
+            return arena.allocate(slabBytes, 64);
         }
     }
 
@@ -156,10 +229,127 @@ final class CpuKvStorage implements KvStorage {
         return (long) (block & slabMask) * blockBytes + (long) layer * layerBytes;
     }
 
+    /** Offset of {@code layer}'s key summary of {@code block} inside {@link #slab}. */
+    long sumBase(int block, int layer) {
+        return base(block, layer) + kBytes + vBytes;
+    }
+
     @Override
     public void copy(int src, int dst, int rows) {
         MemorySegment.copy(slab(src), (long) (src & slabMask) * blockBytes, slab(dst), (long) (dst & slabMask) * blockBytes,
                 blockBytes);
+        if (summaries && rows < B) { // the copy carries the source's summary, which also covers the rows past `rows`
+            for (int l = 0; l < layers; l++) {
+                updateSummary(l, dst, rows);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ key summaries (sparse decode attention)
+
+    private final ThreadLocal<float[]> sumScratch;
+
+    /**
+     * Recomputes the key summary of {@code layer} of {@code block} from its first {@code rows} rows: per kv head and channel
+     * the minimum and the maximum of the stored (dequantized) values, rounded outwards to halves. Exact whatever was in
+     * the block before (a rewind, a copy-on-write copy), so the bound is as tight as the rows that are valid.
+     */
+    void updateSummary(int layer, int block, int rows) {
+        if (!summaries || rows <= 0) {
+            return;
+        }
+        MemorySegment seg = slab(block);
+        long kb = base(block, layer);
+        long sb = sumBase(block, layer);
+        float[] sc = dtype == KvDtype.Q8 ? sumScratch.get() : null;
+        for (int g = 0; g < kvHeads; g++) {
+            if (sc != null) {
+                for (int t = 0; t < rows; t++) {
+                    sc[t] = seg.get(ValueLayout.JAVA_FLOAT, kb + kScaleOff + ((long) g * B + t) * 4);
+                }
+            }
+            for (int p = 0; p < pairs; p++) {
+                int loWord = 0;
+                int hiWord = 0;
+                for (int h = 0; h < 2; h++) {
+                    int i = 2 * p + h;
+                    float lo = 0f;
+                    float hi = 0f;
+                    if (i < headDim) {
+                        lo = Float.POSITIVE_INFINITY;
+                        hi = Float.NEGATIVE_INFINITY;
+                        switch (dtype) {
+                            case F32 -> {
+                                long at = kb + ((long) g * headDim + i) * B * 4;
+                                for (int t = 0; t < rows; t++) {
+                                    float x = seg.get(ValueLayout.JAVA_FLOAT, at + t * 4L);
+                                    lo = Math.min(lo, x);
+                                    hi = Math.max(hi, x);
+                                }
+                            }
+                            case F16 -> {
+                                long at = kb + ((long) g * pairs + p) * B * 4;
+                                for (int t = 0; t < rows; t++) {
+                                    float x = Float.float16ToFloat(half(seg.get(ValueLayout.JAVA_INT, at + t * 4L), h != 0));
+                                    lo = Math.min(lo, x);
+                                    hi = Math.max(hi, x);
+                                }
+                            }
+                            default -> {
+                                long at = kb + ((long) g * headDim + i) * B;
+                                for (int t = 0; t < rows; t++) {
+                                    float x = seg.get(ValueLayout.JAVA_BYTE, at + t) * sc[t];
+                                    lo = Math.min(lo, x);
+                                    hi = Math.max(hi, x);
+                                }
+                            }
+                        }
+                    }
+                    loWord |= (org.robomiri.jllm.kv.KvSummary.down(lo) & 0xFFFF) << (16 * h);
+                    hiWord |= (org.robomiri.jllm.kv.KvSummary.up(hi) & 0xFFFF) << (16 * h);
+                }
+                seg.set(ValueLayout.JAVA_INT, sb + (((long) g * 2) * pairs + p) * 4, loWord);
+                seg.set(ValueLayout.JAVA_INT, sb + (((long) g * 2 + 1) * pairs + p) * 4, hiWord);
+            }
+        }
+    }
+
+    /** The summary of {@code layer} of {@code block} grown by row {@code t} (a fresh summary for {@code t == 0}); used while rows are read in one by one. */
+    void mergeSummaryRow(int layer, int block, int t) {
+        if (!summaries) {
+            return;
+        }
+        if (t == 0) {
+            updateSummary(layer, block, 1);
+            return;
+        }
+        MemorySegment seg = slab(block);
+        long sb = sumBase(block, layer);
+        for (int g = 0; g < kvHeads; g++) {
+            for (int p = 0; p < pairs; p++) {
+                long lat = sb + (((long) g * 2) * pairs + p) * 4;
+                long hat = sb + (((long) g * 2 + 1) * pairs + p) * 4;
+                int loWord = seg.get(ValueLayout.JAVA_INT, lat);
+                int hiWord = seg.get(ValueLayout.JAVA_INT, hat);
+                for (int h = 0; h < 2; h++) {
+                    int i = 2 * p + h;
+                    if (i >= headDim) {
+                        continue;
+                    }
+                    float x = keyValue(layer, block, g, i, t);
+                    float lo = Float.float16ToFloat(half(loWord, h != 0));
+                    float hi = Float.float16ToFloat(half(hiWord, h != 0));
+                    if (x < lo) {
+                        loWord = withHalf(loWord, h != 0, org.robomiri.jllm.kv.KvSummary.down(x));
+                    }
+                    if (x > hi) {
+                        hiWord = withHalf(hiWord, h != 0, org.robomiri.jllm.kv.KvSummary.up(x));
+                    }
+                }
+                seg.set(ValueLayout.JAVA_INT, lat, loWord);
+                seg.set(ValueLayout.JAVA_INT, hat, hiWord);
+            }
+        }
     }
 
     // ------------------------------------------------------------------ element access (scalar: stores, spills, saved caches)
@@ -370,6 +560,7 @@ final class CpuKvStorage implements KvStorage {
                 getRow(layer, block, t, false, b);
                 getRow(layer, block, t, true, b);
             }
+            updateSummary(layer, block, B);
         }
     }
 

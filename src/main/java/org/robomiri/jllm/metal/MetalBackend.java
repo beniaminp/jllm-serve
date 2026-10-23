@@ -10,8 +10,10 @@ import org.robomiri.jllm.model.Decoder;
 import org.robomiri.jllm.model.DecoderLayer;
 import org.robomiri.jllm.kv.KvPool;
 import org.robomiri.jllm.kv.KvSequence;
+import org.robomiri.jllm.kv.KvTierConfig;
 import org.robomiri.jllm.model.KvDtype;
 import org.robomiri.jllm.model.KvQ4;
+import org.robomiri.jllm.model.KvSparse;
 import org.robomiri.jllm.model.LayerSpec;
 import org.robomiri.jllm.model.Mlp;
 import org.robomiri.jllm.model.MlpWeights;
@@ -68,8 +70,26 @@ public final class MetalBackend implements Backend {
      * ({@code pageTbl}, a device copy of {@link KvSequence#table()} kept by the sequence's sink, and {@code pageShift}).
      */
     private final KvSequence seq;
+    /**
+     * A slot whose context does not fit the hot tier keeps its KV in host memory and streams one layer at a time through two
+     * windows (docs/26 §26.2.2): true when {@link #streamed} is set up. The flat attention kernels run over the windows.
+     */
+    private final boolean streaming;
+    private final KvTierConfig tier;
+    private StreamedKv streamed;
     private Metal.Buffer pageTbl;
     private int pageShift;
+    /**
+     * Sparse decode attention (docs/27, backend.kv-sparse) on the paged cache: the pool's per-layer key summaries, the
+     * scratch of the block scores and of the selection, and the configuration; {@code sparseOn} once the model and the
+     * cache type allow it. A decode row with more blocks than the budget runs {@code sparse_score}, {@code sparse_select}
+     * and {@code attention_dec_sp} (see {@link #decodeRow}); every other row is dense, exactly as with the switch off.
+     */
+    private boolean sparseOn;
+    private KvSparse sparse = KvSparse.OFF;
+    private Metal.Buffer[] sparseSums;
+    private Metal.Buffer sparseScores;
+    private Metal.Buffer sparseSel;
     private boolean fusedNormFits;     // see MetalKernels.fusedNormFits
     private boolean replay;            // decode replay (MetalKernels.step) on: see stepKey
     private int[] windows;             // the distinct attention windows of the GQA layers (0 = none), for stepKey
@@ -269,13 +289,23 @@ public final class MetalBackend implements Backend {
 
     /** {@code split}: which MoE layers run their routed experts on the CPU (see {@link MoeSplit}). */
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, null);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, null, null);
     }
 
     /** With a paged KV cache over {@code kvPool} (from {@link #newKvPool}); null = the flat cache. */
     public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split,
                         KvPool kvPool) {
-        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool);
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool, null);
+    }
+
+    /**
+     * With tiered KV storage: a {@code tier} whose {@link KvTierConfig#stream()} is {@code FORCE} (and no pool) makes this slot
+     * keep its KV cache in host memory and stream it layer by layer through two GPU windows, for a context larger than the
+     * GPU's share of memory; results are bit-identical to the flat cache (docs/26).
+     */
+    public MetalBackend(ModelWeights w, int ctx, int maxBatch, String metalLib, KvDtype kvDtype, MoeSplit split,
+                        KvPool kvPool, KvTierConfig tier) {
+        this(w, ctx, maxBatch, open(w.decoder(), metalLib), kvDtype, split, kvPool, tier);
     }
 
     /**
@@ -286,6 +316,16 @@ public final class MetalBackend implements Backend {
      */
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
                                    String metalLib) {
+        return newKvPool(w, ctx, slots, kvDtype, blockTokens, poolTokens, metalLib, null);
+    }
+
+    /**
+     * {@link #newKvPool(ModelWeights, int, int, KvDtype, int, long, String)} with tiered storage: {@code tier.hotBytes()}
+     * (when positive) caps the blocks the pool commits on the GPU; the blocks pushed out go down to the pool's spill
+     * store. The pool is counted in the {@link DeviceLedger} either way.
+     */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   String metalLib, KvTierConfig tier) {
         Decoder arch = w.decoder();
         if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4 || blockTokens < 16
                 || Integer.bitCount(blockTokens) != 1) {
@@ -296,12 +336,97 @@ public final class MetalBackend implements Backend {
         if (blocks > Integer.MAX_VALUE - 16) {
             throw new IllegalArgumentException("backend.kv-pool-tokens " + poolTokens + " needs more than 2^31 blocks");
         }
-        MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks);
+        MetalKvStorage st = new MetalKvStorage(metalLib, kvDtype, arch.core().layers(), g, blockTokens, (int) blocks,
+                KvSparse.get().enabled());
         String format = "paged " + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && KvQ4.supports(g.headDim()) ? " rot" : "")
                 + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim="
                 + g.headDim() + " block=" + blockTokens;
-        return new KvPool(st, (int) blocks, format);
+        KvPool pool = new KvPool(st, (int) blocks, format);
+        if (tier != null && tier.hotBytes() > 0) {
+            pool.setHotCap((int) Math.max(1, Math.min(blocks, tier.hotBytes() / st.residentBytes())));
+            pool.setPrefetch(tier.prefetch());
+        }
+        st.register(w, pool);
+        return pool;
     }
+
+    /** KV bytes of one position (every layer, keys and values) for {@code w} with cache type {@code kvDtype}; 0 without grouped-query attention. */
+    public static long kvBytesPerPosition(ModelWeights w, KvDtype kvDtype) {
+        if (!(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+            return 0;
+        }
+        return (long) w.decoder().core().layers() * 2 * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+    }
+
+    /**
+     * Whether the slots of {@code w} should keep their KV in host memory and stream it ({@link KvTierConfig#stream()}): forced,
+     * or in {@code auto} when one slot's whole context ({@code ctx} positions) is more than the hot budget
+     * ({@code tier.hotBytes()}, when set) can hold.
+     */
+    public static boolean streamsKv(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, KvTierConfig tier) {
+        long perPos = kvBytesPerPosition(w, kvDtype);
+        if (tier == null || perPos == 0 || tier.stream() == KvTierConfig.Stream.OFF) {
+            return false;
+        }
+        if (tier.stream() == KvTierConfig.Stream.FORCE) {
+            return true;
+        }
+        long slotNeed = ((ctx + blockTokens - 1L) / blockTokens + 2) * blockTokens * perPos;
+        return tier.hotBytes() > 0 && tier.hotBytes() < slotNeed;
+    }
+
+    /**
+     * With the memory planner on and no explicit hot budget: whether the planner, at {@code slots * ctx} positions of KV, finds
+     * streaming cheaper than keeping the cache resident and moving experts (or finds resident impossible). Figures the model's
+     * share of the working set before any backend exists.
+     */
+    public static boolean planStreams(ModelWeights w, int ctx, int slots, int maxBatch, KvDtype kvDtype, String metalLib,
+                                      KvTierConfig tier) {
+        Decoder arch = w.decoder();
+        long perPos = kvBytesPerPosition(w, kvDtype);
+        if (perPos == 0 || tier.stream() == KvTierConfig.Stream.OFF) {
+            return false;
+        }
+        int layers = arch.core().layers();
+        long[] eb = new long[layers];
+        int[] ex = new int[layers];
+        int[] top = new int[layers];
+        long expertTotal = 0;
+        for (int l = 0; l < layers; l++) {
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                MlpWeights.Moe mw = w.decoderLayer(l).moe();
+                long bytes = bytes(mw.expGateUp()) + bytes(mw.expDown());
+                eb[l] = bytes / m.experts();
+                ex[l] = m.experts();
+                top[l] = m.topK();
+                expertTotal += bytes;
+            }
+        }
+        Attention.Gqa g = (Attention.Gqa) arch.attention();
+        long ws;
+        try (Metal m = Metal.create(metalLib)) {
+            ws = m.recommendedWorkingSet();
+        }
+        double gb = ExpertPlacement.positiveProperty("jllm.metal.workingSetGb", -1);
+        if (gb > 0) {
+            ws = (long) (gb * 1e9);
+        }
+        long acts = (long) Math.min(MetalConstants.ATT_TILE, maxBatch) * g.heads() * ctx * 4
+                + (long) maxBatch * (3L * arch.core().dim() + 2L * g.qDim() + 2L * arch.maxMlpDim()) * 4
+                + (long) w.lmHead.rows * 4 * (1 + 16L) + (128L << 20);
+        long fixed = w.byteSize() - expertTotal + slots * acts + DeviceLedger.total();
+        long rowBytes = kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+        MemoryPlanner.Inputs in = new MemoryPlanner.Inputs(ws, fixed, eb, ex, top, null, perPos, (long) slots * ctx, true,
+                slots * 4L * ctx * rowBytes, layers, Math.max(1, ctx / 2), MemoryPlanner.STAGE_BYTES_PER_US);
+        MemoryPlanner.Plan p = MemoryPlanner.plan(in);
+        for (String line : MemoryPlanner.describe(in, p)) {
+            System.err.println("Metal memory plan (load): " + line);
+        }
+        return p.mode() == MemoryPlanner.Mode.STREAMED;
+    }
+
+    /** The positions the pool may hold at first under the memory planner; it grows as contexts do. */
+    public static final int PLAN_INITIAL_POSITIONS = 8192;
 
     private static Metal open(Decoder d, String metalLib) {
         int hd = d.attention().headDim();
@@ -332,7 +457,7 @@ public final class MetalBackend implements Backend {
 
     /** Owns {@code metal} from here on: it is closed again if anything below throws. */
     private MetalBackend(ModelWeights w, int ctx, int maxBatch, Metal metal, KvDtype kvDtype, MoeSplit split,
-                         KvPool kvPool) {
+                         KvPool kvPool, KvTierConfig tier) {
         this.w = w;
         this.split = split;
         this.arch = w.decoder();
@@ -344,6 +469,11 @@ public final class MetalBackend implements Backend {
                     + "multiple of " + KvQ4.GROUP + " (not DeepSeek's latent cache), using q8");
             kvDtype = KvDtype.Q8;
         }
+        if (kvDtype == KvDtype.Q4 && specialAttention(arch, ctx)) {
+            System.err.println("note: backend.kv-dtype=q4 is not implemented on the GPU for attention sinks, chunked attention "
+                    + "or attention temperature (gpt-oss, Llama 4), using q8");
+            kvDtype = KvDtype.Q8;
+        }
         this.kvDtype = kvDtype;
         // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
         this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
@@ -351,6 +481,9 @@ public final class MetalBackend implements Backend {
         this.kvHalf = kvDtype == KvDtype.F16;
         this.seq = kvPool != null && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4
                 ? kvPool.newSequence(ctx) : null;
+        this.tier = tier;
+        this.streaming = tier != null && tier.stream() == KvTierConfig.Stream.FORCE && seq == null
+                && arch.attention() instanceof Attention.Gqa && kvDtype != KvDtype.Q4;
         this.k = new MetalKernels(metal, c.normEps());
         try {
             init(kvDtype);
@@ -362,6 +495,16 @@ public final class MetalBackend implements Backend {
             }
             throw e;
         }
+    }
+
+    /** Whether some layer needs the sinks / chunk / temperature extras of the generic attention kernel at this context. */
+    private static boolean specialAttention(Decoder d, int ctx) {
+        for (LayerSpec s : d.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.forContext(ctx).special()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void init(KvDtype kvDtype) {
@@ -407,6 +550,17 @@ public final class MetalBackend implements Backend {
                 pageTbl = k.scratch(4L * Math.max(1, seq.table().length));
                 MemorySegment table = pageTbl.contents();
                 seq.setSink((i, b) -> table.setAtIndex(ValueLayout.JAVA_INT, i, b));
+            } else if (streaming) { // two windows of one layer's rows each, shared by even and odd layers (docs/26)
+                long rowBytes = kvDtype.rowBytes(g.kvDim(), g.kvHeads());
+                long kvBytes = ctx * rowBytes;
+                Metal.Buffer[] wk = {k.scratch(kvBytes), k.scratch(kvBytes)};
+                Metal.Buffer[] wv = {k.scratch(kvBytes), k.scratch(kvBytes)};
+                for (int l = 0; l < c.layers(); l++) {
+                    keyCache[l] = wk[l & 1];
+                    valCache[l] = wv[l & 1];
+                }
+                streamed = new StreamedKv(c.layers(), ctx, rowBytes, wk, wv, tier.hostBytes(),
+                        tier.dir() != null ? tier.dir().resolve("stream") : null);
             } else {
                 long kvBytes = ctx * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
                 for (int l = 0; l < c.layers(); l++) {
@@ -447,6 +601,21 @@ public final class MetalBackend implements Backend {
             System.err.println("Metal kernels: flash prefill " + (flashPrefill ? "on" : "off") + ", flash decode "
                     + (flashDecode ? "on" : "off") + " (" + d.note() + ")");
             decodeAttn = kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(g.headDim()) && MetalTuner.decodeAttention(k, g, kvDtype, attnKernel, attnGroup);
+        }
+        if (KvSparse.get().enabled()) {
+            if (seq != null && a instanceof Attention.Gqa gs && kvDtype != KvDtype.Q4 && MetalKernels.decodeAttentionFits(gs.headDim())
+                    && ((MetalKvStorage) seq.pool().storage()).hasSummaries()) {
+                sparse = KvSparse.get();
+                sparseOn = true;
+                decodeAttn = true; // the sparse kernel is attention_dec's: the dense rows of a sparse run take it too
+                sparseSums = ((MetalKvStorage) seq.pool().storage()).sums;
+                int blockTokens = 1 << pageShift;
+                sparseScores = k.scratch(4L * gs.kvHeads() * ((ctx + blockTokens - 1) / blockTokens));
+                sparseSel = k.scratch(4L * gs.kvHeads() * sparse.budget(blockTokens));
+            } else {
+                System.err.println("note: backend.kv-sparse is not available for this model on Metal (it needs grouped-query attention"
+                        + " with head size 64, 128 or 256, an f32, f16 or q8 paged cache), using dense attention");
+            }
         }
         flashPart = flashDecode || decodeAttn
                 ? k.scratch((long) a.heads() * (decodeAttn ? MetalConstants.FLASH_MAX_SPLITS : MetalKernels.FLASH_SPLITS) * (hd + 2) * 4)
@@ -500,6 +669,7 @@ public final class MetalBackend implements Backend {
                             ? " (backend.metal.cpu-moe=auto leaves experts on the CPU; a placement shared by slots is made "
                             + "when the first slot loads)" : "");
         }
+        logLoadPlan();
     }
 
     // ------------------------------------------------------------------ experts on the CPU
@@ -536,6 +706,11 @@ public final class MetalBackend implements Backend {
             }
         }
         return b;
+    }
+
+    /** Whether the memory planner may move experts of this model between the GPU and the CPU at run time. */
+    private boolean plannerExperts() {
+        return tier != null && tier.plan() && arch.anyMoe() && split.layers() == MoeSplit.AUTO && split.cold() == null;
     }
 
     private static final long STATS_SAVE_NANOS = 10L * 60 * 1_000_000_000L;
@@ -598,7 +773,8 @@ public final class MetalBackend implements Backend {
             }
             cpuLayers += n > 0 ? 1 : 0;
         }
-        if (cpuLayers > 0) {
+        // with the memory planner (docs/26) the CPU side exists from the start, so experts can leave the GPU later as the KV grows
+        if (cpuLayers > 0 || plannerExperts()) {
             synchronized (PLACEMENTS) {
                 if (placement.pool == null) {
                     placement.pool = new ThreadPool(split.threads());
@@ -788,9 +964,9 @@ public final class MetalBackend implements Backend {
         java.util.Arrays.fill(cpuY, 0, n * dim, 0f);
         synchronized (cpuPool) { // shared by the slots of this model; it runs one job at a time
             if (n > 1) {
-                cpuExperts.batched(mw, spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
+                cpuExperts.batched(mw, spec.spec(), spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
             } else {
-                cpuExperts.token(mw, topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
+                cpuExperts.token(mw, spec.spec(), topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
             }
         }
         return true;
@@ -870,9 +1046,18 @@ public final class MetalBackend implements Backend {
         private final Metal.Buffer sin;
         /** GLM rotates interleaved pairs of the first rotaryDim dims, Phi rotate-half pairs of them. */
         private final boolean partial;
+        /** The whole head rotates: the q/k norm of the rope kernel (which covers the whole head) is possible, also with adjacent pairs (Llama 4). */
+        private final boolean fullRotation;
+        /** gpt-oss / Llama 4: the layer needs the generic attention kernel with its extras (sinks, chunk, temperature). */
+        private final boolean special;
+        private final MetalKernels.AttnExtra extra;
 
         GqaStep(Attention.Gqa g, AttnWeights.Gqa w, Metal.Buffer attnNorm) {
             this.g = g;
+            Attention.Gqa eg = g.forContext(ctx);
+            this.special = eg.special();
+            this.extra = special ? new MetalKernels.AttnExtra(k.upload(MetalKernels.AttnExtra.words(eg.chunk(), w.sinks(),
+                    eg.tempFloor(), eg.tempScale()))) : MetalKernels.AttnExtra.NONE;
             this.table = arch.ropeTables().get(g.ropeTable());
             this.attnNorm = attnNorm;
             wq = w.wq();
@@ -889,7 +1074,8 @@ public final class MetalBackend implements Backend {
             cos = ropeCos[g.ropeTable()];
             sin = ropeSin[g.ropeTable()];
             partial = table.pairing() == RopeTable.Pairing.INTERLEAVED || table.rotaryDim() != g.headDim();
-            if (partial && g.qkNorm()) {
+            fullRotation = table.rotaryDim() == g.headDim();
+            if (!fullRotation && (g.qkNorm() || g.l2Norm())) {
                 throw new IllegalArgumentException("partial rotary embedding combined with q/k norm is not implemented");
             }
         }
@@ -919,7 +1105,7 @@ public final class MetalBackend implements Backend {
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
             // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
             // into the staging rows, which kv_store_q8 then quantizes together with v)
-            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             int hd = g.headDim();
@@ -967,14 +1153,16 @@ public final class MetalBackend implements Backend {
                     k.kvStoreQ8(kStage, vStage, keyCache[layer], valCache[layer], cacheOff, hd, g.kvHeads(), pos, n);
                 }
             }
+            if (sparseOn && sparse.layer(layer) && g.window() == 0) { // the summaries of the blocks this chunk wrote
+                k.kvSummary(kvDtype, keyCache[layer], sparseSums[layer], hd, g.kvHeads(), stride, pos, n);
+            }
             float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
-            if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
+            if (decodeAttn && !special && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
                 // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
                 // token, so that every row is exactly what a decode step at its position computes
                 for (int t = 0; t < n; t++) {
                     long qRow = (long) t * g.qDim() * 4;
-                    k.decodeAttention(kvDtype, q, qRow, keyCache[layer], valCache[layer], flashPart, att, qRow, g.heads(),
-                            g.kvHeads(), hd, pos + t, ctx, scale, stride, g.window(), g.softcap());
+                    decodeRow(MetalBackend.this, layer, g, qRow, qRow, pos + t, scale, stride);
                 }
                 return;
             }
@@ -990,10 +1178,16 @@ public final class MetalBackend implements Backend {
                     }
                     k.rowScores((long) (t % sliceRows) * g.heads() * ctx * 4);
                     k.attentionRow(attnKernel, attnGroup, q, qOff, keyCache[layer], valCache[layer], att, qOff, scores, g.heads(),
-                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(),
+                            extra);
                 }
                 k.endIndependent();
                 k.rowScores(0);
+                return;
+            }
+            if (special) {
+                k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
+                        pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n, extra);
                 return;
             }
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
@@ -1030,7 +1224,7 @@ public final class MetalBackend implements Backend {
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, n, dim);
             k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
-            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             // The rows are independent (each has its own q, k, v and att row and its own owner's cache), so each stage is
@@ -1091,12 +1285,13 @@ public final class MetalBackend implements Backend {
                 k.endIndependent();
             }
             float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
-            if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
+            if (decodeAttn && !special) { // attention_dec shares its partial-result buffer between rows: one after the other
                 for (int t = 0; t < n; t++) {
                     k.page(owners[t].pageTbl, owners[t].pageShift);
-                    k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
-                            flashPart, att, (long) t * g.qDim() * 4, g.heads(), g.kvHeads(), hd, positions[t], ctx, scale,
-                            stride, g.window(), g.softcap());
+                    if (sparseOn && sparse.layer(layer) && g.window() == 0) { // the row's block summary, then the row's attention
+                        k.kvSummary(kvDtype, owners[t].keyCache[layer], sparseSums[layer], hd, g.kvHeads(), stride, positions[t], 1);
+                    }
+                    decodeRow(owners[t], layer, g, (long) t * g.qDim() * 4, (long) t * g.qDim() * 4, positions[t], scale, stride);
                 }
                 k.page(pageTbl, pageShift);
                 return;
@@ -1105,7 +1300,7 @@ public final class MetalBackend implements Backend {
             // flash form shares its partial-result buffer between rows and stays one after the other
             boolean anyFlash = false;
             for (int t = 0; t < n; t++) {
-                anyFlash |= flashDecode && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
+                anyFlash |= flashDecode && !special && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
             }
             int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
             for (int t = 0; t < n; t++) {
@@ -1115,7 +1310,7 @@ public final class MetalBackend implements Backend {
                 long qOff = (long) t * g.qDim() * 4;
                 k.page(owners[t].pageTbl, owners[t].pageShift);
                 if (anyFlash) {
-                    if (flashDecode && pos + 1 >= k.flashMinLen) {
+                    if (flashDecode && !special && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                                 hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
@@ -1126,7 +1321,7 @@ public final class MetalBackend implements Backend {
                 }
                 k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
                 k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), extra);
             }
             k.endIndependent();
             k.rowScores(0);
@@ -1343,6 +1538,8 @@ public final class MetalBackend implements Backend {
         private QTensor expDown;
         private Metal.Buffer bExpGateUp; // null when the layer has no expert on the GPU
         private Metal.Buffer bExpDown;
+        /** gpt-oss / Llama 4 arithmetic of the experts and the bias buffers of the experts on the GPU (indexed like expGateUp). */
+        private MetalKernels.MoeMath math = MetalKernels.MoeMath.NONE;
         private final Metal.Buffer ffnNorm;
         private final Route route;
         private final QTensor sharedGateUp;
@@ -1375,6 +1572,23 @@ public final class MetalBackend implements Backend {
                                 counted ? gassign : null, counted ? counts : null, n);
                     }
                 };
+                case Router.TopLogits t -> {
+                    // the DeepSeek router kernel's method 3: top-k of the logits (+ the linear bias); the weights are the
+                    // scores of the selected experts: a softmax over all experts renormalized over the selected ones is a
+                    // softmax over the selected logits (gpt-oss); the sigmoid of each (Llama 4) is not renormalized
+                    Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
+                    yield (n, counted) -> {
+                        if (MetalKernels.FUSE) {
+                            k.routerDsNorm(x, ffnNorm, xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1,
+                                    t.sigmoid(), bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null,
+                                    counted ? counts : null, n);
+                        } else {
+                            k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
+                            k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1, t.sigmoid(),
+                                    bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                        }
+                    };
+                }
                 case Router.DeepSeek r -> {
                     Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
                     int method = switch (r.topK()) {
@@ -1436,6 +1650,19 @@ public final class MetalBackend implements Backend {
                 MemorySegment.copy(toGpu, 0, map.contents(), ValueLayout.JAVA_INT, 0, e);
             }
             gpuExperts = nHot;
+            if (spec.spec().special()) { // gpt-oss / Llama 4: the biases of the experts the GPU holds, in their order there
+                if (math.gub() != null) {
+                    k.release(math.gub());
+                    k.release(math.dnb());
+                }
+                Metal.Buffer gub = null;
+                Metal.Buffer dnb = null;
+                if (spec.spec().bias() && !allCold) {
+                    gub = k.upload(cold != null ? hotRows(weights.gateUpBias(), 2 * spec.moeDim(), cold) : weights.gateUpBias());
+                    dnb = k.upload(cold != null ? hotRows(weights.downBias(), c.dim(), cold) : weights.downBias());
+                }
+                math = MetalKernels.MoeMath.of(spec.spec(), gub, dnb);
+            }
             if (allCold) {
                 expGateUp = weights.expGateUp();
                 expDown = weights.expDown();
@@ -1465,14 +1692,31 @@ public final class MetalBackend implements Backend {
             }
         }
 
+        /** The rows {@code [e * per, (e + 1) * per)} of the experts that are not cold, in order: the packed hot experts' share. */
+        private float[] hotRows(float[] all, int per, boolean[] coldRow) {
+            int hot = 0;
+            for (boolean b : coldRow) {
+                hot += b ? 0 : 1;
+            }
+            float[] out = new float[hot * per];
+            int o = 0;
+            for (int e = 0; e < coldRow.length; e++) {
+                if (!coldRow[e]) {
+                    System.arraycopy(all, e * per, out, o, per);
+                    o += per;
+                }
+            }
+            return out;
+        }
+
         /** The routed experts the GPU holds, for the slots of {@code slotExperts} (index into expGateUp / expDown, -1 = skip). */
         private void gpuRouted(Metal.Buffer slotExperts, int n) {
-            if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+            if (k.moeGrouped(n)) {
                 k.moeGrouped(expGateUp, bExpGateUp, expDown, bExpDown, xb, slotExperts, routeWeight, moeOrder, moeTiles,
-                        moeHidden, moeOut, x, gpuExperts, spec.moeDim(), c.dim(), spec.topK(), n);
+                        moeHidden, moeOut, x, gpuExperts, spec.moeDim(), c.dim(), spec.topK(), n, math);
             } else {
-                k.moeUp(expGateUp, bExpGateUp, xb, slotExperts, moeHidden, spec.moeDim(), spec.topK(), n);
-                k.moeDown(expDown, bExpDown, moeHidden, slotExperts, routeWeight, x, c.dim(), spec.topK(), n);
+                k.moeUp(expGateUp, bExpGateUp, xb, slotExperts, moeHidden, spec.moeDim(), spec.topK(), n, math, routeWeight);
+                k.moeDown(expDown, bExpDown, moeHidden, slotExperts, routeWeight, x, c.dim(), spec.topK(), n, math);
             }
         }
 
@@ -1681,25 +1925,72 @@ public final class MetalBackend implements Backend {
      * rest is encoded (not in a pipelined step, which must stay one command buffer).
      */
     private void encodeLayers(int n, int pos, boolean split) {
-        int dim = c.dim();
         boolean fuseNorm = n == 1 && fusedNormFits;
         for (int l = 0; l < c.layers(); l++) {
-            LayerPlan L = plans[l];
-            L.attention().run(l, n, pos, fuseNorm);
-            if (L.postAttnNorm() != null) {
-                // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
-                k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
-                k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
-            } else {
-                k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
-            }
-            L.ffn().run(l, n, fuseNorm);
-            if (deepstack != null && l < deepstack.length) {
-                addDeepstack(l, n);
-            }
+            encodeLayer(l, n, pos, fuseNorm);
             if (split && MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                 k.commit(); // the GPU starts on these layers while the next ones are encoded
             }
+        }
+    }
+
+    /**
+     * The layers of a pass for a slot that streams its KV cache (docs/26 §26.2.2): layer l runs as its own command buffer
+     * over window {@code l & 1}; while the GPU works on layer l the CPU copies layer l + 1's rows from the host into the
+     * other window, and layer l - 1's new rows from its window to the host. Ends with every layer finished and the
+     * windows' new rows back on the host; the caller encodes the head into the command buffer left open.
+     */
+    private void streamedLayers(int n, int pos) {
+        int layers = c.layers();
+        boolean fuseNorm = n == 1 && fusedNormFits;
+        boolean async = k.metal.canWaitPending();
+        streamed.stage(0, pos);
+        streamed.prefetch(1, pos);
+        for (int l = 0; l < layers; l++) {
+            encodeLayer(l, n, pos, fuseNorm);
+            if (!async) { // an old native library: one layer at a time, nothing overlaps
+                k.commitAndWait();
+                streamed.writeBack(l, pos, n);
+                if (l + 1 < layers) {
+                    streamed.stage(l + 1, pos);
+                }
+                continue;
+            }
+            k.commit();
+            if (l + 1 < layers) {
+                k.metal.waitPending(1); // layer l - 1 is done: its window is free, and its new rows are final
+                if (l > 0) {
+                    streamed.writeBack(l - 1, pos, n);
+                }
+                streamed.stage(l + 1, pos);
+                streamed.prefetch(l + 2, pos);
+            }
+        }
+        if (async) {
+            k.metal.waitPending(0);
+            if (layers > 1) {
+                streamed.writeBack(layers - 2, pos, n);
+            }
+            streamed.writeBack(layers - 1, pos, n);
+        }
+        streamed.endPass();
+    }
+
+    /** The dispatches of decoder layer {@code l}: attention, o_proj, feed-forward. */
+    private void encodeLayer(int l, int n, int pos, boolean fuseNorm) {
+        int dim = c.dim();
+        LayerPlan L = plans[l];
+        L.attention().run(l, n, pos, fuseNorm);
+        if (L.postAttnNorm() != null) {
+            // Glm4 / Gemma: x += rmsnorm(o_proj(attention)), so o_proj cannot accumulate into x directly
+            k.matmul(L.wo(), L.woBuf(), att, 0, xb, 0, n, false, null, 0f, L.woBias());
+            k.rmsnormAdd(xb, L.postAttnNorm(), x, n, dim);
+        } else {
+            k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias()); // x += o_proj(att) (+ bias)
+        }
+        L.ffn().run(l, n, fuseNorm);
+        if (deepstack != null && l < deepstack.length) {
+            addDeepstack(l, n);
         }
     }
 
@@ -1711,7 +2002,27 @@ public final class MetalBackend implements Backend {
      * the CPU (such a step waits for the CPU halfway, so it is not one program).
      */
     private boolean replayable() {
-        return replay && cpuLayers == 0;
+        return replay && cpuLayers == 0 && !streaming; // (a streaming slot changes windows between layers: not one program)
+    }
+
+    /** Whether the token at {@code pos} has more blocks than the sparse budget, so that its sparse layers select blocks. */
+    private boolean sparseRow(int pos) {
+        return (pos >> pageShift) + 1 > sparse.budget(1 << pageShift);
+    }
+
+    /**
+     * The decode attention of the row at {@code pos}, reading owner {@code o}'s cache: {@code attention_dec}, or with
+     * sparse attention on a layer that selects blocks and a context beyond the budget, the sparse pipeline (its key
+     * summaries are current: the caller ran {@code kv_summary} after the keys were stored).
+     */
+    private void decodeRow(MetalBackend o, int layer, Attention.Gqa g, long qOff, long outOff, int pos, float scale, int stride) {
+        if (sparseOn && sparse.layer(layer) && g.window() == 0 && sparseRow(pos)) {
+            k.decodeAttentionSparse(kvDtype, q, qOff, o.keyCache[layer], o.valCache[layer], sparseSums[layer], sparseScores,
+                    sparseSel, flashPart, att, outOff, g.heads(), g.kvHeads(), g.headDim(), pos, ctx, scale, stride, g.softcap(), sparse);
+        } else {
+            k.decodeAttention(kvDtype, q, qOff, o.keyCache[layer], o.valCache[layer], flashPart, att, outOff, g.heads(),
+                    g.kvHeads(), g.headDim(), pos, ctx, scale, stride, g.window(), g.softcap());
+        }
     }
 
     /**
@@ -1723,6 +2034,9 @@ public final class MetalBackend implements Backend {
      */
     private long stepKey(boolean pipelined, int pos) {
         long key = (pipelined ? 1 : 0) | (countStep ? 2 : 0);
+        if (sparseOn && sparseRow(pos)) { // the sparse layers' kernels (and their fixed grids) replace attention_dec's
+            key |= 1L << 62;
+        }
         if (decodeAttn) { // the grid of attention_dec: the number of splits for each attention window
             for (int i = 0; i < windows.length; i++) {
                 key |= (long) k.decSplits(pos, windows[i]) << (3 + 7 * i);
@@ -1808,7 +2122,7 @@ public final class MetalBackend implements Backend {
 
     @Override
     public GreedyPipe greedyPipe(int vocab) {
-        if (!k.metal.canWaitPending() || !PIPELINE || cpuLayers > 0) {
+        if (!k.metal.canWaitPending() || !PIPELINE || cpuLayers > 0 || streaming) {
             return null; // a step with experts on the CPU cannot run ahead of the CPU
         }
         if (pipe == null) {
@@ -1950,6 +2264,8 @@ public final class MetalBackend implements Backend {
                     k.rmsnorm(x, 0, finalNorm, xb, 1, dim);
                     k.matmul(w.lmHead, lmHeadQ, xb, 0, logitsBuf, 0, 1, false, null, c.finalSoftcap());
                 });
+            } else if (streaming) {
+                streamedLayers(n, pos);
             } else {
                 encodeLayers(n, pos, true);
             }
@@ -1982,6 +2298,7 @@ public final class MetalBackend implements Backend {
         } else if (counts != null && System.nanoTime() - lastStatsSave > STATS_SAVE_NANOS) {
             saveExpertStats(true); // a long-running server keeps its statistics current, not only at shutdown
         }
+        memoryTick(); // the memory planner (docs/26): between passes, the GPU is idle
         if (logits != null && stride > 0) {
             int rows = Math.min(w.lmHead.rows, stride);
             for (int i = 0; i < n; i++) {
@@ -2015,7 +2332,7 @@ public final class MetalBackend implements Backend {
     @Override
     public boolean forwardBatch(Backend[] members, int[] tokens, int[] positions, float[][] logits) {
         int n = members.length;
-        if (!BATCH_DECODE || closed || n < 1 || n > maxBatch) {
+        if (!BATCH_DECODE || closed || streaming || n < 1 || n > maxBatch) {
             return false;
         }
         MetalBackend[] owners = new MetalBackend[n];
@@ -2024,7 +2341,7 @@ public final class MetalBackend implements Backend {
             if (!(members[t] instanceof MetalBackend o) || o.w != w || o.kvDtype != kvDtype || o.closed
                     || positions[t] < 0 || positions[t] >= Math.min(ctx, o.ctx) || (mla == null) != (o.mla == null)
                     || o.ropeCustomFrom != Integer.MAX_VALUE // its own rotary rows cannot share this backend's tables
-                    || (o.seq == null) != (seq == null)) {
+                    || o.streaming || (o.seq == null) != (seq == null)) {
                 return false;
             }
             for (int u = 0; u < t; u++) {
@@ -2073,6 +2390,7 @@ public final class MetalBackend implements Backend {
         if (MetalKernels.CONCURRENT_BATCH && n > 1 && k.metal.canRunConcurrent()) {
             k.encoder(1); // the per-row dispatches of the n slots are independent: let them overlap
         }
+        k.singleRows(true);
         k.begin();
         boolean committed = false;
         try {
@@ -2099,6 +2417,7 @@ public final class MetalBackend implements Backend {
                 k.abort();
             }
             k.encoder(encoder);
+            k.singleRows(false);
         }
         if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
             rebalanceExperts();
@@ -2309,6 +2628,26 @@ public final class MetalBackend implements Backend {
         if (!(after < 0.8 * before)) {
             return 0;
         }
+        int changed = replaceExperts(next);
+        System.err.printf("Metal: experts re-placed from the usage so far: %d layers changed, estimated cost per token "
+                + "%.1f -> %.1f us%n", changed, before, after);
+        return changed;
+    }
+
+    /**
+     * Moves the experts to the placement {@code next} ({@code next[l][e]} true = on the CPU), one layer at a time (the new hot
+     * experts are packed, the GPU switches to them, then the old copy is freed). Only while this backend is the placement's sole
+     * user; between forward passes. Used by {@link #rebalanceExperts} and by the memory planner.
+     *
+     * @return the number of layers whose experts moved
+     */
+    int replaceExperts(boolean[][] next) {
+        int layers = c.layers();
+        synchronized (PLACEMENTS) {
+            if (placement.refs > 1 || counts == null) {
+                return 0;
+            }
+        }
         int changed = 0;
         for (int l = 0; l < layers; l++) {
             if (next[l] == null || java.util.Arrays.equals(next[l], placement.cold[l])) {
@@ -2332,9 +2671,224 @@ public final class MetalBackend implements Backend {
             }
             cpuLayers += any ? 1 : 0;
         }
-        System.err.printf("Metal: experts re-placed from the usage so far: %d layers changed, estimated cost per token "
-                + "%.1f -> %.1f us%n", changed, before, after);
         return changed;
+    }
+
+    // ------------------------------------------------------------------ the memory planner (docs/26 §26.2.6)
+
+    private MemoryGovernor ownGovernor;
+
+    private MemoryGovernor governor() {
+        if (seq != null) {
+            return ((MetalKvStorage) seq.pool().storage()).governor;
+        }
+        if (ownGovernor == null) {
+            ownGovernor = new MemoryGovernor();
+        }
+        return ownGovernor;
+    }
+
+    /**
+     * The planner's view of this model now, for {@code kvPositions} positions of resident KV: the budget (Metal's working
+     * set), what is on the GPU besides experts and KV (the other weights, this backend's buffers, other models), the experts,
+     * the cost model's usage statistics.
+     */
+    MemoryPlanner.Inputs planInputs(long kvPositions, boolean canStream) {
+        int layers = c.layers();
+        long[] perExpert = new long[layers];
+        int[] experts = new int[layers];
+        int[] topK = new int[layers];
+        long expertTotal = 0;
+        for (int l = 0; l < layers; l++) {
+            if (arch.layers().get(l).mlp() instanceof Mlp.Moe m) {
+                perExpert[l] = bytesPerExpert(l);
+                experts[l] = m.experts();
+                topK[l] = m.topK();
+                expertTotal += perExpert[l] * experts[l];
+            }
+        }
+        long poolReserved = seq != null ? (long) seq.pool().hotCap() * seq.pool().storage().residentBytes() : 0;
+        long rowBytes = arch.attention() instanceof Attention.Gqa g ? kvDtype.rowBytes(g.kvDim(), g.kvHeads()) : 0;
+        long windows = 4L * ctx * rowBytes; // one slot's streaming windows
+        long others = DeviceLedger.others(ledger) - poolReserved;
+        long own = k.metal.allocatedBytes() - (streaming ? windows : 0);
+        long fixed = w.byteSize() - expertTotal + own + others;
+        long[][] usage = statsFile != null && HOT_EXPERTS ? ExpertPlacement.load(statsFile, layers, modelKey) : null;
+        double bw = streamed != null && streamed.stagedNanos() > 0
+                ? Math.max(1e3, streamed.stagedBytes() / (streamed.stagedNanos() / 1e3)) : MemoryPlanner.STAGE_BYTES_PER_US;
+        return new MemoryPlanner.Inputs(workingSet(), fixed, perExpert, experts, topK, usage, kvBytesPerPosition(w, kvDtype),
+                kvPositions, canStream, split.backends() * windows, layers, Math.max(1, ctx / 2), bw);
+    }
+
+    private static long coldBytes(boolean[][] cold, long[] perExpert) {
+        long b = 0;
+        for (int l = 0; l < cold.length; l++) {
+            for (int e = 0; cold[l] != null && e < cold[l].length; e++) {
+                b += cold[l][e] ? perExpert[l] : 0;
+            }
+        }
+        return b;
+    }
+
+    /**
+     * Between forward passes, with the memory planner on: when the pool's committed blocks near its hot cap, grows the cap by
+     * half (never past the pool's size) and, if the GPU then no longer fits its budget, moves the experts the plan names to the
+     * CPU first. The step is refused (and retried after a while) when it would not fit even with the plan's experts on the CPU,
+     * or when the experts cannot move (slots sharing one placement keep the plan made at load). Blocks already committed stay
+     * committed: the cap only grows, so a long session leaves its experts on the CPU until the model is reloaded.
+     */
+    private void memoryTick() {
+        if (tier == null || !tier.plan() || seq == null || closed) {
+            return;
+        }
+        KvPool pool = seq.pool();
+        MemoryGovernor g = governor();
+        long now = System.nanoTime();
+        int cap = pool.hotCap();
+        int target = MemoryPlanner.nextCap(cap, pool.committedBlocks(), pool.maxBlocks(), 0.85, 1.5);
+        if (target == cap || !g.due(now)) {
+            return;
+        }
+        MemoryPlanner.Inputs in = planInputs((long) target * pool.blockTokens(), false);
+        MemoryPlanner.Plan p = MemoryPlanner.plan(in);
+        boolean[][] cur = placement != null ? placement.cold : new boolean[c.layers()][];
+        long movedNow = coldBytes(cur, in.expertBytes());
+        long gpuNow = in.fixed() + MemoryPlanner.totalExpertBytes(in) - movedNow + in.kvPerPosition() * in.kvPositions();
+        boolean currentFits = gpuNow <= in.budget();
+        String what = String.format("hot cap %d -> %d blocks (%.1f -> %.1f GB)", cap, target,
+                (double) cap * pool.storage().residentBytes() / 1e9, (double) target * pool.storage().residentBytes() / 1e9);
+        if (!currentFits && !p.fits()) {
+            g.record("refused", what + ": would not fit even with " + String.format("%.1f GB", p.expertBytesOnCpu() / 1e9)
+                    + " of experts on the CPU");
+            g.backOff(now);
+            return;
+        }
+        if (p.expertBytesOnCpu() > movedNow || !currentFits) {
+            double curCost = ExpertPlacement.cost(cur, in.expertBytes(), in.experts(), in.topK(), in.usage());
+            if (g.hysteresis.accept(currentFits, curCost, p.costUs(), now)) {
+                int changed = replaceExperts(p.cold());
+                if (changed == 0 && !currentFits) {
+                    g.record("refused", what + ": " + String.format("%.1f GB", (gpuNow - in.budget()) / 1e9)
+                            + " over the budget and the experts cannot move (shared placement or no CPU side)");
+                    g.backOff(now);
+                    return;
+                }
+                if (changed > 0) {
+                    g.record("experts", changed + " layers re-placed: " + String.format("%.1f -> %.1f GB on the CPU, cost per token %.0f -> %.0f us",
+                            movedNow / 1e9, p.expertBytesOnCpu() / 1e9, curCost, p.costUs()));
+                }
+            }
+        }
+        pool.setHotCap(target);
+        g.record("grow", what);
+        g.setPlan(MemoryPlanner.describe(in, p));
+    }
+
+    @Override
+    public java.util.Map<String, Object> memoryReport() {
+        java.util.Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("backend", "metal");
+        out.put("deviceName", k.metal.deviceName());
+        long budget = workingSet();
+        boolean[][] cold = placement != null ? placement.cold : new boolean[c.layers()][];
+        long expertsCpu = 0;
+        long expertsTotal = 0;
+        int cpuExperts = 0;
+        for (int l = 0; l < c.layers(); l++) {
+            expertsTotal += expertBytes(l);
+            for (int e = 0; cold[l] != null && e < cold[l].length; e++) {
+                if (cold[l][e]) {
+                    expertsCpu += bytesPerExpert(l);
+                    cpuExperts++;
+                }
+            }
+        }
+        long poolReserved = seq != null ? (long) seq.pool().hotCap() * seq.pool().storage().residentBytes() : 0;
+        long windows = streamed != null ? 4L * ctx * rowBytes() : 0;
+        long scratch = k.metal.allocatedBytes() - windows;
+        long others = DeviceLedger.others(ledger) - poolReserved;
+        long weightsGpu = w.byteSize() - expertsCpu;
+        java.util.Map<String, Object> dev = new java.util.LinkedHashMap<>();
+        dev.put("budgetBytes", budget);
+        java.util.List<java.util.Map<String, Object>> comps = new java.util.ArrayList<>();
+        comps.add(component("weights on the GPU", weightsGpu, "expert tensors included: " + (expertsTotal - expertsCpu) / 1_000_000 + " MB"));
+        comps.add(component("activations and scratch", scratch, "this slot's buffers"));
+        if (seq != null) {
+            comps.add(component("KV blocks (hot cap)", poolReserved, "committed " + seq.pool().committedBlocks() + " of "
+                    + seq.pool().hotCap() + " blocks"));
+        } else if (streamed != null) {
+            comps.add(component("KV windows", windows, "two layers of the streamed cache"));
+        } else if (arch.attention() instanceof Attention.Gqa) {
+            comps.add(component("KV cache (flat)", (long) ctx * kvBytesPerPosition(w, kvDtype), "counted in the scratch above"));
+        }
+        comps.add(component("other models and slots", others, "DeviceLedger"));
+        dev.put("components", comps);
+        long used = weightsGpu + scratch + windows + poolReserved + others;
+        dev.put("usedBytes", used);
+        dev.put("fits", used <= budget);
+        out.put("device", dev);
+        java.util.Map<String, Object> ex = new java.util.LinkedHashMap<>();
+        ex.put("totalBytes", expertsTotal);
+        ex.put("onCpuBytes", expertsCpu);
+        ex.put("onCpuExperts", cpuExperts);
+        ex.put("cpuLayers", cpuLayers);
+        ex.put("mode", split.layers() == MoeSplit.AUTO ? "auto" : split.layers() == 0 ? "off" : "fixed");
+        out.put("experts", ex);
+        if (seq != null) {
+            out.putAll(org.robomiri.jllm.kv.KvReports.pool(seq.pool()));
+        } else if (streamed != null) {
+            java.util.Map<String, Object> kv = new java.util.LinkedHashMap<>();
+            kv.put("mode", "streamed");
+            kv.put("hostBytes", streamed.hostBytes());
+            kv.put("mappedLayers", streamed.mappedLayers());
+            kv.put("windowBytes", windows);
+            kv.put("passes", streamed.passes());
+            kv.put("stagedBytes", streamed.stagedBytes());
+            kv.put("writtenBytes", streamed.writtenBytes());
+            kv.put("stageGBPerSecond", streamed.stagedNanos() > 0 ? streamed.stagedBytes() / (double) streamed.stagedNanos() : 0);
+            out.put("kv", kv);
+        } else {
+            java.util.Map<String, Object> kv = new java.util.LinkedHashMap<>();
+            kv.put("mode", "flat");
+            out.put("kv", kv);
+        }
+        MemoryGovernor g = governor();
+        java.util.Map<String, Object> plan = new java.util.LinkedHashMap<>();
+        plan.put("enabled", tier != null && tier.plan());
+        plan.put("summary", g.plan());
+        plan.put("decisions", g.history());
+        out.put("plan", plan);
+        return out;
+    }
+
+    private static java.util.Map<String, Object> component(String name, long bytes, String note) {
+        java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("name", name);
+        m.put("bytes", bytes);
+        m.put("note", note);
+        return m;
+    }
+
+    /** The plan at load, for the log and the console. */
+    private void logLoadPlan() {
+        if (tier == null || !tier.plan()) {
+            return;
+        }
+        long positions = seq != null ? (long) seq.pool().hotCap() * seq.pool().blockTokens() : (long) ctx;
+        MemoryPlanner.Inputs in = planInputs(positions, false);
+        boolean[][] cur = placement != null ? placement.cold : new boolean[c.layers()][];
+        long moved = coldBytes(cur, in.expertBytes());
+        long gpu = in.fixed() + MemoryPlanner.totalExpertBytes(in) - moved + (streaming ? in.windowBytes() : in.kvPerPosition() * positions);
+        MemoryPlanner.Plan p = new MemoryPlanner.Plan(streaming ? MemoryPlanner.Mode.STREAMED : MemoryPlanner.Mode.RESIDENT, cur, moved,
+                streaming ? in.windowBytes() : in.kvPerPosition() * positions, gpu, gpu <= in.budget(),
+                ExpertPlacement.cost(cur, in.expertBytes(), in.experts(), in.topK(), in.usage()), 0,
+                streaming ? "the KV is streamed" : "the KV is resident up to the hot cap");
+        MemoryGovernor g = governor();
+        g.setPlan(MemoryPlanner.describe(in, p));
+        for (String line : g.plan()) {
+            System.err.println("Metal memory plan: " + line);
+        }
+        g.record("load", (streaming ? "streamed KV, windows " + in.windowBytes() / 1_000_000 + " MB" : "KV hot cap " + positions + " positions"));
     }
 
     /** Drops this backend's hold on its placement; the last backend on it frees the packed experts. */
@@ -2447,12 +3001,37 @@ public final class MetalBackend implements Backend {
     /** The cache segments of layer {@code l} whose rows are saved one after the other per position: K and V, or the latent rows. */
     private MemorySegment[] segments(int l) {
         return mla != null ? new MemorySegment[]{mla.cache(l)}
+                : streamed != null ? new MemorySegment[]{streamed.keys(l), streamed.values(l)}
                 : new MemorySegment[]{keyCache[l].contents(), valCache[l].contents()};
     }
 
     @Override
     public KvSequence kvSequence() {
         return seq;
+    }
+
+    /**
+     * For tests and studies (docs/27): the logical blocks the last sparse decode step selected per kv head in the last sparse layer
+     * it ran (sinks, chosen blocks, window, ascending), or null when sparse attention is off.
+     */
+    public int[][] lastSparseSelection() {
+        if (!sparseOn) {
+            return null;
+        }
+        int kvHeads = ((Attention.Gqa) arch.attention()).kvHeads();
+        int budget = sparse.budget(1 << pageShift);
+        java.util.Map<Integer, Integer> byPhysical = new java.util.HashMap<>();
+        for (int j = 0; j < seq.blocks(); j++) {
+            byPhysical.put(seq.block(j), j);
+        }
+        int[][] out = new int[kvHeads][budget];
+        for (int g = 0; g < kvHeads; g++) {
+            for (int i = 0; i < budget; i++) {
+                Integer j = byPhysical.get(sparseSel.contents().getAtIndex(ValueLayout.JAVA_INT, (long) g * budget + i));
+                out[g][i] = j == null ? -1 : j;
+            }
+        }
+        return out;
     }
 
     /** The pool buffer row of position {@code s} of this backend's cache (paged: through the block table). */
@@ -2590,6 +3169,17 @@ public final class MetalBackend implements Backend {
         if (q4Rings != null) {
             loadRecent(n, stored, in);
         }
+        if (seq != null && sparseOn) { // the rows came in by the host, not through kv_summary
+            MetalKvStorage st = (MetalKvStorage) seq.pool().storage();
+            int blockTokens = 1 << pageShift;
+            for (int l = 0; l < c.layers(); l++) {
+                if (sparse.layer(l)) {
+                    for (int j = 0; j * blockTokens < n; j++) {
+                        st.updateSummary(l, seq.block(j), Math.min(blockTokens, n - j * blockTokens));
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -2655,6 +3245,9 @@ public final class MetalBackend implements Backend {
         try {
             k.close();
         } finally {
+            if (streamed != null) {
+                streamed.close();
+            }
             DeviceLedger.remove(ledger);
             releasePlacement();
         }

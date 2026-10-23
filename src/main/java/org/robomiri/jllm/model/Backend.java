@@ -285,6 +285,17 @@ public interface Backend extends AutoCloseable {
         return null;
     }
 
+    /**
+     * Where this backend's memory is and what the planner decided (docs/26 §26.2.7), as a JSON-ready tree (maps, lists, numbers,
+     * strings): the budget, the components (weights on the GPU, experts on the CPU, scratch, KV by tier, other models), the
+     * KV pool and its tiers, the streaming counters, and the latest decisions. The default describes the paged pool when
+     * there is one, else {@code null}.
+     */
+    default java.util.Map<String, Object> memoryReport() {
+        org.robomiri.jllm.kv.KvSequence s = kvSequence();
+        return s == null ? null : org.robomiri.jllm.kv.KvReports.pool(s.pool());
+    }
+
     /** A frozen copy of the first {@code n} positions' rows that another thread can write out ({@link #snapshotState}). */
     interface StateSnapshot extends AutoCloseable {
         /** Writes what {@link #saveState} would have written for the positions at the time of the snapshot. */

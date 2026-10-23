@@ -19,7 +19,7 @@ import java.util.Map;
  * written into the per-layer {@link LayerSpec}s, so the loader, the converter and the backends only ever look
  * at the typed vocabulary below and never at the {@code model_type}.
  */
-public sealed interface Architecture permits Decoder, MambaArch, Qwen3NextArch {
+public sealed interface Architecture permits Decoder, MambaArch, Qwen3NextArch, HybridArch {
 
     /**
      * Config key written by the GGUF loader and never found in a Hugging Face config: the file's q/k rows were

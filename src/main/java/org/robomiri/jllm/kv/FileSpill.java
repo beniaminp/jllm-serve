@@ -28,6 +28,11 @@ public final class FileSpill implements KvSpill {
 
     private static final int MAGIC = 0x4B564231; // "KVB1"
 
+    /** Reads of block payloads go through a memory mapping ({@code -Djllm.kv.mapReads=false}: plain reads). */
+    static final boolean MAP_READS = !"false".equals(System.getProperty("jllm.kv.mapReads"));
+    /** Payloads below this many bytes are read plainly (a mapping costs more than it saves). */
+    static final int MAP_MIN = 64 * 1024;
+
     private record Info(long size, long used) {
     }
 
@@ -157,10 +162,21 @@ public final class FileSpill implements KvSpill {
             if (n != payload.remaining()) {
                 return false;
             }
-            ByteBuffer dst = payload.duplicate();
-            while (dst.hasRemaining()) {
-                if (ch.read(dst) < 0) {
-                    return false;
+            long headLen = 4 + 8 + 8 + 4 + 4L * tokens.length + 4;
+            if (ch.size() < headLen + n) {
+                return false;
+            }
+            if (MAP_READS && n >= MAP_MIN) { // the file's pages are mapped and copied once: the OS pages them in (and ahead)
+                try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                    java.lang.foreign.MemorySegment seg = ch.map(FileChannel.MapMode.READ_ONLY, headLen, n, arena);
+                    java.lang.foreign.MemorySegment.copy(seg, 0, java.lang.foreign.MemorySegment.ofBuffer(payload.slice()), 0, n);
+                }
+            } else {
+                ByteBuffer dst = payload.duplicate();
+                while (dst.hasRemaining()) {
+                    if (ch.read(dst) < 0) {
+                        return false;
+                    }
                 }
             }
             payload.position(payload.limit());

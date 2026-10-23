@@ -300,6 +300,26 @@ public final class KvPoolTest {
             }
         }
         check(pool.stats().usedBlocks() == 0, "everything is released afterwards");
+        // an idle holder is asked for its blocks before the pool gives up
+        FakeStorage st2 = new FakeStorage(16);
+        KvPool p2 = new KvPool(st2, 20, "fake");
+        KvSequence idle = p2.newSequence(1024);
+        fill(st2, idle, tokens(60, 240), 0, 240); // 15 blocks, referenced by an idle slot
+        KvSequence busy = p2.newSequence(1024);
+        boolean starved = false;
+        try {
+            fill(st2, busy, tokens(61, 160), 0, 160); // needs 10, 5 are free
+        } catch (KvPoolExhausted e) {
+            starved = true;
+        }
+        busy.clear();
+        p2.setReclaimer(() -> {
+            boolean any = idle.blocks() > 0;
+            idle.clear();
+            return any;
+        });
+        fill(st2, busy, tokens(61, 160), 0, 160);
+        check(starved && busy.length() == 160 && idle.blocks() == 0, "a full pool asks its reclaimer: the idle holder's blocks were freed");
     }
 
     /** Evicted blocks go to the spill store and come back, also after a restart (a new pool on the same directory). */

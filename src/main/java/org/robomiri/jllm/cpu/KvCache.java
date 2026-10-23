@@ -186,6 +186,56 @@ public abstract class KvCache {
     public abstract void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window,
                                    float scale, float softcap);
 
+    /** Chunked attention length of the {@link #attention} call in progress (0 = none), see {@link #attention(ThreadPool, int, int, int, float[], float[], int, int, float[], float, float)}. */
+    int chunk;
+    /** Per-query-head sink logits of the call in progress, or null. */
+    float[] sinks;
+
+    /**
+     * {@link #attention} with the two extras of gpt-oss and Llama 4: chunked attention (a query at position {@code p} sees
+     * only the keys {@code [p / chunk * chunk, p]}; 0 = off) and attention sinks (one learned logit per query head
+     * {@code sinks[h]} joins the softmax with a zero value; null = off). The cache is used by one backend at a time, so the
+     * extras are plain fields for the duration of the call.
+     */
+    public final void attention(ThreadPool pool, int layer, int n, int pos, float[] q, float[] att, int window, int chunk,
+                                float[] sinks, float scale, float softcap) {
+        this.chunk = chunk;
+        this.sinks = sinks;
+        try {
+            attention(pool, layer, n, pos, q, att, window, scale, softcap);
+        } finally {
+            this.chunk = 0;
+            this.sinks = null;
+        }
+    }
+
+    /** First key a query with {@code len} keys in its past (position {@code len - 1}) sees: window and chunk. */
+    final int firstKey(int len, int window) {
+        int first = window > 0 ? Math.max(0, len - window) : 0;
+        return chunk > 0 ? Math.max(first, (len - 1) / chunk * chunk) : first;
+    }
+
+    /**
+     * {@code 1 / sum} of the softmax over the {@code n} scaled scores at {@code sc[o ..]} (numerators left in place), with the
+     * sink logit of query head {@code head} in the denominator when the call has sinks. Without sinks that is
+     * {@code 1 / softmax(...)}, unchanged.
+     */
+    final float softmaxInv(float[] sc, int o, int n, float softcap, int head) {
+        if (sinks == null) {
+            return 1f / softmax(sc, o, n, softcap);
+        }
+        if (softcap > 0 && FASTMATH) {
+            VectorKernels.softcapFast(sc, o, n, softcap);
+        }
+        float sink = sinks[head];
+        float max = sink;
+        for (int i = o; i < o + n; i++) {
+            max = Math.max(max, sc[i]);
+        }
+        float sum = VectorKernels.softmaxExp(sc, o, n, max);
+        return 1f / (sum + (float) Math.exp(sink - max));
+    }
+
     /** The f32 transposed K chunks of {@code layer} (see {@link #keyChunk}) when they can be read in place, else null. */
     abstract float[] keysInPlace(int layer);
 
@@ -470,7 +520,7 @@ public abstract class KvCache {
                 int rows = (t1 - t0) * group;
                 for (int t = t0; t < t1; t++) {
                     int len = pos + t + 1;
-                    int first = window > 0 ? Math.max(0, len - window) : 0;
+                    int first = firstKey(len, window);
                     int exact = exactRows ? Math.max(first, exactFrom(layer, len - 1)) : len;
                     for (int h = 0; h < group; h++) {
                         int r = (t - t0) * group + h;
@@ -542,7 +592,7 @@ public abstract class KvCache {
                             sc[o + s] = (float) Math.tanh(sc[o + s] / softcap) * softcap;
                         }
                     }
-                    float inv = 1f / softmax(sc, o + lo[r], hi[r] - lo[r], softcap);
+                    float inv = softmaxInv(sc, o + lo[r], hi[r] - lo[r], softcap, g * group + r % group);
                     VectorKernels.scale(sc, o + lo[r], hi[r] - lo[r], inv); // probabilities, used by every output vector
                     Arrays.fill(att, rq[r], rq[r] + hd, 0f);
                 }
@@ -611,7 +661,7 @@ public abstract class KvCache {
         int hd = headDim;
         int fl = VectorKernels.FL;
         int len = pos + 1;
-        int first = window > 0 ? Math.max(0, len - window) : 0;
+        int first = firstKey(len, window);
         int span = roundUp(len, CHUNK);
         int heads = kvHeads * group;
         if (decodeScores.length < heads * span) {
@@ -682,7 +732,7 @@ public abstract class KvCache {
                         sc[o + s] = (float) Math.tanh(sc[o + s] / softcap) * softcap;
                     }
                 }
-                float inv = 1f / softmax(sc, o + first, len - first, softcap);
+                float inv = softmaxInv(sc, o + first, len - first, softcap, h);
                 VectorKernels.scale(sc, o + first, len - first, inv);
                 Arrays.fill(att, h * hd, (h + 1) * hd, 0f);
             }
@@ -967,7 +1017,7 @@ public abstract class KvCache {
                 int t0 = (tiles - 1 - i / kvHeads) * tile;
                 int t1 = Math.min(n, t0 + tile);
                 int ko = g * hd;
-                int sMin = window > 0 ? Math.max(0, pos + t0 + 1 - window) : 0;
+                int sMin = firstKey(pos + t0 + 1, window);
                 int sMax = pos + t1;
                 // scores: row (t - t0) * group + h holds the keys of query head g * group + h of token t
                 for (int s = sMin; s < sMax; s++) {
@@ -977,7 +1027,7 @@ public abstract class KvCache {
                     }
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
-                        int first = window > 0 ? Math.max(0, len - window) : 0;
+                        int first = firstKey(len, window);
                         if (s < first || s >= len) {
                             continue;
                         }
@@ -992,12 +1042,12 @@ public abstract class KvCache {
                 }
                 for (int t = t0; t < t1; t++) {
                     int len = pos + t + 1;
-                    int first = window > 0 ? Math.max(0, len - window) : 0;
+                    int first = firstKey(len, window);
                     int qo = t * qDim + g * group * hd;
                     for (int h = 0; h < group; h++) {
                         int row = (t - t0) * group + h;
                         int so = row * span;
-                        sc[invOff + row] = 1f / softmax(sc, so + first, len - first, softcap);
+                        sc[invOff + row] = softmaxInv(sc, so + first, len - first, softcap, g * group + h);
                         Arrays.fill(att, qo + h * hd, qo + (h + 1) * hd, 0f);
                     }
                 }
@@ -1008,7 +1058,7 @@ public abstract class KvCache {
                     }
                     for (int t = t0; t < t1; t++) {
                         int len = pos + t + 1;
-                        int first = window > 0 ? Math.max(0, len - window) : 0;
+                        int first = firstKey(len, window);
                         if (s < first || s >= len) {
                             continue;
                         }

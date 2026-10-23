@@ -228,7 +228,7 @@ class MixedSlotsTest {
                 + tok.vocabSize() + ",\"eos_token_id\":" + tok.tokenId("<|im_end|>") + "}"));
         Path dir = Files.createTempDirectory("mixed-slots");
         WebProperties props = new WebProperties("x", "", List.of(), 100, "y", "deepseek", false, dir.toString(), 1.0, 512, 0,
-                List.of(), spill, 1.0);
+                List.of(), spill, 1.0, 120);
         KvStore store = new KvStore(props);
         KvPool pool = new KvPool(new RowStorage(blocks), blocks, "long rows");
         BatchGroup group = new BatchGroup();

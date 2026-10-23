@@ -6,6 +6,7 @@ import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.metal.MetalBackend;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.KvSparse;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
 import org.robomiri.jllm.tokenizer.Tokenizer;
@@ -36,6 +37,17 @@ import java.util.Set;
  * <p>usage: KvStudy accuracy|needle model=&lt;dir&gt; backend=cpu|metal variants=f32,f16,q8,q4:0,q4:128 [steps=300]
  * [ctx=8192] [text=&lt;file&gt;] [ppl=2048] [lens=4096,8192] [trials=3] [lib=&lt;metal lib&gt;]. A variant {@code q4:R} has the recent
  * window R. Whether keys are rotated is decided by the JVM flag {@code -Djllm.kv.q4.rotate=false}.
+ *
+ * <p>Sparse decode attention (docs/27): a variant {@code f16+p} is the paged cache with dense attention, and
+ * {@code f16+sK[:sink[:window[:denseLayers]]]} the paged cache with sparse decode attention choosing K blocks (sink and
+ * window in tokens, defaults 16 and 256; 2 dense layers). {@code needle} takes {@code tail=N}: the last N tokens of the
+ * prompt (the question) are fed one at a time, as decode steps, so that they too attend sparsely (default 0: the prompt is
+ * prefilled in chunks, as the engine does, and only the generated tokens are sparse).
+ *
+ * <p>{@code decodeppl}: teacher-forced decode perplexity, {@code lens=} contexts, {@code text=} the document (its first
+ * {@code lens} tokens), {@code tail=N} tokens at the end (default 512) scored one decode step at a time after a chunked
+ * prefill of the rest; per variant the mean negative log-probability, the perplexity, the mean absolute difference and
+ * the mean KL against the first variant, and how often the arg max is the same.
  */
 public final class KvStudy {
 
@@ -66,7 +78,15 @@ public final class KvStudy {
                 + " ctx=" + ctx + " model=" + dir.getFileName());
         try (ModelLoader.Loaded l = ModelLoader.load(s, ModelLoader.hub(s), dir.getFileName().toString().replaceFirst("_", "/"))) {
             Study study = new Study(l, backend, o.get("lib"), ctx, batch);
-            if (mode.equals("accuracy")) {
+            study.tail = mode.equals("needle") ? Integer.parseInt(o.getOrDefault("tail", "0")) : 0;
+            if (mode.equals("sparsecheck")) {
+                study.sparseCheck(o.get("text"), Integer.parseInt(o.getOrDefault("len", "3000")), variants[0]);
+            } else if (mode.equals("decodeppl")) {
+                String[] lens = o.getOrDefault("lens", "8192").split(",");
+                for (String len : lens) {
+                    study.decodePpl(variants, Integer.parseInt(len), o.get("text"), Integer.parseInt(o.getOrDefault("tail", "512")));
+                }
+            } else if (mode.equals("accuracy")) {
                 study.accuracy(variants, Integer.parseInt(o.getOrDefault("steps", "300")), o.get("text"),
                         Integer.parseInt(o.getOrDefault("ppl", "2048")), o.get("doc"),
                         Integer.parseInt(o.getOrDefault("doctokens", "3000")), o.getOrDefault("only", ""));
@@ -87,12 +107,14 @@ public final class KvStudy {
         final Engine engine;
         final ModelWeights w;
         final Tokenizer tok;
-        final String backendName;
+        String backendName;
         final String lib;
         final int ctx;
         final int batch;
         final int vocab;
         final Set<Integer> ban;
+        /** needle: the last {@code tail} prompt tokens are fed one at a time (decode steps) instead of in the last chunk. */
+        int tail;
 
         Study(ModelLoader.Loaded l, String backendName, String lib, int ctx, int batch) {
             this.l = l;
@@ -109,6 +131,10 @@ public final class KvStudy {
 
         /** A backend of the variant ({@code f32}, {@code f16}, {@code q8}, {@code q8r} (q8 with rotated keys), {@code q4:R}); f16 is the loader's own. */
         Backend open(String variant) {
+            String[] plus = variant.split("\\+");
+            if (plus.length > 1) {
+                return openPaged(plus[0], plus[1]);
+            }
             String[] p = variant.split(":");
             boolean rot = p[0].equals("q8r"); // q8 with Hadamard-rotated keys (backend.kv-q8-rotate)
             KvDtype dt = KvDtype.parse(rot ? "q8" : p[0]);
@@ -120,6 +146,36 @@ public final class KvStudy {
                 return new MetalBackend(w, ctx, batch, lib, dt);
             }
             return new CpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), dt, false);
+        }
+
+        private org.robomiri.jllm.kv.KvPool lastPool;
+
+        /** A paged backend ({@code mode}: {@code p} dense, {@code sK[:sink[:window[:dense]]]} sparse); the previous variant's pool is closed. */
+        Backend openPaged(String base, String mode) {
+            if (lastPool != null) {
+                lastPool.close();
+                lastPool = null;
+            }
+            boolean rot = base.equals("q8r");
+            KvDtype dt = KvDtype.parse(rot ? "q8" : base);
+            KvDtype.setQ8Rotate(rot);
+            if (mode.startsWith("s")) {
+                String[] a = mode.substring(1).split(":");
+                KvSparse.set(new KvSparse(true, Integer.parseInt(a[0]), a.length > 1 ? Integer.parseInt(a[1]) : 16,
+                        a.length > 2 ? Integer.parseInt(a[2]) : 256, a.length > 3 ? Integer.parseInt(a[3]) : 2));
+            } else {
+                KvSparse.set(KvSparse.OFF);
+            }
+            try {
+                if (backendName.equals("metal")) {
+                    lastPool = MetalBackend.newKvPool(w, ctx, 1, dt, 16, 0, lib);
+                    return new MetalBackend(w, ctx, batch, lib, dt, org.robomiri.jllm.metal.MoeSplit.OFF, lastPool);
+                }
+                lastPool = CpuBackend.newKvPool(w, ctx, 1, dt, 16, 0, rot);
+                return new CpuBackend(w, ctx, batch, Runtime.getRuntime().availableProcessors(), dt, false, lastPool);
+            } finally {
+                KvSparse.set(KvSparse.OFF);
+            }
         }
 
         int[] chat(String user) {
@@ -138,9 +194,188 @@ public final class KvStudy {
 
         /** Prefills {@code prompt} from position 0; the logits of its last token go to {@code logits}. */
         void prefill(Backend b, int[] prompt, float[] logits) {
-            for (int off = 0; off < prompt.length; off += b.maxBatch()) {
-                int n = Math.min(b.maxBatch(), prompt.length - off);
+            int chunked = prompt.length - Math.min(tail, prompt.length - 1);
+            for (int off = 0; off < chunked; off += b.maxBatch()) {
+                int n = Math.min(b.maxBatch(), chunked - off);
                 b.forward(prompt, off, n, off, off + n == prompt.length ? logits : null);
+            }
+            for (int i = chunked; i < prompt.length; i++) {
+                b.forward(prompt, i, 1, i, i == prompt.length - 1 ? logits : null);
+            }
+        }
+
+        /**
+         * Consistency of sparse decode attention (docs/27) on the real model, {@code len} tokens of context, variant {@code v}
+         * (e.g. {@code f16+s16:16:64:2}): (1) CPU against Metal, logits of 24 teacher-forced decode steps; (2) Metal with decode
+         * replay on against off, bit for bit; (3) Metal: a verification chunk of 8 rows against 8 decode steps, bit for bit.
+         */
+        void sparseCheck(String textFile, int len, String v) throws Exception {
+            int[] all = tok.encode(Files.readString(Path.of(textFile)));
+            int[] text = java.util.Arrays.copyOf(all, len + 40);
+            String saved = backendName;
+            int steps = 24;
+            float[][][] logits = new float[3][steps][vocab];
+            int[][][][] picked = new int[2][steps][][];
+            String[] names = {"cpu", "metal", "metal"};
+            for (int run = 0; run < 3; run++) {
+                backendName = names[run];
+                try (Backend b = open(v)) {
+                    if (run == 2 && b instanceof MetalBackend mb) {
+                        mb.replay(false);
+                    }
+                    if (b instanceof CpuBackend cb) {
+                        cb.recordSparseSelection();
+                    }
+                    float[] lg = new float[vocab];
+                    int[] head = java.util.Arrays.copyOf(text, len);
+                    prefill(b, head, lg);
+                    for (int t = 0; t < steps; t++) {
+                        System.arraycopy(lg, 0, logits[run][t], 0, vocab);
+                        b.forward(text, len + t, 1, len + t, lg);
+                        if (run < 2) {
+                            int[][] sel = b instanceof CpuBackend cb ? cb.lastSparseSelection() : ((MetalBackend) b).lastSparseSelection();
+                            picked[run][t] = sel == null ? null : java.util.Arrays.stream(sel).map(int[]::clone).toArray(int[][]::new);
+                        }
+                    }
+                }
+            }
+            double worst = 0;
+            int agree = 0;
+            double top = 0;
+            for (int t = 0; t < steps; t++) {
+                for (int i = 0; i < vocab; i++) {
+                    worst = Math.max(worst, Math.abs(logits[0][t][i] - logits[1][t][i]));
+                    top = Math.max(top, Math.abs(logits[0][t][i]));
+                }
+                agree += argmax(logits[0][t]) == argmax(logits[1][t]) ? 1 : 0;
+            }
+            int selDiffer = 0;
+            int blocksDiffer = 0;
+            int total = 0;
+            for (int t = 0; t < steps; t++) {
+                for (int g = 0; picked[0][t] != null && picked[1][t] != null && g < picked[0][t].length; g++) {
+                    java.util.Set<Integer> a = new java.util.HashSet<>();
+                    for (int x : picked[0][t][g]) {
+                        a.add(x);
+                    }
+                    int miss = 0;
+                    for (int x : picked[1][t][g]) {
+                        miss += a.contains(x) ? 0 : 1;
+                    }
+                    selDiffer += miss > 0 ? 1 : 0;
+                    blocksDiffer += miss;
+                    total++;
+                }
+            }
+            System.out.printf("# sparse check %s: last layer's selection, CPU against Metal: %d of %d (step, kv head) selections differ, %d blocks of %d%n",
+                    v, selDiffer, total, blocksDiffer, total * (picked[0][0] == null ? 0 : picked[0][0][0].length));
+            boolean replaySame = true;
+            for (int t = 0; t < steps; t++) {
+                replaySame &= java.util.Arrays.equals(logits[1][t], logits[2][t]);
+            }
+            System.out.printf(Locale.ROOT, "# sparse check %s, %d tokens: CPU vs Metal max |logit difference| %.4f (largest logit %.2f), arg max equal %d/%d;"
+                    + " Metal with decode replay on = off bit for bit: %s%n", v, len, worst, top, agree, steps, replaySame);
+            String denseV = v.substring(0, v.indexOf('+')) + "+p";
+            float[][][] d = new float[2][8][vocab];
+            for (int run = 0; run < 2; run++) {
+                backendName = names[run];
+                try (Backend b = open(denseV)) {
+                    float[] lg = new float[vocab];
+                    prefill(b, java.util.Arrays.copyOf(text, len), lg);
+                    for (int t = 0; t < 8; t++) {
+                        System.arraycopy(lg, 0, d[run][t], 0, vocab);
+                        b.forward(text, len + t, 1, len + t, lg);
+                    }
+                }
+            }
+            double dw = 0;
+            for (int t = 0; t < 8; t++) {
+                for (int i = 0; i < vocab; i++) {
+                    dw = Math.max(dw, Math.abs(d[0][t][i] - d[1][t][i]));
+                }
+            }
+            System.out.printf(Locale.ROOT, "# sparse check: for reference, dense paged %s CPU vs Metal over 8 steps: max |logit difference| %.4f%n", denseV, dw);
+            backendName = "metal";
+            String dense = v.substring(0, v.indexOf('+')) + "+p";
+            System.out.printf(Locale.ROOT, "# sparse check: a verification chunk of 8 rows against 8 decode steps (Metal), largest logit difference:"
+                    + " sparse %s %.2e, dense %s %.2e (the 8-row projections round differently from one-row ones)%n", v,
+                    chunkVsSteps(text, len, v), dense, chunkVsSteps(text, len, dense));
+            backendName = saved;
+        }
+
+        double chunkVsSteps(int[] text, int len, String v) {
+            float[] one = new float[vocab];
+            float[] rows = new float[8 * vocab];
+            float[] step = new float[vocab];
+            double worst = 0;
+            try (Backend b = open(v)) {
+                prefill(b, java.util.Arrays.copyOf(text, len), one);
+                b.forwardAll(text, len, 8, len, rows, vocab);
+            }
+            try (Backend b = open(v)) {
+                prefill(b, java.util.Arrays.copyOf(text, len), one);
+                for (int t = 0; t < 8; t++) {
+                    b.forward(text, len + t, 1, len + t, step);
+                    for (int i = 0; i < vocab; i++) {
+                        worst = Math.max(worst, Math.abs(step[i] - rows[t * vocab + i]));
+                    }
+                }
+            }
+            return worst;
+        }
+
+        /** Teacher-forced decode perplexity: see the class comment ({@code decodeppl}). */
+        void decodePpl(String[] variants, int len, String textFile, int tailTokens) throws Exception {
+            int[] all = tok.encode(Files.readString(Path.of(textFile)));
+            if (all.length < len) {
+                throw new IllegalArgumentException(textFile + " has only " + all.length + " tokens, " + len + " wanted");
+            }
+            int[] text = java.util.Arrays.copyOf(all, len);
+            int pre = len - tailTokens;
+            float[][] ref = new float[tailTokens][];
+            System.out.printf("%n# decode perplexity, context %d, the last %d tokens scored one decode step at a time%n", len, tailTokens);
+            System.out.println("| cache | mean log-prob | perplexity | mean log-prob difference vs the first | mean abs logit difference"
+                    + " | mean KL (nats) | arg max agreement |");
+            System.out.println("|---|---|---|---|---|---|---|");
+            double refMean = 0;
+            for (int vi = 0; vi < variants.length; vi++) {
+                float[] logits = new float[vocab];
+                double sum = 0;
+                double dAbs = 0;
+                double dKl = 0;
+                int agree = 0;
+                try (Backend b = open(variants[vi])) {
+                    int saved = tail;
+                    tail = 0;
+                    int[] head = java.util.Arrays.copyOf(text, pre);
+                    prefill(b, head, logits);
+                    tail = saved;
+                    for (int t = 0; t < tailTokens; t++) {
+                        sum += logSoftmax(logits, 0, text[pre + t]);
+                        if (vi == 0) {
+                            ref[t] = logits.clone();
+                        } else {
+                            double[] d = diff(ref[t], logits);
+                            dAbs += d[0];
+                            dKl += d[3];
+                            agree += argmax(ref[t]) == argmax(logits) ? 1 : 0;
+                        }
+                        if (t + 1 < tailTokens) {
+                            b.forward(text, pre + t, 1, pre + t, logits);
+                        }
+                    }
+                }
+                double mean = sum / tailTokens;
+                if (vi == 0) {
+                    refMean = mean;
+                }
+                if (vi == 0) {
+                    System.out.printf(Locale.ROOT, "| %s | %.4f | %.4f | reference | | | |%n", variants[vi], mean, Math.exp(-mean));
+                } else {
+                    System.out.printf(Locale.ROOT, "| %s | %.4f | %.4f | %+.5f | %.5f | %.5f | %.1f%% |%n", variants[vi], mean,
+                            Math.exp(-mean), mean - refMean, dAbs / tailTokens, dKl / tailTokens, 100.0 * agree / tailTokens);
+                }
+                System.out.flush();
             }
         }
 
