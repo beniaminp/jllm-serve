@@ -1182,7 +1182,7 @@ final class MetalKernels implements AutoCloseable {
 
     /** Whether {@code attention_fa} exists for this head width. */
     static boolean flashPrefillFits(int headDim) {
-        return headDim == 64 || headDim == 128 || headDim == 256;
+        return headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512;
     }
 
     /**
@@ -1245,11 +1245,14 @@ final class MetalKernels implements AutoCloseable {
 
     /** Whether {@code attention_dec} exists for this head width. */
     static boolean decodeAttentionFits(int headDim) {
-        return headDim == 64 || headDim == 128 || headDim == 256;
+        return headDim == 64 || headDim == 128 || headDim == 256 || headDim == 512;
     }
 
     /** Query heads per attention_dec threadgroup: they share each K/V row; bounded by the registers (o and q per head). */
     static int decGroup(int nHeads, int nKvHeads, int headDim) {
+        if (headDim == 512) {
+            return 1; // only the G = 1 d512 decode instantiations exist (G = 2 would double 16 float4 per lane)
+        }
         int ratio = nHeads / nKvHeads;
         int max = DEC_GROUP > 0 ? DEC_GROUP : (headDim <= 64 ? 4 : 2);
         int g = 1;

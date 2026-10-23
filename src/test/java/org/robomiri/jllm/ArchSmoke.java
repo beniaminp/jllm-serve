@@ -224,10 +224,6 @@ public final class ArchSmoke {
             if (!metal) {
                 return failures;
             }
-            if (cfg instanceof Decoder d && !d.uniformShape()) {
-                System.out.println("  metal skipped: the layers have different attention head shapes");
-                return failures;
-            }
             if (cfg instanceof Decoder d && d.attention().headDim() % 32 != 0) {
                 System.out.println("  metal skipped: headDim " + d.attention().headDim() + " is not a multiple of 32");
                 return failures;
@@ -260,7 +256,9 @@ public final class ArchSmoke {
             }
             if (!mamba && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += q8Check(w, lib, cfg, cpu, KvDtype.Q8, 0);
-                if (Q4) {
+                // q4 needs one row layout for every layer: per-layer head shapes fall back to q8 on Metal
+                boolean uniform = ((Decoder) cfg).uniformShape();
+                if (Q4 && uniform) {
                     failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 0);
                     failures += q8Check(w, lib, cfg, cpu, KvDtype.Q4, 4);
                 }
@@ -276,7 +274,7 @@ public final class ArchSmoke {
                     failures += replayBatchCheck(w, lib, cfg, KvDtype.Q8);
                 }
                 // q4: without a window, and with one short enough that decode steps cross from the ring to the q4 rows
-                for (int recent : Q4 ? new int[]{0, 6} : new int[0]) {
+                for (int recent : Q4 && uniform ? new int[]{0, 6} : new int[0]) {
                     KvDtype.setQ4Recent(recent);
                     try {
                         failures += replayCheck(w, lib, cfg, KvDtype.Q4);
@@ -284,7 +282,7 @@ public final class ArchSmoke {
                         KvDtype.setQ4Recent(KvDtype.Q4_RECENT_DEFAULT);
                     }
                 }
-                if (Q4) {
+                if (Q4 && uniform) {
                     failures += replayBatchCheck(w, lib, cfg, KvDtype.Q4);
                 }
                 if (replayF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense")) {
@@ -294,7 +292,8 @@ public final class ArchSmoke {
             // q8 with Hadamard-rotated keys (backend.kv-q8-rotate), where the attention is standard with whole groups of 32:
             // CPU against Metal, decode replay (alone and batched), saved / copied caches; the batched decode and the draft
             // speculation of the rotated cache are cases of batchCheck / draftCheck above
-            if (!mamba && !hybrid && cfg instanceof Decoder rd && rd.attention() instanceof Attention.Gqa rg
+            if (!mamba && !hybrid && cfg instanceof Decoder rd && rd.uniformShape()
+                    && rd.attention() instanceof Attention.Gqa rg
                     && KvQ4.supports(rg.headDim()) && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 System.out.println("  --- q8 with rotated keys ---");
                 KvDtype.setQ8Rotate(true);
@@ -310,7 +309,8 @@ public final class ArchSmoke {
                     KvDtype.setQ8Rotate(false);
                 }
             }
-            if (!mamba && cfg instanceof Decoder dec && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
+            // (per-layer head shapes have no single saved row format on either backend)
+            if (!mamba && cfg instanceof Decoder dec && dec.uniformShape() && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) { // standard and latent (MLA) caches alike
                 boolean latent = dec.attention() instanceof Attention.Mla;
                 for (KvDtype dt : KvDtype.values()) {
                     if (!(latent && (dt == KvDtype.Q8 || dt == KvDtype.Q4))) { // a q8 latent cache is not saved (q4 is served as q8 there)
@@ -1384,7 +1384,8 @@ public final class ArchSmoke {
             cases.add(new Object[]{dt.toString(), dt, MoeSplit.OFF});
         }
         // (not in the forced-MMA pass: a batched pass and a lone step take different matmul kernels there, and a rotated int8 code flips)
-        if (Q4 && ((Decoder) cfg).attention() instanceof Attention.Gqa rg && KvQ4.supports(rg.headDim())) {
+        if (Q4 && ((Decoder) cfg).uniformShape() && ((Decoder) cfg).attention() instanceof Attention.Gqa rg
+                && KvQ4.supports(rg.headDim())) {
             cases.add(new Object[]{"Q8, rotated keys", KvDtype.Q8, MoeSplit.OFF}); // backend.kv-q8-rotate: rows rotate their own q
         }
         if (((Decoder) cfg).anyMoe()) {
