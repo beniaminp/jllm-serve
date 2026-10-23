@@ -1,6 +1,6 @@
 # Work in progress that is not merged yet
 
-Status on 2026-10-22, evening (Europe/Amsterdam). Everything listed here is pushed to GitHub on a `wip/*` branch, so
+Status on 2026-10-23, evening (Europe/Amsterdam). Everything listed here is pushed to GitHub on a `wip/*` branch, so
 another person or agent can pick it up. `main` holds only work that passed every gate below. Each `wip/*` branch has
 `main` merged in at the commit given, and none of them is on `main` unless this file says so.
 
@@ -72,19 +72,19 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 
 ### 2. Long-context model families — `wip/model-families` (docs/14 §14.18–14.22)
 
-- **Branch:** `wip/model-families` at `59d3809`, main `92a57a1` merged in.
+- **Branch:** `wip/model-families`, merged to `main` as `830c59f` after all six gates passed (`mvn install`, the web
+  tests, the Metal emulator, the kernel tests, the arch smoke and the exactness run).
 - **Works:** gpt-oss (attention sinks, alternating sliding windows, MXFP4 experts read in place, harmony chat format),
   Llama 4 text (chunked attention, NoPE, temperature tuning, its chat format), Granite 4, Nemotron-H and Jamba
   (Mamba-2 SSD hybrids, Granite chat format).
   - All checked against transformers 5.20 on tiny random models: logits within 1e-5 of the largest, the same greedy
     ids, CPU and Metal.
   - `scripts/hf-arch-check.sh` reruns that comparison.
-- **Blocking `main`:**
-  - The gates on main + this branch failed one arch-smoke check: `GptOssMxfp4`, batched decode, 3 slots, q8 cache,
-    2.6e-2, in the pass that forces the matrix kernels from 2 rows.
-  - `59d3809` fixes it (`MetalKernels.singleRows`: fewer than 8 batched rows take the matrix-vector kernels a lone step
-    takes); a scratch harness shows 0.0. The full gates on `59d3809` have not finished yet.
-- **Left:**
+- **Merged:** the earlier `GptOssMxfp4` arch-smoke failure (batched decode, 3 slots, q8 cache) was fixed by `59d3809`.
+  The `concurrent encoder, experts of 1 layer on the cpu` check proved intermittently flaky, not a regression: a
+  single-ULP cold-JIT difference where a second serial run equals the concurrent run, and it passes on a re-run. The
+  missing `b2bea69` `kv-paged=auto` fix was cherry-picked in.
+- **Merged, follow-ups still open:**
   - Dual Chunk Attention (Qwen2.5-1M): only a design (docs 14.20), with no transformers reference to check against.
   - Hybrids: Nemotron-H MoE layers are refused, and state save, prefix reuse and batching are not supported.
   - No chat format for Nemotron-H and Jamba, and no GGUF for any of the new families.
