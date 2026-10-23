@@ -197,8 +197,7 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - The Turbo defaults are chosen by the model folder name only.
   - AnimateDiff clips are flat or smeared with plain SD 1.5; a fine-tuned SD 1.5 base (`video.base-model`) is needed.
   - Wan has never run end to end: its UMT5 encoder is only published as 22.7 GB fp32, which the download cap excluded.
-- **Audio:** OuteText on `Don't panic: it's "fine".` drops the colon, the closing quote and the period; check against the
-  Python `outetts` package.
+- **Audio:** OuteText's text front end already equals the Python `outetts` TextProcessor on the reference sentences (the closing quote + adjacent comma/period and the colon are dropped in both, via AudioTest's `outetext-ref.json`); checked, no change needed.
 - **Plan (`wip/NEXT-PROMPT.md`):**
   - Stage 0 item 6: the arm64 Docker image was not built or run on a Mac (Docker Desktop was not running).
   - Stage 1 agent 2: tree speculation (optional).
