@@ -1297,7 +1297,7 @@ final class MetalKernels implements AutoCloseable {
     }
 
 
-    // ---------------------------------------------------------------- sparse decode attention (docs/26)
+    // ---------------------------------------------------------------- sparse decode attention (docs/27)
 
     /** Blocks one {@code sparse_score} threadgroup scores (four simdgroups, two blocks each). */
     static final int SPARSE_PER_GROUP = 8;
@@ -1322,7 +1322,7 @@ final class MetalKernels implements AutoCloseable {
     }
 
     /**
-     * Attention of the token at {@code pos} over the blocks its query selects (docs/26): {@code sparse_score} bounds every
+     * Attention of the token at {@code pos} over the blocks its query selects (docs/27): {@code sparse_score} bounds every
      * block with the query, {@code sparse_select} picks the sinks, the best {@code cfg.blocks()} candidates and the window
      * per kv head, and {@code attention_dec_sp} attends over them (partials in {@code part}, merged by
      * {@code attention_combine}). The caller has run {@link #kvSummary} for this position and checked that the context has

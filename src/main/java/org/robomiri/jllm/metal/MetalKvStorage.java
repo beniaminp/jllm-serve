@@ -19,7 +19,7 @@ import java.nio.ByteBuffer;
  * reserved up front, as the flat cache's was). They belong to a Metal context of their own, so a slot closing does not
  * free what the others use; every slot's encoder binds them.
  *
- * <p>With sparse decode attention ({@code backend.kv-sparse}, docs/26) every layer also has a buffer of <em>key
+ * <p>With sparse decode attention ({@code backend.kv-sparse}, docs/27) every layer also has a buffer of <em>key
  * summaries</em>: for block {@code b} and kv head {@code g}, {@code 2 * headDim} halves at
  * {@code (b * kvHeads + g) * 2 * headDim}: the per-channel minimum of the block's keys, then the maximum, rounded
  * outwards ({@link KvSummary}). The {@code kv_summary} kernel keeps them current as blocks are written; the host

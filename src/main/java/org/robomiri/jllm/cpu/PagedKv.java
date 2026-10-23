@@ -43,7 +43,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
     private final KvDtype dtype;
     private final int B;
     private final int pairs;
-    /** Sparse decode attention (docs/26); {@link KvSparse#OFF} unless the pool keeps key summaries. */
+    /** Sparse decode attention (docs/27); {@link KvSparse#OFF} unless the pool keeps key summaries. */
     private final KvSparse sparse;
 
     PagedKv(int layers, Attention.Gqa a, int ctx, CpuKvStorage st, KvSequence seq) {
@@ -528,7 +528,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         }
     }
 
-    // ------------------------------------------------------------------ sparse decode attention (docs/26)
+    // ------------------------------------------------------------------ sparse decode attention (docs/27)
 
     /** Set by tests and studies: {@link #lastSelection} receives the blocks each kv head attended in the last sparse row. */
     boolean recordSelection;

@@ -38,7 +38,7 @@ import java.util.Set;
  * [ctx=8192] [text=&lt;file&gt;] [ppl=2048] [lens=4096,8192] [trials=3] [lib=&lt;metal lib&gt;]. A variant {@code q4:R} has the recent
  * window R. Whether keys are rotated is decided by the JVM flag {@code -Djllm.kv.q4.rotate=false}.
  *
- * <p>Sparse decode attention (docs/26): a variant {@code f16+p} is the paged cache with dense attention, and
+ * <p>Sparse decode attention (docs/27): a variant {@code f16+p} is the paged cache with dense attention, and
  * {@code f16+sK[:sink[:window[:denseLayers]]]} the paged cache with sparse decode attention choosing K blocks (sink and
  * window in tokens, defaults 16 and 256; 2 dense layers). {@code needle} takes {@code tail=N}: the last N tokens of the
  * prompt (the question) are fed one at a time, as decode steps, so that they too attend sparsely (default 0: the prompt is
@@ -205,7 +205,7 @@ public final class KvStudy {
         }
 
         /**
-         * Consistency of sparse decode attention (docs/26) on the real model, {@code len} tokens of context, variant {@code v}
+         * Consistency of sparse decode attention (docs/27) on the real model, {@code len} tokens of context, variant {@code v}
          * (e.g. {@code f16+s16:16:64:2}): (1) CPU against Metal, logits of 24 teacher-forced decode steps; (2) Metal with decode
          * replay on against off, bit for bit; (3) Metal: a verification chunk of 8 rows against 8 decode steps, bit for bit.
          */

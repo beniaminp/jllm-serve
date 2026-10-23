@@ -1,4 +1,4 @@
-# 26. Sparse attention while decoding
+# 27. Sparse attention while decoding
 
 A decode step has one new token and a cache of everything before it, and plain attention reads **all** of that cache to produce
 one token: at 32 000 tokens the keys and values of Qwen3-0.6B are 3.7 GB in f16, read again for every word the model says. This
@@ -9,16 +9,16 @@ ones.
 
 | | | where |
 |---|---|---|
-| [26.1](#261-in-plain-words) | the idea, told as a story | |
-| [26.2](#262-how-it-works) | block summaries, the bound `q·k ≤ Σ max(q_i·lo_i, q_i·hi_i)` derived and worked with numbers, rotated keys, the selection, the exact attention over it, the CPU and Metal kernels, replay and batched rows | `kv/KvSummary`, `cpu/PagedKv`, `cpu/CpuKvStorage`, `metal/MetalKvStorage`, `kernels.metal` §4c |
-| [26.3](#263-why-this-design) | StreamingLLM, H2O, Quest, DuoAttention, and why this one; what it costs | |
-| [26.4](#264-settings) | `backend.kv-sparse`, `-blocks`, `-sink`, `-window`, `-dense-layers` | |
-| [26.5](#265-measured) | needle in a haystack at 8k, 16k and 32k, perplexity, decode speed against context length | `KvStudy`, `./jllm bench` |
-| [26.6](#266-checks-and-limits) | the tests, and what is not done | |
+| [27.1](#271-in-plain-words) | the idea, told as a story | |
+| [27.2](#272-how-it-works) | block summaries, the bound `q·k ≤ Σ max(q_i·lo_i, q_i·hi_i)` derived and worked with numbers, rotated keys, the selection, the exact attention over it, the CPU and Metal kernels, replay and batched rows | `kv/KvSummary`, `cpu/PagedKv`, `cpu/CpuKvStorage`, `metal/MetalKvStorage`, `kernels.metal` §4c |
+| [27.3](#273-why-this-design) | StreamingLLM, H2O, Quest, DuoAttention, and why this one; what it costs | |
+| [27.4](#274-settings) | `backend.kv-sparse`, `-blocks`, `-sink`, `-window`, `-dense-layers` | |
+| [27.5](#275-measured) | needle in a haystack at 8k, 16k and 32k, perplexity, decode speed against context length | `KvStudy`, `./jllm bench` |
+| [27.6](#276-checks-and-limits) | the tests, and what is not done | |
 
 ---
 
-## 26.1 In plain words
+## 27.1 In plain words
 
 🧸 You are looking for one sentence in a very long book, and you may glance at every page before you answer. That works, but a
 glance at 2 000 pages takes a long time, and you do it again for every word you say.
@@ -39,12 +39,12 @@ why it is off, and why this chapter measures how often a hidden fact is still fo
 
 ---
 
-## 26.2 How it works
+## 27.2 How it works
 
 📐 The running example is Qwen3-0.6B: 28 layers, 16 query heads over 8 kv heads of `headDim = 128`, blocks of `B = 16`
 positions (chapter 24). Everything here is per layer and per kv head: the two query heads of a group share the kv head's blocks.
 
-### 26.2.1 The block summary
+### 27.2.1 The block summary
 
 For one layer, one kv head and one block, the summary is two vectors of `headDim` numbers, the **per-channel minimum** and
 the **per-channel maximum** of the block's keys:
@@ -74,7 +74,7 @@ Metal, summary buffer:      sums[layer] = half[maxBlocks][kvHeads][2][headDim]  
 
 **What it is computed from.** The summary is of the keys **as stored**: the dequantized values for f16 and q8, and for the q8
 cache with **rotated keys** (`backend.kv-q8-rotate`, the default for q8) the **rotated** and then quantized keys, in the
-rotated basis. Section 26.2.3 explains the choice.
+rotated basis. Section 27.2.3 explains the choice.
 
 **When it is updated.** Every time keys are stored (a prefill chunk, a decode step, a batched row, a verification chunk) the summaries of the blocks
 that were touched are **recomputed from their valid rows** (`KvCache.store` on the CPU, the `kv_summary` kernel on Metal),
@@ -84,7 +84,7 @@ conversation is retried in the middle of a block): a merge would keep the dead r
 (`CpuKvStorage.updateSummary`, `MetalKvStorage.updateSummary`); a saved cache that is loaded grows the summary row by row
 (`mergeSummaryRow`) or recomputes it.
 
-### 26.2.2 The bound: `q·k ≤ Σ max(q_i·lo_i, q_i·hi_i)`
+### 27.2.2 The bound: `q·k ≤ Σ max(q_i·lo_i, q_i·hi_i)`
 
 **Claim.** If every key `k` of a block satisfies `lo_i ≤ k_i ≤ hi_i` in every channel, then for any query `q`
 
@@ -122,9 +122,9 @@ the soft-cap and the softmax are monotone in the score and need not be applied f
 
 **Cost of the bound.** Per block and kv head it reads the 512-byte summary instead of the block's keys (2 048 B in q8, 4 096 B in f16,
 8 192 B in f32): **a quarter, an eighth, a sixteenth** of the key traffic, with `2 · headDim` multiplications per query head. It
-is still linear in the context (the cards must all be read); 26.3 says what a hierarchy of cards would do.
+is still linear in the context (the cards must all be read); 27.3 says what a hierarchy of cards would do.
 
-### 26.2.3 Rotated keys: summaries before or after the rotation?
+### 27.2.3 Rotated keys: summaries before or after the rotation?
 
 With `backend.kv-q8-rotate` the cache stores `H k` (the Walsh–Hadamard transform of the key head, then quantized) and the attention
 computes `(Hq)·(Hk) / B`, where `H` is the unnormalised transform and `B = headDim`: `(Hq)·(Hk) = B q·k`, because `H Hᵀ = B I`
@@ -142,9 +142,9 @@ about a dot product with a box. Two choices:
 The costs of the choice: the rotated box is a *rotated* box in the original space, so it can be looser or tighter than the
 unrotated one. The rotation spreads a loud channel over all channels (which is why it helps quantization): the per-channel ranges
 become more uniform, the original box's few wide channels (where Quest's bound is tight, because the query's weight on them is
-small or large) disappear. The retrieval table in 26.5 measures both with the same selection settings.
+small or large) disappear. The retrieval table in 27.5 measures both with the same selection settings.
 
-### 26.2.4 The selection
+### 27.2.4 The selection
 
 For the token at position `p` (block `nb = p ÷ B + 1` counting the one that holds it):
 
@@ -164,7 +164,7 @@ Worked example, `B = 16`, `sink = 1`, `window = 2` (32 tokens), `K = 3`, a token
 Say the largest bounds are blocks 17 (91.2), 30 (88.0), 3 (87.5) and 22 (60.1). Selected: `[0, 3, 17, 30, 42, 43]` — the sink, the top three, the
 window — **93 keys (five full blocks and 13 rows of the last), of the 701 the dense step reads**. The token attends exactly over those 93 keys (the last block holds `700 mod 16 + 1 = 13` rows).
 
-### 26.2.5 Attention over the selection
+### 27.2.5 Attention over the selection
 
 Exactly dense attention, over fewer keys: scores `s_j = scale · q·k_j` for the keys of the selected blocks, the soft-cap if the model has
 one, a softmax over **those** keys, and the weighted sum of their values. The CPU gathers each selected block's keys (and later
@@ -178,7 +178,7 @@ argument of the kernel body (`dec_body<…, SP>` in `kernels.metal`, the dense k
 offset by the kv head; the work is split over `min(24, ceil(budget·B / 32))` simdgroups per head group, a number that does **not**
 depend on the position.
 
-### 26.2.6 The kernels, in the order a decode step runs them (per sparse layer)
+### 27.2.6 The kernels, in the order a decode step runs them (per sparse layer)
 
 ```
  store k, v        (rope_store_q8r / kv_store_*)           the position's key and value rows go into the block table's rows
@@ -212,7 +212,7 @@ the tail of a prompt. A prefill chunk of 16 or more tokens is **dense**, and so 
 
 ---
 
-## 26.3 Why this design
+## 27.3 Why this design
 
 The question is which keys a token may skip. The published answers:
 
@@ -220,7 +220,7 @@ The question is which keys a token may skip. The published answers:
 |---|---|---|---|
 | **StreamingLLM** (Xiao et al. 2023) | the first few tokens (sinks) and a sliding window | nothing | cheap and simple, but it *forgets* the middle: a fact 20 000 tokens back is gone. We keep its two ideas (sinks, recent window) as the always-attended part. |
 | **H2O** (Zhang et al. 2023) | the "heavy hitters": tokens with the largest accumulated attention so far, plus the recent window; the rest is *evicted* | attention scores of every step, per head | evicts permanently, so a token that is irrelevant now and essential later is lost; needs the attention matrix (or its row sums), which flash-style kernels never materialise. |
-| **Quest** (Tang et al. 2024) | everything stays; each step picks pages by a query-aware bound from per-page key min / max | the summaries | nothing is lost, the choice is made again for every token and the query. **Chosen**, with the bound of 26.2.2. |
+| **Quest** (Tang et al. 2024) | everything stays; each step picks pages by a query-aware bound from per-page key min / max | the summaries | nothing is lost, the choice is made again for every token and the query. **Chosen**, with the bound of 27.2.2. |
 | **DuoAttention** (Xiao et al. 2024) | per head: *retrieval* heads keep the full cache, *streaming* heads keep sinks + window | an offline calibration that classifies heads | a per-model training step and a different cache size per head; it composes with the paged cache but needs data we do not ship. Not done. |
 
 Choices inside Quest:
@@ -239,11 +239,11 @@ Choices inside Quest:
 
 **Costs.** Memory: 3.1 % (f32), 6.3 % (f16) or 12.1 % (q8) more per position. Time: three more dispatches per sparse layer, and the bound
 is **linear** in the context (every block's summary is read each step), so at very long contexts the cards themselves dominate: at 1M tokens
-65 536 blocks · 28 layers · 4 096 B = 7.5 GB of summaries read per token. A second level (a summary of 64 blocks, scored first, then the blocks of the best groups) would make it sub-linear; it is not built (26.6). Accuracy: lossy; the tables in 26.5.
+65 536 blocks · 28 layers · 4 096 B = 7.5 GB of summaries read per token. A second level (a summary of 64 blocks, scored first, then the blocks of the best groups) would make it sub-linear; it is not built (27.6). Accuracy: lossy; the tables in 27.5.
 
 ---
 
-## 26.4 Settings
+## 27.4 Settings
 
 | key | default | |
 |---|---|---|
@@ -258,12 +258,12 @@ The values are the model loader's (`ModelLoader.sparse`); a pool is created for 
 
 ---
 
-## 26.5 Measured
+## 27.5 Measured
 
 Machine: Apple M1 Pro, 10 cores, 32 GB, macOS, 2026-10-22, Qwen3-0.6B (Q4_0 weights), shared with other jobs (the speed rows are taken under the heavy-job lock).
 Tool: `src/test/java/org/robomiri/jllm/KvStudy.java` (`needle`, `decodeppl`, `sparsecheck`) and `./jllm bench`.
 
-### 26.5.1 What was checked first: the sparse step against the dense one
+### 27.5.1 What was checked first: the sparse step against the dense one
 
 `KvStudy sparsecheck` (3 000 tokens of context, 16 chosen blocks, 64-token window, 24 teacher-forced decode steps, `ctx=4096 batch=256`), Metal:
 
@@ -275,7 +275,7 @@ Tool: `src/test/java/org/robomiri/jllm/KvStudy.java` (`needle`, `decodeppl`, `sp
 
 Replay and chunks behave as they do with dense attention (the verification difference is the 8-row projections' rounding, equal for dense and sparse in f32 and f16). CPU and Metal add the bound's terms in a different order, which can put a block on the other side of the cut; the follow-up measurements count the selections that differ and give the dense CPU-vs-Metal difference for comparison (`KvStudy sparsecheck` prints both).
 
-### 26.5.2 Decode perplexity (Metal, Qwen3-0.6B, 2026-10-22)
+### 27.5.2 Decode perplexity (Metal, Qwen3-0.6B, 2026-10-22)
 
 Teacher-forced: the first `L - 512` tokens of a long document (docs 01, 05, 06, 07, 04, 03 concatenated, 330 KB; its later chapters repeat earlier material,
 which is why the perplexity falls with the length) are prefilled in dense chunks, then the last 512 tokens are fed **one decode step at a time** and each
@@ -321,9 +321,9 @@ $JAVA -cp target/classes:target/test-classes org.robomiri.jllm.KvStudy decodeppl
 
 ---
 
-## 26.6 Checks and limits
+## 27.6 Checks and limits
 
-Verified by (all in `mvn -o install`, `scripts/metal-emu/kernel_tests.py` and the studies of 26.5):
+Verified by (all in `mvn -o install`, `scripts/metal-emu/kernel_tests.py` and the studies of 27.5):
 
 * `cpu/SparseKvTest` (no model, 1 405 checks, `mvn -o install`): the outward rounding of halves; the stored summary of every block is
   bit for bit the outward-rounded min / max of the dequantized valid rows, for f32, f16, q8 and q8 with rotated keys, head widths 64 and 128, group sizes
@@ -335,12 +335,12 @@ Verified by (all in `mvn -o install`, `scripts/metal-emu/kernel_tests.py` and th
   positions); `sparse_select` (random, tied, all-equal and wide-range scores, 40 … 5 000 blocks, top 1 … 64, no sink, no window: the set, the order and the physical ids equal numpy's); `attention_dec_sp`
   for f32 / f16 / q8 at 1, 3, 5 splits, soft-cap, the token in the first and last row of its block; and the four kernels in a row against a numpy implementation of the whole step with a planted key.
 * `MetalParamsTest`: the four new parameter structs against `KernelParams`.
-* `KvStudy sparsecheck` on Qwen3-0.6B: CPU and Metal logits of 24 decode steps at 3 000 tokens, decode replay on against off, a verification chunk against decode steps (26.5.4).
+* `KvStudy sparsecheck` on Qwen3-0.6B: CPU and Metal logits of 24 decode steps at 3 000 tokens, decode replay on against off, a verification chunk against decode steps (27.5.4).
 * Off means off: with `backend.kv-sparse=false` no summary region is allocated, no kernel is dispatched and no code path of the paged cache differs (the md5 gate and `PagedKvTest` are unchanged).
 
 **Not done / limits.**
 
-* **The scan of the summaries is linear in the context** (a quarter to a sixteenth of the key traffic, 26.2.2). At a million tokens it is 7.5 GB per token for Qwen3-0.6B; a two-level scheme (a summary of 64 blocks scored first) would make it sub-linear. Not built.
+* **The scan of the summaries is linear in the context** (a quarter to a sixteenth of the key traffic, 27.2.2). At a million tokens it is 7.5 GB per token for Qwen3-0.6B; a two-level scheme (a summary of 64 blocks scored first) would make it sub-linear. Not built.
 * **No tiered storage yet:** the blocks a step does not select stay in memory. Sparse attention is the first half of "read less"; moving cold blocks out of RAM / VRAM (the next item of `wip/NEXT-PROMPT.md` Stage 2) needs the selection to run ahead of the read.
 * **Prefill is dense**, including the part of a long prompt that runs in chunks of 16 or more; only steps of fewer than 16 tokens select. Sparse prefill is its own item.
 * **Per kv head, shared by the query-head group:** a head that needs a block its group mates do not still gets it (the group's maximum), at the price of reading blocks one head wanted for all.

@@ -12,7 +12,7 @@ import java.util.Arrays;
 import java.util.Random;
 
 /**
- * Sparse decode attention on the CPU (docs/26), no model needed. For every cache type (f32, f16, q8, q8 with rotated keys),
+ * Sparse decode attention on the CPU (docs/27), no model needed. For every cache type (f32, f16, q8, q8 with rotated keys),
  * head width, group size and block size:
  * <ul>
  * <li>the stored key summary of a block is the per-channel minimum and maximum of the dequantized rows that are valid,

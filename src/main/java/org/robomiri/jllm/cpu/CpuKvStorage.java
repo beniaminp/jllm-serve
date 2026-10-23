@@ -23,7 +23,7 @@ import java.nio.ByteOrder;
  *      then K scales float [kvHead][B]     V scales float [B][kvHead]
  * </pre>
  *
- * With sparse decode attention ({@code backend.kv-sparse}, docs/26) every layer of a block ends with a third region, the
+ * With sparse decode attention ({@code backend.kv-sparse}, docs/27) every layer of a block ends with a third region, the
  * block's <em>key summary</em>: per kv head the minimum then the maximum of each key channel over the block's rows, as
  * halves rounded outwards ({@link org.robomiri.jllm.kv.KvSummary}), packed two channels to an {@code int} like the f16
  * keys: {@code int [kvHead][2][pairs]} (all minima, then all maxima). It is computed from the values <em>as stored</em>

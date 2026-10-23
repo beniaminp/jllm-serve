@@ -1,7 +1,7 @@
 package org.robomiri.jllm.kv;
 
 /**
- * The arithmetic of block summaries for sparse decode attention (docs/26), shared by the CPU and Metal backends and by
+ * The arithmetic of block summaries for sparse decode attention (docs/27), shared by the CPU and Metal backends and by
  * the tests: the per-channel minimum and maximum of a block's keys, stored as IEEE halves rounded <em>outwards</em> (the
  * minimum down, the maximum up) so that the stored box always contains the real keys, the upper bound of
  * {@code q·k} built on it, and the total order in which blocks are ranked.

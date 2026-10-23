@@ -1,7 +1,7 @@
 package org.robomiri.jllm.model;
 
 /**
- * Sparse attention while decoding (docs/26): a decode step attends exactly over the blocks of the paged KV cache that
+ * Sparse attention while decoding (docs/27): a decode step attends exactly over the blocks of the paged KV cache that
  * a cheap upper bound of {@code q·k} ranks highest, plus the first blocks (attention sinks) and the most recent ones.
  * Set once from the settings by the model loader ({@code backend.kv-sparse*}), read when a backend or a block pool is
  * built, like {@link KvDtype#q8Rotate()}; off by default, and off means nothing below is ever consulted.

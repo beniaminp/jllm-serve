@@ -111,7 +111,7 @@ public final class ContextBudget {
         KvDtype kv = KvDtype.parse(s.get("backend.kv-dtype"));
         long per = bytesPerToken(arch, kv);
         if (s.getBool("backend.kv-sparse") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa g) {
-            // sparse decode attention (docs/26): every block also keeps a min / max key summary of halves per layer and kv head
+            // sparse decode attention (docs/27): every block also keeps a min / max key summary of halves per layer and kv head
             per += (long) d.core().layers() * g.kvHeads() * 2 * g.headDim() * 2 / s.getInt("backend.kv-block");
         }
         long weights = w.byteSize();

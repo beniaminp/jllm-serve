@@ -153,7 +153,7 @@ bench "paged KV cache, 64-token blocks" "$DENSE" "" --backend.kv-paged true --ba
 bench "~3000-token prompt: flat KV cache" "$DENSE" "" --bench.prompt-repeat 300 --engine.speculative off
 bench "~3000-token prompt: paged KV cache" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
 bench "~3000-token prompt: paged KV cache, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off
-# sparse decode attention on the paged cache (docs/26): a decode step bounds q.k of every block with its key summary and
+# sparse decode attention on the paged cache (docs/27): a decode step bounds q.k of every block with its key summary and
 # attends over the best blocks, the first block and the recent window; off by default. Same prompts, dense paged against
 # sparse (16 chosen blocks: the context passes the budget of 33 blocks at ~530 positions; the default 64 blocks at ~1300)
 bench "~3000-token prompt: paged KV cache, dense attention" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-paged true --engine.speculative off

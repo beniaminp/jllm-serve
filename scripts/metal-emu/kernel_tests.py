@@ -1844,7 +1844,7 @@ split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
 
-# ---------------------------------------------------------------------------------------------- sparse decode attention (docs/26)
+# ---------------------------------------------------------------------------------------------- sparse decode attention (docs/27)
 # kv_summary, sparse_score, sparse_select and attention_dec_sp: the block summaries of a paged cache, the Quest bound, the
 # top-k selection and the attention over the selected blocks, each against numpy, then the four in a row against a numpy
 # implementation of the whole step.

@@ -49,7 +49,7 @@ public final class CpuBackend implements Backend {
     /** The key/value cache of the grouped-query layers; null for a latent-attention model. */
     private final KvCache kv;
 
-    /** For tests and studies (docs/26): the blocks the last sparse row selected per kv head, if {@code record} was asked of {@link #recordSparseSelection}. */
+    /** For tests and studies (docs/27): the blocks the last sparse row selected per kv head, if {@code record} was asked of {@link #recordSparseSelection}. */
     public int[][] lastSparseSelection() {
         return kv instanceof PagedKv p ? p.lastSelection : null;
     }

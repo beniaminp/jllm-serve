@@ -92,7 +92,7 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     no paged cache (they fall back to flat), no chunk-limited cache for Llama 4.
   - No real weights have been run, so there are no speed numbers.
 
-### 3. Sparse decode attention — `wip/sparse-attention` (docs/26)
+### 3. Sparse decode attention — `wip/sparse-attention` (docs/27)
 
 - **Branch:** `wip/sparse-attention` at `9a41c17`, main `e951fc7` merged in.
 - **Works (`backend.kv-sparse`, off by default; it turns on the paged cache):**
@@ -101,7 +101,7 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - wired into decode, short verification chunks, batched rows, replay and saved caches;
   - checks: `cpu/SparseKvTest` (1405 checks, in `mvn install`), the kernel_tests sparse section, and `KvStudy
     sparsecheck` on the real GPU (replay on = off bit for bit);
-  - perplexity at 8k/16k/32k is in docs/26 §26.5.2.
+  - perplexity at 8k/16k/32k is in docs/27 §27.5.2.
 - **Left:** the gates on this branch, the needle-in-a-haystack tables at 8k/16k/32k, decode tok/s against context
   length, and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
 - **Known:** CPU and Metal sparse logits differ by up to 0.4–2.8, because a rounding-order difference flips which block

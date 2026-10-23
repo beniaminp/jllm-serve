@@ -1871,7 +1871,7 @@ static inline void ldw(device const half *p, thread float4 *o) {
 template <int W>
 static inline void ldw(device const char *p, thread float4 *o) { o[0] = float4(*(device const char4 *)p); }
 
-// The body of attention_dec, shared by the dense kernel and the sparse one (docs/26): with SP the "cache" is the list of
+// The body of attention_dec, shared by the dense kernel and the sparse one (docs/27): with SP the "cache" is the list of
 // blocks sparse_select chose for each kv head (tbl + kvh * selStride, physical block ids in ascending logical order,
 // the last one holding the token), so a key s of the virtual sequence of selBlocks blocks is row
 // (tb[s >> pageShift] << pageShift) | (s & mask) of the pool. P is AttnSplitParams or AttnDecSpParams.
@@ -2040,7 +2040,7 @@ kernel void attention_dec(device const float *q [[buffer(0)]],
     dec_body<KV, G, D, W, false, AttnSplitParams>(q, kc, vc, part, out, tbl, p, 0, 0, tgp, sg, lane);
 }
 
-// attention_dec over the blocks sparse_select chose (docs/26): tbl is the selection (nKvHeads rows of selStride block ids),
+// attention_dec over the blocks sparse_select chose (docs/27): tbl is the selection (nKvHeads rows of selStride block ids),
 // selBlocks the number of selected blocks. Buffers: q(0) kc(1) vc(2) part(3) out(4) sel(5), AttnDecSpParams(6).
 struct AttnDecSpParams {
     int nHeads;
@@ -2092,7 +2092,7 @@ DEC_INST_KV(1, 128) DEC_INST_KV(2, 128) DEC_INST_KV(4, 128)
 DEC_INST_KV(1, 256) DEC_INST_KV(2, 256)
 
 // ---------------------------------------------------------------------------------------------- 4c. sparse decode attention
-// Sparse attention while decoding (docs/26, backend.kv-sparse; Quest-style block selection on the paged cache). Per pool
+// Sparse attention while decoding (docs/27, backend.kv-sparse; Quest-style block selection on the paged cache). Per pool
 // block, kv head and layer a SUMMARY of the block's keys is kept: for every channel the minimum and the maximum over the
 // block's valid rows, as halves rounded outwards (the minimum down, the maximum up), layout [block][kv head][lo[D], hi[D]].
 // For a query q and a block with summary (lo, hi): every key k of the block has lo_i <= k_i <= hi_i, and q_i k_i is linear in

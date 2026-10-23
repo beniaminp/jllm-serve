@@ -233,7 +233,7 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
-                    <!-- SparseKvTest: sparse decode attention on the CPU (docs/26): summaries, the bound, the selection, the output (no model). -->
+                    <!-- SparseKvTest: sparse decode attention on the CPU (docs/27): summaries, the bound, the selection, the output (no model). -->
                     <execution>
                         <id>sparse-kv-test</id>
                         <phase>test</phase>

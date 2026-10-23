@@ -80,7 +80,7 @@ public final class MetalBackend implements Backend {
     private Metal.Buffer pageTbl;
     private int pageShift;
     /**
-     * Sparse decode attention (docs/26, backend.kv-sparse) on the paged cache: the pool's per-layer key summaries, the
+     * Sparse decode attention (docs/27, backend.kv-sparse) on the paged cache: the pool's per-layer key summaries, the
      * scratch of the block scores and of the selection, and the configuration; {@code sparseOn} once the model and the
      * cache type allow it. A decode row with more blocks than the budget runs {@code sparse_score}, {@code sparse_select}
      * and {@code attention_dec_sp} (see {@link #decodeRow}); every other row is dense, exactly as with the switch off.
@@ -2708,7 +2708,7 @@ public final class MetalBackend implements Backend {
     }
 
     /**
-     * For tests and studies (docs/26): the logical blocks the last sparse decode step selected per kv head in the last sparse layer
+     * For tests and studies (docs/27): the logical blocks the last sparse decode step selected per kv head in the last sparse layer
      * it ran (sinks, chosen blocks, window, ascending), or null when sparse attention is off.
      */
     public int[][] lastSparseSelection() {
