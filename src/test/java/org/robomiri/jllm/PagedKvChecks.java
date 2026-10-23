@@ -150,21 +150,12 @@ final class PagedKvChecks {
     }
 
     /**
-     * The scripted passes, repeated until they agree (at most three times). A kernel's first calls (interpreted, or
-     * compiled at a lower tier) can round differently from its later ones, so even the flat cache can differ from itself
-     * on a repeat of the same call while the JVM is cold; a paging error fails every attempt.
+     * The scripted passes, once. The CPU kernels add their lanes in one fixed order in every JIT tier
+     * ({@code VectorKernels.laneSum}), so the first call from a cold JVM gives the same bits as the later ones and the paged
+     * cache must equal the flat one at once.
      */
     private void script() {
-        int before = failures;
-        for (int attempt = 1; attempt <= 3; attempt++) {
-            failures = before;
-            if (script1(attempt == 3)) {
-                if (attempt > 1) {
-                    System.out.println("  (agreed on attempt " + attempt + ": the first one ran while the kernels were cold)");
-                }
-                return;
-            }
-        }
+        script1(true);
     }
 
     private boolean script1(boolean report) {

@@ -72,6 +72,8 @@ public final class ContextBudget {
             };
             case Qwen3NextArch q -> 2L * q.fullLayers() * kv.rowBytes(q.attention().kvDim(), q.attention().kvHeads());
             case MambaArch m -> 0L;
+            case org.robomiri.jllm.model.HybridArch h -> h.attention() == null ? 0L
+                    : 2L * h.attentionLayers() * kv.rowBytes(h.attention().kvDim(), h.attention().kvHeads());
         };
     }
 
@@ -143,7 +145,7 @@ public final class ContextBudget {
                     basis += String.format(Locale.ROOT, "; physical memory %.1f GB leaves %.1f GB", ram / 1e9, byRam / 1e9);
                 }
             }
-        } else if (ram > 0 && pagedOffHeap(s, arch, kv)) {
+        } else if (ram > 0 && pagedOffHeap(s, arch, kv, w, slots)) {
             // the paged KV cache (backend.kv-paged, docs/24) keeps the CPU blocks in off-heap MemorySegment slabs: the Java heap
             // does not bound the cache, only the physical memory does (the pool never takes more than the flat caches would)
             budget = (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights));
@@ -182,10 +184,19 @@ public final class ContextBudget {
                 || s.getLong("backend.kv-hot-mb") > 0);
     }
 
-    /** Whether this model's CPU KV cache is the paged, off-heap pool: {@code backend.kv-paged} on an attention model with f32 / f16 / q8. */
+    /** Whether this model's CPU KV cache is the paged, off-heap pool, with {@code backend.kv-paged} set to true: an attention model with f32 / f16 / q8. */
     static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
-        return s.getBool("backend.kv-paged") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa
-                && kv != KvDtype.Q4;
+        return s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && pageable(arch, kv);
+    }
+
+    /** The same, with {@code auto} decided as {@link ModelLoader#paged} does for a model of {@code slots} slots. */
+    static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv,
+                                org.robomiri.jllm.model.ModelWeights w, int slots) {
+        return pageable(arch, kv) && ModelLoader.paged(s, w, slots);
+    }
+
+    private static boolean pageable(Architecture arch, KvDtype kv) {
+        return arch instanceof Decoder d && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4;
     }
 
     /** Free space of the Java heap's old generation (where the CPU KV caches live), as {@code KvCache.checkHeap} sees it. */

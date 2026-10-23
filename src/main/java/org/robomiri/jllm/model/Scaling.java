@@ -3,12 +3,20 @@ package org.robomiri.jllm.model;
 import java.util.Arrays;
 
 /** RoPE frequency scaling of a {@link RopeTable} ({@code rope_scaling} in config.json); see {@link Rope#invFreq}. */
-public sealed interface Scaling permits Scaling.None, Scaling.Linear, Scaling.Llama3, Scaling.LongRope, Scaling.Yarn {
+public sealed interface Scaling permits Scaling.None, Scaling.Identity, Scaling.Linear, Scaling.Llama3, Scaling.LongRope, Scaling.Yarn {
 
     None NONE = new None();
+    Identity IDENTITY = new Identity();
 
     /** Plain RoPE. */
     record None() implements Scaling {
+    }
+
+    /**
+     * No rotation at all: every frequency is 0, so the table holds cos = 1 and sin = 0 and a head passes through the
+     * rotary kernel unchanged (the NoPE layers of Llama 4, which share the kernels of the rotated layers).
+     */
+    record Identity() implements Scaling {
     }
 
     /** Every frequency divided by {@code factor}. */
@@ -49,15 +57,22 @@ public sealed interface Scaling permits Scaling.None, Scaling.Linear, Scaling.Ll
      * YaRN: frequencies by {@link Rope#yarnInvFreq}; cos and sin multiplied by {@code attentionFactor} when it is
      * positive, else by {@code yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscaleAllDim)} as in
      * {@code modeling_deepseek.py} (with {@code mscale} 1 and {@code mscaleAllDim} 0 that is the plain
-     * {@code 0.1 ln(factor) + 1} of the YaRN paper, which Qwen-style configs get).
+     * {@code 0.1 ln(factor) + 1} of the YaRN paper, which Qwen-style configs get). {@code truncate = false}
+     * (gpt-oss) keeps the correction range fractional instead of rounding it to whole dimensions.
      */
     record Yarn(double factor, int originalMaxPositions, double betaFast, double betaSlow, double mscale,
-                double mscaleAllDim, double attentionFactor) implements Scaling {
+                double mscaleAllDim, double attentionFactor, boolean truncate) implements Scaling {
 
         /** DeepSeek's form: the amplitude derived from {@code mscale} / {@code mscaleAllDim}. */
         public Yarn(double factor, int originalMaxPositions, double betaFast, double betaSlow, double mscale,
                     double mscaleAllDim) {
-            this(factor, originalMaxPositions, betaFast, betaSlow, mscale, mscaleAllDim, 0);
+            this(factor, originalMaxPositions, betaFast, betaSlow, mscale, mscaleAllDim, 0, true);
+        }
+
+        /** With the correction range truncated to whole dimensions (floor / ceil), as every YaRN but gpt-oss's. */
+        public Yarn(double factor, int originalMaxPositions, double betaFast, double betaSlow, double mscale,
+                    double mscaleAllDim, double attentionFactor) {
+            this(factor, originalMaxPositions, betaFast, betaSlow, mscale, mscaleAllDim, attentionFactor, true);
         }
     }
 }

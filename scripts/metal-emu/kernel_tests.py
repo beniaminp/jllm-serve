@@ -24,23 +24,31 @@ def check(ok, what):
         failures += 1
 
 
-def attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, ntok, scale, window=0, softcap=0.0):
+def attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, ntok, scale, window=0, softcap=0.0, chunk=0, sinks=None,
+                  temp_floor=0, temp_scale=0.0):
+    """Causal grouped-query attention in float64. chunk: a query sees only the keys of its own chunk of `chunk`
+    positions (Llama 4); sinks: one logit per head joins the softmax with a zero value (gpt-oss); temp_floor: the query of
+    position p is multiplied by 1 + temp_scale * ln(1 + floor((p + 1) / temp_floor)) (Llama 4's NoPE layers)."""
     out = np.zeros((ntok, n_heads * hd), np.float64)
     g = n_heads // n_kv
     for t in range(ntok):
         ln = pos0 + t + 1
         first = max(0, ln - window) if window > 0 else 0
+        if chunk > 0:
+            first = max(first, (ln - 1) // chunk * chunk)
+        tf = 1 + temp_scale * np.log1p(np.floor(ln / temp_floor)) if temp_floor > 0 else 1.0
         for h in range(n_heads):
             kvh = h // g
-            qv = q[t, h * hd:(h + 1) * hd].astype(np.float64)
+            qv = q[t, h * hd:(h + 1) * hd].astype(np.float64) * tf
             k = kc[first:ln, kvh * hd:(kvh + 1) * hd].astype(np.float64)
             v = vc[first:ln, kvh * hd:(kvh + 1) * hd].astype(np.float64)
             s = k @ qv * scale
             if softcap > 0:
                 s = np.tanh(s / softcap) * softcap
-            p = np.exp(s - s.max())
-            p /= p.sum()
-            out[t, h * hd:(h + 1) * hd] = p @ v
+            m = s.max() if sinks is None else max(s.max(), sinks[h])
+            p = np.exp(s - m)
+            z = p.sum() + (np.exp(sinks[h] - m) if sinks is not None else 0.0)
+            out[t, h * hd:(h + 1) * hd] = (p / z) @ v
     return out
 
 
@@ -89,7 +97,8 @@ def paged_rows(pool, tbl, page, first, n):
     return np.stack([pool[tbl[p // block] * block + p % block] for p in range(first, first + n)])
 
 
-def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False, page=0):
+def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False, window=0, chunk=0, sinks=False,
+              temp_floor=0, temp_scale=0.0, softcap=0.0, page=0):
     rng = np.random.default_rng(1)
     q = rng.standard_normal((ntok, n_heads * hd)).astype(np.float32)
     kc = rng.standard_normal((ctx, n_kv * hd)).astype(np.float32)
@@ -102,14 +111,23 @@ def attention(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1, q8=False
     out = np.zeros((ntok, n_heads * hd), np.float32)
     scores = np.zeros((ntok * n_heads * ctx,), np.float32)
     scale = 1 / np.sqrt(hd)
+    sk = (rng.standard_normal(n_heads) * 2).astype(np.float32) if sinks else np.zeros(n_heads, np.float32)
     # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap pageShift
+    # buffer 5 (ext, constant per layer): chunk, hasSinks, tempFloor (ints), tempScale (float), then one sink per head;
+    # buffer 6 the page table; the struct is buffer 7
     p = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride,
-             n_heads * hd, 0, 0, 0.0, page)
+             n_heads * hd, window, 0, softcap, page)
+    ext = np.concatenate([np.array([chunk, int(sinks), temp_floor], np.int32).view(np.float32),
+                          np.array([temp_scale], np.float32), sk])
     kc, vc, tbl = paged([kc, vc], page)
-    E.dispatch(name, [q, kc, vc, out, scores, tbl], p, (n_heads // G, ntok), (256,))
-    ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale)
+    E.dispatch(name, [q, kc, vc, out, scores, ext, tbl], p, (n_heads // G, ntok), (256,))
+    ref = attention_ref(q, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale, window, softcap, chunk, sk if sinks else None,
+                        temp_floor, temp_scale)
     err = np.abs(out - ref).max()
-    check(err < 1e-4, '%s hd=%d%s: max err %.2e' % (name, hd, ', paged (blocks of %d)' % (1 << page) if page else '', err))
+    extra = ''.join([', window %d' % window if window else '', ', chunk %d' % chunk if chunk else '', ', sinks' if sinks else '',
+                     ', temp %d/%g' % (temp_floor, temp_scale) if temp_floor else '',
+                     ', paged (blocks of %d)' % (1 << page) if page else ''])
+    check(err < 1e-4, '%s hd=%d%s: max err %.2e' % (name, hd, extra, err))
 
 
 def kv_store_q8(hd, n_kv=2, ntok=5, pos0=3, ctx=12, page=0):
@@ -215,6 +233,16 @@ if not ONLY:
     attention('attention_g1_d64_q8', 64, q8=True)
     attention('attention_q8', 96, q8=True)
     attention('attention_g4_d128_q8', 128, n_heads=8, n_kv=2, G=4, q8=True)
+    # gpt-oss: attention sinks (alone, with a sliding window, on the q8 cache); Llama 4: chunked attention (queries on both
+    # sides of a chunk boundary) and the position-dependent query temperature
+    attention('attention_g1_d64', 64, sinks=True, pos0=10, ntok=5, ctx=24)
+    attention('attention_g1_d64', 64, sinks=True, window=4, pos0=10, ntok=5, ctx=24)
+    attention('attention_g1_d64_q8', 64, sinks=True, window=6, pos0=10, ntok=5, ctx=24, q8=True)
+    attention('attention', 96, sinks=True, pos0=3, ntok=4, ctx=24)
+    attention('attention_g1_d128', 128, chunk=8, pos0=6, ntok=8, ctx=24)
+    attention('attention_g1_d64_q8', 64, chunk=4, pos0=2, ntok=9, ctx=24, q8=True)
+    attention('attention_g1_d64', 64, temp_floor=4, temp_scale=0.4, pos0=2, ntok=9, ctx=24)
+    attention('attention_g1_d128', 128, temp_floor=8, temp_scale=0.3, chunk=8, sinks=True, pos0=6, ntok=8, ctx=24)
     kv_store_q8(128)
     kv_store_q8(64, n_kv=3)
     # the paged cache (docs/24): the same kernels over a shuffled pool and a block table
@@ -668,10 +696,17 @@ def moe_tiles(counts, experts, rng):
     return np.array([perm[i] for i in order], np.int32), np.array([len(counts)] + tiles, np.int32), start
 
 
-def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts=(2, 0, 3, 2)):
+def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts=(2, 0, 3, 2), clamp=0.0, alpha=1.702,
+             bias=False, win=False):
+    """moe_up_<kind> / moe_down_<kind> against numpy. clamp / bias / win: gpt-oss's clamped SwiGLU with the experts' gate/up
+    and down biases, and Llama 4's routing weight on the expert's input (MoeXParams.flags 1 / 2 / 4)."""
     rng = np.random.default_rng(13)
     order, tiles, slots = moe_tiles(counts, experts, rng)
     ntok = (slots + top_k - 1) // top_k
+    flags = (1 if clamp > 0 else 0) | (2 if bias else 0) | (4 if win else 0)
+    gub = (rng.standard_normal((n_exp, 2 * m)) * 0.5).astype(np.float32) if bias else np.zeros((n_exp, 2 * m), np.float32)
+    dnb = (rng.standard_normal((n_exp, dim)) * 0.5).astype(np.float32) if bias else np.zeros((n_exp, dim), np.float32)
+    rw = rng.random(slots).astype(np.float32) + 0.1
     x = rng.standard_normal((ntok, dim)).astype(np.float32)
     if fmt in GGUF:  # gate experts [E * m] in buffer 0, up experts [E * m] in buffer 1
         gq, _, gw = fmt_weights(fmt, n_exp * m, dim, rng)
@@ -684,7 +719,8 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
         wg, wu = w2[:, :m], w2[:, m:]
     hid = np.full((ntok * top_k, m), np.nan, np.float32)
     name = 'moe_up_%s_%s' % (kind, fmt)
-    E.dispatch(name, [wq, ws, x, order, tiles, hid], pack('iii', 2 * m, dim, top_k),
+    # MoeXParams: rowsPerExpert cols topK flags limit alpha; buffers 6 / 7 = the gate/up bias and the routing weights
+    E.dispatch(name, [wq, ws, x, order, tiles, hid, gub, rw], pack('iiiiff', 2 * m, dim, top_k, flags, clamp, alpha),
                ((m + 31) // 32, len(counts)), (128,))
     slot_e = np.zeros(slots, int)
     for e, s0, c in tiles[1:].reshape(-1, 3):
@@ -694,7 +730,16 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
         out = np.zeros((slots, m))
         for s in range(slots):
             xv = x[s // top_k].astype(np.float64)
-            out[s] = silu(g[slot_e[s]] @ xv) * (u[slot_e[s]] @ xv)
+            e = slot_e[s]
+            gv = g[e] @ xv + gub[e, :m]
+            uv = u[e] @ xv + gub[e, m:]
+            if win:
+                gv, uv = gv * rw[s], uv * rw[s]
+            if clamp > 0:
+                gv, uv = np.minimum(gv, clamp), np.clip(uv, -clamp, clamp)
+                out[s] = (uv + 1) * gv / (1 + np.exp(-alpha * gv))
+            else:
+                out[s] = silu(gv) * uv
         return out
     exact = up_ref(wg.astype(np.float64), wu.astype(np.float64))
     halfw = up_ref(wg.astype(np.float16).astype(np.float64), wu.astype(np.float16).astype(np.float64))
@@ -702,28 +747,29 @@ def moe_test(fmt, kind, m, dim, n_exp=4, top_k=2, counts=(5, 32, 16, 1), experts
     sc = np.abs(exact).max()
     eh, ee = np.abs(got - halfw).max() / sc, np.abs(got - exact).max() / sc
     ok = (eh < 2e-5 and ee < 2e-3) if rounds_half(fmt, kind) else ee < 1e-5
-    check(ok, '%s m=%d dim=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, m, dim, list(counts), eh, ee))
+    feat = ''.join([' clamp %g/%g' % (clamp, alpha) if clamp > 0 else '', ' bias' if bias else '', ' weight-on-input' if win else ''])
+    check(ok, '%s m=%d dim=%d tiles %s%s: rel err %.1e (half weights), %.1e (exact)' % (name, m, dim, list(counts), feat, eh, ee))
 
-    # down: ys[s] = rw[s] * W_e h[s], rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
+    # down: ys[s] = rw[s] * (W_e h[s] + bias_e), rows = dim, cols = m (a fresh h, so the check is independent of moe_up)
     h = rng.standard_normal((slots, m)).astype(np.float32)
-    rw = rng.random(slots).astype(np.float32)
     if fmt in GGUF and m % 256 != 0 and fmt in KQ256:
         return
     dq, ds, dw = fmt_weights(fmt, n_exp * dim, m, rng)
     dw = dw.reshape(n_exp, dim, m)
     ys = np.full((slots, dim), np.nan, np.float32)
     name = 'moe_down_%s_%s' % (kind, fmt)
-    E.dispatch(name, [dq, ds, h, order, tiles, rw, ys], pack('iii', dim, m, top_k), ((dim + 63) // 64, len(counts)),
-               (128,))
+    E.dispatch(name, [dq, ds, h, order, tiles, rw, ys, dnb], pack('iiiiff', dim, m, top_k, flags, clamp, alpha),
+               ((dim + 63) // 64, len(counts)), (128,))
 
     def down_ref(wd):
-        return np.stack([rw[s] * (wd[slot_e[s]] @ h[s].astype(np.float64)) for s in range(slots)])
+        return np.stack([(1.0 if win else rw[s]) * (wd[slot_e[s]] @ h[s].astype(np.float64) + dnb[slot_e[s]])
+                         for s in range(slots)])
     exact = down_ref(dw.astype(np.float64))
     halfw = down_ref(dw.astype(np.float16).astype(np.float64))
     sc = np.abs(exact).max()
     eh, ee = np.abs(ys - halfw).max() / sc, np.abs(ys - exact).max() / sc
     ok = (eh < 2e-5 and ee < 2e-3) if rounds_half(fmt, kind) else ee < 1e-5
-    check(ok, '%s dim=%d m=%d tiles %s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), eh, ee))
+    check(ok, '%s dim=%d m=%d tiles %s%s: rel err %.1e (half weights), %.1e (exact)' % (name, dim, m, list(counts), feat, eh, ee))
 
 
 def plain_test(fmt, rows=96, cols=None, ntok=3):
@@ -783,6 +829,13 @@ if not ONLY:
     mm_test('q4', 'hmma', 64, 128, 7)                              # one 8-token block of the tile only
     swiglu_test('q8', 'hmma', 32, 128, 64, use_gelu=True)
     moe_test('q4', 'hmma', 96, 128, counts=(32, 32, 3), experts=(1, 3, 1))
+    # gpt-oss's experts (clamped SwiGLU + biases) and Llama 4's (the routing weight on the input), on both MMA cores and the
+    # MXFP4 / Q8 formats the checkpoints are served in
+    for kind in ('mma', 'hmma'):
+        for fmt in ('q4', 'q8', 'mxfp4'):
+            moe_test(fmt, kind, 64, 128, clamp=2.0, alpha=1.702, bias=True)
+            moe_test(fmt, kind, 64, 128, win=True)
+        moe_test('q4', kind, 64, 128, clamp=0.5, alpha=1.702)
 def split_chunk(hd=64, n_heads=4, n_kv=2, pos0=200, ctx=256, n_split=7, window=0):
     """attention_split with chunk = 0 (the keys per split derived in the kernel, as a recorded decode step passes it)
     gives the bytes of the explicit ceil(keys / nSplit)."""
@@ -923,6 +976,36 @@ def router_norm(ds=False, n_exp=16, dim=128, top_k=4, ntok=3, remap=False, metho
     check(same and picks_ok, '%s ntok=%d remap=%s: %s rmsnorm + %s' % ('router_ds_norm' if ds else 'router_norm', ntok,
                                                                       remap, 'same bytes as' if same else 'DIFFERENT from',
                                                                       'router_ds' if ds else 'router'))
+
+
+def router_top_logits(sigmoid, n_exp=16, dim=128, top_k=4, ntok=5):
+    """router_ds method 3 (gpt-oss: linear bias on the logits, top-k, softmax over the selected ones) and the sigmoid
+    form (Llama 4: sigmoid of each selected logit) against numpy."""
+    rng = np.random.default_rng(9)
+    x = rng.standard_normal((ntok, dim)).astype(np.float32)
+    w = (rng.standard_normal((n_exp, dim)) * 0.3).astype(np.float32)
+    bias = (rng.standard_normal(n_exp) * 0.5).astype(np.float32)
+    assign = np.zeros(ntok * top_k, np.int32)
+    rw = np.zeros(ntok * top_k, np.float32)
+    emap = np.arange(n_exp, dtype=np.int32)
+    gassign = np.zeros(ntok * top_k, np.int32)
+    counts = np.zeros(n_exp, np.uint32)
+    fields = (n_exp, dim, top_k, 0 if sigmoid else 1, 1, 1, int(sigmoid), 3, 0, 1.0, 0)
+    E.dispatch('router_ds', [x, w, assign, rw, bias, emap, gassign, counts], pack('iiiiiiiiifi', *fields), (ntok,), (256,))
+    ok = True
+    for t in range(ntok):
+        logits = w.astype(np.float64) @ x[t].astype(np.float64) + bias
+        top = np.argsort(-logits)[:top_k]
+        sel = logits[top]
+        want = 1 / (1 + np.exp(-sel)) if sigmoid else np.exp(sel - sel.max()) / np.exp(sel - sel.max()).sum()
+        ok &= list(assign[t * top_k:(t + 1) * top_k]) == list(top) and np.abs(rw[t * top_k:(t + 1) * top_k] - want).max() < 1e-5
+    check(ok, 'router_ds method 3 (%s of the selected logits, linear bias): experts and weights as numpy'
+          % ('sigmoid' if sigmoid else 'softmax'))
+
+
+if not ONLY:
+    router_top_logits(False)
+    router_top_logits(True, top_k=1)
 
 
 # ---- multi-row single-row walk (section 2a of kernels.metal): mv<NR>_matmul / matmul3 / matmul_swiglu against numpy and,
@@ -1518,14 +1601,14 @@ def attention_q8_rot(name, hd, n_heads=4, n_kv=2, pos0=5, ntok=3, ctx=16, G=1):
     scores = np.zeros((ntok * n_heads * ctx,), np.float32)
     # AttnParams: nHeads nKvHeads qkDim vDim pos0 ctx scale qStride kStride vStride oStride window tokenOffset softcap
     p = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale / B, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0, 0)
-    E.dispatch(name, [qr, kb, vb, out, scores, np.zeros(1, np.int32)], p, (n_heads // G, ntok), (256,))
+    E.dispatch(name, [qr, kb, vb, out, scores, np.zeros(4 + n_heads, np.float32), np.zeros(1, np.int32)], p, (n_heads // G, ntok), (256,))
     ref_rot = attention_ref(qr, kd, vd, n_heads, n_kv, hd, pos0, ntok, scale / B)
     exact = attention_ref(q, kc, vc, n_heads, n_kv, hd, pos0, ntok, scale)
     # the same kernel over plain q8 rows of the unrotated keys
     (pk, pkd) = q8_rows(kc, n_kv, hd)
     out0 = np.zeros_like(out)
     p0 = pack('iiiiiifiiiiiifi', n_heads, n_kv, hd, hd, pos0, ctx, scale, n_heads * hd, stride, stride, n_heads * hd, 0, 0, 0.0, 0)
-    E.dispatch(name, [q, pk, vb, out0, scores.copy(), np.zeros(1, np.int32)], p0, (n_heads // G, ntok), (256,))
+    E.dispatch(name, [q, pk, vb, out0, scores.copy(), np.zeros(4 + n_heads, np.float32), np.zeros(1, np.int32)], p0, (n_heads // G, ntok), (256,))
     e_rot, e_plain = np.abs(out - exact).max(), np.abs(out0 - exact).max()
     check(np.abs(out - ref_rot).max() < 1e-4 and e_rot < e_plain,
           '%s hd=%d rotated keys: max err %.2e vs the kernel on the dequantized rows, %.2e vs f32 keys (plain q8 %.2e)'
@@ -1760,6 +1843,109 @@ split_q4(64, recent=0)
 split_q4(128, derive_chunk=True)
 split_q4(128, lost=(290,), n_split=7, derive_chunk=True)
 
+
+# ---- attention / state-space hybrids (section 15 of kernels.metal): Granite 4, Nemotron-H, Jamba
+def softplus_np(x):
+    return np.where(x > 20, x, np.log1p(np.exp(np.minimum(x, 20))))
+
+
+def vec_tests():
+    rng = np.random.default_rng(40)
+    n = 777
+    y = rng.standard_normal(n).astype(np.float32)
+    x = rng.standard_normal(n).astype(np.float32)
+    x0 = x.copy()
+    E.dispatch('vec_axpy', [y, x], pack('if', n, 0.22), ((n + 255) // 256,), (256,))
+    check(np.abs(x - (x0 + np.float32(0.22) * y)).max() < 1e-6, 'vec_axpy x += s y')
+    E.dispatch('vec_zero', [x], pack('if', n, 0.0), ((n + 255) // 256,), (256,))
+    check(not x.any(), 'vec_zero')
+    out = np.zeros(n, np.float32)
+    E.dispatch('relu2', [y, out], pack('if', n, 0.0), ((n + 255) // 256,), (256,))
+    check(np.abs(out - np.maximum(y, 0) ** 2).max() < 1e-6, 'relu2 y = relu(x)^2')
+
+
+def m2_pieces(heads=8, head_dim=32, groups=2, state=16, kern=4, ntok=11, norm_groups=2, dt_min=0.0, dt_max=np.inf, seed=41):
+    """m2_conv, m2_scan and m2_gnorm against a float64 numpy Mamba-2 on random in_proj rows, over two chunks so that the
+    carried conv and SSM states are exercised."""
+    rng = np.random.default_rng(seed)
+    di = heads * head_dim
+    cd = di + 2 * groups * state
+    pw = di + cd + heads
+    w = (rng.standard_normal((cd, kern)) * 0.4).astype(np.float32)
+    bias = (rng.standard_normal(cd) * 0.2).astype(np.float32)
+    dtb = (rng.standard_normal(heads) * 0.8 - 0.5).astype(np.float32)
+    A = -np.exp(np.log(1 + 7 * rng.random(heads))).astype(np.float32)
+    D = (1 + 0.3 * rng.standard_normal(heads)).astype(np.float32)
+    nw = (1 + 0.2 * rng.standard_normal(di)).astype(np.float32)
+    proj = rng.standard_normal((2 * ntok, pw)).astype(np.float32)
+    cst = np.zeros((cd, kern - 1), np.float32)
+    sst = np.zeros((heads * head_dim, state), np.float32)
+    got = []
+    for c0 in (0, ntok):
+        pr = np.ascontiguousarray(proj[c0:c0 + ntok])
+        conv = np.zeros((ntok, cd), np.float32)
+        y = np.zeros((ntok, di), np.float32)
+        E.dispatch('m2_conv', [pr, w, bias, cst, conv], pack('iiiii', cd, kern, ntok, pw, di), ((cd + 63) // 64,), (64,))
+        E.dispatch('m2_scan', [conv, pr, dtb, A, D, sst, y], pack('iiiiiiiiiff', heads, head_dim, groups, state, ntok, pw,
+                                                                  di + cd, cd, di, dt_min, dt_max),
+                   ((heads * head_dim + 63) // 64,), (64,))
+        gs = di // norm_groups
+        E.dispatch('m2_gnorm', [y, pr, nw], pack('iiiif', di, gs, ntok, pw, 1e-5), (norm_groups, ntok), (256,))
+        got.append(y.copy())
+    # float64 reference
+    cs = np.zeros((cd, kern - 1))
+    ss = np.zeros((heads, head_dim, state))
+    ref = []
+    for t in range(2 * ntok):
+        u = proj[t, di:di + cd].astype(np.float64)
+        win = np.concatenate([cs, u[:, None]], axis=1)  # [cd, kern]
+        s = (w * win).sum(1) + bias
+        cs = win[:, 1:]
+        xbc = s / (1 + np.exp(-s))
+        xh = xbc[:di].reshape(heads, head_dim)
+        B = xbc[di:di + groups * state].reshape(groups, state)
+        C = xbc[di + groups * state:].reshape(groups, state)
+        dt = np.clip(softplus_np(proj[t, di + cd:].astype(np.float64) + dtb), dt_min, dt_max)
+        yh = np.zeros((heads, head_dim))
+        for h in range(heads):
+            g = h // (heads // groups)
+            ss[h] = ss[h] * np.exp(dt[h] * A[h]) + dt[h] * xh[h][:, None] * B[g][None, :]
+            yh[h] = ss[h] @ C[g] + D[h] * xh[h]
+        v = yh.reshape(-1) * (lambda z: z / (1 + np.exp(-z)))(proj[t, :di].astype(np.float64))
+        gs = di // norm_groups
+        out = np.zeros(di)
+        for g in range(norm_groups):
+            seg = v[g * gs:(g + 1) * gs]
+            out[g * gs:(g + 1) * gs] = nw[g * gs:(g + 1) * gs] * seg / np.sqrt((seg * seg).mean() + 1e-5)
+        ref.append(out)
+    ref = np.array(ref)
+    got = np.concatenate(got)
+    err = np.abs(got - ref).max() / np.abs(ref).max()
+    check(err < 1e-5, 'm2_conv + m2_scan + m2_gnorm heads=%d x %d groups=%d state=%d conv=%d normGroups=%d dt in [%g, %g]: '
+          'rel err %.1e over 2 chunks' % (heads, head_dim, groups, state, kern, norm_groups, dt_min, dt_max, err))
+
+
+def rms3_test(rank=8, state=16, ntok=5):
+    rng = np.random.default_rng(42)
+    stride = rank + 2 * state
+    x = rng.standard_normal((ntok, stride)).astype(np.float32)
+    w = (1 + 0.3 * rng.standard_normal(stride)).astype(np.float32)
+    x0 = x.astype(np.float64)
+    E.dispatch('rms3', [x, w], pack('iiiif', rank, state, stride, ntok, 1e-6), (3, ntok), (256,))
+    ref = x0.copy()
+    for off, width in ((0, rank), (rank, state), (rank + state, state)):
+        seg = x0[:, off:off + width]
+        ref[:, off:off + width] = seg / np.sqrt((seg * seg).mean(1, keepdims=True) + 1e-6) * w[off:off + width]
+    check(np.abs(x - ref).max() < 1e-5, 'rms3 (Jamba dt / B / C norms) rank=%d state=%d' % (rank, state))
+
+
+if not ONLY:
+    vec_tests()
+    m2_pieces()
+    m2_pieces(heads=4, head_dim=64, groups=1, state=128, kern=3, norm_groups=1, dt_min=0.05, seed=43)
+    m2_pieces(heads=12, head_dim=16, groups=3, state=8, kern=4, norm_groups=3, ntok=1, seed=44)
+    rms3_test()
+    rms3_test(rank=256, state=64, ntok=3)
 
 if not ONLY:
     # the image-generation kernels (diffusion.metal): gemm, convolution, normalisation, attention, layout

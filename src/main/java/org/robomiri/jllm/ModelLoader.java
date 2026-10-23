@@ -18,6 +18,7 @@ import org.robomiri.jllm.metal.Qwen3NextMetalBackend;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
 import org.robomiri.jllm.model.KvDtype;
+import org.robomiri.jllm.model.HybridArch;
 import org.robomiri.jllm.model.MambaArch;
 import org.robomiri.jllm.model.ModelWeights;
 import org.robomiri.jllm.model.QType;
@@ -296,7 +297,7 @@ public final class ModelLoader {
             return s.getInt("backend.batch");
         }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
-                || arch instanceof Qwen3NextArch q && q.anyMoe();
+                || arch instanceof Qwen3NextArch q && q.anyMoe() || arch instanceof HybridArch h && h.anyMoe();
         int auto = moe ? MOE_BATCH
                 : arch instanceof org.robomiri.jllm.model.Decoder && resolveBackend(s).equals("metal") ? METAL_DENSE_BATCH : DEFAULT_BATCH;
         if (arch.core().modelType().startsWith("gemma3")) {
@@ -344,9 +345,30 @@ public final class ModelLoader {
      * The pool of KV blocks the CPU slots of {@code weights} share when {@code backend.kv-paged} is on (docs/24), made
      * by the first slot; null when the flat cache is wanted or the model cannot be paged.
      */
+    private static final java.util.Map<ModelWeights, Boolean> PAGED =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /**
+     * Whether the slots of {@code weights} use the paged KV cache: {@code backend.kv-paged} true / false as given; with
+     * {@code auto} (the default) when the model was loaded with two or more slots (the first call, {@link #load}, knows the
+     * slot count and decides for the model; {@link #extraEngine} finds the decision again), else the flat cache.
+     */
+    static boolean paged(Settings s, ModelWeights weights, int slots) {
+        String v = s.get("backend.kv-paged").trim().toLowerCase(java.util.Locale.ROOT);
+        if (v.equals("true") || v.equals("false")) {
+            return v.equals("true");
+        }
+        return PAGED.computeIfAbsent(weights, w -> slots >= 2);
+    }
+
     private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int ctx, int slots,
                                                       boolean metal, org.robomiri.jllm.kv.KvTierConfig tier) {
-        if (!s.getBool("backend.kv-paged") && tier == null) {
+        if (!paged(s, weights, slots) && tier == null) {
+            return null;
+        }
+        if (weights.arch instanceof org.robomiri.jllm.model.Decoder dec && CpuBackend.anySpecial(dec, ctx)) {
+            System.err.println("note: backend.kv-paged does not apply to attention sinks, chunked attention or attention "
+                    + "temperature (gpt-oss, Llama 4): their attention kernels read the flat cache, so it is used");
             return null;
         }
         int block = s.getInt("backend.kv-block");
@@ -592,9 +614,13 @@ public final class ModelLoader {
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));
         boolean mamba = arch instanceof MambaArch;
-        if (member && s.getBool("backend.kv-paged") && (mamba || arch instanceof Qwen3NextArch)) {
+        if (member && s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && (mamba || arch instanceof Qwen3NextArch)) {
             System.err.println("note: backend.kv-paged does not apply to " + (mamba ? "Mamba" : "Qwen3-Next / Qwen3.5")
                     + ": a recurrent state is a function of every earlier token and cannot be shared per block, so the flat cache is used");
+        }
+        if (member && s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && arch instanceof org.robomiri.jllm.model.HybridArch) {
+            System.err.println("note: backend.kv-paged does not apply to the attention / state-space hybrids (Granite 4, Nemotron-H, Jamba): "
+                    + "a recurrent state cannot be shared per block, so the flat cache is used");
         }
         if (mamba && kvDtype != KvDtype.F32) { // a recurrent state: there is no KV cache to store as f16
             System.err.println("note: backend.kv-dtype=" + kvDtype + " is ignored for a Mamba model (it has no KV cache)");
@@ -605,6 +631,15 @@ public final class ModelLoader {
                         threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
                         hybridInt8(s, weights, threads));
                 case "metal" -> new Qwen3NextMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
+                default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
+            };
+        }
+        if (arch instanceof HybridArch) { // Granite 4 / Nemotron-H / Jamba: state-space states plus a KV cache for the attention layers
+            return switch (backendName) {
+                case "cpu" -> new org.robomiri.jllm.cpu.HybridCpuBackend(weights, ctx, batch,
+                        threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
+                        hybridInt8(s, weights, threads));
+                case "metal" -> new org.robomiri.jllm.metal.HybridMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype);
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         }
@@ -673,7 +708,8 @@ public final class ModelLoader {
         ModelWeights weights = p.weights();
         try {
             if (arch instanceof MambaArch || targetArch instanceof MambaArch
-                    || arch instanceof Qwen3NextArch || targetArch instanceof Qwen3NextArch) {
+                    || arch instanceof Qwen3NextArch || targetArch instanceof Qwen3NextArch
+                    || arch instanceof HybridArch || targetArch instanceof HybridArch) {
                 throw new IllegalArgumentException("engine.draft-model: speculation needs attention (KV cache) models");
             }
             System.err.println("Draft model: " + arch);

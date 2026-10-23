@@ -106,6 +106,19 @@ public final class ArchSmoke {
         }
         return switch (a) {
             case MambaArch m -> m.dInner() % b == 0;
+            case org.robomiri.jllm.model.HybridArch h -> {
+                boolean ok = (h.attention() == null || h.attention().qDim() % b == 0)
+                        && (h.mamba2() == null || h.mamba2().dInner() % b == 0)
+                        && (h.mamba1() == null || h.mamba1().dInner() % b == 0);
+                for (org.robomiri.jllm.model.HybridArch.Layer l : h.layers()) {
+                    ok &= switch (l.ffn()) {
+                        case null -> true;
+                        case Mlp.Dense dense -> dense.hidden() % b == 0;
+                        case Mlp.Moe moe -> moe.moeDim() % b == 0 && (moe.shared() == null || moe.shared().hidden() % b == 0);
+                    };
+                }
+                yield ok;
+            }
             case Qwen3NextArch q -> {
                 boolean ok = q.attention().qDim() % b == 0 && q.deltaNet().valueWidth() % b == 0;
                 for (Mlp p : q.mlps()) {
@@ -179,19 +192,25 @@ public final class ArchSmoke {
         int failures = 0;
         boolean mamba = cfg instanceof MambaArch;
         boolean hybrid = cfg instanceof Qwen3NextArch; // Qwen3-Next: recurrent DeltaNet states plus a KV cache
-        boolean recurrent = mamba || hybrid;
+        boolean hyb = cfg instanceof org.robomiri.jllm.model.HybridArch; // Granite 4 / Nemotron-H / Jamba
+        boolean recurrent = mamba || hybrid || hyb;
         try (ModelWeights w = ModelWeights.load(dir, cfg, quant, head, ShardProvider.local(dir), null)) {
             int[] cpu;
             float[] cpuLogits = new float[cfg.core().vocabSize()];
             try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4)
                     : hybrid ? new Qwen3NextCpuBackend(w, 64, 16, 4, KvDtype.F32)
+                    : hyb ? new org.robomiri.jllm.cpu.HybridCpuBackend(w, 64, 16, 4, KvDtype.F32)
                     : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                 cpu = generate(b, cpuLogits);
                 failures += recurrent ? stateChecks(b, cfg, "cpu") : 0;
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
-            if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            if (PAGED && cfg instanceof Decoder sd && org.robomiri.jllm.cpu.CpuBackend.anySpecial(sd, 64)
+                    && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+                // (gpt-oss / Llama 4: sinks, chunked attention or temperature read the flat cache; ModelLoader falls back to it)
+                System.out.println("  paged KV cache: not applicable to sinks / chunked attention / temperature tuning");
+            } else if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
                 boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
                 failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
@@ -210,6 +229,7 @@ public final class ArchSmoke {
             float[] gpuLogits = new float[cfg.core().vocabSize()];
             try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib)
                     : hybrid ? new Qwen3NextMetalBackend(w, 64, 16, lib, KvDtype.F32)
+                    : hyb ? new org.robomiri.jllm.metal.HybridMetalBackend(w, 64, 16, lib, KvDtype.F32)
                     : new MetalBackend(w, 64, 16, lib)) {
                 gpu = generate(b, gpuLogits);
                 failures += recurrent ? stateChecks(b, cfg, "metal") : 0;
@@ -224,7 +244,7 @@ public final class ArchSmoke {
             }
             if (hybrid && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += hybridBatchCheck(w, lib);
-            } else if (!mamba && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            } else if (!mamba && !hyb && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 failures += batchCheck(w, lib, cfg);
                 failures += draftCheck(w, dir, lib, cfg);
             }
@@ -785,12 +805,15 @@ public final class ArchSmoke {
             m.concurrent(on);
         } else if (b instanceof Qwen3NextMetalBackend m) {
             m.concurrent(on);
+        } else if (b instanceof org.robomiri.jllm.metal.HybridMetalBackend m) {
+            m.concurrent(on);
         }
     }
 
     private static long barriers(Backend b) {
         return b instanceof MetalBackend m ? m.barriers() : b instanceof MambaMetalBackend m ? m.barriers()
-                : b instanceof Qwen3NextMetalBackend m ? m.barriers() : 0;
+                : b instanceof Qwen3NextMetalBackend m ? m.barriers()
+                : b instanceof org.robomiri.jllm.metal.HybridMetalBackend m ? m.barriers() : 0;
     }
 
     /**
@@ -843,14 +866,17 @@ public final class ArchSmoke {
         int vocab = cfg.core().vocabSize();
         boolean mamba = cfg instanceof MambaArch;
         boolean hybrid = cfg instanceof Qwen3NextArch;
+        boolean hyb = cfg instanceof org.robomiri.jllm.model.HybridArch;
         int bad = 0;
         List<Object[]> cases = new ArrayList<>(); // label, maker
         for (KvDtype dt : mamba ? new KvDtype[]{KvDtype.F32} : full ? KvDtype.values() : new KvDtype[]{KvDtype.F32}) {
-            if (hybrid && dt == KvDtype.Q8) {
-                continue; // no q8 cache for the hybrid
+            if ((hybrid || hyb) && (dt == KvDtype.Q8 || dt == KvDtype.Q4)) {
+                continue; // no q8 / q4 cache for the hybrids
             }
             BackendMaker mk = () -> mamba ? new MambaMetalBackend(w, 64, CONC_CHUNK, lib)
-                    : hybrid ? new Qwen3NextMetalBackend(w, 64, CONC_CHUNK, lib, dt) : new MetalBackend(w, 64, CONC_CHUNK, lib, dt);
+                    : hybrid ? new Qwen3NextMetalBackend(w, 64, CONC_CHUNK, lib, dt)
+                    : hyb ? new org.robomiri.jllm.metal.HybridMetalBackend(w, 64, CONC_CHUNK, lib, dt)
+                    : new MetalBackend(w, 64, CONC_CHUNK, lib, dt);
             cases.add(new Object[]{"kv " + dt, mk});
         }
         java.nio.file.Path stats = null;
@@ -889,7 +915,7 @@ public final class ArchSmoke {
                 System.clearProperty("jllm.metal.expertStatsDir");
             }
         }
-        if (full && !mamba && !hybrid) {
+        if (full && !mamba && !hybrid && !hyb) {
             bad += concCase("pipelined") ? concurrentPipe(w, lib, cfg) : 0;
             bad += concCase("batched") ? concurrentBatch(w, lib, cfg) : 0;
         }

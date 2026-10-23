@@ -66,6 +66,8 @@ public final class ChatTemplate {
             "Nov", "Dec"};
     /** Llama 3.x with the date taken at render time, like transformers' {@code strftime_now("%d %b %Y")}. */
     private static final Format LLAMA3_TODAY = llama3(ChatTemplate::today);
+    /** gpt-oss with the date taken at render time, like transformers' {@code strftime_now("%Y-%m-%d")}. */
+    private static final Format HARMONY_TODAY = harmony(() -> LocalDate.now().toString());
 
     private ChatTemplate() {
     }
@@ -134,6 +136,12 @@ public final class ChatTemplate {
                 return GLM4;
             case "mamba", "mamba2", "falcon_mamba":
                 return MAMBA;
+            case "gpt_oss":
+                return HARMONY_TODAY;
+            case "llama4", "llama4_text":
+                return LLAMA4;
+            case "granitemoehybrid", "granite":
+                return GRANITE;
             default:
                 throw new IllegalArgumentException("no chat template for model_type \"" + modelType + "\"");
         }
@@ -178,7 +186,126 @@ public final class ChatTemplate {
         }, "<|eot_id|>", "<|end_of_text|>", "<|eom_id|>");
     }
 
+    /**
+     * gpt-oss's harmony format with a fixed {@code Current date:} such as {@code "2025-08-05"} instead of the date of the
+     * render; use it for reproducible prompts.
+     */
+    public static Format harmony(String dateString) {
+        return harmony(() -> dateString);
+    }
+
+    /**
+     * gpt-oss's harmony format as far as plain chat goes (no tools, no tool calls; the Jinja template of the model is the
+     * reference): a system message with the model identity, the knowledge cutoff, today's date, the reasoning effort and
+     * the valid channels; the first {@code system} / {@code developer} message as a developer message with "# Instructions";
+     * {@code <|start|>user<|message|>...<|end|>} turns; earlier assistant turns as their {@code final} channel only (the
+     * analysis channel is dropped, as the template does); the generation prompt {@code <|start|>assistant}. A last assistant
+     * message without a generation prompt ends with {@code <|return|>} instead of {@code <|end|>}.
+     *
+     * <p>{@code enableThinking} chooses the reasoning effort: true is the template's default {@code medium} and the model
+     * writes its analysis channel first; false is {@code low} and the prompt already opens the {@code final} channel
+     * ({@code <|channel|>final<|message|>} after the assistant header), so the answer comes directly and the output has no
+     * analysis to separate. The model ends its answer with {@code <|return|>}; {@code <|end|>} ends the analysis message,
+     * after which it goes on, so only {@code <|return|>}, {@code <|call|>} and {@code <|endoftext|>} stop generation.
+     */
+    private static Format harmony(Supplier<String> date) {
+        return new Family("harmony", (m, gen, think, o) -> {
+            o.ctl("<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n"
+                    + "Current date: " + date.get() + "\n\nReasoning: " + (think ? "medium" : "low")
+                    + "\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>");
+            int first = 0;
+            if (!m.isEmpty() && ("developer".equals(m.get(0).role()) || "system".equals(m.get(0).role()))) {
+                String dev = content(m.get(0));
+                first = 1;
+                if (!dev.isEmpty()) {
+                    o.ctl("<|start|>developer<|message|># Instructions\n\n");
+                    o.txt(dev);
+                    o.ctl("\n\n<|end|>");
+                }
+            }
+            for (int i = first; i < m.size(); i++) {
+                String role = m.get(i).role();
+                if ("assistant".equals(role)) {
+                    o.ctl("<|start|>assistant<|channel|>final<|message|>");
+                    o.txt(content(m.get(i)));
+                    o.ctl(i == m.size() - 1 && !gen ? "<|return|>" : "<|end|>");
+                } else if ("user".equals(role)) {
+                    o.ctl("<|start|>user<|message|>");
+                    o.txt(content(m.get(i)));
+                    o.ctl("<|end|>");
+                } else if ("tool".equals(role)) {
+                    throw new IllegalArgumentException("tool messages are not supported by the gpt-oss chat format here");
+                } // (like the template, any other role is skipped)
+            }
+            if (gen) {
+                o.ctl(think ? "<|start|>assistant" : "<|start|>assistant<|channel|>final<|message|>");
+            }
+        }, "<|return|>", "<|call|>", "<|endoftext|>");
+    }
+
     // ------------------------------------------------------------------ the families
+
+    /**
+     * Llama 4 (plain chat; no tools, no images): {@code <|begin_of_text|>}, a trimmed system message as the system header
+     * if there is one, then {@code <|header_start|>role<|header_end|>\n\n} + the content (as it is) + {@code <|eot|>} per
+     * message, and the assistant header as the generation prompt.
+     */
+    private static final Format LLAMA4 = new Family("llama4", (m, gen, think, o) -> {
+        o.ctl("<|begin_of_text|>");
+        int first = 0;
+        if (!m.isEmpty() && "system".equals(m.get(0).role())) {
+            String system = pyTrim(content(m.get(0)));
+            first = 1;
+            if (!system.isEmpty()) {
+                o.ctl("<|header_start|>system<|header_end|>\n\n");
+                o.txt(system);
+                o.ctl("<|eot|>");
+            }
+        }
+        for (int i = first; i < m.size(); i++) {
+            if ("tool".equals(m.get(i).role()) || "ipython".equals(m.get(i).role())) {
+                throw new IllegalArgumentException("tool messages are not supported by the Llama 4 chat format here");
+            }
+            o.ctl("<|header_start|>" + m.get(i).role() + "<|header_end|>\n\n");
+            o.txt(content(m.get(i)));
+            o.ctl("<|eot|>");
+        }
+        if (gen) {
+            o.ctl("<|header_start|>assistant<|header_end|>\n\n");
+        }
+    }, "<|eot|>", "<|end_of_text|>", "<|eom|>");
+
+    /**
+     * IBM Granite 4 (plain chat; no tools or documents): every message is {@code <|start_of_role|>role<|end_of_role|>}
+     * + content + {@code <|end_of_text|>\n}; the first message, if it is a system message, becomes the system turn (the
+     * model's default system message when there is none), and the assistant header is the generation prompt. No BOS.
+     */
+    private static final Format GRANITE = new Family("granite", (m, gen, think, o) -> {
+        int first = 0;
+        String system = "You are a helpful assistant. Please ensure responses are professional, accurate, and safe.";
+        if (!m.isEmpty() && "system".equals(m.get(0).role())) {
+            first = 1;
+            if (!content(m.get(0)).isEmpty()) {
+                system = content(m.get(0));
+            }
+        }
+        o.ctl("<|start_of_role|>system<|end_of_role|>");
+        o.txt(system);
+        o.ctl("<|end_of_text|>");
+        o.txt("\n");
+        for (int i = first; i < m.size(); i++) {
+            if ("tool".equals(m.get(i).role())) {
+                throw new IllegalArgumentException("tool messages are not supported by the Granite chat format here");
+            }
+            o.ctl("<|start_of_role|>" + m.get(i).role() + "<|end_of_role|>");
+            o.txt(content(m.get(i)));
+            o.ctl("<|end_of_text|>");
+            o.txt("\n");
+        }
+        if (gen) {
+            o.ctl("<|start_of_role|>assistant<|end_of_role|>");
+        }
+    }, "<|end_of_text|>");
 
     /**
      * Qwen3 ChatML with thinking. Assistant turns before the last user query drop their reasoning; those after it

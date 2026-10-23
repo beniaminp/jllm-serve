@@ -34,9 +34,54 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
      * @param outBias   {@code o_proj} has a bias too ({@code attention_bias} of Llama, Qwen3, Gemma)
      * @param scale     multiplier of {@code q.k} before the softmax
      * @param softcap   {@code tanh(s / cap) * cap} on the scaled score, 0 = off (Gemma 2)
+     * @param sinks     one learned logit per query head joins the softmax as an extra "key" with a zero value, so a head
+     *                  can attend to nothing (gpt-oss: {@code self_attn.sinks})
+     * @param chunk     chunked attention (Llama 4): a query sees only the keys of its own chunk of {@code chunk}
+     *                  positions, {@code [p / chunk * chunk, p]}; 0 = no chunking. Combined with a window, the stricter wins
+     * @param l2Norm    parameterless RMS norm of every q / k head <em>after</em> the rotation (Llama 4's {@code use_qk_norm})
+     * @param tempFloor Llama 4's attention temperature tuning of the NoPE layers: the query of position {@code p} is
+     *                  multiplied by {@code 1 + tempScale * ln(1 + floor((p + 1) / tempFloor))}; 0 = off
+     * @param tempScale see {@code tempFloor}
      */
     record Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
-               boolean outBias, float scale, float softcap) implements Attention {
+               boolean outBias, float scale, float softcap, boolean sinks, int chunk, boolean l2Norm, int tempFloor,
+               float tempScale) implements Attention {
+
+        /** The attention every family but gpt-oss and Llama 4 has: no sinks, no chunks, no L2 norm, no temperature. */
+        public Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
+                   boolean outBias, float scale, float softcap) {
+            this(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, false, 0, false, 0, 0f);
+        }
+
+        /** The keys a query at position {@code p} sees start at this position. */
+        public int firstKey(int p) {
+            int first = window > 0 ? Math.max(0, p + 1 - window) : 0;
+            return chunk > 0 ? Math.max(first, p / chunk * chunk) : first;
+        }
+
+        /** The multiplier of a query at position {@code p} (1 unless {@link #tempFloor} is set). */
+        public float tempFactor(int p) {
+            return tempFloor <= 0 ? 1f : (float) (Math.log1p(Math.floor((p + 1.0) / tempFloor)) * tempScale + 1.0);
+        }
+
+        /** True if the layer needs more than the plain causal / windowed softmax. */
+        public boolean special() {
+            return sinks || chunk > 0 || tempFloor > 0;
+        }
+
+        /**
+         * This layer as a backend of context length {@code ctx} sees it: a chunk or a temperature threshold that no position
+         * below {@code ctx} reaches changes nothing, so it is switched off and the layer keeps the fast kernels.
+         */
+        public Gqa forContext(int ctx) {
+            int c = chunk >= ctx ? 0 : chunk;
+            int t = tempFloor > ctx ? 0 : tempFloor;
+            if (c == chunk && t == tempFloor) {
+                return this;
+            }
+            return new Gqa(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, sinks, c, l2Norm,
+                    t, tempScale);
+        }
 
         @Override
         public int qDim() {
