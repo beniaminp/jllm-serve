@@ -425,9 +425,10 @@ final class MetalTuner {
                 case DecoderLayer L -> {
                     switch (L.attn()) {
                         case AttnWeights.Gqa g -> {
-                            QTensor[] qkv = {g.wq(), g.wk(), g.wv()};
-                            if (g.wq().type == g.wk().type && g.wk().type == g.wv().type) {
-                                int rows = g.wq().rows + g.wk().rows + g.wv().rows;
+                            QTensor wv = g.wv() != null ? g.wv() : g.wk(); // attention_k_eq_v: the fused q/k projection, k also the value
+                            QTensor[] qkv = {g.wq(), g.wk(), wv};
+                            if (g.wq().type == g.wk().type && g.wk().type == wv.type) {
+                                int rows = g.wq().rows + g.wk().rows + wv.rows;
                                 add(m, MetalKernels.MmaFamily.MATMUL3, qkv, rows,
                                         List.of(MetalKernels.hmmaKey(MetalKernels.MmaFamily.MATMUL3, g.wq().type, rows, g.wq().cols)));
                             } else {

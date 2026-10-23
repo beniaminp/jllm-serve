@@ -5746,6 +5746,14 @@ kernel void vec_zero(device float *x [[buffer(0)]],
     x[gid] = 0.0f;
 }
 
+// x[i] *= s (Gemma 4's per-layer layer_scalar, applied to the residual stream after each layer)
+kernel void vec_scale(device float *x [[buffer(0)]],
+                      constant VecParams &p [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]]) {
+    if (int(gid) >= p.n) return;
+    x[gid] *= p.s;
+}
+
 // y[i] = relu(x[i])^2 (x and y may be the same buffer)
 kernel void relu2(device const float *x [[buffer(0)]],
                   device float *y [[buffer(1)]],

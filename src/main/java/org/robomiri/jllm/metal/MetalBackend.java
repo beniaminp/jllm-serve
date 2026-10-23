@@ -115,6 +115,8 @@ public final class MetalBackend implements Backend {
     private int keyedVocab = -1;       // the pipe's vocabulary the recorded pipe steps were made with
     private Metal.Buffer kStage;
     private Metal.Buffer vStage;
+    /** All-ones RMS-norm gains for Gemma 4's parameterless V-norm, one buffer per distinct head width. */
+    private final Map<Integer, Metal.Buffer> vNormOnes = new HashMap<>();
 
     private Metal.Buffer embedQ;
     private Metal.Buffer lmHeadQ;
@@ -541,6 +543,25 @@ public final class MetalBackend implements Backend {
         return false;
     }
 
+    /** Whether some layer normalizes its value heads (Gemma 4): an f16 cache then stages v in f32 for the norm. */
+    private boolean anyVNorm() {
+        for (LayerSpec s : arch.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.vNorm()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** All-ones gains for a parameterless V-norm of {@code headDim}-wide head rows (uploaded once per width). */
+    private Metal.Buffer vNormGains(int headDim) {
+        return vNormOnes.computeIfAbsent(headDim, n -> {
+            float[] ones = new float[n];
+            java.util.Arrays.fill(ones, 1f);
+            return k.upload(ones);
+        });
+    }
+
     private void init(KvDtype kvDtype) {
         Attention a = arch.attention();
         // Gemma 4 mixes 256- and 512-wide heads: every layer keeps its own cache and attention kernel, and the scratch
@@ -618,9 +639,11 @@ public final class MetalBackend implements Backend {
                     k.rowIndexed(valCache[l], rowBytes);
                 }
             }
-            // f32 k rows before RoPE (f16, q8, q4, paged) and v rows before the quantization / the paged store
+            // f32 k rows before RoPE (f16, q8, q4, paged) and v rows before the quantization / the paged store; Gemma 4's
+            // V-norm also needs an f32 v row for the f16 cache (the norm runs before the single rounding into half)
             kStage = kvDtype != KvDtype.F32 || seq != null ? k.scratch((long) maxBatch * maxKvDim * 4) : null;
-            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 || seq != null
+            boolean vNorm = kvDtype == KvDtype.F16 && anyVNorm();
+            vStage = kvDtype == KvDtype.Q8 || kvDtype == KvDtype.Q4 || seq != null || vNorm
                     ? k.scratch((long) maxBatch * maxKvDim * 4) : null;
             int recent = Math.min(KvDtype.q4Recent(), ctx);
             if (kvDtype == KvDtype.Q4 && recent > 0) {
@@ -1169,7 +1192,7 @@ public final class MetalBackend implements Backend {
             wv = w.wv();
             bwq = k.wrap(wq.data);
             bwk = k.wrap(wk.data);
-            bwv = k.wrap(wv.data);
+            bwv = wv != null ? k.wrap(wv.data) : null; // Gemma 4's attention_k_eq_v layers have no v_proj
             bq = w.bq() != null ? k.upload(w.bq()) : null;
             bk = w.bk() != null ? k.upload(w.bk()) : null;
             bv = w.bv() != null ? k.upload(w.bv()) : null;
@@ -1203,6 +1226,15 @@ public final class MetalBackend implements Backend {
             long kOff = kvDtype != KvDtype.F32 || paged ? 0 : cacheOff;
             Metal.Buffer vDst = staged ? vStage : valCache[layer];
             long vOff = staged ? 0 : cacheOff;
+            int hd = g.headDim();
+            boolean vNorm = g.vNorm();
+            // Gemma 4's parameterless V-norm is an f32 RMS norm before the store: an f16 cache stages v in f32 as well
+            // (and attention_k_eq_v's v must stay float until that norm), so the rows are rounded once by the store.
+            boolean floatV = vNorm || g.kEqV();
+            boolean stageV = floatV && kvHalf && !staged;
+            Metal.Buffer vProj = stageV ? vStage : vDst;
+            long vProjOff = stageV ? 0 : vOff;
+            boolean vProjHalf = !floatV && kvHalf && !paged;
             Metal.Buffer in = x;
             Metal.Buffer norm = attnNorm;
             if (!fuseNorm) {
@@ -1210,14 +1242,23 @@ public final class MetalBackend implements Backend {
                 in = xb;
                 norm = null;
             }
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vDst, vOff, kvHalf && !paged, bq, bk, bv, n);
+            if (g.kEqV()) { // V = the key projection (pre-RoPE), written to both the k and v outputs
+                k.matmulQkEqV(wq, bwq, wk, bwk, in, norm, q, kDst, kOff, vProj, vProjOff, bq, bk, n);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, in, norm, q, kDst, kOff, vProj, vProjOff, vProjHalf, bq, bk, bv, n);
+            }
+            if (vNorm) { // one RMS norm per value head (headDim-wide rows), all-ones gains, in place in the f32 v rows
+                k.rmsnorm(vProj, vProjOff, vNormGains(hd), vProj, n * g.kvHeads(), hd);
+            }
+            if (stageV) { // the f32 v rows into the f16 cache rows (V = K or the normalized v projection)
+                k.kvPutRows(true, vStage, 0, valCache[layer], cacheOff, kvDim, kvDim, n);
+            }
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
             // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
             // into the staging rows, which kv_store_q8 then quantizes together with v)
             boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
-            int hd = g.headDim();
             if (q4) {
                 k.rope(adjacent, kvHalf, q, kDst, kOff, kStage, 0, useNorm ? qNorm : null, useNorm ? kNorm : null, cos, sin,
                         hd, g.qDim(), kvDim, g.heads(), g.kvHeads(), pos, 0, rotHalf, n);
@@ -1333,7 +1374,14 @@ public final class MetalBackend implements Backend {
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, n, dim);
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
+            if (g.kEqV()) { // V = the pre-RoPE key projection, in the f32 rowV staging rows
+                k.matmulQkEqV(wq, bwq, wk, bwk, xb, null, q, rowK, 0, rowV, 0, bq, bk, n);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
+            }
+            if (g.vNorm()) {
+                k.rmsnorm(rowV, 0, vNormGains(hd), rowV, n * g.kvHeads(), hd);
+            }
             boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
@@ -1456,7 +1504,14 @@ public final class MetalBackend implements Backend {
             boolean q8 = kvDtype == KvDtype.Q8;
             int stride = kvDtype.rowStride(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, rows, dim);
-            k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, rows);
+            if (g.kEqV()) { // V = the pre-RoPE key projection, in the f32 rowV staging rows
+                k.matmulQkEqV(wq, bwq, wk, bwk, xb, null, q, rowK, 0, rowV, 0, bq, bk, rows);
+            } else {
+                k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, rows);
+            }
+            if (g.vNorm()) {
+                k.rmsnorm(rowV, 0, vNormGains(hd), rowV, rows * g.kvHeads(), hd);
+            }
             boolean useNorm = !partial && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
@@ -2103,6 +2158,22 @@ public final class MetalBackend implements Backend {
         if (deepstack != null && l < deepstack.length) {
             addDeepstack(l, n);
         }
+        scaleLayerOutput(l, n);
+        if (System.getProperty("jllm.debug.layers") != null) {
+            k.commitAndWait();
+            MemorySegment dbg = x.contents();
+            System.err.printf("DBG metal L%d %.9g %.9g %.9g%n", l,
+                    dbg.getAtIndex(ValueLayout.JAVA_FLOAT, 0), dbg.getAtIndex(ValueLayout.JAVA_FLOAT, 1),
+                    dbg.getAtIndex(ValueLayout.JAVA_FLOAT, dim - 1));
+        }
+    }
+
+    /** Gemma 4's per-layer {@code layer_scalar}: after the layer, x *= the layer's scalar (the residual stream included). */
+    private void scaleLayerOutput(int layer, int rows) {
+        float s = w.decoderLayer(layer).layerScalar();
+        if (s != 1f) {
+            k.vecScale(x, rows * c.dim(), s);
+        }
     }
 
     // ------------------------------------------------------------------ decode replay
@@ -2516,6 +2587,7 @@ public final class MetalBackend implements Backend {
                     k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, n, true, null, 0f, L.woBias());
                 }
                 L.ffn().run(l, n, false);
+                scaleLayerOutput(l, n);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit();
                 }
@@ -2638,6 +2710,7 @@ public final class MetalBackend implements Backend {
                     k.matmul(L.wo(), L.woBuf(), att, 0, x, 0, rows, true, null, 0f, L.woBias());
                 }
                 L.ffn().run(l, rows, false);
+                scaleLayerOutput(l, rows);
                 if (MetalKernels.COMMIT_LAYERS > 0 && (l + 1) % MetalKernels.COMMIT_LAYERS == 0 && l + 1 < c.layers()) {
                     k.commit();
                 }
