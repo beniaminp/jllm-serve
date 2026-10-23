@@ -23,8 +23,8 @@ import java.util.Map;
  *   x · std + mean ──VAE decode──▶ 1 + 4 (F' − 1) frames
  * </pre>
  *
- * The text encoder is large (5.7 B parameters): it is read and quantized to int8 when a request arrives, used for the prompt and the
- * negative prompt and released before the transformer starts, so that its 4.6 GB and the transformer's weights are never needed at once.
+ * The text encoder is large (5.7 B parameters): it is read and quantized to int8 on the first request and then kept for later requests,
+ * so the 22.7 GB float32 file is read (and the weights quantized) once per pipeline rather than once per prompt.
  */
 public final class WanPipeline implements AutoCloseable {
 
@@ -51,6 +51,8 @@ public final class WanPipeline implements AutoCloseable {
     private final Map<String, Object> schedulerConfig;
     private final boolean q8;
     private final UnigramTokenizer tokenizer;
+    /** Built on the first request and reused: the 22.7 GB float32 file is read and quantized only once. */
+    private Umt5Encoder textEncoder;
     public volatile long textNs, ditNs, vaeNs, totalNs;
     public volatile float[] lastLatents;
 
@@ -91,6 +93,14 @@ public final class WanPipeline implements AutoCloseable {
         return s.replaceAll("\\s+", " ").strip();
     }
 
+    /** The shared UMT5 encoder: read and quantized on first use, reused by every later request of this pipeline. */
+    private Umt5Encoder textEncoder() throws IOException {
+        if (textEncoder == null) {
+            textEncoder = new Umt5Encoder(dir.resolve("text_encoder"), q8);
+        }
+        return textEncoder;
+    }
+
     private int[] ids(String text) {
         int[] ids = tokenizer.encode(clean(text));
         if (ids.length > MAX_TEXT) {
@@ -127,11 +137,10 @@ public final class WanPipeline implements AutoCloseable {
         int[] nid = ids(r.negativePrompt() == null ? "" : r.negativePrompt());
         float[] pe;
         float[] ne = null;
-        try (Umt5Encoder enc = new Umt5Encoder(dir.resolve("text_encoder"), q8)) {
-            pe = enc.encode(pid);
-            if (cfg) {
-                ne = enc.encode(nid);
-            }
+        Umt5Encoder enc = textEncoder();
+        pe = enc.encode(pid);
+        if (cfg) {
+            ne = enc.encode(nid);
         }
         int d = pe.length / pid.length;
         cond = dit.encodeText(padded(pe, pid.length, d), MAX_TEXT);
@@ -219,6 +228,9 @@ public final class WanPipeline implements AutoCloseable {
 
     @Override
     public void close() {
+        if (textEncoder != null) {
+            textEncoder.close();
+        }
         dit.close();
         vae.close();
         devices.close();

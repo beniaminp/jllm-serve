@@ -74,7 +74,16 @@ public final class ImagePipeline implements AutoCloseable {
     private final boolean forceZerosForEmpty;
     public final Defaults defaults;
 
+    /** Loads the model and picks its defaults from the folder name and scheduler config. */
     public ImagePipeline(Path dir, Devices devices) throws IOException {
+        this(dir, devices, null);
+    }
+
+    /**
+     * @param turboOverride {@code TRUE} / {@code FALSE} to force the distilled-model defaults on or off, or {@code null} to
+     *                      detect them from the folder name (and the {@code lcm} + trailing-spacing combination)
+     */
+    public ImagePipeline(Path dir, Devices devices, Boolean turboOverride) throws IOException {
         this.dir = dir;
         this.devices = devices;
         Map<String, Object> index = Json.parseObject(Files.readString(dir.resolve("model_index.json"), StandardCharsets.UTF_8));
@@ -99,7 +108,8 @@ public final class ImagePipeline implements AutoCloseable {
         Path sc = dir.resolve("scheduler").resolve("scheduler_config.json");
         schedulerConfig = Files.isRegularFile(sc) ? Json.parseObject(Files.readString(sc, StandardCharsets.UTF_8)) : Map.of();
         String name = dir.getFileName().toString().toLowerCase(Locale.ROOT);
-        boolean turbo = name.contains("turbo") || Json.str(schedulerConfig, "timestep_spacing", "").equals("trailing")
+        boolean turbo = turboOverride != null ? turboOverride
+                : name.contains("turbo") || Json.str(schedulerConfig, "timestep_spacing", "").equals("trailing")
                 && name.contains("lcm");
         int size = xl ? 1024 : (unetSampleSize() >= 96 ? 768 : 512);
         if (turbo) {

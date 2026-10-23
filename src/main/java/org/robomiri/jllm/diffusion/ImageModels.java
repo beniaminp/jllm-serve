@@ -50,6 +50,19 @@ public final class ImageModels {
         return DiffusersRepo.isDiffusersDir(folder(s, source));
     }
 
+    /**
+     * {@code image.turbo}: {@code auto} keeps the name-based detection (a folder whose name contains {@code turbo}, or an
+     * {@code lcm} model with trailing timestep spacing), {@code true} / {@code false} force the distilled defaults on or off
+     * (so a renamed Turbo folder, or a fine-tune without "turbo" in its path, gets the right ones).
+     */
+    private static Boolean turboOverride(Settings s) {
+        return switch (s.get("image.turbo").toLowerCase(java.util.Locale.ROOT)) {
+            case "true" -> Boolean.TRUE;
+            case "false" -> Boolean.FALSE;
+            default -> null;
+        };
+    }
+
     /** Loads the pipeline with the {@code image.*} settings. */
     public static ImagePipeline load(Settings s, HuggingFaceHub hub, String source) throws IOException, InterruptedException {
         Path dir = resolve(s, hub, source);
@@ -57,7 +70,7 @@ public final class ImageModels {
         boolean xl = index.containsKey("text_encoder_2");
         Devices dev = Devices.open(s.get("image.backend"), s.get("image.precision"), xl);
         try {
-            ImagePipeline p = new ImagePipeline(dir, dev);
+            ImagePipeline p = new ImagePipeline(dir, dev, turboOverride(s));
             p.setVaeTiling(s.getInt("image.vae-tile"), s.getInt("image.vae-tile-overlap"));
             return p;
         } catch (IOException | RuntimeException e) {
