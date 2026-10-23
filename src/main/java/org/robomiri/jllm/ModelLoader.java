@@ -600,7 +600,7 @@ public final class ModelLoader {
     /** The sparse decode attention settings (docs/27); the switch also needs the paged cache, which it turns on. */
     static org.robomiri.jllm.model.KvSparse sparse(Settings s) {
         boolean on = s.getBool("backend.kv-sparse");
-        if (on && !s.getBool("backend.kv-paged") && !sparseNoted) {
+        if (on && !s.get("backend.kv-paged").trim().equalsIgnoreCase("true") && !sparseNoted) {
             sparseNoted = true;
             System.err.println("note: backend.kv-sparse needs the paged KV cache, which it turns on (backend.kv-paged)");
         }
