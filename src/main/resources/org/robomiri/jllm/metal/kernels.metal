@@ -24,6 +24,9 @@ using namespace metal;
 #define PF_ROWS 2               // rows per simdgroup of matmul_pf / matmul3_pf
 #define PF_UNITS 1              // gate + up units per simdgroup of matmul_swiglu_pf
 #define PF_TOKS 8               // tokens per simdgroup of the prefill matmuls
+#define SB_ROWS 2               // rows per simdgroup of the small-batch matmuls
+#define SB_MAX_TOKS 16          // most tokens of a small-batch pass
+#define SB_STAGE_TOKS 8         // tokens whose activation chunk is staged in threadgroup memory at a time
 #define MMA_BR 64               // output rows per threadgroup of the MMA prefill matmuls
 #define MMA_BT 32               // tokens per threadgroup of the MMA prefill matmuls
 #define MM_THREADS 128          // matmul threadgroup: 4 simdgroups = 4 rows (norm_scale_128 relies on it)
@@ -755,6 +758,130 @@ template [[host_name("matmul3_pf_q8_h")]] kernel matmul3_pf_h_t matmul3_pf<8, PF
 typedef decltype(matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>) matmul_swiglu_pf_t;
 template [[host_name("matmul_swiglu_pf_q4")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<4, PF_UNITS, PF_TOKS>;
 template [[host_name("matmul_swiglu_pf_q8")]] kernel matmul_swiglu_pf_t matmul_swiglu_pf<8, PF_UNITS, PF_TOKS>;
+
+// ---------------------------------------------------------------------------------------------- 2a. matmul: small batches
+// Passes of 2 .. SB_MAX_TOKS tokens (speculative verification, batched decode). The single-row and tiled kernels
+// above give every lane one 32-weight block and let it gather that block's 32 activations of each token straight
+// from device memory, at a 128-byte stride between lanes: a float4 load touches 32 cache lines, and the loads
+// outnumber the weight loads 8 * n : 1, so the pass cost grows almost linearly with n although the weights are
+// read once. These kernels stage the activations through threadgroup memory instead: the 128 threads of the
+// threadgroup copy the chunk of 32 blocks (1024 columns) of up to SB_STAGE_TOKS tokens coalesced into `xs`, with
+// block b's float4 j stored at slot b * 8 + ((j + b) & 7) so that the lanes' strided reads are conflict-free, and
+// every lane then reads its block's activations from there. The arithmetic is the one of mm_tile: lane l still
+// handles blocks l, l + 32, ... of a row in that order with the shared q4_block_dot / q8_block_dot, one simd_sum
+// per output, so the results are bit-identical to the other families. Weights are dequantized once per chunk and
+// used for every token of the pass. Q4_0 / Q8_0 only.
+
+template <int QT, int NR, int NT>
+static inline void mm_tile_sb(thread device const uchar *const *wq, thread device const float *const *ws,
+                              thread const ulong *grow, int nr, int nb, device const float *x, ulong xstride,
+                              int nt, thread float (*acc)[NT], threadgroup float4 *xs, ushort tid, ushort lane) {
+    device const float4 *x4 = as_f4(x);
+    const ulong xs4 = xstride >> 2;
+    for (int cb = 0; cb < nb; cb += 32) {
+        const int nbc = min(32, nb - cb);
+        const bool live = nr > 0 && lane < nbc;
+        const int b = cb + lane;
+        // the block's weights as floats (exact: small integers), once for all tokens
+        float4 wf[NR][8];
+        float s[NR];
+        if (live) {
+            for (int r = 0; r < NR; r++) {
+                if (r < nr) {
+                    if (QT == 4) {
+                        device const uchar4 *rq = (device const uchar4 *)(wq[r] + grow[r] * nb * 16) + b * 4;
+                        for (int k = 0; k < 4; k++) {
+                            const uchar4 v = rq[k];
+                            wf[r][k] = float4(v & uchar4(15)) - 8.0f;
+                            wf[r][k + 4] = float4(v >> uchar4(4)) - 8.0f;
+                        }
+                    } else {
+                        device const char4 *rq = (device const char4 *)(wq[r] + grow[r] * nb * 32) + b * 8;
+                        for (int k = 0; k < 8; k++) wf[r][k] = float4(rq[k]);
+                    }
+                    s[r] = ws[r][grow[r] * nb + b];
+                }
+            }
+        }
+        for (int th = 0; th < nt; th += SB_STAGE_TOKS) {
+            const int nth = min(SB_STAGE_TOKS, nt - th);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int t = 0; t < nth; t++) {
+                for (int i = tid; i < nbc * 8; i += MM_THREADS) {
+                    const int bb = i >> 3;
+                    xs[t * 256 + bb * 8 + (((i & 7) + bb) & 7)] = x4[(ulong)(th + t) * xs4 + (ulong)cb * 8 + i];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (live) {
+                for (int t = 0; t < nth; t++) {
+                    threadgroup const float4 *xt = xs + t * 256 + lane * 8;
+                    for (int r = 0; r < NR; r++) {
+                        if (r < nr) {
+                            float d = 0.0f;
+                            if (QT == 4) {
+                                for (int k = 0; k < 4; k++) {
+                                    d += dot(wf[r][k], xt[(k + lane) & 7]) + dot(wf[r][k + 4], xt[(k + 4 + lane) & 7]);
+                                }
+                            } else {
+                                for (int k = 0; k < 8; k++) d += dot(wf[r][k], xt[(k + lane) & 7]);
+                            }
+                            acc[r][th + t] += d * s[r];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Same buffers and parameters as matmul_pf; grid (ceil(rows / (NR * 4)), 1), 128 threads, threadgroup(0) =
+// min(ntok, SB_STAGE_TOKS) * 4096 bytes. ntok <= NT.
+template <int QT, int NR, int NT>
+kernel void matmul_sb(device const uchar *wq [[buffer(0)]],
+                      device const float *ws [[buffer(1)]],
+                      device const float *x [[buffer(2)]],
+                      device float *out [[buffer(3)]],
+                      device const float *nw [[buffer(4)]],
+                      constant MatmulParams &p [[buffer(5)]],
+                      threadgroup float4 *xs [[threadgroup(0)]],
+                      uint2 tgp [[threadgroup_position_in_grid]],
+                      ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]],
+                      ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int row0 = (int(tgp.x) * nsg + sg) * NR;
+    const int nb = p.cols / QK;
+    const int nr = max(0, min(NR, p.rows - row0));
+    device const uchar *wqs[NR];
+    device const float *wss[NR];
+    ulong grow[NR];
+    for (int r = 0; r < NR; r++) {
+        wqs[r] = wq;
+        wss[r] = ws;
+        grow[r] = (ulong)(row0 + min(r, max(nr - 1, 0)));
+    }
+    float acc[NR][NT];
+    for (int r = 0; r < NR; r++)
+        for (int t = 0; t < NT; t++) acc[r][t] = 0.0f;
+    mm_tile_sb<QT, NR, NT>(wqs, wss, grow, nr, nb, x, (ulong)p.cols, p.ntok, acc, xs, sg * 32 + lane, lane);
+    for (int r = 0; r < NR; r++) {
+        if (r < nr) {
+            for (int t = 0; t < NT; t++) {
+                if (t < p.ntok) {
+                    float v = simd_sum(acc[r][t]);
+                    if (lane == 0) {
+                        ulong o = (ulong)t * p.rows + row0 + r;
+                        out[o] = p.accumulate ? out[o] + v : (p.softcap > 0.0f ? softcap_f(v, p.softcap) : v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(matmul_sb<4, SB_ROWS, SB_MAX_TOKS>) matmul_sb_t;
+template [[host_name("matmul_sb_q4")]] kernel matmul_sb_t matmul_sb<4, SB_ROWS, SB_MAX_TOKS>;
+template [[host_name("matmul_sb_q8")]] kernel matmul_sb_t matmul_sb<8, SB_ROWS, SB_MAX_TOKS>;
 
 // ---------------------------------------------------------------------------------------------- 2b. matmul: MMA prefill
 // Prefill chunks of at least MMA_MIN_TOKENS tokens use the matrix units: one threadgroup (4 simdgroups) computes a
