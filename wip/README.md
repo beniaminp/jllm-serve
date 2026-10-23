@@ -42,11 +42,16 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 
 ### 1. Mixed scheduler — `wip/scheduler` (docs/25)
 
-- **Branch:** `wip/scheduler` at `cc23365`, with main `e951fc7` merged in. `cc23365` is a WIP docs commit on top of
-  `2a32e70`, which passed all six gates.
-- **On its way to `main`:** `2a32e70` merged onto main as `ba44b68`, gates running. The merge resolved two conflicts:
+- **Branch:** `wip/scheduler`, merged to `main` as `29ccca1` after all six gates passed (`mvn install`, the web tests,
+  the Metal emulator, the kernel tests, the arch smoke and the exactness run). The merge resolved two conflicts:
   - `ModelLoader.kvPool` pages when `paged(...)` or `mixedWanted(...)`;
   - `Engine` keeps both `releaseKv` (idle slots, paged follow-up) and `releaseCache` (scheduler).
+- **Two real fixes found during the merge:**
+  - the Metal mixed pass (`forwardMixed`/`runSegments`) was missing the attention `AttnExtra` buffer, so it bound the
+    paged block table at the wrong buffer index and produced garbage (NaN) logits; fixed by adding an `attentionAt`
+    overload that takes the `AttnExtra`;
+  - the concurrent-encoder check is now warmed up (the serial reference is computed on a second run), which stops the
+    intermittent cold-JIT single-ULP flake.
 - **Works (`engine.scheduler=mixed`; `slots` stays the default and is unchanged):**
   - `Backend.forwardMixed` on CPU and Metal: one prefill chunk plus every decode token plus every draft verification in
     one pass;
@@ -56,11 +61,11 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - client-gone wake in under 60 ms;
   - tests: `SchedulerPolicyTest`, `MixedSchedulerTest`, `MixedPassChecks` in arch smoke, jllm-web `MixedSlotsTest`, and
     the `SchedulerBench` agent workload.
-- **Left:**
+- **Merged, follow-ups still open:**
   1. Second benchmark round (pass budget, background chunk cap, the 30B alone and with 2 slots), then fill the `TBD`
      markers in docs/25 §25.5 and the README numbers.
-  2. Arch smoke with the concurrent encoder at the final commit.
-  3. Decide the default from the numbers.
+  2. Decide the default from the numbers. `engine.scheduler` is still `slots`, so mixed is off by default until those
+     numbers decide.
 - **Known:**
   - Round 1 on Metal, 0.6B agent workload: slots with the flat cache 65 s, slots with paged 36.5 s, mixed 36.0 s wall.
     Mixed raises the inter-token p95 (56–196 ms against 37 ms) because decode rows ride a 256-row chunk pass, and lowers
