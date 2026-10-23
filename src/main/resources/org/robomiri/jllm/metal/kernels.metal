@@ -39,7 +39,7 @@ using namespace metal;
 #define ATT_TILE 32             // tokens per attention dispatch (scores scratch rows per head)
 #define DEC_SG 4                // simdgroups per attention_dec threadgroup (decode attention, section 4b)
 #define DEC_THREADS 128         // attention_dec threadgroup = DEC_SG simdgroups
-#define MAX_PER 8               // widest head in units of 32 lanes (headDim <= 256)
+#define MAX_PER 8               // widest runtime head in units of 32 lanes (headDim <= 256); d512 instantiations pass MAXP = 16
 #define MLA_MAX_PER 18          // widest absorbed MLA query / cache row in units of 32 lanes (kv_lora_rank + rope <= 576)
 #define CHANNEL_THREADS 64      // mla_lat_store / mamba_conv / mamba_scan threadgroup
 #define MAX_EXPERTS 1024        // router logits held in threadgroup memory
@@ -1649,7 +1649,9 @@ kernel void attention_t(device const float *q [[buffer(0)]],
 
 // attention / attention_h / attention_q8: runtime widths (head dims other than 64 / 128 / 256);
 // attention_mla[_h|_q8]: runtime widths up to MLA_MAX_PER * 32 (DeepSeek's absorbed queries);
-// attention_g{G}_d{headDim}[_h|_q8]: compile-time widths, G query heads per threadgroup.
+// attention_g{G}_d{headDim}[_h|_q8]: compile-time widths, G query heads per threadgroup. The d512 forms pass
+// MAXP = PER = 16 so part[] holds the whole 512-wide value head; the 64 / 128 / 256 forms keep MAX_PER (8 units), so
+// their threadgroup memory is unchanged.
 #define ATTN_INST(KV, G, PER, NAME) \
     template [[host_name(NAME)]] kernel decltype(attention_t<KV, G, PER, PER>) attention_t<KV, G, PER, PER>;
 ATTN_INST(float, 1, 0, "attention")           ATTN_INST(half, 1, 0, "attention_h")          ATTN_INST(char, 1, 0, "attention_q8")
@@ -1659,6 +1661,9 @@ template [[host_name("attention_mla_q8")]] kernel decltype(attention_t<char, 1, 
 ATTN_INST(float, 1, 2, "attention_g1_d64")    ATTN_INST(half, 1, 2, "attention_g1_d64_h")   ATTN_INST(char, 1, 2, "attention_g1_d64_q8")
 ATTN_INST(float, 1, 4, "attention_g1_d128")   ATTN_INST(half, 1, 4, "attention_g1_d128_h")  ATTN_INST(char, 1, 4, "attention_g1_d128_q8")
 ATTN_INST(float, 1, 8, "attention_g1_d256")   ATTN_INST(half, 1, 8, "attention_g1_d256_h")  ATTN_INST(char, 1, 8, "attention_g1_d256_q8")
+template [[host_name("attention_g1_d512")]] kernel decltype(attention_t<float, 1, 16, 16, 16>) attention_t<float, 1, 16, 16, 16>;
+template [[host_name("attention_g1_d512_h")]] kernel decltype(attention_t<half, 1, 16, 16, 16>) attention_t<half, 1, 16, 16, 16>;
+template [[host_name("attention_g1_d512_q8")]] kernel decltype(attention_t<char, 1, 16, 16, 16>) attention_t<char, 1, 16, 16, 16>;
 // The grouped variants are only instantiated when the host defines JLLM_ATTN_GROUPS (-Djllm.metal.attnGroup).
 #ifdef JLLM_ATTN_GROUPS
 ATTN_INST(float, 2, 2, "attention_g2_d64")    ATTN_INST(float, 4, 2, "attention_g4_d64")    ATTN_INST(float, 8, 2, "attention_g8_d64")
@@ -1674,7 +1679,7 @@ ATTN_INST(char, 2, 8, "attention_g2_d256_q8") ATTN_INST(char, 4, 8, "attention_g
 
 // ---------------------------------------------------------------------------------------------- 4. attention: flash decoding
 // Optional (-Djllm.metal.flashDecode=true): a decode step (one token) over a long context splits the key range of
-// every head across nSplit threadgroups instead of one. attention_split<KV> runs the three phases of `attention`
+// every head across nSplit threadgroups instead of one. attention_split<KV, MAXP> runs the three phases of `attention`
 // on its sub-range [first + split * chunk, ...) with the softmax taken relative to the sub-range's own maximum,
 // and writes the unnormalised partial (o[headDim], max, sum) to `part`; attention_combine then rescales the
 // partials to the global maximum and divides by the combined sum. The combine adds the sub-ranges' sums and
@@ -1698,7 +1703,7 @@ struct AttnSplitParams {
     int pageShift;   // paged cache (see kv_row); 0 = flat
 };
 
-template <typename KV>
+template <typename KV, int MAXP = MAX_PER>
 kernel void attention_split(device const float *q [[buffer(0)]],
                             device const KV *kc [[buffer(1)]],
                             device const KV *vc [[buffer(2)]],
@@ -1713,7 +1718,7 @@ kernel void attention_split(device const float *q [[buffer(0)]],
                             ushort lane [[thread_index_in_simdgroup]],
                             ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[32];
-    threadgroup float red[ATT_SIMDGROUPS][ATT_THREADS];
+    threadgroup float red[ATT_SIMDGROUPS][MAXP * 32]; // = ATT_THREADS for MAX_PER
     const ushort tid = tid2.x;
     const ushort tpg = tpg2.x;
 
@@ -1733,15 +1738,15 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     device const KV *vb = vc + kvh * p.headDim;
     device float *po = part + ((ulong)h * p.nSplit + split) * (p.headDim + 2);
 
-    float qr[MAX_PER];
-    for (int i = 0; i < MAX_PER; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
+    float qr[MAXP];
+    for (int i = 0; i < MAXP; i++) qr[i] = i < per ? qv[lane + i * 32] : 0.0f;
 
     float mx = -INFINITY;
     for (int s = s0 + sg; s < s1; s += nsg) {
         const ulong rk = kv_row(tbl, p.pageShift, s);
         device const KV *kv = kb + rk * p.kvStride;
         float d = 0.0f;
-        for (int i = 0; i < MAX_PER; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
+        for (int i = 0; i < MAXP; i++) if (i < per) d += qr[i] * float(kv[lane + i * 32]);
         d = simd_sum(d) * (p.scale * kv_scale(kc + rk * p.kvStride, p.kvStride, p.nKvHeads, kvh));
         if (p.softcap > 0.0f) d = softcap_f(d, p.softcap);
         if (lane == 0) sc[s] = d;
@@ -1764,15 +1769,15 @@ kernel void attention_split(device const float *q [[buffer(0)]],
     sum = tg_sum(sum, buf, sg, lane, nsg);
     threadgroup_barrier(mem_flags::mem_device);
 
-    float o[MAX_PER];
-    for (int i = 0; i < MAX_PER; i++) o[i] = 0.0f;
+    float o[MAXP];
+    for (int i = 0; i < MAXP; i++) o[i] = 0.0f;
     for (int s = s0 + sg; s < s1; s += nsg) {
         const ulong rv = kv_row(tbl, p.pageShift, s);
         const float pr = sc[s] * kv_scale(vc + rv * p.kvStride, p.kvStride, p.nKvHeads, kvh);
         device const KV *vv = vb + rv * p.kvStride;
-        for (int i = 0; i < MAX_PER; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
+        for (int i = 0; i < MAXP; i++) if (i < per) o[i] += pr * float(vv[lane + i * 32]);
     }
-    for (int i = 0; i < MAX_PER; i++) if (i < per) red[sg][lane + i * 32] = o[i];
+    for (int i = 0; i < MAXP; i++) if (i < per) red[sg][lane + i * 32] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int d = tid; d < p.headDim; d += tpg) {
         float acc = 0.0f;
@@ -1825,6 +1830,11 @@ kernel void attention_combine(device const float *part [[buffer(0)]],
 template [[host_name("attention_split")]] kernel decltype(attention_split<float>) attention_split<float>;
 template [[host_name("attention_split_h")]] kernel decltype(attention_split<half>) attention_split<half>;
 template [[host_name("attention_split_q8")]] kernel decltype(attention_split<char>) attention_split<char>;
+// _d512: the same kernel with the runtime head width bounded at 512 (16 units) for the 512-wide heads of Gemma 4's
+// full-attention layers; the plain instantiations keep MAXP = MAX_PER (8 units), so their buffers stay 256 wide.
+template [[host_name("attention_split_d512")]] kernel decltype(attention_split<float, 16>) attention_split<float, 16>;
+template [[host_name("attention_split_d512_h")]] kernel decltype(attention_split<half, 16>) attention_split<half, 16>;
+template [[host_name("attention_split_d512_q8")]] kernel decltype(attention_split<char, 16>) attention_split<char, 16>;
 
 // ---------------------------------------------------------------------------------------------- 4b. attention: decode
 // attention_dec<KV, G, D>: the attention of ONE token (a decode step) over a long cache, written for memory-level
@@ -2090,6 +2100,9 @@ kernel void attention_dec_sp(device const float *q [[buffer(0)]],
 DEC_INST_KV(1, 64) DEC_INST_KV(2, 64) DEC_INST_KV(4, 64)
 DEC_INST_KV(1, 128) DEC_INST_KV(2, 128) DEC_INST_KV(4, 128)
 DEC_INST_KV(1, 256) DEC_INST_KV(2, 256)
+// 512-wide heads (Gemma 4 full-attention layers): one KV head, so one query head per threadgroup (G = 1); G > 1
+// would double the persistent float4 query / accumulator arrays (16 each at D = 512).
+DEC_INST_KV(1, 512)
 
 // ---------------------------------------------------------------------------------------------- 4c. sparse decode attention
 // Sparse attention while decoding (docs/27, backend.kv-sparse; Quest-style block selection on the paged cache). Per pool
@@ -4090,6 +4103,12 @@ template [[host_name("attention_fa_d256_h")]] kernel decltype(attention_fa<half,
 template [[host_name("attention_fa_d64_q8")]] kernel decltype(attention_fa<char, 64>) attention_fa<char, 64>;
 template [[host_name("attention_fa_d128_q8")]] kernel decltype(attention_fa<char, 128>) attention_fa<char, 128>;
 template [[host_name("attention_fa_d256_q8")]] kernel decltype(attention_fa<char, 256>) attention_fa<char, 256>;
+// 512-wide heads (Gemma 4): BK = 4096 / 512 = 8 keys per staged block (16 KB), the smallest block the 8-key
+// simdgroup tiles allow. qm / om then hold 64 8x8 tiles each (256 registers per lane before the temporaries), so the
+// d512 forms are expected to spill; correctness is unaffected (kernel_tests.py checks it).
+template [[host_name("attention_fa_d512")]] kernel decltype(attention_fa<float, 512>) attention_fa<float, 512>;
+template [[host_name("attention_fa_d512_h")]] kernel decltype(attention_fa<half, 512>) attention_fa<half, 512>;
+template [[host_name("attention_fa_d512_q8")]] kernel decltype(attention_fa<char, 512>) attention_fa<char, 512>;
 
 // ---------------------------------------------------------------------------------------------- 10. pipelined greedy decoding
 // A greedy decode step can be queued before the CPU has seen the previous token: argmax writes the chosen id into a
@@ -5058,6 +5077,12 @@ kernel void attention_fb(device const float *q [[buffer(0)]],
 FB_INSTANTIATE(64)
 FB_INSTANTIATE(128)
 FB_INSTANTIATE(256)
+// 512-wide heads (Gemma 4): the half staging gives BK = 8192 / (512 * 2) = 8 keys per block (two 8 KB buffers).
+// An f32 staging would give BK = 4, below the 8-key simdgroup tiles, and forcing 8 keys would need 33 KB of
+// threadgroup memory (K + V + the score / diagonal scratch) over the 32 KB limit, so there is no attention_fb_d512
+// for an f32 cache: attention_fa_d512 (one 16 KB K or V buffer, BK = 8) covers that case.
+template [[host_name("attention_fb_d512_h")]] kernel decltype(attention_fb<half, half, 512>) attention_fb<half, half, 512>;
+template [[host_name("attention_fb_d512_q8")]] kernel decltype(attention_fb<char, half, 512>) attention_fb<char, half, 512>;
 
 
 // ---------------------------------------------------------------------------------------------- 14. q4 KV cache
