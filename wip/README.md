@@ -94,7 +94,12 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 
 ### 3. Sparse decode attention — `wip/sparse-attention` (docs/27)
 
-- **Branch:** `wip/sparse-attention` at `9a41c17`, main `e951fc7` merged in.
+- **Branch:** `wip/sparse-attention`, merged to `main` as `65f759a` after all six gates passed (`mvn install`, the web
+  tests, the Metal emulator, the kernel tests, the arch smoke and the exactness run, whose md5 matched on both CPU and
+  Metal). Merging `main` in resolved 11 conflicting files (`ContextBudget`, `ModelLoader`, `Settings`, `CpuBackend`,
+  `PagedKv`, `MetalKvStorage`, `kernel_tests.py`, `mac-validate.sh`, `README`, `docs/24`, `docs/README`) to reconcile
+  sparse attention with the paged-auto, tiered-KV and hybrid backends. One follow-up fix: `ModelLoader.sparse` reads
+  `backend.kv-paged` as `auto`/`true`/`false` instead of `getBool`.
 - **Works (`backend.kv-sparse`, off by default; it turns on the paged cache):**
   - per-block key summaries (half min/max per channel), the Quest upper bound, top-k blocks plus sinks plus the recent
     window, on the CPU paged cache and on Metal (`kv_summary`, `sparse_score_d*`, `sparse_select`, `attention_dec_sp`);
@@ -102,13 +107,10 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - checks: `cpu/SparseKvTest` (1405 checks, in `mvn install`), the kernel_tests sparse section, and `KvStudy
     sparsecheck` on the real GPU (replay on = off bit for bit);
   - perplexity at 8k/16k/32k is in docs/27 §27.5.2.
-- **Left:** the gates on this branch, the needle-in-a-haystack tables at 8k/16k/32k, decode tok/s against context
+- **Merged, follow-ups still open:** the needle-in-a-haystack tables at 8k/16k/32k, decode tok/s against context
   length, and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
 - **Known:** CPU and Metal sparse logits differ by up to 0.4–2.8, because a rounding-order difference flips which block
   is selected. Argmax agrees 23–24 of 24.
-- **Docs numbering:** both this branch and the tiered-KV branch wrote `docs/26`. The tiered-KV branch merged first with
-  `docs/26-tiered-kv-and-memory-planner.md`, so this branch's `docs/26-sparse-attention.md` renumbers to `docs/27` when
-  it merges.
 
 ### 4. Tiered KV storage and memory planner — `wip/tiered-kv-memory-planner` (docs/26)
 
