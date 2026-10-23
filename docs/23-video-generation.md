@@ -334,7 +334,7 @@ That is *lossless*: a diffusion picture is full of noise-like texture, so its re
 ./jllm-web/run.sh                                                                                    # Models: load the adapter; then the Video tab
 ```
 
-The first run downloads the adapter (1.8 GB) and the Stable Diffusion 1.5 base (2.6 GB, fp16 files) into `models/`. Flags: `--frames`,
+The first run downloads the adapter (1.8 GB) and the Stable Diffusion 1.5 base (2.1 GB, fp16 files) into `models/`. Flags: `--frames`,
 `--fps`, `--steps`, `--guidance`, `--width`, `--height`, `--seed`, `--scheduler`, `--negative`, `--out` (the extension picks the format),
 `--base-model`, `--video-format`; all `video.*` keys are in [`jllm.properties`](../src/main/resources/jllm.properties), including the
 switch `video.enabled` (false hides the endpoints, the console tab and the chat tool, and refuses to load video models).

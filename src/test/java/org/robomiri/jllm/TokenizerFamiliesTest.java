@@ -31,7 +31,8 @@ public final class TokenizerFamiliesTest {
             {"qwen3", "qwen3"}, {"qwen2", "qwen2"}, {"llama3", "llama"}, {"mistral", "mistral"},
             {"gemma3", "gemma3_text"}, {"gemma2", "gemma2"}, {"phi3", "phi3"}, {"phi4", "phi3"},
             {"glmedge", "glm"}, {"glm4", "glm4"}, {"dsr1", "qwen2"}, {"mamba", "mamba"}, {"dsv2", "deepseek_v2"},
-            {"phi4_14b", "phi3"}};
+            {"phi4_14b", "phi3"}, {"gptoss", "gpt_oss"}, {"llama4", "llama4_text"},
+            {"granite", "granitemoehybrid"}};
 
     /**
      * Tokenizers of other model types that no supported family uses (Unigram: t5, albert, xlmr; WordPiece: bert,
@@ -45,6 +46,8 @@ public final class TokenizerFamiliesTest {
     private static Path ROOT;
     /** The Llama 3.x template's fallback date (what jinja2 renders without {@code strftime_now}). */
     private static final String LLAMA_FIXTURE_DATE = "26 Jul 2024";
+    /** The date the gpt-oss fixtures were rendered with (the generator pins {@code strftime_now}). */
+    private static final String GPTOSS_FIXTURE_DATE = "2025-08-05";
 
     static int passed;
     static int failed;
@@ -175,6 +178,7 @@ public final class TokenizerFamiliesTest {
         // forModelType("llama") prints the date of the render; the fixtures were rendered by jinja2 without
         // strftime_now, i.e. with the template's own fallback date, which the test pins the same way
         ChatTemplate.Format fmt = name.equals("llama3") ? ChatTemplate.llama3(LLAMA_FIXTURE_DATE)
+                : name.equals("gptoss") ? ChatTemplate.harmony(GPTOSS_FIXTURE_DATE)
                 : ChatTemplate.forModelType(modelType, tok);
         int chatBad = 0;
         for (Object c : chats) {
@@ -227,6 +231,9 @@ public final class TokenizerFamiliesTest {
         expectStops("mamba", 0);
         expectStops("dsv2", 100001);
         expectStops("phi4_14b", 100265, 100257);
+        expectStops("gptoss", 200002, 200012, 199999); // <|return|>, <|call|>, <|endoftext|>
+        expectStops("llama4", 200008, 200001, 200007); // <|eot|>, <|end_of_text|>, <|eom|>
+        expectStops("granite", 100257); // <|end_of_text|>
 
         // BOS / EOS information, never added inside encode()
         expectBos("llama3", 128000, true);

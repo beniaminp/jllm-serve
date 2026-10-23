@@ -164,6 +164,14 @@ bench "~8000-token prompt: sparse decode attention (default 64 blocks)" "$DENSE"
 bench "~8000-token prompt: sparse decode attention, f16 cache" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-sparse true --backend.kv-dtype f16 --engine.speculative off
 bench "~8000-token prompt: sparse decode attention, q8 cache (rotated keys)" "$DENSE" "" --ctx 12288 --bench.prompt-repeat 800 --backend.kv-sparse true --backend.kv-dtype q8 --engine.speculative off
 bench "~3000-token prompt: sparse decode attention, decode replay off" "$DENSE" "-Djllm.metal.replay=false" --bench.prompt-repeat 300 --backend.kv-sparse true --backend.kv-sparse-blocks 16 --engine.speculative off
+# tiered KV storage (docs/26): a hot tier limited to 70 MB (38 blocks of f16), host tier 4 MB, files behind it; the 3000-token prompts
+# need 340 MB of f16 KV, so the 2 MB rows keep the cache on the host and stream it layer by layer (kv-stream auto) against the same
+# f16 prompt fully resident
+bench "~3000-token prompt: f16 KV resident (reference for the tier rows)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --engine.speculative off
+bench "~3000-token prompt: tiered KV, 70 MB hot tier (streamed, f16)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 70 --backend.kv-host-mb 4 --engine.speculative off
+bench "~3000-token prompt: tiered KV, 2 MB hot tier (streamed, f16, layers in mapped files)" "$DENSE" "" --bench.prompt-repeat 300 --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 2 --backend.kv-host-mb 100 --engine.speculative off
+bench "tiered KV, pool tier only (no stream, hot tier 400 MB, f16)" "$DENSE" "" --backend.kv-dtype f16 --backend.kv-tier true --backend.kv-hot-mb 400 --backend.kv-stream off --engine.speculative off
+bench "tiered KV, memory planner on (f16)" "$DENSE" "" --backend.kv-dtype f16 --backend.kv-tier true --backend.memory-plan true --engine.speculative off
 bench "q4 KV cache, no recent window" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 0 --engine.speculative off
 bench "q4 KV cache, recent window 512" "$DENSE" "" --backend.kv-dtype q4 --backend.kv-q4-recent 512 --engine.speculative off
 bench "~2000-token prompt: f16 KV cache" "$DENSE" "" --backend.kv-dtype f16 --engine.speculative off --bench.prompt-repeat 200

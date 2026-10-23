@@ -54,7 +54,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
         this.B = st.B;
         this.pairs = st.pairs;
         this.sparse = st.summaries ? KvSparse.get() : KvSparse.OFF;
-        this.direct = dtype == KvDtype.F32 && B % (2 * VectorKernels.FL) == 0 && !Boolean.getBoolean("jllm.cpu.pagedGather");
+        this.direct = B % (2 * VectorKernels.FL) == 0 && !Boolean.getBoolean("jllm.cpu.pagedGather");
         if (B % VectorKernels.FL != 0 || B % 2 != 0) {
             throw new IllegalArgumentException("backend.kv-block " + B + " must be a multiple of the vector length " + VectorKernels.FL);
         }
@@ -311,20 +311,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
                 int pb = blk0 + (int) ((long) (blk1 - blk0) * (part + 1) / keyParts);
                 for (int blk = pa; blk < pb; blk++) {
                     int id = seq.block(blk);
-                    MemorySegment seg = st.slab(id);
-                    long kb = st.base(id, layer) + (long) g * hd * B * 4;
-                    int row = g * group;
-                    int r = 0;
-                    for (; r + 3 < group; r += 4) {
-                        scores4(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd, (row + r + 3) * hd, hd,
-                                sc, (row + r) * span + blk * B, span, scale);
-                    }
-                    for (; r + 1 < group; r += 2) {
-                        scores2(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, hd, sc, (row + r) * span + blk * B, span, scale);
-                    }
-                    for (; r < group; r++) {
-                        scores1(seg, kb, q, (row + r) * hd, hd, sc, (row + r) * span + blk * B, scale);
-                    }
+                    scoreBlock(st.slab(id), st.base(id, layer), g, q, sc, blk, span, scale);
                 }
             }
         });
@@ -353,14 +340,69 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
                     int hi = Math.min(len, (blk + 1) * B);
                     int id = seq.block(blk);
                     MemorySegment seg = st.slab(id);
-                    long vb = st.base(id, layer) + st.kBytes + ((long) g * hd + e0) * 4; // key 0 of the block, element e0
+                    long lb = st.base(id, layer);
                     for (int r = 0; r < group; r++) {
                         int h = g * group + r;
-                        accumulate(sc, span, h, lo, hi, blk * B, seg, vb, kvDim, att, h * hd + e0, slice);
+                        switch (dtype) {
+                            case F32 -> accumulate(sc, span, h, lo, hi, blk * B, seg, lb + st.kBytes + ((long) g * hd + e0) * 4, kvDim,
+                                    att, h * hd + e0, slice); // key 0 of the block, element e0
+                            case F16 -> PagedKernels.accumulateF16(sc, span, h, lo, hi, blk * B, seg, lb + st.kBytes, kvDim, g, hd, e0,
+                                    att, h * hd + e0, slice);
+                            default -> PagedKernels.accumulateQ8(sc, span, h, lo, hi, blk * B, seg, lb + st.kBytes, st.vScaleOff, kvDim,
+                                    kvHeads, g, hd, e0, att, h * hd + e0, slice);
+                        }
                     }
                 }
             }
         });
+    }
+
+    /** The scores of kv head {@code g}'s query rows against the {@code B} keys of block {@code blk} (layer starting at byte {@code lb}). */
+    private void scoreBlock(MemorySegment seg, long lb, int g, float[] q, float[] sc, int blk, int span, float scale) {
+        int hd = headDim;
+        int row = g * group;
+        int r = 0;
+        int so = row * span + blk * B;
+        switch (dtype) {
+            case F32 -> {
+                long kb = lb + (long) g * hd * B * 4;
+                for (; r + 3 < group; r += 4) {
+                    scores4(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd, (row + r + 3) * hd, hd, sc,
+                            so + r * span, span, scale);
+                }
+                for (; r + 1 < group; r += 2) {
+                    scores2(seg, kb, q, (row + r) * hd, (row + r + 1) * hd, hd, sc, so + r * span, span, scale);
+                }
+                for (; r < group; r++) {
+                    scores1(seg, kb, q, (row + r) * hd, hd, sc, so + r * span, scale);
+                }
+            }
+            case F16 -> {
+                for (; r + 3 < group; r += 4) {
+                    PagedKernels.scoresF16x4(seg, lb, g, pairs, B, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd,
+                            (row + r + 3) * hd, sc, so + r * span, span, scale);
+                }
+                for (; r + 1 < group; r += 2) {
+                    PagedKernels.scoresF16x2(seg, lb, g, pairs, B, q, (row + r) * hd, (row + r + 1) * hd, sc, so + r * span, span, scale);
+                }
+                for (; r < group; r++) {
+                    PagedKernels.scoresF16x1(seg, lb, g, pairs, B, q, (row + r) * hd, sc, so + r * span, scale);
+                }
+            }
+            default -> {
+                for (; r + 3 < group; r += 4) {
+                    PagedKernels.scoresQ8x4(seg, lb, st.kScaleOff, g, hd, B, q, (row + r) * hd, (row + r + 1) * hd, (row + r + 2) * hd,
+                            (row + r + 3) * hd, sc, so + r * span, span, scale);
+                }
+                for (; r + 1 < group; r += 2) {
+                    PagedKernels.scoresQ8x2(seg, lb, st.kScaleOff, g, hd, B, q, (row + r) * hd, (row + r + 1) * hd, sc, so + r * span,
+                            span, scale);
+                }
+                for (; r < group; r++) {
+                    PagedKernels.scoresQ8x1(seg, lb, st.kScaleOff, g, hd, B, q, (row + r) * hd, sc, so + r * span, scale);
+                }
+            }
+        }
     }
 
     /** Scores of four query rows against the {@code B} keys of the block at {@code k[kb ..]} ({@code [hd][B]} floats), as {@code KvCache.score4}. */

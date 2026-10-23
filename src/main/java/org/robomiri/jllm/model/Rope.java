@@ -78,6 +78,7 @@ public final class Rope {
             case Scaling.Yarn y -> y.attentionFactor() > 0 ? y.attentionFactor()
                     : yarnMscale(y.factor(), y.mscale()) / yarnMscale(y.factor(), y.mscaleAllDim());
             case Scaling.None n -> 1.0;
+            case Scaling.Identity i -> 1.0;
             case Scaling.Linear l -> 1.0;
             case Scaling.Llama3 l -> 1.0;
         };
@@ -120,6 +121,9 @@ public final class Rope {
         switch (scaling) {
             case Scaling.None n -> {
             }
+            case Scaling.Identity i -> {
+                return new double[half]; // frequency 0: cos 1, sin 0
+            }
             case Scaling.Linear l -> {
                 for (int i = 0; i < half; i++) {
                     f[i] /= l.factor();
@@ -136,8 +140,8 @@ public final class Rope {
                     if (wavelen > lowWavelen) {
                         f[i] /= sc.factor();
                     } else {
-                        double smooth = (sc.originalMaxPositions() / wavelen - sc.lowFreqFactor())
-                                / (sc.highFreqFactor() - sc.lowFreqFactor());
+                        double span = sc.highFreqFactor() - sc.lowFreqFactor();
+                        double smooth = span > 0 ? (sc.originalMaxPositions() / wavelen - sc.lowFreqFactor()) / span : 0;
                         f[i] = (1 - smooth) * f[i] / sc.factor() + smooth * f[i];
                     }
                 }
@@ -149,7 +153,7 @@ public final class Rope {
                 }
             }
             case Scaling.Yarn y -> {
-                return yarnInvFreq(rotaryDim, theta, y.factor(), y.originalMaxPositions(), y.betaFast(), y.betaSlow());
+                return yarnInvFreq(rotaryDim, theta, y.factor(), y.originalMaxPositions(), y.betaFast(), y.betaSlow(), y.truncate());
             }
         }
         return f;
@@ -172,9 +176,17 @@ public final class Rope {
      * {@code [max(floor(dim_fast), 0), min(ceil(dim_slow), dim-1)]} with {@code dim_x = yarnCorrectionDim(beta_x)}.
      */
     public static double[] yarnInvFreq(int dim, double base, double factor, int origMax, double betaFast, double betaSlow) {
+        return yarnInvFreq(dim, base, factor, origMax, betaFast, betaSlow, true);
+    }
+
+    /** As above; {@code truncate = false} keeps the (clamped) correction range fractional (transformers' {@code truncate}). */
+    public static double[] yarnInvFreq(int dim, double base, double factor, int origMax, double betaFast, double betaSlow,
+                                       boolean truncate) {
         int half = dim / 2;
-        double low = Math.max(Math.floor(yarnCorrectionDim(betaFast, dim, base, origMax)), 0);
-        double high = Math.min(Math.ceil(yarnCorrectionDim(betaSlow, dim, base, origMax)), dim - 1);
+        double lowDim = yarnCorrectionDim(betaFast, dim, base, origMax);
+        double highDim = yarnCorrectionDim(betaSlow, dim, base, origMax);
+        double low = Math.max(truncate ? Math.floor(lowDim) : lowDim, 0);
+        double high = Math.min(truncate ? Math.ceil(highDim) : highDim, dim - 1);
         if (low == high) {
             high += 0.001; // prevent a singularity
         }

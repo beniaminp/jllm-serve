@@ -69,6 +69,11 @@ public final class VectorKernels {
         };
     }
 
+    /** {@link #laneSum} for a 128-bit (four lane) vector whatever the preferred width is: {@code (l0 + l1) + (l2 + l3)}. */
+    static float laneSum4(FloatVector v) {
+        return (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
+    }
+
     private static float dotQ4(MemorySegment seg, long q, long s, int nb, float[] x, int xo) {
         FloatVector acc = FloatVector.zero(F);
         for (int b = 0; b < nb; b++) {
@@ -186,7 +191,7 @@ public final class VectorKernels {
             a0 = FloatVector.fromArray(F, a, ao + i).fma(FloatVector.fromArray(F, b, bo + i), a0);
             a1 = FloatVector.fromArray(F, a, ao + i + FL).fma(FloatVector.fromArray(F, b, bo + i + FL), a1);
         }
-        float s = a0.add(a1).reduceLanes(VectorOperators.ADD);
+        float s = laneSum(a0.add(a1));
         for (; i < n; i++) {
             s += a[ao + i] * b[bo + i];
         }
@@ -381,7 +386,7 @@ public final class VectorKernels {
             e.intoArray(x, i);
             acc = acc.add(e);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = laneSum(acc);
         for (; i < o + n; i++) {
             float e = expFast(x[i] - max);
             x[i] = e;

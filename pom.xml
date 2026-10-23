@@ -172,6 +172,46 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- KvTierTest: the warm host-memory tier, the on-disk block formats, a pool with a small hot cap, prefetch, persist (no model). -->
+                    <execution>
+                        <id>kv-tier-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.KvTierTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- MemoryPlannerTest: experts against KV blocks against streaming, hysteresis, cap growth (no model, no GPU). -->
+                    <execution>
+                        <id>memory-planner-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.metal.MemoryPlannerTest</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- PagedKvTest: the paged CPU cache equals the flat one bit for bit (no model). -->
                     <execution>
                         <id>paged-kv-test</id>

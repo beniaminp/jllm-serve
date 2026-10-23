@@ -63,6 +63,9 @@ public class KvStore {
             return;
         }
         org.robomiri.jllm.kv.KvPool pool = seq.pool();
+        if (pool.spill() != null) {
+            return; // backend.kv-tier already gave the pool its tiered block store (host memory, then files)
+        }
         try {
             pool.setSpill(new org.robomiri.jllm.kv.FileSpill(dir.resolve("blocks"), fingerprint(m) + "|" + pool.format(),
                     (long) (props.kvSpillMaxGb() * 1e9)));
@@ -208,8 +211,8 @@ public class KvStore {
      */
     public void restore(LoadedModel m, LoadedModel.Slot slot, int[] prompt) {
         Engine e = slot.engine();
-        if (!enabled() || !e.canPersistCache() || prompt.length <= MIN_GAIN) {
-            return;
+        if (!enabled() || !e.canPersistCache() || prompt.length <= MIN_GAIN || blockSessions(m, slot)) {
+            return; // (block sessions come back through the pool's own match / adopt)
         }
         String fp = fingerprint(m);
         String h = hash(fp);
@@ -270,9 +273,40 @@ public class KvStore {
         NOW
     }
 
+    /**
+     * With {@code backend.kv-tier} a conversation is saved as the pool's own block files (docs/26 §26.2.5): the blocks of its
+     * token path that the store does not hold yet are written (in the configured disk format) and flushed, and nothing else.
+     * Reloading needs no file of its own: the next prompt's tokens find the blocks by their path hashes, and the engine adopts
+     * them like any evicted block (prefetched, and only as far as the prompt matches).
+     */
+    private boolean blockSessions(LoadedModel m, LoadedModel.Slot slot) {
+        var seq = slot.engine().backend().kvSequence();
+        return seq != null && seq.pool().spill() != null && "true".equals(m.settings().get("backend.kv-tier"));
+    }
+
+    private void saveBlocks(LoadedModel m, LoadedModel.Slot slot, String why) {
+        Engine e = slot.engine();
+        int[] tokens = e.cachedTokens();
+        if (tokens.length < props.kvCacheMinTokens()) {
+            return;
+        }
+        var pool = slot.engine().backend().kvSequence().pool();
+        long t0 = System.nanoTime();
+        int written = pool.persist(tokens, tokens.length);
+        if (written > 0) {
+            pool.flushSpill();
+            System.err.printf("kv-cache: saved %d tokens of %s (slot %d, %s) as %d block files in %.2f s%n", tokens.length, m.id(),
+                    slot.index(), why, written, (System.nanoTime() - t0) / 1e9);
+        }
+    }
+
     /** Saves the slot's cache unless it is short or a saved file already holds it. */
     void save(LoadedModel m, LoadedModel.Slot slot, String why, Mode mode) {
         Engine e = slot.engine();
+        if (blockSessions(m, slot)) {
+            saveBlocks(m, slot, why);
+            return;
+        }
         if (!e.canPersistCache()) {
             return;
         }

@@ -172,6 +172,43 @@ const Models = (() => {
     }));
   }
 
+  // The Memory card (docs/26): per loaded model the GPU budget as a bar of its components, the experts on the CPU, the KV pool by tier
+  // (hot = GPU blocks, warm = host memory, cold = SSD files), streaming counters and the planner's latest decisions.
+  function renderMemory(list) {
+    const box = $('#memory-list');
+    const rows = (list || []).filter(m => m.report);
+    if (!rows.length) { box.innerHTML = '<p class="empty">No loaded model reports its memory (the CPU backend with a flat cache does not).</p>'; return; }
+    const COLORS = ['#4c78a8', '#f58518', '#54a24b', '#b279a2', '#9d755d'];
+    box.innerHTML = rows.map(m => {
+      const r = m.report, dev = r.device, kv = r.kv || {}, ex = r.experts, plan = r.plan;
+      let html = `<div class="mem-model"><strong>${esc(m.model)}</strong> <span class="muted small">${esc(r.backend || '')}${m.slots > 1 ? ' · ' + m.slots + ' slots' : ''} · KV ${esc(kv.mode || '?')}</span>`;
+      if (dev) {
+        const comps = dev.components.filter(c => c.bytes > 0);
+        const total = Math.max(dev.budgetBytes, dev.usedBytes);
+        html += `<div class="mem-bar" title="${fmtBytes(dev.usedBytes)} of ${fmtBytes(dev.budgetBytes)}" style="display:flex;height:18px;background:var(--bg2,#eee);border-radius:4px;overflow:hidden;margin:6px 0">`
+          + comps.map((c, i) => `<div title="${esc(c.name)}: ${fmtBytes(c.bytes)}" style="width:${(100 * c.bytes / total).toFixed(2)}%;background:${COLORS[i % COLORS.length]}"></div>`).join('')
+          + '</div><div class="hint">' + comps.map((c, i) => `<span style="color:${COLORS[i % COLORS.length]}">&#9632;</span> ${esc(c.name)} ${fmtBytes(c.bytes)}`).join(' &nbsp; ')
+          + `<br>GPU budget ${fmtBytes(dev.budgetBytes)} · used ${fmtBytes(dev.usedBytes)} · ${dev.fits ? '<span class="badge ok">fits</span>' : '<span class="badge err">over budget</span>'}</div>`;
+      }
+      if (ex && ex.totalBytes > 0) {
+        html += `<div class="hint">experts: ${fmtBytes(ex.totalBytes - ex.onCpuBytes)} on the GPU, ${fmtBytes(ex.onCpuBytes)} on the CPU (${ex.onCpuExperts} experts in ${ex.cpuLayers} layers, cpu-moe ${esc(ex.mode)})</div>`;
+      }
+      if (kv.hot) {
+        html += `<div class="hint">KV blocks of ${kv.blockTokens} positions (${fmtBytes(kv.blockBytes)}): hot ${kv.hot.usedBlocks} in use + ${kv.hot.cachedBlocks} cached, committed ${kv.hot.committedBlocks} of cap ${kv.hot.capBlocks} (${fmtBytes(kv.hot.capBytes)})`
+          + ` · warm ${kv.warm?.blocks ?? 0} blocks ${fmtBytes(kv.warm?.bytes ?? 0)}${kv.warm?.budgetBytes ? ' of ' + fmtBytes(kv.warm.budgetBytes) : ''}`
+          + ` · cold ${kv.cold?.files ?? 0} files ${fmtBytes(kv.cold?.bytes ?? 0)}`
+          + `<br>traffic: ${kv.traffic.evictions} evicted, ${kv.traffic.reloads} reloaded, ${kv.warm?.prefetchHits ?? 0}/${kv.traffic.prefetchHints} prefetched, ${kv.traffic.dedups} shared</div>`;
+      } else if (kv.mode === 'streamed') {
+        html += `<div class="hint">streamed KV: ${fmtBytes(kv.hostBytes)} on the host (${kv.mappedLayers} layers memory-mapped), windows ${fmtBytes(kv.windowBytes)} on the GPU · ${kv.passes} passes, ${fmtBytes(kv.stagedBytes)} staged at ${Number(kv.stageGBPerSecond).toFixed(1)} GB/s</div>`;
+      }
+      if (plan && (plan.enabled || (plan.decisions || []).length)) {
+        html += `<details class="sub"><summary class="hint">memory plan${plan.enabled ? '' : ' (planner off)'}</summary><pre class="hint">`
+          + esc((plan.summary || []).join('\n') + '\n' + (plan.decisions || []).slice(-8).map(d => new Date(d.atMillis).toLocaleTimeString() + '  ' + d.kind + ': ' + d.detail).join('\n')) + '</pre></details>';
+      }
+      return html + '</div>';
+    }).join('<hr>');
+  }
+
   function renderJobs(jobs) {
     const box = $('#job-list');
     if (!jobs.length) { box.innerHTML = '<p class="empty">No jobs.</p>'; return; }
@@ -244,6 +281,7 @@ const Models = (() => {
     try {
       const [loaded, jobs] = await Promise.all([refreshLoaded(), api('/api/jobs')]);
       renderLoaded(loaded); renderJobs(jobs);
+      api('/api/memory').then(renderMemory).catch(() => { $('#memory-list').innerHTML = ''; });
       // audio:begin
       window.AudioUI?.renderModelsRows();
       // audio:end

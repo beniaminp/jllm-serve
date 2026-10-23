@@ -868,8 +868,9 @@ and the V rows of the latest positions as halves, each slot tagged with the posi
 `P` reads the keys `[P − R + 1, P]` from the ring and older ones from the 4-bit rows; the same for V. If a slot has
 lost a position (after a rollback, or a partial copy), `exactFrom(P)` moves the boundary up so that the exact part is
 a contiguous suffix: which representation a (query, key) pair uses depends only on `P` and on the ring, so prefill
-and decode stay bit-identical. The ring costs `2 · L · (R + chunk) · kvDim · 2` bytes (22 MB for R = 128, 66 MB for
-R = 512 on Qwen3-0.6B) whatever the context.
+and decode stay bit-identical. The ring costs `2 · L · (R + chunk) · kvDim · 2` bytes, where `chunk` is the prefill
+chunk (`backend.batch`): 44 MB for R = 128 and 88 MB for R = 512 on Qwen3-0.6B with `backend.batch=auto` = 256 on
+Metal (22 MB / 66 MB with 64-token chunks), whatever the context.
 
 **Saved caches** (`kv q4 recent=R layers=… kvDim=… headDim=…`): per layer, per position, the K row then the V row in the
 row layout above (the stored nibbles and scales themselves, nothing is rounded again), then — with a window — for
@@ -1182,8 +1183,9 @@ window is read twice (once in the 4-bit rows for storage, once from the ring for
   score scale by the power of two `B` is exact in float. The CPU and the GPU kernel perform the same butterflies on the same
   operands in the same order, so the stored bytes are identical and a cache file moves between backends.
 * **A window of halves, not a better cache.** The newest positions carry most of the attention, so storing only them
-  exactly (+0.27 nats instead of +0.91 at window 128) is the cheapest accuracy there is; the price is the ring (22 MB at R = 128,
-  66 MB at R = 512 for Qwen3-0.6B, independent of the context) and a second read of those keys.
+  exactly (+0.27 nats instead of +0.91 at window 128) is the cheapest accuracy there is; the price is the ring (44 MB at
+  R = 128, 88 MB at R = 512 for Qwen3-0.6B with `backend.batch=auto` = 256, 22 / 66 MB with 64-token chunks, independent
+  of the context) and a second read of those keys.
 * **Values are not rotated.** At 4 bits the values cost only -0.019 nats unrotated; a rotation of V would have to be undone on
   the output of every attention head.
 * **q4 stays opt-in** because on this model it is clearly worse than q8 (the keys need about 5 bits); **rotated q8 is on by default**

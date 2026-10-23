@@ -1005,16 +1005,26 @@ public final class SmokeTest {
                     kv.store(0, 0, k, v, n);
                     for (int window : new int[]{0, 6}) {
                         for (float softcap : new float[]{0f, 5f}) {
+                          // chunked attention (Llama 4) and attention sinks (gpt-oss), also together with a window
+                          for (int chunk : new int[]{0, 5}) {
+                           for (boolean sinkOn : new boolean[]{false, true}) {
+                            if ((chunk > 0 || sinkOn) && softcap > 0) {
+                                continue;
+                            }
+                            float[] sinks = new float[cfg.heads()];
+                            for (int h = 0; h < sinks.length; h++) {
+                                sinks[h] = (h - 1.5f) * 1.7f;
+                            }
                             float scale = 0.2f;
                             float[] prefill = new float[n * qDim];
                             float[] decode = new float[n * qDim];
                             float[] one = new float[qDim];
                             float[] qt = new float[qDim];
                             for (int rep = 0; rep < 3; rep++) { // warm the kernels so both paths run compiled code
-                                kv.attention(pool, 0, n, 0, q, prefill, window, scale, softcap);
+                                kv.attention(pool, 0, n, 0, q, prefill, window, chunk, sinkOn ? sinks : null, scale, softcap);
                                 for (int t = 0; t < n; t++) {
                                     System.arraycopy(q, t * qDim, qt, 0, qDim);
-                                    kv.attention(pool, 0, 1, t, qt, one, window, scale, softcap);
+                                    kv.attention(pool, 0, 1, t, qt, one, window, chunk, sinkOn ? sinks : null, scale, softcap);
                                     System.arraycopy(one, 0, decode, t * qDim, qDim);
                                 }
                             }
@@ -1048,10 +1058,13 @@ public final class SmokeTest {
                             for (int t = 0; t < n; t++) {
                                 int len = t + 1;
                                 int first = window > 0 ? Math.max(0, len - window) : 0;
+                                if (chunk > 0) {
+                                    first = Math.max(first, (len - 1) / chunk * chunk);
+                                }
                                 for (int h = 0; h < cfg.heads(); h++) {
                                     int ko = (h / group) * hd;
                                     double[] sc = new double[len];
-                                    double max = Double.NEGATIVE_INFINITY;
+                                    double max = sinkOn ? sinks[h] : Double.NEGATIVE_INFINITY;
                                     int exFrom = Math.max(0, len - recent);
                                     for (int s = first; s < len; s++) {
                                         float[] kk = s >= exFrom && recent > 0 ? kx : ks;
@@ -1066,7 +1079,7 @@ public final class SmokeTest {
                                         sc[s] = d;
                                         max = Math.max(max, d);
                                     }
-                                    double sum = 0;
+                                    double sum = sinkOn ? Math.exp(sinks[h] - max) : 0;
                                     for (int s = first; s < len; s++) {
                                         sc[s] = Math.exp(sc[s] - max);
                                         sum += sc[s];
@@ -1085,12 +1098,15 @@ public final class SmokeTest {
                                     }
                                 }
                             }
-                            String what = kv.format() + " window=" + window + " softcap=" + softcap;
+                            String what = kv.format() + " window=" + window + " softcap=" + softcap
+                                    + (chunk > 0 ? " chunk=" + chunk : "") + (sinkOn ? " sinks" : "");
                             check(maxRef < 2e-6, "kv attention " + what + " vs double reference: max diff " + maxRef);
                             // same kernels, so bit-identical once both run C2 code; while one of them still runs
                             // the interpreter's sequential lane reduction a last-bit (1e-7) difference is expected
                             check(maxPd < 5e-7, "kv attention " + what + " tiled prefill vs decode: max diff " + maxPd
                                     + ", " + exact + "/" + (n * qDim) + " bit-identical");
+                           }
+                          }
                         }
                     }
                 }
@@ -1531,7 +1547,13 @@ public final class SmokeTest {
                     "{\"type\":\"yarn\",\"factor\":40,\"mscale\":1.0,\"mscale_all_dim\":0.707,\"beta_fast\":16}"))).scaling();
             check(ms instanceof Scaling.Yarn y && y.betaFast() == 16 && Math.abs(Rope.amplitude(ms) - m) < 1e-12,
                     "yarn mscale / mscale_all_dim: " + ms);
-            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}", "{\"type\":\"yarn\",\"factor\":4,\"truncate\":false}"}) {
+            // truncate: false (gpt-oss) is read: the correction range stays fractional, so the frequencies differ from the default's
+            RopeTable ntt = rope(cfg(tmp, base.formatted("{\"type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768,"
+                    + "\"truncate\":false}")));
+            check(ntt.scaling() instanceof Scaling.Yarn y && !y.truncate() && t.scaling() instanceof Scaling.Yarn d && d.truncate()
+                            && !Arrays.equals(Rope.invFreq(ntt, 40960), Rope.invFreq(t, 40960)),
+                    "yarn truncate false is read and changes the frequencies: " + ntt.scaling());
+            for (String bad : new String[]{"{\"type\":\"yarn\",\"factor\":-1}"}) {
                 try {
                     cfg(tmp, base.formatted(bad));
                     check(false, "rejected yarn config " + bad);

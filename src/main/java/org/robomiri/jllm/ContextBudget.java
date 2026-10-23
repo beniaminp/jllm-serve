@@ -72,6 +72,8 @@ public final class ContextBudget {
             };
             case Qwen3NextArch q -> 2L * q.fullLayers() * kv.rowBytes(q.attention().kvDim(), q.attention().kvHeads());
             case MambaArch m -> 0L;
+            case org.robomiri.jllm.model.HybridArch h -> h.attention() == null ? 0L
+                    : 2L * h.attentionLayers() * kv.rowBytes(h.attention().kvDim(), h.attention().kvHeads());
         };
     }
 
@@ -117,7 +119,20 @@ public final class ContextBudget {
         long budget;
         String basis;
         long ws = ModelLoader.resolveBackend(s).equals("metal") ? org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib")) : 0;
-        if (ws > 0) {
+        if (tierManaged(s, arch, kv)) {
+            // tiered KV storage (docs/26): the cache is not bounded by the GPU's share. A slot that does not fit the hot tier keeps its
+            // rows in host memory and streams them (backend.kv-stream), the planner (backend.memory-plan) grows the pool and moves
+            // experts as contexts grow, and what the pool pushes out goes to host memory and the SSD. So the context is bounded
+            // by the physical memory, as for the off-heap paged cache, and, when streaming is off, by the hot budget.
+            budget = ram > 0 ? (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights)) : Long.MAX_VALUE / 4;
+            basis = String.format(Locale.ROOT, "tiered KV storage (docs/26): physical memory %.1f GB - weights %.1f GB, %.0f%% for the cache",
+                    ram / 1e9, weights / 1e9, 100 * SHARE);
+            long hot = s.getLong("backend.kv-hot-mb") * 1_000_000L;
+            if (s.get("backend.kv-stream").trim().equalsIgnoreCase("off") && hot > 0 && hot < budget) {
+                budget = hot;
+                basis += String.format(Locale.ROOT, "; backend.kv-stream=off keeps it within backend.kv-hot-mb (%.1f GB)", hot / 1e9);
+            }
+        } else if (ws > 0) {
             long others = org.robomiri.jllm.metal.MetalMemory.residentBytes();
             long reserve = Math.max(512L << 20, ws / 32);
             boolean moe = arch instanceof Decoder d && d.anyMoe() || arch instanceof Qwen3NextArch q && q.anyMoe();
@@ -134,7 +149,7 @@ public final class ContextBudget {
                     basis += String.format(Locale.ROOT, "; physical memory %.1f GB leaves %.1f GB", ram / 1e9, byRam / 1e9);
                 }
             }
-        } else if (ram > 0 && pagedOffHeap(s, arch, kv)) {
+        } else if (ram > 0 && pagedOffHeap(s, arch, kv, w, slots)) {
             // the paged KV cache (backend.kv-paged, docs/24) keeps the CPU blocks in off-heap MemorySegment slabs: the Java heap
             // does not bound the cache, only the physical memory does (the pool never takes more than the flat caches would)
             budget = (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights));
@@ -162,10 +177,30 @@ public final class ContextBudget {
         return plan(per, arch.core().maxPositions(), s.getInt("backend.ctx-max"), budget, slots, basis);
     }
 
-    /** Whether this model's CPU KV cache is the paged, off-heap pool: {@code backend.kv-paged} on an attention model with f32 / f16 / q8. */
+    /**
+     * Whether the cache is tiered ({@code backend.kv-tier}, docs/26) in a way that frees the context from the GPU's share: streaming
+     * is allowed, or the planner owns the budget, or a hot budget is given. (Tiered with none of these, the pool is the whole GPU
+     * share and the Metal arithmetic above applies.)
+     */
+    static boolean tierManaged(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
+        return s.getBool("backend.kv-tier") && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4
+                && (!s.get("backend.kv-stream").trim().equalsIgnoreCase("off") || s.getBool("backend.memory-plan")
+                || s.getLong("backend.kv-hot-mb") > 0);
+    }
+
+    /** Whether this model's CPU KV cache is the paged, off-heap pool, with {@code backend.kv-paged} set to true: an attention model with f32 / f16 / q8. */
     static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv) {
-        return (s.getBool("backend.kv-paged") || s.getBool("backend.kv-sparse")) && arch instanceof Decoder d && d.attention() instanceof Attention.Gqa
-                && kv != KvDtype.Q4;
+        return (s.get("backend.kv-paged").trim().equalsIgnoreCase("true") || s.getBool("backend.kv-sparse")) && pageable(arch, kv);
+    }
+
+    /** The same, with {@code auto} decided as {@link ModelLoader#paged} does for a model of {@code slots} slots. */
+    static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv,
+                                org.robomiri.jllm.model.ModelWeights w, int slots) {
+        return pageable(arch, kv) && (ModelLoader.paged(s, w, slots) || s.getBool("backend.kv-sparse"));
+    }
+
+    private static boolean pageable(Architecture arch, KvDtype kv) {
+        return arch instanceof Decoder d && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4;
     }
 
     /** Free space of the Java heap's old generation (where the CPU KV caches live), as {@code KvCache.checkHeap} sees it. */
