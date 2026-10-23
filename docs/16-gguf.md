@@ -625,7 +625,7 @@ All of them under the heavy lock on the Apple M1 Pro (10 cores, 32 GB). **Not me
 ## 16.10 Limits and what is next
 
 * **Architectures**: `llama`, `mistral3`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen3next`, `qwen35moe` (16.13), `gemma2`,
-  `gemma3`, `phi3`, `chatglm`, `glm4`, `mamba` and `deepseek2` (16.15). Other architectures are refused, with the reason where
+  `gemma3`, `gemma4`, `gemma4_unified`, `phi3`, `chatglm`, `glm4`, `mamba` and `deepseek2` (16.15). Other architectures are refused, with the reason where
   it is known (16.15).
 * **Formats**: IQ1\*, IQ2\*, IQ3\* and the ternary TQ\* types are refused (the 16-entry-codebook IQ4 types are in place; the
   others use 256-entry grids and are not done); Q2_K, F16 and BF16 have no int8-activation CPU kernel (Q3_K has Java and native ones, 07 §7.10); the x86-64
@@ -1069,7 +1069,7 @@ the 27B only, and on a prompt that repeats itself, which flatters every speculat
 
 ---
 
-## 16.15 Gemma 2/3, Phi-3, GLM, Mamba, DeepSeek-V2/V3 and Mistral 3 as GGUF files
+## 16.15 Gemma 2/3/4, Phi-3, GLM, Mamba, DeepSeek-V2/V3 and Mistral 3 as GGUF files
 
 Code: `gguf/GgufFamilies.java` (the metadata of each family), `gguf/GgufArchitecture.java` (the `Family` enum),
 `gguf/GgufWeights.java` (names, fused tensors), `model/AttnWeights.java` (`Mla`: split `kv_b`); tests
@@ -1094,6 +1094,7 @@ column is `GgufArchSmoke` on the real GPU: CPU and Metal generate the same 8 gre
 | `qwen2`, `qwen3moe` (and `qwen3`) | as before | ≤ 3e-7 | 2.5e-7 … 3.1e-7 | yes |
 | `gemma2` | `gemma2` | 0 | 6.7e-5 | yes |
 | `gemma3` (also from the text part of the multimodal checkpoint) | `gemma3_text` | 0 | 1.8e-5 | yes |
+| `gemma4` / `gemma4_unified` (the 12B is `gemma4`) | `gemma4_text` / `gemma4_unified_text` | metadata of the real 12B file read; no full-file run | — | CPU only (the 512-wide full-attention heads exceed the Metal kernels) |
 | `phi3` (long, short and no LongRoPE factors) | `phi3` | ≤ 4e-7 | 2.0e-7 … 1.1e-6 | yes |
 | `chatglm` (`GlmForCausalLM`: GLM-4-9B-chat-hf, GLM-Edge) | `glm` | 0 | 2.8e-7 | yes |
 | `glm4` (GLM-4-0414) | `glm4` | 0 | 4.7e-7 | yes |

@@ -3,9 +3,9 @@
 pipeline tests. Standard library only.
 
 usage: make-tiny-model.py <out-dir> <family> [--seed N] [--head-dim N] [--vocab N] [--attention-bias] [--set key=json ...]
-  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2 | gptoss | gptoss_mxfp4 | llama4 | llama4mix | granite | nemotronh | jamba
+  family: llama | mistral | qwen2 | llama3rope | glm | glmedge | glm4 | phi3 | phi3short | phi3mha | gemma2 | gemma3 | gemma3mm | gemma4 | mamba | qwen3moe | deepseek_v2 | deepseek_v2q | deepseek_v3 | mamba3 | mamba130m | qwen3next | qwen3next2 | gptoss | gptoss_mxfp4 | llama4 | llama4mix | granite | nemotronh | jamba
 
-All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 32) can run them:
+All use headDim 32 (gemma2: 64; gemma4: 32 local / 64 full) so the Metal backend (which needs a multiple of 32) can run them:
   llama      plain Llama: GQA 4/2, untied head, no scaling
   mistral    sliding_window=4 on every layer, GQA 4/2, untied head
   qwen2      q/k/v bias, tied embeddings, sliding window 6 on layers >= 2 (use_sliding_window)
@@ -26,6 +26,8 @@ All use headDim 32 (gemma2: 64) so the Metal backend (which needs a multiple of 
              (sliding_window 6), embedding scaled by sqrt(hidden)
   gemma3     Gemma 3 text: head_dim 32, q/k norm, no soft-caps, 6 layers = 5 local + 1 global (pattern 6),
              rope_theta 1e6 with linear scaling 8 on the global layer, rope_local_base_freq 1e4 on local ones
+  gemma4     Gemma 4 text: 5 local + 1 full layer, 32-wide local / 64-wide full heads, K = V on the full layers,
+             parameterless V norm, proportional RoPE (quarter of the full head), per-layer layer_scalar, plain norms
   gemma3mm   the same decoder in the multimodal wrapper layout (Gemma3ForConditionalGeneration, text_config,
              tensors under language_model.model.*, plus dummy vision tensors that must be ignored)
   mamba      Mamba v1: d_model 64, d_inner 128, state 16, conv 4, dt_rank 4 (ceil(64/16)), 3 layers, tied head
@@ -134,6 +136,18 @@ FAMILIES = {
         attn_logit_softcapping=None, final_logit_softcapping=None, query_pre_attn_scalar=48, sliding_window=6,
         sliding_window_pattern=6, attention_bias=False, tie_word_embeddings=True, bos_token_id=2,
         eos_token_id=106),
+    "gemma4": dict(
+        architectures=["Gemma4ForCausalLM"], model_type="gemma4_text", hidden_size=128, intermediate_size=192,
+        num_hidden_layers=6, num_attention_heads=4, num_key_value_heads=2, head_dim=32, global_head_dim=64,
+        num_global_key_value_heads=1, vocab_size=1000, max_position_embeddings=512, rms_norm_eps=1e-6,
+        hidden_activation="gelu_pytorch_tanh", attention_bias=False, tie_word_embeddings=True,
+        attention_k_eq_v=True, final_logit_softcapping=30.0, sliding_window=6,
+        layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+                     "sliding_attention", "full_attention"],
+        rope_parameters=dict(full_attention=dict(rope_type="proportional", partial_rotary_factor=0.25,
+                                                 rope_theta=1000000.0),
+                             sliding_attention=dict(rope_type="default", rope_theta=10000.0)),
+        bos_token_id=2, eos_token_id=106),
     "qwen3moe": dict(
         architectures=["Qwen3MoeForCausalLM"], model_type="qwen3_moe", hidden_size=128, intermediate_size=192,
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32, vocab_size=1000,
@@ -709,8 +723,10 @@ def main():
     bias = bias or obias
     fused = cfg["model_type"] == "phi3"
     gemma = cfg["model_type"].startswith("gemma")
-    # Gemma stores norm gains as w and applies 1 + w, so random gains are centered on 0
-    nb = 0.0 if gemma else 1.0
+    gemma4 = cfg["model_type"].startswith("gemma4")
+    # Gemma 2 / 3 store norm gains as w and apply 1 + w, so random gains are centered on 0; Gemma 4 stores the gain
+    # itself (no 1 + w), so its random gains are centered on 1
+    nb = 1.0 if gemma4 else (0.0 if gemma else 1.0)
     pre = "language_model.model." if wrapper else "model."
 
     tensors = {}
@@ -728,21 +744,27 @@ def main():
     mat(pre + "embed_tokens.weight", vocab, d, 1.0)
     for l in range(cfg["num_hidden_layers"]):
         p = pre + "layers.%d." % l
+        local = cfg.get("layer_types", [None] * cfg["num_hidden_layers"])[l] != "full_attention" if gemma4 else True
+        lhd = (cfg.get("head_dim", hd) if local else cfg.get("global_head_dim", hd)) if gemma4 else hd
+        lkv = (kv if local else cfg.get("num_global_key_value_heads", kv)) if gemma4 else kv
         vec(p + "input_layernorm.weight", d, nb)
         vec(p + "post_attention_layernorm.weight", d, nb)
         if gemma:
             vec(p + "pre_feedforward_layernorm.weight", d, nb)
             vec(p + "post_feedforward_layernorm.weight", d, nb)
-        if cfg["model_type"] in ("gemma3_text", "qwen3_moe"):
-            vec(p + "self_attn.q_norm.weight", hd, nb)
-            vec(p + "self_attn.k_norm.weight", hd, nb)
+        if cfg["model_type"] in ("gemma3_text", "gemma4_text", "gemma4_unified_text", "qwen3_moe"):
+            vec(p + "self_attn.q_norm.weight", lhd, nb)
+            vec(p + "self_attn.k_norm.weight", lhd, nb)
+        if gemma4:
+            vec(p + "layer_scalar", 1, 0.9, 0.05)
         if fused:  # rows: q (heads*hd), then k (kv*hd), then v (kv*hd)
             mat(p + "self_attn.qkv_proj.weight", (heads + 2 * kv) * hd, d)
         else:
-            mat(p + "self_attn.q_proj.weight", heads * hd, d)
-            mat(p + "self_attn.k_proj.weight", kv * hd, d)
-            mat(p + "self_attn.v_proj.weight", kv * hd, d)
-        mat(p + "self_attn.o_proj.weight", d, heads * hd)
+            mat(p + "self_attn.q_proj.weight", heads * lhd, d)
+            mat(p + "self_attn.k_proj.weight", lkv * lhd, d)
+            if not (gemma4 and cfg.get("attention_k_eq_v") and not local):  # Gemma 4 full layers: K = V
+                mat(p + "self_attn.v_proj.weight", lkv * lhd, d)
+        mat(p + "self_attn.o_proj.weight", d, heads * lhd)
         if bias:
             vec(p + "self_attn.q_proj.bias", heads * hd, 0.0, 0.15)
             vec(p + "self_attn.k_proj.bias", kv * hd, 0.0, 0.15)

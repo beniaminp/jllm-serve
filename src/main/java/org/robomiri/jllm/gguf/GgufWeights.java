@@ -194,6 +194,8 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             case "self_attn.k_proj.bias" -> new String[]{b + "attn_k.bias"};
             case "self_attn.v_proj.bias" -> new String[]{b + "attn_v.bias"};
             case "self_attn.o_proj.weight" -> new String[]{b + "attn_output.weight"};
+            // Gemma 4's per-layer output scalar
+            case "layer_scalar" -> new String[]{b + "layer_output_scale.weight"};
             // Phi-3, ChatGLM, GLM-4 store gate and up as one ffn_up of 2 x ff rows (gate first): already the stacked layout
             case "mlp.gate_up" -> gguf.hasTensor(b + "ffn_gate.weight") || !gguf.hasTensor(b + "ffn_up.weight")
                     ? new String[]{b + "ffn_gate.weight", b + "ffn_up.weight"} : new String[]{b + "ffn_up.weight"};

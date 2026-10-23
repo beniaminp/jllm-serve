@@ -13,9 +13,21 @@ import java.util.List;
  *                  {@code rotaryDim / 2}; empty for a text-only rotary embedding. A model with sections still runs
  *                  with plain positions for text ({@link RopePositions} gives pictures theirs)
  * @param mropeInterleaved Qwen3-VL's interleaved assignment of the pairs to the axes
+ * @param activePairs how many of the leading {@code rotaryDim / 2} pairs carry a frequency; the rest rotate by 0
+ *                  (Gemma 4's proportional RoPE: {@code rotaryDim} is the whole head — so its pair offset is
+ *                  {@code head_dim / 2} — but only {@code partial_rotary_factor} of the pairs are non-zero)
  */
 public record RopeTable(int rotaryDim, double theta, Scaling scaling, Pairing pairing, List<Integer> mrope,
-                        boolean mropeInterleaved) {
+                        boolean mropeInterleaved, int activePairs) {
+
+    public RopeTable(int rotaryDim, double theta, Scaling scaling, Pairing pairing, List<Integer> mrope,
+                     boolean mropeInterleaved) {
+        this(rotaryDim, theta, scaling, pairing, mrope, mropeInterleaved, rotaryDim / 2);
+    }
+
+    public RopeTable(int rotaryDim, double theta, Scaling scaling, Pairing pairing) {
+        this(rotaryDim, theta, scaling, pairing, List.of(), false);
+    }
 
     /** Which dimensions of a head form a rotated pair. */
     public enum Pairing {
@@ -33,9 +45,8 @@ public record RopeTable(int rotaryDim, double theta, Scaling scaling, Pairing pa
         if (!mrope.isEmpty() && (mrope.size() != 3 || mrope.stream().mapToInt(Integer::intValue).sum() != rotaryDim / 2)) {
             throw new IllegalArgumentException("mrope sections " + mrope + " must be three numbers summing to " + rotaryDim / 2);
         }
-    }
-
-    public RopeTable(int rotaryDim, double theta, Scaling scaling, Pairing pairing) {
-        this(rotaryDim, theta, scaling, pairing, List.of(), false);
+        if (activePairs < 0 || activePairs > rotaryDim / 2) {
+            throw new IllegalArgumentException("active rotary pairs " + activePairs + " of " + (rotaryDim / 2));
+        }
     }
 }

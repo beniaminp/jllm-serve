@@ -352,7 +352,7 @@ public final class MetalBackend implements Backend {
 
     /** KV bytes of one position (every layer, keys and values) for {@code w} with cache type {@code kvDtype}; 0 without grouped-query attention. */
     public static long kvBytesPerPosition(ModelWeights w, KvDtype kvDtype) {
-        if (!(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
+        if (!w.decoder().uniformShape() || !(w.decoder().attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
             return 0;
         }
         return (long) w.decoder().core().layers() * 2 * kvDtype.rowBytes(g.kvDim(), g.kvHeads());
@@ -429,6 +429,10 @@ public final class MetalBackend implements Backend {
     public static final int PLAN_INITIAL_POSITIONS = 8192;
 
     private static Metal open(Decoder d, String metalLib) {
+        if (!d.uniformShape()) {
+            throw new IllegalArgumentException("the Metal backend needs one attention head shape for every layer (Gemma 4 "
+                    + "mixes 256- and 512-wide heads); use backend=cpu");
+        }
         int hd = d.attention().headDim();
         if (hd % 32 != 0 || hd > 256) {
             throw new IllegalArgumentException("Metal backend needs headDim multiple of 32 and <= 256");

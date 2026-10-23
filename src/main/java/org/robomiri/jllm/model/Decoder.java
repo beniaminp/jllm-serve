@@ -7,8 +7,10 @@ import java.util.List;
  * residual), final RMSNorm, LM head. Each layer is a {@link LayerSpec}; the rotary tables the attention layers
  * refer to (by index) are listed once.
  *
- * <p>Every layer has the same attention variant and head shape (a backend sizes its caches from it); window,
- * rotary table, scale and the MLP may differ per layer.
+ * <p>Most families have the same attention variant and head shape in every layer; Gemma 4's full-attention layers
+ * are the exception (a wider head, one key/value head and K = V). A backend that sizes one cache from
+ * {@link #attention()} requires {@link #uniformShape()}; a backend that keeps a cache per layer does not.
+ * Window, rotary table, scale and the MLP may differ per layer either way.
  */
 public record Decoder(Core core, List<LayerSpec> layers, List<RopeTable> ropeTables) implements Architecture {
 
@@ -27,15 +29,23 @@ public record Decoder(Core core, List<LayerSpec> layers, List<RopeTable> ropeTab
             if (a.ropeTable() < 0 || a.ropeTable() >= ropeTables.size()) {
                 throw new IllegalArgumentException("rope table " + a.ropeTable() + " of " + ropeTables.size());
             }
-            if (!a.sameShape(first)) {
-                throw new IllegalArgumentException("attention shapes differ between layers: " + first + " vs " + a);
-            }
         }
     }
 
-    /** The attention of layer 0: its variant and head shape are those of every layer. */
+    /** The attention of layer 0: its variant and head shape are those of every layer when {@link #uniformShape()}. */
     public Attention attention() {
         return layers.getFirst().attn();
+    }
+
+    /** True if every layer has layer 0's attention variant and head shape (a backend may size one cache from it). */
+    public boolean uniformShape() {
+        Attention first = layers.getFirst().attn();
+        for (LayerSpec s : layers) {
+            if (!s.attn().sameShape(first)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Width of the widest dense GLU (the dense layers' hidden size or the shared experts'), 0 if there is none. */

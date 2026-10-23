@@ -96,9 +96,16 @@ public final class Rope {
         return sc.factor() <= 1.0 ? 1.0 : Math.sqrt(1 + Math.log(sc.factor()) / Math.log(sc.originalMaxPositions()));
     }
 
-    /** The {@code rotaryDim/2} inverse frequencies of {@code t} for a context of {@code ctx} tokens. */
+    /**
+     * The {@code rotaryDim/2} inverse frequencies of {@code t} for a context of {@code ctx} tokens; the pairs from
+     * {@link RopeTable#activePairs()} on are 0 (Gemma 4's proportional RoPE leaves the rest of the head unrotated).
+     */
     public static double[] invFreq(RopeTable t, int ctx) {
-        return invFreq(t.rotaryDim(), t.theta(), t.scaling(), ctx);
+        double[] f = invFreq(t.rotaryDim(), t.theta(), t.scaling(), ctx);
+        if (t.activePairs() < f.length) {
+            java.util.Arrays.fill(f, t.activePairs(), f.length, 0.0);
+        }
+        return f;
     }
 
     /**

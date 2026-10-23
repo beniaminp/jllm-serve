@@ -42,15 +42,26 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
      * @param tempFloor Llama 4's attention temperature tuning of the NoPE layers: the query of position {@code p} is
      *                  multiplied by {@code 1 + tempScale * ln(1 + floor((p + 1) / tempFloor))}; 0 = off
      * @param tempScale see {@code tempFloor}
+     * @param kEqV      the value is the key projection's output (Gemma 4's full-attention layers: no {@code v_proj})
+     * @param vNorm     a parameterless RMS norm on every value head, before the cache (Gemma 4)
      */
     record Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
                boolean outBias, float scale, float softcap, boolean sinks, int chunk, boolean l2Norm, int tempFloor,
-               float tempScale) implements Attention {
+               float tempScale, boolean kEqV, boolean vNorm) implements Attention {
 
-        /** The attention every family but gpt-oss and Llama 4 has: no sinks, no chunks, no L2 norm, no temperature. */
+        /** The attention every family but gpt-oss, Llama 4 and Gemma 4 has: no sinks, chunks, L2 norm, temperature or V norm, and no K = V. */
         public Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
                    boolean outBias, float scale, float softcap) {
-            this(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, false, 0, false, 0, 0f);
+            this(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, false, 0, false, 0, 0f,
+                    false, false);
+        }
+
+        /** As the ten-argument constructor, plus gpt-oss / Llama 4's sinks, chunks, L2 norm and temperature; no K = V or V norm. */
+        public Gqa(int heads, int kvHeads, int headDim, int window, int ropeTable, boolean qkNorm, boolean bias,
+                   boolean outBias, float scale, float softcap, boolean sinks, int chunk, boolean l2Norm, int tempFloor,
+                   float tempScale) {
+            this(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, sinks, chunk, l2Norm,
+                    tempFloor, tempScale, false, false);
         }
 
         /** The keys a query at position {@code p} sees start at this position. */
@@ -80,7 +91,7 @@ public sealed interface Attention permits Attention.Gqa, Attention.Mla {
                 return this;
             }
             return new Gqa(heads, kvHeads, headDim, window, ropeTable, qkNorm, bias, outBias, scale, softcap, sinks, c, l2Norm,
-                    t, tempScale);
+                    t, tempScale, kEqV, vNorm);
         }
 
         @Override

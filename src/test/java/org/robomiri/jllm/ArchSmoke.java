@@ -206,11 +206,13 @@ public final class ArchSmoke {
             }
             System.out.println(label + "  " + cfg);
             System.out.println("  cpu   " + Arrays.toString(cpu));
-            if (PAGED && cfg instanceof Decoder sd && org.robomiri.jllm.cpu.CpuBackend.anySpecial(sd, 64)
+            if (cfg instanceof Decoder sd && !sd.uniformShape()) {
+                System.out.println("  paged / mixed / tier checks skipped: the layers have different attention head shapes");
+            } else if (PAGED && cfg instanceof Decoder sd && org.robomiri.jllm.cpu.CpuBackend.anySpecial(sd, 64)
                     && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 // (gpt-oss / Llama 4: sinks, chunked attention or temperature read the flat cache; ModelLoader falls back to it)
                 System.out.println("  paged KV cache: not applicable to sinks / chunked attention / temperature tuning");
-            } else if (PAGED && !recurrent && cfg instanceof Decoder && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
+            } else if (PAGED && !recurrent && cfg instanceof Decoder && ((Decoder) cfg).uniformShape() && quant == QType.Q4_0 && head == QuantFile.DEFAULT_HEAD) {
                 // the paged KV cache against the flat one, bit for bit (CPU, and Metal when it is there): docs/24
                 boolean firstOfKind = pagedF16.add(((Decoder) cfg).anyMoe() ? "moe" : "dense"); // f16 on the first dense and MoE only
                 failures += PagedKvChecks.run(w, lib, metal, cfg, firstOfKind);
@@ -220,6 +222,10 @@ public final class ArchSmoke {
                 }
             }
             if (!metal) {
+                return failures;
+            }
+            if (cfg instanceof Decoder d && !d.uniformShape()) {
+                System.out.println("  metal skipped: the layers have different attention head shapes");
                 return failures;
             }
             if (cfg instanceof Decoder d && d.attention().headDim() % 32 != 0) {
