@@ -106,12 +106,17 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   length, and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
 - **Known:** CPU and Metal sparse logits differ by up to 0.4–2.8, because a rounding-order difference flips which block
   is selected. Argmax agrees 23–24 of 24.
-- **Docs numbering:** both this branch and the next one wrote `docs/26`. Whichever merges second renumbers to 27.
+- **Docs numbering:** both this branch and the tiered-KV branch wrote `docs/26`. The tiered-KV branch merged first with
+  `docs/26-tiered-kv-and-memory-planner.md`, so this branch's `docs/26-sparse-attention.md` renumbers to `docs/27` when
+  it merges.
 
 ### 4. Tiered KV storage and memory planner — `wip/tiered-kv-memory-planner` (docs/26)
 
-- **Branch:** `wip/tiered-kv-memory-planner` at `e9fc4d9`, main `e951fc7` merged in. **The gates have not run on it
-  yet.**
+- **Branch:** `wip/tiered-kv-memory-planner`, merged to `main` as `4643494` after all six gates passed (`mvn install`,
+  the web tests, the Metal emulator, the kernel tests, the arch smoke and the exactness run, whose md5 was
+  `79472f690f73bd28598d5d7fb5dee1a4` on both CPU and Metal). Merging `main` in resolved three conflicts
+  (`ContextBudget.java`, `ModelLoader.java`, `KvPool.java`) to reconcile tiered KV with the paged-auto, idle-slot
+  `Reclaimer` and hybrid-backend features that had landed on `main`.
 - **Works (checked by quick runs):**
   - `backend.kv-tier`: a warm host-memory tier with background demotion and prefetch in front of the block files, an
     on-disk q8/q4 block codec, memory-mapped block reads, and a hot cap and persistence in `KvPool` (`KvTierTest`).
@@ -126,8 +131,7 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - Saved sessions as block files (`KvStore.saveBlocks`).
   - `ContextBudget.tierManaged`: with `backend.kv-tier`, `backend.ctx=auto` is bounded by physical memory, not the GPU
     share.
-- **Left:**
-  - the six gates;
+- **Merged, follow-ups still open:**
   - the measurements: Qwen3-0.6B at 32k resident vs tiered, the 30B with a growing context, and the `TierDiskStudy`
     accuracy table, so docs/26 §26.5 has only interim numbers;
   - `TierEngineTest` (a real model through the engine) has not run to completion;
