@@ -528,10 +528,10 @@ Verified by (all in `mvn -o install` / `scripts/arch-smoke.sh` / `kernel_tests.p
   `backend.kv-q4-recent` positions are kept exact only in that slot), so a shared block cannot carry it. A q4 slot keeps its flat cache (a note
   is printed).
 * DeepSeek's latent cache, Mamba and Qwen3-Next / Qwen3.5 keep flat caches (24.2.8).
-* The Metal pool is not counted in `DeviceLedger` (the MoE expert placement budgets the weights and the per-slot buffers, not the pool).
+* ~~The Metal pool is not counted in `DeviceLedger`~~: fixed in chapter 26 (§26.2.1): every Metal pool registers `hotCap · blockBytes`, so the MoE expert placement leaves room for it.
 * On AVX-512 with `B = 16` the f32 decode gathers (no direct kernel for one-vector-wide blocks).
 * An idle slot keeps its conversation's blocks referenced; they are evicted only when the slot moves to another conversation (sharing does not
   need the slot, the pool would, so a pool smaller than `slots · ctx` can run out: `KvPoolExhausted`).
 * The flat-cache attention on Metal needs a scores scratch of `tile · heads · ctx` floats, so the Metal paged cache reaches a million tokens
   in storage but not through `attention_t`; the decode kernels (`attention_dec`, `attention_split`) have no such limit.
-* No scheduler, no sparse attention, no tiered (host / SSD) storage yet: this chapter is the foundation they need.
+* No scheduler and no sparse attention yet; tiered (host / SSD) storage, streamed KV and the memory planner are chapter 26. This chapter is the foundation they need.

@@ -362,8 +362,8 @@ public final class ModelLoader {
     }
 
     private static org.robomiri.jllm.kv.KvPool kvPool(Settings s, ModelWeights weights, KvDtype kvDtype, int ctx, int slots,
-                                                      boolean metal) {
-        if (!paged(s, weights, slots)) {
+                                                      boolean metal, org.robomiri.jllm.kv.KvTierConfig tier) {
+        if (!paged(s, weights, slots) && tier == null) {
             return null;
         }
         if (weights.arch instanceof org.robomiri.jllm.model.Decoder dec && CpuBackend.anySpecial(dec, ctx)) {
@@ -373,17 +373,43 @@ public final class ModelLoader {
         }
         int block = s.getInt("backend.kv-block");
         long tokens = s.getLong("backend.kv-pool-tokens");
-        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens;
+        String key = (metal ? "metal|" : "cpu|") + kvDtype + (kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() ? "r" : "") + "|" + block + "|" + ctx + "|" + tokens
+                + (tier != null ? "|tier=" + tier.hotBytes() + "," + tier.hostBytes() + "," + tier.diskFormat() : "");
         org.robomiri.jllm.kv.KvPool pool = org.robomiri.jllm.kv.KvPools.get(weights, key,
                 () -> metal ? org.robomiri.jllm.metal.MetalBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens,
-                        s.opt("backend.metal.lib")) : CpuBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens));
+                        s.opt("backend.metal.lib"), tier) : CpuBackend.newKvPool(weights, ctx, slots, kvDtype, block, tokens,
+                        KvDtype.q8Rotate(), tier));
         if (pool == null) {
-            System.err.println("note: backend.kv-paged is not available for this model on " + (metal ? "Metal" : "the CPU") + " ("
-                    + (kvDtype == KvDtype.Q4 ? "q4 cache" : "latent attention") + "), using the flat KV cache");
+            System.err.println("note: " + (tier != null ? "backend.kv-tier" : "backend.kv-paged") + " is not available for this model on "
+                    + (metal ? "Metal" : "the CPU") + " (" + (kvDtype == KvDtype.Q4 ? "q4 cache" : "latent attention")
+                    + "), using the flat KV cache");
         } else {
             pool.setSharing(s.getBool("backend.kv-prefix-share"));
+            if (tier != null && pool.spill() == null) {
+                try {
+                    String fp = weights.arch + "|" + s.get("model.quant") + "|" + weights.byteSize() + "|" + kvDtype;
+                    org.robomiri.jllm.kv.KvTier.attach(pool, tier, fp, tier.dir().resolve("blocks"),
+                            (long) (s.getLong("backend.kv-tier-max-gb") * 1e9));
+                } catch (java.io.IOException e) {
+                    System.err.println("warning: no block store for the KV tiers in " + tier.dir() + ": " + e.getMessage());
+                }
+            }
         }
         return pool;
+    }
+
+    /** The tiered KV storage settings, or null when {@code backend.kv-tier} is off. */
+    static org.robomiri.jllm.kv.KvTierConfig tierConfig(Settings s) {
+        if (!s.getBool("backend.kv-tier")) {
+            return null;
+        }
+        String d = s.get("backend.kv-tier-dir").trim();
+        Path dir = d.isEmpty() ? Path.of(System.getProperty("user.home"), ".cache", "jllm", "kv-tier") : Path.of(d);
+        return new org.robomiri.jllm.kv.KvTierConfig(s.getLong("backend.kv-hot-mb") * 1_000_000L,
+                s.getLong("backend.kv-host-mb") * 1_000_000L,
+                org.robomiri.jllm.kv.KvBlockCodec.Format.parse(s.get("backend.kv-disk-format")), s.getBool("backend.kv-prefetch"),
+                s.getBool("backend.memory-plan"),
+                org.robomiri.jllm.kv.KvTierConfig.Stream.parse(s.get("backend.kv-stream")), dir);
     }
 
     /** The batch group of each loaded model's weights (engine.batch-decode); weak: gone with the weights. */
@@ -617,6 +643,29 @@ public final class ModelLoader {
                 default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
             };
         }
+        org.robomiri.jllm.kv.KvTierConfig tier = member && arch instanceof org.robomiri.jllm.model.Decoder ? tierConfig(s) : null;
+        if (tier != null && backendName.equals("metal") && tier.hotBytes() == 0 && !tier.plan()) {
+            // no budget given and no planner: the hot tier is the GPU's free share, as backend.ctx=auto reckons it (docs/10 §10.13)
+            long ws = org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib"));
+            if (ws > 0) {
+                long free = Math.max(0, ws - org.robomiri.jllm.metal.MetalMemory.residentBytes() - weights.byteSize()
+                        - Math.max(512L << 20, ws / 32));
+                tier = tier.withHotBytes((long) (ContextBudget.SHARE * free));
+            }
+        }
+        boolean planned = tier != null && tier.plan() && tier.hotBytes() == 0 && backendName.equals("metal");
+        boolean streamKv = tier != null && backendName.equals("metal") && (planned
+                ? tier.stream() != org.robomiri.jllm.kv.KvTierConfig.Stream.FORCE
+                        ? org.robomiri.jllm.metal.MetalBackend.planStreams(weights, ctx, Math.max(1, slots), batch, kvDtype,
+                                s.opt("backend.metal.lib"), tier)
+                        : org.robomiri.jllm.metal.MetalBackend.kvBytesPerPosition(weights, kvDtype) > 0
+                : org.robomiri.jllm.metal.MetalBackend.streamsKv(weights, ctx, slots, kvDtype, s.getInt("backend.kv-block"), tier));
+        if (planned && !streamKv) { // the planner's hot cap starts small and grows with the contexts
+            long perPos = org.robomiri.jllm.metal.MetalBackend.kvBytesPerPosition(weights, kvDtype);
+            if (perPos > 0) {
+                tier = tier.withHotBytes(Math.min((long) Math.max(1, slots) * ctx, org.robomiri.jllm.metal.MetalBackend.PLAN_INITIAL_POSITIONS) * perPos);
+            }
+        }
         return switch (backendName) {
             case "cpu" -> mamba
                     ? new MambaCpuBackend(weights, ctx, batch,
@@ -625,17 +674,18 @@ public final class ModelLoader {
                     : member && group(s, weights) != null // a group's slots share one pool: they never compute at once
                     ? new CpuBackend(weights, ctx, batch, group(s, weights).cpuPool(
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors()), kvDtype,
-                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null)
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false, tier) : null)
                     : new CpuBackend(weights, ctx, batch,
                             threads > 0 ? threads : Runtime.getRuntime().availableProcessors(), kvDtype,
-                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false) : null);
+                            int8(s, weights, threads), member ? kvPool(s, weights, kvDtype, ctx, slots, false, tier) : null);
             case "metal" -> mamba
                     ? new MambaMetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"))
                     : new MetalBackend(weights, ctx, batch, s.opt("backend.metal.lib"), kvDtype,
                             new MoeSplit(MoeSplit.parseLayers(s.get("backend.metal.cpu-moe")),
                                     threads > 0 ? threads : Runtime.getRuntime().availableProcessors(),
                                     int8(s, weights, threads), null, Math.max(1, slots)),
-                            member ? kvPool(s, weights, kvDtype, ctx, slots, true) : null);
+                            member && !streamKv ? kvPool(s, weights, kvDtype, ctx, slots, true, tier) : null,
+                            streamKv ? tier.withStream(org.robomiri.jllm.kv.KvTierConfig.Stream.FORCE) : tier);
             default -> throw new IllegalArgumentException("unknown backend '" + backendName + "' (cpu|metal|auto)");
         };
     }

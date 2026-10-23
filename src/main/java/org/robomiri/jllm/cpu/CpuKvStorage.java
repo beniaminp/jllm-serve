@@ -123,6 +123,11 @@ final class CpuKvStorage implements KvStorage {
     }
 
     @Override
+    public org.robomiri.jllm.kv.KvBlockCodec codec(org.robomiri.jllm.kv.KvBlockCodec.Format f) {
+        return new org.robomiri.jllm.kv.KvBlockCodec(f, dtype, layers, B, kvHeads, headDim);
+    }
+
+    @Override
     public long residentBytes() {
         return blockBytes;
     }
@@ -140,9 +145,58 @@ final class CpuKvStorage implements KvStorage {
             }
             MemorySegment[] next = java.util.Arrays.copyOf(cur, need);
             for (int i = cur.length; i < need; i++) {
-                next[i] = arena.allocate(slabBytes, 64);
+                if (i >= hotSlabs && coldDir != null) {
+                    next[i] = mapSlab();
+                } else {
+                    next[i] = arena.allocate(slabBytes, 64);
+                    hotCount++;
+                }
             }
             slabs = next;
+        }
+    }
+
+    // ------------------------------------------------------------------ the SSD tier (docs/26 §26.2.3)
+
+    private int hotSlabs = Integer.MAX_VALUE;
+    private java.nio.file.Path coldDir;
+    private int hotCount;
+    private int coldCount;
+
+    /**
+     * Keeps at most {@code hotBytes} of slabs in the process's own memory: the slabs past that many are memory-mapped
+     * files in {@code dir} (unlinked at once: they live as long as the mapping), so the operating system pages them between RAM and the
+     * SSD. The blocks in them are read and written exactly like the others (same code, same bytes), so results do not
+     * change. Call before the first block is handed out.
+     */
+    void setHotBudget(long hotBytes, java.nio.file.Path dir) {
+        if (slabs.length > 0) {
+            throw new IllegalStateException("the hot budget must be set before the pool grows");
+        }
+        this.hotSlabs = (int) Math.max(0, Math.min(Integer.MAX_VALUE, hotBytes / Math.max(1, slabBytes)));
+        this.coldDir = dir;
+    }
+
+    /** Slabs in the process's memory and slabs that are mapped files (the SSD tier), for the console. */
+    synchronized int[] slabCounts() {
+        return new int[]{hotCount, coldCount};
+    }
+
+    private MemorySegment mapSlab() {
+        try {
+            java.nio.file.Files.createDirectories(coldDir);
+            java.nio.file.Path f = java.nio.file.Files.createTempFile(coldDir, "kvslab", ".bin");
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(f, java.nio.file.StandardOpenOption.READ,
+                    java.nio.file.StandardOpenOption.WRITE)) {
+                MemorySegment m = ch.map(java.nio.channels.FileChannel.MapMode.READ_WRITE, 0, slabBytes, arena);
+                java.nio.file.Files.deleteIfExists(f); // unlinked while mapped: the space goes back with the mapping, even after a crash
+                coldCount++;
+                return m;
+            }
+        } catch (java.io.IOException e) {
+            System.err.println("warning: no memory-mapped KV slab in " + coldDir + " (" + e.getMessage() + "), using memory");
+            hotCount++;
+            return arena.allocate(slabBytes, 64);
         }
     }
 

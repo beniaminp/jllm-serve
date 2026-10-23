@@ -132,11 +132,24 @@ public final class CpuBackend implements Backend {
     /** {@link #newKvPool(ModelWeights, int, int, KvDtype, int, long)} with the q8 cache's rotated keys given ({@code backend.kv-q8-rotate}). */
     public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
                                    boolean rotateQ8) {
+        return newKvPool(w, ctx, slots, kvDtype, blockTokens, poolTokens, rotateQ8, null);
+    }
+
+    /**
+     * With tiered storage ({@code tier}, docs/26): when {@code tier.hotBytes()} is positive, the pool's slabs beyond that many
+     * bytes are memory-mapped files under {@code tier.dir()} (the SSD tier, paged by the operating system), read and written by
+     * the same code as the slabs in memory.
+     */
+    public static KvPool newKvPool(ModelWeights w, int ctx, int slots, KvDtype kvDtype, int blockTokens, long poolTokens,
+                                   boolean rotateQ8, org.robomiri.jllm.kv.KvTierConfig tier) {
         Decoder arch = w.decoder();
         if (!(arch.attention() instanceof Attention.Gqa g) || kvDtype == KvDtype.Q4) {
             return null;
         }
         CpuKvStorage st = new CpuKvStorage(kvDtype, arch.core().layers(), g, blockTokens, rotateQ8);
+        if (tier != null && tier.hotBytes() > 0 && tier.dir() != null) {
+            st.setHotBudget(tier.hotBytes(), tier.dir().resolve("slabs"));
+        }
         long perSeq = (ctx + blockTokens - 1L) / blockTokens + 2;
         long blocks = poolTokens > 0 ? (poolTokens + blockTokens - 1) / blockTokens : Math.max(1, slots) * perSeq;
         if (blocks > Integer.MAX_VALUE - 16) {
@@ -144,7 +157,16 @@ public final class CpuBackend implements Backend {
         }
         String format = "paged " + kvDtype + (st.rotate ? " rot" : "") + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim()
                 + " block=" + blockTokens;
-        return new KvPool(st, (int) blocks, format);
+        KvPool pool = new KvPool(st, (int) blocks, format);
+        if (tier != null) {
+            pool.setPrefetch(tier.prefetch());
+        }
+        return pool;
+    }
+
+    /** Slabs of the pool's blocks in the process's memory and in memory-mapped files, or null for another pool. */
+    public static int[] slabCounts(KvPool pool) {
+        return pool != null && pool.storage() instanceof CpuKvStorage st ? st.slabCounts() : null;
     }
 
     private CpuBackend(ModelWeights w, int ctx, int maxBatch, ThreadPool pool, boolean ownsPool, KvDtype kvDtype,

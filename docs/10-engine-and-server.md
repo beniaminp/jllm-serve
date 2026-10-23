@@ -887,6 +887,9 @@ CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (th
 CPU, backend.kv-paged=true (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
         the paged pool (docs/24) is off-heap MemorySegment slabs, so -Xmx no longer bounds the cache, only the RAM does
 both  : budget = min(budget, 0.6 · max(0, 0.75 · physicalMemory − weights))   (weights are memory-mapped: they must fit in RAM too)
+Metal or CPU, backend.kv-tier=true with streaming allowed, a hot budget or the memory planner (docs/26):
+        budget = 0.6 · max(0, 0.75 · physicalMemory − weights); with backend.kv-stream=off: at most backend.kv-hot-mb
+        (the GPU's share no longer bounds the cache: a slot that does not fit streams from host memory, the planner owns the GPU side)
 a draft model (engine.speculative=draft) keeps a cache of the same length: budget = budget / 2
 ```
 
@@ -979,7 +982,7 @@ costs address space and only touches the pages that get written.
   Qwen3-0.6B at f32 on this 32 GB Mac that is `0.6 · (0.75 · 34.4 − 0.5) = 15.2 GB`, i.e. the trained 40 960 positions instead of the heap-bound
   7 168. The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
   costs address space until conversations fill it. On Metal the paged pool is Metal buffers counted against the working set exactly like the
-  flat caches, so the Metal arithmetic is unchanged. A model that cannot be paged (q4, DeepSeek, Mamba, Qwen3-Next) keeps the heap budget on the CPU.
+  flat caches (and, since chapter 26, registered in the device ledger, so the MoE expert placement leaves room for it), so the Metal arithmetic is unchanged unless `backend.kv-tier` takes the cache off the GPU share (`ContextBudget.tierManaged`, docs/26 §26.2.1). A model that cannot be paged (q4, DeepSeek, Mamba, Qwen3-Next) keeps the heap budget on the CPU.
   An explicit `backend.kv-pool-tokens` smaller than the context is not taken into account.
 - When the weights leave no room the result is the 1 024 floor and the log says "limited by memory"; set a number to override.
 - Saved conversations (`KvStore`) ignore `backend.ctx` in their compatibility key, and `Engine` refuses a saved cache longer than the

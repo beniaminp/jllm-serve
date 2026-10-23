@@ -21,6 +21,9 @@ public final class MetalKvStorage implements KvStorage {
 
     private final Metal metal;
     private final int layers;
+    private final KvDtype dtype;
+    private final int kvHeads;
+    private final int headDim;
     private final int B;
     private final long rowBytes;
     private final int maxBlocks;
@@ -33,6 +36,9 @@ public final class MetalKvStorage implements KvStorage {
         }
         this.metal = Metal.create(metalLib);
         this.layers = layers;
+        this.dtype = dtype;
+        this.kvHeads = a.kvHeads();
+        this.headDim = a.headDim();
         this.B = blockTokens;
         this.rowBytes = dtype.rowBytes(a.kvDim(), a.kvHeads());
         this.maxBlocks = maxBlocks;
@@ -65,6 +71,11 @@ public final class MetalKvStorage implements KvStorage {
     }
 
     @Override
+    public org.robomiri.jllm.kv.KvBlockCodec codec(org.robomiri.jllm.kv.KvBlockCodec.Format f) {
+        return new org.robomiri.jllm.kv.KvBlockCodec(f, dtype, layers, B, kvHeads, headDim);
+    }
+
+    @Override
     public long residentBytes() {
         return (long) layers * B * 2 * rowBytes;
     }
@@ -74,6 +85,7 @@ public final class MetalKvStorage implements KvStorage {
         if (blocks > maxBlocks) {
             throw new IllegalStateException("block " + blocks + " is past the pool buffers (" + maxBlocks + ")");
         }
+        committedBlocks = Math.max(committedBlocks, blocks);
     }
 
     /** The bytes of row {@code t} of block {@code block} in {@code seg} (a layer's K or V buffer contents). */
@@ -120,8 +132,50 @@ public final class MetalKvStorage implements KvStorage {
         src.position(src.position() + spillBytes());
     }
 
+    private DeviceLedger.Resident ledger;
+
+    /**
+     * Counts the pool in the {@link DeviceLedger}: its buffers belong to a Metal context of their own, so no backend's own
+     * buffers include them, and a model planning its GPU memory (the MoE expert placement, the memory planner) would
+     * otherwise not see the KV blocks at all. What is counted is the pool's hot cap (the blocks it may commit), the
+     * budget the GPU has to keep for it.
+     */
+    void register(org.robomiri.jllm.model.ModelWeights w, org.robomiri.jllm.kv.KvPool pool) {
+        ledger = new DeviceLedger.Resident() {
+            @Override
+            public org.robomiri.jllm.model.ModelWeights weights() {
+                return w;
+            }
+
+            @Override
+            public long gpuWeightBytes() {
+                return 0;
+            }
+
+            @Override
+            public long ownBytes() {
+                return (long) pool.hotCap() * residentBytes();
+            }
+        };
+        DeviceLedger.add(ledger);
+    }
+
+    /** Bytes the pool's committed blocks occupy now (the high-water mark; pages of free blocks stay committed). */
+    long committedBytes() {
+        return (long) committedBlocks * residentBytes();
+    }
+
+    private volatile int committedBlocks;
+
+    /** The memory planner's state for this pool's model (docs/26). */
+    final MemoryGovernor governor = new MemoryGovernor();
+
     @Override
     public void close() {
+        if (ledger != null) {
+            DeviceLedger.remove(ledger);
+            ledger = null;
+        }
         metal.close();
     }
 }

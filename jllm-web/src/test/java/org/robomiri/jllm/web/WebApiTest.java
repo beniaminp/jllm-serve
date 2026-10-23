@@ -61,6 +61,13 @@ class WebApiTest {
     }
 
     @Test
+    void memoryReportIsEmptyWithoutModels() throws Exception {
+        mvc.perform(get("/api/memory").header("Authorization", AUTH)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(0)); // docs/26: one entry per loaded model, none loaded
+        mvc.perform(get("/api/memory")).andExpect(status().isUnauthorized());
+    }
+
+    @Test
     void noModelLoaded() throws Exception {
         mvc.perform(get("/v1/models").header("Authorization", AUTH)).andExpect(status().isOk())
                 .andExpect(jsonPath("$.object").value("list")).andExpect(jsonPath("$.data").isEmpty());

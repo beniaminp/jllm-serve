@@ -93,6 +93,24 @@ public class ManagementController {
         return out;
     }
 
+    /**
+     * Where each loaded text model's memory is (docs/26): the GPU budget and its components, the experts on the CPU, the KV
+     * pool by tier (hot, host memory, SSD), streaming counters and the memory planner's latest decisions. Models whose
+     * backend cannot say (a CPU flat cache) are listed with a null report.
+     */
+    @GetMapping("/memory")
+    public List<Map<String, Object>> memory() {
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (LoadedModel m : models.loaded()) {
+            Map<String, Object> e = new java.util.LinkedHashMap<>();
+            e.put("model", m.id());
+            e.put("slots", m.slotCount());
+            e.put("report", m.engine().backend().memoryReport());
+            out.add(e);
+        }
+        return out;
+    }
+
     @PostMapping("/models/load")
     public Job.View load(@RequestBody ModelManager.LoadRequest request) {
         return models.load(request);
