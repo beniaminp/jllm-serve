@@ -72,6 +72,8 @@ public final class ContextBudget {
             };
             case Qwen3NextArch q -> 2L * q.fullLayers() * kv.rowBytes(q.attention().kvDim(), q.attention().kvHeads());
             case MambaArch m -> 0L;
+            case org.robomiri.jllm.model.HybridArch h -> h.attention() == null ? 0L
+                    : 2L * h.attentionLayers() * kv.rowBytes(h.attention().kvDim(), h.attention().kvHeads());
         };
     }
 

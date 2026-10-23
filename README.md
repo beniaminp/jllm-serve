@@ -10,7 +10,14 @@ and the DeepSeek-R1 distills (`qwen2`), **Llama 3.x** (`llama`), **Mistral** (`m
 (`glm`, `glm4`), **Phi-3 / 3.5 / 4** (`phi3`), **Gemma 2 / 3** text (`gemma2`, `gemma3_text`, `gemma3`),
 **DeepSeek V2 / V3** (`deepseek_v2`, `deepseek_v3`; bf16, or FP8 dequantized while converting), **Mamba** (`mamba`) and
 **Qwen3-Next** (`qwen3_next`; also **Qwen3.5** from GGUF: Gated DeltaNet linear attention in 3 of 4 layers, so a 4× smaller KV cache,
-[docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)).
+[docs/14 §14.14](docs/14-model-families.md#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)),
+**gpt-oss** (`gpt_oss`: attention sinks, clamped-SwiGLU experts, MXFP4 experts read in place,
+[§14.18](docs/14-model-families.md#1418-gpt-oss-attention-sinks-sliding-windows-clamped-swiglu-experts-with-biases-mxfp4)),
+**Llama 4** text (`llama4_text`: chunked attention, NoPE layers with temperature tuning, sigmoid MoE,
+[§14.19](docs/14-model-families.md#1419-llama-4-text-chunked-attention-nope-layers-temperature-tuning-sigmoid-moe)) and the
+attention / state-space hybrids **Granite 4** (`granitemoehybrid`), **Nemotron-H** (`nemotron_h`, dense) and **Jamba** (`jamba`)
+([§14.22](docs/14-model-families.md#1422-attention--state-space-hybrids-granite-4-nemotron-h-jamba)); Qwen2.5-1M's Dual Chunk
+Attention is a [documented design](docs/14-model-families.md#1420-dual-chunk-attention-for-qwen25-1m-the-design-not-implemented), not code.
 Weights are quantized once to **Q4_0, Q8_0 or Q2_K** and memory-mapped afterwards; the KV cache can be f32, f16 or
 q8 (int8 with a scale per row, a quarter of f32).
 llama.cpp **GGUF** files (`Qwen/Qwen3-0.6B-GGUF`, `unsloth/...-GGUF`, a local `.gguf`) run as they are, without a
@@ -86,6 +93,7 @@ New to all of it? **[docs/00 Explained simply](docs/00-explained-simply.md)** te
 | Multi-token prediction | the model's own `nextn` layer drafts one token per step, verified in the same pass (`engine.speculative=mtp`, the default for a model with a head; `off` disables it): output equal to plain decoding, 4.3 -> 5.4 tok/s on the 27B when every guess is right (+26%), break-even at 61% right guesses | [16 §16.14](docs/16-gguf.md#1614-multi-token-prediction-the-model-as-its-own-draft-model) |
 | Native int8 CPU kernels | `libjllm_cpu` (C, NEON `sdot` / AVX2 / AVX-VNNI / AVX512-VNNI) for the int8-activation decode dot products of Q4_0, Q8_0, the K-quants and the newer GGUF types, loaded through FFM, checked against the Java kernels at start-up (`backend.cpu.native=auto\|true\|false`, `backend.cpu.native-lib`) | [07 §7.16](docs/07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu) |
 | int8 or float, measured | `backend.cpu.int8-activations=auto` times one token's matmuls both ways at load and keeps the faster (int8 on ARM, often float on AVX-512) | [07 §7.10.1](docs/07-cpu-backend.md#7101-auto-measure-dont-guess) |
+| Checked against transformers on tiny random models (gpt-oss, Llama 4, Granite 4, Nemotron-H, Jamba: logits at 52 positions, greedy ids, chunk invariance, CPU and Metal) | `scripts/hf-arch-check.sh` | [14 §14.21](docs/14-model-families.md#1421-checking-the-new-families-against-transformers-on-tiny-random-models) |
 | Checked against transformers on real weights | Qwen3, Qwen2.5, Llama 3.2, Mistral, GLM-Edge, Gemma 2/3 and Mamba give the same token ids, chat templates and (to quantization rounding) logits as Hugging Face transformers; `scripts/real-weights-check.sh` reruns it for any model | [14 §14.13](docs/14-model-families.md#1413-verified-on-real-weights) |
 | Speech-to-text (Whisper) | `openai/whisper-tiny … large-v3-turbo` from the Hub: log-mel exactly as `transformers` computes it, encoder + decoder with cross-attention on the CPU (4x4 register tiles) and on Metal (own `audio.metal` kernels, encoder and decoder on the GPU), the OpenAI decoding protocol (language detection, timestamps, 30 s windows, temperature fallback), word timestamps by DTW over the alignment heads; identical token ids to `transformers`; `POST /v1/audio/transcriptions` and `/translations` | [21](docs/21-audio.md) |
 | Text-to-speech (OuteTTS) | a Qwen2 language model that writes audio-codec tokens, run by the same engine as the chat models, plus the WavTokenizer decoder (convolutions, attention, ConvNeXt, inverse STFT) in Java; 10 voices, speed without changing the pitch; `POST /v1/audio/speech` | [21](docs/21-audio.md) |

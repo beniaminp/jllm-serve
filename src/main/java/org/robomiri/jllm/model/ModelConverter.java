@@ -310,6 +310,7 @@ public final class ModelConverter {
             case MambaArch m -> planMamba(m);
             case Decoder d -> planDecoder(d);
             case Qwen3NextArch q -> planQwen3Next(q);
+            case HybridArch h -> planHybrid(h);
         };
     }
 
@@ -357,19 +358,23 @@ public final class ModelConverter {
                     if (g.outBias()) {
                         rules.add(f32(p + "self_attn.o_proj.bias", p + "self_attn.o_proj.bias"));
                     }
+                    if (g.sinks()) {
+                        rules.add(f32(p + "self_attn.sinks", p + "self_attn.sinks"));
+                    }
                 }
                 case Attention.Mla m -> rules.addAll(mlaRules(p, m, dim));
             }
             switch (spec.mlp()) {
                 case Mlp.Moe m -> rules.addAll(moeRules(p, m, dim));
                 case Mlp.Dense dense -> {
+                    String f = ffnName(p); // Llama 4 calls its dense MLP feed_forward
                     if (fusedGateUp(p)) {
                         // GLM: gate_up_proj is already [gate; up] stacked, the layout of mlp.gate_up
                         rules.add(quantize(p + "mlp.gate_up", p + "mlp.gate_up_proj.weight", quant, 0, 0));
                     } else {
-                        rules.add(stack(p + "mlp.gate_up", List.of(p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight"), quant, 0, 0));
+                        rules.add(stack(p + "mlp.gate_up", List.of(f + "gate_proj.weight", f + "up_proj.weight"), quant, 0, 0));
                     }
-                    rules.add(quantize(p + "mlp.down_proj.weight", quant));
+                    rules.add(quantize(p + "mlp.down_proj.weight", f + "down_proj.weight", quant, 0, 0));
                 }
             }
             units.add(new Unit("layer." + l, List.copyOf(rules)));
@@ -421,6 +426,9 @@ public final class ModelConverter {
     private List<Rule> moeRules(String p, Mlp.Moe moe, int dim) {
         int e = moe.experts();
         int m = moe.moeDim();
+        if (moe.router() instanceof Router.TopLogits) {
+            return topLogitsRules(p, moe, dim);
+        }
         List<Rule> rules = new ArrayList<>();
         rules.add(f32(p + "mlp.router", routerName(p)));
         if (moe.shared() != null) {
@@ -448,6 +456,172 @@ public final class ModelConverter {
         rules.add(stack(p + "mlp.experts.gate_up", gateUp, quant, m, 0));
         rules.add(stack(p + "mlp.experts.down", downs, quant, 0, m));
         return rules;
+    }
+
+    /** The checkpoint's name for the feed-forward block of the layer with prefix {@code p}: Llama 4 says feed_forward, the others mlp. */
+    private String ffnName(String p) {
+        for (String n : new String[]{"router.weight", "gate_proj.weight", "experts.gate_up_proj"}) {
+            if (shardOf.containsKey(p + "feed_forward." + n)) {
+                return p + "feed_forward.";
+            }
+        }
+        return p + "mlp.";
+    }
+
+    /**
+     * The MoE of gpt-oss and Llama 4 ({@link Router.TopLogits}): the f32 router (+ bias), Llama 4's shared expert and the
+     * experts. Their checkpoints store each stacked tensor transposed ({@code gate_up_proj [E, dim, 2m]},
+     * {@code down_proj [E, m, dim]}, so the matmul is {@code x @ W}), either as bf16 / f32 (quantized to {@code quant} here,
+     * gate and up columns alternating for gpt-oss, as two blocks for Llama 4) or, gpt-oss as released, as MXFP4:
+     * {@code *_blocks [E, rows, cols/32, 16]} with {@code *_scales [E, rows, cols/32]}, which is repacked block for block
+     * into the ggml MXFP4 layout the kernels read in place (the nibbles of a block are reordered, the scale byte is the
+     * same e8m0) with gate and up as two tensors. Biases go to f32 with gate then up per expert.
+     */
+    private List<Rule> topLogitsRules(String p, Mlp.Moe moe, int dim) {
+        int e = moe.experts();
+        int m = moe.moeDim();
+        String f = ffnName(p);
+        List<Rule> rules = new ArrayList<>();
+        rules.add(f32(p + "mlp.router", f + "router.weight"));
+        if (((Router.TopLogits) moe.router()).bias()) {
+            rules.add(f32(p + "mlp.router_bias", f + "router.bias"));
+        }
+        if (moe.shared() != null) {
+            String sp = f + "shared_expert.";
+            int sh = moe.shared().hidden();
+            rules.add(stack(p + "mlp.shared.gate_up", List.of(sp + "gate_proj.weight", sp + "up_proj.weight"), quant, sh, 0));
+            rules.add(quantize(p + "mlp.shared.down", sp + "down_proj.weight", quant, 0, sh));
+        }
+        Mlp.ExpertSpec es = moe.spec();
+        // output row j of an expert's [gate; up] block -> the column of the checkpoint's 2m fused output columns
+        int[] guCol = new int[2 * m];
+        for (int j = 0; j < 2 * m; j++) {
+            int g = j < m ? j : j - m;
+            guCol[j] = es.interleaved() ? 2 * g + (j < m ? 0 : 1) : j;
+        }
+        if (es.bias()) {
+            rules.add(reorderBias(p + "mlp.experts.gate_up_bias", f + "experts.gate_up_proj_bias", e, guCol));
+            rules.add(f32(p + "mlp.experts.down_bias", f + "experts.down_proj_bias"));
+        }
+        if (shardOf.containsKey(f + "experts.gate_up_proj_blocks")) {
+            int[] gate = new int[m];
+            int[] up = new int[m];
+            for (int j = 0; j < m; j++) {
+                gate[j] = guCol[j];
+                up[j] = guCol[m + j];
+            }
+            rules.add(mxfp4(p + "mlp.experts.gate", f + "experts.gate_up_proj", e, 2 * m, dim, gate));
+            rules.add(mxfp4(p + "mlp.experts.up", f + "experts.gate_up_proj", e, 2 * m, dim, up));
+            int[] all = new int[dim];
+            for (int j = 0; j < dim; j++) {
+                all[j] = j;
+            }
+            rules.add(mxfp4(p + "mlp.experts.down", f + "experts.down_proj", e, dim, m, all));
+            return rules;
+        }
+        rules.add(transposedExperts(p + "mlp.experts.gate_up", f + "experts.gate_up_proj", quant, e, dim, 2 * m, guCol));
+        int[] all = new int[dim];
+        for (int j = 0; j < dim; j++) {
+            all[j] = j;
+        }
+        rules.add(transposedExperts(p + "mlp.experts.down", f + "experts.down_proj", quant, e, m, dim, all));
+        return rules;
+    }
+
+    /** {@code [E, 2m]} biases -> {@code [E * 2m]} in the order of the stacked rows ({@code col[j]} = source column of row j). */
+    private static Rule reorderBias(String cacheName, String source, int experts, int[] col) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            SafeTensors.Tensor t = s.getFirst();
+            int n = col.length;
+            if (!Arrays.equals(t.shape(), new long[]{experts, n})) {
+                throw new IOException(t + " does not match [" + experts + ", " + n + "]");
+            }
+            float[] src = t.toFloatArray();
+            float[] out = new float[experts * n];
+            for (int x = 0; x < experts; x++) {
+                for (int j = 0; j < n; j++) {
+                    out[x * n + j] = src[x * n + col[j]];
+                }
+            }
+            return out;
+        });
+    }
+
+    /**
+     * The experts of a transposed stacked tensor {@code [E, in, out]} (the matmul is {@code x @ W[e]}) as a quantized
+     * {@code [E * out, in]} tensor whose row {@code j} of expert {@code e} is column {@code col[j]} of {@code W[e]}.
+     * Expert by expert, so only one expert's floats are in memory next to the result.
+     */
+    private static Rule transposedExperts(String cacheName, String source, QType type, int experts, int in, int out, int[] col) {
+        return new Rule(cacheName, List.of(source), (a, s) -> {
+            SafeTensors.Tensor t = s.getFirst();
+            if (!Arrays.equals(t.shape(), new long[]{experts, in, out})) {
+                throw new IOException(t + " does not match [" + experts + ", " + in + ", " + out + "]");
+            }
+            QTensor all = QTensor.allocate(a, type, experts * out, in);
+            float[] slab = new float[in * out];
+            for (int x = 0; x < experts; x++) {
+                t.toFloat((long) x * in * out, slab, 0, in * out);
+                try (Arena pa = Arena.ofShared()) {
+                    all.setRows(x * out, QTensor.quantize(pa, type, out, in, (r, dst) -> {
+                        int c = col[r];
+                        for (int i = 0; i < in; i++) {
+                            dst[i] = slab[i * out + c];
+                        }
+                    }));
+                }
+            }
+            return all;
+        });
+    }
+
+    /**
+     * MXFP4 experts as ggml {@link QType#MXFP4} blocks. {@code source} names the pair {@code source_blocks} /
+     * {@code source_scales} of shape {@code [E, srcRows, cols/32, 16]} / {@code [E, srcRows, cols/32]}; the result has
+     * {@code E * rowMap.length} rows, row {@code r} of expert {@code e} being source row {@code rowMap[r]} of expert
+     * {@code e}. The checkpoint packs element {@code 2i} in the low and {@code 2i + 1} in the high nibble of byte
+     * {@code i}; ggml puts element {@code j} in the low and {@code j + 16} in the high nibble of byte {@code j}. The
+     * e8m0 scale byte and the e2m1 code are the same in both.
+     */
+    private static Rule mxfp4(String cacheName, String source, int experts, int srcRows, int cols, int[] rowMap) {
+        return new Rule(cacheName, List.of(source + "_blocks", source + "_scales"), (a, s) -> {
+            SafeTensors.Tensor blocks = s.get(0);
+            SafeTensors.Tensor scales = s.get(1);
+            int nb = cols / 32;
+            if (cols % 32 != 0 || !Arrays.equals(blocks.shape(), new long[]{experts, srcRows, nb, 16})
+                    || !Arrays.equals(scales.shape(), new long[]{experts, srcRows, nb})
+                    || blocks.dtype() != SafeTensors.DType.U8 || scales.dtype() != SafeTensors.DType.U8) {
+                throw new IOException(blocks + " / " + scales + " do not match MXFP4 [" + experts + ", " + srcRows + ", "
+                        + nb + ", 16] / [" + experts + ", " + srcRows + ", " + nb + "]");
+            }
+            int outRows = rowMap.length;
+            QTensor out = QTensor.allocate(a, QType.MXFP4, experts * outRows, cols);
+            java.util.stream.IntStream.range(0, experts * outRows).parallel().forEach(row -> {
+                int x = row / outRows;
+                int srcRow = rowMap[row % outRows];
+                byte[] in = new byte[16];
+                byte[] blk = new byte[17];
+                for (int b = 0; b < nb; b++) {
+                    long idx = ((long) x * srcRows + srcRow) * nb + b;
+                    java.lang.foreign.MemorySegment.copy(blocks.data(), java.lang.foreign.ValueLayout.JAVA_BYTE, idx * 16, in, 0, 16);
+                    blk[0] = scales.data().get(java.lang.foreign.ValueLayout.JAVA_BYTE, idx);
+                    for (int j = 0; j < 16; j++) {
+                        int lo = nibble(in, j);
+                        int hi = nibble(in, j + 16);
+                        blk[1 + j] = (byte) (lo | (hi << 4));
+                    }
+                    java.lang.foreign.MemorySegment.copy(blk, 0, out.data, java.lang.foreign.ValueLayout.JAVA_BYTE,
+                            out.rowOffset(row) + (long) b * 17, 17);
+                }
+            });
+            return out;
+        });
+    }
+
+    /** Element {@code k} (0..31) of a checkpoint MXFP4 block: even elements in the low nibble of byte k/2, odd ones in the high. */
+    private static int nibble(byte[] packed, int k) {
+        int v = packed[k >> 1] & 0xFF;
+        return (k & 1) == 0 ? v & 0xF : v >>> 4;
     }
 
     private List<String> layerNorms(String p) {
@@ -627,6 +801,137 @@ public final class ModelConverter {
             units.add(new Unit("layer." + l, List.copyOf(rules)));
         }
         units.add(new Unit("final", finalRules(f32PlusOne(FINAL_NORM, FINAL_NORM))));
+        return units;
+    }
+
+    // ------------------------------------------------------------------ attention / state-space hybrids
+
+    /** A cache tensor of zeros (a conv bias the checkpoint does not have). */
+    private static Rule zeros(String cacheName, int n) {
+        return new Rule(cacheName, List.of(), (a, s) -> new float[n]);
+    }
+
+    /**
+     * Granite 4, Nemotron-H and Jamba under the canonical names of {@link HybridLayer}: {@code input_layernorm} /
+     * {@code post_attention_layernorm} for the one or two norms of a layer, {@code self_attn.*}, {@code mixer.*} for the
+     * state-space blocks ({@code A = -exp(A_log)}, a zero conv bias when absent, Jamba's three norms as
+     * {@code dt_norm} / {@code b_norm} / {@code c_norm}), {@code mlp.gate_up} / {@code mlp.down_proj.weight} for a dense
+     * block (Granite's {@code shared_mlp.input_linear} is already [gate; up]; Nemotron-H's {@code up_proj} has no gate) and the
+     * MoE tensors as for the decoders. Where the checkpoints name things: Granite {@code model.layers.N.mamba} /
+     * {@code .self_attn} / {@code .shared_mlp} / {@code .block_sparse_moe}, Nemotron-H {@code backbone.layers.N.norm} /
+     * {@code .mixer}, Jamba {@code model.layers.N.mamba} / {@code .self_attn} / {@code .feed_forward} / {@code pre_ff_layernorm}.
+     */
+    private List<Unit> planHybrid(HybridArch h) {
+        String type = h.core().modelType();
+        boolean nemo = type.equals("nemotron_h");
+        boolean jamba = type.equals("jamba");
+        int dim = h.core().dim();
+        List<Unit> units = new ArrayList<>();
+        units.add(new Unit("embed", List.of(quantize(EMBED, nemo ? "backbone.embeddings.weight" : EMBED, head, 0, 0))));
+        for (int l = 0; l < h.core().layers(); l++) {
+            HybridArch.Layer spec = h.layers().get(l);
+            String sp = (nemo ? "backbone.layers." : "model.layers.") + l + ".";
+            String cp = "model.layers." + l + ".";
+            List<Rule> rules = new ArrayList<>();
+            rules.add(f32(cp + "input_layernorm.weight", sp + (nemo ? "norm.weight" : "input_layernorm.weight")));
+            if (spec.mixer() != HybridArch.Mixer.NONE && spec.ffn() != null) {
+                rules.add(f32(cp + "post_attention_layernorm.weight",
+                        sp + (jamba ? "pre_ff_layernorm.weight" : "post_attention_layernorm.weight")));
+            }
+            String ms = sp + (nemo ? "mixer." : spec.mixer() == HybridArch.Mixer.ATTENTION ? "self_attn." : "mamba.");
+            String mc = cp + "mixer.";
+            switch (spec.mixer()) {
+                case ATTENTION -> {
+                    for (String n : new String[]{"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                        rules.add(quantize(cp + "self_attn." + n + ".weight", ms + n + ".weight", quant, 0, 0));
+                    }
+                }
+                case MAMBA2 -> {
+                    rules.add(quantize(mc + "in_proj.weight", ms + "in_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "conv1d.weight", ms + "conv1d.weight"));
+                    rules.add(shardOf.containsKey(ms + "conv1d.bias") ? f32(mc + "conv1d.bias", ms + "conv1d.bias")
+                            : zeros(mc + "conv1d.bias", h.mamba2().convDim()));
+                    rules.add(f32(mc + "dt_bias", ms + "dt_bias"));
+                    rules.add(negExp(mc + "A", ms + "A_log"));
+                    rules.add(f32(mc + "D", ms + "D"));
+                    rules.add(f32(mc + "norm.weight", ms + "norm.weight"));
+                    rules.add(quantize(mc + "out_proj.weight", ms + "out_proj.weight", quant, 0, 0));
+                }
+                case MAMBA1 -> {
+                    rules.add(quantize(mc + "in_proj.weight", ms + "in_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "conv1d.weight", ms + "conv1d.weight"));
+                    rules.add(shardOf.containsKey(ms + "conv1d.bias") ? f32(mc + "conv1d.bias", ms + "conv1d.bias")
+                            : zeros(mc + "conv1d.bias", h.mamba1().dInner()));
+                    rules.add(quantize(mc + "x_proj.weight", ms + "x_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "dt_proj.weight", ms + "dt_proj.weight"));
+                    rules.add(f32(mc + "dt_proj.bias", ms + "dt_proj.bias"));
+                    rules.add(negExp(mc + "A", ms + "A_log"));
+                    rules.add(f32(mc + "D", ms + "D"));
+                    rules.add(quantize(mc + "out_proj.weight", ms + "out_proj.weight", quant, 0, 0));
+                    rules.add(f32(mc + "dt_norm.weight", ms + "dt_layernorm.weight"));
+                    rules.add(f32(mc + "b_norm.weight", ms + "b_layernorm.weight"));
+                    rules.add(f32(mc + "c_norm.weight", ms + "c_layernorm.weight"));
+                }
+                case NONE -> {
+                }
+            }
+            switch (spec.ffn()) {
+                case null -> {
+                }
+                case Mlp.Dense d -> {
+                    if (nemo) { // a ReLU-squared MLP: up_proj and down_proj only
+                        rules.add(quantize(cp + "mlp.gate_up", ms + "up_proj.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", ms + "down_proj.weight", quant, 0, 0));
+                    } else if (jamba) {
+                        String f = sp + "feed_forward.";
+                        rules.add(stack(cp + "mlp.gate_up", List.of(f + "gate_proj.weight", f + "up_proj.weight"), quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", f + "down_proj.weight", quant, 0, 0));
+                    } else {
+                        rules.add(quantize(cp + "mlp.gate_up", sp + "shared_mlp.input_linear.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.down_proj.weight", sp + "shared_mlp.output_linear.weight", quant, 0, 0));
+                    }
+                }
+                case Mlp.Moe m -> {
+                    int e = m.experts();
+                    int md = m.moeDim();
+                    if (jamba) {
+                        String f = sp + "feed_forward.";
+                        rules.add(f32(cp + "mlp.router", f + "router.weight"));
+                        if (shardOf.containsKey(f + "experts.gate_up_proj")) {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "experts.gate_up_proj", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "experts.down_proj", quant, new long[]{e, dim, md}));
+                        } else {
+                            List<String> gateUp = new ArrayList<>(2 * e);
+                            List<String> downs = new ArrayList<>(e);
+                            for (int i = 0; i < e; i++) {
+                                String ep = f + "experts." + i + ".";
+                                gateUp.add(ep + "gate_proj.weight");
+                                gateUp.add(ep + "up_proj.weight");
+                                downs.add(ep + "down_proj.weight");
+                            }
+                            rules.add(stack(cp + "mlp.experts.gate_up", gateUp, quant, md, 0));
+                            rules.add(stack(cp + "mlp.experts.down", downs, quant, 0, md));
+                        }
+                    } else { // Granite: input_linear [E, 2m, dim] is [gate; up] per expert, output_linear [E, dim, m]
+                        String f = sp + "block_sparse_moe.";
+                        rules.add(f32(cp + "mlp.router", shardOf.containsKey(f + "router.layer.weight") ? f + "router.layer.weight"
+                                : f + "router.weight"));
+                        if (shardOf.containsKey(f + "input_linear.weight")) {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "input_linear.weight", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "output_linear.weight", quant, new long[]{e, dim, md}));
+                        } else {
+                            rules.add(flatten3d(cp + "mlp.experts.gate_up", f + "experts.gate_up_proj", quant, new long[]{e, 2L * md, dim}));
+                            rules.add(flatten3d(cp + "mlp.experts.down", f + "experts.down_proj", quant, new long[]{e, dim, md}));
+                        }
+                        rules.add(quantize(cp + "mlp.shared.gate_up", sp + "shared_mlp.input_linear.weight", quant, 0, 0));
+                        rules.add(quantize(cp + "mlp.shared.down", sp + "shared_mlp.output_linear.weight", quant, 0, 0));
+                    }
+                }
+            }
+            units.add(new Unit("layer." + l, List.copyOf(rules)));
+        }
+        String finalNorm = nemo ? "backbone.norm_f.weight" : jamba ? "model.final_layernorm.weight" : FINAL_NORM;
+        units.add(new Unit("final", finalRules(f32(FINAL_NORM, finalNorm))));
         return units;
     }
 

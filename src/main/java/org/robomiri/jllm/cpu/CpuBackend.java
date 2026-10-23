@@ -167,6 +167,13 @@ public final class CpuBackend implements Backend {
         Attention a = arch.attention();
         switch (a) {
             case Attention.Gqa g -> {
+                if (kvDtype == KvDtype.Q4 && anySpecial(arch, ctx)) {
+                    // the cache format is the same on both backends (a saved cache loads into either), and the GPU's q4
+                    // attention kernels have no sinks, chunks or temperature
+                    System.err.println("note: backend.kv-dtype=q4 is not implemented for attention sinks, chunked attention or "
+                            + "attention temperature (gpt-oss, Llama 4), using q8");
+                    kvDtype = KvDtype.Q8;
+                }
                 if (kvPool != null) {
                     seq = kvPool.newSequence(ctx);
                     kv = new PagedKv(c.layers(), g, ctx, (CpuKvStorage) kvPool.storage(), seq);
@@ -212,6 +219,17 @@ public final class CpuBackend implements Backend {
         for (int l = 0; l < c.layers(); l++) {
             plans[l] = plan(arch.layers().get(l), w.decoderLayer(l));
         }
+    }
+
+    /** Whether some layer needs sinks / chunks / the attention temperature at this context ({@link Attention.Gqa#special}). */
+    /** Whether a layer has attention sinks, chunked attention or temperature tuning at this context (gpt-oss, Llama 4). */
+    public static boolean anySpecial(Decoder d, int ctx) {
+        for (LayerSpec s : d.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.forContext(ctx).special()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ layer plans
@@ -292,6 +310,7 @@ public final class CpuBackend implements Backend {
             }
             normRope(q, 0, g.qDim(), g.heads(), w.qNorm(), n, pos);
             normRope(kStage, 0, g.kvDim(), g.kvHeads(), w.kNorm(), n, pos);
+            temperature(q, 0, n, pos);
             kv.store(layer, pos, kStage, vStage, n);
             if (bidirectional && n > 1) {
                 // every row attends to all rows of the picture: with all n keys stored, each is a "last row" at pos + n - 1
@@ -301,12 +320,26 @@ public final class CpuBackend implements Backend {
                 float[] aRow = new float[outDim];
                 for (int t = 0; t < n; t++) {
                     System.arraycopy(q, t * qDim, qRow, 0, qDim);
-                    kv.attention(pool, layer, 1, pos + n - 1, qRow, aRow, g.window(), g.scale(), g.softcap());
+                    kv.attention(pool, layer, 1, pos + n - 1, qRow, aRow, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
                     System.arraycopy(aRow, 0, att, t * outDim, outDim);
                 }
                 return;
             }
-            kv.attention(pool, layer, n, pos, q, att, g.window(), g.scale(), g.softcap());
+            kv.attention(pool, layer, n, pos, q, att, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
+        }
+
+        /** Llama 4's attention temperature: row {@code t} of the queries at {@code v[base ..]} times {@code g.tempFactor(pos + t)}. */
+        private void temperature(float[] v, int base, int n, int pos) {
+            if (g.tempFloor() <= 0) {
+                return;
+            }
+            int qDim = g.qDim();
+            for (int t = 0; t < n; t++) {
+                float f = g.tempFactor(pos + t);
+                for (int i = base + t * qDim, e = i + qDim; i < e; i++) {
+                    v[i] *= f;
+                }
+            }
         }
 
         @Override
@@ -329,11 +362,12 @@ public final class CpuBackend implements Backend {
                 int pos = positions[t];
                 normRopeHeads(q, t * qDim, qDim, g.heads(), w.qNorm(), pos, 0, g.heads());
                 normRopeHeads(kStage, t * kvDim, kvDim, g.kvHeads(), w.kNorm(), pos, 0, g.kvHeads());
+                temperature(q, t * qDim, 1, pos);
                 System.arraycopy(kStage, t * kvDim, o.kStage, 0, kvDim);
                 System.arraycopy(vStage, t * kvDim, o.vStage, 0, kvDim);
                 System.arraycopy(q, t * qDim, o.q, 0, qDim);
                 o.kv.store(layer, pos, o.kStage, o.vStage, 1);
-                o.kv.attention(pool, layer, 1, pos, o.q, o.att, g.window(), g.scale(), g.softcap());
+                o.kv.attention(pool, layer, 1, pos, o.q, o.att, g.window(), g.chunk(), w.sinks(), g.scale(), g.softcap());
                 System.arraycopy(o.att, 0, att, t * outDim, outDim);
             }
             return true;
@@ -726,6 +760,7 @@ public final class CpuBackend implements Backend {
             this.sharedDim = spec.shared() == null ? 0 : spec.shared().hidden();
             this.route = switch (spec.router()) {
                 case Router.Softmax s -> (xo, ao, parallel) -> routeSoftmax(xo, scratch.get(), ao, parallel);
+                case Router.TopLogits t -> (xo, ao, parallel) -> routeTopLogits(t, scratch.get(), xo, ao, parallel);
                 case Router.DeepSeek r -> {
                     // per-thread working space (logits, the router's scratch, the top-k ids / weights), so
                     // tokens can be routed in parallel
@@ -745,11 +780,11 @@ public final class CpuBackend implements Backend {
                         route.route(t * c.dim(), t * topK, false);
                     }
                 });
-                experts.batched(w, spec.experts(), topK, spec.moeDim(), n, xb, assign, routeWeight, x);
+                experts.batched(w, spec.spec(), spec.experts(), topK, spec.moeDim(), n, xb, assign, routeWeight, x);
             } else {
                 for (int t = 0; t < n; t++) {
                     route.route(t * c.dim(), t * topK, true);
-                    experts.token(w, topK, spec.moeDim(), t, xb, assign, routeWeight, x);
+                    experts.token(w, spec.spec(), topK, spec.moeDim(), t, xb, assign, routeWeight, x);
                 }
             }
             if (sharedDim > 0) {
@@ -778,6 +813,51 @@ public final class CpuBackend implements Backend {
             }
             for (int i = 0; i < e; i++) {
                 logits[i] = VectorKernels.dot(router, i * dim, xb, xo, dim);
+            }
+        }
+
+        /**
+         * gpt-oss / Llama 4: the top-k of the router logits (plus the router's bias), weighted by a softmax over the
+         * selected logits or by the sigmoid of each. {@code logits} is scratch of at least {@code experts} floats.
+         */
+        private void routeTopLogits(Router.TopLogits t, float[] logits, int xo, int ao, boolean parallel) {
+            int e = spec.experts();
+            int topK = spec.topK();
+            routerLogits(xo, logits, parallel);
+            float[] bias = w.routerBias();
+            if (bias != null) {
+                for (int i = 0; i < e; i++) {
+                    logits[i] += bias[i];
+                }
+            }
+            for (int k = 0; k < topK; k++) {
+                int best = 0;
+                float bv = Float.NEGATIVE_INFINITY;
+                for (int i = 0; i < e; i++) {
+                    if (logits[i] > bv) {
+                        bv = logits[i];
+                        best = i;
+                    }
+                }
+                assign[ao + k] = best;
+                routeWeight[ao + k] = bv;
+                logits[best] = Float.NEGATIVE_INFINITY;
+            }
+            if (t.sigmoid()) {
+                for (int k = 0; k < topK; k++) {
+                    routeWeight[ao + k] = 1f / (1f + (float) Math.exp(-routeWeight[ao + k]));
+                }
+                return;
+            }
+            float max = routeWeight[ao]; // the first pick is the largest
+            float sum = 0;
+            for (int k = 0; k < topK; k++) {
+                float p = (float) Math.exp(routeWeight[ao + k] - max);
+                routeWeight[ao + k] = p;
+                sum += p;
+            }
+            for (int k = 0; k < topK; k++) {
+                routeWeight[ao + k] /= sum;
             }
         }
 

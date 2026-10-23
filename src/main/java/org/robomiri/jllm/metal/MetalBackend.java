@@ -334,6 +334,11 @@ public final class MetalBackend implements Backend {
                     + "multiple of " + KvQ4.GROUP + " (not DeepSeek's latent cache), using q8");
             kvDtype = KvDtype.Q8;
         }
+        if (kvDtype == KvDtype.Q4 && specialAttention(arch, ctx)) {
+            System.err.println("note: backend.kv-dtype=q4 is not implemented on the GPU for attention sinks, chunked attention "
+                    + "or attention temperature (gpt-oss, Llama 4), using q8");
+            kvDtype = KvDtype.Q8;
+        }
         this.kvDtype = kvDtype;
         // backend.kv-q8-rotate: keys rotated before the int8 quantization; not for DeepSeek's latent cache or other head sizes
         this.q8Rot = kvDtype == KvDtype.Q8 && KvDtype.q8Rotate() && arch.attention() instanceof Attention.Gqa ga
@@ -352,6 +357,16 @@ public final class MetalBackend implements Backend {
             }
             throw e;
         }
+    }
+
+    /** Whether some layer needs the sinks / chunk / temperature extras of the generic attention kernel at this context. */
+    private static boolean specialAttention(Decoder d, int ctx) {
+        for (LayerSpec s : d.layers()) {
+            if (s.attn() instanceof Attention.Gqa g && g.forContext(ctx).special()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void init(KvDtype kvDtype) {
@@ -778,9 +793,9 @@ public final class MetalBackend implements Backend {
         java.util.Arrays.fill(cpuY, 0, n * dim, 0f);
         synchronized (cpuPool) { // shared by the slots of this model; it runs one job at a time
             if (n > 1) {
-                cpuExperts.batched(mw, spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
+                cpuExperts.batched(mw, spec.spec(), spec.experts(), topK, spec.moeDim(), n, cpuXb, cpuAssign, cpuWeight, cpuY);
             } else {
-                cpuExperts.token(mw, topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
+                cpuExperts.token(mw, spec.spec(), topK, spec.moeDim(), 0, cpuXb, cpuAssign, cpuWeight, cpuY);
             }
         }
         return true;
@@ -860,9 +875,18 @@ public final class MetalBackend implements Backend {
         private final Metal.Buffer sin;
         /** GLM rotates interleaved pairs of the first rotaryDim dims, Phi rotate-half pairs of them. */
         private final boolean partial;
+        /** The whole head rotates: the q/k norm of the rope kernel (which covers the whole head) is possible, also with adjacent pairs (Llama 4). */
+        private final boolean fullRotation;
+        /** gpt-oss / Llama 4: the layer needs the generic attention kernel with its extras (sinks, chunk, temperature). */
+        private final boolean special;
+        private final MetalKernels.AttnExtra extra;
 
         GqaStep(Attention.Gqa g, AttnWeights.Gqa w, Metal.Buffer attnNorm) {
             this.g = g;
+            Attention.Gqa eg = g.forContext(ctx);
+            this.special = eg.special();
+            this.extra = special ? new MetalKernels.AttnExtra(k.upload(MetalKernels.AttnExtra.words(eg.chunk(), w.sinks(),
+                    eg.tempFloor(), eg.tempScale()))) : MetalKernels.AttnExtra.NONE;
             this.table = arch.ropeTables().get(g.ropeTable());
             this.attnNorm = attnNorm;
             wq = w.wq();
@@ -879,7 +903,8 @@ public final class MetalBackend implements Backend {
             cos = ropeCos[g.ropeTable()];
             sin = ropeSin[g.ropeTable()];
             partial = table.pairing() == RopeTable.Pairing.INTERLEAVED || table.rotaryDim() != g.headDim();
-            if (partial && g.qkNorm()) {
+            fullRotation = table.rotaryDim() == g.headDim();
+            if (!fullRotation && (g.qkNorm() || g.l2Norm())) {
                 throw new IllegalArgumentException("partial rotary embedding combined with q/k norm is not implemented");
             }
         }
@@ -909,7 +934,7 @@ public final class MetalBackend implements Backend {
             // QK-norm + RoPE for the q rows and the k rows of this chunk in one dispatch: k is read from kDst
             // and written to the cache rows at pos (the same rows for f32, rounded to half for f16; for q8 back
             // into the staging rows, which kv_store_q8 then quantizes together with v)
-            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : g.headDim() / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             int hd = g.headDim();
@@ -958,7 +983,7 @@ public final class MetalBackend implements Backend {
                 }
             }
             float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
-            if (decodeAttn && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
+            if (decodeAttn && !special && !bidirectional && n < MetalKernels.FLASH_PREFILL_MIN) {
                 // a short chunk (a verification pass of speculative decoding, a prompt's tail): one decode attention per
                 // token, so that every row is exactly what a decode step at its position computes
                 for (int t = 0; t < n; t++) {
@@ -980,10 +1005,16 @@ public final class MetalBackend implements Backend {
                     }
                     k.rowScores((long) (t % sliceRows) * g.heads() * ctx * 4);
                     k.attentionRow(attnKernel, attnGroup, q, qOff, keyCache[layer], valCache[layer], att, qOff, scores, g.heads(),
-                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                            g.kvHeads(), hd, hd, pos + n - 1, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(),
+                            extra);
                 }
                 k.endIndependent();
                 k.rowScores(0);
+                return;
+            }
+            if (special) {
+                k.attention(attnKernel, attnGroup, q, keyCache[layer], valCache[layer], att, scores, g.heads(), g.kvHeads(), hd, hd,
+                        pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), n, extra);
                 return;
             }
             if (flashDecode && n == 1 && pos + 1 >= k.flashMinLen) {
@@ -1020,7 +1051,7 @@ public final class MetalBackend implements Backend {
             long rowBytes = kvDtype.rowBytes(kvDim, g.kvHeads());
             k.rmsnorm(x, 0, attnNorm, xb, n, dim);
             k.matmul3(wq, bwq, wk, bwk, wv, bwv, xb, null, q, rowK, 0, rowV, 0, false, bq, bk, bv, n);
-            boolean useNorm = !partial && qNorm != null && kNorm != null;
+            boolean useNorm = fullRotation && qNorm != null && kNorm != null;
             int rotHalf = partial ? table.rotaryDim() / 2 : hd / 2;
             boolean adjacent = table.pairing() == RopeTable.Pairing.INTERLEAVED;
             // The rows are independent (each has its own q, k, v and att row and its own owner's cache), so each stage is
@@ -1081,7 +1112,7 @@ public final class MetalBackend implements Backend {
                 k.endIndependent();
             }
             float scale = q8Rot ? g.scale() / KvQ4.block(hd) : g.scale();
-            if (decodeAttn) { // attention_dec shares its partial-result buffer between rows: one after the other
+            if (decodeAttn && !special) { // attention_dec shares its partial-result buffer between rows: one after the other
                 for (int t = 0; t < n; t++) {
                     k.page(owners[t].pageTbl, owners[t].pageShift);
                     k.decodeAttention(kvDtype, q, (long) t * g.qDim() * 4, owners[t].keyCache[layer], owners[t].valCache[layer],
@@ -1095,7 +1126,7 @@ public final class MetalBackend implements Backend {
             // flash form shares its partial-result buffer between rows and stays one after the other
             boolean anyFlash = false;
             for (int t = 0; t < n; t++) {
-                anyFlash |= flashDecode && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
+                anyFlash |= flashDecode && !special && positions[t] + 1 >= k.flashMinLen; // the instance's thresholds, as the single step uses
             }
             int sliceRows = Math.max(1, (int) (scores.size() / ((long) g.heads() * ctx * 4)));
             for (int t = 0; t < n; t++) {
@@ -1105,7 +1136,7 @@ public final class MetalBackend implements Backend {
                 long qOff = (long) t * g.qDim() * 4;
                 k.page(owners[t].pageTbl, owners[t].pageShift);
                 if (anyFlash) {
-                    if (flashDecode && pos + 1 >= k.flashMinLen) {
+                    if (flashDecode && !special && pos + 1 >= k.flashMinLen) {
                         k.flashAttentionRow(kvDtype, q, qOff, kc, vc, flashPart, scores, att, qOff, g.heads(), g.kvHeads(),
                                 hd, pos, ctx, scale, g.qDim(), stride, g.window(), g.softcap());
                         continue;
@@ -1116,7 +1147,7 @@ public final class MetalBackend implements Backend {
                 }
                 k.rowScores(anyFlash ? 0 : (long) (t % sliceRows) * g.heads() * ctx * 4);
                 k.attentionRow(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd,
-                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap());
+                        hd, pos, ctx, scale, g.qDim(), stride, stride, g.qDim(), g.window(), g.softcap(), extra);
             }
             k.endIndependent();
             k.rowScores(0);
@@ -1186,6 +1217,8 @@ public final class MetalBackend implements Backend {
         private QTensor expDown;
         private Metal.Buffer bExpGateUp; // null when the layer has no expert on the GPU
         private Metal.Buffer bExpDown;
+        /** gpt-oss / Llama 4 arithmetic of the experts and the bias buffers of the experts on the GPU (indexed like expGateUp). */
+        private MetalKernels.MoeMath math = MetalKernels.MoeMath.NONE;
         private final Metal.Buffer ffnNorm;
         private final Route route;
         private final QTensor sharedGateUp;
@@ -1218,6 +1251,23 @@ public final class MetalBackend implements Backend {
                                 counted ? gassign : null, counted ? counts : null, n);
                     }
                 };
+                case Router.TopLogits t -> {
+                    // the DeepSeek router kernel's method 3: top-k of the logits (+ the linear bias); the weights are the
+                    // scores of the selected experts: a softmax over all experts renormalized over the selected ones is a
+                    // softmax over the selected logits (gpt-oss); the sigmoid of each (Llama 4) is not renormalized
+                    Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
+                    yield (n, counted) -> {
+                        if (MetalKernels.FUSE) {
+                            k.routerDsNorm(x, ffnNorm, xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1,
+                                    t.sigmoid(), bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null,
+                                    counted ? counts : null, n);
+                        } else {
+                            k.rmsnorm(x, 0, ffnNorm, xb, n, dim);
+                            k.routerDs(xb, router, assign, routeWeight, bias, e, dim, topK, !t.sigmoid(), 1, 1, t.sigmoid(),
+                                    bias != null ? 3 : 0, false, 1f, counted ? map : null, counted ? gassign : null, counted ? counts : null, n);
+                        }
+                    };
+                }
                 case Router.DeepSeek r -> {
                     Metal.Buffer bias = w.routerBias() != null ? k.upload(w.routerBias()) : null;
                     int method = switch (r.topK()) {
@@ -1279,6 +1329,19 @@ public final class MetalBackend implements Backend {
                 MemorySegment.copy(toGpu, 0, map.contents(), ValueLayout.JAVA_INT, 0, e);
             }
             gpuExperts = nHot;
+            if (spec.spec().special()) { // gpt-oss / Llama 4: the biases of the experts the GPU holds, in their order there
+                if (math.gub() != null) {
+                    k.release(math.gub());
+                    k.release(math.dnb());
+                }
+                Metal.Buffer gub = null;
+                Metal.Buffer dnb = null;
+                if (spec.spec().bias() && !allCold) {
+                    gub = k.upload(cold != null ? hotRows(weights.gateUpBias(), 2 * spec.moeDim(), cold) : weights.gateUpBias());
+                    dnb = k.upload(cold != null ? hotRows(weights.downBias(), c.dim(), cold) : weights.downBias());
+                }
+                math = MetalKernels.MoeMath.of(spec.spec(), gub, dnb);
+            }
             if (allCold) {
                 expGateUp = weights.expGateUp();
                 expDown = weights.expDown();
@@ -1308,14 +1371,31 @@ public final class MetalBackend implements Backend {
             }
         }
 
+        /** The rows {@code [e * per, (e + 1) * per)} of the experts that are not cold, in order: the packed hot experts' share. */
+        private float[] hotRows(float[] all, int per, boolean[] coldRow) {
+            int hot = 0;
+            for (boolean b : coldRow) {
+                hot += b ? 0 : 1;
+            }
+            float[] out = new float[hot * per];
+            int o = 0;
+            for (int e = 0; e < coldRow.length; e++) {
+                if (!coldRow[e]) {
+                    System.arraycopy(all, e * per, out, o, per);
+                    o += per;
+                }
+            }
+            return out;
+        }
+
         /** The routed experts the GPU holds, for the slots of {@code slotExperts} (index into expGateUp / expDown, -1 = skip). */
         private void gpuRouted(Metal.Buffer slotExperts, int n) {
-            if (MetalKernels.MOE_MMA && n >= MetalKernels.MOE_MMA_MIN) {
+            if (k.moeGrouped(n)) {
                 k.moeGrouped(expGateUp, bExpGateUp, expDown, bExpDown, xb, slotExperts, routeWeight, moeOrder, moeTiles,
-                        moeHidden, moeOut, x, gpuExperts, spec.moeDim(), c.dim(), spec.topK(), n);
+                        moeHidden, moeOut, x, gpuExperts, spec.moeDim(), c.dim(), spec.topK(), n, math);
             } else {
-                k.moeUp(expGateUp, bExpGateUp, xb, slotExperts, moeHidden, spec.moeDim(), spec.topK(), n);
-                k.moeDown(expDown, bExpDown, moeHidden, slotExperts, routeWeight, x, c.dim(), spec.topK(), n);
+                k.moeUp(expGateUp, bExpGateUp, xb, slotExperts, moeHidden, spec.moeDim(), spec.topK(), n, math, routeWeight);
+                k.moeDown(expDown, bExpDown, moeHidden, slotExperts, routeWeight, x, c.dim(), spec.topK(), n, math);
             }
         }
 
@@ -1916,6 +1996,7 @@ public final class MetalBackend implements Backend {
         if (MetalKernels.CONCURRENT_BATCH && n > 1 && k.metal.canRunConcurrent()) {
             k.encoder(1); // the per-row dispatches of the n slots are independent: let them overlap
         }
+        k.singleRows(true);
         k.begin();
         boolean committed = false;
         try {
@@ -1942,6 +2023,7 @@ public final class MetalBackend implements Backend {
                 k.abort();
             }
             k.encoder(encoder);
+            k.singleRows(false);
         }
         if (counts != null && System.nanoTime() - lastRebalance > REBALANCE_NANOS) {
             rebalanceExperts();

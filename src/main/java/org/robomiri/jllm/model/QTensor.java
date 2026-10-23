@@ -143,6 +143,30 @@ public final class QTensor {
     }
 
     /**
+     * A zeroed tensor of any type in the engine's page-aligned layout (blocks, then scales, if the type has them), for
+     * the converter to fill: {@link #quantize} for the formats the engine produces, the block bytes written directly
+     * for the ggml formats it only copies (gpt-oss's MXFP4 experts).
+     */
+    public static QTensor allocate(Arena arena, QType type, int rows, int cols) {
+        if (cols % type.blockSize != 0 && type.gguf) {
+            throw new IllegalArgumentException(type + " needs a multiple of " + type.blockSize + " columns, got " + cols);
+        }
+        return new QTensor(type, rows, cols, arena.allocate(byteSize(type, rows, cols), PAGE));
+    }
+
+    /** Copies all rows of {@code src} (same type and width) into rows {@code [dstRow, dstRow + src.rows)} of this tensor. */
+    public void setRows(int dstRow, QTensor src) {
+        if (src.type != type || src.cols != cols || dstRow < 0 || dstRow + src.rows > rows || second != null) {
+            throw new IllegalArgumentException("cannot copy " + src.rows + "x" + src.cols + " " + src.type + " into rows "
+                    + dstRow + ".. of " + rows + "x" + cols + " " + type);
+        }
+        MemorySegment.copy(src.data, src.rowOffset(0), data, rowOffset(dstRow), (long) src.rows * blocksPerRow() * type.blockBytes);
+        if (type.scaleBytes > 0) {
+            MemorySegment.copy(src.data, src.scaleOffset(0), data, scaleOffset(dstRow), (long) src.rows * blocksPerRow() * type.scaleBytes);
+        }
+    }
+
+    /**
      * Wraps the bytes of a ggml tensor in place: {@code rows} rows of {@code cols / blockSize} contiguous blocks of
      * {@code type} (a {@link QType#gguf} type or {@link QType#Q2_K}, whose block layout is llama.cpp's), exactly
      * {@code rows * cols / blockSize * blockBytes} bytes, with no padding. The segment need not be page aligned.
