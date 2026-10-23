@@ -44,7 +44,8 @@ public final class VideoCli {
         String prompt = s.has("prompt") ? s.get("prompt") : "a red balloon floating over a green hill, white clouds moving, photo";
         String ffmpeg = VideoEncoder.resolveFfmpeg(s.get("video.ffmpeg"));
         String prec = s.get("video.precision").equals("auto") ? "f32" : s.get("video.precision");
-        int frames = (Math.max(1, s.getInt("video.frames")) - 1) / 4 * 4 + 1;
+        int frames = s.source("video.frames").equals("default") ? 13
+                : (Math.max(1, s.getInt("video.frames")) - 1) / 4 * 4 + 1;
         int steps = Integer.parseInt(pick(s, "image.steps", "video.steps"));
         double guidance = Double.parseDouble(pick(s, "image.guidance", "video.guidance"));
         long seed = Long.parseLong(pick(s, "image.seed", "video.seed"));

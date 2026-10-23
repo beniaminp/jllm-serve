@@ -6,12 +6,19 @@ import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
@@ -41,6 +48,10 @@ public final class Umt5Encoder implements AutoCloseable {
     private static final VectorSpecies<Float> F128 = FloatVector.SPECIES_128;
     private static final VectorSpecies<Byte> B128 = ByteVector.SPECIES_128;
     private static final int GROUP = 32;
+    /** The int8 copy of the linear layers, in {@code ~/.cache/jllm/umt5/} (see {@link #writeCache}). */
+    private static final int CACHE_MAGIC = 0x554D5438; // "UMT8"
+    private static final int CACHE_VERSION = 1;
+    private static final int CACHE_CHUNK = 1 << 20;
 
     /** A linear layer {@code y = x·Wᵀ} with {@code W [n, k]}: float, or int8 groups with scales. */
     private static final class Lin {
@@ -118,6 +129,8 @@ public final class Umt5Encoder implements AutoCloseable {
     private final float[] finalNorm;
     private final Checkpoint ckpt;
     private final Arena arena = Arena.ofShared();
+    private final CacheTarget cache;
+    private int cacheIndex;
     private long residentBytes;
 
     /**
@@ -140,15 +153,21 @@ public final class Umt5Encoder implements AutoCloseable {
             throw new IOException("unsupported UMT5 configuration in " + dir);
         }
         embed = ckpt.has("shared.weight") ? ckpt.get("shared.weight") : ckpt.get("encoder.embed_tokens.weight");
+        cache = q8 ? cacheTarget(dir) : null;
+        List<Lin> cached = cache == null ? null : readCache(cache, arena, nl * 7);
         layers = new Layer[nl];
         for (int i = 0; i < nl; i++) {
             String p = "encoder.block." + i + ".layer.";
-            layers[i] = new Layer(vec(p + "0.layer_norm.weight"), lin(p + "0.SelfAttention.q.weight"), lin(p + "0.SelfAttention.k.weight"),
-                    lin(p + "0.SelfAttention.v.weight"), lin(p + "0.SelfAttention.o.weight"), vec(p + "0.SelfAttention.relative_attention_bias.weight"),
-                    vec(p + "1.layer_norm.weight"), lin(p + "1.DenseReluDense.wi_0.weight"), lin(p + "1.DenseReluDense.wi_1.weight"),
-                    lin(p + "1.DenseReluDense.wo.weight"));
+            layers[i] = new Layer(vec(p + "0.layer_norm.weight"), lin(cached, p + "0.SelfAttention.q.weight"),
+                    lin(cached, p + "0.SelfAttention.k.weight"), lin(cached, p + "0.SelfAttention.v.weight"),
+                    lin(cached, p + "0.SelfAttention.o.weight"), vec(p + "0.SelfAttention.relative_attention_bias.weight"),
+                    vec(p + "1.layer_norm.weight"), lin(cached, p + "1.DenseReluDense.wi_0.weight"),
+                    lin(cached, p + "1.DenseReluDense.wi_1.weight"), lin(cached, p + "1.DenseReluDense.wo.weight"));
         }
         finalNorm = vec("encoder.final_layer_norm.weight");
+        if (cache != null && cached == null) {
+            writeCache(cache);
+        }
     }
 
     private float[] vec(String name) {
@@ -157,7 +176,7 @@ public final class Umt5Encoder implements AutoCloseable {
         return v;
     }
 
-    private Lin lin(String name) {
+    private Lin lin(List<Lin> cached, String name) throws IOException {
         SafeTensors.Tensor t = ckpt.get(name);
         int n = (int) t.shape()[0];
         int k = (int) t.shape()[1];
@@ -165,6 +184,17 @@ public final class Umt5Encoder implements AutoCloseable {
             float[] w = t.toFloatArray();
             residentBytes += w.length * 4L;
             return new Lin(n, k, w, null, null);
+        }
+        if (cached != null) {
+            if (cacheIndex >= cached.size()) {
+                throw new IOException("int8 cache for " + ckpt.dir + " is incomplete: delete " + cache.file());
+            }
+            Lin l = cached.get(cacheIndex++);
+            if (l.n != n || l.k != k) {
+                throw new IOException("int8 cache for " + ckpt.dir + " does not match the checkpoint: delete " + cache.file());
+            }
+            residentBytes += (long) n * k + l.scales.length * 4L;
+            return l;
         }
         MemorySegment seg = arena.allocate((long) n * k, 64);
         float[] scales = new float[n * (k / GROUP)];
@@ -191,6 +221,170 @@ public final class Umt5Encoder implements AutoCloseable {
         });
         residentBytes += (long) n * k + scales.length * 4L;
         return new Lin(n, k, null, seg, scales);
+    }
+
+    // ------------------------------------------------------------------ the int8 cache
+
+    /** {@code ~/.cache/jllm/umt5/<key>.q8}: the quantized linear layers of one {@code text_encoder} folder. */
+    private record CacheTarget(Path file, long key) {
+    }
+
+    /** All seven quantized linears of a layer, in the order {@link #writeCache} stores them. */
+    private static Lin[] linears(Layer ly) {
+        return new Lin[]{ly.q(), ly.k(), ly.v(), ly.o(), ly.wi0(), ly.wi1(), ly.wo()};
+    }
+
+    /**
+     * Derived from the folder path and the size and modification time of {@code config.json} and the weight files, so that replacing the
+     * model invalidates the cache. 0 when the folder cannot be listed.
+     */
+    private static long cacheKey(Path dir) {
+        try {
+            List<Path> files = new ArrayList<>();
+            try (var listing = Files.list(dir)) {
+                listing.filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.equals("config.json") || (n.startsWith("model")
+                            && (n.endsWith(".safetensors") || n.endsWith(".safetensors.index.json")));
+                }).sorted().forEach(files::add);
+            }
+            long h = 0xcbf29ce484222325L;
+            for (char c : dir.toAbsolutePath().normalize().toString().toCharArray()) {
+                h = (h ^ c) * 0x100000001b3L;
+            }
+            for (Path f : files) {
+                for (char c : f.getFileName().toString().toCharArray()) {
+                    h = (h ^ c) * 0x100000001b3L;
+                }
+                h = (h ^ Files.size(f)) * 0x100000001b3L;
+                h = (h ^ Files.getLastModifiedTime(f).toMillis()) * 0x100000001b3L;
+            }
+            return h;
+        } catch (IOException e) {
+            return 0;
+        }
+    }
+
+    private static CacheTarget cacheTarget(Path dir) {
+        String home = System.getProperty("user.home");
+        if (home == null || home.isBlank()) {
+            return null;
+        }
+        long key = cacheKey(dir);
+        if (key == 0) {
+            return null;
+        }
+        return new CacheTarget(Path.of(home, ".cache", "jllm", "umt5").resolve(Long.toHexString(key) + ".q8"), key);
+    }
+
+    /** The cached layers, or null when there is no usable cache (the caller then quantizes and writes one). */
+    private static List<Lin> readCache(CacheTarget target, Arena arena, int expected) {
+        if (!Files.isRegularFile(target.file())) {
+            return null;
+        }
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(target.file()), CACHE_CHUNK))) {
+            if (in.readInt() != CACHE_MAGIC || in.readInt() != CACHE_VERSION || in.readLong() != target.key()
+                    || in.readInt() != expected) {
+                return null;
+            }
+            int[][] dims = new int[expected][2];
+            for (int i = 0; i < expected; i++) {
+                dims[i][0] = in.readInt();
+                dims[i][1] = in.readInt();
+                if (dims[i][0] <= 0 || dims[i][1] <= 0 || dims[i][1] % GROUP != 0) {
+                    return null;
+                }
+            }
+            List<Lin> out = new ArrayList<>(expected);
+            for (int[] d : dims) {
+                MemorySegment q = arena.allocate((long) d[0] * d[1], 64);
+                readBytes(in, q, (long) d[0] * d[1]);
+                out.add(new Lin(d[0], d[1], null, q, readFloats(in, d[0] * (d[1] / GROUP))));
+            }
+            return out;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Writes the int8 copy (best effort: a full disk or a read-only home only means the next request quantizes again). */
+    private void writeCache(CacheTarget target) {
+        Path tmp = null;
+        try {
+            Files.createDirectories(target.file().getParent());
+            tmp = Files.createTempFile(target.file().getParent(), "umt5-", ".tmp");
+            try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(tmp), CACHE_CHUNK))) {
+                out.writeInt(CACHE_MAGIC);
+                out.writeInt(CACHE_VERSION);
+                out.writeLong(target.key());
+                out.writeInt(layers.length * 7);
+                for (Layer ly : layers) {
+                    for (Lin l : linears(ly)) {
+                        out.writeInt(l.n);
+                        out.writeInt(l.k);
+                    }
+                }
+                for (Layer ly : layers) {
+                    for (Lin l : linears(ly)) {
+                        writeBytes(out, l.q, (long) l.n * l.k);
+                        writeFloats(out, l.scales);
+                    }
+                }
+            }
+            Files.move(tmp, target.file(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            tmp = null;
+        } catch (IOException | RuntimeException e) {
+            // no cache
+        } finally {
+            if (tmp != null) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                    // left behind
+                }
+            }
+        }
+    }
+
+    private static void writeBytes(DataOutputStream out, MemorySegment src, long count) throws IOException {
+        byte[] chunk = new byte[CACHE_CHUNK];
+        for (long at = 0; at < count; at += chunk.length) {
+            int n = (int) Math.min(chunk.length, count - at);
+            MemorySegment.copy(src, ValueLayout.JAVA_BYTE, at, chunk, 0, n);
+            out.write(chunk, 0, n);
+        }
+    }
+
+    private static void readBytes(DataInputStream in, MemorySegment dst, long count) throws IOException {
+        byte[] chunk = new byte[CACHE_CHUNK];
+        for (long at = 0; at < count; at += chunk.length) {
+            int n = (int) Math.min(chunk.length, count - at);
+            in.readFully(chunk, 0, n);
+            MemorySegment.copy(chunk, 0, dst, ValueLayout.JAVA_BYTE, at, n);
+        }
+    }
+
+    private static void writeFloats(DataOutputStream out, float[] v) throws IOException {
+        ByteBuffer bb = ByteBuffer.allocate(1 << 16).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < v.length; ) {
+            bb.clear();
+            int n = Math.min(bb.capacity() / 4, v.length - i);
+            bb.asFloatBuffer().put(v, i, n);
+            out.write(bb.array(), 0, n * 4);
+            i += n;
+        }
+    }
+
+    private static float[] readFloats(DataInputStream in, int count) throws IOException {
+        float[] v = new float[count];
+        byte[] chunk = new byte[1 << 16];
+        for (int i = 0; i < count; ) {
+            int n = Math.min(chunk.length / 4, count - i);
+            in.readFully(chunk, 0, n * 4);
+            ByteBuffer.wrap(chunk, 0, n * 4).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(v, i, n);
+            i += n;
+        }
+        return v;
     }
 
     /** Bytes of weights held in memory (the embedding table stays in the memory-mapped file). */
