@@ -2060,17 +2060,26 @@ final class MetalKernels implements AutoCloseable {
                      Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
                      int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
                      float softcap, int n) {
+        attentionAt(kernel, groups, q, qOff, kc, vc, out, outOff, scores, nHeads, nKvHeads, qkDim, vDim, pos, ctx, scale,
+                qStride, kStride, vStride, oStride, window, softcap, n, AttnExtra.NONE);
+    }
+
+    void attentionAt(String kernel, int groups, Metal.Buffer q, long qOff, Metal.Buffer kc, Metal.Buffer vc,
+                     Metal.Buffer out, long outOff, Metal.Buffer scores, int nHeads, int nKvHeads, int qkDim, int vDim,
+                     int pos, int ctx, float scale, int qStride, int kStride, int vStride, int oStride, int window,
+                     float softcap, int n, AttnExtra ex) {
         bind(0, q, qOff);
         bind(1, kc, 0);
         bind(2, vc, 0);
         bind(3, out, outOff);
         bind(4, scores, 0);
-        bindOrDummy(5, pageTbl);
+        bindOrDummy(5, ex.ext());
+        bindOrDummy(6, pageTbl);
         for (int t0 = 0; t0 < n; t0 += ATT_TILE) {
             p.reset(KernelParams.ATTN).i(nHeads).i(nKvHeads).i(qkDim).i(vDim).i(pos).i(ctx)
                     .f(scale)
                     .i(qStride).i(kStride).i(vStride).i(oStride).i(window).i(t0).f(softcap).i(pageShift);
-            dispatch(kernel, 6, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
+            dispatch(kernel, 7, 0, nHeads / groups, Math.min(ATT_TILE, n - t0), 1, ATT_THREADS, 1, 1);
         }
     }
 

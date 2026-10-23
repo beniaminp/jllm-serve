@@ -1420,7 +1420,7 @@ public final class MetalBackend implements Backend {
                             stride, qDim, g.window(), g.softcap());
                 } else {
                     k.attentionAt(attnKernel, attnGroup, q, qOff, kc, vc, att, qOff, scores, g.heads(), g.kvHeads(), hd, hd,
-                            pos, ctx, scale, qDim, stride, stride, qDim, g.window(), g.softcap(), n);
+                            pos, ctx, scale, qDim, stride, stride, qDim, g.window(), g.softcap(), n, extra);
                 }
             }
             int singles = 0;
