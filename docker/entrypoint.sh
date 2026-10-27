@@ -11,6 +11,8 @@
 #                      addition to the JDK's own CAs for downloads
 #   JLLM_CPU_NATIVE    backend.cpu.native: auto (default: the image's native int8 kernels when they load and pass
 #                      their self-check, else the Java kernels), true (require them), false (the Java kernels)
+#   JLLM_DIRECT_MEMORY limit of the memory outside the heap that a paged CPU KV cache uses (-XX:MaxDirectMemorySize):
+#                      default the container's memory limit (or the host's memory); a size such as 16g, or "default"
 #   JAVA_OPTS          extra JVM options; arguments after the image name go to the console (--server.port=…, …)
 set -eu
 cd /data
@@ -56,10 +58,14 @@ if [ -n "${JLLM_CPU_NATIVE:-}" ]; then
   JAVA_OPTS="${JAVA_OPTS:-} -Djllm.cpu.native=$JLLM_CPU_NATIVE"
 fi
 
+# the paged CPU KV cache lives outside the heap: let it use the container's memory, not just the heap size
+. /opt/jllm/jvm-memory.sh
+DIRECT="$(jllm_direct_memory_opt)"
+
 # shellcheck disable=SC2086
 exec java \
   --add-modules jdk.incubator.vector \
   --enable-native-access=ALL-UNNAMED \
-  -XX:+UseParallelGC -XX:MaxRAMPercentage="${JLLM_HEAP_PERCENT:-60}" -Xmn"${JLLM_XMN:-512m}" \
+  -XX:+UseParallelGC -XX:MaxRAMPercentage="${JLLM_HEAP_PERCENT:-60}" -Xmn"${JLLM_XMN:-512m}" $DIRECT \
   ${JAVA_OPTS:-} \
   -jar /opt/jllm/jllm-web.jar --server.address=0.0.0.0 "$@"

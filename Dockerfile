@@ -59,6 +59,7 @@ COPY --from=build /jllm-web.jar /opt/jllm/jllm-web.jar
 # the native kernels, when they were built (entrypoint.sh passes their path; without them the Java kernels run)
 COPY --from=native /out/ /opt/jllm/native/
 COPY docker/entrypoint.sh /opt/jllm/entrypoint.sh
+COPY scripts/jvm-memory.sh /opt/jllm/jvm-memory.sh
 USER jllm
 WORKDIR /data
 VOLUME ["/data"]

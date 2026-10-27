@@ -566,6 +566,18 @@ final class CpuKvStorage implements KvStorage {
 
     @Override
     public void close() {
-        slabs = new MemorySegment[0]; // the memory is freed when the arena is collected
+        boolean held;
+        synchronized (this) {
+            held = hotCount > 0 || coldCount > 0;
+            slabs = new MemorySegment[0]; // the memory is freed when the arena is collected
+        }
+        if (held) {
+            // The slabs come from an automatic arena: their memory returns only when a GC finds the arena unreachable.
+            // Under the JVM's default direct-memory limit (the heap size) a full limit forced that GC; the launchers now
+            // raise the limit to the physical memory, so nothing would, and an unloaded model's cache could stay resident
+            // for as long as the heap is quiet. One explicit GC when a pool that held memory is closed (a model unload,
+            // a study's variant) returns it now.
+            System.gc();
+        }
     }
 }

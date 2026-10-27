@@ -219,9 +219,9 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 - **Left:**
   - Run the six gates on a Mac against `main` (the arch smoke to its end, the Metal half of the exactness run).
   - Run the real Wan encoder once (22.7 GB download) to measure the read time with the copy off and on (mac-validate row).
-  - Decide whether the launchers should raise `-XX:MaxDirectMemorySize` so the CPU paged cache gets the RAM `auto` used to
-    promise. A very large limit would also mean that dropped automatic-arena slabs (for example after a model is unloaded
-    in the console) are freed only when a GC happens to run, so this is the owner's call; today `JAVA_OPTS` does it per run.
+  - Done (2026-10-27, at the owner's request): the launchers raise `-XX:MaxDirectMemorySize` to the physical memory or the
+    container's limit (`scripts/jvm-memory.sh`, `JLLM_DIRECT_MEMORY`), and closing a pool that held slabs runs one GC so an
+    unloaded model's cache returns at once (docs/10 §10.13).
 
 ## Not started (small follow-ups found along the way)
 

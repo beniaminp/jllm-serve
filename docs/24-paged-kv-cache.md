@@ -442,7 +442,10 @@ their blocks referenced until the caller or the console's sweeper releases them.
 `backend.ctx` is `auto` by default ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)); `ModelLoader` decides it
 once per model, before the pool is created, and the pool key and size use that number. With paging on, the CPU budget `auto` uses is the
 physical memory (the blocks are off the Java heap) instead of the free heap of the flat cache, bounded by the JVM's direct-memory limit
-(`-XX:MaxDirectMemorySize`, by default the heap size), which the slabs of `CpuKvStorage` count against ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)).
+(`-XX:MaxDirectMemorySize`), which the slabs of `CpuKvStorage` count against. The launchers (`./jllm`, `jllm-web/run.sh`, the Docker
+entrypoint) set that limit to the physical memory or the container's limit (`scripts/jvm-memory.sh`, `JLLM_DIRECT_MEMORY` to override);
+without them it is the heap size ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)). Closing a pool
+that held slabs (a model unloaded) runs one `System.gc()`, so the memory returns at once.
 
 ---
 

@@ -3,7 +3,9 @@
 #
 # Needs JDK 26+. Environment:
 #   JAVA_HOME   JDK to use (default: the java on PATH)
-#   JLLM_XMX    Java heap size, default 4g (the CPU backend keeps its KV cache on the heap)
+#   JLLM_XMX    Java heap size, default 4g (the CPU backend keeps its flat KV cache on the heap)
+#   JLLM_DIRECT_MEMORY  limit of the memory outside the heap that the paged CPU KV cache uses (-XX:MaxDirectMemorySize):
+#               default the physical memory (scripts/jvm-memory.sh); a size such as 16g, or "default" for the JVM's own (the heap)
 #   JAVA_OPTS   extra JVM options, e.g. "-XX:+UseZGC -Djllm.metal.lib=/path/libjllm_metal.dylib"
 #
 # Relative paths given on the command line (--dir, --config, ./jllm.properties) resolve against the
@@ -36,11 +38,15 @@ if [ -f "$METAL_LIB" ]; then
   JAVA_OPTS="${JAVA_OPTS:-} -Djllm.metal.lib=$METAL_LIB"
 fi
 
+# the paged CPU KV cache lives outside the heap: let it use the physical memory, not just the heap size
+. "$DIR/scripts/jvm-memory.sh"
+DIRECT="$(jllm_direct_memory_opt)"
+
 # shellcheck disable=SC2086
 exec "$JAVA" \
   --add-modules jdk.incubator.vector \
   --enable-native-access=ALL-UNNAMED \
-  -XX:+UseParallelGC -Xmx"${JLLM_XMX:-4g}" \
+  -XX:+UseParallelGC -Xmx"${JLLM_XMX:-4g}" $DIRECT \
   ${JAVA_OPTS:-} \
   -cp "$DIR/target/classes" \
   org.robomiri.jllm.Main "$@"

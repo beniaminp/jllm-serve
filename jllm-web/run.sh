@@ -8,6 +8,8 @@
 #                  slot, e.g. 3.8 GB for a 0.6B Qwen3 at a 32768 context with an f16 cache (weights are memory-mapped
 #                  outside the heap). The young generation is kept small (JLLM_XMN, default 512m) so that the
 #                  caches, which live in the old generation, can use nearly all of it.
+#   JLLM_DIRECT_MEMORY  limit of the memory outside the heap that a paged CPU KV cache uses (-XX:MaxDirectMemorySize):
+#                  default the physical memory (scripts/jvm-memory.sh); a size such as 16g, or "default" for the JVM's own
 #   JAVA_OPTS      extra JVM options
 #   JLLM_NO_BUILD  set to skip the Maven builds
 #
@@ -41,6 +43,8 @@ if [ -n "${JLLM_XMX:-}" ]; then
 else
   HEAP="-XX:MaxRAMPercentage=60"
 fi
+. "$ROOT/scripts/jvm-memory.sh"
+HEAP="$HEAP $(jllm_direct_memory_opt)"
 
 # shellcheck disable=SC2086
 exec "$JAVA" \

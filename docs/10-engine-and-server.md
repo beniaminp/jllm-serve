@@ -993,8 +993,24 @@ costs address space and only touches the pages that get written.
   buffer memory` once a conversation grew past roughly 17 000 positions. `ContextBudget.directFree` (the limit, read through
   `HotSpotDiagnosticMXBean`, minus the `direct` buffer pool in use) therefore also bounds the budget (90 % of it), the log says so
   ("the JVM's direct-memory limit leaves … GB"), and `CpuBackend.newKvPool` warns when an explicit `backend.ctx` or
-  `backend.kv-pool-tokens` makes a pool that cannot be held. To give the paged cache the RAM, raise the limit:
-  `JAVA_OPTS=-XX:MaxDirectMemorySize=16g ./jllm …` (or a larger `JLLM_XMX`). The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
+  `backend.kv-pool-tokens` makes a pool that cannot be held.
+
+  **The launchers raise the limit to the physical memory.** 🧸 The JVM has a second purse, besides the heap, for memory it
+  hands out directly; by default that purse is as small as the heap (4 GB), which made the paged cache stop at 4 GB however
+  much RAM the machine had. `./jllm`, `jllm-web/run.sh` and the Docker entrypoint now make that purse as large as the
+  machine's memory, and the context budget above decides how much of it the cache really takes. 📐 `scripts/jvm-memory.sh`
+  (sourced by all three) prints `-XX:MaxDirectMemorySize=<bytes>`: the physical memory (`hw.memsize` on macOS,
+  `MemTotal` of `/proc/meminfo` on Linux), or the container's limit when it is lower (`/sys/fs/cgroup/memory.max`, cgroup v2,
+  then `memory/memory.limit_in_bytes`, v1; `max` and the v1 "unlimited" value leave the physical memory). `JLLM_DIRECT_MEMORY=16g`
+  sets it explicitly and `JLLM_DIRECT_MEMORY=default` leaves the JVM's own limit (the heap size). With the limit raised,
+  `directFree` is no longer the smaller term, so `auto` plans from the physical memory again and the log line has no "direct-memory
+  limit" part: on the same x86 VM (16 GB, 14.3 GB visible to the JVM), `JLLM_XMX=1g ./jllm bench --backend cpu --backend.kv-paged true --bench.prompt-repeat 500`,
+  planned 26 624 positions (6.11 GB per slot) and prefilled the 5 013-token prompt that had died at 0.95 GB before. A plain
+  `java` command line without the option keeps the JVM default, and the bound of this section keeps it from failing.
+  The price of a large limit: the JVM no longer runs a collection when the small default limit fills up, which is what used to
+  free the slabs of a cache nobody holds any more (the arena is freed only when a GC finds it unreachable). `CpuKvStorage.close()`
+  (a model unloaded in the console, `ModelLoader.Loaded.close`, a study's variant) therefore asks for one `System.gc()` when the
+  pool held memory, so an unloaded model's cache is returned at once rather than at the next collection. The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
   costs address space until conversations fill it. On Metal the paged pool is Metal buffers counted against the working set exactly like the
   flat caches (and, since chapter 26, registered in the device ledger, so the MoE expert placement leaves room for it), so the Metal arithmetic is unchanged unless `backend.kv-tier` takes the cache off the GPU share (`ContextBudget.tierManaged`, docs/26 §26.2.1). A model that cannot be paged (q4, DeepSeek, Mamba, Qwen3-Next) keeps the heap budget on the CPU.
   An explicit `backend.kv-pool-tokens` smaller than the context is not taken into account.

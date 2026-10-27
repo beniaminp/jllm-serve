@@ -48,6 +48,7 @@ Upgrade: `docker pull` the new image, `docker rm -f jllm`, and run it again with
 |---|---|---|
 | `JLLM_API_KEY` | generated | the key the console and `/v1` require. Unset: generated on first start, kept in `/data/.jllm-api-key`, printed to the log. `none`: no key (only behind your own authentication) |
 | `JLLM_HEAP_PERCENT` | 60 | Java heap as a share of the container's memory limit |
+| `JLLM_DIRECT_MEMORY` | the container's limit | the limit of the memory outside the heap that a paged CPU KV cache (docs/24) uses (`-XX:MaxDirectMemorySize`, set by `/opt/jllm/jvm-memory.sh` from the cgroup limit, else the host's memory); a size such as `16g`, or `default` for the JVM's own (the heap size) |
 | `JLLM_AUTOLOAD` | | models to load at start, comma separated (`Qwen/Qwen3-0.6B,unsloth/Qwen3-4B-GGUF:Q4_K_M`) |
 | `HF_TOKEN` | | Hugging Face token for gated or private models |
 | `JLLM_EXTRA_CA_CERT` | | path (inside the container) of a PEM file with the CA of a TLS-intercepting proxy |
@@ -70,6 +71,10 @@ heap (one per slot). Give the container at least
 memory ≥ weights file  +  heap,     heap = JLLM_HEAP_PERCENT % of the limit  ≥  slots · KV cache
 KV cache = layers · ctx · kvDim · 2 · (4 bytes f32 | 2 bytes f16)
 ```
+
+A **paged** KV cache (`backend.kv-paged`, docs/24; on by default with two or more slots) lives outside the heap instead, in
+memory the entrypoint lets grow up to the container's limit (`JLLM_DIRECT_MEMORY`); `backend.ctx=auto` sizes it from that
+limit (docs/10 §10.13), so then `memory ≥ weights + heap in use + paged cache`, and a smaller `JLLM_HEAP_PERCENT` leaves it more room.
 
 For example, Qwen3-0.6B Q4_0 has 452 MB of weights. At `--ctx 4096` with an f32 cache its KV cache is
 28 · 4096 · 1024 · 2 · 4 B = 0.94 GB, so `--memory 4g` is comfortable. A 30B-A3B MoE at Q4_0 (19.4 GB) needs about

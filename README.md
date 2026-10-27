@@ -638,7 +638,10 @@ with the reference `tokenizers`/`jinja2` libraries (`src/test/python/gen_tokeniz
 `ConverterTest` deletes and rewrites cache files, so give it private copies of the models in a scratch directory
 (see the comment at the top of `src/test/java/org/robomiri/jllm/ConverterTest.java`), never `models/`.
 
-Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the CPU KV cache lives on the heap),
+Launcher environment: `JAVA_HOME`, `JLLM_XMX` (heap, default `4g`; the flat CPU KV cache lives on the heap),
+`JLLM_DIRECT_MEMORY` (the limit of the memory outside the heap that the paged CPU KV cache uses, `-XX:MaxDirectMemorySize`;
+default the physical memory, or the container's limit, from `scripts/jvm-memory.sh`; a size such as `16g`, or `default` for the
+JVM's own, the heap size; [docs/10 §10.13](docs/10-engine-and-server.md#1013-the-default-context-length-backendctxauto)),
 `JAVA_OPTS` (extra JVM flags), `JLLM_NO_BUILD=1` to skip the incremental compile.
 
 ## Layout
