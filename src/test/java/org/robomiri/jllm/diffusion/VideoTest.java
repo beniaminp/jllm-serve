@@ -30,6 +30,20 @@ public final class VideoTest {
 
     private static int failures;
 
+    /** The delay (cs) of each of the first {@code n} frames of a GIF, from its graphic control extensions. */
+    static int[] gifDelays(ImageReader rd, int n) throws java.io.IOException {
+        int[] d = new int[n];
+        for (int i = 0; i < n; i++) {
+            org.w3c.dom.Node root = rd.getImageMetadata(i).getAsTree("javax_imageio_gif_image_1.0");
+            for (org.w3c.dom.Node c = root.getFirstChild(); c != null; c = c.getNextSibling()) {
+                if (c.getNodeName().equals("GraphicControlExtension")) {
+                    d[i] = Integer.parseInt(c.getAttributes().getNamedItem("delayTime").getNodeValue());
+                }
+            }
+        }
+        return d;
+    }
+
     static void check(boolean ok, String what) {
         System.out.println((ok ? "ok   " : "FAIL ") + what);
         if (!ok) {
@@ -290,6 +304,40 @@ public final class VideoTest {
                 worst = Math.min(worst, psnr(rgb, frames.get(i).rgb()));
             }
             check(worst > 25, String.format("GIF frames are close to the originals (worst PSNR %.1f dB)", worst));
+            check(java.util.Arrays.equals(gifDelays(rd, n), new int[]{13, 12, 13, 12, 13}), "GIF delays at 8 fps are 13, 12, 13, 12, 13 cs (the running total stays exact)");
+            rd.dispose();
+        }
+        // above 50 fps a frame would last 1 cs, which browsers play as 10 cs: frames are dropped instead, keeping the clip's length
+        boolean same = true;
+        for (double fps : new double[]{1, 7.5, 8, 12, 16, 24, 25, 30, 33.3, 49.9, 50}) {
+            int[][] t = VideoEncoder.gifTiming(40, fps);
+            same &= t.length == 40;
+            for (int i = 0; same && i < t.length; i++) {
+                same = t[i][0] == i && t[i][1] == VideoEncoder.delay(i, fps, 100);
+            }
+        }
+        check(same, "GIF timing up to 50 fps keeps every frame with the exact-total delays");
+        boolean fast = true;
+        for (double fps : new double[]{50.1, 55, 60, 75, 99, 100, 144, 240}) {
+            for (int n : new int[]{1, 2, 3, 7, 16, 61}) {
+                int[][] t = VideoEncoder.gifTiming(n, fps);
+                int total = 0;
+                for (int j = 0; j < t.length; j++) {
+                    fast &= t[j][1] >= 2 && (j == 0 ? t[j][0] == 0 : t[j][0] > t[j - 1][0]) && t[j][0] < n;
+                    total += t[j][1];
+                }
+                fast &= total == Math.max(2, Math.round(n * 100 / fps)); // the clip's length, or the shortest still a viewer shows
+            }
+        }
+        check(fast, "GIF timing above 50 fps: every delay at least 2 cs, frames in order, total = the clip's length");
+        List<Image> quick = sampleFrames(32, 24, 12, false);
+        try (ImageInputStream in = ImageIO.createImageInputStream(new ByteArrayInputStream(VideoEncoder.gif(quick, 60)))) {
+            ImageReader rd = ImageIO.getImageReadersByFormatName("gif").next();
+            rd.setInput(in);
+            int n = rd.getNumImages(true);
+            int[] d = gifDelays(rd, n);
+            check(n == 8 && java.util.Arrays.equals(d, new int[]{2, 3, 2, 3, 2, 3, 2, 3}),
+                    "12 frames at 60 fps: 8 frames of 2 or 3 cs, 20 cs in all (" + n + " frames, " + java.util.Arrays.toString(d) + ")");
             rd.dispose();
         }
         // a clip with a full 256-colour noise picture exercises LZW table resets and code widths

@@ -86,6 +86,38 @@ public final class VideoEncoder {
         return (int) (Math.round((i + 1) * scale / fps) - Math.round(i * scale / fps));
     }
 
+    /** Browsers (Chromium, Firefox, WebKit) play a GIF delay of 0 or 1 cs as 10 cs; 2 cs is the shortest they honour. */
+    static final int GIF_MIN_DELAY = 2;
+
+    /**
+     * The frames a GIF keeps and their delays in cs, as {@code {frame index, delay}} pairs. Frame {@code i} starts at
+     * {@code t(i) = round(i · 100 / fps)} cs; a frame is kept when it starts at least {@link #GIF_MIN_DELAY} after the last kept one, and
+     * each kept frame lasts until the next kept one starts (the last until {@code t(n)}). Up to 50 fps this keeps every frame with the
+     * {@link #delay} values; above, frames are dropped rather than given a 1 cs delay, so the clip keeps its length.
+     */
+    static int[][] gifTiming(int n, double fps) {
+        long[] t = new long[n + 1];
+        for (int i = 0; i <= n; i++) {
+            t[i] = Math.round(i * 100 / fps);
+        }
+        java.util.ArrayList<Integer> kept = new java.util.ArrayList<>();
+        kept.add(0);
+        for (int i = 1; i < n; i++) {
+            if (t[i] - t[kept.getLast()] >= GIF_MIN_DELAY) {
+                kept.add(i);
+            }
+        }
+        if (kept.size() > 1 && t[n] - t[kept.getLast()] < GIF_MIN_DELAY) {
+            kept.removeLast(); // the last kept frame would be too short: its time goes to the one before
+        }
+        int[][] out = new int[kept.size()][];
+        for (int j = 0; j < kept.size(); j++) {
+            long end = j + 1 < kept.size() ? t[kept.get(j + 1)] : t[n];
+            out[j] = new int[]{kept.get(j), (int) Math.max(GIF_MIN_DELAY, end - t[kept.get(j)])};
+        }
+        return out;
+    }
+
     // ------------------------------------------------------------------ ffmpeg
 
     /**
@@ -277,11 +309,10 @@ public final class VideoEncoder {
             o.writeBytes("NETSCAPE2.0".getBytes(StandardCharsets.US_ASCII));
             o.writeBytes(new byte[]{0x03, 0x01, 0, 0, 0});
         }
-        for (int i = 0; i < frames.size(); i++) {
+        for (int[] fd : gifTiming(frames.size(), fps)) { // above 50 fps some frames are dropped to keep every delay at 2 cs or more
+            int i = fd[0];
             o.writeBytes(new byte[]{0x21, (byte) 0xF9, 0x04, 0x04});
-            // GIF counts in whole centiseconds: above 50 fps some frames are 1 cs. Keep the requested rate rather than clamping
-            // every such frame to 2 cs (which made the clip play slower); 1 is the smallest delay a viewer can be told about.
-            le16(o, Math.max(1, delay(i, fps, 100)));
+            le16(o, fd[1]);
             o.write(0);
             o.write(0);
             o.write(0x2C);
