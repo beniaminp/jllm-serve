@@ -82,6 +82,14 @@ public final class AgentDefaultsTest {
                 "paged KV cache: the CPU budget is off-heap (physical memory), not the Java heap");
         check(!ContextBudget.pagedOffHeap(paged, arch, KvDtype.Q4) && !ContextBudget.pagedOffHeap(Settings.load(new String[]{}), arch, KvDtype.F32),
                 "a q4 cache, or paging off, stays on the heap budget");
+        // the paged CPU pool's slabs come from an automatic arena, which counts against the JVM's direct-memory limit
+        // (this JVM sets no -XX:MaxDirectMemorySize, so the limit is the heap's maximum)
+        long before = ContextBudget.directFree();
+        java.lang.foreign.MemorySegment slab = java.lang.foreign.Arena.ofAuto().allocate(64L << 20, 64);
+        long after = ContextBudget.directFree();
+        check(before > 0 && before <= Runtime.getRuntime().maxMemory() && before - after >= 64L << 20,
+                String.format("direct memory: %.0f MB free, %.0f MB after a 64 MB slab of an automatic arena", before / 1e6, after / 1e6));
+        java.lang.ref.Reference.reachabilityFence(slab);
 
         Settings s = Settings.load(new String[]{});
         check(s.get("backend.ctx").equals("auto") && !ModelLoader.explicitCtx(s), "backend.ctx is auto by default");

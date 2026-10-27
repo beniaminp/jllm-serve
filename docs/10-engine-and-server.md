@@ -890,7 +890,9 @@ Metal : free   = workingSet − otherModels − weights − reserve  [+ 0.10·wo
         budget = 0.6 · max(0, free)
 CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the flat CPU cache lives on the heap)
 CPU, backend.kv-paged=true (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
-        the paged pool (docs/24) is off-heap MemorySegment slabs, so -Xmx no longer bounds the cache, only the RAM does
+        the paged pool (docs/24) is off-heap MemorySegment slabs, so the heap no longer bounds the cache; but the slabs come
+        from an automatic arena, which the JVM limits like direct buffers, so also
+        budget = min(budget, 0.9 · (MaxDirectMemorySize − direct memory in use))   (the limit is the heap size, -Xmx, unless given)
 both  : budget = min(budget, 0.6 · max(0, 0.75 · physicalMemory − weights))   (weights are memory-mapped: they must fit in RAM too)
 Metal or CPU, backend.kv-tier=true with streaming allowed, a hot budget or the memory planner (docs/26):
         budget = 0.6 · max(0, 0.75 · physicalMemory − weights); with backend.kv-stream=off: at most backend.kv-hot-mb
@@ -985,7 +987,14 @@ costs address space and only touches the pages that get written.
   (`JLLM_XMX`, default 4 g). With `backend.kv-paged=true` the CPU blocks are off-heap ([24 §24.2.6](24-paged-kv-cache.md#2426-the-cpu-backend)),
   so `auto` counts the physical memory instead (`ContextBudget.pagedOffHeap`; the log says "paged KV cache, off the Java heap"): for
   Qwen3-0.6B at f32 on this 32 GB Mac that is `0.6 · (0.75 · 34.4 − 0.5) = 15.2 GB`, i.e. the trained 40 960 positions instead of the heap-bound
-  7 168. The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
+  7 168, **when the JVM may allocate that much off the heap**. The slabs come from an automatic arena (`CpuKvStorage`), which counts against
+  `-XX:MaxDirectMemorySize`, and that limit is the maximum heap unless it is given: with the launcher's `JLLM_XMX=4g` a pool cannot pass
+  about 4 GB, and before this bound a 40 960-position `auto` context failed with `OutOfMemoryError: Cannot reserve … bytes of direct
+  buffer memory` once a conversation grew past roughly 17 000 positions. `ContextBudget.directFree` (the limit, read through
+  `HotSpotDiagnosticMXBean`, minus the `direct` buffer pool in use) therefore also bounds the budget (90 % of it), the log says so
+  ("the JVM's direct-memory limit leaves … GB"), and `CpuBackend.newKvPool` warns when an explicit `backend.ctx` or
+  `backend.kv-pool-tokens` makes a pool that cannot be held. To give the paged cache the RAM, raise the limit:
+  `JAVA_OPTS=-XX:MaxDirectMemorySize=16g ./jllm …` (or a larger `JLLM_XMX`). The pool allocates only the blocks in use (`backend.kv-pool-tokens=0` sizes it to at most the flat caches), so a long `auto` context
   costs address space until conversations fill it. On Metal the paged pool is Metal buffers counted against the working set exactly like the
   flat caches (and, since chapter 26, registered in the device ledger, so the MoE expert placement leaves room for it), so the Metal arithmetic is unchanged unless `backend.kv-tier` takes the cache off the GPU share (`ContextBudget.tierManaged`, docs/26 §26.2.1). A model that cannot be paged (q4, DeepSeek, Mamba, Qwen3-Next) keeps the heap budget on the CPU.
   An explicit `backend.kv-pool-tokens` smaller than the context is not taken into account.

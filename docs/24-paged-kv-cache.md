@@ -441,7 +441,8 @@ their blocks referenced until the caller or the console's sweeper releases them.
 
 `backend.ctx` is `auto` by default ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)); `ModelLoader` decides it
 once per model, before the pool is created, and the pool key and size use that number. With paging on, the CPU budget `auto` uses is the
-physical memory (the blocks are off the Java heap) instead of the free heap of the flat cache.
+physical memory (the blocks are off the Java heap) instead of the free heap of the flat cache, bounded by the JVM's direct-memory limit
+(`-XX:MaxDirectMemorySize`, by default the heap size), which the slabs of `CpuKvStorage` count against ([10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)).
 
 ---
 

@@ -18,8 +18,8 @@ import java.util.Locale;
  * down to a multiple of 1024 (256 below 4096), with a floor of 1024. {@code budget} is {@link #SHARE} of what is free:
  * on Metal the device's recommended working set minus what the open backends and this model's weights hold (and a
  * reserve for activations); on the CPU backends the free Java heap, which holds their flat KV caches, or, with the
- * paged cache ({@code backend.kv-paged}, docs/24), whose blocks are off-heap, the physical memory alone. Both are capped by a
- * share of the physical memory. A mixture-of-experts model whose experts may go to the CPU
+ * paged cache ({@code backend.kv-paged}, docs/24), whose blocks are off-heap, the physical memory and the JVM's direct-memory limit
+ * ({@link #directFree}). Both are capped by a share of the physical memory. A mixture-of-experts model whose experts may go to the CPU
  * ({@code backend.metal.cpu-moe}) may also push up to {@link #MOE_SPILL} of the working set of its experts out for
  * the cache. The planner is a pure function ({@link #plan}) so it is tested without a device; {@link ModelLoader}
  * gathers the numbers.
@@ -172,6 +172,13 @@ public final class ContextBudget {
             budget = (long) (SHARE * Math.max(0, RAM_SHARE * ram - weights));
             basis = String.format(Locale.ROOT, "paged KV cache, off the Java heap: physical memory %.1f GB - weights %.1f GB, %.0f%% for the cache",
                     ram / 1e9, weights / 1e9, 100 * SHARE);
+            // its slabs come from an automatic arena, which the JVM limits like direct buffers: a larger pool fails when it grows
+            long direct = (long) (DIRECT_SHARE * directFree());
+            if (direct < budget) {
+                budget = direct;
+                basis += String.format(Locale.ROOT, "; the JVM's direct-memory limit leaves %.1f GB (-XX:MaxDirectMemorySize, by default"
+                        + " the heap size: JLLM_XMX)", direct / 1e9);
+            }
         } else {
             long heap = heapFree();
             budget = (long) (SHARE * heap);
@@ -219,6 +226,34 @@ public final class ContextBudget {
 
     private static boolean pageable(Architecture arch, KvDtype kv) {
         return arch instanceof Decoder d && d.uniformShape() && d.attention() instanceof Attention.Gqa && kv != KvDtype.Q4;
+    }
+
+    /** Of the free direct memory, what the paged CPU pool may take (the rest: the server's buffers and the other automatic arenas). */
+    static final double DIRECT_SHARE = 0.9;
+
+    /**
+     * What the JVM still lets automatic arenas and direct buffers allocate: {@code -XX:MaxDirectMemorySize} (when it is not given,
+     * the maximum heap size, as the JDK takes it) minus the direct memory in use. The CPU paged KV pool's slabs come from an
+     * automatic arena ({@code CpuKvStorage}), so they count against it, unlike the memory-mapped weights and SSD-tier slabs.
+     */
+    public static long directFree() {
+        long max = 0;
+        try {
+            max = Long.parseLong(java.lang.management.ManagementFactory.getPlatformMXBean(com.sun.management.HotSpotDiagnosticMXBean.class)
+                    .getVMOption("MaxDirectMemorySize").getValue());
+        } catch (RuntimeException e) {
+            // not a HotSpot VM: the default below
+        }
+        if (max <= 0) {
+            max = Runtime.getRuntime().maxMemory();
+        }
+        long used = 0;
+        for (java.lang.management.BufferPoolMXBean p : java.lang.management.ManagementFactory.getPlatformMXBeans(java.lang.management.BufferPoolMXBean.class)) {
+            if (p.getName().equals("direct")) {
+                used = p.getMemoryUsed();
+            }
+        }
+        return Math.max(0, max - used);
     }
 
     /** Free space of the Java heap's old generation (where the CPU KV caches live), as {@code KvCache.checkHeap} sees it. */

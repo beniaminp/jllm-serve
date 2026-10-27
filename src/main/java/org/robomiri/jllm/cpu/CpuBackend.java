@@ -174,6 +174,17 @@ public final class CpuBackend implements Backend {
         }
         String format = "paged " + kvDtype + (st.rotate ? " rot" : "") + " layers=" + arch.core().layers() + " kvDim=" + g.kvDim() + " headDim=" + g.headDim()
                 + " block=" + blockTokens;
+        long inMemory = blocks * st.blockBytes; // the slabs past a tier's hot budget are mapped files, which do not count
+        if (tier != null && tier.hotBytes() > 0 && tier.dir() != null) {
+            inMemory = Math.min(inMemory, tier.hotBytes());
+        }
+        long direct = org.robomiri.jllm.ContextBudget.directFree();
+        if (inMemory > direct) {
+            System.err.printf(java.util.Locale.ROOT, "warning: the paged KV pool may grow to %.2f GB off the Java heap, but the JVM's"
+                    + " direct-memory limit leaves %.2f GB: a conversation that needs more fails when the pool grows; lower backend.ctx"
+                    + " or backend.kv-pool-tokens, or raise -XX:MaxDirectMemorySize (by default the heap size: JLLM_XMX)%n",
+                    inMemory / 1e9, direct / 1e9);
+        }
         KvPool pool = new KvPool(st, (int) blocks, format);
         if (tier != null) {
             pool.setPrefetch(tier.prefetch());
