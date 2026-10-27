@@ -22,6 +22,7 @@ public final class Checkpoint implements AutoCloseable {
     public final Path dir;
     public final Map<String, Object> config;
     private final List<SafeTensors> files = new ArrayList<>();
+    private final List<Path> paths = new ArrayList<>();
     private final Map<String, SafeTensors.Tensor> tensors = new LinkedHashMap<>();
 
     private Checkpoint(Path dir, Map<String, Object> config) {
@@ -69,11 +70,17 @@ public final class Checkpoint implements AutoCloseable {
     private void add(Path f) throws IOException {
         SafeTensors st = SafeTensors.open(f);
         files.add(st);
+        paths.add(f);
         tensors.putAll(st.tensors());
     }
 
     public boolean has(String name) {
         return tensors.containsKey(name);
+    }
+
+    /** The {@code .safetensors} files the tensors were read from (one, or the shards in name order). */
+    public List<Path> files() {
+        return List.copyOf(paths);
     }
 
     public SafeTensors.Tensor get(String name) {

@@ -6,10 +6,35 @@ import java.nio.file.Path;
  * Times the Wan 2.1 transformer and VAE decoder on random inputs: {@code WanBench MODEL_DIR backend precision latentFrames latentH latentW reps [textTokens]}
  * (the transformer sees {@code latentFrames · latentH/2 · latentW/2} tokens; the decoder turns the latent into {@code 1 + 4 (frames − 1)}
  * frames of {@code 8 latentH × 8 latentW} pixels). The first call includes shader compilation. Run it under the machine's heavy lock.
+ *
+ * <p>{@code WanBench MODEL_DIR t5 cache(true|false) [tokens]} times the int8 UMT5 text encoder instead: two encoders one after the other,
+ * each read (quantized from the float32 files, or mapped from {@code jllm-q8.bin} with the cache on) and run on {@code tokens} ids
+ * (default 64). With the cache on, the first writes the int8 copy into the model's {@code text_encoder} folder and the second maps it.
  */
 public final class WanBench {
 
+    private static void t5(Path model, boolean cache, int tokens) throws Exception {
+        int[] ids = new int[tokens];
+        for (int i = 0; i < tokens; i++) {
+            ids[i] = 2 + i * 37 % 100; // any ids work for timing; these fit the tiny test vocabulary too
+        }
+        for (String round : new String[]{"first", "warm "}) {
+            long t0 = System.nanoTime();
+            try (Umt5Encoder enc = new Umt5Encoder(model.resolve("text_encoder"), true, cache)) {
+                double load = (System.nanoTime() - t0) / 1e9;
+                long t1 = System.nanoTime();
+                enc.encode(ids);
+                System.out.printf("%s umt5 cache %s: read %.1f s, encode %.2f s (%d tokens, %.1f GB of int8 weights%s)%n", round, cache, load,
+                        (System.nanoTime() - t1) / 1e9, tokens, enc.residentBytes() / 1e9, enc.fromCache() ? ", mapped from the copy" : "");
+            }
+        }
+    }
+
     public static void main(String[] a) throws Exception {
+        if (a.length > 1 && a[1].equals("t5")) {
+            t5(Path.of(a[0]), a.length > 2 && Boolean.parseBoolean(a[2]), a.length > 3 ? Integer.parseInt(a[3]) : 64);
+            return;
+        }
         Path model = Path.of(a[0]);
         String backend = a.length > 1 ? a[1] : "metal";
         String precision = a.length > 2 ? a[2] : "f32";

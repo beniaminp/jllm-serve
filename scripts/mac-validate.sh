@@ -480,6 +480,23 @@ if [ -f "$WANM/transformer/config.json" ] && [ -f "$WANM/vae/config.json" ]; the
   wanbench "flash attention off (scores + softmax), f32" "-Djllm.diffusion.flash=false" metal f32 5 24 40
   wanbench "chunked group norm off, f32" "-Djllm.diffusion.simpleNorm=true" metal f32 5 24 40
 fi
+# Wan's UMT5 text encoder (int8, CPU) with the on-disk int8 copy off and on (video.text-encoder-cache, docs/23 section 23.12.6): read
+# and encode 64 tokens, twice; with the copy on, the second encoder maps it (the first run writes 5.2 GB into $WANM/text_encoder)
+if [ -f "$WANM/text_encoder/config.json" ]; then
+  t5bench() { # label cache
+    "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -XX:+UseParallelGC -Xmx6g \
+      -cp target/classes:target/test-classes org.robomiri.jllm.diffusion.WanBench "$WANM" t5 "$2" 64 > "$OUT/t5.log" 2>&1 || {
+      echo "| $1 | failed | | $(tail -1 "$OUT/t5.log") |"; return; }
+    local line
+    line=$(grep '^warm  umt5' "$OUT/t5.log" | tail -1)
+    echo "| $1 | $(echo "$line" | sed 's/.*read \([0-9.]*\) s.*/\1/') | $(echo "$line" | sed 's/.*encode \([0-9.]*\) s.*/\1/') |"
+  }
+  echo
+  echo "| Wan UMT5 text encoder, int8 on the CPU, 64 tokens (second of two runs) | read s | encode s |"
+  echo "|---|---|---|"
+  t5bench "int8 copy off (read and quantize the float32 files)" false
+  t5bench "int8 copy on (map text_encoder/jllm-q8.bin)" true
+fi
 # GGUF block types read in place against the old behaviour (dequantize at load, requantize to Q8_0): the same file, a
 # switch on the loader (-Djllm.gguf.requantize=all; a list of ggml type names limits it to those types)
 if [ -n "$GGUF_TYPES" ]; then

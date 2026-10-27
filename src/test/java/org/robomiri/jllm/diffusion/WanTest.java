@@ -39,6 +39,64 @@ public final class WanTest {
         return m;
     }
 
+    /**
+     * The int8 copy of the UMT5 encoder on disk ({@code video.text-encoder-cache}), in a copy of the tiny encoder's folder: written by the
+     * first encoder, mapped by the next, the same bits as a fresh quantization either way, and rewritten when the float file changes or
+     * the copy is damaged; without the switch nothing is written.
+     */
+    private static void textCache(Path src) throws Exception {
+        Path dir = Files.createTempDirectory("jllm-umt5-cache");
+        try {
+            for (String f : new String[]{"config.json", "model.safetensors"}) {
+                Files.copy(src.resolve(f), dir.resolve(f));
+            }
+            int[] ids = {5, 17, 3, 99, 42, 1};
+            float[] fresh;
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, false)) {
+                fresh = e.encode(ids);
+            }
+            check(!Files.exists(dir.resolve(Umt5Encoder.CACHE_FILE)) && !Files.exists(dir.resolve(Umt5Encoder.CACHE_INDEX)),
+                    "UMT5 cache off: nothing written next to the float file");
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(!e.fromCache() && Files.isRegularFile(dir.resolve(Umt5Encoder.CACHE_FILE)) && Files.isRegularFile(dir.resolve(Umt5Encoder.CACHE_INDEX)),
+                        "UMT5 cache on, first encoder: quantizes and writes jllm-q8.bin + jllm-q8.json");
+                check(java.util.Arrays.equals(e.encode(ids), fresh), "UMT5 cache on, first encoder: the same bits as without the cache");
+            }
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(e.fromCache() && java.util.Arrays.equals(e.encode(ids), fresh), "UMT5 cache on, next encoder: maps the int8 copy, the same bits");
+            }
+            Path weights = dir.resolve("model.safetensors");
+            Files.setLastModifiedTime(weights, java.nio.file.attribute.FileTime.fromMillis(Files.getLastModifiedTime(weights).toMillis() + 5000));
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(!e.fromCache() && java.util.Arrays.equals(e.encode(ids), fresh), "UMT5 cache: a changed float file makes it quantize (and write) again");
+            }
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(e.fromCache(), "UMT5 cache: the rewritten copy is mapped by the next encoder");
+            }
+            Path bin = dir.resolve(Umt5Encoder.CACHE_FILE);
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(bin, java.nio.file.StandardOpenOption.WRITE)) {
+                ch.truncate(ch.size() / 2);
+            }
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(!e.fromCache() && java.util.Arrays.equals(e.encode(ids), fresh), "UMT5 cache: a truncated copy is not read (quantized again)");
+            }
+            Files.writeString(dir.resolve(Umt5Encoder.CACHE_INDEX), "{\"version\": 0}");
+            try (Umt5Encoder e = new Umt5Encoder(dir, true, true)) {
+                check(!e.fromCache(), "UMT5 cache: an index of another version is not read");
+            }
+            try (Umt5Encoder e = new Umt5Encoder(dir, false, true)) {
+                check(!e.fromCache(), "UMT5 cache: a float encoder never reads the int8 copy");
+            }
+        } finally {
+            try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+                for (Path f : files.toList()) {
+                    Files.delete(f);
+                }
+            }
+            Files.delete(dir);
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         scheduler();
         Path model = resource("tiny-wan");
@@ -49,6 +107,7 @@ public final class WanTest {
             WanCompare q = new WanCompare(limits("umt5=5e-2", 1), true);
             check(q.t5(model, resource("ref-wan-t5"), "cpu", "q8") == 0, String.format("UMT5 encoder with int8 weights within 5e-2 of float (%.1e)", q.relative));
         }
+        textCache(model.resolve("text_encoder"));
         Path real = Path.of(System.getProperty("jllm.wan.dir", "models/Wan-AI_Wan2.1-T2V-1.3B-Diffusers"));
         if (Files.isRegularFile(real.resolve("tokenizer").resolve("tokenizer.json"))) {
             WanCompare c = new WanCompare(Map.of(), true);

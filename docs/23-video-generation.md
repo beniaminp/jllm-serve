@@ -27,7 +27,7 @@ Nothing is borrowed from PyTorch or diffusers except, in the tests, their *answe
 
 Each part is explained in the same order: 🧸 the idea in plain words, 📐 how it works (formulas with every symbol defined, a worked example with real numbers, the shapes of the tensors), why it was built this way, the switches, the measurements and what they mean, and
 what is checked and what is not. The gathered "settings" are in [23.9.1](#2391-settings), the editor in [23.9.2](#2392-the-clip-editor), what the measurements mean in [23.11.1](#23111-what-the-numbers-mean), and the second model family
-(Wan 2.1) in [23.12](#2312-wan-21-how-far-it-got-and-what-remains) with its parts in 23.12.1-23.12.5; [23.13](#2313-why-the-clips-are-limited) says why the clips are not better than they are.
+(Wan 2.1) in [23.12](#2312-wan-21-how-far-it-got-and-what-remains) with its parts in 23.12.1-23.12.6; [23.13](#2313-why-the-clips-are-limited) says why the clips are not better than they are.
 
 **The two pipelines with their shapes.**
 
@@ -388,6 +388,7 @@ All keys are in `jllm.properties` (validated at start-up, editable in the consol
 | `video.base-model` | `stable-diffusion-v1-5/stable-diffusion-v1-5` | the SD 1.x model (diffusers layout) the adapter rides on; any SD 1.5 fine-tune; change it to change the style (23.13) |
 | `video.backend`, `video.precision` | `auto`, `auto` | `metal` / `cpu`; `auto` precision is float16 on the GPU for AnimateDiff (float32 for the Wan command, 23.12); `f32` gives the numbers of 23.10 for twice the memory and 1.5 times the time |
 | `video.decode-chunk` | `1` | frames per VAE call; 1 keeps the memory peak lowest |
+| `video.text-encoder-cache` | `true` | Wan: keep the int8 copy of the UMT5 text encoder next to its float32 files (`text_encoder/jllm-q8.bin`, 5.2 GB) and map it on later runs; `false` quantizes the 22.7 GB float32 file on every run and writes nothing (23.12.6) |
 | `video.ffmpeg`, `video.format` | `auto`, `auto` | MP4 needs `ffmpeg` (`auto` looks on the PATH; `off`, or a path); `auto` format is MP4 with ffmpeg, else lossless WebP; `gif` for universal playback |
 | `video.frames`, `video.fps` | `16`, `8` | clip length (at most 32 with the v1.5 adapters; the adapter was trained on 16) and playback speed; **for Wan the frame count is rounded down to 4k + 1, so 16 becomes 13**, and the default fps is 16 |
 | `video.steps`, `.guidance`, `.width`, `.height`, `.seed`, `.scheduler`, `.negative`, `.out` | `0`, `-1`, `0`, `0`, `-1`, empty, empty, empty | the `jllm video` command; the `image.*` names of the same meaning (`image.steps` ...) count when given |
@@ -546,7 +547,7 @@ real clip could be made end to end.
 | `WanVae` | causal 3-D convolutions (a 3-tap kernel over time that only looks back, done as three shifted 2-D convolutions that are added), temporal up-sampling by a convolution that doubles the frames, the first frame decoded alone | latent `[F, h, w, 16]` → `1 + 4(F − 1)` frames of `8h × 8w` |
 | `Umt5Encoder`, `UnigramTokenizer` | 24 layers of width 4096, relative position bias per layer, no attention scaling; SentencePiece **Unigram** tokenizer read from `tokenizer.json` (space collapsing, metaspace, Viterbi segmentation, fused unknowns) | on the CPU; the linear layers are quantized to int8 (Q8_0 layout, groups of 32) while they are read |
 | `FlowScheduler` | flow-matching sigmas with shift 3, UniPC multistep predictor-corrector of order 2 (and plain Euler) | 30 steps by default, guidance 5 |
-| `WanPipeline` | tokenize → UMT5 (read, used, freed per request) → transformer twice per step (guidance) → UniPC → VAE | `jllm video --video-model <local Wan folder>` |
+| `WanPipeline` | tokenize → UMT5 (read or mapped from its int8 copy, used, freed per request) → transformer twice per step (guidance) → UniPC → VAE | `jllm video --video-model <local Wan folder>` |
 
 New operations on the image stack (`Ops`, CPU and Metal): RMS norm, rotary embedding, adaptive modulation `x (1 + scale) + shift`, gated
 residual, frame shift for the causal convolution, row gather and stack, the tanh GELU; each GPU kernel has a numpy reference in
@@ -596,7 +597,7 @@ weights beyond the rows above, and a streaming preview of intermediate steps.
 
 ---
 
-The five parts of Wan 2.1 are explained below in the order the data flows through them: the text (23.12.4), the diffusion transformer (23.12.1), flow matching and its sampler (23.12.2), the causal 3-D VAE (23.12.3) and the pipeline that joins them (23.12.5).
+The five parts of Wan 2.1 are explained below in the order the data flows through them: the text (23.12.4), the diffusion transformer (23.12.1), flow matching and its sampler (23.12.2), the causal 3-D VAE (23.12.3) and the pipeline that joins them (23.12.5); 23.12.6 is the int8 copy of the text encoder that later runs map.
 
 ### 23.12.1 The diffusion transformer (`WanTransformer`)
 
@@ -676,16 +677,77 @@ bucket            0   17   23   24   25   26   29   31    31      |   1    7    
 
 Only the real tokens are encoded; the pipeline zero-pads the rows to 512 as diffusers does (`_get_t5_prompt_embeds`) and the transformer's cross-attention sees all 512 rows.
 *int8.* 5.7 B parameters are 22.7 GB in float32 as shipped, 11 GB in bfloat16; with `q8` every linear weight is stored per row in groups of 32 as int8 plus a float scale (`w ≈ s · q`, the Q8_0 layout of chapter 6): **4.6 GB** for the 24 layers, read tensor by tensor so the float32 file is never resident, and the 256 000 × 4 096 embedding table read row by row from the mapped file. Activations stay float.
-**Why this design.** The encoder runs on the CPU (a few hundred tokens), is read when a request arrives, used for the prompt and the negative prompt, and **freed before the transformer starts**, so its 4.6 GB and the transformer's weights are never needed at once. Because the quantization happens while the float32 file is read, **every request reads the whole 22.7 GB file again** and the int8 copy is not kept between requests; the time of that read was not measured, and caching the quantized form would be the obvious improvement.
+**Why this design.** The encoder runs on the CPU (a few hundred tokens), is read when a request arrives, used for the prompt and the negative prompt, and **freed before the transformer starts**, so its 5.2 GB (4.6 GB of int8 weights plus their scales) and the transformer's weights are never needed at once. The quantization happens while the float32 file is read, so without more every request would read the 18.5 GB of float32 linear weights again; the int8 copy on disk (23.12.6) keeps the quantized form between runs instead of keeping it in memory.
 **Checks and limits.** Tokenizer: eight prompts (accents, Japanese, emoji, runs of spaces, empty) give the same ids as Hugging Face `tokenizers` on the tiny and on the real 256 000-piece vocabulary. Encoder: tiny random weights 3.7·10⁻⁷ in float and 1.2·10⁻² with int8 (a random two-layer model is the worst case for quantization). **Not measured**: the encoder on its real weights (they were not downloaded, 23.12), and therefore the real error of int8.
 
 ### 23.12.5 The pipeline, and what a real run needs
 
 🧸 To make one clip: read the words, ask the big reader, let it go; start from noise; thirty times ask the transformer "which way?" twice (once with the words, once without) and walk; then unpack the result into frames.
 
-📐 `WanPipeline.generate`: (1) tokenize prompt and negative prompt, load the UMT5 encoder, encode both, free it; (2) draw the noise from `Rng(seed)` as one `[16, F', h, w]` tensor (PyTorch order) and store it frames-major; (3) for each of the 30 steps: `v = DiT(x, t, text)` and `v_u = DiT(x, t, negative)`, `v = v_u + g (v − v_u)` (`g = 5`), `x = FlowScheduler.step(v, i, x)`;
-(4) `x · std + mean`, VAE decode, frames to pictures. Per request it needs: the text encoder 4.6 GB (briefly), the transformer and the VAE 6.2 GB in float32 (5.7 + 0.5) or 3.1 GB in float16, and activations (10.0 GB of GPU buffers in float32, 5.0 GB in float16, for 17 frames at 320 × 192). An estimate for 17 frames of 320 × 192 and 30 steps: `30 · 2 · 1.43 s + 5 s = 91 s` of GPU time in float16 plus the text encoder (23.12 above).
+📐 `WanPipeline.generate`: (1) tokenize prompt and negative prompt, load the UMT5 encoder (quantize it, or map its int8 copy, 23.12.6), encode both, free it; (2) draw the noise from `Rng(seed)` as one `[16, F', h, w]` tensor (PyTorch order) and store it frames-major; (3) for each of the 30 steps: `v = DiT(x, t, text)` and `v_u = DiT(x, t, negative)`, `v = v_u + g (v − v_u)` (`g = 5`), `x = FlowScheduler.step(v, i, x)`;
+(4) `x · std + mean`, VAE decode, frames to pictures. Per request it needs: the text encoder 5.2 GB (briefly), the transformer and the VAE 6.2 GB in float32 (5.7 + 0.5) or 3.1 GB in float16, and activations (10.0 GB of GPU buffers in float32, 5.0 GB in float16, for 17 frames at 320 × 192). An estimate for 17 frames of 320 × 192 and 30 steps: `30 · 2 · 1.43 s + 5 s = 91 s` of GPU time in float16 plus the text encoder (23.12 above).
 **Settings and entry point.** `./jllm video --video-model <local Wan folder> --prompt …` (the folder must hold `model_index.json` of class `WanPipeline`); not served by the API servers, the console or the chat tool, which stay AnimateDiff. **What would be needed for a first real clip**: the text encoder's weights. The repository stores them only as float32 (22.7 GB, five shards); the download budget of this work was 20 GB for all models. Nothing else is missing.
+
+### 23.12.6 The int8 copy of the text encoder on disk (`video.text-encoder-cache`)
+
+🧸 The big reader is stored in a very precise but very heavy form (22.7 GB). Before each use the code squeezes it into a lighter form
+(about a quarter of the size) that is almost as good, which means carrying the whole heavy book in every time. Now the squeezed book is
+written down once next to the heavy one; the next time the light copy is opened directly, and the heavy book stays on the shelf. When the
+heavy book changes, the light copy no longer matches its label and is squeezed again.
+
+📐 *What is stored.* Every linear layer `W [n, k]` of the encoder (q, k, v, o, `wi_0`, `wi_1`, `wo` in each of the 24 layers) as the
+int8 rows `q [n][k]` and the scales `s [n][k/32]` (little-endian float32) of the Q8_0 layout (23.12.4: `s = max|w| / 127` per group
+of 32, `q = round(w / s)` clamped to ±127), each starting at a multiple of 64 bytes, in `text_encoder/jllm-q8.bin`. The index
+`text_encoder/jllm-q8.json` is written last (so a half-written copy has none and is never read) and holds the format version, the
+group size, the float files it was made from (name, size and modification time of each shard), the size of the `.bin` and, per layer,
+`{n, k, q, s}` (the byte offsets of the rows and of the scales). The embedding table, the norm gains and the position biases are not
+copied: they are read from the float files as before (the embedding row by row, only for the prompt's tokens).
+
+```
+ first run (cache on, no copy)                          later runs (the index matches the float files)
+ ─────────────────────────────                          ───────────────────────────────────────────────
+ model-0000{1..5}-of-00005.safetensors (22.7 GB f32)    jllm-q8.json ─ version 1, group 32, sources = the 5 shards'
+   │ read layer by layer (18.5 GB of linear weights)      │            (name, size, mtime), bytes, {n, k, q, s} per layer
+   ▼ quantize: s = max|w|/127, q = round(w/s)              ▼ every check passes
+ int8 rows + scales in memory (5.2 GB) ──► encode         jllm-q8.bin (5.2 GB) ── mapped (no read, no quantization)
+   │                                                        │ the layers are slices of the mapping ──► encode
+   ▼ write jllm-q8.bin.partial → rename → jllm-q8.json      ▼
+ freed before the transformer starts                       unmapped before the transformer starts
+```
+
+*Worked example* (the tiny test encoder, `d_model = 32`, `d_ff = 64`, 2 layers): the first layer `q` is `[32, 32]`, so its rows take
+32 × 32 = 1 024 bytes at offset 0 and its scales 32 × (32 / 32) × 4 = 128 bytes at offset 1 024; the next layer starts at the multiple
+of 64 after 1 152, which is 1 152 itself. The 14 layers make a 23 040-byte file. For `umt5-xxl` (24 layers, 4 × 4096 × 4096 +
+3 × 10 240 × 4096 = 192 937 984 weights per layer): 4 630 511 616 bytes of int8 rows plus 578 813 952 of scales = **5.21 GB**, which a run
+maps instead of reading 18.5 GB of float32 weights (4 bytes per weight) and quantizing them.
+
+*When the copy is not used* (the encoder says why on stderr and quantizes again, then rewrites the copy): the index does not parse, has
+another version or group, names other float files or other sizes or modification times (a re-download or an edited checkpoint), gives
+another size for the `.bin` (a truncated or replaced file), or has an entry missing or not fitting the file or the checkpoint's shapes.
+Writing is best effort: with less free space than the copy plus 1 GB, or in a read-only folder, it prints a warning and the run goes on
+(the next one quantizes again); a failed write leaves only a `.partial` file, which is never read and is removed.
+
+**Classes.** `diffusion/Umt5Encoder` (`CACHE_FILE`, `CACHE_INDEX`, `openCache`, `writeCache`, the constructor `Umt5Encoder(dir, q8,
+cache)`), `diffusion/Checkpoint.files()` (the shards the index records), `diffusion/WanPipeline(dir, devices, q8, textCache)`,
+`diffusion/VideoCli` (passes the setting).
+
+**Why this design.** The quantized form is kept *on disk* rather than in memory: the encoder is still freed before the transformer
+starts (23.12.4), so the peak memory of a request does not grow by 5.2 GB, and the saving reaches every run of `jllm video`, which
+loads one pipeline per command (a copy kept in memory would help only a process that serves several Wan requests, and there is none:
+the servers stay AnimateDiff). The mapped pages are the operating system's file cache, which it can drop under memory pressure and
+which a following run often still finds in memory. The weights are the same bytes as a fresh quantization, so results do not change;
+the copy costs 5.2 GB of disk next to the 22.7 GB float files. The same idea is the LLMs' `jllm-<quant>.bin` (chapter 6), kept
+separate because the encoder's rows are not `QTensor` blobs and its float files are the only source of truth.
+
+**Settings.** `video.text-encoder-cache` (default `true`); `false` keeps the old path: quantize on every run and write nothing.
+`scripts/mac-validate.sh` has a row for each (`WanBench <model> t5 false|true`: read and encode 64 tokens twice, the second run timed)
+when `text_encoder/` is in the Wan folder.
+
+**Checks and limits.** `WanTest` (in `mvn install`), on a copy of the tiny encoder: nothing is written with the switch off; the first
+encoder with it on writes both files and encodes the same bits as without the cache, the next maps the copy and encodes the same bits;
+a changed modification time of the float file, a truncated `.bin` and an index of another version are each refused and quantized
+again; a float (not int8) encoder never reads the copy. **Not measured**: the read time of the real 22.7 GB encoder against its 5.2 GB
+copy (its weights were not downloaded, 23.12).
 
 ---
 

@@ -48,8 +48,8 @@ public final class VideoCli {
 
     /**
      * Wan 2.1 text-to-video from a local folder (docs/23 section 23.12): frames must be 4k + 1 (rounded down), sizes multiples of 16, the
-     * text encoder is quantized to int8 on the CPU while it is read, the transformer runs in float32 on the GPU unless
-     * {@code video.precision} says f16.
+     * text encoder is quantized to int8 on the CPU while it is read (or its int8 copy mapped, {@code video.text-encoder-cache}), the
+     * transformer runs in float32 on the GPU unless {@code video.precision} says f16.
      */
     private static void runWan(Settings s, String source) throws Exception {
         String prompt = s.has("prompt") ? s.get("prompt") : "a red balloon floating over a green hill, white clouds moving, photo";
@@ -64,7 +64,7 @@ public final class VideoCli {
         w = w == 0 ? 480 : w;
         h = h == 0 ? (w == 480 ? 272 : w) : h;
         Devices dev = Devices.open(s.get("video.backend"), prec, false);
-        try (WanPipeline pipe = new WanPipeline(Path.of(source), dev, true)) {
+        try (WanPipeline pipe = new WanPipeline(Path.of(source), dev, true, s.getBool("video.text-encoder-cache"))) {
             System.err.println("Wan 2.1 text-to-video, " + dev.description() + ", text encoder int8 on the CPU");
             WanPipeline.Request r = new WanPipeline.Request(prompt, pick(s, "image.negative", "video.negative"), w, h, frames, steps <= 0 ? 30 : steps,
                     guidance < 0 ? 5.0 : guidance, seed < 0 ? ThreadLocalRandom.current().nextLong(0, 1L << 31) : seed,

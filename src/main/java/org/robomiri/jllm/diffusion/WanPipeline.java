@@ -23,8 +23,10 @@ import java.util.Map;
  *   x · std + mean ──VAE decode──▶ 1 + 4 (F' − 1) frames
  * </pre>
  *
- * The text encoder is large (5.7 B parameters): it is read and quantized to int8 on the first request and then kept for later requests,
- * so the 22.7 GB float32 file is read (and the weights quantized) once per pipeline rather than once per prompt.
+ * The text encoder is large (5.7 B parameters): it is read and quantized to int8 when a request arrives, used for the prompt and the
+ * negative prompt and released before the transformer starts, so that its 4.6 GB and the transformer's weights are never needed at once.
+ * With the text cache on, the int8 copy is written next to the float32 files once ({@link Umt5Encoder#CACHE_FILE}) and later requests map
+ * it instead of reading and quantizing the 22.7 GB float32 file again.
  */
 public final class WanPipeline implements AutoCloseable {
 
@@ -50,9 +52,8 @@ public final class WanPipeline implements AutoCloseable {
     private final WanVae vae;
     private final Map<String, Object> schedulerConfig;
     private final boolean q8;
+    private final boolean textCache;
     private final UnigramTokenizer tokenizer;
-    /** Built on the first request and reused: the 22.7 GB float32 file is read and quantized only once. */
-    private Umt5Encoder textEncoder;
     public volatile long textNs, ditNs, vaeNs, totalNs;
     public volatile float[] lastLatents;
 
@@ -60,9 +61,18 @@ public final class WanPipeline implements AutoCloseable {
      * @param q8 quantize the text encoder to int8 while reading it (needed for the real 5.7 B model; the tiny test model runs in float)
      */
     public WanPipeline(Path dir, Devices devices, boolean q8) throws IOException {
+        this(dir, devices, q8, false);
+    }
+
+    /**
+     * @param textCache with {@code q8}: keep the int8 text encoder on disk next to its float32 files and map it on later requests
+     *                  ({@code video.text-encoder-cache}, {@link Umt5Encoder#Umt5Encoder(Path, boolean, boolean)})
+     */
+    public WanPipeline(Path dir, Devices devices, boolean q8, boolean textCache) throws IOException {
         this.dir = dir;
         this.devices = devices;
         this.q8 = q8;
+        this.textCache = textCache;
         Map<String, Object> index = Json.parseObject(Files.readString(dir.resolve("model_index.json"), StandardCharsets.UTF_8));
         if (!"WanPipeline".equals(Json.str(index, "_class_name", ""))) {
             throw new IOException("unsupported pipeline " + Json.str(index, "_class_name", "") + " in " + dir + " (Wan 2.1 text-to-video: WanPipeline)");
@@ -91,14 +101,6 @@ public final class WanPipeline implements AutoCloseable {
 
     private static String clean(String s) {
         return s.replaceAll("\\s+", " ").strip();
-    }
-
-    /** The shared UMT5 encoder: read and quantized on first use, reused by every later request of this pipeline. */
-    private Umt5Encoder textEncoder() throws IOException {
-        if (textEncoder == null) {
-            textEncoder = new Umt5Encoder(dir.resolve("text_encoder"), q8);
-        }
-        return textEncoder;
     }
 
     private int[] ids(String text) {
@@ -137,10 +139,11 @@ public final class WanPipeline implements AutoCloseable {
         int[] nid = ids(r.negativePrompt() == null ? "" : r.negativePrompt());
         float[] pe;
         float[] ne = null;
-        Umt5Encoder enc = textEncoder();
-        pe = enc.encode(pid);
-        if (cfg) {
-            ne = enc.encode(nid);
+        try (Umt5Encoder enc = new Umt5Encoder(dir.resolve("text_encoder"), q8, textCache)) {
+            pe = enc.encode(pid);
+            if (cfg) {
+                ne = enc.encode(nid);
+            }
         }
         int d = pe.length / pid.length;
         cond = dit.encodeText(padded(pe, pid.length, d), MAX_TEXT);
@@ -228,9 +231,6 @@ public final class WanPipeline implements AutoCloseable {
 
     @Override
     public void close() {
-        if (textEncoder != null) {
-            textEncoder.close();
-        }
         dit.close();
         vae.close();
         devices.close();

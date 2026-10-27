@@ -332,6 +332,7 @@ public final class Settings {
         require(getInt("video.steps") >= 0 && getInt("video.steps") <= 200, "video.steps", "must be 0 (model default) .. 200");
         require(getInt("video.width") >= 0 && getInt("video.height") >= 0, "video.width", "and video.height must be 0 (model default) or positive");
         require(getInt("video.decode-chunk") >= 1 && getInt("video.decode-chunk") <= 32, "video.decode-chunk", "must be 1..32");
+        getBool("video.text-encoder-cache");
         getLong("video.seed");
         getFloat("video.guidance");
         require(get("vision.backend").matches("cpu|metal|auto"), "vision.backend", "must be cpu, metal or auto");

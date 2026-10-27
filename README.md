@@ -518,7 +518,7 @@ Settings added with the features above (all in [`src/main/resources/jllm.propert
 | `model.mmproj`, `vision.*` (`enabled`, `auto-download`, `backend`, `image-min-tokens`, `image-max-tokens`, `cache-mb`, `max-image-bytes`, `max-image-pixels`, `allow-private-urls`) | `auto-discovered`, ... | pictures as input ([20 §20.9](docs/20-vision.md#209-settings)) |
 | `audio.*` (`stt-model`, `tts-model`, `backend`, `metal.decoder`, `threads`, `resident-mb`, `ffmpeg`, `max-seconds`, `max-upload-mb`, `tts.*`, `stt.*`, `codec-*`) | see the file | Whisper and OuteTTS ([21](docs/21-audio.md)) |
 | `image.*` (`model`, `backend`, `precision`, `vae-tile`, `vae-tile-overlap`, `steps`, `guidance`, `width`, `height`, `seed`, `scheduler`, `negative`, `count`, `out`, `init`, `mask`, `strength`) | see the file | image generation ([22](docs/22-image-generation.md)) |
-| `video.*` (`enabled`, `model`, `base-model`, `backend`, `precision`, `ffmpeg`, `format`, `decode-chunk`, `frames`, `fps`, `steps`, `guidance`, `width`, `height`, `seed`, `scheduler`, `negative`, `out`) | see the file | video generation ([23](docs/23-video-generation.md)) |
+| `video.*` (`enabled`, `model`, `base-model`, `backend`, `precision`, `ffmpeg`, `format`, `decode-chunk`, `text-encoder-cache`, `frames`, `fps`, `steps`, `guidance`, `width`, `height`, `seed`, `scheduler`, `negative`, `out`) | see the file | video generation ([23](docs/23-video-generation.md)) |
 | `bench.prompt-repeat` | `40` | the bench prompt repeats one sentence this many times: 40 = ~413 tokens, 200 = ~2 000 |
 
 JVM switches (through `JAVA_OPTS`, for comparisons and fallbacks; each keeps the old path when set the other way):
