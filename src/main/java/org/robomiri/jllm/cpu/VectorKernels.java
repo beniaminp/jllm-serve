@@ -3,6 +3,7 @@ package org.robomiri.jllm.cpu;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
 import org.robomiri.jllm.model.QTensor;
 import org.robomiri.jllm.model.QType;
@@ -55,24 +56,49 @@ public final class VectorKernels {
     }
 
     /**
-     * The lanes of {@code v} added in a fixed order, adjacent pairs first: {@code ((l0 + l1) + (l2 + l3))} on NEON. Used
-     * instead of {@code reduceLanes(ADD)}, whose order is unspecified: the Java fallback that the interpreter and C1 run
-     * adds the lanes one after the other, the C2 code on NEON in pairs, so a kernel summed differently until C2 took over
-     * and two runs of the same prompt (or the CPU experts of the Metal split, whose first pass runs cold) differed in the
-     * last bit. This order is the one C2 uses on 128-bit NEON, so steady-state results are unchanged. The 16 lanes of
-     * AVX-512 (and any other width) are added in the same adjacent-pairs tree: left to {@code reduceLanes}, a 16-lane x86
-     * machine had the same cold-JIT difference (PagedKvTest's repeated flat attention differed in the last bit). Public for the
-     * image, audio and vision kernels, whose vectors are the same preferred species.
+     * The lanes of {@code v} added in a fixed order, the same in the interpreter, in C1 and in C2. Used instead of
+     * {@code reduceLanes(ADD)}, whose order is unspecified: the Java fallback that the interpreter and C1 run adds the lanes
+     * one after the other, C2 as a tree, so a kernel summed differently until C2 took over and two runs of the same prompt
+     * (or the CPU experts of the Metal split, whose first pass runs cold) differed in the last bit (docs/07 section 7.14).
+     *
+     * <ul>
+     *   <li>4 lanes (NEON): {@code (l0 + l1) + (l2 + l3)}, the order C2 uses on 128-bit NEON, so steady-state results did not
+     *       change there.</li>
+     *   <li>8 and 16 lanes (AVX2, AVX-512): a butterfly of whole-vector permutes and adds, {@code v += v.rearrange(i ^ FL/2)},
+     *       then {@code i ^ FL/4}, ... {@code i ^ 1}, and lane 0. A permute only moves data, so every tier gets the same bits.
+     *       Reading the lanes one by one ({@code v.lane(i)}) would cost far more: each read expands into many C2 nodes, and a
+     *       tile kernel with sixteen such sums is no longer inlined (NodeCountInliningCutoff) and boxes its vectors.</li>
+     * </ul>
+     *
+     * Kernels that sum many accumulators at once ({@link #dot4x4}, {@link #dot4}, {@code audio/Dense}, {@code vision/VMath})
+     * write the same butterfly out on each accumulator in their own body, store them ({@link #tile}) and read lane 0: a call
+     * that takes the vectors would not be inlined there either. The results are bit for bit those of this method.
      */
     public static float laneSum(FloatVector v) {
-        return switch (FL) {
-            case 4 -> (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
-            case 8 -> ((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7)));
-            case 16 -> (((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7))))
-                    + (((v.lane(8) + v.lane(9)) + (v.lane(10) + v.lane(11))) + ((v.lane(12) + v.lane(13)) + (v.lane(14) + v.lane(15))));
-            default -> pairwiseSum(v.toArray());
-        };
+        if (FL == 4) {
+            return laneSum4(v);
+        }
+        if (FL == 8 || FL == 16) {
+            v = v.add(v.rearrange(SWH));
+            v = v.add(v.rearrange(SWQ));
+            v = v.add(v.rearrange(SWE));
+            if (FL == 16) {
+                v = v.add(v.rearrange(SW1));
+            }
+            return v.lane(0);
+        }
+        return pairwiseSum(v.toArray());
     }
+
+    /**
+     * The butterfly's permutes (constants: C2 compiles a constant permute as one instruction): lane {@code i} with lane
+     * {@code i ^ FL/2} ({@code SWH}), {@code i ^ FL/4} ({@code SWQ}), {@code i ^ FL/8} ({@code SWE}) and, on 16 lanes,
+     * {@code i ^ 1} ({@code SW1}). Public for the audio and vision kernels that write the butterfly out.
+     */
+    public static final VectorShuffle<Float> SWH = VectorShuffle.fromOp(F, i -> i ^ Math.max(1, FL / 2));
+    public static final VectorShuffle<Float> SWQ = VectorShuffle.fromOp(F, i -> i ^ Math.max(1, FL / 4));
+    public static final VectorShuffle<Float> SWE = VectorShuffle.fromOp(F, i -> i ^ Math.max(1, FL / 8));
+    public static final VectorShuffle<Float> SW1 = VectorShuffle.fromOp(F, i -> i ^ 1);
 
     /** The adjacent-pairs tree of {@link #laneSum} for any power-of-two lane count (a lone lane is carried up a level). */
     static float pairwiseSum(float[] a) {
@@ -245,7 +271,35 @@ public final class VectorKernels {
             s2 = FloatVector.fromArray(F, w, wo + 2 * n + i).fma(xv, s2);
             s3 = FloatVector.fromArray(F, w, wo + 3 * n + i).fma(xv, s3);
         }
-        store4(out, oo, s0, s1, s2, s3, acc);
+        if (FL == 4) {
+            store4(out, oo, s0, s1, s2, s3, acc);
+            return;
+        }
+        // wider vectors: laneSum's butterfly written out on each (see dot4x4), stored, lane 0 read
+        s0 = s0.add(s0.rearrange(SWH));
+        s0 = s0.add(s0.rearrange(SWQ));
+        s0 = s0.add(s0.rearrange(SWE));
+        s1 = s1.add(s1.rearrange(SWH));
+        s1 = s1.add(s1.rearrange(SWQ));
+        s1 = s1.add(s1.rearrange(SWE));
+        s2 = s2.add(s2.rearrange(SWH));
+        s2 = s2.add(s2.rearrange(SWQ));
+        s2 = s2.add(s2.rearrange(SWE));
+        s3 = s3.add(s3.rearrange(SWH));
+        s3 = s3.add(s3.rearrange(SWQ));
+        s3 = s3.add(s3.rearrange(SWE));
+        if (FL == 16) { // the fourth step of 16 lanes
+            s0 = s0.add(s0.rearrange(SW1));
+            s1 = s1.add(s1.rearrange(SW1));
+            s2 = s2.add(s2.rearrange(SW1));
+            s3 = s3.add(s3.rearrange(SW1));
+        }
+        float[] t = TILE.get();
+        s0.intoArray(t, 0);
+        s1.intoArray(t, FL);
+        s2.intoArray(t, 2 * FL);
+        s3.intoArray(t, 3 * FL);
+        storeLane0(t, 0, out, oo, acc);
     }
 
     /**
@@ -286,10 +340,125 @@ public final class VectorKernels {
             d2 = w2.fma(xv, d2);
             d3 = w3.fma(xv, d3);
         }
-        store4(out, oa, a0, a1, a2, a3, acc);
-        store4(out, ob, b0, b1, b2, b3, acc);
-        store4(out, oc, c0, c1, c2, c3, acc);
-        store4(out, od, d0, d1, d2, d3, acc);
+        if (FL == 4) {
+            store4(out, oa, a0, a1, a2, a3, acc);
+            store4(out, ob, b0, b1, b2, b3, acc);
+            store4(out, oc, c0, c1, c2, c3, acc);
+            store4(out, od, d0, d1, d2, d3, acc);
+            return;
+        }
+        // 8 or 16 lanes: the sixteen accumulators are stored (one node each) and summed in scalar code. Passed to store4
+        // instead, only the first of its four calls was inlined (NodeCountInliningCutoff) and the other twelve vectors
+        // were boxed for every tile, which made CPU prefill on AVX-512 seven times slower.
+        // the butterfly of laneSum on each accumulator, written out (a call taking the vectors would not be inlined)
+        a0 = a0.add(a0.rearrange(SWH));
+        a0 = a0.add(a0.rearrange(SWQ));
+        a0 = a0.add(a0.rearrange(SWE));
+        a1 = a1.add(a1.rearrange(SWH));
+        a1 = a1.add(a1.rearrange(SWQ));
+        a1 = a1.add(a1.rearrange(SWE));
+        a2 = a2.add(a2.rearrange(SWH));
+        a2 = a2.add(a2.rearrange(SWQ));
+        a2 = a2.add(a2.rearrange(SWE));
+        a3 = a3.add(a3.rearrange(SWH));
+        a3 = a3.add(a3.rearrange(SWQ));
+        a3 = a3.add(a3.rearrange(SWE));
+        b0 = b0.add(b0.rearrange(SWH));
+        b0 = b0.add(b0.rearrange(SWQ));
+        b0 = b0.add(b0.rearrange(SWE));
+        b1 = b1.add(b1.rearrange(SWH));
+        b1 = b1.add(b1.rearrange(SWQ));
+        b1 = b1.add(b1.rearrange(SWE));
+        b2 = b2.add(b2.rearrange(SWH));
+        b2 = b2.add(b2.rearrange(SWQ));
+        b2 = b2.add(b2.rearrange(SWE));
+        b3 = b3.add(b3.rearrange(SWH));
+        b3 = b3.add(b3.rearrange(SWQ));
+        b3 = b3.add(b3.rearrange(SWE));
+        c0 = c0.add(c0.rearrange(SWH));
+        c0 = c0.add(c0.rearrange(SWQ));
+        c0 = c0.add(c0.rearrange(SWE));
+        c1 = c1.add(c1.rearrange(SWH));
+        c1 = c1.add(c1.rearrange(SWQ));
+        c1 = c1.add(c1.rearrange(SWE));
+        c2 = c2.add(c2.rearrange(SWH));
+        c2 = c2.add(c2.rearrange(SWQ));
+        c2 = c2.add(c2.rearrange(SWE));
+        c3 = c3.add(c3.rearrange(SWH));
+        c3 = c3.add(c3.rearrange(SWQ));
+        c3 = c3.add(c3.rearrange(SWE));
+        d0 = d0.add(d0.rearrange(SWH));
+        d0 = d0.add(d0.rearrange(SWQ));
+        d0 = d0.add(d0.rearrange(SWE));
+        d1 = d1.add(d1.rearrange(SWH));
+        d1 = d1.add(d1.rearrange(SWQ));
+        d1 = d1.add(d1.rearrange(SWE));
+        d2 = d2.add(d2.rearrange(SWH));
+        d2 = d2.add(d2.rearrange(SWQ));
+        d2 = d2.add(d2.rearrange(SWE));
+        d3 = d3.add(d3.rearrange(SWH));
+        d3 = d3.add(d3.rearrange(SWQ));
+        d3 = d3.add(d3.rearrange(SWE));
+        if (FL == 16) { // the fourth step of 16 lanes
+            a0 = a0.add(a0.rearrange(SW1));
+            a1 = a1.add(a1.rearrange(SW1));
+            a2 = a2.add(a2.rearrange(SW1));
+            a3 = a3.add(a3.rearrange(SW1));
+            b0 = b0.add(b0.rearrange(SW1));
+            b1 = b1.add(b1.rearrange(SW1));
+            b2 = b2.add(b2.rearrange(SW1));
+            b3 = b3.add(b3.rearrange(SW1));
+            c0 = c0.add(c0.rearrange(SW1));
+            c1 = c1.add(c1.rearrange(SW1));
+            c2 = c2.add(c2.rearrange(SW1));
+            c3 = c3.add(c3.rearrange(SW1));
+            d0 = d0.add(d0.rearrange(SW1));
+            d1 = d1.add(d1.rearrange(SW1));
+            d2 = d2.add(d2.rearrange(SW1));
+            d3 = d3.add(d3.rearrange(SW1));
+        }
+        float[] t = TILE.get();
+        a0.intoArray(t, 0);
+        a1.intoArray(t, FL);
+        a2.intoArray(t, 2 * FL);
+        a3.intoArray(t, 3 * FL);
+        b0.intoArray(t, 4 * FL);
+        b1.intoArray(t, 5 * FL);
+        b2.intoArray(t, 6 * FL);
+        b3.intoArray(t, 7 * FL);
+        c0.intoArray(t, 8 * FL);
+        c1.intoArray(t, 9 * FL);
+        c2.intoArray(t, 10 * FL);
+        c3.intoArray(t, 11 * FL);
+        d0.intoArray(t, 12 * FL);
+        d1.intoArray(t, 13 * FL);
+        d2.intoArray(t, 14 * FL);
+        d3.intoArray(t, 15 * FL);
+        storeLane0(t, 0, out, oa, acc);
+        storeLane0(t, 4 * FL, out, ob, acc);
+        storeLane0(t, 8 * FL, out, oc, acc);
+        storeLane0(t, 12 * FL, out, od, acc);
+    }
+
+    /** Per thread: the accumulators of a {@link #dot4x4} tile (or of {@link #dot4}) stored after their butterfly. */
+    private static final ThreadLocal<float[]> TILE = ThreadLocal.withInitial(() -> new float[16 * FL]);
+
+    /**
+     * The calling thread's scratch of {@code 16 * FL} floats, for kernels outside this class (audio, vision) that run
+     * {@link #laneSum}'s butterfly on their accumulators themselves and store them to read lane 0: on 8 and 16 lanes a
+     * tile that calls {@link #laneSum} on each of its accumulators is too large for C2 to inline the calls, and the
+     * vectors are boxed.
+     */
+    public static float[] tile() {
+        return TILE.get();
+    }
+
+    /** {@code out[oo + j] (+)= t[base + j * FL]} for {@code j < 4}: lane 0 of four stored accumulators, which holds their sum. */
+    private static void storeLane0(float[] t, int base, float[] out, int oo, boolean acc) {
+        for (int j = 0; j < 4; j++) {
+            float r = t[base + j * FL];
+            out[oo + j] = acc ? out[oo + j] + r : r;
+        }
     }
 
     private static void store4(float[] out, int oo, FloatVector s0, FloatVector s1, FloatVector s2, FloatVector s3,

@@ -61,10 +61,40 @@ final class VMath {
             s2 = FloatVector.fromArray(F, w, wo + 2 * n + i).fma(xv, s2);
             s3 = FloatVector.fromArray(F, w, wo + 3 * n + i).fma(xv, s3);
         }
-        out[oo] = VectorKernels.laneSum(s0);
-        out[oo + 1] = VectorKernels.laneSum(s1);
-        out[oo + 2] = VectorKernels.laneSum(s2);
-        out[oo + 3] = VectorKernels.laneSum(s3);
+        if (FL == 4) {
+            out[oo] = VectorKernels.laneSum(s0);
+            out[oo + 1] = VectorKernels.laneSum(s1);
+            out[oo + 2] = VectorKernels.laneSum(s2);
+            out[oo + 3] = VectorKernels.laneSum(s3);
+            return;
+        }
+        // 8 / 16 lanes: VectorKernels.laneSum's butterfly written out on each accumulator, stored, lane 0 read (the same bits)
+        s0 = s0.add(s0.rearrange(VectorKernels.SWH));
+        s0 = s0.add(s0.rearrange(VectorKernels.SWQ));
+        s0 = s0.add(s0.rearrange(VectorKernels.SWE));
+        s1 = s1.add(s1.rearrange(VectorKernels.SWH));
+        s1 = s1.add(s1.rearrange(VectorKernels.SWQ));
+        s1 = s1.add(s1.rearrange(VectorKernels.SWE));
+        s2 = s2.add(s2.rearrange(VectorKernels.SWH));
+        s2 = s2.add(s2.rearrange(VectorKernels.SWQ));
+        s2 = s2.add(s2.rearrange(VectorKernels.SWE));
+        s3 = s3.add(s3.rearrange(VectorKernels.SWH));
+        s3 = s3.add(s3.rearrange(VectorKernels.SWQ));
+        s3 = s3.add(s3.rearrange(VectorKernels.SWE));
+        if (FL == 16) { // the fourth step of 16 lanes
+            s0 = s0.add(s0.rearrange(VectorKernels.SW1));
+            s1 = s1.add(s1.rearrange(VectorKernels.SW1));
+            s2 = s2.add(s2.rearrange(VectorKernels.SW1));
+            s3 = s3.add(s3.rearrange(VectorKernels.SW1));
+        }
+        float[] t = VectorKernels.tile();
+        s0.intoArray(t, 0);
+        s1.intoArray(t, FL);
+        s2.intoArray(t, 2 * FL);
+        s3.intoArray(t, 3 * FL);
+        for (int j = 0; j < 4; j++) {
+            out[oo + j] = t[j * FL];
+        }
     }
 
     private static void dot4x4(float[] w, int wo, int n, float[] x, int xa, int xb, int xc, int xd,
@@ -99,10 +129,104 @@ final class VMath {
             d2 = w2.fma(xv, d2);
             d3 = w3.fma(xv, d3);
         }
-        store4(out, oa, a0, a1, a2, a3);
-        store4(out, ob, b0, b1, b2, b3);
-        store4(out, oc, c0, c1, c2, c3);
-        store4(out, od, d0, d1, d2, d3);
+        if (FL == 4) {
+            store4(out, oa, a0, a1, a2, a3);
+            store4(out, ob, b0, b1, b2, b3);
+            store4(out, oc, c0, c1, c2, c3);
+            store4(out, od, d0, d1, d2, d3);
+            return;
+        }
+        // 8 / 16 lanes: VectorKernels.laneSum's butterfly written out on each accumulator, then stored and lane 0 read (the
+        // same bits). Passed to store4 instead, C2 inlined only the first call (NodeCountInliningCutoff) and boxed the others.
+        a0 = a0.add(a0.rearrange(VectorKernels.SWH));
+        a0 = a0.add(a0.rearrange(VectorKernels.SWQ));
+        a0 = a0.add(a0.rearrange(VectorKernels.SWE));
+        a1 = a1.add(a1.rearrange(VectorKernels.SWH));
+        a1 = a1.add(a1.rearrange(VectorKernels.SWQ));
+        a1 = a1.add(a1.rearrange(VectorKernels.SWE));
+        a2 = a2.add(a2.rearrange(VectorKernels.SWH));
+        a2 = a2.add(a2.rearrange(VectorKernels.SWQ));
+        a2 = a2.add(a2.rearrange(VectorKernels.SWE));
+        a3 = a3.add(a3.rearrange(VectorKernels.SWH));
+        a3 = a3.add(a3.rearrange(VectorKernels.SWQ));
+        a3 = a3.add(a3.rearrange(VectorKernels.SWE));
+        b0 = b0.add(b0.rearrange(VectorKernels.SWH));
+        b0 = b0.add(b0.rearrange(VectorKernels.SWQ));
+        b0 = b0.add(b0.rearrange(VectorKernels.SWE));
+        b1 = b1.add(b1.rearrange(VectorKernels.SWH));
+        b1 = b1.add(b1.rearrange(VectorKernels.SWQ));
+        b1 = b1.add(b1.rearrange(VectorKernels.SWE));
+        b2 = b2.add(b2.rearrange(VectorKernels.SWH));
+        b2 = b2.add(b2.rearrange(VectorKernels.SWQ));
+        b2 = b2.add(b2.rearrange(VectorKernels.SWE));
+        b3 = b3.add(b3.rearrange(VectorKernels.SWH));
+        b3 = b3.add(b3.rearrange(VectorKernels.SWQ));
+        b3 = b3.add(b3.rearrange(VectorKernels.SWE));
+        c0 = c0.add(c0.rearrange(VectorKernels.SWH));
+        c0 = c0.add(c0.rearrange(VectorKernels.SWQ));
+        c0 = c0.add(c0.rearrange(VectorKernels.SWE));
+        c1 = c1.add(c1.rearrange(VectorKernels.SWH));
+        c1 = c1.add(c1.rearrange(VectorKernels.SWQ));
+        c1 = c1.add(c1.rearrange(VectorKernels.SWE));
+        c2 = c2.add(c2.rearrange(VectorKernels.SWH));
+        c2 = c2.add(c2.rearrange(VectorKernels.SWQ));
+        c2 = c2.add(c2.rearrange(VectorKernels.SWE));
+        c3 = c3.add(c3.rearrange(VectorKernels.SWH));
+        c3 = c3.add(c3.rearrange(VectorKernels.SWQ));
+        c3 = c3.add(c3.rearrange(VectorKernels.SWE));
+        d0 = d0.add(d0.rearrange(VectorKernels.SWH));
+        d0 = d0.add(d0.rearrange(VectorKernels.SWQ));
+        d0 = d0.add(d0.rearrange(VectorKernels.SWE));
+        d1 = d1.add(d1.rearrange(VectorKernels.SWH));
+        d1 = d1.add(d1.rearrange(VectorKernels.SWQ));
+        d1 = d1.add(d1.rearrange(VectorKernels.SWE));
+        d2 = d2.add(d2.rearrange(VectorKernels.SWH));
+        d2 = d2.add(d2.rearrange(VectorKernels.SWQ));
+        d2 = d2.add(d2.rearrange(VectorKernels.SWE));
+        d3 = d3.add(d3.rearrange(VectorKernels.SWH));
+        d3 = d3.add(d3.rearrange(VectorKernels.SWQ));
+        d3 = d3.add(d3.rearrange(VectorKernels.SWE));
+        if (FL == 16) { // the fourth step of 16 lanes
+            a0 = a0.add(a0.rearrange(VectorKernels.SW1));
+            a1 = a1.add(a1.rearrange(VectorKernels.SW1));
+            a2 = a2.add(a2.rearrange(VectorKernels.SW1));
+            a3 = a3.add(a3.rearrange(VectorKernels.SW1));
+            b0 = b0.add(b0.rearrange(VectorKernels.SW1));
+            b1 = b1.add(b1.rearrange(VectorKernels.SW1));
+            b2 = b2.add(b2.rearrange(VectorKernels.SW1));
+            b3 = b3.add(b3.rearrange(VectorKernels.SW1));
+            c0 = c0.add(c0.rearrange(VectorKernels.SW1));
+            c1 = c1.add(c1.rearrange(VectorKernels.SW1));
+            c2 = c2.add(c2.rearrange(VectorKernels.SW1));
+            c3 = c3.add(c3.rearrange(VectorKernels.SW1));
+            d0 = d0.add(d0.rearrange(VectorKernels.SW1));
+            d1 = d1.add(d1.rearrange(VectorKernels.SW1));
+            d2 = d2.add(d2.rearrange(VectorKernels.SW1));
+            d3 = d3.add(d3.rearrange(VectorKernels.SW1));
+        }
+        float[] t = VectorKernels.tile();
+        a0.intoArray(t, 0);
+        a1.intoArray(t, FL);
+        a2.intoArray(t, 2 * FL);
+        a3.intoArray(t, 3 * FL);
+        b0.intoArray(t, 4 * FL);
+        b1.intoArray(t, 5 * FL);
+        b2.intoArray(t, 6 * FL);
+        b3.intoArray(t, 7 * FL);
+        c0.intoArray(t, 8 * FL);
+        c1.intoArray(t, 9 * FL);
+        c2.intoArray(t, 10 * FL);
+        c3.intoArray(t, 11 * FL);
+        d0.intoArray(t, 12 * FL);
+        d1.intoArray(t, 13 * FL);
+        d2.intoArray(t, 14 * FL);
+        d3.intoArray(t, 15 * FL);
+        int[] o = {oa, ob, oc, od};
+        for (int g = 0; g < 4; g++) {
+            for (int j = 0; j < 4; j++) {
+                out[o[g] + j] = t[(4 * g + j) * FL];
+            }
+        }
     }
 
     private static void store4(float[] out, int oo, FloatVector s0, FloatVector s1, FloatVector s2, FloatVector s3) {

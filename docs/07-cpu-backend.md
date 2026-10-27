@@ -1269,19 +1269,62 @@ The Q4_0 / Q8_0 row dots and the 4-row / 4 x 4 prefill tiles (`dotQ4`, `dotQ8`, 
 kernels give the same bits in the interpreter, in C1 and in C2 (steady-state results did not change on NEON) and a CPU run no
 longer depends on when C2 took over. It was found as a flaky check of the Metal backend's CPU expert split
 ([8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)). The
-float `dot` and the softmax sums use it as well, and so, since a run on an x86 machine with AVX-512, do all widths: `laneSum`
-spelled out only 4 and 8 lanes and left the 16 lanes of a 512-bit vector to `reduceLanes`, which there sums sequentially in
-the interpreter and as a tree in C2 (46 of 64 random 16-lane sums differ), so `JitStableKernelsTest` and `PagedKvTest` failed
-on that machine. 16 lanes are now the same adjacent-pairs tree written out, any other width a generic pairwise sum
-(`pairwiseSum`); this changes the last bits of steady-state results on AVX-512 only, and the CPU exactness md5 of
-[11](11-performance.md) stayed the same there. The GGUF block dots (`GgufKernels`, `Q2KKernels`, `Q6KKernels`) and the K-quant
-int8 dots (`KQuantKernels`, 4 lanes through `laneSum4`) were changed the same way: on that machine the first call of 12 of the
-13 fixture formats differed from the compiled ones. `JitStableKernelsTest` checks all of them, the GGUF ones first: once any
-caller has made `reduceLanes` hot (the `MAX` of `Int8Kernels.quantize` does), C2 compiles that library method by itself and
-even an interpreted kernel then gets the compiled order, which hides a cold difference. The image, audio and vision CPU kernels
-(`diffusion/CpuOps`, `audio/Dense`, `vision/VMath`) add their lanes through the same `laneSum` (public for them);
-`JitStableKernelsTest` runs `Dense.mul`, whose first call differed from the compiled one before. No float `reduceLanes(ADD)`
-is left in the CPU kernels (the integer block sums of `KQuantKernels` keep it: integer addition is exact in any order).
+float `dot` and the softmax sums use it as well.
+
+**8 and 16 lanes (AVX2, AVX-512): a butterfly, written out where it is hot.** 🧸 Adding sixteen numbers can be done one after
+the other, or in pairs, then pairs of pairs. Both are fine, but the computer must always do it the *same* way, or two runs give
+answers that differ in the last digit. Doing it the same way must also not be slow: the obvious way ("take out number 1, then
+number 2, ...") turned out to be very slow for the Java compiler, so the numbers are folded in half instead (the first eight
+added to the last eight, then half of that, and so on), which the processor does in one instruction per fold.
+
+📐 On an x86 machine (Xeon, AVX-512 and AVX-512 VNNI, 4 cores, JDK 26.0.2) `laneSum` first spelled out only 4 and 8 lanes and
+left the 16 lanes of a 512-bit vector to `reduceLanes`, which sums sequentially in the interpreter and as a tree in C2 (46 of
+64 random 16-lane sums differ), so `JitStableKernelsTest` and `PagedKvTest` failed there. Writing the 16 lanes out as
+`v.lane(0) + v.lane(1) + ...` fixed the order but cost **7×** in CPU prefill: every `lane(i)` of a 512-bit vector expands
+into many C2 nodes, `dot4x4` (16 accumulators, 16 sums) passed C2's node budget, `store4` was inlined for its first call only
+(`-XX:+PrintInlining`: `NodeCountInliningCutoff`, "callee is too large") and the other twelve accumulators were **boxed** on
+every tile. The same cliff already existed in the original code on 8 lanes (AVX2), whose `laneSum` was `lane(0) ... lane(7)`.
+
+The fixed order now used for 8 and 16 lanes is a butterfly of whole-vector permutes and adds, then lane 0:
+
+```
+v = v + v.rearrange(i -> i ^ FL/2)      lane i holds l_i + l_(i^8)                      (16 lanes; 8 lanes start at i ^ 4)
+v = v + v.rearrange(i -> i ^ FL/4)      lane i holds (l_i + l_(i^8)) + (l_(i^4) + l_(i^12))
+v = v + v.rearrange(i -> i ^ FL/8)      ... then i ^ 1 on 16 lanes
+return v.lane(0)                        ((((l0+l8)+(l4+l12)) + ((l2+l10)+(l6+l14))) + (((l1+l9)+(l5+l13)) + ((l3+l11)+(l7+l15))))
+```
+
+A permute only moves data (`rearrange` with a `static final` shuffle is one `vpermps` in C2 and exact in the Java fallback), so
+the interpreter, C1 and C2 compute the same bits. The tile kernels that sum many accumulators at once (`VectorKernels.dot4x4`,
+`dot4`, `audio/Dense`, `vision/VMath`) write the same steps out on each accumulator in their own body, store the vectors to a
+per-thread scratch (`VectorKernels.tile()`) and read lane 0: a helper method taking the vectors would again not be inlined. The
+result equals `laneSum` bit for bit, so a tiled matmul equals the untiled one. 4 lanes (NEON) keep `(l0 + l1) + (l2 + l3)`, the
+order C2 uses there, so nothing changes on the Mac.
+
+*Measured* (Qwen3-0.6B Q4_0, float activations, f16 cache, `./jllm bench --backend cpu --backend.cpu.int8-activations false
+--backend.kv-dtype f16 --ctx 4096 --bench.prompt-repeat 60 --bench.max-tokens 32 --bench.rounds 3 --engine.speculative off`,
+613-token prompt, on that 4-core x86 VM; 8 lanes with `JAVA_OPTS=-XX:MaxVectorSize=32`; tok/s of two rounds):
+
+| lane sum | prefill, 16 lanes | decode, 16 lanes | prefill, 8 lanes | decode, 8 lanes | same bits in every JIT tier |
+|---|---|---|---|---|---|
+| before (`reduceLanes` on 16 lanes, `lane(0..7)` on 8, `4341f53`) | 228 – 258 | 28.0 – 30.8 | **23.1 – 23.2** | 17.5 – 17.9 | 16 lanes no, 8 lanes yes |
+| `lane(0..15)` written out (commit `8329c5f`) | 27.4 | 23.6 | — | — | yes |
+| stored, then summed in scalar code | 154 – 160 | 28.3 – 29.8 | 165 – 171 | 20.4 – 21.1 | yes |
+| **butterfly, written out in the tile kernels (now)** | **219 – 254** | 27.8 – 35.2 | **186 – 199** | 19.2 – 21.6 | yes |
+
+On the same machine, `vision/VMath.tile` (256 × 1024 by 64 tokens, one thread) went from 90.7 GFLOP/s (`reduceLanes`) to 76.5
+on 16 lanes and from 71.9 to 65.0 on 8, and `audio/Dense.mul` from 68.3 to 68.3 and from 74 – 93 to 75.7: a small price for
+results that no longer depend on when C2 took over. The CPU exactness md5 of [11](11-performance.md)
+(`79472f690f73bd28598d5d7fb5dee1a4`) is the same before and after, on 16 lanes.
+
+The GGUF block dots (`GgufKernels`, `Q2KKernels`, `Q6KKernels`) and the K-quant int8 dots (`KQuantKernels`, 4 lanes through
+`laneSum4`) were changed the same way: on that machine the first call of 12 of the 13 fixture formats differed from the
+compiled ones. `JitStableKernelsTest` checks all of them, the GGUF ones first: once any caller has made `reduceLanes` hot (the
+`MAX` of `Int8Kernels.quantize` does), C2 compiles that library method by itself and even an interpreted kernel then gets the
+compiled order, which hides a cold difference. The image, audio and vision CPU kernels (`diffusion/CpuOps`, `audio/Dense`,
+`vision/VMath`) use the same order; `JitStableKernelsTest` runs `Dense.mul`, whose first call differed from the compiled one
+before. No float `reduceLanes(ADD)` is left in the CPU kernels (the integer block sums of `KQuantKernels` keep it: integer
+addition is exact in any order). Checks: `JitStableKernelsTest` and `PagedKvTest` pass on 16 and on 8 lanes.
 
 ---
 

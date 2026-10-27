@@ -177,15 +177,106 @@ public final class Dense {
                     a23 = w2.fma(v3, a23);
                     a33 = w3.fma(v3, a33);
                 }
-                float[] r = {
-                        VectorKernels.laneSum(a00), VectorKernels.laneSum(a10),
-                        VectorKernels.laneSum(a20), VectorKernels.laneSum(a30),
-                        VectorKernels.laneSum(a01), VectorKernels.laneSum(a11),
-                        VectorKernels.laneSum(a21), VectorKernels.laneSum(a31),
-                        VectorKernels.laneSum(a02), VectorKernels.laneSum(a12),
-                        VectorKernels.laneSum(a22), VectorKernels.laneSum(a32),
-                        VectorKernels.laneSum(a03), VectorKernels.laneSum(a13),
-                        VectorKernels.laneSum(a23), VectorKernels.laneSum(a33)};
+                float[] r;
+                if (LANES == 4) {
+                    r = new float[]{
+                            VectorKernels.laneSum(a00), VectorKernels.laneSum(a10),
+                            VectorKernels.laneSum(a20), VectorKernels.laneSum(a30),
+                            VectorKernels.laneSum(a01), VectorKernels.laneSum(a11),
+                            VectorKernels.laneSum(a21), VectorKernels.laneSum(a31),
+                            VectorKernels.laneSum(a02), VectorKernels.laneSum(a12),
+                            VectorKernels.laneSum(a22), VectorKernels.laneSum(a32),
+                            VectorKernels.laneSum(a03), VectorKernels.laneSum(a13),
+                            VectorKernels.laneSum(a23), VectorKernels.laneSum(a33)};
+                } else { // 8 / 16 lanes: VectorKernels.laneSum's butterfly written out on each, stored, lane 0 read (the same bits)
+                    a00 = a00.add(a00.rearrange(VectorKernels.SWH));
+                    a00 = a00.add(a00.rearrange(VectorKernels.SWQ));
+                    a00 = a00.add(a00.rearrange(VectorKernels.SWE));
+                    a10 = a10.add(a10.rearrange(VectorKernels.SWH));
+                    a10 = a10.add(a10.rearrange(VectorKernels.SWQ));
+                    a10 = a10.add(a10.rearrange(VectorKernels.SWE));
+                    a20 = a20.add(a20.rearrange(VectorKernels.SWH));
+                    a20 = a20.add(a20.rearrange(VectorKernels.SWQ));
+                    a20 = a20.add(a20.rearrange(VectorKernels.SWE));
+                    a30 = a30.add(a30.rearrange(VectorKernels.SWH));
+                    a30 = a30.add(a30.rearrange(VectorKernels.SWQ));
+                    a30 = a30.add(a30.rearrange(VectorKernels.SWE));
+                    a01 = a01.add(a01.rearrange(VectorKernels.SWH));
+                    a01 = a01.add(a01.rearrange(VectorKernels.SWQ));
+                    a01 = a01.add(a01.rearrange(VectorKernels.SWE));
+                    a11 = a11.add(a11.rearrange(VectorKernels.SWH));
+                    a11 = a11.add(a11.rearrange(VectorKernels.SWQ));
+                    a11 = a11.add(a11.rearrange(VectorKernels.SWE));
+                    a21 = a21.add(a21.rearrange(VectorKernels.SWH));
+                    a21 = a21.add(a21.rearrange(VectorKernels.SWQ));
+                    a21 = a21.add(a21.rearrange(VectorKernels.SWE));
+                    a31 = a31.add(a31.rearrange(VectorKernels.SWH));
+                    a31 = a31.add(a31.rearrange(VectorKernels.SWQ));
+                    a31 = a31.add(a31.rearrange(VectorKernels.SWE));
+                    a02 = a02.add(a02.rearrange(VectorKernels.SWH));
+                    a02 = a02.add(a02.rearrange(VectorKernels.SWQ));
+                    a02 = a02.add(a02.rearrange(VectorKernels.SWE));
+                    a12 = a12.add(a12.rearrange(VectorKernels.SWH));
+                    a12 = a12.add(a12.rearrange(VectorKernels.SWQ));
+                    a12 = a12.add(a12.rearrange(VectorKernels.SWE));
+                    a22 = a22.add(a22.rearrange(VectorKernels.SWH));
+                    a22 = a22.add(a22.rearrange(VectorKernels.SWQ));
+                    a22 = a22.add(a22.rearrange(VectorKernels.SWE));
+                    a32 = a32.add(a32.rearrange(VectorKernels.SWH));
+                    a32 = a32.add(a32.rearrange(VectorKernels.SWQ));
+                    a32 = a32.add(a32.rearrange(VectorKernels.SWE));
+                    a03 = a03.add(a03.rearrange(VectorKernels.SWH));
+                    a03 = a03.add(a03.rearrange(VectorKernels.SWQ));
+                    a03 = a03.add(a03.rearrange(VectorKernels.SWE));
+                    a13 = a13.add(a13.rearrange(VectorKernels.SWH));
+                    a13 = a13.add(a13.rearrange(VectorKernels.SWQ));
+                    a13 = a13.add(a13.rearrange(VectorKernels.SWE));
+                    a23 = a23.add(a23.rearrange(VectorKernels.SWH));
+                    a23 = a23.add(a23.rearrange(VectorKernels.SWQ));
+                    a23 = a23.add(a23.rearrange(VectorKernels.SWE));
+                    a33 = a33.add(a33.rearrange(VectorKernels.SWH));
+                    a33 = a33.add(a33.rearrange(VectorKernels.SWQ));
+                    a33 = a33.add(a33.rearrange(VectorKernels.SWE));
+                    if (LANES == 16) { // the fourth step of 16 lanes
+                        a00 = a00.add(a00.rearrange(VectorKernels.SW1));
+                        a10 = a10.add(a10.rearrange(VectorKernels.SW1));
+                        a20 = a20.add(a20.rearrange(VectorKernels.SW1));
+                        a30 = a30.add(a30.rearrange(VectorKernels.SW1));
+                        a01 = a01.add(a01.rearrange(VectorKernels.SW1));
+                        a11 = a11.add(a11.rearrange(VectorKernels.SW1));
+                        a21 = a21.add(a21.rearrange(VectorKernels.SW1));
+                        a31 = a31.add(a31.rearrange(VectorKernels.SW1));
+                        a02 = a02.add(a02.rearrange(VectorKernels.SW1));
+                        a12 = a12.add(a12.rearrange(VectorKernels.SW1));
+                        a22 = a22.add(a22.rearrange(VectorKernels.SW1));
+                        a32 = a32.add(a32.rearrange(VectorKernels.SW1));
+                        a03 = a03.add(a03.rearrange(VectorKernels.SW1));
+                        a13 = a13.add(a13.rearrange(VectorKernels.SW1));
+                        a23 = a23.add(a23.rearrange(VectorKernels.SW1));
+                        a33 = a33.add(a33.rearrange(VectorKernels.SW1));
+                    }
+                    float[] tl = VectorKernels.tile();
+                    a00.intoArray(tl, 0);
+                    a10.intoArray(tl, LANES);
+                    a20.intoArray(tl, 2 * LANES);
+                    a30.intoArray(tl, 3 * LANES);
+                    a01.intoArray(tl, 4 * LANES);
+                    a11.intoArray(tl, 5 * LANES);
+                    a21.intoArray(tl, 6 * LANES);
+                    a31.intoArray(tl, 7 * LANES);
+                    a02.intoArray(tl, 8 * LANES);
+                    a12.intoArray(tl, 9 * LANES);
+                    a22.intoArray(tl, 10 * LANES);
+                    a32.intoArray(tl, 11 * LANES);
+                    a03.intoArray(tl, 12 * LANES);
+                    a13.intoArray(tl, 13 * LANES);
+                    a23.intoArray(tl, 14 * LANES);
+                    a33.intoArray(tl, 15 * LANES);
+                    r = new float[16];
+                    for (int i = 0; i < 16; i++) {
+                        r[i] = tl[i * LANES];
+                    }
+                }
                 for (; k < cols; k++) {
                     for (int tt = 0; tt < 4; tt++) {
                         float xv = x[x0 + tt * xs + k];
