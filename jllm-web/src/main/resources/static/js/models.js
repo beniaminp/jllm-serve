@@ -106,7 +106,7 @@ const Models = (() => {
       const total = shown.reduce((a, f) => a + Math.max(0, f.size), 0);
       out.innerHTML = `<p><strong>${esc(info.repo)}</strong> @ ${esc(info.revision)} · <span class="badge info">${info.video ? 'video model' : info.diffusers ? 'image model' : info.gguf ? 'GGUF' : 'safetensors'}</span>
         ${shown.length} files, ${fmtBytes(total)} · <a href="https://huggingface.co/${esc(info.repo)}" target="_blank" rel="noopener">model card ↗</a></p>
-        ${info.video ? '<p class="hint">An AnimateDiff motion adapter: loading it also downloads the Stable Diffusion 1.5 model it works with (<code>video.base-model</code>, fp16 files, about 2.6 GB, once). It makes short clips on the <a href="#video">Video</a> tab and on <code>/v1/videos/generations</code>.</p>' : ''}
+        ${info.video ? '<p class="hint">An AnimateDiff motion adapter: loading it also downloads the Stable Diffusion 1.5 model it works with (<code>video.base-model</code>, fp16 files, about 2.1 GB, once). It makes short clips on the <a href="#video">Video</a> tab and on <code>/v1/videos/generations</code>.</p>' : ''}
         ${info.diffusers ? '<p class="hint">A diffusers repository: the fp16 files are downloaded and run as text-to-image / image-to-image / inpainting on the <a href="#images">Images</a> tab.</p>' : info.gguf ? '' : '<p class="hint">Quantized once on first load into the model directory (Q4_0 by default), memory-mapped afterwards.</p>'}`;
       out.appendChild(loadForm({source, image: !!info.diffusers, video: !!info.video /* video */, revision: info.revision, gguf: info.gguf, ggufFiles: info.ggufFiles, ggufFile: info.file,
         quant: info.quant, defaultId: info.defaultId, download: true,

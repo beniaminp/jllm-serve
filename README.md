@@ -190,7 +190,7 @@ against diffusers: [docs/22](docs/22-image-generation.md).
 ./jllm-web/run.sh                                                                      # Models: load the adapter; then the Video tab
 ```
 
-The adapter (1.8 GB) and the Stable Diffusion 1.5 base it works with (2.6 GB, fp16 files) are downloaded once into `models/`. MP4 needs `ffmpeg`
+The adapter (1.8 GB) and the Stable Diffusion 1.5 base it works with (2.1 GB, fp16 files) are downloaded once into `models/`. MP4 needs `ffmpeg`
 on the PATH (`video.ffmpeg`); without it clips are animated WebP (lossless) or GIF. `video.enabled=false` switches the endpoints, the console tab
 and the chat tool off. All `video.*` keys are in [`jllm.properties`](src/main/resources/jllm.properties); how it works, the API shape (OpenAI has no
 video endpoint: it follows `/v1/images/generations`), the editor, accuracy against diffusers and the measured speed: [docs/23](docs/23-video-generation.md).
