@@ -1,8 +1,8 @@
 package org.robomiri.jllm.diffusion;
 
 import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
+import org.robomiri.jllm.cpu.VectorKernels;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
 import java.lang.foreign.Arena;
@@ -525,7 +525,7 @@ public final class CpuOps implements Ops {
         for (; i < SP.loopBound(n); i += L) {
             acc = FloatVector.fromArray(SP, a, ao + i).fma(FloatVector.fromArray(SP, b, bo + i), acc);
         }
-        float s = acc.reduceLanes(VectorOperators.ADD);
+        float s = VectorKernels.laneSum(acc); // a fixed order in every JIT tier
         for (; i < n; i++) {
             s += a[ao + i] * b[bo + i];
         }

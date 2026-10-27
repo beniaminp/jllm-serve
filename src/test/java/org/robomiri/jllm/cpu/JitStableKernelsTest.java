@@ -37,6 +37,7 @@ public final class JitStableKernelsTest {
         try (Arena arena = Arena.ofShared()) {
             gguf(arena);
         }
+        dense();
         int cols = 256;
         int rows = 16;
         Random rnd = new Random(42);
@@ -81,8 +82,45 @@ public final class JitStableKernelsTest {
             System.out.println("FAILED: " + failures);
             System.exit(1);
         }
-        System.out.println("JIT-stable kernels passed (the lane sums of dotRow, dot4 and dot4x4 and of the GGUF block dots give the"
-                + " interpreter's bits in C2)");
+        System.out.println("JIT-stable kernels passed (the lane sums of dotRow, dot4 and dot4x4, of the GGUF block dots and of the"
+                + " audio matmul give the interpreter's bits in C2)");
+    }
+
+    /**
+     * {@code audio/Dense.mul} (Whisper and the speech models: a 4 x 4 tile for four tokens and the row dot for the fifth), first
+     * results against later ones; the image ({@code diffusion/CpuOps}) and vision ({@code vision/VMath}) kernels add their lanes
+     * through the same {@code VectorKernels.laneSum}.
+     */
+    private static void dense() {
+        int rows = 12;
+        int cols = 96;
+        int n = 5;
+        Random rnd = new Random(9);
+        float[] w = new float[rows * cols];
+        float[] x = new float[n * cols];
+        for (int i = 0; i < w.length; i++) {
+            w[i] = rnd.nextFloat() - 0.5f;
+        }
+        for (int i = 0; i < x.length; i++) {
+            x[i] = rnd.nextFloat() - 0.5f;
+        }
+        org.robomiri.jllm.audio.Dense.Mat m = org.robomiri.jllm.audio.Dense.Mat.of(w, rows, cols, null);
+        try (ThreadPool tp = new ThreadPool(1)) {
+            float[] first = null;
+            for (int round = 0; round < 20_000; round++) {
+                float[] out = new float[n * rows];
+                org.robomiri.jllm.audio.Dense.mul(tp, m, x, 0, cols, n, out, 0, rows, false);
+                if (first == null) {
+                    first = out;
+                } else if (!Arrays.equals(first, out)) {
+                    failures++;
+                    int i = Arrays.mismatch(first, out);
+                    System.out.println("FAIL audio Dense.mul: output " + i + " of round " + round + " is " + out[i] + ", the first call gave "
+                            + first[i]);
+                    break;
+                }
+            }
+        }
     }
 
     /** The GGUF fixtures' 4 rows of 512 (as {@code GgufKernelsCheck} reads them), first results against later ones. */

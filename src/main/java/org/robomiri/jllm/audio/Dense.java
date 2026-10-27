@@ -1,9 +1,9 @@
 package org.robomiri.jllm.audio;
 
 import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 import org.robomiri.jllm.cpu.ThreadPool;
+import org.robomiri.jllm.cpu.VectorKernels;
 import org.robomiri.jllm.safetensors.SafeTensors;
 
 /**
@@ -178,14 +178,14 @@ public final class Dense {
                     a33 = w3.fma(v3, a33);
                 }
                 float[] r = {
-                        a00.reduceLanes(VectorOperators.ADD), a10.reduceLanes(VectorOperators.ADD),
-                        a20.reduceLanes(VectorOperators.ADD), a30.reduceLanes(VectorOperators.ADD),
-                        a01.reduceLanes(VectorOperators.ADD), a11.reduceLanes(VectorOperators.ADD),
-                        a21.reduceLanes(VectorOperators.ADD), a31.reduceLanes(VectorOperators.ADD),
-                        a02.reduceLanes(VectorOperators.ADD), a12.reduceLanes(VectorOperators.ADD),
-                        a22.reduceLanes(VectorOperators.ADD), a32.reduceLanes(VectorOperators.ADD),
-                        a03.reduceLanes(VectorOperators.ADD), a13.reduceLanes(VectorOperators.ADD),
-                        a23.reduceLanes(VectorOperators.ADD), a33.reduceLanes(VectorOperators.ADD)};
+                        VectorKernels.laneSum(a00), VectorKernels.laneSum(a10),
+                        VectorKernels.laneSum(a20), VectorKernels.laneSum(a30),
+                        VectorKernels.laneSum(a01), VectorKernels.laneSum(a11),
+                        VectorKernels.laneSum(a21), VectorKernels.laneSum(a31),
+                        VectorKernels.laneSum(a02), VectorKernels.laneSum(a12),
+                        VectorKernels.laneSum(a22), VectorKernels.laneSum(a32),
+                        VectorKernels.laneSum(a03), VectorKernels.laneSum(a13),
+                        VectorKernels.laneSum(a23), VectorKernels.laneSum(a33)};
                 for (; k < cols; k++) {
                     for (int tt = 0; tt < 4; tt++) {
                         float xv = x[x0 + tt * xs + k];
@@ -212,7 +212,7 @@ public final class Dense {
                 for (; k < bound; k += LANES) {
                     acc = FloatVector.fromArray(F, wa, wbase + k).fma(FloatVector.fromArray(F, x, x0 + k), acc);
                 }
-                float s = acc.reduceLanes(VectorOperators.ADD);
+                float s = VectorKernels.laneSum(acc);
                 for (; k < cols; k++) {
                     s += wa[wbase + k] * x[x0 + k];
                 }
@@ -323,7 +323,7 @@ public final class Dense {
         for (; i < bound; i += LANES) {
             acc = FloatVector.fromArray(F, a, ao + i).fma(FloatVector.fromArray(F, b, bo + i), acc);
         }
-        float s = acc.reduceLanes(VectorOperators.ADD);
+        float s = VectorKernels.laneSum(acc);
         for (; i < n; i++) {
             s += a[ao + i] * b[bo + i];
         }

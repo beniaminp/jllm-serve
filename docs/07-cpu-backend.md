@@ -1278,8 +1278,10 @@ on that machine. 16 lanes are now the same adjacent-pairs tree written out, any 
 int8 dots (`KQuantKernels`, 4 lanes through `laneSum4`) were changed the same way: on that machine the first call of 12 of the
 13 fixture formats differed from the compiled ones. `JitStableKernelsTest` checks all of them, the GGUF ones first: once any
 caller has made `reduceLanes` hot (the `MAX` of `Int8Kernels.quantize` does), C2 compiles that library method by itself and
-even an interpreted kernel then gets the compiled order, which hides a cold difference. Still on `reduceLanes(ADD)`: the
-image, audio and vision CPU kernels (`diffusion/CpuOps`, `audio/Dense`, `vision/VMath`).
+even an interpreted kernel then gets the compiled order, which hides a cold difference. The image, audio and vision CPU kernels
+(`diffusion/CpuOps`, `audio/Dense`, `vision/VMath`) add their lanes through the same `laneSum` (public for them);
+`JitStableKernelsTest` runs `Dense.mul`, whose first call differed from the compiled one before. No float `reduceLanes(ADD)`
+is left in the CPU kernels (the integer block sums of `KQuantKernels` keep it: integer addition is exact in any order).
 
 ---
 

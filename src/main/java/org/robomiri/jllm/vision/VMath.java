@@ -1,9 +1,9 @@
 package org.robomiri.jllm.vision;
 
 import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 import org.robomiri.jllm.cpu.ThreadPool;
+import org.robomiri.jllm.cpu.VectorKernels;
 
 /**
  * Float kernels of the CPU vision encoder: register-tiled matrix products (4 weight rows x 4 activation rows per
@@ -61,10 +61,10 @@ final class VMath {
             s2 = FloatVector.fromArray(F, w, wo + 2 * n + i).fma(xv, s2);
             s3 = FloatVector.fromArray(F, w, wo + 3 * n + i).fma(xv, s3);
         }
-        out[oo] = s0.reduceLanes(VectorOperators.ADD);
-        out[oo + 1] = s1.reduceLanes(VectorOperators.ADD);
-        out[oo + 2] = s2.reduceLanes(VectorOperators.ADD);
-        out[oo + 3] = s3.reduceLanes(VectorOperators.ADD);
+        out[oo] = VectorKernels.laneSum(s0);
+        out[oo + 1] = VectorKernels.laneSum(s1);
+        out[oo + 2] = VectorKernels.laneSum(s2);
+        out[oo + 3] = VectorKernels.laneSum(s3);
     }
 
     private static void dot4x4(float[] w, int wo, int n, float[] x, int xa, int xb, int xc, int xd,
@@ -106,10 +106,10 @@ final class VMath {
     }
 
     private static void store4(float[] out, int oo, FloatVector s0, FloatVector s1, FloatVector s2, FloatVector s3) {
-        out[oo] = s0.reduceLanes(VectorOperators.ADD);
-        out[oo + 1] = s1.reduceLanes(VectorOperators.ADD);
-        out[oo + 2] = s2.reduceLanes(VectorOperators.ADD);
-        out[oo + 3] = s3.reduceLanes(VectorOperators.ADD);
+        out[oo] = VectorKernels.laneSum(s0);
+        out[oo + 1] = VectorKernels.laneSum(s1);
+        out[oo + 2] = VectorKernels.laneSum(s2);
+        out[oo + 3] = VectorKernels.laneSum(s3);
     }
 
     /** Dequantizes one block of weight rows into a float array with row stride {@code kPad}. */

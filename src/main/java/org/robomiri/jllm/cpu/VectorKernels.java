@@ -61,9 +61,10 @@ public final class VectorKernels {
      * and two runs of the same prompt (or the CPU experts of the Metal split, whose first pass runs cold) differed in the
      * last bit. This order is the one C2 uses on 128-bit NEON, so steady-state results are unchanged. The 16 lanes of
      * AVX-512 (and any other width) are added in the same adjacent-pairs tree: left to {@code reduceLanes}, a 16-lane x86
-     * machine had the same cold-JIT difference (PagedKvTest's repeated flat attention differed in the last bit).
+     * machine had the same cold-JIT difference (PagedKvTest's repeated flat attention differed in the last bit). Public for the
+     * image, audio and vision kernels, whose vectors are the same preferred species.
      */
-    static float laneSum(FloatVector v) {
+    public static float laneSum(FloatVector v) {
         return switch (FL) {
             case 4 -> (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
             case 8 -> ((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7)));
