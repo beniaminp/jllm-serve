@@ -59,14 +59,31 @@ public final class VectorKernels {
      * instead of {@code reduceLanes(ADD)}, whose order is unspecified: the Java fallback that the interpreter and C1 run
      * adds the lanes one after the other, the C2 code on NEON in pairs, so a kernel summed differently until C2 took over
      * and two runs of the same prompt (or the CPU experts of the Metal split, whose first pass runs cold) differed in the
-     * last bit. This order is the one C2 uses on 128-bit NEON, so steady-state results are unchanged.
+     * last bit. This order is the one C2 uses on 128-bit NEON, so steady-state results are unchanged. The 16 lanes of
+     * AVX-512 (and any other width) are added in the same adjacent-pairs tree: left to {@code reduceLanes}, a 16-lane x86
+     * machine had the same cold-JIT difference (PagedKvTest's repeated flat attention differed in the last bit).
      */
     static float laneSum(FloatVector v) {
         return switch (FL) {
             case 4 -> (v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3));
             case 8 -> ((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7)));
-            default -> v.reduceLanes(VectorOperators.ADD);
+            case 16 -> (((v.lane(0) + v.lane(1)) + (v.lane(2) + v.lane(3))) + ((v.lane(4) + v.lane(5)) + (v.lane(6) + v.lane(7))))
+                    + (((v.lane(8) + v.lane(9)) + (v.lane(10) + v.lane(11))) + ((v.lane(12) + v.lane(13)) + (v.lane(14) + v.lane(15))));
+            default -> pairwiseSum(v.toArray());
         };
+    }
+
+    /** The adjacent-pairs tree of {@link #laneSum} for any power-of-two lane count (a lone lane is carried up a level). */
+    static float pairwiseSum(float[] a) {
+        for (int n = a.length; n > 1; n = (n + 1) / 2) {
+            for (int i = 0; i < n / 2; i++) {
+                a[i] = a[2 * i] + a[2 * i + 1];
+            }
+            if ((n & 1) == 1) {
+                a[n / 2] = a[n - 1];
+            }
+        }
+        return a[0];
     }
 
     /** {@link #laneSum} for a 128-bit (four lane) vector whatever the preferred width is: {@code (l0 + l1) + (l2 + l3)}. */

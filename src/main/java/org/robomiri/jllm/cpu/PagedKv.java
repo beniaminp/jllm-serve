@@ -9,7 +9,6 @@ import org.robomiri.jllm.model.KvSparse;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.FloatVector;
 import jdk.incubator.vector.IntVector;
-import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
 import java.lang.foreign.MemorySegment;
@@ -693,7 +692,7 @@ final class PagedKv extends KvCache implements KvCache.RowCodec {
             FloatVector hiO = F16.highHalf(hi);
             acc = acc.add(e.mul(loE).max(e.mul(hiE))).add(o.mul(loO).max(o.mul(hiO)));
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = VectorKernels.laneSum(acc); // a fixed order: the cold and the compiled kernel pick the same blocks
         for (; pp < pairs; pp++) {
             int lo = seg.get(ValueLayout.JAVA_INT, sb + pp * 4L);
             int hi = seg.get(ValueLayout.JAVA_INT, sb + (pairs + pp) * 4L);
