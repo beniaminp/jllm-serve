@@ -42,7 +42,9 @@ import java.util.Set;
  * {@code f16+sK[:sink[:window[:denseLayers]]]} the paged cache with sparse decode attention choosing K blocks (sink and
  * window in tokens, defaults 16 and 256; 2 dense layers). {@code needle} takes {@code tail=N}: the last N tokens of the
  * prompt (the question) are fed one at a time, as decode steps, so that they too attend sparsely (default 0: the prompt is
- * prefilled in chunks, as the engine does, and only the generated tokens are sparse).
+ * prefilled in chunks, as the engine does, and only the generated tokens are sparse). {@code share=true} (CPU, paged variants of
+ * one cache type) prefills each haystack once and decodes every variant from it ({@code check=true}: the first haystack is also
+ * run by each variant alone and must give the same answer tokens).
  *
  * <p>{@code decodeppl}: teacher-forced decode perplexity, {@code lens=} contexts, {@code text=} the document (its first
  * {@code lens} tokens), {@code tail=N} tokens at the end (default 512) scored one decode step at a time after a chunked
@@ -96,8 +98,13 @@ public final class KvStudy {
                 for (int i = 0; i < ls.length; i++) {
                     ls[i] = Integer.parseInt(lens[i]);
                 }
-                study.needle(variants, ls, Integer.parseInt(o.getOrDefault("trials", "3")),
-                        Integer.parseInt(o.getOrDefault("depths", "3")));
+                if (Boolean.parseBoolean(o.getOrDefault("share", "false"))) {
+                    study.needleShared(variants, ls, Integer.parseInt(o.getOrDefault("trials", "3")),
+                            Integer.parseInt(o.getOrDefault("depths", "3")), Boolean.parseBoolean(o.getOrDefault("check", "false")));
+                } else {
+                    study.needle(variants, ls, Integer.parseInt(o.getOrDefault("trials", "3")),
+                            Integer.parseInt(o.getOrDefault("depths", "3")));
+                }
             }
         }
     }
@@ -618,6 +625,27 @@ public final class KvStudy {
             return sb.toString();
         }
 
+        /** The haystacks of one length (the same for every variant), with their pass keys and depth indexes, appended. */
+        List<int[]> haystacks(Random r0, int per, int len, int trials, int depths, List<String> keys, List<Integer> depthIdx) {
+            List<int[]> prompts = new ArrayList<>();
+            for (int d = 0; d < depths; d++) {
+                for (int t = 0; t < trials; t++) {
+                    String key = Integer.toString(10000 + r0.nextInt(90000));
+                    double depth = depths == 1 ? 0.5 : (double) d / (depths - 1);
+                    int sentences = Math.max(10, (len - 120) / per);
+                    int at = (int) (depth * sentences);
+                    Random fr = new Random(1000 + len + d * 31 + t);
+                    String text = filler(fr, at) + "The pass key is " + key + ". Remember it. " + key + " is the pass key.\n"
+                            + filler(fr, sentences - at);
+                    int[] p = chat(text + "\nWhat is the pass key mentioned in the text above? Answer with only the number.");
+                    prompts.add(p);
+                    keys.add(key);
+                    depthIdx.add(d);
+                }
+            }
+            return prompts;
+        }
+
         void needle(String[] variants, int[] lens, int trials, int depths) {
             System.out.println("\n| context (tokens) | cache | found the key | by depth (start .. end) |");
             System.out.println("|---|---|---|---|");
@@ -625,24 +653,9 @@ public final class KvStudy {
             int per = tok.encode(filler(new Random(1), 200)).length / 200;
             for (int len : lens) {
                 // the same haystacks for every variant
-                List<int[]> prompts = new ArrayList<>();
                 List<String> keys = new ArrayList<>();
                 List<Integer> depthIdx = new ArrayList<>();
-                for (int d = 0; d < depths; d++) {
-                    for (int t = 0; t < trials; t++) {
-                        String key = Integer.toString(10000 + r0.nextInt(90000));
-                        double depth = depths == 1 ? 0.5 : (double) d / (depths - 1);
-                        int sentences = Math.max(10, (len - 120) / per);
-                        int at = (int) (depth * sentences);
-                        Random fr = new Random(1000 + len + d * 31 + t);
-                        String text = filler(fr, at) + "The pass key is " + key + ". Remember it. " + key + " is the pass key.\n"
-                                + filler(fr, sentences - at);
-                        int[] p = chat(text + "\nWhat is the pass key mentioned in the text above? Answer with only the number.");
-                        prompts.add(p);
-                        keys.add(key);
-                        depthIdx.add(d);
-                    }
-                }
+                List<int[]> prompts = haystacks(r0, per, len, trials, depths, keys, depthIdx);
                 for (String v : variants) {
                     int found = 0;
                     int[] byDepth = new int[depths];
@@ -673,6 +686,123 @@ public final class KvStudy {
                     System.out.printf(Locale.ROOT, "| %d (%d) | %s | %d/%d | %s |%n", len, promptLen, v, found, prompts.size(), bd);
                     System.out.flush();
                 }
+            }
+        }
+
+        /**
+         * {@link #needle} for paged variants of one cache type ({@code f16+p,f16+s128,f16+s64,...}) with the prefill shared: each
+         * haystack is prefilled once, up to its last whole chunk, by one backend on a pool that keeps the key summaries; each variant
+         * then gets a backend of its own on that pool, shares those blocks ({@link Backend#copyStateFrom}: copy on write) and feeds
+         * the rest of the prompt and its answer itself. A chunk of {@link KvSparse#MAX_ROWS} rows or more attends densely whatever
+         * the variant, and the shared prefix ends on a chunk (and block) boundary, so every variant computes exactly what a run of its
+         * own computes (the {@code check} option compares the first haystack with one) for one prefill instead of one per variant.
+         */
+        void needleShared(String[] variants, int[] lens, int trials, int depths, boolean check) {
+            String base = variants[0].split("\\+")[0];
+            KvSparse[] modes = new KvSparse[variants.length];
+            int dense = Integer.MAX_VALUE;
+            for (int i = 0; i < variants.length; i++) {
+                String[] plus = variants[i].split("\\+");
+                if (plus.length != 2 || !plus[0].equals(base)) {
+                    throw new IllegalArgumentException("share=true needs paged variants of one cache type, such as f16+p,f16+s64: " + variants[i]);
+                }
+                if (plus[1].startsWith("s")) {
+                    String[] a = plus[1].substring(1).split(":");
+                    modes[i] = new KvSparse(true, Integer.parseInt(a[0]), a.length > 1 ? Integer.parseInt(a[1]) : 16,
+                            a.length > 2 ? Integer.parseInt(a[2]) : 256, a.length > 3 ? Integer.parseInt(a[3]) : 2);
+                    dense = Math.min(dense, modes[i].denseLayers());
+                } else {
+                    modes[i] = KvSparse.OFF;
+                }
+            }
+            // the prefilling backend keeps the summaries of every layer a variant selects in; its chunks attend densely
+            KvSparse writer = new KvSparse(true, 64, 16, 256, dense == Integer.MAX_VALUE ? 0 : dense);
+            boolean rot = base.equals("q8r");
+            KvDtype dt = KvDtype.parse(rot ? "q8" : base);
+            KvDtype.setQ8Rotate(rot);
+            System.out.println("\n| context (tokens) | cache | found the key | by depth (start .. end) |");
+            System.out.println("|---|---|---|---|");
+            Random r0 = new Random(7);
+            int per = tok.encode(filler(new Random(1), 200)).length / 200;
+            int threads = Runtime.getRuntime().availableProcessors();
+            for (int len : lens) {
+                List<String> keys = new ArrayList<>();
+                List<Integer> depthIdx = new ArrayList<>();
+                List<int[]> prompts = haystacks(r0, per, len, trials, depths, keys, depthIdx);
+                int[] found = new int[variants.length];
+                int[][] byDepth = new int[variants.length][depths];
+                int promptLen = 0;
+                for (int i = 0; i < prompts.size(); i++) {
+                    int[] p = prompts.get(i);
+                    promptLen = p.length;
+                    if (p.length + 24 > ctx) {
+                        throw new IllegalStateException("prompt of " + p.length + " tokens does not fit ctx " + ctx);
+                    }
+                    KvSparse.set(writer);
+                    org.robomiri.jllm.kv.KvPool pool = CpuBackend.newKvPool(w, ctx, 2, dt, 16, 0, rot);
+                    try (Backend pre = new CpuBackend(w, ctx, batch, threads, dt, false, pool)) {
+                        KvSparse.set(KvSparse.OFF);
+                        int prefix = (p.length - 1) / pre.maxBatch() * pre.maxBatch(); // whole chunks; at least one token is left
+                        long t0 = System.nanoTime();
+                        for (int off = 0; off < prefix; off += pre.maxBatch()) {
+                            pre.forward(p, off, pre.maxBatch(), off, null);
+                        }
+                        double preS = (System.nanoTime() - t0) / 1e9;
+                        for (int v = 0; v < variants.length; v++) {
+                            KvSparse.set(modes[v]);
+                            try (Backend b = new CpuBackend(w, ctx, batch, threads, dt, false, pool)) {
+                                KvSparse.set(KvSparse.OFF);
+                                long t1 = System.nanoTime();
+                                b.copyStateFrom(pre, prefix);
+                                float[] logits = new float[vocab];
+                                for (int off = prefix; off < p.length; off += b.maxBatch()) {
+                                    int n = Math.min(b.maxBatch(), p.length - off);
+                                    b.forward(p, off, n, off, off + n == p.length ? logits : null);
+                                }
+                                int[] out = new int[14];
+                                for (int t = 0; t < out.length; t++) {
+                                    out[t] = argmax(logits);
+                                    if (t + 1 < out.length) {
+                                        b.forward(out, t, 1, p.length + t, logits);
+                                    }
+                                }
+                                String ans = tok.decode(out);
+                                boolean ok = ans.contains(keys.get(i));
+                                if (check && i == 0) { // the same haystack in a run of this variant alone
+                                    String saved = variants[v];
+                                    try (Backend alone = open(saved)) {
+                                        int[] ref = generate(alone, p, 14, null);
+                                        System.out.println("# check " + saved + ": shared prefill " + (java.util.Arrays.equals(ref, out)
+                                                ? "== a run of its own" : "DIFFERS from a run of its own: " + tok.decode(ref)));
+                                    }
+                                    if (lastPool != null) {
+                                        lastPool.close();
+                                        lastPool = null;
+                                    }
+                                }
+                                System.out.printf(Locale.ROOT, "# %s len %d trial %d (depth %d): %s in %.1f s (shared prefill of %d tokens %.1f s): %s%n",
+                                        variants[v], len, i, depthIdx.get(i), ok ? "found" : "missed", (System.nanoTime() - t1) / 1e9, prefix,
+                                        preS, ans.strip().replace('\n', ' '));
+                                System.out.flush();
+                                if (ok) {
+                                    found[v]++;
+                                    byDepth[v][depthIdx.get(i)]++;
+                                }
+                            }
+                        }
+                    } finally {
+                        KvSparse.set(KvSparse.OFF);
+                        pool.close();
+                    }
+                }
+                for (int v = 0; v < variants.length; v++) {
+                    StringBuilder bd = new StringBuilder();
+                    for (int d = 0; d < depths; d++) {
+                        bd.append(d > 0 ? " / " : "").append(byDepth[v][d]).append('/').append(trials);
+                    }
+                    System.out.printf(Locale.ROOT, "| %d (%d) | %s | %d/%d | %s |%n", len, promptLen, variants[v], found[v], prompts.size(), bd);
+                }
+                System.out.flush();
             }
         }
     }
