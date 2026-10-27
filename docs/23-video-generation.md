@@ -20,7 +20,7 @@ Nothing is borrowed from PyTorch or diffusers except, in the tests, their *answe
 | [23.9](#239-api-command-line-console-and-chat-tool) | `/v1/videos/*`, `jllm video`, the Video tab and its editor, `generate_video` | `VideoApi`, `VideoHttp`, `web/video` |
 | [23.10](#2310-verified-against-diffusers) | stage-by-stage comparison with Hugging Face diffusers | `VideoCompare`, `VideoTest` |
 | [23.11](#2311-measured-speed-and-memory) | seconds per clip and per step on this Mac, against diffusers on the same GPU | `VideoBench` |
-| [23.12](#2312-wan-21-how-far-it-got-and-what-remains) | Wan 2.1 (a diffusion transformer video model): what was checked and what is missing | |
+| [23.12](#2312-wan-21-how-far-it-got-and-what-remains) | Wan 2.1 (a diffusion transformer video model): what was checked and what is missing; the int8 copy of its text encoder on disk (23.12.6) | `WanPipeline`, `Umt5Encoder` |
 | [23.13](#2313-why-the-clips-are-limited) | which limits of the clips are the code's and which the models' | |
 
 ---

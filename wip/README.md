@@ -1,7 +1,8 @@
 # Work in progress that is not merged yet
 
-Status on 2026-10-23, evening (Europe/Amsterdam). Everything listed here is pushed to GitHub on a `wip/*` branch, so
-another person or agent can pick it up. `main` holds only work that passed every gate below. Each `wip/*` branch has
+Status on 2026-10-27 (UTC); items 1–6 as of 2026-10-23, item 7 added on 2026-10-27. Everything listed here is pushed to
+GitHub on a `wip/*` branch (item 7: `ccr-be155af0-ycvdp8`), so another person or agent can pick it up. `main` holds only work that passed every gate below, except item 7, which the
+owner had pushed to `main` on 2026-10-27 after the gates that run on Linux. Each `wip/*` branch has
 `main` merged in at the commit given, and none of them is on `main` unless this file says so.
 
 ## How to continue a branch
@@ -72,8 +73,8 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     the p99 stalls. The pass budget is the knob.
   - The 30B MoE ran at about 1 tok/s per stream in the 3-slot bench (expert placement under 3 slots); not understood
     yet.
-  - `ContextBudget` counts the off-heap paged pool only for `backend.kv-paged=true`, not for `auto` or when the mixed
-    scheduler turns paging on.
+  - Done (item 7): `ContextBudget` counts the off-heap paged pool for `auto` and when the mixed scheduler turns paging on, and
+    bounds it by the JVM's direct-memory limit.
 
 ### 2. Long-context model families — `wip/model-families` (docs/14 §14.18–14.22)
 
@@ -148,13 +149,9 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 
 ### 5. Paged KV cache follow-ups — `wip/paged-kv` (docs/24)
 
-- **Branch:** `wip/paged-kv` at `9a6a261`, main `92a57a1` plus one WIP docs commit. The code itself is on `main`.
-- **Left:**
-  - Re-measure CPU f16/q8/f32 decode, paged against flat, under a quiet machine.
-  - Replace the placeholders `@@CPUCOST@@` in docs/24 and `@@CPUREADME@@` in README, and update the §24.5 CPU rows and
-    the §24.3 costs line.
-  - The §24.2.6 claim that the older (ternary) f16 version cost 4× must be confirmed or softened from those numbers.
-  - **Do not merge this commit as it is: it has placeholders.**
+- **Done:** merged to `main` as `3723c42` ("docs: measure the paged CPU decode cost (q8/f32 -3%, f16 free)"): the
+  placeholders are filled with quiet-machine Qwen3-0.6B numbers, the §24.5 CPU rows and the §24.3 costs line are updated, and
+  the 4× f16 figure is attributed to the discarded ternary build. Nothing is left on `wip/paged-kv`.
 
 ### 6. Gemma 4 (12B) — `wip/gemma4`
 
@@ -180,21 +177,62 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   real 12B (`unsloth/gemma-4-12b-it-GGUF` Q4_K_M, 7.1 GB) loaded and generated coherent text end to end on the CPU
   backend.
 
+### 7. Review of the video follow-ups, and fixes found on an x86 machine — `ccr-be155af0-ycvdp8`
+
+- **Branch:** `ccr-be155af0-ycvdp8`, `4341f53` plus the commits of 2026-10-27, **pushed to `main` at the owner's request** (a
+  fast-forward). It passed the gates that run on Linux; no Mac was available, so the Mac gates are still to be run on `main`
+  (see "Gates" below).
+- **Review of `5cae543` / `4341f53` (the video follow-ups), and what changed:**
+  - *GIF delays:* allowing 1 cs made clips above 50 fps play 2.8× too slowly, because browsers play 0–1 cs as 10 cs.
+    `VideoEncoder.gifTiming` now drops frames so that every delay is at least 2 cs and the clip keeps its length (docs/23 §23.8).
+  - *Wan text encoder:* the in-memory cache kept 5.2 GB beside the transformer and saved nothing (`jllm video` makes one
+    request per pipeline). The encoder is freed before the transformer again; its int8 copy is kept on disk instead
+    (`text_encoder/jllm-q8.bin` + `jllm-q8.json`, `video.text-encoder-cache`, docs/23 §23.12.6), so later runs map 5.2 GB rather
+    than read 18.5 GB of float32 weights and quantize them. Checked in `WanTest` on the tiny encoder (the same bits, stale and
+    truncated copies refused); a `WanBench t5` off/on row is in `mac-validate.sh`.
+  - *`image.turbo`:* documented (docs/22 §22.8, §22.12.1, README); in the console it is now a load-time setting.
+  - *Wan's 13-frame default* and *`video.base-model` validation:* fine as they were.
+- **Found on the way:**
+  - `VectorKernels.laneSum` left 16-lane vectors (AVX-512) to `reduceLanes`, so `JitStableKernelsTest` and `PagedKvTest`
+    failed on x86 (cold-JIT last-bit differences); fixed. The CPU exactness md5 is unchanged on x86. The GGUF block dots and
+    the K-quant int8 dots had the same difference (12 of 13 fixture formats); they use the fixed order now, and
+    `JitStableKernelsTest` checks them before anything makes `reduceLanes` hot (which hid it). The image, audio and vision
+    CPU kernels (`diffusion/CpuOps`, `audio/Dense`, `vision/VMath`) use it too; no float `reduceLanes(ADD)` is left.
+  - `LongContextTest` needs 4.3 GB of direct memory; below ~18 GB of RAM the default limit was too small (now set in the pom).
+  - The emulator's `packed_float4` / `packed_half4` had vector alignment, so `kernel_tests.py` segfaulted on x86 in
+    `wh_gemm` (rows of 33 floats); fixed in `metal_emu.h`.
+  - **The CPU paged KV cache could run out of direct memory:** its slabs come from an automatic arena, which counts against
+    `-XX:MaxDirectMemorySize` (by default the heap: 4 GB with `./jllm`), but `backend.ctx=auto` sized it from physical memory
+    alone. Reproduced (`JLLM_XMX=1g`: auto planned 26 624 positions, a 5 000-token prompt died with `OutOfMemoryError: Cannot
+    reserve ... direct buffer memory`). `ContextBudget` now bounds the budget by the limit and `CpuBackend.newKvPool` warns for
+    an explicit context that cannot be held (docs/10 §10.13, docs/24).
+- **Gates on this branch** (Linux x86-64, Xeon with AVX-512, 4 cores, 15 GB, Temurin JDK 26.0.2; no Mac):
+  - `mvn -o install`: BUILD SUCCESS. The web tests: 62 run, 0 failures. `scripts/build-metal-emu.sh`: exit 0.
+    `kernel_tests.py`: 1172 ok, 0 FAIL.
+  - Arch smoke on the emulator (`METAL_EMU=1 scripts/arch-smoke.sh`, one emulated GPU thread per fiber, so it runs for
+    hours on this machine): **not finished when this was written.** The run on `64f27d1` had passed the DeepSeek reference,
+    the saved-cache, Qwen3-Next and GGUF-Qwen3-Next checks, `GgufArchSmoke` (20 models) and every `ArchSmoke` check through
+    LlamaPlain, LlamaDraft and part of Mistral with no `FAIL` (672 ok lines); an earlier run on `ecf4aa4` had reached Qwen2
+    with no `FAIL` before it was restarted on the newer commit. `f4e9739` changes only the image, audio and vision CPU
+    kernels, which arch smoke does not run. Run it to the end (or `scripts/arch-smoke.sh` on a Mac) before relying on it.
+  - Exactness, CPU: `79472f690f73bd28598d5d7fb5dee1a4`, as on the Mac. The Metal half needs a Mac.
+- **Left:**
+  - Run the six gates on a Mac against `main` (the arch smoke to its end, the Metal half of the exactness run).
+  - Run the real Wan encoder once (22.7 GB download) to measure the read time with the copy off and on (mac-validate row).
+  - Decide whether the launchers should raise `-XX:MaxDirectMemorySize` so the CPU paged cache gets the RAM `auto` used to
+    promise. A very large limit would also mean that dropped automatic-arena slabs (for example after a model is unloaded
+    in the console) are freed only when a GC happens to run, so this is the owner's call; today `JAVA_OPTS` does it per run.
+
 ## Not started (small follow-ups found along the way)
 
 - **Docs:**
   - A final detailed pass on docs 10, 11, 14, 20 and 24 to the standard above.
-  - docs 11.9 / 07.13: the q4 recent-window ring is `128 + backend.batch` rows, about 44 MB for Qwen3-0.6B with
-    `backend.batch=auto` (256 on Metal), not the 22 MB quoted for batch 64; the 11.9 speed table predates `auto`.
-  - docs 11, line about the native int8 kernels: check the anchor `#cpu-native-int8-kernels-backendcpunative-07-716` on
-    GitHub.
-  - docs 23.9 says SD 1.5 fp16 is 2.6 GB, while 22.2 says 2.1 GB (the 2.6 GB may include the safety checker).
+  - Done: docs 11.9 / 07.13 give the 44 MB ring for `backend.batch=auto` and say the 11.9 speed table predates `auto`; the
+    docs 11 anchor `#cpu-native-int8-kernels-backendcpunative-07-716` matches GitHub's slug of the 11.1 heading; the SD 1.5
+    base is 2.1 GB (UNet, text encoder and VAE in fp16; the safety checker is not downloaded), now also in the README and the
+    console.
 - **Video:**
-  - `Umt5Encoder` is rebuilt on every Wan request: the 22.7 GB f32 file is re-read and re-quantized each time; cache
-    the int8 copy.
-  - `jllm video`'s default `video.frames=16` becomes 13 frames for Wan (4k+1 rounding).
-  - GIF frame delays are clamped to at least 2 cs, so above 50 fps a GIF plays slower than asked.
-  - The Turbo defaults are chosen by the model folder name only.
+  - Done (item 7): the int8 UMT5 copy on disk, Wan's explicit 13-frame default, GIF timing above 50 fps, `image.turbo`.
   - AnimateDiff clips are flat or smeared with plain SD 1.5; a fine-tuned SD 1.5 base (`video.base-model`) is needed.
   - Wan has never run end to end: its UMT5 encoder is only published as 22.7 GB fp32, which the download cap excluded.
 - **Audio:** OuteText's text front end already equals the Python `outetts` TextProcessor on the reference sentences (the closing quote + adjacent comma/period and the colon are dropped in both, via AudioTest's `outetext-ref.json`); checked, no change needed.
