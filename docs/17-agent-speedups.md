@@ -59,8 +59,10 @@ starting at 4 with `K = engine.draft-tokens = 16`, plus the existing back-off (a
 
 **Measured** (Qwen3-0.6B, CPU, 4-core AVX-512, greedy): rewriting an 80-line Java class from the prompt with one rename,
 19.9 → 81.2 tok/s, 274 of 280 drafted tokens accepted; a free-form story, 24.4 → 23.3 tok/s (−4 %, few and short
-drafts). Matches of 2 tokens cost 8 % on the story for no gain on the copy, hence the minimum of 3. MoE models keep it
-off unless set ([11 §11.6](11-performance.md)): a verification pass reads the experts of every drafted position.
+drafts). Matches of 2 tokens cost 8 % on the story for no gain on the copy, hence the minimum of 3. MoE models kept it
+off at first ([11 §11.6](11-performance.md#116-speculative-decoding)), because a verification pass reads the experts of every
+drafted position; since prompt lookup pauses when its drafts do not pay, it is on for them too ([11 §11.11](11-performance.md#1111-agent-defaults-measured):
+the 30B gains 33 – 68 % on a code edit and loses 1 – 10 % on tool calls and prose).
 
 ---
 

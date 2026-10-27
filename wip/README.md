@@ -206,6 +206,21 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     alone. Reproduced (`JLLM_XMX=1g`: auto planned 26 624 positions, a 5 000-token prompt died with `OutOfMemoryError: Cannot
     reserve ... direct buffer memory`). `ContextBudget` now bounds the budget by the limit and `CpuBackend.newKvPool` warns for
     an explicit context that cannot be held (docs/10 §10.13, docs/24).
+  - **Gemma 4 never reached the GPU through `./jllm`:** `ModelLoader.newBackend` still switched a non-uniform decoder to the
+    CPU ("the Metal attention kernels do not support" 512-wide heads), a note left from `d7b388e` that the Metal commits of
+    item 6 did not remove (`ArchSmoke` builds `MetalBackend` directly, so it did not notice); `ContextBudget` sized its
+    context from the heap for the same reason. Both removed (`bd83a8e`). The same line had bent `backend.batch=auto`
+    (256-token chunks for Mamba, dense Qwen3-Next and the hybrids on Metal, documented as 64; 64 for Gemma 4); the rule of
+    `a0ef980` is back: 256 for a dense decoder on Metal, Gemma 4 included.
+- **Docs (at the owner's request: detailed, and one page with the parameters to run each model best):**
+  - New chapter **docs/28 Best settings for each model**: a command line per family, the settings ranked by effect with
+    their measured cost and source, the `backend.ctx=auto` budget worked out for the 0.6B and the 30B (it reproduces the
+    measured 18 432 / 37 888 / 74 752), agents, CPU-only x86 / Docker machines and the launchers' Java memory, a checklist,
+    and what is not measured. Linked from the README (configuration and measured sections) and the docs index.
+  - Stale statements fixed: the README's M1 Pro table (now ~2 100 / ~143 and ~300 / ~27, as docs/11 §11.1); speculation
+    "off by default" / "MoE keeps it off" (docs/11 summary, docs/17 §17.1) and the missing `mtp` value (docs/10 table);
+    `backend.cpu.int8-activations` "default `true`" (docs/07, now `auto`); Llama 4 and the Mamba-2 hybrids listed as not
+    supported (docs/14 §14.6, docs/15 §15.9).
 - **Gates on this branch** (Linux x86-64, Xeon with AVX-512, 4 cores, 15 GB, Temurin JDK 26.0.2; no Mac):
   - `mvn -o install`: BUILD SUCCESS. The web tests: 62 run, 0 failures. `scripts/build-metal-emu.sh`: exit 0.
     `kernel_tests.py`: 1172 ok, 0 FAIL.
@@ -219,6 +234,10 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
 - **Left:**
   - Run the six gates on a Mac against `main` (the arch smoke to its end, the Metal half of the exactness run).
   - Run the real Wan encoder once (22.7 GB download) to measure the read time with the copy off and on (mac-validate row).
+  - Run the real Gemma 4 12B through `./jllm` on Metal (`unsloth/gemma-4-12b-it-GGUF` Q4_K_M) now that the loader lets it:
+    the start-up line must say `Backend: metal`, and its text should match `--backend cpu --backend.cpu.int8-activations false`
+    greedy; then put its speed into docs/28 §28.5.5.
+  - docs/28 §28.10 lists what is not measured yet; the CPU f16 cache on x86 against q8 can be timed on Linux.
   - Done (2026-10-27, at the owner's request): the launchers raise `-XX:MaxDirectMemorySize` to the physical memory or the
     container's limit (`scripts/jvm-memory.sh`, `JLLM_DIRECT_MEMORY`), and closing a pool that held slabs runs one GC so an
     unloaded model's cache returns at once (docs/10 §10.13).

@@ -467,6 +467,8 @@ Every setting lives in [`src/main/resources/jllm.properties`](src/main/resources
 documentation. Precedence: bundled defaults → external file (`--config path`, `$JLLM_CONFIG`, or
 `./jllm.properties` if present) → command line. `./jllm config` prints the effective values and their origin.
 A `./jllm.properties` in the directory you run from is git-ignored, so it is a good place for personal overrides.
+The settings worth changing for each model family, and what each costs and buys as measured, are collected in
+[docs/28 Best settings for each model](docs/28-best-settings.md).
 
 ```sh
 cp src/main/resources/jllm.properties jllm.properties   # edit: backend.ctx=2048, server.port=9000, ...
@@ -570,13 +572,15 @@ The server is meant for your own machine. Keep these in mind before changing the
 
 | Model | Backend | Prefill | Decode |
 |---|---|---|---|
-| Qwen3-0.6B Q4_0, 413-token prompt | Metal | ~1 430 tok/s | ~117 tok/s |
-| Qwen3-0.6B Q4_0, 413-token prompt | CPU (NEON 128-bit, 10 threads), int8 activations (`backend.cpu.int8-activations`, the default) | ~275 tok/s | ~51 tok/s |
-| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal | ~49 tok/s | ~25 tok/s |
+| Qwen3-0.6B Q4_0, 413-token prompt | Metal (`backend.batch=auto` = 256-token chunks, speculation off) | ~2 100 tok/s | ~143 tok/s |
+| Qwen3-0.6B Q4_0, 413-token prompt | CPU (NEON 128-bit, 10 threads), int8 activations (`backend.cpu.int8-activations=auto` picks them there) | ~275 tok/s | ~51 tok/s |
+| Qwen3-30B-A3B Q4_0 (19.4 GB cache) | Metal (256-token chunks) | ~300 tok/s | ~27 tok/s |
 | Qwen3-30B-A3B Q4_0 (19.4 GB cache) | CPU, int8 activations | ~12 tok/s | ~6 tok/s |
 
 Float activations on the CPU (`--backend.cpu.int8-activations false`) decode about 4× slower; the full history of
-measurements is in [docs/11](docs/11-performance.md#111-measured).
+measurements is in [docs/11](docs/11-performance.md#111-measured). **Which settings to use for each model** (backend,
+weights, KV cache type, context, prefill chunk, speculation, slots, Java memory), with the measured effect of each, is
+[docs/28](docs/28-best-settings.md).
 
 Against llama.cpp 0.7.0 (Homebrew, build 11669, Metal) on the same `unsloth/Qwen3-0.6B-GGUF` Q4_0 file, 413-token
 prompt, 128 tokens decoded at depth 413, speculation off (`scripts/mac-validate.sh --vs-llama`, 2026-10-22, after the

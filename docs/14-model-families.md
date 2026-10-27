@@ -226,9 +226,12 @@ checkpoint names as f32, and the embedding/LM head are always Q8_0.
 ## 14.6 Not supported (yet)
 
 - State-space models are a different architecture and have their own chapter: **Mamba** (`model_type: mamba`,
-  `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); Mamba-2 and hybrids are not.
+  `state-spaces/mamba-*-hf`) is supported, see [15](15-mamba.md); so are the attention / state-space hybrids with
+  Mamba-2 (or Mamba-1) layers, Granite 4, Nemotron-H and Jamba ([14.22](#1422-attention--state-space-hybrids-granite-4-nemotron-h-jamba)),
+  and Qwen3-Next's Gated DeltaNet ([14.14](#1414-qwen3-next-hybrid-gated-deltanet--gated-attention--sparse-moe)). A plain
+  Mamba-2 model (`model_type: mamba2`) and Falcon-Mamba are not.
 - `dynamic` RoPE scaling, YaRN with `truncate: false`; `hidden_act`
-  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; Llama 4; a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
+  other than `silu` (Gemma's `gelu_pytorch_tanh` via `hidden_activation` is the one exception); MLP bias; Llama 4's vision tower (its text tower is supported, [14.19](#1419-llama-4-text-chunked-attention-nope-layers-temperature-tuning-sigmoid-moe)); a `head_dim` that is not a multiple of 32 (Mistral Nemo-style) on Metal (CPU works).
 - Tokenizers: Llama 3 uses a tiktoken-style byte-level BPE (close to Qwen's); Mistral and Llama 2 use SentencePiece
   vocabularies with byte fallback. That is the tokenizer's job (chapter 4), not the model's.
 - Hub test checkpoints: `hf-internal-testing/tiny-random-LlamaForCausalLM` has `hidden_size = 16`, which is not a

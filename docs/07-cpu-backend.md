@@ -445,7 +445,7 @@ this context length. On AVX-512 the same source code needs 4× fewer instruction
 
 ## 7.10 Int8 activations: integer dot products (`Int8Kernels`)
 
-Code: `cpu/Int8Kernels.java`; switch: `backend.cpu.int8-activations` (default `true`); used by
+Code: `cpu/Int8Kernels.java`; switch: `backend.cpu.int8-activations` (default `auto`: both paths are timed on the loaded model and the faster is kept, [7.10.1](#7101-auto-measure-dont-guess); `true` / `false` force one); used by
 `CpuBackend.matmul` for `n == 1` (decode) and by the MoE per-token loops. This is llama.cpp's
 `q4_0 × q8_0` scheme, and it removes the bottleneck of 7.9.
 
@@ -577,7 +577,7 @@ three formats against the `gguf.quants` reference.
 
 **CPU vs Metal agreement.** The Metal backend computes with float activations, so the bit-for-bit
 CPU == Metal checks (`scripts/arch-smoke.sh`, `ArchSmoke`, `DeepSeekRef`) construct the CPU backend with
-int8 activations off; with the default `true`, CPU and Metal greedy outputs can diverge after the first
+int8 activations off; with int8 activations on (what `auto` picks on Apple silicon), CPU and Metal greedy outputs can diverge after the first
 near-tie exactly as described in [11.1](11-performance.md#111-measured). Pass
 `--backend.cpu.int8-activations false` whenever an exact CPU/Metal comparison is wanted.
 

@@ -512,9 +512,12 @@ cheap when they fail, and 3-token minimum matches cost less on free text than 2.
 - The CPU path was instruction-bound at 128-bit SIMD; int8 activations with integer dot products took the
   row kernel from ~30 conversion-heavy instructions per block to ~31 single-cycle integer ops doing twice
   the lanes, 6× per kernel and ~4× per decoded token (13 → 51 tok/s).
-- Speculative decoding ([11.6](#116-speculative-decoding)) is off by default: a verification pass of n tokens costs
-  1 + 0.36 (n−1) single steps on the dense 0.6B and 1 + 0.55 (n−1) on the 30B MoE, so it gains only for text that
-  copies its input (+15 % for code editing with prompt lookup) and loses on the MoE.
+- Speculative decoding ([11.6](#116-speculative-decoding)) is on by default (`engine.speculative=ngram`, prompt lookup, for
+  every model with a KV cache; `mtp` for a model with its own next-token head): a verification pass of n tokens costs
+  1 + 0.36 (n−1) single steps on the dense 0.6B and 1 + 0.55 (n−1) on the 30B MoE, so it gains on text that copies its
+  input (a code edit +106 % on the 0.6B, +33 to +68 % on the 30B, [11.11](#1111-agent-defaults-measured)) and pauses itself
+  when its drafts do not pay, which keeps the loss on prose and tool calls at 0 – 10 %. (It was off by default, and off
+  for MoE models, until 11.11.)
 - Memory is dominated by the weights and the KV cache (`--ctx` and `backend.kv-dtype` are the knobs).
 
 ---
