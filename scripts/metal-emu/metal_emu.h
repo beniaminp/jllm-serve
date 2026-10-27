@@ -34,10 +34,13 @@ EMU_VEC(ushort)
 EMU_VEC(short)
 EMU_VEC(int)
 EMU_VEC(ulong)
-typedef uchar4 packed_uchar4;
-typedef char4 packed_char4;
-typedef float4 packed_float4;
-typedef half4 packed_half4;
+// Metal's packed vectors are aligned like their element, not like the vector: a load through one may be at any element offset
+// (wh_gemm reads rows of 33 floats). As plain float4 they got 16-byte alignment, and on x86 clang used aligned SSE loads,
+// which fault on such an address; the reduced alignment of the typedef makes them unaligned loads (NEON never cared).
+typedef uchar packed_uchar4 __attribute__((ext_vector_type(4), aligned(1)));
+typedef char packed_char4 __attribute__((ext_vector_type(4), aligned(1)));
+typedef float packed_float4 __attribute__((ext_vector_type(4), aligned(4)));
+typedef half packed_half4 __attribute__((ext_vector_type(4), aligned(2)));
 
 // ---- constructors: mk_float4(scalar) splats, mk_float4(a, b, c, d) composes, mk_float4(vector) converts
 template <typename V> struct emu_elem;
