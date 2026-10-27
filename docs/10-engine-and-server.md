@@ -889,7 +889,7 @@ rowBytes(w)       : f32 4w   f16 2w   q8 w + 4·kvHeads (one f32 scale per head 
 Metal : free   = workingSet − otherModels − weights − reserve  [+ 0.10·workingSet if an MoE model may spill experts to the CPU]
         budget = 0.6 · max(0, free)
 CPU   : budget = 0.6 · (free space of the Java heap's old generation)       (the flat CPU cache lives on the heap)
-CPU, backend.kv-paged=true (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
+CPU, backend.kv-paged=true, or the mixed scheduler (an attention model, f32 / f16 / q8):  budget = 0.6 · max(0, 0.75 · physicalMemory − weights)
         the paged pool (docs/24) is off-heap MemorySegment slabs, so the heap no longer bounds the cache; but the slabs come
         from an automatic arena, which the JVM limits like direct buffers, so also
         budget = min(budget, 0.9 · (MaxDirectMemorySize − direct memory in use))   (the limit is the heap size, -Xmx, unless given)

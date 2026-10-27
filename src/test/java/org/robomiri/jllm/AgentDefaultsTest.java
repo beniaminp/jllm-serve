@@ -82,6 +82,9 @@ public final class AgentDefaultsTest {
                 "paged KV cache: the CPU budget is off-heap (physical memory), not the Java heap");
         check(!ContextBudget.pagedOffHeap(paged, arch, KvDtype.Q4) && !ContextBudget.pagedOffHeap(Settings.load(new String[]{}), arch, KvDtype.F32),
                 "a q4 cache, or paging off, stays on the heap budget");
+        Settings mixed = Settings.load(new String[]{"--backend.kv-paged", "false", "--engine.scheduler", "mixed"});
+        check(ContextBudget.pagedOffHeap(mixed, arch, KvDtype.F32, null, 1), // kv-paged=false never looks at the weights
+                "the mixed scheduler pages the cache even with backend.kv-paged=false: the CPU budget is off-heap");
         // the paged CPU pool's slabs come from an automatic arena, which counts against the JVM's direct-memory limit
         // (this JVM sets no -XX:MaxDirectMemorySize, so the limit is the heap's maximum)
         long before = ContextBudget.directFree();

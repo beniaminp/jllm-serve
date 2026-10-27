@@ -218,10 +218,13 @@ public final class ContextBudget {
         return (s.get("backend.kv-paged").trim().equalsIgnoreCase("true") || s.getBool("backend.kv-sparse")) && pageable(arch, kv);
     }
 
-    /** The same, with {@code auto} decided as {@link ModelLoader#paged} does for a model of {@code slots} slots. */
+    /**
+     * The same, with {@code auto} decided as {@link ModelLoader#paged} does for a model of {@code slots} slots, and with the mixed
+     * scheduler, which pages the cache whatever {@code backend.kv-paged} says ({@link ModelLoader#mixedWanted}).
+     */
     static boolean pagedOffHeap(org.robomiri.jllm.config.Settings s, Architecture arch, KvDtype kv,
                                 org.robomiri.jllm.model.ModelWeights w, int slots) {
-        return pageable(arch, kv) && (ModelLoader.paged(s, w, slots) || s.getBool("backend.kv-sparse"));
+        return pageable(arch, kv) && (ModelLoader.paged(s, w, slots) || s.getBool("backend.kv-sparse") || ModelLoader.mixedWanted(s, arch));
     }
 
     private static boolean pageable(Architecture arch, KvDtype kv) {
