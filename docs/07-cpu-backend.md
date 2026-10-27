@@ -1266,10 +1266,20 @@ near-tie; the `run` gates in [11](11-performance.md) have been stable across hun
 
 The Q4_0 / Q8_0 row dots and the 4-row / 4 x 4 prefill tiles (`dotQ4`, `dotQ8`, `store4`) no longer call `reduceLanes`:
 `VectorKernels.laneSum` adds the lanes in the pairs-first order that C2 uses on 128-bit NEON, in every tier, so those
-kernels give the same bits in the interpreter, in C1 and in C2 (steady-state results did not change) and a CPU run no longer
-depends on when C2 took over. `JitStableKernelsTest` checks it; the Q2_K, Q6_K, GGUF and int8 dots, the float `dot` and the
-softmax sums still have the noise described here. It was found as a flaky check of the Metal backend's CPU expert split
-([8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)).
+kernels give the same bits in the interpreter, in C1 and in C2 (steady-state results did not change on NEON) and a CPU run no
+longer depends on when C2 took over. It was found as a flaky check of the Metal backend's CPU expert split
+([8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)). The
+float `dot` and the softmax sums use it as well, and so, since a run on an x86 machine with AVX-512, do all widths: `laneSum`
+spelled out only 4 and 8 lanes and left the 16 lanes of a 512-bit vector to `reduceLanes`, which there sums sequentially in
+the interpreter and as a tree in C2 (46 of 64 random 16-lane sums differ), so `JitStableKernelsTest` and `PagedKvTest` failed
+on that machine. 16 lanes are now the same adjacent-pairs tree written out, any other width a generic pairwise sum
+(`pairwiseSum`); this changes the last bits of steady-state results on AVX-512 only, and the CPU exactness md5 of
+[11](11-performance.md) stayed the same there. The GGUF block dots (`GgufKernels`, `Q2KKernels`, `Q6KKernels`) and the K-quant
+int8 dots (`KQuantKernels`, 4 lanes through `laneSum4`) were changed the same way: on that machine the first call of 12 of the
+13 fixture formats differed from the compiled ones. `JitStableKernelsTest` checks all of them, the GGUF ones first: once any
+caller has made `reduceLanes` hot (the `MAX` of `Int8Kernels.quantize` does), C2 compiles that library method by itself and
+even an interpreted kernel then gets the compiled order, which hides a cold difference. Still on `reduceLanes(ADD)`: the
+image, audio and vision CPU kernels (`diffusion/CpuOps`, `audio/Dense`, `vision/VMath`).
 
 ---
 

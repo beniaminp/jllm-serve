@@ -80,7 +80,7 @@ public final class Q6KKernels {
             }
             acc = accQ.fma(FloatVector.broadcast(F, d), acc);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = VectorKernels.laneSum(acc);
         int tail = cols - full * Q6K.BLOCK;
         if (tail > 0) {
             sum += Q6K.dotBlock(seg, base, tail, x, xo + full * Q6K.BLOCK);

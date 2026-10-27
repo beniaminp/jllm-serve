@@ -118,7 +118,7 @@ final class GgufKernels {
             int xb = xo + b * 32;
             acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16)).fma(scale, acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static float dotQ8(MemorySegment seg, long q, int nb, float[] x, int xo) {
@@ -130,7 +130,7 @@ final class GgufKernels {
             int xb = xo + b * 32;
             acc = VectorKernels.halfDot(v0, x, xb).add(VectorKernels.halfDot(v1, x, xb + 16)).fma(scale, acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantQ4(MemorySegment seg, long q, int nb, float[] dst, int off) {
@@ -234,7 +234,7 @@ final class GgufKernels {
             acc = accQ.fma(FloatVector.broadcast(F, d), acc);
             acc = accM.fma(FloatVector.broadcast(F, -dmin), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantK(MemorySegment seg, long q, int nb, float[] dst, int off, boolean q5) {
@@ -335,7 +335,7 @@ final class GgufKernels {
             FloatVector mv = FloatVector.broadcast(F, Float.float16ToFloat((short) (dm >>> 16)));
             acc = affineDot(hi, dv, mv, x, xb + 16, affineDot(lo, dv, mv, x, xb, acc));
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantQ41(MemorySegment seg, long q, int nb, float[] dst, int off, boolean q5) {
@@ -369,7 +369,7 @@ final class GgufKernels {
             acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
                     .fma(FloatVector.broadcast(F, Ggml.f16(seg, q)), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantQ50(MemorySegment seg, long q, int nb, float[] dst, int off) {
@@ -398,7 +398,7 @@ final class GgufKernels {
             acc = VectorKernels.halfDot(lo, x, xb).add(VectorKernels.halfDot(hi, x, xb + 16))
                     .fma(FloatVector.broadcast(F, d), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantTab(MemorySegment seg, long q, int nb, float[] dst, int off, boolean fp4) {
@@ -434,7 +434,7 @@ final class GgufKernels {
             }
             acc = accQ.fma(FloatVector.broadcast(F, Ggml.f16(seg, q)), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantIQ4XS(MemorySegment seg, long q, int nb, float[] dst, int off) {
@@ -502,7 +502,7 @@ final class GgufKernels {
             }
             acc = accQ.fma(FloatVector.broadcast(F, Float.float16ToFloat(seg.get(LE16, q + 108))), acc);
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(acc);
     }
 
     private static void dequantQ3K(MemorySegment seg, long q, int nb, float[] dst, int off) {
@@ -549,7 +549,7 @@ final class GgufKernels {
             a0 = halves(seg, q + 2L * i, bf16).fma(FloatVector.fromArray(F, x, xo + i), a0);
             a1 = halves(seg, q + 2L * (i + FL), bf16).fma(FloatVector.fromArray(F, x, xo + i + FL), a1);
         }
-        return a0.add(a1).reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum(a0.add(a1));
     }
 
     private static void dequantHalves(MemorySegment seg, long q, int cols, float[] dst, int off, boolean bf16) {

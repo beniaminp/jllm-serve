@@ -162,7 +162,7 @@ public final class KQuantKernels {
                 acc = widenSum(pb).add(magicBits).reinterpretAsFloats().sub(magic).fma(FloatVector.broadcast(F4, ws[2 * g + 1]), acc);
             }
         }
-        return acc.reduceLanes(VectorOperators.ADD) - minus;
+        return VectorKernels.laneSum4(acc) - minus;
     }
 
     /**
@@ -204,7 +204,7 @@ public final class KQuantKernels {
                 }
             }
         }
-        return acc.reduceLanes(VectorOperators.ADD) - minus;
+        return VectorKernels.laneSum4(acc) - minus;
     }
 
     /**
@@ -242,7 +242,7 @@ public final class KQuantKernels {
                 }
             }
         }
-        return acc.reduceLanes(VectorOperators.ADD);
+        return VectorKernels.laneSum4(acc);
     }
 
     // ------------------------------------------------------------------ prefill: permuted float rows

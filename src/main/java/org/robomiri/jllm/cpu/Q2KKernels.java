@@ -68,7 +68,7 @@ public final class Q2KKernels {
             acc = accQ.fma(FloatVector.broadcast(F, d), acc);
             acc = accM.fma(FloatVector.broadcast(F, -dmin), acc);
         }
-        float sum = acc.reduceLanes(VectorOperators.ADD);
+        float sum = VectorKernels.laneSum(acc);
         int tail = cols - full * Q2K.BLOCK;
         if (tail > 0) {
             sum += Q2K.dotBlock(seg, base, tail, x, xo + full * Q2K.BLOCK);
