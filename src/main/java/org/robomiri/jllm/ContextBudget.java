@@ -133,8 +133,7 @@ public final class ContextBudget {
         long ram = physicalMemory();
         long budget;
         String basis;
-        boolean metal = ModelLoader.resolveBackend(s).equals("metal")
-                && (!(arch instanceof Decoder d) || d.uniformShape()); // Gemma 4 runs on the CPU: its 512-wide heads
+        boolean metal = ModelLoader.resolveBackend(s).equals("metal");
         long ws = metal ? org.robomiri.jllm.metal.MetalMemory.workingSet(s.opt("backend.metal.lib")) : 0;
         if (tierManaged(s, arch, kv)) {
             // tiered KV storage (docs/26): the cache is not bounded by the GPU's share. A slot that does not fit the hot tier keeps its

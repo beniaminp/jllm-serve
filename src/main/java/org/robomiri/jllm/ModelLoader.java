@@ -298,8 +298,7 @@ public final class ModelLoader {
         }
         boolean moe = arch instanceof org.robomiri.jllm.model.Decoder d && d.anyMoe()
                 || arch instanceof Qwen3NextArch q && q.anyMoe() || arch instanceof HybridArch h && h.anyMoe();
-        boolean metal = resolveBackend(s).equals("metal")
-                && (!(arch instanceof org.robomiri.jllm.model.Decoder d2) || d2.uniformShape());
+        boolean metal = resolveBackend(s).equals("metal") && arch instanceof org.robomiri.jllm.model.Decoder;
         int auto = moe ? MOE_BATCH : metal ? METAL_DENSE_BATCH : DEFAULT_BATCH;
         if (arch.core().modelType().startsWith("gemma3")) {
             return Math.max(auto, GEMMA3_PICTURE_BATCH); // a picture's 256 tokens attend to each other and go through in one pass
@@ -652,11 +651,6 @@ public final class ModelLoader {
             batch += s.getInt("engine.mixed-reserve"); // room for the tokens that ride with a full prefill chunk (BatchGroup.Member hides it)
         }
         String backendName = resolveBackend(s);
-        if (backendName.equals("metal") && arch instanceof org.robomiri.jllm.model.Decoder d && !d.uniformShape()) {
-            System.err.println("note: Gemma 4's full-attention layers use a 512-wide head, which the Metal attention kernels "
-                    + "do not support; using the CPU backend (the flat KV cache)");
-            backendName = "cpu";
-        }
         int threads = s.getInt("backend.threads");
         // before any CPU matmul exists (and before the int8 auto probe, which times the native kernels when present)
         // (-Djllm.cpu.native, as the Docker image's JLLM_CPU_NATIVE sets it, stands in for an unset backend.cpu.native)
