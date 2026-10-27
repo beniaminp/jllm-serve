@@ -780,9 +780,9 @@ public final class KvStudy {
                                         lastPool = null;
                                     }
                                 }
-                                System.out.printf(Locale.ROOT, "# %s len %d trial %d (depth %d): %s in %.1f s (shared prefill of %d tokens %.1f s): %s%n",
-                                        variants[v], len, i, depthIdx.get(i), ok ? "found" : "missed", (System.nanoTime() - t1) / 1e9, prefix,
-                                        preS, ans.strip().replace('\n', ' '));
+                                System.out.printf(Locale.ROOT, "# %s len %d trial %d (depth %d, key %s): %s in %.1f s (shared prefill of %d tokens %.1f s): %s%n",
+                                        variants[v], len, i, depthIdx.get(i), keys.get(i), ok ? "found" : "missed", (System.nanoTime() - t1) / 1e9,
+                                        prefix, preS, ans.strip().replace('\n', ' '));
                                 System.out.flush();
                                 if (ok) {
                                     found[v]++;
