@@ -433,13 +433,17 @@ student's own noised output. The result predicts a sharp `x̂₀` even from near
 
 `ImagePipeline` recognises these models by name (a folder or repository containing `turbo`) and takes those defaults
 (`ImagePipeline.Defaults`: 1 step, guidance 0, 512, `euler`; other models: 25 steps, guidance 7.5, `dpmpp_2m_karras`).
+`image.turbo` overrides the name: `auto` (the default) detects as just said, `true` forces the distilled defaults (a renamed
+SD-Turbo folder, or a distilled fine-tune whose name does not say `turbo`) and `false` forbids them (an ordinary model whose path
+happens to contain the word). The choice is made when the model loads (`ImageModels.load` → `ImagePipeline(dir, devices, turboOverride)`),
+so in the console a change applies at the next load.
 
 *Worked example, what a Turbo step does.* With the single step of `n = 1` (`σ₀ = 14.6146`, `σ₁ = 0`) the Euler rule is `x̃ ← x̃ − σ₀ ε̂`, i.e. `x̂₀`. Start from the pure-noise latent `x̃ = σ₀ ε`; the picture is `σ₀ (ε − ε̂)`: a difference of two numbers that are both of order 1, multiplied by 14.6. An error of 0.01 in the predicted noise therefore moves the latent
 by 0.146 (latents have a standard deviation of about 1 after the scaling factor), which is why a model must be *trained* for this regime: an ordinary model is not accurate enough at `σ = 14.6` for one step to give a sharp picture. With four steps the network is asked for `ε̂` at the noise levels 14.6, 4.08, 1.61 and 0.69 (the trailing schedule), each with less leverage on the result.
 
 **Why this design (22.8).** The alternative for a fast picture is to run an ordinary model for fewer steps, which degrades (the samplers of 22.7 are accurate at about 20 steps, not at 1-4). SD-Turbo and SDXL-Turbo cost no guidance (half the UNet work) and one to four steps: measured 1.68 s for a 512² picture in one step, 9.63 s for 20 steps of the same model (22.14).
-The price is picture quality at larger sizes (repeated subjects, above) and the loss of the negative prompt. **Settings**: a model is treated as Turbo when its folder or repository name contains `turbo` (or contains `lcm` with a `trailing` scheduler config), which selects its defaults (1 step, guidance 0, 512, Euler, trailing spacing); a renamed folder gets the ordinary defaults, so pass `steps`, `guidance` and `scheduler`
-explicitly then. The per-request fields override the defaults; 1-4 steps is the useful range.
+The price is picture quality at larger sizes (repeated subjects, above) and the loss of the negative prompt. **Settings**: a model is treated as Turbo when its folder or repository name contains `turbo` (or contains `lcm` with a `trailing` scheduler config), which selects its defaults (1 step, guidance 0, 512, Euler, trailing spacing); a renamed folder gets the ordinary defaults unless
+`image.turbo=true` says otherwise (or pass `steps`, `guidance` and `scheduler` explicitly). The per-request fields override the defaults; 1-4 steps is the useful range.
 
 ---
 
@@ -645,6 +649,7 @@ All keys are in `jllm.properties` (validated at start-up, edited in the console'
 | `image.model` (`--image-model`) | empty | the model `./jllm serve` loads (a Hub repository, downloaded as fp16 files, or a local folder); `--model none` serves only images |
 | `image.backend` | `auto` | `metal` when there is a GPU, else `cpu` (float32, 12.2 s for a one-step picture: only for machines without a GPU); `cpu` to keep the GPU free |
 | `image.precision` | `auto` (= f16) | `f32` to compare with a reference or when a model overflows in half precision: 2.38 s instead of 1.68 s for a one-step picture, 4.3 GB of weights instead of 2.6; the VAE of an SDXL-type model is f32 in either case |
+| `image.turbo` | `auto` | the distilled-model defaults of 22.8 (1 step, guidance 0, 512, Euler): `auto` when the folder or repository name contains `turbo` (or `lcm` with trailing timestep spacing), `true` / `false` to force them on or off for a renamed or differently named model; read when the model loads |
 | `image.vae-tile`, `image.vae-tile-overlap` | `128`, `8` | latent pixels per side decoded in one piece (128 = 1024 × 1024 in about 3 GB), and the blended overlap of tiles; use `64` on a small machine (3 % brightness difference per tile, 22.13) |
 | `image.steps`, `.guidance`, `.width`, `.height`, `.seed`, `.scheduler`, `.negative`, `.count`, `.out` | `0`, `-1`, `0`, `0`, `-1`, empty, empty, `1`, `image.png` | the `jllm image` command; the same names are fields of the API request (`guidance_scale`, `negative_prompt`, `size`, `n`) |
 | `image.init`, `image.mask`, `image.strength` | empty, empty, `0.8` | the command's input picture, mask (white = repaint) and how much of the picture is redrawn |

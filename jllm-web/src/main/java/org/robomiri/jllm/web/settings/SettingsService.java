@@ -212,8 +212,9 @@ public class SettingsService {
     }
 
     public static Scope scope(String key) {
-        if (key.startsWith("image.")) { // the image model's device and VAE tiling apply at load; the rest belongs to "jllm image" / "jllm serve"
-            return key.equals("image.backend") || key.equals("image.precision") || key.startsWith("image.vae-tile") ? Scope.LOAD : Scope.CLI;
+        if (key.startsWith("image.")) { // the image model's device, Turbo defaults and VAE tiling apply at load; the rest belongs to "jllm image" / "jllm serve"
+            return key.equals("image.backend") || key.equals("image.precision") || key.equals("image.turbo") || key.startsWith("image.vae-tile")
+                    ? Scope.LOAD : Scope.CLI;
         }
         if (key.startsWith("video.")) { // the video model's device and base model apply at load; the format and switch are read per request
             return key.equals("video.backend") || key.equals("video.precision") || key.equals("video.decode-chunk") || key.equals("video.base-model") ? Scope.LOAD
