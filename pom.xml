@@ -289,6 +289,9 @@
                                 <argument>--add-modules</argument>
                                 <argument>jdk.incubator.vector</argument>
                                 <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <!-- 4.3 GB of KV slabs from an automatic arena, which counts against the direct-memory
+                                     limit; its default is the heap size (a quarter of RAM), too small below 18 GB -->
+                                <argument>-XX:MaxDirectMemorySize=6g</argument>
                                 <argument>-cp</argument>
                                 <classpath/>
                                 <argument>org.robomiri.jllm.cpu.LongContextTest</argument>
