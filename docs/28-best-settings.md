@@ -113,7 +113,7 @@ leave the default; "—" means the setting does not apply. Speeds are tokens per
 | Llama 3.x, R1-Distill-Llama | `./jllm chat --model unsloth/Llama-3.2-1B-Instruct` | Metal | `q4` | as Qwen3 dense | auto | not measured (expect dense numbers scaled by size) | — |
 | Mistral 7B v0.1–v0.3, Mistral Small 3 / Devstral (GGUF `mistral3`) | `./jllm chat --model <repo>` | Metal; `--backend cpu` when `head_dim` is not a multiple of 32 | `q4` | as dense | auto | not measured | — |
 | Gemma 2 / Gemma 3 | `./jllm chat --model unsloth/gemma-3-1b-it` | Metal | `q4` | as dense (Metal q4 KV refused with a picture) | auto | Gemma 3 4B with a picture: decode 25.3 | — (Gemma 3's chunk is raised to ≥ 256 by itself) |
-| Gemma 4 12B | `./jllm chat --model <Gemma 4 12B repo>` | Metal or CPU (512-wide heads on both) | `q4` | `f32` / `f16` / plain `q8` (no q4, no rotated q8) | auto | not measured | — (no paged, batched or tiered KV) |
+| Gemma 4 12B | `./jllm chat --model <Gemma 4 12B repo>` | Metal or CPU (512-wide heads on both) | `q4` | `f32` / `f16` / plain `q8` (no q4, no rotated q8) | auto | Metal 8 tok/s decode | — (no paged, batched or tiered KV) |
 | Phi-3 / 3.5 / 4 | `./jllm chat --model microsoft/Phi-3.5-mini-instruct --ctx 4096` | Metal (`head_dim` 96 keeps the generic decode attention) | `q4` | as dense | **`--ctx 4096`** for short chats (the short LongRoPE factors) | not measured | `--ctx` larger only when the text is long |
 | GLM-4 / GLM-Edge | `./jllm chat --model THUDM/GLM-4-9B-0414 --backend.kv-dtype f16` | Metal | `q4` | `f16` | auto | not measured | — |
 | DeepSeek V2-Lite (MLA) | `./jllm chat --model deepseek-ai/DeepSeek-V2-Lite-Chat --backend.kv-dtype f16` | Metal | `q4` (≈ 10 GB) | **`f16`** (the latent cache is small; q8 has one scale per latent row) | auto | not measured | — |
@@ -406,7 +406,7 @@ dense. Only TinyMistral-248M was checked on real weights.
   with a picture.
 - **Gemma 4 (12B dense)**: CPU and Metal (512-wide attention kernels, per-layer head-shape dispatch). Each layer keeps its own
   flat cache, so the paged, batched, mixed and tiered passes, q4 KV and rotated q8 are not offered: use `f32`, `f16` or plain
-  `q8` with one slot. E2B / E4B (per-layer embeddings) and 26B-A4B (MoE) are refused. Not timed on real weights.
+  `q8` with one slot. E2B / E4B (per-layer embeddings) and 26B-A4B (MoE) are refused. Real weights on Metal (M1 Pro, Q4_K_M, f32 KV): decode about 8 tok/s, prefill 73-85 tok/s; the 512-wide flash kernels are off there ([14 §14.10.7](14-model-families.md#14107-gemma-4-12b)).
 
 ### 28.5.6 Phi-3 / 3.5 / 4
 

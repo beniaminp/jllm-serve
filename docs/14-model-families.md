@@ -623,6 +623,42 @@ and tiered KV passes, q4 KV and rotated q8 are not offered (each layer keeps its
 the same decoder `gemma4`: llama.cpp's converter (b11669) writes the 12B's `Gemma4UnifiedForConditionalGeneration` under that
 architecture too (`Gemma4UnifiedModel.model_arch = GEMMA4`); the reader also accepts the name `gemma4_unified`.
 
+**Real 12B on Metal (what was measured, and the abort that hid it).** Apple M1 Pro, Gemma 4 12B Q4_K_M GGUF (7.1 GB),
+`--ctx 4096`, kv f32, `--engine.speculative off` for the runs, default `bench` for the speed.
+
+Plain words: at start the Metal backend times and checks its optional attention kernels once per head shape (`MetalTuner`).
+Gemma 4 has two shapes, 256-wide local and 512-wide full. For the 512 shape the check of the flash-prefill kernel
+`attention_fb_d512` failed with "kernel not found" (by design: an f32 cache has no d512 form of that kernel, only `_h` / `_q8`) and the flash-decode kernel disagreed
+with the plain one (max diff 2.6e-1). A failed or disagreeing optional kernel is meant to be switched off quietly, but the
+timing helper `MetalTuner.time` had opened a command buffer and an encoder before the exception, and nothing ended
+them. The next `begin` then replaced the open encoder, and Metal aborts the process when an encoder is released without
+`endEncoding` (`failed assertion 'Command encoder released without endEncoding'`, exit 134) before one token was
+printed. The tiny synthetic Gemma 4 (32 / 64-wide heads) never hit it because those head sizes have every kernel. Fix:
+`MetalTuner.time` ends the command buffer with `k.abort()` (the existing `jm_abort`, which every forward-pass path already
+uses) when the recorded work throws, so the probe is reported as failed and the 512 shape runs on the plain
+`attention_g1_d512` kernel (flash prefill off, flash decode off, decode attention off). Coverage: `scripts/arch-smoke.sh`
+can also generate `Gemma4Hd512ForCausalLM` (`SMOKE_HD512=1 scripts/arch-smoke.sh`; `make-tiny-model.py gemma4 --head-dim 256
+--set global_head_dim=512`), a tiny Gemma 4 with the real 256 / 512 head sizes. It reproduces the abort without the fix and
+passes the f32 / f16 CPU-vs-Metal and concurrent-encoder checks with it, but it is opt-in because 9 other checks fail on the
+512-wide full layers (all with the 512 head, none with 32 / 64 or 256 alone): q8-KV CPU-vs-Metal (max diff 5.4), concurrent
+encoder with q8, decode replay f32 / q8 (differs from step 7 / step 0), batched decode q8 / q4 and replay x batch. On the
+real 12B (f32 KV, window 1024) replay on and off print the same 60 greedy tokens at position 2300, so the default path is
+unaffected; the q8 and replay checks on 512-wide heads are open.
+
+| Check | Command (after `--model <gguf> --model.dir models`) | Result |
+|---|---|---|
+| chat answer, Metal | `run --backend metal --ctx 1024 --prompt "What is the capital of France?" --temp 0 --max-tokens 12` | "The capital of France is Paris." (before: abort, exit 134) |
+| chat answer, Metal vs CPU | `run --backend {metal,cpu} --prompt "Complete the sentence: The three primary colors are red, yellow and" --temp 0` | both "blue." |
+| prompt past the 1024 window | `chat --backend metal --ctx 4096 < 2305-token text` (question at the end) | "The keeper writes the weather in the ledger." (coherent) |
+| decode speed | `bench --backend metal --ctx 4096` | 7.9 / 8.0 / 8.1 tok/s |
+| prefill speed | same | 73 / 84 / 85 tok/s (2305-token prompt: 56 tok/s, 41 s) |
+
+A raw completion (`--raw`, no chat template) gets its `<bos>` from the file's `tokenizer.ggml.add_bos_token` (the tokenizer
+comes from the original repository, whose config does not say; [04](04-tokenizer.md)): "The three primary colors are red,
+yellow and" gives " blue.\n<|channel>thought\n<channel|>That is correct! These are known as the", llama.cpp's text. Open items: the 512-wide flash-decode kernel disagrees with the plain kernel on
+real data (the tuner correctly keeps it off), `attention_fb_d512` does not exist, and decode (about 8 tok/s) is far below
+the memory-bandwidth limit of the 7.1 GB weights.
+
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
 Code: `Families.deepseek`, `model/Attention.Mla`, `model/Router.DeepSeek` + `model/DeepSeekRouter`, `model/AttnWeights.Mla`

@@ -612,8 +612,16 @@ final class MetalTuner {
         for (int i = 0; i < reps; i++) {
             k.begin();
             long t0 = System.nanoTime();
-            r.run();
-            k.commitAndWait();
+            boolean done = false;
+            try {
+                r.run();
+                k.commitAndWait();
+                done = true;
+            } finally {
+                if (!done) {
+                    k.abort(); // an un-ended encoder would make Metal abort the process on release
+                }
+            }
             best = Math.min(best, (System.nanoTime() - t0) / 1e6);
         }
         return best;
