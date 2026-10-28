@@ -11,7 +11,7 @@ Machines, unless a row says otherwise:
 | name in this chapter | machine | where its numbers come from |
 |---|---|---|
 | **M1 Pro** | Apple M1 Pro, 10 CPU cores (8 performance + 2 efficiency), 16-core GPU, 32 GB unified memory, ~200 GB/s, macOS; Metal working set 26.8 GB | almost every Metal and CPU number of chapters 07–27 |
-| **x86 VM** | a 4-core cloud VM, Intel Xeon with AVX-512 and AVX-512 VNNI, Linux, JDK 26.0.2, 16 GB | the AVX-512 / AVX2 rows ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history), [07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)), the agent runs on a CPU, the needle study of [27 §27.5](27-sparse-attention.md#275-measured) |
+| **x86 VM** | a 4-core cloud VM, Intel Xeon with AVX-512 and AVX-512 VNNI, Linux, JDK 26.0.2, 15 GB | the AVX-512 / AVX2 rows ([07 §7.14](07-cpu-backend.md#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history), [07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)), the agent runs on a CPU, the needle study of [27 §27.5](27-sparse-attention.md#275-measured) |
 
 Contents:
 
@@ -310,7 +310,7 @@ Gemma 4 (per-layer head shapes), and gpt-oss / Llama 4 (sinks, chunked attention
 
 | key | default | what it does | measured | best |
 |---|---|---|---|---|
-| `backend.kv-sparse` | `false` | Quest-style decode attention: each 16-position block keeps min / max key summaries; a step attends exactly over the best `kv-sparse-blocks` blocks + sink + recent window (≈ 1 300 positions) | perplexity at 8 192 / 16 384 / 32 768 tokens, 64 blocks: 29.58 vs 25.84, 8.35 vs 8.14, 3.025 vs 2.905; 128 blocks within 0.5–3 % of dense at 16 k and 32 k; needle retrieval in [27 §27.5](27-sparse-attention.md#275-measured) | off; on for contexts far beyond 1 300 tokens where a small accuracy loss is acceptable, with `--backend.kv-sparse-blocks 128` |
+| `backend.kv-sparse` | `false` | Quest-style decode attention: each 16-position block keeps min / max key summaries; a step attends exactly over the best `kv-sparse-blocks` blocks + sink + recent window (≈ 1 300 positions) | perplexity at 8 192 / 16 384 / 32 768 tokens, 64 blocks: 29.58 vs 25.84, 8.35 vs 8.14, 3.025 vs 2.905; 128 blocks within 0.5–3 % of dense at 16 k and 32 k; needle in a haystack (CPU, 30 haystacks of 8 k – 32 k tokens): dense 26, 128 blocks 26, 64 blocks 25, 32 blocks 25, 16 blocks 19 found, and the decode steps about twice as fast as dense at 32 k ([27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)) | off; on for contexts far beyond 1 300 tokens where a small accuracy loss is acceptable; `--backend.kv-sparse-blocks 128` costs little more time than 64 and keeps the perplexity closer to dense; never below 32 |
 | `backend.kv-tier` | `false` | hot / host / SSD tiers for the paged pool; a slot larger than the hot cap streams its KV (Metal) | interim, 0.6B f16 Metal: streamed decode 58.7 tok/s (512) / 69.0 (1 024); pool tier with the planner 105.4 (1 024) → 49.3 (12 000) ([26 §26.5](26-tiered-kv-and-memory-planner.md#265-measured)) | off; on for a server that must keep many or very long conversations within a memory budget |
 | `backend.memory-plan` | `false` | one GPU budget across experts, KV and scratch (needs `kv-tier` and `cpu-moe=auto`) | planner unit numbers for the 30B: 16 384 positions → 256 of 6 144 experts on the CPU, 1.0 ms / token | off; on for a big MoE model whose context grows |
 | `backend.metal.cpu-moe` | `auto` | routed experts in CPU memory, run on the CPU, so a model larger than the working set fits | estimates only: a cold expert ≈ 50 µs, a whole CPU layer 0.25–0.4 ms ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)) | `auto` (moves nothing when the model fits) |
@@ -720,7 +720,8 @@ What this chapter cannot recommend from data yet, each with what would decide it
 1. **`engine.scheduler=mixed` against `slots`**: the tables of [25 §25.5](25-scheduler.md#255-measured) are still to be filled
    on the Mac (`SchedulerBench`); its knobs (`pass-budget`, `mixed-reserve`, `background-chunk-cap`, `max-running`) are unmeasured.
 2. **Batched decoding against taking turns** on a quiet Mac ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)).
-3. **Sparse attention speed** and the best `kv-sparse-blocks` (64 or 128): perplexity is measured; retrieval in [27 §27.5](27-sparse-attention.md#275-measured).
+3. **Sparse attention on Metal**: the needle table and the decode speed on the GPU (the CPU's are in [27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)
+   ); decode tokens per second against context length; whether 64 or 128 blocks should be the default (128 is closer in perplexity, both are within one haystack of dense).
 4. **Tiered KV** beyond the interim 0.6B numbers, and the accuracy of `backend.kv-disk-format` q8 / q4 ("about 0.5 %" / "about 8 %").
 5. **The f16 KV cache on an x86 CPU** (F16C) against q8, at 2 000+ tokens.
 6. **q4 KV at long contexts on Metal** since the decode attention kernel of [08 §8.31](08-metal-backend.md#831-decode-attention-attention_dec).

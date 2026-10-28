@@ -113,8 +113,12 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - checks: `cpu/SparseKvTest` (1405 checks, in `mvn install`), the kernel_tests sparse section, and `KvStudy
     sparsecheck` on the real GPU (replay on = off bit for bit);
   - perplexity at 8k/16k/32k is in docs/27 §27.5.2.
-- **Merged, follow-ups still open:** the needle-in-a-haystack tables at 8k/16k/32k, decode tok/s against context
-  length, and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
+- **Measured since (CPU, x86, 2026-10-28):** the needle in a haystack at 8k/16k/32k (docs/27 §27.5.3, `KvStudy needle
+  share=true`: each haystack prefilled once for every variant): of 30 haystacks dense attention finds 26, 128 blocks 26,
+  64 blocks 25, 32 blocks 25, 16 blocks 19; the misses are near-misses (one digit wrong); the decode steps take about half
+  the dense time at 32k.
+- **Still open:** the Metal needle table and decode tok/s against context length on the GPU (commands in docs/27 §27.5),
+  and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
 - **Known:** CPU and Metal sparse logits differ by up to 0.4–2.8, because a rounding-order difference flips which block
   is selected. Argmax agrees 23–24 of 24.
 

@@ -306,7 +306,85 @@ within 0.5 % – 3 % of dense at 16 k and 32 k. The loss shrinks with the contex
 repetitive), and is a smooth function of the budget, not a cliff. Rotated q8 keys give about the same loss (-0.071 against -0.135 at 8 k, -0.054 against -0.025 at 16 k, -0.063 against -0.040 at 32 k): the
 bound in the rotated basis is neither clearly tighter nor looser.
 
-The needle-in-a-haystack, decode perplexity and decode speed tables (8k / 16k / 32k tokens) are being measured under the shared GPU lock and are added in a follow-up commit; the commands are:
+### 27.5.3 Needle in a haystack (CPU, x86, 2026-10-28)
+
+🧸 A five-digit pass key is hidden in a long pile of numbered notes, and the model is asked to repeat it. Full attention reads
+every note at every word of the answer; sparse attention reads only the blocks of 16 tokens its summaries say matter most (64
+of them by default, about 1 300 tokens with the sink and the recent window). The question is whether those blocks still contain
+the key.
+
+📐 **Setup.** Machine: the 4-core x86 cloud VM of [28](28-best-settings.md) (Intel Xeon with AVX-512 VNNI, 15 GB, Linux,
+JDK 26.0.2), CPU backend, 4 threads, native int8 kernels, Qwen3-0.6B (Q4_0 weights), paged f16 cache. The haystack is a list of
+notes such as `Note 48211: the quiet harbor stayed open until spring.` (every sentence carries a five-digit number: a decoy for
+the key); the sentence `The pass key is 59811. Remember it. 59811 is the pass key.` sits at depth `d / 4` of the text
+(`d` = 0 … 4, 0 = start), two haystacks per depth and length (10 per length, the same 30 for every variant); the question
+`What is the pass key mentioned in the text above? Answer with only the number.` closes the Qwen3 chat prompt; greedy, 14
+tokens; "found" means the answer contains the key. Each haystack is prefilled **once**, dense, in whole 64-token chunks into a
+paged pool that also writes the block summaries (`share=true`); every variant then adopts those blocks (the same rows, no
+recompute), prefills the rest of the prompt itself (1 to 64 tokens, depending on the haystack's length) and decodes 13 tokens
+with its own attention. A rest of 16 tokens or more is a dense chunk (27.6), so for most haystacks the **first** answer token is
+the same dense one in every variant and the following 13 are sparse decode steps, as in real use, where a prompt ends with a
+prefill chunk.
+
+```sh
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -XX:MaxDirectMemorySize=10g \
+  -cp target/classes:target/test-classes org.robomiri.jllm.KvStudy needle model=models/Qwen_Qwen3-0.6B backend=cpu \
+  ctx=33280 batch=64 lens=8192,16384,32000 trials=2 depths=5 tail=0 share=true check=false \
+  variants=f16+p,f16+s128,f16+s64,f16+s32,f16+s16
+```
+
+| context (prompt tokens) | attention | positions read per decode step | found the key | by depth 0 / 1 / 2 / 3 / 4 (of 2 each) |
+|---|---|---|---|---|
+| 8 192 (~8 330) | dense, paged f16 (reference) | all | 8 / 10 | 1 / 2 / 1 / 2 / 2 |
+| | sparse, 128 blocks | 2 320 | 9 / 10 | 1 / 2 / 2 / 2 / 2 |
+| | sparse, 64 blocks (default) | 1 296 | 8 / 10 | 1 / 2 / 1 / 2 / 2 |
+| | sparse, 32 blocks | 784 | 9 / 10 | 1 / 2 / 2 / 2 / 2 |
+| | sparse, 16 blocks | 528 | 6 / 10 | 1 / 1 / 1 / 1 / 2 |
+| 16 384 (~16 750) | dense (reference) | all | 8 / 10 | 2 / 2 / 1 / 1 / 2 |
+| | sparse, 128 / 64 / 32 blocks | 2 320 / 1 296 / 784 | 8 / 8 / 8 of 10 | 2 / 2 / 1 / 1 / 2 (each) |
+| | sparse, 16 blocks | 528 | 6 / 10 | 2 / 1 / 0 / 1 / 2 |
+| 32 000 (~32 790) | dense (reference) | all | **10 / 10** | 2 / 2 / 2 / 2 / 2 |
+| | sparse, 128 blocks | 2 320 | 9 / 10 | 2 / 1 / 2 / 2 / 2 |
+| | sparse, 64 blocks (default) | 1 296 | 9 / 10 | 2 / 1 / 2 / 2 / 2 |
+| | sparse, 32 blocks | 784 | 8 / 10 | 2 / 0 / 2 / 2 / 2 |
+| | sparse, 16 blocks | 528 | 7 / 10 | 2 / 1 / 1 / 1 / 2 |
+| **all 30** | dense / 128 / 64 / 32 / 16 blocks | | **26 / 26 / 25 / 25 / 19** | |
+
+(Positions read per step: the selected blocks × 16, plus the sink block (16) and the 256-position window; the 2 dense layers read
+everything.)
+
+**What it says.**
+
+* The model itself misses 4 of 30 with full attention (it answers with a decoy's number, `55095` for the key `24236` at 8 k, or a
+  digit off: `64495` for `74495`): the haystack is hard for a 0.6B model, and every variant inherits those misses.
+* **128 and 64 blocks are within one haystack of dense attention at every length** (26 and 25 of 30 against 26), while reading
+  2 320 / 1 296 positions instead of up to 32 794. **32 blocks** (784 positions) also find 25, but lose both haystacks of one depth
+  at 32 k; **16 blocks** (528) are too few: 19 of 30, with misses at every length.
+* The sparse misses are near-misses: `8883` for `18883` (128 blocks, 32 k), `47058` for `47051` (32 blocks, 32 k), `78084` for
+  `78044` (16 blocks, 8 k). The key's region is found, but one digit comes out wrong. That is what a selection that keeps most but
+  not all of the key's blocks (or of the blocks that make its digits unambiguous) would do; this run does not log the selected
+  blocks, so it cannot say which.
+* For 128 and 64 blocks one haystack separates them from dense attention: at 32 k, depth 1, key `18883`, dense attention finds
+  it and every sparse budget misses (32 blocks also miss `47051`, at the same depth). The reverse happens once: at 8 k, depth 2,
+  key `36254`, 128 and 32 blocks answer right where dense attention (and 64 blocks) answer `44649`, a near tie, not a gain.
+
+**Time** (indicative: the median time of the rest of the prompt (1 – 64 tokens) plus 13 decode steps, the same work in every
+variant, which ran one after the other on the same haystack; the first 8 k haystack, which warmed up the JIT, is left out):
+
+| context | dense | 128 blocks | 64 blocks | 32 blocks | 16 blocks |
+|---|---|---|---|---|---|
+| 8 192 | 1.90 s | 1.40 s | 1.30 s | 1.40 s | 1.40 s |
+| 16 384 | 3.75 s | 2.40 s | 2.15 s | 2.10 s | 2.05 s |
+| 32 000 | 6.70 s | 3.50 s | 3.30 s | 3.20 s | 3.55 s |
+
+At 32 k the sparse variants take about half the dense time for the same steps (the rest of the prompt is mostly dense in both,
+so the decode steps alone gain more); below 64 blocks the time no longer falls, because the summary scan, the two dense layers
+and the weights dominate. The dense prefill of the shared part
+took 72 – 128 s for 8 320 tokens, 226 – 288 s for 16 704 and 768 – 817 s for 32 768 (40 – 116 tok/s: each 64-token chunk
+attends to everything before it).
+
+The Metal needle, decode perplexity and decode speed tables (8k / 16k / 32k tokens) are measured under the shared GPU lock on
+the Mac and are added in a follow-up commit; the commands are:
 
 ```sh
 JAVA="$JAVA_HOME/bin/java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Djllm.metal.lib=target/native/libjllm_metal.dylib"
