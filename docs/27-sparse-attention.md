@@ -341,7 +341,7 @@ Verified by (all in `mvn -o install`, `scripts/metal-emu/kernel_tests.py` and th
 **Not done / limits.**
 
 * **The scan of the summaries is linear in the context** (a quarter to a sixteenth of the key traffic, 27.2.2). At a million tokens it is 7.5 GB per token for Qwen3-0.6B; a two-level scheme (a summary of 64 blocks scored first) would make it sub-linear. Not built.
-* **No tiered storage yet:** the blocks a step does not select stay in memory. Sparse attention is the first half of "read less"; moving cold blocks out of RAM / VRAM (the next item of `wip/NEXT-PROMPT.md` Stage 2) needs the selection to run ahead of the read.
+* **The unselected blocks stay resident:** tiered storage exists ([26](26-tiered-kv-and-memory-planner.md): hot, host and SSD tiers for the paged pool), but it moves whole conversations' blocks by recency, not the blocks a sparse step skips. Keeping only the selected blocks of a running sequence on the GPU needs the selection to run ahead of the read; not built.
 * **Prefill is dense**, including the part of a long prompt that runs in chunks of 16 or more; only steps of fewer than 16 tokens select. Sparse prefill is its own item.
 * **Per kv head, shared by the query-head group:** a head that needs a block its group mates do not still gets it (the group's maximum), at the price of reading blocks one head wanted for all.
 * **Metal: head sizes 64, 128, 256 only** (the dec kernels'), f32 / f16 / q8 paged caches; `attention_dec` is forced on for a sparse run (the start-up check that normally decides it is skipped for the dense rows).

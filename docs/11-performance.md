@@ -220,8 +220,8 @@ matrices and 115 GB/s for the LM head: the 1 – 3 MB matrices are latency-bound
    | Qwen3-0.6B, q8 KV cache | 198 → 170 ([08 §8.23](08-metal-backend.md#823-decode-fusions)) | 203 | 3 |
    | Qwen3-30B-A3B | 386 → 338 | 391 | 3 |
 
-   Not yet measured on a Mac (the emulator's wall time means nothing); `scripts/mac-validate.sh` compares replay on
-   and off.
+   Measured on the M1 Pro since: replay makes no measurable difference to decode (f16 cache 114.5 tok/s with replay off
+   against 114.4 on, [11.9](#119-the-q4-kv-cache-measured)); `scripts/mac-validate.sh` compares replay on and off.
 2. **Under-filled GPU.** `o_proj` / `down_proj` have 1024 output rows → 256 threadgroups of 4
    simdgroups (128 with the multi-row kernels, whose lanes each keep 4 rows' loads in flight); the 16-core GPU wants thousands in flight to hide memory latency. Latency, not bandwidth, bounds
    these matmuls.
@@ -307,7 +307,7 @@ Set by the `jllm` launcher:
 | `--add-modules jdk.incubator.vector` | the Vector API is an incubator module; without it `VectorKernels` does not load |
 | `--enable-native-access=ALL-UNNAMED` | silences the warning for FFM restricted methods (`Linker`, `SymbolLookup`) |
 | `-XX:+UseParallelGC` | almost nothing is allocated during generation; ParallelGC has the lowest overhead |
-| `-Xmx4g` (`JLLM_XMX`) | room for the CPU KV cache at `--ctx 4096`; raise it for larger contexts on CPU, or halve the cache with `backend.kv-dtype=f16` |
+| `-Xmx4g` (`JLLM_XMX`) | the flat CPU KV cache of a single slot lives on the heap: `backend.ctx=auto` gives it 60 % of the free heap (7 168 positions for Qwen3-0.6B at f32 with 4 GB, [10 §10.13](10-engine-and-server.md#1013-the-default-context-length-backendctxauto)); raise it for longer contexts, or shrink the cache with `backend.kv-dtype=q8`. The paged pool of two or more slots is off the heap, bounded by `-XX:MaxDirectMemorySize`, which the launchers set to the physical memory (`JLLM_DIRECT_MEMORY`) |
 
 Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="-Djllm.cpu.fastmath=false" ./jllm bench`):
 

@@ -197,8 +197,10 @@ The fixed cost per expert is shared by 4 tokens at `n = 64` and by 16 at `n = 25
 by expert: the CPU with a counting sort (12.4), Metal with `moe_sort` and the simdgroup-matrix tile kernels
 ([08 §8.15](08-metal-backend.md#815-expert-grouped-moe-prefill)). And MoE models prefill in **256-token chunks**
 unless `backend.batch` is set to a number. Measured on the CPU expert path with one Qwen3-30B-A3B-shaped layer (Q4_0, 4
-cores), that is 1.5–1.6× faster per token than 64-token chunks; on Metal it is not measured yet
-([11](11-performance.md)).
+cores), that is 1.5–1.6× faster per token than 64-token chunks ([11](11-performance.md)); on Metal the 30B prefills a
+413-token prompt at 211 tok/s with 64-token chunks and 301 with 256 (326 with 512), and in a later re-measurement
+158–160 / 262–267 / 293–306 tok/s for 64 / 256 / 512 ([08 §8.29](08-metal-backend.md#829-the-prefill-chunk-backendbatchauto),
+[08 §8.33](08-metal-backend.md#833-should-the-prefill-chunk-come-from-the-tuner-backendbatchauto-stays-at-256)).
 
 The same code serves DeepSeek-V2/V3 ([14.11](14-model-families.md#1411-deepseek-v2--v3-multi-head-latent-attention--shared-experts)):
 only the router (`Router.DeepSeek`) and the extra shared-expert matmul differ.

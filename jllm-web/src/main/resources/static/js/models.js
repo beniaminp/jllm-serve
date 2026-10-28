@@ -59,7 +59,7 @@ const Models = (() => {
       form['backend.kv-dtype'].value = 'f16';
       form.slots.value = 2;
       form['server.queue-timeout-ms'].value = 1800000; // a request may wait behind another one's long prefill
-      toast('Context 32768, f16 KV cache, 2 slots. On the CPU backend the KV caches live on the Java heap: about 3.7 GB per slot for a 0.6B model, more for bigger ones (JLLM_XMX).', 'info', 9000);
+      toast('Context 32768, f16 KV cache, 2 slots. On the CPU backend the two slots share one paged KV pool outside the Java heap: up to about 3.7 GB per slot for a 0.6B model, less when they share a prompt, more for bigger models (run.sh lets it use the physical memory; JLLM_DIRECT_MEMORY bounds it). On the CPU a q8 cache decodes faster than f16 (docs/28).', 'info', 9000);
     });
     let action = 'load';
     form.querySelectorAll('button[type=submit]').forEach(b => b.addEventListener('click', () => { action = b.value; }));

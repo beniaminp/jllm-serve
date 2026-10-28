@@ -232,8 +232,9 @@ simply runs unpipelined.
 
 *Expected gain:* the CPU share of a step — logits copy, argmax over 151 936 floats, encoding ~170 dispatches through
 FFM — is on the order of a millisecond, out of ~9 ms per token for Qwen3-0.6B on an M1 Pro ([08 §8.7](08-metal-backend.md));
-hiding it is worth roughly 10 %, more for small models and fast GPUs. Not measured on Apple hardware yet: run `bench`
-with `-Djllm.metal.pipeline=false` and without to see it on yours.
+hiding it is worth roughly 10 %, more for small models and fast GPUs. Measured on the M1 Pro since, it is not: Qwen3-0.6B
+decoded 117.5 tok/s pipelined and 119.7 with `-Djllm.metal.pipeline=false` ([08 §8.20](08-metal-backend.md#820-validating-on-a-mac),
+within run-to-run noise). Run `bench` with `-Djllm.metal.pipeline=false` and without to see it on yours.
 
 ---
 

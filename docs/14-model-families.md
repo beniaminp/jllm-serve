@@ -592,7 +592,8 @@ caches and `head_dim` 32, 64 and 256. A 262 144-row vocabulary also runs (CPU ==
 
 ### 14.10.6 Not supported / not verified
 
-Images (the vision tower and projector are skipped, so Gemma 3 4B+ is text-only);
+Images from a safetensors checkpoint (its vision tower and projector are skipped, so Gemma 3 4B+ loaded that way is text-only;
+pictures work through a GGUF file and its `mmproj` projector, [20 §20.13](20-vision.md#2013-gemma-3-attention-that-runs-both-ways-inside-a-picture));
 the 4B+ sizes and Gemma 2 9B/27B were checked only through their configs and tensor indexes (only the 2B/1B/4B
 configs above were read); real weights were run only for `gemma-2-2b-it` and `gemma-3-1b-it` (14.13);
 `dynamic` RoPE scaling; Gemma 3n and Gemma 1 (`model_type: gemma`, no extra norms) are rejected.
