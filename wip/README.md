@@ -115,8 +115,9 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - perplexity at 8k/16k/32k is in docs/27 §27.5.2.
 - **Measured since (CPU, x86, 2026-10-28):** the needle in a haystack at 8k/16k/32k (docs/27 §27.5.3, `KvStudy needle
   share=true`: each haystack prefilled once for every variant): of 30 haystacks dense attention finds 26, 128 blocks 26,
-  64 blocks 25, 32 blocks 25, 16 blocks 19; the misses are near-misses (one digit wrong); the decode steps take about half
-  the dense time at 32k.
+  64 blocks 25, 32 blocks 25, 16 blocks 19; the misses are near-misses (one digit wrong). Decode speed (§27.5.4, `KvStudy
+  decodespeed`, int8 activations): 64 blocks 1.06× / 2.13× / 2.69× / 3.00× the dense speed at 2k / 8k / 16k / 32k (7.85 vs
+  2.62 tok/s at 32k); on that x86 CPU the dense cache formats rank q8 (rotated) > f16 > f32 (6.80 / 4.93 / 3.59 tok/s at 16k).
 - **Still open:** the Metal needle table and decode tok/s against context length on the GPU (commands in docs/27 §27.5),
   and anything at 128k+ (the 30B supports 262k but did not fit beside other jobs).
 - **Known:** CPU and Metal sparse logits differ by up to 0.4–2.8, because a rounding-order difference flips which block

@@ -234,9 +234,11 @@ on Metal: f32 92.9, f16 113.4, q8 114.4 tok/s ([08 §8.31](08-metal-backend.md#8
 - **Metal, short conversations**: the default `f32`; every type decodes at about the same speed below ~1 000 tokens.
 - **Metal, long conversations or several slots**: `q8` (rotated, the default for q8): a quarter of f32's memory, as fast as
   f16, and 0.003 nats from f16. `f16` if you want no quantization at all.
-- **CPU (measured on the M1 Pro's CPU)**: `q8` or `f32`. The CPU's f16 cache decoded at **9.7 tok/s against 36.0 (f32) and
-  41.4 (q8)** at 2 000 tokens: the half-to-float conversion of the Vector API is the bottleneck on that machine. On x86 the
-  F16C conversion is a single instruction; the f16 decode there has not been timed against q8 (see [28.10](#2810-not-measured-yet)).
+- **CPU: `q8`** (rotated, the default for q8) on both machines measured. On the M1 Pro's CPU the f16 cache decoded at
+  **9.7 tok/s against 36.0 (f32) and 41.4 (q8)** at 2 000 tokens: the half-to-float conversion of the Vector API is the
+  bottleneck there, so use `q8` or `f32`, not `f16`. On the x86 VM (AVX-512, F16C: the conversion is one instruction) f16 is
+  faster than f32 and q8 faster again: 20.8 / 26.0 / **35.7** tok/s (f32 / f16 / rotated q8) at 2 048 tokens and
+  3.59 / 4.93 / **6.80** at 16 384 ([27 §27.5.4](27-sparse-attention.md#2754-decode-speed-against-the-context-length-cpu-x86-2026-10-28)).
 - **`q4`** only when memory decides; `backend.kv-q4-recent=512` "when answers matter more than prefill speed", `0` to save
   the ring and lose only 7.5 % of prefill speed against f16 ([11 §11.9](11-performance.md#119-the-q4-kv-cache-measured)).
 - DeepSeek (MLA): `f16` ("the latent cache is already small, f16 is the safer choice"); q4 is served as q8.
@@ -310,7 +312,7 @@ Gemma 4 (per-layer head shapes), and gpt-oss / Llama 4 (sinks, chunked attention
 
 | key | default | what it does | measured | best |
 |---|---|---|---|---|
-| `backend.kv-sparse` | `false` | Quest-style decode attention: each 16-position block keeps min / max key summaries; a step attends exactly over the best `kv-sparse-blocks` blocks + sink + recent window (≈ 1 300 positions) | perplexity at 8 192 / 16 384 / 32 768 tokens, 64 blocks: 29.58 vs 25.84, 8.35 vs 8.14, 3.025 vs 2.905; 128 blocks within 0.5–3 % of dense at 16 k and 32 k; needle in a haystack (CPU, 30 haystacks of 8 k – 32 k tokens): dense 26, 128 blocks 26, 64 blocks 25, 32 blocks 25, 16 blocks 19 found, and the decode steps about twice as fast as dense at 32 k ([27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)) | off; on for contexts far beyond 1 300 tokens where a small accuracy loss is acceptable; `--backend.kv-sparse-blocks 128` costs little more time than 64 and keeps the perplexity closer to dense; never below 32 |
+| `backend.kv-sparse` | `false` | Quest-style decode attention: each 16-position block keeps min / max key summaries; a step attends exactly over the best `kv-sparse-blocks` blocks + sink + recent window (≈ 1 300 positions) | perplexity at 8 192 / 16 384 / 32 768 tokens, 64 blocks: 29.58 vs 25.84, 8.35 vs 8.14, 3.025 vs 2.905; 128 blocks within 0.5–3 % of dense at 16 k and 32 k; needle in a haystack (CPU, 30 haystacks of 8 k – 32 k tokens): dense 26, 128 blocks 26, 64 blocks 25, 32 blocks 25, 16 blocks 19 found ([27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)); CPU decode with 64 blocks 2.1× / 2.7× / 3.0× the dense speed at 8 k / 16 k / 32 k (7.85 against 2.62 tok/s at 32 k), 6 % slower than dense at 2 k with 128 blocks ([27 §27.5.4](27-sparse-attention.md#2754-decode-speed-against-the-context-length-cpu-x86-2026-10-28)) | off; on for contexts far beyond 1 300 tokens where a small accuracy loss is acceptable; `--backend.kv-sparse-blocks 128` costs little more time than 64 and keeps the perplexity closer to dense; never below 32 |
 | `backend.kv-tier` | `false` | hot / host / SSD tiers for the paged pool; a slot larger than the hot cap streams its KV (Metal) | interim, 0.6B f16 Metal: streamed decode 58.7 tok/s (512) / 69.0 (1 024); pool tier with the planner 105.4 (1 024) → 49.3 (12 000) ([26 §26.5](26-tiered-kv-and-memory-planner.md#265-measured)) | off; on for a server that must keep many or very long conversations within a memory budget |
 | `backend.memory-plan` | `false` | one GPU budget across experts, KV and scratch (needs `kv-tier` and `cpu-moe=auto`) | planner unit numbers for the 30B: 16 384 positions → 256 of 6 144 experts on the CPU, 1.0 ms / token | off; on for a big MoE model whose context grows |
 | `backend.metal.cpu-moe` | `auto` | routed experts in CPU memory, run on the CPU, so a model larger than the working set fits | estimates only: a cold expert ≈ 50 µs, a whole CPU layer 0.25–0.4 ms ([08 §8.18](08-metal-backend.md#818-experts-on-the-cpu-backendmetalcpu-moe)) | `auto` (moves nothing when the model fits) |
@@ -594,7 +596,7 @@ the files it read. The engine should read each of those tokens once, keep them, 
 | context | 32 768 (preset) | opencode's instructions and tools ≈ 11 k tokens, Cline ~12 k, Continue ~5 k, aider ~4 k |
 | slots | 2 (preset) | a side request (a title) no longer evicts the main conversation: 10 443 of 10 484 tokens cached, prefilled in 2.5 s |
 | KV paging | `auto` → paged with 2 slots | 8 conversations × 4 096 shared tokens: 1.1 GB instead of 7.7 GB; a resent conversation in 32 ms instead of 6.3 s (Metal) |
-| KV type | `f16` (preset) on Metal; **`q8` on the CPU** | Metal: rotated q8 is as fast (122.9 vs 121.0 tok/s at 2 013 tokens) for half the memory again; CPU: f16 decoded 9.7 tok/s against 41.4 for q8 at 2 000 tokens on the M1 Pro's CPU |
+| KV type | `f16` (preset) on Metal; **`q8` on the CPU** | Metal: rotated q8 is as fast (122.9 vs 121.0 tok/s at 2 013 tokens) for half the memory again; CPU: f16 decoded 9.7 tok/s against 41.4 for q8 at 2 000 tokens on the M1 Pro's CPU, and on the x86 VM rotated q8 decodes 6.80 tok/s against 4.93 for f16 at 16 k |
 | speculation | `ngram` (default) | code edits +106 % (0.6B Metal), +33…+68 % (30B), +44 % (CPU) |
 | tool calls | `engine.constrained-tools`, `engine.jump-forward`, `engine.constraint-masks` all `true` | every call parses; a 32-token call 254 → 149 ms on Metal ([17 §17.7.2](17-agent-speedups.md#1772-measured-checks-limits-and-switches)) |
 | tokenizing | `engine.prompt-cache-mb` 64 | a 100 k-character, 50-turn conversation tokenizes in 0.50 ms instead of 15.6 ms ([17 §17.5](17-agent-speedups.md#175-tokenizing-only-what-is-new)) |
@@ -617,8 +619,10 @@ On a machine without a usable GPU everything runs on the CPU backend. What matte
    width (8 lanes), which is how the AVX2 rows below were measured.
 3. **Memory**: one slot keeps its cache on the heap (`JLLM_XMX`); two or more slots use the off-heap paged pool, which the
    launchers now let grow to the RAM (`JLLM_DIRECT_MEMORY` to bound it).
-4. **The KV type**: `q8` or `f32` (see 28.4.4).
-5. **Speculation**: `ngram` pays most on the CPU, where the verify pass is cheap: rewriting a file 19.9 → 81.2 tok/s on 4
+4. **The KV type**: `q8` (rotated): the fastest on both CPUs measured (28.4.4).
+5. **Sparse attention for long contexts**: `--backend.kv-sparse true` decodes 2 – 3× faster than dense attention at 8 k – 32 k
+   tokens on the x86 VM for a retrieval accuracy within one haystack of 30 ([27 §27.5.3 – 27.5.4](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)).
+6. **Speculation**: `ngram` pays most on the CPU, where the verify pass is cheap: rewriting a file 19.9 → 81.2 tok/s on 4
    AVX-512 cores ([17 §17.1](17-agent-speedups.md)).
 
 **Measured on the x86 VM** (4 cores, AVX-512 VNNI, JDK 26.0.2; Qwen3-0.6B Q4_0, float activations, f16 cache,
@@ -721,9 +725,9 @@ What this chapter cannot recommend from data yet, each with what would decide it
    on the Mac (`SchedulerBench`); its knobs (`pass-budget`, `mixed-reserve`, `background-chunk-cap`, `max-running`) are unmeasured.
 2. **Batched decoding against taking turns** on a quiet Mac ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)).
 3. **Sparse attention on Metal**: the needle table and the decode speed on the GPU (the CPU's are in [27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)
-   ); decode tokens per second against context length; whether 64 or 128 blocks should be the default (128 is closer in perplexity, both are within one haystack of dense).
+   and 27.5.4); whether 64 or 128 blocks should be the default (128 is closer in perplexity and 9 – 25 % slower per step, both are within one haystack of dense).
 4. **Tiered KV** beyond the interim 0.6B numbers, and the accuracy of `backend.kv-disk-format` q8 / q4 ("about 0.5 %" / "about 8 %").
-5. **The f16 KV cache on an x86 CPU** (F16C) against q8, at 2 000+ tokens.
+5. Measured since: the f16 KV cache on an x86 CPU against f32 and q8 ([27 §27.5.4](27-sparse-attention.md#2754-decode-speed-against-the-context-length-cpu-x86-2026-10-28): q8 fastest, f32 slowest).
 6. **q4 KV at long contexts on Metal** since the decode attention kernel of [08 §8.31](08-metal-backend.md#831-decode-attention-attention_dec).
 7. **`backend.batch` on other GPUs** (M3 / M4, 32+ cores) and `hmma` there.
 8. **`backend.metal.cpu-moe` placement costs** on a model larger than the working set.

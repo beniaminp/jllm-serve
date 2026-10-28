@@ -383,6 +383,51 @@ and the weights dominate. The dense prefill of the shared part
 took 72 – 128 s for 8 320 tokens, 226 – 288 s for 16 704 and 768 – 817 s for 32 768 (40 – 116 tok/s: each 64-token chunk
 attends to everything before it).
 
+### 27.5.4 Decode speed against the context length (CPU, x86, 2026-10-28)
+
+🧸 Each new word must look back along the whole shelf. With full attention a twice longer shelf means twice the looking; with
+sparse attention the looking stays about the same (the ~1 300 positions it picks plus a quick glance at every block's summary),
+so the longer the conversation, the larger the gain.
+
+📐 `KvStudy decodespeed` (same machine as 27.5.3; Qwen3-0.6B Q4_0, 4 threads, native int8 kernels, **int8 activations** as a
+default CPU run uses here): one needle haystack per length is prefilled once into a paged pool that keeps the block summaries;
+then, three rounds in turn, every variant adopts those blocks, feeds the rest of the prompt and times 64 decode steps after 8
+untimed ones, all variants feeding the same teacher-forced tokens (so they differ only in attention). Median of the 3 rounds
+(the rounds differ by 2 – 10 %):
+
+```sh
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -XX:MaxDirectMemorySize=10g \
+  -cp target/classes:target/test-classes org.robomiri.jllm.KvStudy decodespeed backend=cpu ctx=33280 batch=64 steps=64 \
+  warm=8 rounds=3 int8=true lens=2048,8192,16384,32000 variants=f16+p,f16+s128,f16+s64,f16+s32
+```
+
+| context (prompt tokens) | dense, paged f16 | sparse 128 blocks | sparse 64 blocks (default) | sparse 32 blocks | 64 blocks vs dense |
+|---|---|---|---|---|---|
+| 2 048 (2 040) | 26.0 tok/s (38.4 ms) | 24.5 (40.9 ms) | 27.6 (36.2 ms) | 32.4 (30.9 ms) | 1.06× |
+| 8 192 (8 336) | 9.47 (105.5 ms) | 16.1 (62.0 ms) | 20.2 (49.6 ms) | 22.6 (44.3 ms) | 2.13× |
+| 16 384 (16 733) | 4.93 (202.7 ms) | 11.9 (84.3 ms) | 13.3 (75.3 ms) | 14.4 (69.5 ms) | 2.69× |
+| 32 000 (32 854) | 2.62 (381.1 ms) | 7.21 (138.6 ms) | 7.85 (127.3 ms) | 8.50 (117.6 ms) | 3.00× |
+
+**What it says.** Dense decode slows in proportion to the context (38 → 381 ms per token from 2 k to 32 k: the attention reads
+every cached row in all 28 layers). Sparse decode slows much less (36 → 127 ms with 64 blocks): what still grows is the scan of
+the summaries (linear in the blocks, 27.2.2) and the two dense layers; what does not is the attention
+proper, which reads 1 296 positions however long the context is. The gain is **2.1× at 8 k, 2.7× at 16 k and 3.0× at 32 k** for
+64 blocks; 128 blocks take 9 – 25 % more time per step than 64, and 32 blocks 8 – 15 % less. At 2 k the 128-block budget
+(2 320 positions) is larger than the context, so the step attends to everything *and* scans the summaries: 6 % slower than
+dense, the cost of switching sparse attention on for short conversations. Together with 27.5.3: 64 blocks find the key in 25
+of 30 haystacks against 26 for dense attention, at 3× the decode speed at 32 k.
+
+The same runs with the dense cache in other formats (`variants=f32+p` and `variants=q8r+p`, `lens=2048,16384`) answer, for this
+x86 CPU, the question docs/28 had left open (the M1 Pro's CPU decoded f16 caches far slower than f32 or q8, docs/24 §24.5):
+
+| context | dense f32 | dense f16 | dense q8, rotated keys |
+|---|---|---|---|
+| 2 048 | 20.8 tok/s | 26.0 | **35.7** |
+| 16 384 | 3.59 | 4.93 | **6.80** |
+
+On AVX-512 the half-to-float conversion is one instruction (F16C), so f16 is faster than f32 here (it reads half the bytes),
+and q8 with rotated keys is faster again (a quarter of f32's bytes).
+
 The Metal needle, decode perplexity and decode speed tables (8k / 16k / 32k tokens) are measured under the shared GPU lock on
 the Mac and are added in a follow-up commit; the commands are:
 
