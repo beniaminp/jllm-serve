@@ -212,13 +212,17 @@ limited by …)` says which budget decided it.
 
 ### 28.4.4 The KV cache: `backend.kv-dtype` and its companions
 
-| `backend.kv-dtype` | bytes per token (Qwen3-0.6B) | perplexity at 4 096 tokens, vs f16 21.2222 | needle (27 questions, 4k–16.8k) | Metal decode, 413 / 2 013 tokens | CPU decode, 413 / 2 000 tokens |
-|---|---|---|---|---|---|
-| `f32` (default) | 229 KB | 21.2204 (exact) | — | — / ~108.6 (paged table) | 89.3 / **36.0** |
-| `f16` | 115 KB | 21.2222 | 23 | 142.5 / 121.0 | 69.2 / **9.7** |
-| `q8` rotated (default for q8) | 59 KB | 21.2804 (+0.0027 nats) | 23 | 139.1 / 122.9 | — |
-| `q8` plain (`--backend.kv-q8-rotate false`) | 59 KB | 21.8289 (+0.028 nats) | 26 | 142.9 / 126.8 | 83.6 / **41.4** |
-| `q4` (window 128) | 31.5 KB + ring | 32/128/512 window: +0.369 / +0.269 / +0.152 nats | 23 (w128), 24 (w512) | within 9 % of f16 at 413, equal at 2 000 | 49.2 / — |
+| `backend.kv-dtype` | bytes per token (Qwen3-0.6B) | perplexity at 4 096 tokens, vs f16 21.2222 | needle (27 questions, 4k–16.8k) | Metal decode tok/s, 413 / 2 013 tokens (11.10) | Metal decode, 2 000 tokens (24.5) | CPU decode, 413 (11.9) / 2 000 tokens (24.5) |
+|---|---|---|---|---|---|---|
+| `f32` (default) | 229 KB | 21.2204 (exact) | — | ~143 at 413 (11.1) | 108.6 | 89.3 / **36.0** |
+| `f16` | 115 KB | 21.2222 | 23 | 142.5 / 121.0 | 124.5 | 69.2 / **9.7** |
+| `q8` rotated (default for q8) | 59 KB | 21.2804 (+0.0027 nats) | 23 | 139.1 / 122.9 | — | — |
+| `q8` plain (`--backend.kv-q8-rotate false`) | 59 KB | 21.8289 (+0.028 nats) | 26 | 142.9 / 126.8 | 127.4 | 83.6 / **41.4** |
+| `q4` (window 128) | 31.5 KB + ring | 32/128/512 window: +0.369 / +0.269 / +0.152 nats | 23 (w128), 24 (w512) | within 9 % of f16 at 413, equal at 2 000 (11.9) | — | 49.2 / — |
+
+The two Metal columns are two measurement sessions (each compares its rows with each other, not with the other column):
+docs/11 §11.10 alternated f16 / q8 / rotated q8 at 413 and 2 013 tokens; docs/24 §24.5 alternated the flat and the paged
+cache at 2 000 tokens (the flat rows are quoted). The CPU's 413-token column moved by ±20 % between runs (a shared machine).
 
 Sources: memory and quality [07 §7.13](07-cpu-backend.md#713-the-f16-kv-cache-kvcache); Metal speed
 [11 §11.10](11-performance.md#1110-the-q8-cache-with-rotated-keys-measured); CPU speed [11 §11.9](11-performance.md#119-the-q4-kv-cache-measured)
