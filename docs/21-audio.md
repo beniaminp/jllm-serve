@@ -608,8 +608,8 @@ last windows above it bound the speech; the output starts 12 windows (0.12 s) be
 * *Reuse the language-model engine for the hard half.* OuteTTS is a Qwen2 model, so the part that costs 75 tokens per second of speech runs on the same `Engine` as a chat model: Q8_0 or Q4_0 weights, the KV cache, the Metal kernels, the sampler.
   The alternatives in 21.7 (Kokoro, OuteTTS 1.0, Pocket/Qwen3-TTS) needed new network types or an 8 times bigger codec.
 * *The codec stays on the CPU* (62 M parameters, 0.050 s per second of speech in 21.13): it is under a tenth of the language model's time, so a GPU port would not have helped the real-time factor.
-* *Q8_0 for the speech language model by default* (`audio.tts.quant`): `jllm.properties` says 4 bits visibly hurt speech for a 0.5B model; the measured round trip (21.13, 12 sentences) found Q4_0 within noise (5.96 % against 6.62 % word error),
-  so the safe default stayed and `q4` is a documented option for speed (RTF 0.81 against 1.01).
+* *Q8_0 for the speech language model by default* (`audio.tts.quant`): 4 bits were expected to hurt the speech of a 0.5B model (the reason first given in `jllm.properties`); the measured round trip (21.13, 12 sentences) found Q4_0 within noise (5.96 % against 6.62 % word error),
+  which `jllm.properties` now says, but on a sample that small the safe default stayed and `q4` is a documented option for speed (RTF 0.81 against 1.01).
 * *Reference voices as data, not code.* A voice is the package's speaker profile (words + codes) in a 26 kB JSON file, the prompt builder is ~40 lines, and every voice is verified at load (its words must equal what `OuteText` makes of its text, else it is skipped with a message).
 * *Long text in pieces of ~220 characters*, each starting from the speaker prompt, joined with 250 ms of silence: the model is trained on utterances of a few seconds to a few tens of seconds, a piece never needs more context than `audio.tts.ctx`, and the first
   words can be played before the last are written. The cost is a pause of fixed length between sentences, whatever the punctuation.
