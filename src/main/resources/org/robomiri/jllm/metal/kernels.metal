@@ -2447,7 +2447,7 @@ kernel void rope_store_q8(device float *q [[buffer(0)]],
                           ushort lane [[thread_index_in_simdgroup]],
                           ushort nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float buf[32];
-    threadgroup float hv[MAX_PER * 32];   // the k head after norm and rotation
+    threadgroup float hv[2 * MAX_PER * 32]; // the k head after norm and rotation (up to 512 wide)
     const ushort tid = tid2.x;
     const int kvDim = p.nKvHeads * p.headDim;
     if (int(tgp.x) >= p.nHeads + p.nKvHeads) { // a v head: quantized as it is

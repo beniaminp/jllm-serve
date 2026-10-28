@@ -636,14 +636,26 @@ them. The next `begin` then replaced the open encoder, and Metal aborts the proc
 printed. The tiny synthetic Gemma 4 (32 / 64-wide heads) never hit it because those head sizes have every kernel. Fix:
 `MetalTuner.time` ends the command buffer with `k.abort()` (the existing `jm_abort`, which every forward-pass path already
 uses) when the recorded work throws, so the probe is reported as failed and the 512 shape runs on the plain
-`attention_g1_d512` kernel (flash prefill off, flash decode off, decode attention off). Coverage: `scripts/arch-smoke.sh`
-can also generate `Gemma4Hd512ForCausalLM` (`SMOKE_HD512=1 scripts/arch-smoke.sh`; `make-tiny-model.py gemma4 --head-dim 256
---set global_head_dim=512`), a tiny Gemma 4 with the real 256 / 512 head sizes. It reproduces the abort without the fix and
-passes the f32 / f16 CPU-vs-Metal and concurrent-encoder checks with it, but it is opt-in because 9 other checks fail on the
-512-wide full layers (all with the 512 head, none with 32 / 64 or 256 alone): q8-KV CPU-vs-Metal (max diff 5.4), concurrent
-encoder with q8, decode replay f32 / q8 (differs from step 7 / step 0), batched decode q8 / q4 and replay x batch. On the
-real 12B (f32 KV, window 1024) replay on and off print the same 60 greedy tokens at position 2300, so the default path is
-unaffected; the q8 and replay checks on 512-wide heads are open.
+`attention_g1_d512` kernel (flash prefill off, flash decode off, decode attention off). Coverage: `scripts/arch-smoke.sh` generates `Gemma4Hd512ForCausalLM` in every run (`make-tiny-model.py gemma4 --head-dim 256
+--set global_head_dim=512`), a tiny Gemma 4 with the real 256 / 512 head sizes. It reproduces the abort without the tuner fix.
+
+**What was wrong with the 512-wide heads (two bugs, both fixed).** Plain words: several Metal kernels were written when no
+head was wider than 256 and keep a scratch array of 256 numbers for one head. A 512-wide head does not fit, so the kernel
+read or wrote past the end of its scratch space: into its neighbours' numbers (wrong results, and different from run to run,
+which is why the checks flaked) or, for flash decoding, a variant for 512 existed but was never chosen.
+
+| # | Where | What was wrong | Which checks it explained |
+|---|---|---|---|
+| 1 | `kernels.metal`, `rope_store_q8` (the fused RoPE + q8 store of the decode path): `threadgroup float hv[MAX_PER * 32]` | `hv` holds the key head after norm and rotation; `MAX_PER * 32` is 256 floats, a 512-wide key head wrote 256 floats past it, so the quantized k rows were wrong. Now `hv[2 * MAX_PER * 32]` | q8 CPU vs Metal (max diff 5.4, now 7.7e-3), concurrent encoder q8, batched decode q8 |
+| 2 | `MetalKernels.flashAttention` / `flashAttentionRow`: the dispatch named `attention_split` + cache suffix for every head width | `attention_split` bounds its per-thread arrays and `red[][]` at 256; the `attention_split_d512[_h/_q8]` instantiations (MAXP 16) existed but were never dispatched. A 512-wide head overflowed `qr[]`, `o[]` and `red[]`. `splitSuffix(headDim)` now adds `_d512` above 256 | decode replay f32 / q8 / f16 and replay x batch (the test forces flash decode on), and the tuner's flash-decode d512 check (max diff 2.6e-1), which compared the broken kernel with the plain one |
+
+`kv q4` is not affected (Gemma 4 has per-layer head shapes, so the loader already serves q4 as q8 with a note).
+
+After the fixes the flash-decode check on the real 12B shape (16 heads, 1 kv head, 512) agrees (max diff 2.4e-8, was 2.6e-1) and
+the tuner keeps it off only because it is slower there (2.29 ms against 1.10 ms for the plain kernel); the tiny 4-head shape
+turns it on. Smoke: `scripts/arch-smoke.sh` ends `arch smoke passed` with the 512 model included (all 10 earlier failures of
+`SMOKE_HD512=1` gone); `scripts/build-metal-emu.sh` exits 0 and `kernel_tests.py` prints no FAIL line. The tuner's cache key
+covers the kernel source, so the fixed `kernels.metal` starts with fresh decisions.
 
 | Check | Command (after `--model <gguf> --model.dir models`) | Result |
 |---|---|---|
@@ -655,9 +667,11 @@ unaffected; the q8 and replay checks on 512-wide heads are open.
 
 A raw completion (`--raw`, no chat template) gets its `<bos>` from the file's `tokenizer.ggml.add_bos_token` (the tokenizer
 comes from the original repository, whose config does not say; [04](04-tokenizer.md)): "The three primary colors are red,
-yellow and" gives " blue.\n<|channel>thought\n<channel|>That is correct! These are known as the", llama.cpp's text. Open items: the 512-wide flash-decode kernel disagrees with the plain kernel on
-real data (the tuner correctly keeps it off), `attention_fb_d512` does not exist, and decode (about 8 tok/s) is far below
-the memory-bandwidth limit of the 7.1 GB weights.
+yellow and" gives " blue.\n<|channel>thought\n<channel|>That is correct! These are known as the", llama.cpp's text. With q8 KV (`--backend.kv-dtype q8`, rotated keys by default) the chat answer is "The capital of France is Paris." and the raw
+completion is the same text as with f32. Decode speed on the real 12B (`bench --backend metal --ctx 4096`): 7.9 / 8.0 / 8.1 tok/s
+before and after (flash decode stays off for the 512 shape because the plain kernel is faster); `attention_fb_d512` does not
+exist for an f32 cache (threadgroup memory), `attention_fa_d512` agrees but is slower. Decode (about 8 tok/s) is far below the
+memory-bandwidth limit of the 7.1 GB weights.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 

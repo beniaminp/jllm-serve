@@ -31,7 +31,7 @@
 #                                                         Metal (512-wide attention kernels, per-layer shape dispatch);
 #                                                         only the paged, mixed, tier, q4 and rotated-q8 checks are
 #                                                         skipped for its per-layer head shapes
-#   hf-internal-testing_tiny-random-Gemma4Hd512ForCausalLM  generated only with SMOKE_HD512=1: Gemma 4 with the real 12B's 256 / 512-wide heads
+#   hf-internal-testing_tiny-random-Gemma4Hd512ForCausalLM  generated: Gemma 4 with the real 12B's 256 / 512-wide heads
 #   hf-internal-testing_tiny-random-Gemma{2,3}Hd256ForCausalLM  generated: head_dim 256, the largest Metal supports
 #   hf-internal-testing_tiny-random-Gemma2BiasForCausalLM generated: Gemma 2 with attention_bias (the o_proj bias
 #                                                         before the post-attention norm)
@@ -130,13 +130,8 @@ gen gemma2 Gemma2ForCausalLM
 gen gemma3 Gemma3ForCausalLM
 gen gemma3mm Gemma3MMForCausalLM
 gen gemma4 Gemma4ForCausalLM
-# the real 12B's 256 local / 512 full heads: opt in with SMOKE_HD512=1 (it reproduces the start-up abort that the tuner fix
-# covers, but its q8-KV, decode-replay and batched-decode checks still fail on the 512-wide heads: docs/14 section 14.10.7)
-HD512=
-if [ -n "${SMOKE_HD512:-}" ]; then
-  gen gemma4 Gemma4Hd512ForCausalLM --head-dim 256 --set global_head_dim=512
-  HD512="$M/${P}-Gemma4Hd512ForCausalLM"
-fi
+# the real 12B's 256 local / 512 full heads (512-wide attention kernels, flash decode, q8 stores; docs/14 section 14.10.7)
+gen gemma4 Gemma4Hd512ForCausalLM --head-dim 256 --set global_head_dim=512
 gen gemma2 Gemma2Hd256ForCausalLM --head-dim 256
 gen gemma3 Gemma3Hd256ForCausalLM --head-dim 256
 gen gemma2 Gemma2BiasForCausalLM --attention-bias
@@ -235,7 +230,7 @@ ggen jamba jamba
   "$M/${P}-LlamaBiasForCausalLM" "$M/${P}-Gemma2BiasForCausalLM" \
   "$M/${P}-GlmForCausalLM" "$M/${P}-GlmEdgeForCausalLM" "$M/${P}-Glm4ForCausalLM" \
   "$M/${P}-Phi3ForCausalLM" "$M/${P}-Phi3ShortForCausalLM" "$M/${P}-Phi3MhaForCausalLM" \
-  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" "$M/${P}-Gemma4ForCausalLM" $HD512 \
+  "$M/${P}-Gemma2ForCausalLM" "$M/${P}-Gemma3ForCausalLM" "$M/${P}-Gemma3MMForCausalLM" "$M/${P}-Gemma4ForCausalLM" "$M/${P}-Gemma4Hd512ForCausalLM" \
   "$M/${P}-Gemma2Hd256ForCausalLM" "$M/${P}-Gemma3Hd256ForCausalLM" \
   "$M/${P}-MambaForCausalLM" "$M/${P}-Mamba3ForCausalLM" "$M/${P}-Qwen3MoeForCausalLM" \
   "$M/${P}-DeepseekV2ForCausalLM" "$M/${P}-DeepseekV2QLoraForCausalLM" "$M/${P}-DeepseekV3ForCausalLM" \

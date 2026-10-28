@@ -1043,6 +1043,11 @@ final class MetalKernels implements AutoCloseable {
         dispatch("argmax", 2, 0, 1, 1, 1, ROW_THREADS, 1, 1);
     }
 
+    /** attention_split keeps its per-thread arrays and threadgroup buffers 256 wide; the 512-wide heads have their own instantiations. */
+    static String splitSuffix(int headDim) {
+        return headDim > 256 ? "_d512" : "";
+    }
+
     /** Suffix of the attention / cache-store instantiations for a cache type: none (f32), {@code _h}, {@code _q8}. */
     static String kvSuffix(KvDtype kv) {
         return switch (kv) {
@@ -1250,7 +1255,7 @@ final class MetalKernels implements AutoCloseable {
         // step stays valid while nSplit does (MetalBackend's step key)
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).iv(DecodeProgram.VAR_POS, pos).i(ctx).f(scale)
                 .i(qStride).i(kvStride).i(window).f(softcap).i(nSplit).i(0).i(pageShift);
-        dispatch("attention_split" + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        dispatch("attention_split" + splitSuffix(headDim) + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, 0);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
@@ -1919,7 +1924,7 @@ final class MetalKernels implements AutoCloseable {
         bindOrDummy(5, pageTbl);
         p.reset(KernelParams.ATTN_SPLIT).i(nHeads).i(nKvHeads).i(headDim).i(pos).i(ctx).f(scale).i(qStride).i(kvStride)
                 .i(window).f(softcap).i(nSplit).i(chunk).i(pageShift);
-        dispatch("attention_split" + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
+        dispatch("attention_split" + splitSuffix(headDim) + kvSuffix(kv), 6, 0, nHeads, nSplit, 1, ATT_THREADS, 1, 1);
         bind(0, part, 0);
         bind(1, out, outOff);
         p.reset(KernelParams.ATTN_COMBINE).i(nHeads).i(headDim).i(nSplit);
