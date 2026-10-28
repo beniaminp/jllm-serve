@@ -118,9 +118,9 @@ leave the default; "—" means the setting does not apply. Speeds are tokens per
 | GLM-4 / GLM-Edge | `./jllm chat --model THUDM/GLM-4-9B-0414 --backend.kv-dtype f16` | Metal | `q4` | `f16` | auto | not measured | — |
 | DeepSeek V2-Lite (MLA) | `./jllm chat --model deepseek-ai/DeepSeek-V2-Lite-Chat --backend.kv-dtype f16` | Metal | `q4` (≈ 10 GB) | **`f16`** (the latent cache is small; q8 has one scale per latent row) | auto | not measured | — |
 | Mamba | `./jllm run --model state-spaces/mamba-130m-hf --raw --prompt "…"` | Metal | `q4` | — (state, no cache) | — | random-weight 130m: Metal ~1 060 / ~273 (loaded machine) | — |
-| gpt-oss | `./jllm chat --model openai/gpt-oss-20b` | Metal | MXFP4 experts in place | `f32` / `f16` / `q8` (q4 served as q8) | auto | not measured (tiny models only) | `--think false` for low reasoning effort |
-| Llama 4 (text) | `./jllm chat --model <Llama 4 repo>` | Metal | `q4` | as gpt-oss | auto (full, not chunk-limited) | not measured | — |
-| Granite 4 / Nemotron-H / Jamba | `./jllm chat --model <repo>` (Granite has a template; the others: `/v1/completions`) | CPU or Metal | `q4` | `f32` / `f16` | auto | not measured | — (every request starts at position 0) |
+| gpt-oss | `./jllm chat --model openai/gpt-oss-20b` (or a `gpt-oss` GGUF) | Metal | MXFP4 experts in place | `f32` / `f16` / `q8` (q4 served as q8) | auto | not measured (tiny models only) | `--think false` for low reasoning effort |
+| Llama 4 (text) | `./jllm chat --model <Llama 4 repo or GGUF>` | Metal | `q4` | as gpt-oss | auto (full, not chunk-limited) | not measured | — |
+| Granite 4 / Nemotron-H / Jamba | `./jllm chat --model <repo or GGUF>` (Granite has a template; the others: `/v1/completions`) | CPU or Metal | `q4` | `f32` / `f16` | auto | not measured | — (every request starts at position 0) |
 | any GGUF file | `./jllm chat --model unsloth/Qwen3-0.6B-GGUF --gguf-quant Q4_0` | Metal | **Q4_0** files decode fastest; K-quants run in place | as the family | auto | Q4_0 GGUF Metal 1 903 / 134.8 | `-Djllm.gguf.requantize=none` on the CPU when only the in-place file fits |
 | vision (SmolVLM, Qwen2.5-VL, Qwen3-VL, Gemma 3) | `./jllm chat --model ggml-org/Qwen3-VL-2B-Instruct-GGUF --gguf-quant Q8_0 --image a.png` | Metal (`vision.backend=auto`) | the file's; **F16 projector** | as the family | auto | Qwen3-VL-2B: encode 764 ms, decode 39.6 | `--vision.image-max-tokens N` to bound big pictures |
 | Whisper | `./jllm transcribe --model openai/whisper-small --audio talk.wav` | Metal, GPU decoder for small and up (auto) | the checkpoint's | — | — | small: 61.7 s of speech in 4.71 s | `--audio.stt.fallback false` when a silent end is slow |
@@ -462,12 +462,16 @@ the generic attention kernel on Metal (no flash decoding: slower at long context
 no paged cache (sinks). `chat.thinking` / `enable_thinking` selects the harmony reasoning effort (true = medium, false =
 low): `--think false` answers sooner. `backend.metal.cpu-moe` works. Only tiny random models were run: no speed is claimed
 ([14 §14.18](14-model-families.md#1418-gpt-oss-attention-sinks-sliding-windows-clamped-swiglu-experts-with-biases-mxfp4)).
+**GGUF files** (`general.architecture` `gpt-oss`, e.g. `ggml-org/gpt-oss-20b-GGUF`) are read too, MXFP4 experts in place; the
+SwiGLU clamp is llama.cpp's fixed 7.0 ([16 §16.16](16-gguf.md#1616-gpt-oss-llama-4-granite-4-nemotron-h-and-jamba-as-gguf-files)).
 
 ### 28.5.12 Llama 4 (text)
 
 The text tower only. Chunked attention keeps a full (not chunk-limited) cache; q4 KV is served as q8; no Metal flash
 attention for the chunked and temperature-tuned layers; no paged cache. Scout is 109 B: no real-weight run
-([14 §14.19](14-model-families.md#1419-llama-4-text-chunked-attention-nope-layers-temperature-tuning-sigmoid-moe)).
+([14 §14.19](14-model-families.md#1419-llama-4-text-chunked-attention-nope-layers-temperature-tuning-sigmoid-moe)). **GGUF
+files** (`llama4`) are read with llama.cpp's fixed chunk (8192), temperature and NoPE layers; the vision projector is not
+([16 §16.16](16-gguf.md#1616-gpt-oss-llama-4-granite-4-nemotron-h-and-jamba-as-gguf-files)).
 
 ### 28.5.13 Qwen2.5-1M
 
@@ -481,7 +485,9 @@ in the region where plain attention is exact". The 7B at 262 144 tokens needs 15
 KV f32 or f16 (q8 / q4 served as f16 on Metal). No prefix reuse, no speculation as a target, no continuous batching, no
 `cpu-moe`, no state save / restore: every request starts from position 0, so keep prompts short or accept the full prefill.
 Nemotron-H and Jamba have no chat template: format the prompt yourself or use `/v1/completions`; Granite has one. Only tiny
-models were run ([14 §14.22](14-model-families.md#1422-attention--state-space-hybrids-granite-4-nemotron-h-jamba)).
+models were run ([14 §14.22](14-model-families.md#1422-attention--state-space-hybrids-granite-4-nemotron-h-jamba)). **GGUF
+files** (`granitehybrid`, `nemotron_h`, `jamba`) are read as well; for Granite the Mamba-2 norm is per group, as llama.cpp
+computes it ([16 §16.16](16-gguf.md#1616-gpt-oss-llama-4-granite-4-nemotron-h-and-jamba-as-gguf-files)).
 
 ### 28.5.15 GGUF files (every family)
 

@@ -17,8 +17,9 @@ import java.util.Map;
  * parsers of {@code Families}, so a family's defaults, validation and canonical {@code Core.description} are
  * exactly those of a safetensors load of the same model.
  *
- * <p>Supported {@code general.architecture} values: {@code qwen3}, {@code qwen3moe}, {@code qwen2} and
- * {@code llama} (which is also what llama.cpp calls Mistral / Mixtral-less Llama-style models).
+ * <p>Supported {@code general.architecture} values: those of {@link Family} (the Llama, Qwen, Gemma, Phi, GLM, Mamba,
+ * DeepSeek and Mistral 3 decoders, the Gated DeltaNet hybrids, gpt-oss, Llama 4, and the attention / state-space
+ * hybrids Granite 4, Nemotron-H and Jamba, whose metadata {@link GgufFamilies} maps as a whole).
  */
 final class GgufArchitecture {
 
@@ -57,7 +58,17 @@ final class GgufArchitecture {
         /** DeepSeek-V2 / V3 / R1 (MLA, shared + routed experts): {@link GgufFamilies#deepseek2}. */
         DEEPSEEK2("deepseek2", "deepseek_v3"),
         /** Mistral Small 3.x / Ministral / Devstral: the llama architecture under another name (and no attention temperature). */
-        MISTRAL3("mistral3", "mistral");
+        MISTRAL3("mistral3", "mistral"),
+        /** gpt-oss (20B / 120B): attention sinks, alternating windows, MXFP4 experts with biases: {@link GgufFamilies#gptOss}. */
+        GPT_OSS("gpt-oss", "gpt_oss"),
+        /** Llama 4 text (Scout, Maverick): chunked attention, NoPE layers with a temperature, sigmoid MoE: {@link GgufFamilies#llama4}. */
+        LLAMA4("llama4", "llama4_text"),
+        /** Granite 4 (Mamba-2 + attention, MoE with a shared expert, muP multipliers): {@link GgufFamilies#graniteHybrid}. */
+        GRANITE_HYBRID("granitehybrid", "granitemoehybrid"),
+        /** Nemotron-H (Mamba-2, attention and ReLU-squared MLP layers): {@link GgufFamilies#nemotronH}. */
+        NEMOTRON_H("nemotron_h", "nemotron_h"),
+        /** Jamba (Mamba-1 with dt / B / C norms + attention, MoE every other layer): {@link GgufFamilies#jamba}. */
+        JAMBA("jamba", "jamba");
 
         final String ggufName;
         final String modelType;
@@ -114,7 +125,9 @@ final class GgufArchitecture {
             Map.entry("cohere2", "uses LayerNorm and a parallel residual"),
             Map.entry("gemma", "Gemma 1 is not among the families (Gemma 2 and 3 are)"),
             Map.entry("falcon", "uses LayerNorm and a parallel residual"),
-            Map.entry("mamba2", "Mamba 2 is not implemented (Mamba 1 is)"),
+            Map.entry("mamba2", "a plain Mamba 2 model is not among the families (Mamba 1 is, and Mamba-2 layers inside Granite 4 and Nemotron-H)"),
+            Map.entry("nemotron_h_moe", "Nemotron-H's mixture-of-experts layers are not implemented (the dense nemotron_h is)"),
+            Map.entry("falcon-h1", "Falcon-H1's parallel attention and Mamba-2 heads are not among the families"),
             Map.entry("internlm2", "has no chat template here"),
             Map.entry("exaone", "has no chat template here"),
             Map.entry("exaone4", "has no chat template here"));
@@ -160,6 +173,19 @@ final class GgufArchitecture {
         String p = family.ggufName + ".";
         if (family == Family.MAMBA) {
             return GgufFamilies.mamba(g);
+        }
+        switch (family) {
+            case GRANITE_HYBRID -> {
+                return GgufFamilies.graniteHybrid(g);
+            }
+            case NEMOTRON_H -> {
+                return GgufFamilies.nemotronH(g);
+            }
+            case JAMBA -> {
+                return GgufFamilies.jamba(g);
+            }
+            default -> {
+            }
         }
         Map<String, Object> c = new LinkedHashMap<>();
         c.put("model_type", family.modelType);
@@ -257,6 +283,12 @@ final class GgufArchitecture {
         }
         if (family == Family.DEEPSEEK2) {
             GgufFamilies.deepseek2(g, p, c);
+        }
+        if (family == Family.GPT_OSS) {
+            GgufFamilies.gptOss(g, p, c, ((Number) c.get("num_hidden_layers")).longValue());
+        }
+        if (family == Family.LLAMA4) {
+            GgufFamilies.llama4(g, p, c, ((Number) c.get("num_hidden_layers")).longValue());
         }
         if (family == Family.QWEN3MOE) {
             c.put("num_experts", need(g, p + "expert_count"));
@@ -376,6 +408,11 @@ final class GgufArchitecture {
                 }
                 if (g.get(p + "rope.scaling.yarn_beta_slow") instanceof Number b) {
                     rs.put("beta_slow", b.doubleValue());
+                }
+                if (g.get(p + "rope.scaling.yarn_truncate") instanceof Boolean t) {
+                    // gpt-oss: transformers' truncate=false keeps the correction range fractional; the converter writes
+                    // it (llama.cpp's ggml_rope_yarn_corr_dims always rounds it outwards)
+                    rs.put("truncate", t);
                 }
                 double attn = g.dbl(p + "rope.scaling.attn_factor", 1.0);
                 if (attn != 1.0) {

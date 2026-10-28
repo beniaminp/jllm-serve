@@ -57,8 +57,12 @@ final class HfToGguf {
     private final Map<String, Object> raw;
     private final Map<String, float[]> data = new HashMap<>();
     private final Map<String, long[]> shapes = new HashMap<>();
+    /** U8 tensors (gpt-oss's MXFP4 blocks and scales), kept as bytes; their shapes are in {@link #shapes}. */
+    private final Map<String, byte[]> bytes = new HashMap<>();
+    /** Tensors written as they are (MXFP4 repacked from the checkpoint), whatever {@link Outtype} says. */
+    private final TreeMap<String, Object[]> rawTensors = new TreeMap<>();
     private final Options opt;
-    private final GgufWriter w = new GgufWriter();
+    private final GgufWriter w = new GgufWriter().overwriteDuplicates();
     private final TreeMap<String, T> out = new TreeMap<>();
     private String arch;
     private String p;
@@ -77,8 +81,14 @@ final class HfToGguf {
             for (Path f : (Iterable<Path>) files.filter(x -> x.toString().endsWith(".safetensors")).sorted()::iterator) {
                 try (SafeTensors st = SafeTensors.open(f)) {
                     for (SafeTensors.Tensor t : st.tensors().values()) {
-                        data.put(t.name(), t.toFloatArray());
                         shapes.put(t.name(), t.shape());
+                        if (t.dtype() == SafeTensors.DType.U8) {
+                            byte[] b = new byte[Math.toIntExact(t.numel())];
+                            java.lang.foreign.MemorySegment.copy(t.data(), java.lang.foreign.ValueLayout.JAVA_BYTE, 0, b, 0, b.length);
+                            bytes.put(t.name(), b);
+                        } else {
+                            data.put(t.name(), t.toFloatArray());
+                        }
                     }
                 }
             }
@@ -146,6 +156,11 @@ final class HfToGguf {
             case "Glm4ForCausalLM" -> glm4();
             case "MambaForCausalLM" -> mamba();
             case "DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM" -> deepseek2();
+            case "GptOssForCausalLM" -> gptOss();
+            case "Llama4ForCausalLM", "Llama4ForConditionalGeneration" -> llama4();
+            case "GraniteMoeHybridForCausalLM" -> graniteHybrid();
+            case "NemotronHForCausalLM" -> nemotronH();
+            case "JambaForCausalLM" -> jamba();
             default -> throw new IllegalArgumentException("no converter for " + a);
         }
         emit();
@@ -820,6 +835,594 @@ final class HfToGguf {
         vocab();
     }
 
+    // ------------------------------------------------------------------ gpt-oss, Llama 4
+
+    /** The layer types of a config (layer_types), or null. */
+    private List<?> layerTypes() {
+        return hp.get("layer_types") instanceof List<?> l ? l : null;
+    }
+
+    /** {@code [E][a][b]} as {@code [E][b][a]}. */
+    private static float[] transposeEach(float[] d, int e, int a, int b) {
+        float[] t = new float[d.length];
+        for (int x = 0; x < e; x++) {
+            for (int i = 0; i < a; i++) {
+                for (int j = 0; j < b; j++) {
+                    t[(x * b + j) * a + i] = d[(x * a + i) * b + j];
+                }
+            }
+        }
+        return t;
+    }
+
+    /** Rows {@code start, start + step, ...} ({@code n} of them) of each of {@code e} blocks of {@code rows x cols}. */
+    private static float[] pickRows(float[] d, int e, int rows, int cols, int start, int step, int n) {
+        float[] o = new float[e * n * cols];
+        for (int x = 0; x < e; x++) {
+            for (int r = 0; r < n; r++) {
+                System.arraycopy(d, (x * rows + start + r * step) * cols, o, (x * n + r) * cols, cols);
+            }
+        }
+        return o;
+    }
+
+    private static float[] negExp(float[] d) {
+        float[] a = new float[d.length];
+        for (int i = 0; i < a.length; i++) {
+            a[i] = -(float) Math.exp(d[i]);
+        }
+        return a;
+    }
+
+    /**
+     * gpt-oss's MXFP4 experts (GptOssModel.repack_mxfp4): {@code blocks [E, R, nb, 16]} / {@code scales [E, R, nb]}, rows
+     * {@code start, start + step, ...} of each expert, as ggml MXFP4 blocks (the scale byte, then byte j holding element j
+     * in its low and element j + 16 in its high nibble, where the checkpoint packs elements 2i / 2i + 1 into byte i).
+     */
+    private void mxfp4(String gguf, String hf, int start, int step) {
+        byte[] blocks = bytes.get(hf + "_blocks");
+        byte[] scales = bytes.get(hf + "_scales");
+        long[] sh = shapes.get(hf + "_blocks");
+        int e = (int) sh[0];
+        int rows = (int) sh[1];
+        int nb = (int) sh[2];
+        int n = rows / step;
+        byte[] o = new byte[e * n * nb * 17];
+        int k = 0;
+        for (int x = 0; x < e; x++) {
+            for (int r = 0; r < n; r++) {
+                int row = start + r * step;
+                for (int b = 0; b < nb; b++) {
+                    int idx = (x * rows + row) * nb + b;
+                    o[k++] = scales[idx];
+                    for (int j = 0; j < 16; j++) {
+                        int lo = nib(blocks, idx * 16, j);
+                        int hi = nib(blocks, idx * 16, j + 16);
+                        o[k++] = (byte) (lo | (hi << 4));
+                    }
+                }
+            }
+        }
+        rawTensors.put(gguf, new Object[]{GgmlType.MXFP4, new long[]{32L * nb, n, e}, o});
+    }
+
+    private static int nib(byte[] b, int off, int k) {
+        int v = b[off + (k >> 1)] & 0xFF;
+        return (k & 1) == 0 ? v & 0xF : v >>> 4;
+    }
+
+    /**
+     * gpt-oss (conversion/gpt_oss.py): TextModel's keys plus {@code attention.sliding_window} and the expert width; the
+     * attention sinks as {@code attn_sinks.weight}, the MLP norm as {@code post_attention_norm} (the arch has no ffn_norm),
+     * the router and its bias, the experts' gate and up taken from the alternating columns of {@code gate_up_proj} (float
+     * checkpoints, transposed to rows) or from its alternating rows of MXFP4 blocks (repacked raw), with their biases.
+     * llama.cpp derives the windowed layers from a pattern of 2 and hard-codes the SwiGLU clamp (7.0, alpha 1.702).
+     */
+    private void gptOss() {
+        begin("gpt-oss");
+        need(hpNum("swiglu_limit", 7.0) == 7.0 && hpNum("swiglu_alpha", 1.702) == 1.702,
+                "llama.cpp's graph hard-codes swiglu_limit 7.0 and alpha 1.702");
+        List<?> types = layerTypes();
+        for (int l = 0; types != null && l < layers(); l++) {
+            need(String.valueOf(types.get(l)).equals(l % 2 == 0 ? "sliding_attention" : "full_attention"),
+                    "llama.cpp windows the even layers (load_swa_pattern 2)");
+        }
+        textParams(true);
+        w.u32(p + "attention.sliding_window", (long) hpNum("sliding_window", 0));
+        w.u32(p + "expert_feed_forward_length", (long) hpNum("intermediate_size", 0));
+        int e = (int) hpNum("num_local_experts", 0);
+        int m = (int) hpNum("intermediate_size", 0);
+        int d = (int) hpNum("hidden_size", 0);
+        for (String name : sortedNames()) {
+            Matcher mt = LAYER.matcher(name);
+            float[] v = data.get(name);
+            long[] sh = shapes.get(name);
+            if (name.equals("model.embed_tokens.weight")) {
+                put("token_embd.weight", name);
+            } else if (name.equals("model.norm.weight")) {
+                put("output_norm.weight", name);
+            } else if (name.equals("lm_head.weight")) {
+                put("output.weight", name);
+            } else if (mt.matches()) {
+                String b = "blk." + mt.group(1) + ".";
+                switch (mt.group(2)) {
+                    case "post_attention_layernorm.weight" -> put(b + "post_attention_norm.weight", v, sh);
+                    case "self_attn.sinks" -> put(b + "attn_sinks.weight", v, sh);
+                    case "mlp.router.weight" -> put(b + "ffn_gate_inp.weight", v, sh);
+                    case "mlp.router.bias" -> put(b + "ffn_gate_inp.bias", v, sh);
+                    case "mlp.experts.gate_up_proj_bias" -> {
+                        put(b + "ffn_gate_exps.bias", pickRows(v, e, 2 * m, 1, 0, 2, m), e, m);
+                        put(b + "ffn_up_exps.bias", pickRows(v, e, 2 * m, 1, 1, 2, m), e, m);
+                    }
+                    case "mlp.experts.down_proj_bias" -> put(b + "ffn_down_exps.bias", v, sh);
+                    case "mlp.experts.gate_up_proj" -> {
+                        float[] t = transposeEach(v, e, d, 2 * m); // [E, 2m, dim]
+                        put(b + "ffn_gate_exps.weight", pickRows(t, e, 2 * m, d, 0, 2, m), e, m, d);
+                        put(b + "ffn_up_exps.weight", pickRows(t, e, 2 * m, d, 1, 2, m), e, m, d);
+                    }
+                    case "mlp.experts.down_proj" -> put(b + "ffn_down_exps.weight", transposeEach(v, e, m, d), e, d, m);
+                    default -> put(b + attnOrMlp(mt.group(2)), v, sh);
+                }
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        for (String name : new java.util.TreeSet<>(bytes.keySet())) {
+            Matcher mt = LAYER.matcher(name);
+            if (!mt.matches() || !name.endsWith("_blocks")) {
+                continue;
+            }
+            String b = "blk." + mt.group(1) + ".";
+            String hf = name.substring(0, name.length() - "_blocks".length());
+            if (hf.endsWith("mlp.experts.gate_up_proj")) {
+                mxfp4(b + "ffn_gate_exps.weight", hf, 0, 2);
+                mxfp4(b + "ffn_up_exps.weight", hf, 1, 2);
+            } else if (hf.endsWith("mlp.experts.down_proj")) {
+                mxfp4(b + "ffn_down_exps.weight", hf, 0, 1);
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        vocab();
+    }
+
+    /** LlamaModel.generate_extra_tensors: a llama3 rope_scaling as per-pair divisors ({@code rope_freqs.weight}). */
+    private void llama3Freqs() {
+        Map<String, Object> rp = fullRope();
+        if (!"llama3".equalsIgnoreCase(String.valueOf(rp.get("rope_type")))) {
+            return;
+        }
+        double base = num(rp, "rope_theta", 10000);
+        int dim = headDim();
+        double factor = num(rp, "factor", 8), low = num(rp, "low_freq_factor", 1), high = num(rp, "high_freq_factor", 4);
+        double old = num(rp, "original_max_position_embeddings", 8192);
+        float[] f = new float[dim / 2];
+        for (int i = 0; i < f.length; i++) {
+            double freq = 1.0 / Math.pow(base, (2.0 * i) / dim);
+            double wavelen = 2 * Math.PI / freq;
+            if (wavelen < old / high) {
+                f[i] = 1;
+            } else if (wavelen > old / low) {
+                f[i] = (float) factor;
+            } else {
+                double smooth = (old / wavelen - low) / (high - low);
+                f[i] = (float) (1 / ((1 - smooth) / factor + smooth));
+            }
+        }
+        put("rope_freqs.weight", f, f.length);
+    }
+
+    /**
+     * Llama 4 text (conversion/llama.py Llama4Model): no q / k permutation; {@code intermediate_size_mlp} becomes the
+     * feed_forward_length and {@code intermediate_size} the expert width; {@code interleave_moe_layer_step}; the llama3
+     * frequencies as {@code rope_freqs}; the experts' {@code gate_up_proj [E, dim, 2m]} transposed and split in halves.
+     * llama.cpp's loader hard-codes the chunk (8192), the temperature (floor 8192, scale 0.1), the NoPE layers (every
+     * 4th) and the q / k norm (unless 128 experts), so a config must agree with them to be expressible.
+     */
+    private void llama4() {
+        begin("llama4");
+        int n = layers();
+        int e = (int) hpNum("num_local_experts", 0);
+        need(hpNum("attention_chunk_size", 8192) == 8192 && hpNum("floor_scale", 8192) == 8192
+                && hpNum("attn_scale", 0.1) == 0.1 && !(hp.get("attn_temperature_tuning") instanceof Boolean b && !b),
+                "llama.cpp hard-codes attention_chunk_size 8192, floor_scale 8192, attn_scale 0.1 and the temperature tuning");
+        need(!(hp.get("use_qk_norm") instanceof Boolean q) || q == (e != 128), "llama.cpp uses the q / k norm unless the model has 128 experts");
+        need(hp.get("moe_layers") == null, "llama.cpp places the MoE layers by interleave_moe_layer_step");
+        if (hp.get("no_rope_layers") instanceof List<?> nr) {
+            for (int l = 0; l < n; l++) {
+                need(((Number) nr.get(l)).intValue() == ((l + 1) % 4 != 0 ? 1 : 0), "llama.cpp's NoPE layers are every 4th");
+            }
+        }
+        List<?> types = layerTypes();
+        for (int l = 0; types != null && l < n; l++) {
+            need(String.valueOf(types.get(l)).equals(l % 4 < 3 ? "chunked_attention" : "full_attention"),
+                    "llama.cpp chunks three layers of four (load_swa_pattern 4)");
+        }
+        Map<String, Object> saved = new LinkedHashMap<>(hp);
+        hp.put("intermediate_size_moe", hp.get("intermediate_size"));
+        hp.put("intermediate_size", hp.get("intermediate_size_mlp"));
+        textParams(true);
+        w.u32(p + "vocab_size", (long) hpNum("vocab_size", 0));
+        w.u32(p + "rope.dimension_count", headDim());
+        w.u32(p + "interleave_moe_layer_step", (long) hpNum("interleave_moe_layer_step", 1));
+        w.u32(p + "expert_feed_forward_length", (long) hpNum("intermediate_size_moe", 0));
+        hp.clear();
+        hp.putAll(saved);
+        llama3Freqs();
+        int m = (int) hpNum("intermediate_size", 0);
+        int d = (int) hpNum("hidden_size", 0);
+        for (String name0 : sortedNames()) {
+            // Llama4ForConditionalGeneration: TextModel.filter_tensors drops the vision tower and the projector,
+            // ModelBase.filter_tensors strips "language_model."
+            if (name0.contains("vision_") || name0.contains("multi_modal_projector") || name0.contains("patch_embedding")) {
+                continue;
+            }
+            String name = name0.startsWith("language_model.") ? name0.substring("language_model.".length()) : name0;
+            Matcher mt = LAYER.matcher(name);
+            float[] v = data.get(name0);
+            long[] sh = shapes.get(name0);
+            if (name.equals("model.embed_tokens.weight")) {
+                put("token_embd.weight", v, sh);
+            } else if (name.equals("model.norm.weight")) {
+                put("output_norm.weight", v, sh);
+            } else if (name.equals("lm_head.weight")) {
+                if (!bool("tie_word_embeddings")) {
+                    put("output.weight", v, sh);
+                }
+            } else if (mt.matches()) {
+                String b = "blk." + mt.group(1) + ".";
+                String s0 = mt.group(2);
+                switch (s0) {
+                    case "feed_forward.router.weight" -> put(b + "ffn_gate_inp.weight", v, sh);
+                    case "feed_forward.experts.gate_up_proj" -> {
+                        float[] t = transposeEach(v, e, d, 2 * m); // [E, 2m, dim]: gate rows, then up rows
+                        put(b + "ffn_gate_exps.weight", pickRows(t, e, 2 * m, d, 0, 1, m), e, m, d);
+                        put(b + "ffn_up_exps.weight", pickRows(t, e, 2 * m, d, m, 1, m), e, m, d);
+                    }
+                    case "feed_forward.experts.down_proj" -> put(b + "ffn_down_exps.weight", transposeEach(v, e, m, d), e, d, m);
+                    case "feed_forward.shared_expert.gate_proj.weight" -> put(b + "ffn_gate_shexp.weight", v, sh);
+                    case "feed_forward.shared_expert.up_proj.weight" -> put(b + "ffn_up_shexp.weight", v, sh);
+                    case "feed_forward.shared_expert.down_proj.weight" -> put(b + "ffn_down_shexp.weight", v, sh);
+                    default -> put(b + attnOrMlp(s0.replace("feed_forward.", "mlp.")), v, sh);
+                }
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        vocab();
+    }
+
+    // ------------------------------------------------------------------ attention / state-space hybrids
+
+    /**
+     * A Mamba-2 mixer (Mamba2Model.modify_tensors): conv1d squeezed to {@code [conv, k]}, {@code dt_bias} as
+     * {@code ssm_dt.bias}, {@code A = -exp(A_log)} and {@code D} as {@code [heads, 1]}, the gated norm as
+     * {@code [groups, d_inner / groups]}. Returns false for a name that is not one of its tensors.
+     */
+    private boolean mamba2Tensor(String b, String s, float[] v, long[] sh, int groups) {
+        switch (s) {
+            case "in_proj.weight" -> put(b + "ssm_in.weight", v, sh);
+            case "conv1d.weight" -> put(b + "ssm_conv1d.weight", v, sh[0], sh[2]);
+            case "conv1d.bias" -> put(b + "ssm_conv1d.bias", v, sh);
+            case "dt_bias" -> put(b + "ssm_dt.bias", v, sh);
+            case "A_log" -> put(b + "ssm_a", negExp(v), sh[0], 1);
+            case "D" -> put(b + "ssm_d", v, sh[0], 1);
+            case "norm.weight" -> put(b + "ssm_norm.weight", v, groups, sh[0] / groups);
+            case "out_proj.weight" -> put(b + "ssm_out.weight", v, sh);
+            default -> {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** {@code q}, {@code k} (permuted as LlamaModel does: the hybrids keep undo_permute), {@code v}, {@code o}. */
+    private void permutedAttention(String b, String s, float[] v, long[] sh, String prefix) {
+        int heads = (int) hpNum("num_attention_heads", 0);
+        int kv = (int) hpNum("num_key_value_heads", heads);
+        String n = s.substring(prefix.length());
+        float[] d = switch (n) {
+            case "q_proj.weight" -> GgufModelTest.permute(v, (int) sh[0], (int) sh[1], heads);
+            case "k_proj.weight" -> GgufModelTest.permute(v, (int) sh[0], (int) sh[1], kv);
+            default -> v;
+        };
+        put(b + attnOrMlp("self_attn." + n), d, sh);
+    }
+
+    /** {@code [2h, dim]} as its two halves of {@code h} rows. */
+    private static float[][] halves(float[] v, int rowsEach, int cols) {
+        return new float[][]{java.util.Arrays.copyOfRange(v, 0, rowsEach * cols), java.util.Arrays.copyOfRange(v, rowsEach * cols, 2 * rowsEach * cols)};
+    }
+
+    /**
+     * Granite 4 (conversion/granite.py GraniteHybridModel over GraniteMoeModel / Mamba2Model): TextModel's keys (head_dim
+     * dropped as GraniteModel does), the muP multipliers as {@code attention.scale} / {@code embedding_scale} /
+     * {@code residual_scale} / {@code logit_scale}, the shared expert width, the Mamba-2 sizes ({@code time_step_rank} is
+     * the head count), a per-layer {@code attention.head_count_kv} that is 0 on the Mamba layers, and
+     * {@code rope.scaling.finetuned} false (no RoPE when there are Mamba layers, whatever {@code position_embedding_type} says).
+     */
+    private void graniteHybrid() {
+        begin("granitehybrid");
+        int n = layers();
+        int dim = (int) hpNum("hidden_size", 0);
+        int heads = (int) hpNum("num_attention_heads", 0);
+        List<?> types = layerTypes();
+        need(types != null, "layer_types");
+        boolean[] attn = new boolean[n];
+        boolean anySsm = false;
+        for (int l = 0; l < n; l++) {
+            attn[l] = "attention".equals(String.valueOf(types.get(l)));
+            anySsm |= !attn[l];
+        }
+        need(!anySsm || !"rope".equals(hp.get("position_embedding_type")), "llama.cpp's granitehybrid has no RoPE next to Mamba layers");
+        need(!has("head_dim") || (int) hpNum("head_dim", 0) == dim / heads, "GraniteModel drops head_dim: it must be hidden_size / heads");
+        int groups = (int) hpNum("mamba_n_groups", 1);
+        need(groups == 1, "llama.cpp normalizes the Mamba-2 output per group, transformers' Granite over all of d_inner");
+        int inner = (int) (hpNum("mamba_expand", 2) * dim);
+        need(inner == 2 * dim && inner == (int) (hpNum("mamba_n_heads", 0) * hpNum("mamba_d_head", 0)),
+                "llama.cpp supports an expansion factor of 2 (mamba_n_heads x mamba_d_head = 2 x hidden_size)");
+        Map<String, Object> saved = new LinkedHashMap<>(hp);
+        hp.remove("head_dim");
+        textParams(true);
+        hp.clear();
+        hp.putAll(saved);
+        w.u32(p + "vocab_size", (long) hpNum("vocab_size", 0));
+        w.u32(p + "rope.dimension_count", dim / heads);
+        for (String[] k : new String[][]{{"attention_multiplier", "attention.scale"}, {"embedding_multiplier", "embedding_scale"},
+                {"residual_multiplier", "residual_scale"}, {"logits_scaling", "logit_scale"}}) {
+            if (hpNum(k[0], 0) != 0) {
+                w.f32(p + k[1], (float) hpNum(k[0], 0));
+            }
+        }
+        if (hpNum("shared_intermediate_size", 0) != 0) {
+            w.u32(p + "expert_shared_feed_forward_length", (long) hpNum("shared_intermediate_size", 0));
+        }
+        w.u32(p + "ssm.conv_kernel", (long) hpNum("mamba_d_conv", 4));
+        w.u32(p + "ssm.state_size", (long) hpNum("mamba_d_state", 256));
+        w.u32(p + "ssm.group_count", groups);
+        w.u32(p + "ssm.inner_size", inner);
+        w.u32(p + "ssm.time_step_rank", (long) hpNum("mamba_n_heads", 0));
+        int kvHeads = (int) hpNum("num_key_value_heads", heads);
+        int[] kv = new int[n];
+        for (int l = 0; l < n; l++) {
+            kv[l] = attn[l] ? kvHeads : 0;
+        }
+        w.i32s(p + "attention.head_count_kv", kv);
+        w.bool(p + "rope.scaling.finetuned", !anySsm);
+        if (anySsm) {
+            w.u32(p + "context_length", 1 << 20);
+        }
+        boolean experts = hpNum("num_local_experts", 0) > 0;
+        int e = (int) hpNum("num_local_experts", 0);
+        int m = (int) hpNum("intermediate_size", 0);
+        int sm = (int) hpNum("shared_intermediate_size", m);
+        for (String name : sortedNames()) {
+            Matcher mt = LAYER.matcher(name);
+            float[] v = data.get(name);
+            long[] sh = shapes.get(name);
+            if (name.equals("model.embed_tokens.weight")) {
+                put("token_embd.weight", name);
+            } else if (name.equals("model.norm.weight")) {
+                put("output_norm.weight", name);
+            } else if (name.equals("lm_head.weight")) {
+                if (!bool("tie_word_embeddings")) {
+                    put("output.weight", name);
+                }
+            } else if (mt.matches()) {
+                String b = "blk." + mt.group(1) + ".";
+                String s0 = mt.group(2);
+                if (s0.startsWith("mamba.")) {
+                    need(mamba2Tensor(b, s0.substring("mamba.".length()), v, sh, groups), "unmapped tensor " + name);
+                } else if (s0.startsWith("self_attn.")) {
+                    permutedAttention(b, s0, v, sh, "self_attn.");
+                } else {
+                    switch (s0) {
+                        case "input_layernorm.weight" -> put(b + "attn_norm.weight", v, sh);
+                        case "post_attention_layernorm.weight" -> put(b + "ffn_norm.weight", v, sh);
+                        case "block_sparse_moe.router.layer.weight" -> put(b + "ffn_gate_inp.weight", v, sh);
+                        case "block_sparse_moe.input_linear.weight" -> {
+                            put(b + "ffn_gate_exps.weight", pickRows(v, e, 2 * m, dim, 0, 1, m), e, m, dim);
+                            put(b + "ffn_up_exps.weight", pickRows(v, e, 2 * m, dim, m, 1, m), e, m, dim);
+                        }
+                        case "block_sparse_moe.output_linear.weight" -> put(b + "ffn_down_exps.weight", v, sh);
+                        case "shared_mlp.input_linear.weight" -> {
+                            float[][] gu = halves(v, sm, dim);
+                            put(b + (experts ? "ffn_gate_shexp.weight" : "ffn_gate.weight"), gu[0], sm, dim);
+                            put(b + (experts ? "ffn_up_shexp.weight" : "ffn_up.weight"), gu[1], sm, dim);
+                        }
+                        case "shared_mlp.output_linear.weight" -> put(b + (experts ? "ffn_down_shexp.weight" : "ffn_down.weight"), v, sh);
+                        default -> throw new IllegalArgumentException("unmapped tensor " + name);
+                    }
+                }
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        vocab();
+    }
+
+    /**
+     * Nemotron-H (conversion/nemotron.py NemotronHModel over GraniteHybridModel): per layer of
+     * {@code hybrid_override_pattern} a Mamba-2 mixer, an attention mixer or a ReLU-squared MLP, told apart by the per-layer
+     * {@code attention.head_count_kv} and {@code feed_forward_length}; {@code layer_norm_epsilon} as
+     * {@code attention.layer_norm_epsilon}; {@code key_length} = head_dim. llama.cpp's scan has no {@code time_step_min}
+     * clamp, so a config with one cannot be expressed.
+     */
+    private void nemotronH() {
+        begin("nemotron_h");
+        String pattern = String.valueOf(hp.get("hybrid_override_pattern"));
+        int n = pattern.length();
+        need(n == layers(), "hybrid_override_pattern has one character per layer");
+        need(pattern.indexOf('E') < 0 && hp.get("num_experts_per_tok") == null, "Nemotron-H MoE is the nemotron_h_moe architecture");
+        need(hpNum("time_step_min", 0.001) == 0, "llama.cpp does not clamp the step size at time_step_min");
+        int dim = (int) hpNum("hidden_size", 0);
+        int heads = (int) hpNum("num_attention_heads", 0);
+        int headDim = (int) hpNum("head_dim", dim / Math.max(1, heads));
+        int groups = (int) hpNum("n_groups", 8);
+        int mh = (int) hpNum("mamba_num_heads", 0);
+        int inner = mh * (int) hpNum("mamba_head_dim", 0);
+        w.u32(p + "block_count", n);
+        w.u32(p + "context_length", 1 << 20);
+        w.u32(p + "embedding_length", dim);
+        int ff = (int) hpNum("intermediate_size", 0);
+        int[] ffs = new int[n];
+        int[] kv = new int[n];
+        for (int l = 0; l < n; l++) {
+            ffs[l] = pattern.charAt(l) == '-' ? ff : 0;
+            kv[l] = pattern.charAt(l) == '*' ? (int) hpNum("num_key_value_heads", heads) : 0;
+        }
+        w.i32s(p + "feed_forward_length", ffs);
+        w.u32(p + "attention.head_count", heads);
+        w.i32s(p + "attention.head_count_kv", kv);
+        w.f32(p + "attention.layer_norm_epsilon", (float) hpNum("layer_norm_epsilon", 1e-5));
+        w.u32(p + "vocab_size", (long) hpNum("vocab_size", 0));
+        w.u32(p + "rope.dimension_count", dim / heads);
+        w.u32(p + "ssm.conv_kernel", (long) hpNum("conv_kernel", 4));
+        w.u32(p + "ssm.state_size", (long) hpNum("ssm_state_size", 128));
+        w.u32(p + "ssm.group_count", groups);
+        w.u32(p + "ssm.inner_size", inner);
+        w.u32(p + "ssm.time_step_rank", mh);
+        w.bool(p + "rope.scaling.finetuned", false);
+        w.u32(p + "attention.key_length", headDim);
+        w.u32(p + "attention.value_length", headDim);
+        w.u32("general.file_type", 1);
+        Pattern layer = Pattern.compile("^backbone\\.layers\\.(\\d+)\\.(.+)$");
+        for (String name : sortedNames()) {
+            Matcher mt = layer.matcher(name);
+            float[] v = data.get(name);
+            long[] sh = shapes.get(name);
+            if (name.equals("backbone.embeddings.weight")) {
+                put("token_embd.weight", name);
+            } else if (name.equals("backbone.norm_f.weight")) {
+                put("output_norm.weight", name);
+            } else if (name.equals("lm_head.weight")) {
+                if (!bool("tie_word_embeddings")) {
+                    put("output.weight", name);
+                }
+            } else if (mt.matches()) {
+                int l = Integer.parseInt(mt.group(1));
+                String b = "blk." + l + ".";
+                String s0 = mt.group(2);
+                char kind = pattern.charAt(l);
+                if (s0.equals("norm.weight")) {
+                    put(b + "attn_norm.weight", v, sh);
+                } else if (kind == 'M') {
+                    need(mamba2Tensor(b, s0.substring("mixer.".length()), v, sh, groups), "unmapped tensor " + name);
+                } else if (kind == '*') {
+                    permutedAttention(b, s0, v, sh, "mixer.");
+                } else {
+                    switch (s0) {
+                        case "mixer.up_proj.weight" -> put(b + "ffn_up.weight", v, sh);
+                        case "mixer.down_proj.weight" -> put(b + "ffn_down.weight", v, sh);
+                        default -> throw new IllegalArgumentException("unmapped tensor " + name);
+                    }
+                }
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        vocab();
+    }
+
+    /**
+     * Jamba (conversion/jamba.py): its own key set (a per-layer {@code attention.head_count_kv} from the attention period
+     * and offset, the Mamba-1 sizes, {@code expert_count}); the Mamba-1 tensors with the dt / B / C norms, conv squeezed,
+     * {@code A = -exp(A_log)}; the experts merged into {@code ffn_*_exps}.
+     */
+    private void jamba() {
+        begin("jamba");
+        int n = layers();
+        int dim = (int) hpNum("hidden_size", 0);
+        int inner = (int) (hpNum("mamba_expand", 2) * dim);
+        need(inner == 2 * dim, "llama.cpp supports an expansion factor of 2");
+        int offset = (int) hpNum("attn_layer_offset", 4);
+        int period = (int) hpNum("attn_layer_period", 8);
+        int[] kv = new int[n];
+        for (int l = offset; l < n; l++) {
+            kv[l] = (l - offset) % period == 0 ? (int) hpNum("num_key_value_heads", 0) : 0;
+        }
+        w.u32(p + "block_count", n);
+        w.u32(p + "context_length", (long) hpNum("max_position_embeddings", 0));
+        w.u32(p + "embedding_length", dim);
+        w.u32(p + "feed_forward_length", (long) hpNum("intermediate_size", 0));
+        w.u32(p + "attention.head_count", (long) hpNum("num_attention_heads", 0));
+        w.i32s(p + "attention.head_count_kv", kv);
+        w.u32(p + "ssm.conv_kernel", (long) hpNum("mamba_d_conv", 4));
+        w.u32(p + "ssm.inner_size", inner);
+        w.u32(p + "ssm.state_size", (long) hpNum("mamba_d_state", 16));
+        w.u32(p + "ssm.time_step_rank", has("mamba_dt_rank") ? (long) hpNum("mamba_dt_rank", 0) : -(dim / -16));
+        w.f32(p + "attention.layer_norm_rms_epsilon", (float) (has("layer_norm_epsilon") ? hpNum("layer_norm_epsilon", 1e-6) : hpNum("rms_norm_eps", 1e-6)));
+        w.u32(p + "expert_count", (long) Math.max(hpNum("num_local_experts", 0), hpNum("num_experts", 0)));
+        w.u32(p + "expert_used_count", (long) hpNum("num_experts_per_tok", 0));
+        w.u32("general.file_type", 1);
+        int e = (int) Math.max(hpNum("num_local_experts", 0), hpNum("num_experts", 0));
+        for (String name : sortedNames()) {
+            Matcher mt = LAYER.matcher(name);
+            float[] v = data.get(name);
+            long[] sh = shapes.get(name);
+            if (name.equals("model.embed_tokens.weight")) {
+                put("token_embd.weight", name);
+            } else if (name.equals("model.final_layernorm.weight")) {
+                put("output_norm.weight", name);
+            } else if (name.equals("lm_head.weight")) {
+                if (!bool("tie_word_embeddings")) {
+                    put("output.weight", name);
+                }
+            } else if (mt.matches()) {
+                String b = "blk." + mt.group(1) + ".";
+                String s0 = mt.group(2);
+                if (s0.contains(".experts.")) {
+                    continue; // merged below
+                }
+                String g = switch (s0) {
+                    case "input_layernorm.weight" -> "attn_norm.weight";
+                    case "pre_ff_layernorm.weight" -> "ffn_norm.weight";
+                    case "feed_forward.router.weight" -> "ffn_gate_inp.weight";
+                    case "feed_forward.gate_proj.weight" -> "ffn_gate.weight";
+                    case "feed_forward.up_proj.weight" -> "ffn_up.weight";
+                    case "feed_forward.down_proj.weight" -> "ffn_down.weight";
+                    case "mamba.in_proj.weight" -> "ssm_in.weight";
+                    case "mamba.conv1d.bias" -> "ssm_conv1d.bias";
+                    case "mamba.x_proj.weight" -> "ssm_x.weight";
+                    case "mamba.dt_proj.weight" -> "ssm_dt.weight";
+                    case "mamba.dt_proj.bias" -> "ssm_dt.bias";
+                    case "mamba.D" -> "ssm_d";
+                    case "mamba.out_proj.weight" -> "ssm_out.weight";
+                    case "mamba.dt_layernorm.weight" -> "ssm_dt_norm.weight";
+                    case "mamba.b_layernorm.weight" -> "ssm_b_norm.weight";
+                    case "mamba.c_layernorm.weight" -> "ssm_c_norm.weight";
+                    case "mamba.conv1d.weight", "mamba.A_log" -> null;
+                    default -> attnOrMlp(s0);
+                };
+                if (s0.equals("mamba.conv1d.weight")) {
+                    put(b + "ssm_conv1d.weight", v, sh[0], sh[2]);
+                } else if (s0.equals("mamba.A_log")) {
+                    put(b + "ssm_a", negExp(v), sh);
+                } else {
+                    put(b + g, v, sh);
+                }
+            } else {
+                throw new IllegalArgumentException("unmapped tensor " + name);
+            }
+        }
+        for (int l = 0; l < n; l++) {
+            String ep = "model.layers." + l + ".feed_forward.experts.";
+            if (!data.containsKey(ep + "0.gate_proj.weight")) {
+                continue;
+            }
+            for (String[] part : new String[][]{{"down_proj", "ffn_down_exps"}, {"gate_proj", "ffn_gate_exps"}, {"up_proj", "ffn_up_exps"}}) {
+                long[] sh = shapes.get(ep + "0." + part[0] + ".weight");
+                float[] all = new float[e * (int) (sh[0] * sh[1])];
+                for (int x = 0; x < e; x++) {
+                    float[] one = data.get(ep + x + "." + part[0] + ".weight");
+                    System.arraycopy(one, 0, all, x * one.length, one.length);
+                }
+                put("blk." + l + "." + part[1] + ".weight", all, e, sh[0], sh[1]);
+            }
+        }
+        vocab();
+    }
+
     // ------------------------------------------------------------------ tensors
 
     private List<String> sortedNames() {
@@ -945,6 +1548,9 @@ final class HfToGguf {
                     w.f32Tensor(name, dims, dequantQ8(blocks));
                 }
             }
+        }
+        for (Map.Entry<String, Object[]> e : rawTensors.entrySet()) {
+            w.tensor(e.getKey(), (GgmlType) e.getValue()[0], (long[]) e.getValue()[1], (byte[]) e.getValue()[2]);
         }
     }
 

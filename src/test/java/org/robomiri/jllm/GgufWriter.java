@@ -52,10 +52,28 @@ final class GgufWriter {
         o.writeBytes(b);
     }
 
+    /** Whether a key written twice replaces its first value ({@link #overwriteDuplicates}) or is written twice. */
+    private boolean overwrite;
+
+    /**
+     * A key written again replaces its value in place, as gguf-py does ("Duplicated key name ..., overwriting it"), which
+     * {@link HfToGguf} relies on; by default a duplicate is written as it is (the reader tests need such files).
+     */
+    GgufWriter overwriteDuplicates() {
+        overwrite = true;
+        return this;
+    }
+
     private void put(String key, int type, byte[] value) {
         ByteArrayOutputStream o = new ByteArrayOutputStream();
         o.writeBytes(buf(4).putInt(type).array());
         o.writeBytes(value);
+        for (Object[] e : overwrite ? kv : List.<Object[]>of()) {
+            if (e[0].equals(key)) {
+                e[1] = o.toByteArray();
+                return;
+            }
+        }
         kv.add(new Object[]{key, o.toByteArray()});
     }
 

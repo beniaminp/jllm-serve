@@ -87,9 +87,12 @@ public final class GgufArchSmoke {
         try (GgufModel g = GgufModel.open(gguf); ModelWeights w = g.weights()) {
             Architecture cfg = w.arch;
             boolean mamba = cfg instanceof MambaArch;
+            boolean hybrid = cfg instanceof org.robomiri.jllm.model.HybridArch;
             float[] cpuLogits = new float[cfg.core().vocabSize()];
             int[] cpu;
-            try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4) : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
+            try (Backend b = mamba ? new MambaCpuBackend(w, 64, 16, 4)
+                    : hybrid ? new org.robomiri.jllm.cpu.HybridCpuBackend(w, 64, 16, 4, KvDtype.F32, false)
+                    : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false)) {
                 cpu = generate(b, cpuLogits);
             }
             System.out.println(name + " (" + ggufArch + ", Q8_0 gguf)  " + cfg);
@@ -103,7 +106,9 @@ public final class GgufArchSmoke {
             }
             float[] gpuLogits = new float[cfg.core().vocabSize()];
             int[] gpu;
-            try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib) : new MetalBackend(w, 64, 16, lib)) {
+            try (Backend b = mamba ? new MambaMetalBackend(w, 64, 16, lib)
+                    : hybrid ? new org.robomiri.jllm.metal.HybridMetalBackend(w, 64, 16, lib, KvDtype.F32)
+                    : new MetalBackend(w, 64, 16, lib)) {
                 gpu = generate(b, gpuLogits);
             }
             System.out.println("  metal " + Arrays.toString(gpu));

@@ -211,6 +211,341 @@ final class GgufFamilies {
         return c;
     }
 
+    // ------------------------------------------------------------------ gpt-oss
+
+    /**
+     * {@code gpt-oss}: sliding-window and full attention layers alternating (llama.cpp's pattern of 2, the even layers
+     * sliding, unless the file has an {@code attention.sliding_window_pattern}), a learned sink logit per head
+     * ({@code attn_sinks}), biases on q / k / v / o, on the router and on the experts, the top-k-then-softmax router, YaRN.
+     * The expert width is {@code expert_feed_forward_length}. The clamped SwiGLU's limit and alpha are not in the file:
+     * llama.cpp's graph uses gpt-oss's 7.0 and 1.702 ({@code LLM_FFN_SWIGLU_OAI_MOE}), and so does this mapping.
+     */
+    static void gptOss(GgufFile g, String p, Map<String, Object> c, long layers) throws IOException {
+        c.put("model_type", "gpt_oss");
+        c.put("num_local_experts", GgufArchitecture.need(g, p + "expert_count"));
+        c.put("num_experts_per_tok", GgufArchitecture.need(g, p + "expert_used_count"));
+        c.put("intermediate_size", GgufArchitecture.need(g, p + "expert_feed_forward_length"));
+        c.put("sliding_window", GgufArchitecture.need(g, p + "attention.sliding_window"));
+        c.put("layer_types", windowTypes(g, p, layers, 2, "sliding_attention", "full_attention"));
+        c.put("swiglu_limit", 7.0);
+        c.put("swiglu_alpha", 1.702);
+        if (!c.containsKey("rope_scaling")) {
+            // the file says no scaling; the family's own default (YaRN x32) must not apply
+            Map<String, Object> none = new LinkedHashMap<>();
+            none.put("rope_type", "default");
+            c.put("rope_scaling", none);
+        }
+    }
+
+    /**
+     * The layer types of llama.cpp's {@code load_swa_pattern(n)}: the file's {@code attention.sliding_window_pattern}
+     * (a bool per layer) when it has one, else layer {@code l} uses the window when {@code l % n < n - 1}.
+     */
+    static List<Object> windowTypes(GgufFile g, String p, long layers, int n, String windowed, String full) {
+        Object pattern = g.get(p + "attention.sliding_window_pattern");
+        long every = pattern instanceof Number num ? num.longValue() : n;
+        List<Object> types = new ArrayList<>();
+        for (int l = 0; l < layers; l++) {
+            boolean local = pattern instanceof boolean[] b ? l < b.length && b[l] : every == 0 || l % every < every - 1;
+            types.add(local ? windowed : full);
+        }
+        return types;
+    }
+
+    // ------------------------------------------------------------------ Llama 4
+
+    /**
+     * {@code llama4} (text): llama.cpp writes none of the attention extras and hard-codes them in its loader, as
+     * Scout and Maverick ship them: chunked attention of 8192 positions on three layers of four (the fourth is a
+     * NoPE layer with global attention, {@code n_no_rope_layer_step} 4), the attention temperature of the NoPE layers
+     * (floor 8192, scale 0.1), and the L2 norm of q and k on the rotated layers unless the model has 128 experts
+     * (Maverick). A file with {@code attention.sliding_window} 0 (MobileLLM-style) has neither chunks nor NoPE layers
+     * before the last. The dense width is {@code feed_forward_length}, the experts' (and the shared expert's)
+     * {@code expert_feed_forward_length}; MoE layers every {@code interleave_moe_layer_step}. The q / k rows are in the
+     * Hugging Face order (the converter does not permute them for llama4), which is the family's pairing already.
+     */
+    static void llama4(GgufFile g, String p, Map<String, Object> c, long layers) throws IOException {
+        c.put("model_type", "llama4_text");
+        long experts = GgufArchitecture.need(g, p + "expert_count");
+        c.put("num_local_experts", experts);
+        c.put("num_experts_per_tok", GgufArchitecture.need(g, p + "expert_used_count"));
+        c.put("intermediate_size_mlp", c.get("intermediate_size"));
+        c.put("intermediate_size", GgufArchitecture.need(g, p + "expert_feed_forward_length"));
+        c.put("interleave_moe_layer_step", GgufArchitecture.need(g, p + "interleave_moe_layer_step"));
+        boolean noChunks = g.get(p + "attention.sliding_window") instanceof Number w && w.longValue() == 0;
+        List<Object> types = new ArrayList<>();
+        if (noChunks) {
+            c.put("attention_chunk_size", null);
+            c.put("no_rope_layer_interval", layers);
+            c.put("attn_temperature_tuning", false);
+            for (int l = 0; l < layers; l++) {
+                types.add("full_attention");
+            }
+        } else {
+            c.put("attention_chunk_size", 8192L);
+            c.put("no_rope_layer_interval", 4L);
+            c.put("attn_temperature_tuning", true);
+            c.put("floor_scale", 8192L);
+            c.put("attn_scale", 0.1);
+            types = windowTypes(g, p, layers, 4, "chunked_attention", "full_attention");
+        }
+        c.put("layer_types", types);
+        c.put("use_qk_norm", experts != 128);
+    }
+
+    // ------------------------------------------------------------------ attention / state-space hybrids
+
+    /** The keys every hybrid shares: sizes, vocabulary, tokens, and the attention heads of the attention layers. */
+    private static Map<String, Object> hybridBase(GgufFile g, String p, String modelType) throws IOException {
+        Map<String, Object> c = new LinkedHashMap<>();
+        c.put("model_type", modelType);
+        c.put("hidden_size", GgufArchitecture.need(g, p + "embedding_length"));
+        c.put("num_hidden_layers", GgufArchitecture.need(g, p + "block_count"));
+        GgufFile.Tensor embed = g.tensors().get("token_embd.weight");
+        if (embed == null) {
+            throw new IOException("GGUF has no token_embd.weight");
+        }
+        c.put("vocab_size", embed.rows());
+        c.put("max_position_embeddings", g.num(p + "context_length", 1 << 20));
+        c.put("tie_word_embeddings", !g.hasTensor("output.weight"));
+        if (g.get("tokenizer.ggml.bos_token_id") instanceof Number b) {
+            c.put("bos_token_id", b.longValue());
+        }
+        List<Object> eos = new ArrayList<>();
+        for (String k : new String[]{"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"}) {
+            if (g.get(k) instanceof Number e && !eos.contains(e.longValue())) {
+                eos.add(e.longValue());
+            }
+        }
+        c.put("eos_token_id", eos);
+        c.put("hidden_act", "silu");
+        long[] kv = perLayer(g, p + "attention.head_count_kv", ((Number) c.get("num_hidden_layers")).intValue());
+        long kvHeads = 0;
+        for (long v : kv) {
+            kvHeads = Math.max(kvHeads, v);
+        }
+        if (kvHeads > 0) {
+            c.put("num_attention_heads", GgufArchitecture.scalar(g, p + "attention.head_count"));
+            c.put("num_key_value_heads", kvHeads);
+        }
+        if (g.get(p + "attention.key_length") instanceof Number kl) {
+            c.put("head_dim", kl.longValue());
+        }
+        c.put("attention_bias", g.hasTensor(firstAttention(kv) + "attn_q.bias"));
+        return c;
+    }
+
+    /** A per-layer integer key: its array, or its one value for every layer (0 when absent). */
+    static long[] perLayer(GgufFile g, String key, int layers) throws IOException {
+        long[] out = new long[layers];
+        Object v = g.get(key);
+        if (v instanceof long[] a) {
+            if (a.length < layers) {
+                throw new IOException(key + " has " + a.length + " entries for " + layers + " layers");
+            }
+            System.arraycopy(a, 0, out, 0, layers);
+        } else if (v instanceof Number n) {
+            java.util.Arrays.fill(out, n.longValue());
+        }
+        return out;
+    }
+
+    private static String firstAttention(long[] kv) {
+        for (int l = 0; l < kv.length; l++) {
+            if (kv[l] > 0) {
+                return "blk." + l + ".";
+            }
+        }
+        return "blk.0.";
+    }
+
+    /** The Mamba-2 sizes of Granite 4 / Nemotron-H: {@code {d_inner, heads, head_dim, groups, state, conv_kernel}}. */
+    private static long[] mamba2(GgufFile g, String p) throws IOException {
+        long inner = GgufArchitecture.need(g, p + "ssm.inner_size");
+        long heads = GgufArchitecture.need(g, p + "ssm.time_step_rank"); // llama.cpp keeps the Mamba-2 head count here
+        if (inner % heads != 0) {
+            throw new IOException(p + "ssm.inner_size " + inner + " is not a multiple of ssm.time_step_rank " + heads);
+        }
+        return new long[]{inner, heads, inner / heads, GgufArchitecture.need(g, p + "ssm.group_count"),
+                GgufArchitecture.need(g, p + "ssm.state_size"), GgufArchitecture.need(g, p + "ssm.conv_kernel")};
+    }
+
+    /**
+     * {@code granitehybrid} (Granite 4): a layer is a Mamba-2 one when its {@code attention.head_count_kv} is 0, an
+     * attention one otherwise; each has the MoE of {@code expert_count} experts of {@code feed_forward_length} plus
+     * the shared expert of {@code expert_shared_feed_forward_length} (or, without experts, a dense MLP of
+     * {@code feed_forward_length}); the muP multipliers ({@code attention.scale}, absent meaning llama.cpp's
+     * {@code 1/sqrt(head_dim)}, {@code embedding_scale}, {@code residual_scale}, {@code logit_scale}); RoPE only when
+     * {@code rope.scaling.finetuned} is true (its default), on q / k rows the converter permuted. The gated norm of
+     * the Mamba-2 output is per group, as llama.cpp computes it ({@link org.robomiri.jllm.model.Architecture#GGUF_GROUPED_SSM_NORM}).
+     */
+    static Map<String, Object> graniteHybrid(GgufFile g) throws IOException {
+        String p = "granitehybrid.";
+        Map<String, Object> c = hybridBase(g, p, "granitemoehybrid");
+        int layers = ((Number) c.get("num_hidden_layers")).intValue();
+        long dim = ((Number) c.get("hidden_size")).longValue();
+        long[] kv = perLayer(g, p + "attention.head_count_kv", layers);
+        List<Object> types = new ArrayList<>();
+        for (long v : kv) {
+            types.add(v == 0 ? "mamba" : "attention");
+        }
+        c.put("layer_types", types);
+        c.put("rms_norm_eps", g.dbl(p + "attention.layer_norm_rms_epsilon", 1e-5));
+        long experts = g.num(p + "expert_count", 0);
+        long ff = GgufArchitecture.need(g, p + "feed_forward_length");
+        c.put("num_local_experts", experts);
+        c.put("intermediate_size", ff);
+        if (experts > 0) {
+            c.put("num_experts_per_tok", GgufArchitecture.need(g, p + "expert_used_count"));
+            if (g.num(p + "expert_shared_feed_forward_length", 0) <= 0) {
+                throw new IOException("Granite 4 without a shared expert (" + p + "expert_shared_feed_forward_length) is not supported");
+            }
+            c.put("shared_intermediate_size", g.num(p + "expert_shared_feed_forward_length", 0));
+        } else {
+            c.put("shared_intermediate_size", ff);
+        }
+        long heads = g.num(p + "attention.head_count", 0);
+        if (c.containsKey("num_attention_heads")) {
+            long headDim = c.get("head_dim") instanceof Number h ? h.longValue() : dim / Math.max(1, heads);
+            c.put("attention_multiplier", g.dbl(p + "attention.scale", 0) != 0 ? g.dbl(p + "attention.scale", 0)
+                    : 1.0 / Math.sqrt(headDim));
+        }
+        c.put("embedding_multiplier", nonZero(g.dbl(p + "embedding_scale", 0)));
+        c.put("residual_multiplier", nonZero(g.dbl(p + "residual_scale", 0)));
+        c.put("logits_scaling", nonZero(g.dbl(p + "logit_scale", 0)));
+        boolean rope = g.bool(p + "rope.scaling.finetuned", true);
+        c.put("position_embedding_type", rope ? "rope" : "nope");
+        if (rope) {
+            c.put("rope_theta", g.dbl(p + "rope.freq_base", 10000.0));
+            c.put(org.robomiri.jllm.model.Architecture.GGUF_INTERLEAVED_ROPE, true);
+        }
+        if (layers > countNonZero(kv)) {
+            long[] m = mamba2(g, p);
+            c.put("mamba_n_heads", m[1]);
+            c.put("mamba_d_head", m[2]);
+            c.put("mamba_expand", m[0] / dim);
+            c.put("mamba_n_groups", m[3]);
+            c.put("mamba_d_state", m[4]);
+            c.put("mamba_d_conv", m[5]);
+            c.put(org.robomiri.jllm.model.Architecture.GGUF_GROUPED_SSM_NORM, true);
+        }
+        return c;
+    }
+
+    private static double nonZero(double v) {
+        return v == 0 ? 1.0 : v; // llama.cpp: 0 (absent) means no scaling
+    }
+
+    private static int countNonZero(long[] a) {
+        int n = 0;
+        for (long v : a) {
+            n += v != 0 ? 1 : 0;
+        }
+        return n;
+    }
+
+    /**
+     * {@code nemotron_h}: per layer a Mamba-2 mixer ({@code attention.head_count_kv} and {@code feed_forward_length}
+     * both 0), an attention mixer ({@code feed_forward_length} 0) or a ReLU-squared MLP of that width, written back as
+     * the {@code hybrid_override_pattern} ("M", "*", "-"); one norm per layer with {@code attention.layer_norm_epsilon};
+     * attention without positions. llama.cpp's scan does not clamp the step size, so {@code time_step_min} is 0 here.
+     */
+    static Map<String, Object> nemotronH(GgufFile g) throws IOException {
+        String p = "nemotron_h.";
+        Map<String, Object> c = hybridBase(g, p, "nemotron_h");
+        int layers = ((Number) c.get("num_hidden_layers")).intValue();
+        if (g.num(p + "expert_count", 0) > 0) {
+            throw new IOException("Nemotron-H mixture-of-experts layers are not supported");
+        }
+        long[] kv = perLayer(g, p + "attention.head_count_kv", layers);
+        long[] ff = perLayer(g, p + "feed_forward_length", layers);
+        StringBuilder pattern = new StringBuilder();
+        long width = 0;
+        for (int l = 0; l < layers; l++) {
+            pattern.append(ff[l] > 0 ? '-' : kv[l] > 0 ? '*' : 'M');
+            if (ff[l] > 0) {
+                if (width != 0 && width != ff[l]) {
+                    throw new IOException(p + "feed_forward_length differs between MLP layers (" + width + ", " + ff[l] + ")");
+                }
+                width = ff[l];
+            }
+        }
+        c.put("hybrid_override_pattern", pattern.toString());
+        c.put("intermediate_size", width);
+        double eps = g.dbl(p + "attention.layer_norm_epsilon", g.dbl(p + "attention.layer_norm_rms_epsilon", 1e-5));
+        c.put("layer_norm_epsilon", eps);
+        c.put("mamba_hidden_act", "silu");
+        c.put("mlp_hidden_act", "relu2");
+        if (pattern.indexOf("M") >= 0) {
+            long[] m = mamba2(g, p);
+            c.put("mamba_num_heads", m[1]);
+            c.put("mamba_head_dim", m[2]);
+            c.put("n_groups", m[3]);
+            c.put("ssm_state_size", m[4]);
+            c.put("conv_kernel", m[5]);
+            c.put("time_step_min", 0.0);
+        }
+        return c;
+    }
+
+    /**
+     * {@code jamba}: an attention layer where {@code attention.head_count_kv} is non-zero, a Mamba-1 one (with the
+     * norms of dt, B and C) otherwise; a MoE where the layer has {@code ffn_gate_inp}, a SwiGLU MLP otherwise. The
+     * family's config describes both by a period and an offset, which are recovered from the layers (and checked).
+     */
+    static Map<String, Object> jamba(GgufFile g) throws IOException {
+        String p = "jamba.";
+        Map<String, Object> c = hybridBase(g, p, "jamba");
+        int layers = ((Number) c.get("num_hidden_layers")).intValue();
+        long dim = ((Number) c.get("hidden_size")).longValue();
+        long[] kv = perLayer(g, p + "attention.head_count_kv", layers);
+        boolean[] attn = new boolean[layers];
+        boolean[] moe = new boolean[layers];
+        for (int l = 0; l < layers; l++) {
+            attn[l] = kv[l] > 0;
+            moe[l] = g.hasTensor("blk." + l + ".ffn_gate_inp.weight");
+        }
+        long[] a = periodic(attn, "attention");
+        long[] e = periodic(moe, "expert");
+        c.put("attn_layer_period", a[0]);
+        c.put("attn_layer_offset", a[1]);
+        c.put("expert_layer_period", e[0]);
+        c.put("expert_layer_offset", e[1]);
+        c.put("num_experts", g.num(p + "expert_count", 0));
+        c.put("num_experts_per_tok", g.num(p + "expert_used_count", 0));
+        c.put("intermediate_size", GgufArchitecture.need(g, p + "feed_forward_length"));
+        c.put("rms_norm_eps", g.dbl(p + "attention.layer_norm_rms_epsilon", 1e-6));
+        if (countNonZero(kv) < layers) {
+            long inner = GgufArchitecture.need(g, p + "ssm.inner_size");
+            if (inner % dim != 0) {
+                throw new IOException(p + "ssm.inner_size " + inner + " is not a multiple of embedding_length " + dim);
+            }
+            c.put("mamba_expand", inner / dim);
+            c.put("mamba_d_state", GgufArchitecture.need(g, p + "ssm.state_size"));
+            c.put("mamba_d_conv", GgufArchitecture.need(g, p + "ssm.conv_kernel"));
+            c.put("mamba_dt_rank", GgufArchitecture.need(g, p + "ssm.time_step_rank"));
+        }
+        return c;
+    }
+
+    /** {@code {period, offset}} with {@code mask[l] == (l % period == offset)} for every layer, or an error. */
+    static long[] periodic(boolean[] mask, String what) throws IOException {
+        List<Integer> on = new ArrayList<>();
+        for (int l = 0; l < mask.length; l++) {
+            if (mask[l]) {
+                on.add(l);
+            }
+        }
+        long period = on.size() >= 2 ? on.get(1) - on.get(0) : mask.length + 1L;
+        long offset = on.isEmpty() ? mask.length : on.get(0) % period;
+        for (int l = 0; l < mask.length; l++) {
+            if (mask[l] != (l % period == offset)) {
+                throw new IOException("the " + what + " layers of this Jamba GGUF (" + on + ") are not every n-th layer");
+            }
+        }
+        return new long[]{period, offset};
+    }
+
     // ------------------------------------------------------------------ DeepSeek-V2 / V3 (deepseek2)
 
     /**

@@ -221,6 +221,14 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     "off by default" / "MoE keeps it off" (docs/11 summary, docs/17 §17.1) and the missing `mtp` value (docs/10 table);
     `backend.cpu.int8-activations` "default `true`" (docs/07, now `auto`); Llama 4 and the Mamba-2 hybrids listed as not
     supported (docs/14 §14.6, docs/15 §15.9).
+- **GGUF for the remaining families (at the owner's request):** `gpt-oss`, `llama4`, `granitehybrid`, `nemotron_h` and `jamba`
+  files are read (docs/16 §16.16). What llama.cpp's loader fixes and the file does not say is written into the description as
+  llama.cpp's constant (gpt-oss's SwiGLU clamp 7.0; Llama 4's chunk 8192, temperature, NoPE every 4th layer, q/k norm unless 128
+  experts; the Mamba-2 gated norm per group, `Architecture.GGUF_GROUPED_SSM_NORM`; no step clamp). `HfToGguf` ports the five
+  converters (MXFP4 repacked raw, gate/up de-interleaved, per-layer `head_count_kv` / `feed_forward_length`, Jamba's merged
+  experts) and refuses what llama.cpp would compute differently; `GgufFamiliesCheck` has seven new variants (F32 GGUF vs
+  safetensors <= 4.9e-7; all 124 checks pass), and `scripts/arch-smoke.sh` generates them for `GgufArchSmoke` (CPU half run;
+  the Metal half and `scripts/gguf-llamacpp-check.sh` are for a Mac: llama.cpp could not be built here).
 - **Gates on this branch** (Linux x86-64, Xeon with AVX-512, 4 cores, 15 GB, Temurin JDK 26.0.2; no Mac):
   - `mvn -o install`: BUILD SUCCESS. The web tests: 62 run, 0 failures. `scripts/build-metal-emu.sh`: exit 0.
     `kernel_tests.py`: 1172 ok, 0 FAIL.
@@ -238,6 +246,9 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     the start-up line must say `Backend: metal`, and its text should match `--backend cpu --backend.cpu.int8-activations false`
     greedy; then put its speed into docs/28 §28.5.5.
   - docs/28 §28.10 lists what is not measured yet; the CPU f16 cache on x86 against q8 can be timed on Linux.
+  - On a Mac: `scripts/gguf-llamacpp-check.sh gpt-oss gpt-oss-mxfp4 llama4 llama4-mix granite4 nemotron-h jamba` (llama.cpp's
+    logits on the new GGUF families) and `scripts/arch-smoke.sh` (their CPU == Metal half); then fill the llama.cpp column of
+    docs/16 §16.16.
   - Done (2026-10-27, at the owner's request): the launchers raise `-XX:MaxDirectMemorySize` to the physical memory or the
     container's limit (`scripts/jvm-memory.sh`, `JLLM_DIRECT_MEMORY`), and closing a pool that held slabs runs one GC so an
     unloaded model's cache returns at once (docs/10 §10.13).

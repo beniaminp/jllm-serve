@@ -175,7 +175,26 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             case "self_attn.kv_b_proj.weight" -> new String[]{b + "attn_kv_b.weight"};
             case "self_attn.k_b_proj.weight" -> new String[]{b + "attn_k_b.weight"};
             case "self_attn.v_b_proj.weight" -> new String[]{b + "attn_v_b.weight"};
-            case "mlp.router_bias" -> new String[]{b + "exp_probs_b.bias"};
+            // DeepSeek-V3's selection bias, or the linear bias of gpt-oss's router
+            case "mlp.router_bias" -> new String[]{b + (gguf.hasTensor(b + "exp_probs_b.bias") ? "exp_probs_b.bias" : "ffn_gate_inp.bias")};
+            // gpt-oss: a sink logit per head, the experts' biases (gate and up are joined per expert in floats())
+            case "self_attn.sinks" -> new String[]{b + "attn_sinks.weight"};
+            case "mlp.experts.gate_up_bias" -> new String[]{b + "ffn_gate_exps.bias", b + "ffn_up_exps.bias"};
+            case "mlp.experts.down_bias" -> new String[]{b + "ffn_down_exps.bias"};
+            // the state-space mixers of Granite 4 / Nemotron-H (Mamba-2) and Jamba (Mamba-1): A is already -exp(A_log)
+            case "mixer.in_proj.weight" -> new String[]{b + "ssm_in.weight"};
+            case "mixer.conv1d.weight" -> new String[]{b + "ssm_conv1d.weight"};
+            case "mixer.conv1d.bias" -> new String[]{b + "ssm_conv1d.bias"};
+            case "mixer.dt_bias", "mixer.dt_proj.bias" -> new String[]{b + "ssm_dt.bias"};
+            case "mixer.A" -> new String[]{b + "ssm_a"};
+            case "mixer.D" -> new String[]{b + "ssm_d"};
+            case "mixer.norm.weight" -> new String[]{b + "ssm_norm.weight"};
+            case "mixer.out_proj.weight" -> new String[]{b + "ssm_out.weight"};
+            case "mixer.x_proj.weight" -> new String[]{b + "ssm_x.weight"};
+            case "mixer.dt_proj.weight" -> new String[]{b + "ssm_dt.weight"};
+            case "mixer.dt_norm.weight" -> new String[]{b + "ssm_dt_norm.weight"};
+            case "mixer.b_norm.weight" -> new String[]{b + "ssm_b_norm.weight"};
+            case "mixer.c_norm.weight" -> new String[]{b + "ssm_c_norm.weight"};
             case "nextn.eh_proj" -> new String[]{b + "nextn.eh_proj.weight"};
             case "nextn.enorm" -> new String[]{b + "nextn.enorm.weight"};
             case "nextn.hnorm" -> new String[]{b + "nextn.hnorm.weight"};
@@ -253,6 +272,9 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
         }
         String[] g = require(name);
         if (g.length == 1) {
+            if (name.endsWith("mlp.gate_up") && family == GgufArchitecture.Family.NEMOTRON_H) {
+                return matrix(gguf.tensor(g[0])); // a ReLU-squared MLP: ffn_up alone, no gate rows
+            }
             if (name.endsWith("mlp.gate_up")) {
                 return fusedGateUp(gguf.tensor(g[0]));
             }
@@ -277,7 +299,33 @@ public final class GgufWeights implements TensorSource, AutoCloseable {
             }
             return floatsOf(sub(sl));
         }
+        String[] g = resolve(name);
+        if (name.endsWith("mixer.conv1d.bias") && g != null && !gguf.hasTensor(g[0])) {
+            // a Mamba conv without a bias (llama.cpp's TENSOR_NOT_REQUIRED): zeros, as the safetensors conversion writes
+            Matcher m = LAYER.matcher(name);
+            String w = m.matches() ? "blk." + m.group(1) + ".ssm_conv1d.weight" : "";
+            if (gguf.hasTensor(w)) {
+                return new float[Math.toIntExact(gguf.tensor(w).rows())];
+            }
+        }
+        if (name.endsWith("mlp.experts.gate_up_bias")) {
+            return joinPerExpert(floatsOf(gguf.tensor(require(name)[0])), floatsOf(gguf.tensor(require(name)[1])),
+                    Math.toIntExact(gguf.tensor(require(name)[0]).cols()));
+        }
         return floatsOf(gguf.tensor(require(name)[0]));
+    }
+
+    /** {@code [E][m]} gate and up biases as {@code [E][gate m | up m]}, the order of the stacked expert rows. */
+    private static float[] joinPerExpert(float[] gate, float[] up, int m) {
+        if (gate.length != up.length || m <= 0 || gate.length % m != 0) {
+            throw new IllegalArgumentException("expert biases of " + gate.length + " / " + up.length + " values do not split into rows of " + m);
+        }
+        float[] out = new float[2 * gate.length];
+        for (int e = 0; e < gate.length / m; e++) {
+            System.arraycopy(gate, e * m, out, 2 * e * m, m);
+            System.arraycopy(up, e * m, out, (2 * e + 1) * m, m);
+        }
+        return out;
     }
 
     /** The elements of a float-typed tensor in file order. */

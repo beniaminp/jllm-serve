@@ -207,6 +207,15 @@ ggen deepseek_v2q deepseek-v2q --set n_group=1 --set topk_group=1 --set topk_met
   --set rope_scaling='{"type":"yarn","factor":4.0,"original_max_position_embeddings":64,"beta_fast":32,"beta_slow":1,"mscale":0.707,"mscale_all_dim":0.707}'
 ggen deepseek_v3 deepseek-v3
 ggen deepseek_v3 deepseek-v3-fused-exps
+# the variants llama.cpp can express (docs/16 §16.16): its hard-coded SwiGLU clamp, Llama 4 chunk and temperature, Granite's
+# grouped norm with one group, Nemotron-H without the step clamp
+ggen gptoss gpt-oss --set swiglu_limit=7.0
+ggen gptoss_mxfp4 gpt-oss-mxfp4 --set swiglu_limit=7.0
+ggen llama4 llama4 --set attention_chunk_size=8192 --set floor_scale=8192 --set attn_scale=0.1
+ggen llama4mix llama4-mix --set attention_chunk_size=8192 --set floor_scale=8192 --set attn_scale=0.1
+ggen granite granite4 --set mamba_n_groups=1
+ggen nemotronh nemotron-h --set time_step_min=0.0
+ggen jamba jamba
 "$JAVA_HOME/bin/java" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -Djllm.cpu.fastmath=false ${JAVA_OPTS:-} \
   -cp target/classes:target/test-classes org.robomiri.jllm.GgufArchSmoke "$METAL_LIB" "$G"/*/
 

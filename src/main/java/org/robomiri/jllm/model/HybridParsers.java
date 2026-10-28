@@ -136,8 +136,10 @@ final class HybridParsers {
                 if (rs == null && rp != null && (rp.containsKey("rope_type") || rp.containsKey("type"))) {
                     rs = rp;
                 }
+                // a GGUF's q / k rows were permuted by llama.cpp's converter (granitehybrid keeps Llama's undo_permute)
                 rope = new RopeTable(attn.headDim() & ~1, theta, Families.parseRopeScaling(rs, c, attn.headDim() & ~1),
-                        RopeTable.Pairing.HALF);
+                        Json.bool(c, Architecture.GGUF_INTERLEAVED_ROPE, false) ? RopeTable.Pairing.INTERLEAVED
+                                : RopeTable.Pairing.HALF);
             } else {
                 rope = identityRope(attn);
             }
@@ -160,7 +162,9 @@ final class HybridParsers {
                         + " expand=" + expand + " hidden_size=" + dim + " n_groups=" + groups + " d_state=" + state
                         + " d_conv=" + conv);
             }
-            m2 = new HybridArch.Mamba2(heads, headDim, groups, state, conv, 1, dtMin, dtMax, (float) eps);
+            // transformers' gated norm spans all of d_inner; a GGUF's (llama.cpp's) is per group
+            int normGroups = Json.bool(c, Architecture.GGUF_GROUPED_SSM_NORM, false) ? groups : 1;
+            m2 = new HybridArch.Mamba2(heads, headDim, groups, state, conv, normGroups, dtMin, dtMax, (float) eps);
         }
         return build(arch, "granitemoehybrid", c, dim, vocab, eps, layers, attn, rope, m2, null, f(c, "embedding_multiplier", 1.0),
                 f(c, "logits_scaling", 1.0), String.format(" mult(res=%g)%s", res,

@@ -29,6 +29,12 @@ public sealed interface Architecture permits Decoder, MambaArch, Qwen3NextArch, 
     String GGUF_INTERLEAVED_ROPE = "jllm_gguf_interleaved_rope";
     /** Config key set for a Qwen3.5 GGUF: its Gated DeltaNet value heads are in tiled, not grouped, order. */
     String GGUF_TILED_VALUE_HEADS = "jllm_gguf_tiled_value_heads";
+    /**
+     * Config key set for a Granite 4 GGUF: llama.cpp normalizes the gated Mamba-2 output per group of
+     * {@code d_inner / n_groups} channels for every architecture ({@code build_mamba2_layer}), where transformers'
+     * Granite normalizes all of {@code d_inner} at once; the two agree when {@code mamba_n_groups} is 1 (docs/16-gguf.md).
+     */
+    String GGUF_GROUPED_SSM_NORM = "jllm_gguf_grouped_ssm_norm";
 
     Core core();
 

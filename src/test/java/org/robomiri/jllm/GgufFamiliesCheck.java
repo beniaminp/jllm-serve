@@ -80,7 +80,20 @@ public final class GgufFamiliesCheck {
                     "--set", "topk_method=\"greedy\"", "--set", "norm_topk_prob=false", "--set", "routed_scaling_factor=2.5",
                     "--set", YARN_EQ),
             new Model("deepseek-v3", 2e-5, 2e-3, "deepseek_v3"),
-            new Model("deepseek-v3-fused-exps", 2e-5, 2e-3, "deepseek_v3", "--fuse-gate-up-exps"));
+            new Model("deepseek-v3-fused-exps", 2e-5, 2e-3, "deepseek_v3", "--fuse-gate-up-exps"),
+            // gpt-oss: llama.cpp's graph clamps the SwiGLU at 7.0 whatever the config says
+            new Model("gpt-oss", 2e-5, 2e-3, "gptoss", "--set", "swiglu_limit=7.0"),
+            new Model("gpt-oss-mxfp4", 2e-5, 2e-3, "gptoss_mxfp4", "--set", "swiglu_limit=7.0"),
+            // Llama 4: llama.cpp hard-codes the chunk (8192) and the NoPE temperature (floor 8192, scale 0.1)
+            new Model("llama4", 2e-5, 2e-3, "llama4", "--set", "attention_chunk_size=8192", "--set", "floor_scale=8192",
+                    "--set", "attn_scale=0.1"),
+            new Model("llama4-mix", 2e-5, 2e-3, "llama4mix", "--set", "attention_chunk_size=8192", "--set", "floor_scale=8192",
+                    "--set", "attn_scale=0.1"),
+            // Granite 4: llama.cpp's gated norm is per group (equal to transformers' with one group)
+            new Model("granite4", 2e-5, 2e-3, "granite", "--set", "mamba_n_groups=1"),
+            // Nemotron-H: llama.cpp's scan does not clamp the step size at time_step_min
+            new Model("nemotron-h", 2e-5, 2e-3, "nemotronh", "--set", "time_step_min=0.0"),
+            new Model("jamba", 2e-5, 2e-3, "jamba"));
 
     static int passed;
     static int failed;
@@ -112,6 +125,7 @@ public final class GgufFamiliesCheck {
 
     static Backend backend(ModelWeights w) {
         return w.arch instanceof MambaArch ? new MambaCpuBackend(w, 64, 16, 4)
+                : w.arch instanceof org.robomiri.jllm.model.HybridArch ? new org.robomiri.jllm.cpu.HybridCpuBackend(w, 64, 16, 4, KvDtype.F32, false)
                 : new CpuBackend(w, 64, 16, 4, KvDtype.F32, false);
     }
 

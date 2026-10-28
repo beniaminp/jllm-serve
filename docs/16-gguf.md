@@ -1105,11 +1105,11 @@ column is `GgufArchSmoke` on the real GPU: CPU and Metal generate the same 8 gre
 "jllm vs llama.cpp" uses the file holding the Q8_0-rounded weights as F32, so both engines multiply the same numbers; llama.cpp
 runs on the CPU with an f32 cache and no flash attention, `llama-debug --save-logits`, build b11669.)
 
-Refused with a message that names the reason (math the engine does not have): `granite*` (scales the embeddings, residual
-branches and logits), `olmo2` (norms after the attention and the MLP, full-width q/k norm), `smollm3` (layers without RoPE),
+Refused with a message that names the reason (math the engine does not have): the plain `granite` / `granitemoe` decoders
+(they scale the embeddings, residual branches and logits; the hybrid `granitehybrid` is read, 16.16), `olmo2` (norms after the attention and the MLP, full-width q/k norm), `smollm3` (layers without RoPE),
 `qwen2moe` (a sigmoid-gated shared expert in a decoder layer), the LayerNorm families (`stablelm`, `phi2`, `starcoder2`,
-`command-r`, `cohere2`, `falcon`, `olmo`), Gemma 1, Mamba 2, and `internlm2` / `exaone*` (llama-like, but no chat template
-here). `mistral3` with `attention.temperature_scale` (Ministral 3's position-dependent query scaling) is refused too.
+`command-r`, `cohere2`, `falcon`, `olmo`), Gemma 1, a plain Mamba 2 model (Mamba-2 layers inside Granite 4 and Nemotron-H are
+read, 16.16), `nemotron_h_moe`, `falcon-h1`, and `internlm2` / `exaone*` (llama-like, but no chat template here). `mistral3` with `attention.temperature_scale` (Ministral 3's position-dependent query scaling) is refused too.
 
 ### 16.15.1 What each converter writes, and how it is read
 
@@ -1196,7 +1196,7 @@ DeepSeek-V2-Lite    kv_b_proj [4096, 512] = [H (nope + v), kv_lora] with H = 16,
   a wrong permutation, a missing `+1` or a transposed `kv_b` shows up as a logit difference far above the 1e-7 - 2e-5 the checks end with.
 * *Keep the file's layout where the kernels can use it* (fused `attn_qkv` and `ffn_up` as views, `attn_k_b` / `attn_v_b` as the absorbed MLA wants them), instead of
   splitting and re-stacking: no copy of a compressed matrix, and the quantization stays the file's.
-* *Refuse what the engine cannot do* (Granite's scalings, OLMo-2's post-norms, SmolLM3's NoPE layers, Qwen2-MoE's gated shared expert, LayerNorm families, Gemma 1, Mamba 2, Falcon-Mamba, Ministral 3's temperature scale), with the reason, rather than run the closest family and produce plausible wrong text.
+* *Refuse what the engine cannot do* (the plain Granite decoder's scalings, OLMo-2's post-norms, SmolLM3's NoPE layers, Qwen2-MoE's gated shared expert, LayerNorm families, Gemma 1, Mamba 2, Falcon-Mamba, Ministral 3's temperature scale), with the reason, rather than run the closest family and produce plausible wrong text.
 * *Follow the model where llama.cpp and transformers differ and the file is silent* (V2-236B group routing, the sliding window of Phi-3): these two are documented
   as judgement calls in 16.15.1.
 * *Costs:* the DeepSeek Q8_0 floor (2e-2 of the largest logit on tiny models, because the blocks of `attn_k_b` run along `nope` instead of `kv_lora`), the families' tokenizers
@@ -1207,3 +1207,103 @@ llama.cpp's converter (`--fuse-qkv`, `--fuse-gate-up-exps`) are accepted without
 
 **Checks and limits.** The table above (F32 GGUF vs safetensors 0 - 9e-7, jllm vs llama.cpp 2e-7 - 1.9e-5 of the largest logit, Metal == CPU for the same 8 greedy tokens) and 16.15.2; limits as
 stated in 16.15.3: no real files of these families were run, so what is proved is the layout against llama.cpp's own loader, not a model's text.
+
+## 16.16 gpt-oss, Llama 4, Granite 4, Nemotron-H and Jamba as GGUF files
+
+Code: `gguf/GgufFamilies.java` (`gptOss`, `llama4`, `graniteHybrid`, `nemotronH`, `jamba`, `windowTypes`, `periodic`),
+`gguf/GgufArchitecture.java` (`Family.GPT_OSS`, `LLAMA4`, `GRANITE_HYBRID`, `NEMOTRON_H`, `JAMBA`; the YaRN `truncate` key),
+`gguf/GgufWeights.java` (sinks, router and expert biases, the `ssm_*` tensors, Nemotron-H's gate-less MLP),
+`model/HybridParsers.java` (`Architecture.GGUF_GROUPED_SSM_NORM`, interleaved RoPE for a permuted Granite file); tests
+`HfToGguf.java` (`gptOss`, `llama4`, `graniteHybrid`, `nemotronH`, `jamba`, `mxfp4`), `GgufFamiliesCheck.java`,
+`GgufArchSmoke.java`, `scripts/arch-smoke.sh`.
+
+🧸 These five families could already run from a Hugging Face folder ([14 §14.18 – 14.22](14-model-families.md#1418-gpt-oss-attention-sinks-sliding-windows-clamped-swiglu-experts-with-biases-mxfp4)),
+but not from the one-file boxes llama.cpp packs them in. Their boxes are unusual in a new way: some of what makes the model work
+is **not written in the box at all**. llama.cpp's program simply knows it ("gpt-oss always clips its gate at 7", "Llama 4 always
+reads its context in chunks of 8192"). So reading these files means knowing what llama.cpp knows, and writing it back into the
+description the engine builds the model from.
+
+📐 **Status** (tiny random checkpoints of `scripts/make-tiny-model.py`, written as llama.cpp's converter writes them by
+`HfToGguf`, then `GgufFamiliesCheck`; relative logit differences over the prompt and three greedy steps, CPU backend, f32 cache;
+the x86 VM, 2026-10-28; `java -cp target/classes:target/test-classes org.robomiri.jllm.GgufFamiliesCheck gpt-oss gpt-oss-mxfp4
+llama4 llama4-mix granite4 nemotron-h jamba`):
+
+| GGUF architecture | jllm family (`model_type`) | tiny variant (overrides that make it expressible) | F32 GGUF vs safetensors | Q8_0 in place vs F32 of its values | Q8_0 GGUF vs safetensors (quantization noise) |
+|---|---|---|---|---|---|
+| `gpt-oss` | `gpt_oss` | float experts, `swiglu_limit=7.0` | 0 | 2.9e-7 | 6.8e-4 |
+| `gpt-oss` | `gpt_oss` | MXFP4 experts (`_blocks` / `_scales`), `swiglu_limit=7.0` | 0 | 3.2e-7 | 5.5e-4 |
+| `llama4` | `llama4_text` | `Llama4ForCausalLM`, MoE every layer, `attention_chunk_size=8192`, `floor_scale=8192`, `attn_scale=0.1` | 4.9e-7 | 4.2e-7 | 9.9e-4 |
+| `llama4` | `llama4_text` | `Llama4ForConditionalGeneration` (vision tower dropped), dense and MoE layers alternating, the same overrides | 4.6e-7 | 5.5e-7 | 8.8e-4 |
+| `granitehybrid` | `granitemoehybrid` | Mamba-2 / attention `MMAMA`, MoE + shared expert, muP multipliers, `mamba_n_groups=1` | 1.2e-7 | 2.1e-7 | 4.8e-4 |
+| `nemotron_h` | `nemotron_h` | pattern `M-M*-M` (Mamba-2, ReLU² MLP, attention), two groups, `time_step_min=0.0` | 1.7e-7 | 7.6e-7 | 1.3e-3 |
+| `jamba` | `jamba` | Mamba-1 with dt / B / C norms, attention on layer 2, MoE on layers 1 and 3 | 0 | 1.5e-6 | 3.5e-3 |
+
+The whole `GgufFamiliesCheck` (the families of 16.15 and these) passes 124 checks. The CPU half of `GgufArchSmoke` (8 greedy
+tokens from the Q8_0 file) runs for all seven; its Metal half (CPU == Metal) and `scripts/gguf-llamacpp-check.sh` (llama.cpp's
+own logits on the same file) were **not run**: the machine had no Mac, and building llama.cpp there was not allowed. Both scripts
+list the new variants, so a Mac run of `scripts/arch-smoke.sh` and of `scripts/gguf-llamacpp-check.sh` closes that gap.
+
+### 16.16.1 What each converter writes, and how it is read
+
+From llama.cpp's converter (`conversion/gpt_oss.py`, `llama.py` `Llama4Model`, `granite.py` `GraniteHybridModel`,
+`nemotron.py` `NemotronHModel`, `jamba.py`, `mamba.py` `Mamba2Model`, `base.py` `TextModel`) and loader
+(`src/models/openai-moe.cpp`, `llama4.cpp`, `granite-hybrid.cpp`, `nemotron-h.cpp`, `jamba.cpp`, `mamba-base.cpp`), tag b11669:
+
+| family | what the file has | read as |
+|---|---|---|
+| gpt-oss | TextModel's keys plus `attention.sliding_window` and `expert_feed_forward_length`; YaRN keys including `rope.scaling.yarn_truncate`; `attn_sinks.weight` (one logit per head); `post_attention_norm` for the norm before the MoE (the architecture has no `ffn_norm`); `ffn_gate_inp` with its `.bias`; **gate and up as separate expert tensors** `ffn_gate_exps` / `ffn_up_exps` (the checkpoint's alternating columns of `gate_up_proj`, transposed to rows), `ffn_down_exps`, each with a `.bias`; MXFP4 checkpoints repacked raw as ggml MXFP4 blocks | windowed layers by llama.cpp's pattern of 2 (the even ones) or the file's `attention.sliding_window_pattern`; `mlp.experts.gate_up` is the pair of views (`QTensor.split`, no copy, MXFP4 in place); the gate and up biases are joined per expert into the stacked order; `swiglu_limit` 7.0 and `swiglu_alpha` 1.702 set (not in the file); a file with no rope-scaling keys gets no scaling, not the family's YaRN default |
+| Llama 4 | `feed_forward_length` = the **dense** width (`intermediate_size_mlp`), `expert_feed_forward_length` = the experts' and the shared expert's; `interleave_moe_layer_step`; Llama 3 frequencies as `rope_freqs.weight`; q / k rows **not** permuted (the converter's `undo_permute = False`); experts `gate_up_proj [E, dim, 2m]` transposed and cut in halves (gate rows, then up rows), `ffn_*_shexp`; `ffn_norm` before the MLP; nothing about chunks, NoPE layers, the temperature or the q / k norm | `attention_chunk_size` 8192, NoPE every 4th layer (`no_rope_layer_interval` 4), `floor_scale` 8192, `attn_scale` 0.1, chunked on three layers of four (or the file's window pattern), `use_qk_norm` unless 128 experts: the constants of llama.cpp's loader; `attention.sliding_window = 0` (MobileLLM) turns chunks, temperature and the early NoPE layers off; the family's own interleaved pairing applies to the unpermuted rows; a `rope_freqs` table that is not Llama 3's of an 8192 original context is used as a divisor table (16.2) |
+| Granite 4 | TextModel's keys (`head_dim` dropped by `GraniteModel`), `attention.scale`, `embedding_scale`, `residual_scale`, `logit_scale`, `expert_shared_feed_forward_length`; **`attention.head_count_kv` per layer, 0 on the Mamba layers**; `ssm.conv_kernel`, `ssm.state_size`, `ssm.group_count`, `ssm.inner_size`, `ssm.time_step_rank` = the Mamba-2 **head count**; `rope.scaling.finetuned` = false (no RoPE next to Mamba layers) and `context_length` 2^20; Mamba-2 tensors `ssm_in`, `ssm_conv1d` (squeezed), `ssm_conv1d.bias`, `ssm_dt.bias` (= `dt_bias`), `ssm_a` = `-exp(A_log)` and `ssm_d` as `[heads, 1]`, `ssm_norm` as `[groups, d_inner / groups]`, `ssm_out`; q / k permuted as Llama's; experts split from `input_linear`, shared expert from `shared_mlp.input_linear` | `layer_types` from the kv array; head size `d_inner / heads`; the multipliers (an absent `attention.scale` is llama.cpp's `1/sqrt(head_dim)`, not transformers' 1.0; absent scales are 1); RoPE (interleaved pairing for the permuted rows) only when `rope.scaling.finetuned` is true, its default; the gated norm **per group** (`GGUF_GROUPED_SSM_NORM`) |
+| Nemotron-H | `attention.head_count_kv` and **`feed_forward_length` per layer**: both 0 = Mamba-2, kv > 0 = attention, ff > 0 = the ReLU² MLP; `attention.layer_norm_epsilon` (the config's `layer_norm_epsilon`; no RMS key); `attention.key_length` = head_dim; the Mamba-2 keys and tensors as Granite's; `ffn_up` / `ffn_down` only | `hybrid_override_pattern` rebuilt (`M`, `*`, `-`); one norm per layer; `mlp.gate_up` is `ffn_up` alone (no gate rows); `time_step_min` 0 (llama.cpp's scan has no clamp); `nemotron_h_moe` refused |
+| Jamba | its own key set: `attention.head_count_kv` per layer (kv heads on the attention layers, 0 elsewhere), `feed_forward_length`, `ssm.conv_kernel`, `ssm.inner_size`, `ssm.state_size`, `ssm.time_step_rank` (= `dt_rank`), `expert_count` / `expert_used_count`; Mamba-1 tensors with `ssm_dt_norm`, `ssm_b_norm`, `ssm_c_norm`, `ssm_a` = `-exp(A_log)` `[d_inner, d_state]`; `ffn_gate_inp` only on MoE layers; experts merged into `ffn_*_exps`; `model.final_layernorm` as `output_norm` | `attn_layer_period` / `_offset` and `expert_layer_period` / `_offset` recovered from which layers have kv heads / a router, and checked against every layer (a file whose layers are not every n-th is refused) |
+
+**What llama.cpp knows and the file does not say**, each written into the description as llama.cpp's constant: gpt-oss's SwiGLU
+clamp (7.0, alpha 1.702, `LLM_FFN_SWIGLU_OAI_MOE`); Llama 4's chunk (8192), temperature (floor 8192, scale 0.1, offset 1), NoPE
+layers (every 4th), chunked layers (three of four) and q / k norm (not for 128 experts); the Mamba-2 gated norm per group
+(`build_mamba2_layer`) and no step-size clamp (`ggml_ssm_scan`). Two keys the converter writes and llama.cpp's loader ignores are
+**followed**: `rope.scaling.yarn_truncate` (gpt-oss's `truncate: false` keeps the YaRN correction range fractional; ggml always rounds
+it outwards) and the per-layer `attention.sliding_window_pattern` when present.
+
+**What the test writer refuses** (`HfToGguf`, "llama.cpp's converter cannot express this model"): a gpt-oss with another SwiGLU limit or
+other windowed layers; a Llama 4 whose chunk, temperature, NoPE layers, chunked layers, `moe_layers` or q / k norm differ from llama.cpp's
+constants; a Granite 4 with RoPE next to Mamba layers, a `head_dim` other than `hidden / heads`, an expansion other than 2, or more than one
+Mamba group (llama.cpp's per-group norm is then another model than transformers'); a Nemotron-H with MoE layers or a `time_step_min`
+clamp; a Jamba with an expansion other than 2. The tiny variants above set the overrides that make them expressible.
+
+### 16.16.2 Worked examples
+
+```
+gpt-oss MXFP4 block   the checkpoint packs element 2i in the low and 2i+1 in the high nibble of byte i:
+                      bytes 0x21 0x43 ... hold the 4-bit codes 1, 2, 3, 4 of elements 0, 1, 2, 3   (byte 0 = 0x21: low 1, high 2)
+                      ggml wants element j low and j+16 high in byte j:   byte 0 = code of element 0 | code of element 16 << 4
+                      so ggml byte j = nibble(j) | nibble(j + 16) << 4, after the scale byte (17 bytes per 32 weights, unchanged e8m0 scale)
+gpt-oss gate / up     gate_up_proj [E, dim, 2m] with m = 2: columns g0 u0 g1 u1   ->  transposed rows g0 u0 g1 u1
+                      ffn_gate_exps = rows 0, 2 (g0 g1),  ffn_up_exps = rows 1, 3 (u0 u1);  biases [E, 2m] split the same way
+                      read back: per expert [g0 g1 | u0 u1], the engine's stacked order (two views, no copy)
+Granite 4 layers      attention.head_count_kv = [0, 0, 2, 0, 2]  ->  layer_types = mamba, mamba, attention, mamba, attention
+Mamba-2 sizes         ssm.inner_size 256, ssm.time_step_rank 8 (heads)  ->  head size 256 / 8 = 32; mamba_expand = 256 / 128 = 2
+                      ssm_norm [2, 128] holds the same 256 gains as the checkpoint's norm.weight [256], one row per group
+Nemotron-H pattern    head_count_kv = [0, 0, 0, 2, 0, 0], feed_forward_length = [0, 192, 0, 0, 192, 0]  ->  "M-M*-M"
+Jamba periods         head_count_kv = [0, 0, 2, 0]: one attention layer -> period 5 (layers + 1), offset 2 (the config said 4 / 2:
+                      for 4 layers the same layers);  routers on layers 1, 3 -> expert period 2, offset 1
+Llama 4 NoPE          layers 0 1 2 3: (l + 1) % 4 == 0 only for layer 3 -> NoPE, global, temperature log(floor((pos + 1) / 8192) + 1) x 0.1 + 1
+```
+
+### 16.16.3 Why this design, settings, checks and limits
+
+* *Write llama.cpp's constants into the description, don't add switches.* A GGUF of these families means what llama.cpp computes from
+  it; where that is a constant of its loader, the same constant is set in the `config.json` the reader builds, so the family parsers
+  of chapter 14 stay the only place a model is described.
+* *Prove the layout by writing the file.* As in 16.15, `HfToGguf` ports the converter's rules (names, splits, transposes, the MXFP4
+  repack, the per-layer arrays, the tensors forced to F32), so a wrong transpose or a missed norm shows up as a logit difference far
+  above the ≤ 5e-7 the checks end with.
+* *Refuse what the two programs would compute differently* (16.16.1), in the test writer, rather than test a variant no real file can be.
+
+**Settings.** None of their own: `general.architecture` selects the mapping, `-Djllm.gguf.requantize` applies as everywhere (16.4.1). The
+families' own limits (chapter 14) hold for their GGUF files: no paged KV for gpt-oss and Llama 4, every request from position 0 for
+the hybrids, q8 / q4 KV served as f16 for the hybrids on Metal.
+
+**Checks and limits.** `GgufFamiliesCheck` (the table above, part of `mvn test`), the CPU half of `GgufArchSmoke`. Not done: llama.cpp's
+logits on these files (`scripts/gguf-llamacpp-check.sh`) and the Metal half of `GgufArchSmoke`, both for a Mac; no real gpt-oss,
+Llama 4, Granite 4, Nemotron-H or Jamba GGUF was loaded (each is gigabytes); Llama 4's vision projector (`mmproj`), Nemotron-H's MoE
+(`nemotron_h_moe`), plain Mamba 2 and Falcon-H1 files are refused.

@@ -945,7 +945,9 @@ The same parsers run on a GGUF file: `GgufArchitecture` writes the `config.json`
 describes (`qwen3.block_count` → `num_hidden_layers`, ...) and calls `Architecture.parse`, so the description and the
 defaults are those of the safetensors load. Besides `llama`, `qwen2`, `qwen3`, `qwen3moe` (and the Qwen3.5 / Qwen3-Next
 hybrids) the GGUF architectures `gemma2`, `gemma3`, `phi3`, `chatglm`, `glm4`, `mamba`, `deepseek2` and `mistral3` are
-mapped ([16 §16.15](16-gguf.md#1615-gemma-23-phi-3-glm-mamba-deepseek-v2v3-and-mistral-3-as-gguf-files)); adding one means its
+mapped ([16 §16.15](16-gguf.md#1615-gemma-234-phi-3-glm-mamba-deepseek-v2v3-and-mistral-3-as-gguf-files)), and so are
+`gpt-oss`, `llama4`, `granitehybrid`, `nemotron_h` and `jamba` ([16 §16.16](16-gguf.md#1616-gpt-oss-llama-4-granite-4-nemotron-h-and-jamba-as-gguf-files));
+adding one means its
 metadata keys in `GgufArchitecture` / `GgufFamilies`, its tensor names in `GgufWeights.resolve` and, if llama.cpp's converter
 permutes or folds something for it (Llama's q/k rows, Gemma's `1 + w` norms, Mamba's `-exp(A_log)`), the matching switch in
 the `Architecture`.
@@ -954,7 +956,11 @@ Where the GGUF layout differs from the checkpoint's, per family: **Gemma 2/3** t
 convention), the attention scale is `1/sqrt(head_dim)` (no `query_pre_attn_scalar` in the file) and the embedding scale is
 the float `sqrt(dim)`; **Phi-3 / ChatGLM / GLM-4** `attn_qkv` and `ffn_up` are the fused `qkv_proj` / `gate_up_proj` rows,
 LongRoPE comes as two `rope_factors_*` tensors; **Mamba** `ssm_a` is `-exp(A_log)`; **DeepSeek** `kv_b_proj` is two tensors,
-`attn_k_b` (the key half, transposed) and `attn_v_b`, and `yarn_log_multiplier = 0.1 × mscale_all_dim`.
+`attn_k_b` (the key half, transposed) and `attn_v_b`, and `yarn_log_multiplier = 0.1 × mscale_all_dim`; **gpt-oss** gate and up
+are separate (de-interleaved) expert tensors, MXFP4 kept as blocks, and the SwiGLU clamp is llama.cpp's fixed 7.0; **Llama 4**'s
+chunk, temperature, NoPE layers and q/k norm are not in the file (llama.cpp fixes them as Scout ships them); **Granite 4 /
+Nemotron-H / Jamba** say which layers are recurrent by a per-layer `attention.head_count_kv` of 0, and llama.cpp normalizes the
+Mamba-2 output per group.
 
 ## 14.13 Verified on real weights
 
@@ -1916,6 +1922,6 @@ on 18 conversations. No speed is claimed: the real hybrids (7B and up) were not 
 - Chat formats for Nemotron-H and Jamba (no `ChatTemplate` entry: format the prompt yourself or use `/v1/completions`).
   Granite has one (`ChatTemplate.GRANITE`: `<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n`, the default system
   message when none is given, no tools or documents).
-- GGUF files of `granitehybrid`, `nemotron_h`, `jamba` (llama.cpp's names).
+- Done since: GGUF files of `granitehybrid`, `nemotron_h`, `jamba` (llama.cpp's names), [16 §16.16](16-gguf.md#1616-gpt-oss-llama-4-granite-4-nemotron-h-and-jamba-as-gguf-files).
 - Real-weight validation (Granite-4.0-H-Tiny is 7B in total: a download this task did not do; its config, chat template and
   tokenizer were read).
