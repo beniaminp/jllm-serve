@@ -88,6 +88,15 @@ public final class KvStudy {
                 for (String len : lens) {
                     study.decodePpl(variants, Integer.parseInt(len), o.get("text"), Integer.parseInt(o.getOrDefault("tail", "512")));
                 }
+            } else if (mode.equals("decodespeed")) {
+                String[] lens = o.getOrDefault("lens", "8192").split(",");
+                int[] ls = new int[lens.length];
+                for (int i = 0; i < ls.length; i++) {
+                    ls[i] = Integer.parseInt(lens[i]);
+                }
+                study.decodeSpeed(variants, ls, Integer.parseInt(o.getOrDefault("steps", "64")),
+                        Integer.parseInt(o.getOrDefault("warm", "8")), Integer.parseInt(o.getOrDefault("rounds", "3")),
+                        Boolean.parseBoolean(o.getOrDefault("int8", "false")));
             } else if (mode.equals("accuracy")) {
                 study.accuracy(variants, Integer.parseInt(o.getOrDefault("steps", "300")), o.get("text"),
                         Integer.parseInt(o.getOrDefault("ppl", "2048")), o.get("doc"),
@@ -801,6 +810,103 @@ public final class KvStudy {
                         bd.append(d > 0 ? " / " : "").append(byDepth[v][d]).append('/').append(trials);
                     }
                     System.out.printf(Locale.ROOT, "| %d (%d) | %s | %d/%d | %s |%n", len, promptLen, variants[v], found[v], prompts.size(), bd);
+                }
+                System.out.flush();
+            }
+        }
+
+        /**
+         * Decode speed against the context length on the CPU, for paged variants of one cache type ({@code f16+p,f16+s64,...}):
+         * one needle haystack of {@code len} tokens is prefilled once in whole chunks, as {@link #needleShared} does; then, for
+         * {@code rounds} rounds, every variant in turn shares those blocks ({@link Backend#copyStateFrom}), feeds the rest of the
+         * prompt, takes {@code warm} untimed decode steps and {@code steps} timed ones. The decode steps feed the same fixed tokens
+         * in every variant (teacher-forced filler), so the variants do the same work but for their attention. Prints the median
+         * of the rounds in tokens per second. {@code int8}: the decode matmuls with int8 activations (what
+         * {@code backend.cpu.int8-activations=auto} picks where they are faster), else float ones as the other modes use.
+         */
+        void decodeSpeed(String[] variants, int[] lens, int steps, int warm, int rounds, boolean int8) {
+            String base = variants[0].split("\\+")[0];
+            KvSparse[] modes = new KvSparse[variants.length];
+            int dense = Integer.MAX_VALUE;
+            for (int i = 0; i < variants.length; i++) {
+                String[] plus = variants[i].split("\\+");
+                if (plus.length != 2 || !plus[0].equals(base)) {
+                    throw new IllegalArgumentException("decodespeed needs paged variants of one cache type, such as f16+p,f16+s64: " + variants[i]);
+                }
+                if (plus[1].startsWith("s")) {
+                    String[] a = plus[1].substring(1).split(":");
+                    modes[i] = new KvSparse(true, Integer.parseInt(a[0]), a.length > 1 ? Integer.parseInt(a[1]) : 16,
+                            a.length > 2 ? Integer.parseInt(a[2]) : 256, a.length > 3 ? Integer.parseInt(a[3]) : 2);
+                    dense = Math.min(dense, modes[i].denseLayers());
+                } else {
+                    modes[i] = KvSparse.OFF;
+                }
+            }
+            KvSparse writer = new KvSparse(true, 64, 16, 256, dense == Integer.MAX_VALUE ? 0 : dense);
+            boolean rot = base.equals("q8r");
+            KvDtype dt = KvDtype.parse(rot ? "q8" : base);
+            KvDtype.setQ8Rotate(rot);
+            int per = tok.encode(filler(new Random(1), 200)).length / 200;
+            int threads = Runtime.getRuntime().availableProcessors();
+            int[] feed = tok.encode(filler(new Random(3), 4 * (warm + steps) / Math.max(1, per) + 4));
+            if (feed.length < warm + steps) {
+                throw new IllegalStateException("filler of " + feed.length + " tokens for " + (warm + steps) + " steps");
+            }
+            System.out.println("\n| context (tokens) | cache | decode tok/s (median of " + rounds + ", " + (int8 ? "int8" : "float")
+                    + " activations) | ms per step |");
+            System.out.println("|---|---|---|---|");
+            for (int len : lens) {
+                List<String> keys = new ArrayList<>();
+                List<Integer> depthIdx = new ArrayList<>();
+                int[] p = haystacks(new Random(7), per, len, 1, 1, keys, depthIdx).getFirst();
+                if (p.length + warm + steps + 1 > ctx) {
+                    throw new IllegalStateException("prompt of " + p.length + " tokens and " + (warm + steps) + " steps do not fit ctx " + ctx);
+                }
+                double[][] tps = new double[variants.length][rounds];
+                KvSparse.set(writer);
+                org.robomiri.jllm.kv.KvPool pool = CpuBackend.newKvPool(w, ctx, 2, dt, 16, 0, rot);
+                try (Backend pre = new CpuBackend(w, ctx, batch, threads, dt, false, pool)) {
+                    KvSparse.set(KvSparse.OFF);
+                    int prefix = (p.length - 1) / pre.maxBatch() * pre.maxBatch();
+                    long t0 = System.nanoTime();
+                    for (int off = 0; off < prefix; off += pre.maxBatch()) {
+                        pre.forward(p, off, pre.maxBatch(), off, null);
+                    }
+                    System.out.printf(Locale.ROOT, "# len %d: prompt %d tokens, shared prefill of %d in %.1f s%n", len, p.length, prefix,
+                            (System.nanoTime() - t0) / 1e9);
+                    float[] logits = new float[vocab];
+                    for (int r = 0; r < rounds; r++) {
+                        for (int v = 0; v < variants.length; v++) {
+                            KvSparse.set(modes[v]);
+                            try (Backend b = new CpuBackend(w, ctx, batch, threads, dt, int8, pool)) {
+                                KvSparse.set(KvSparse.OFF);
+                                b.copyStateFrom(pre, prefix);
+                                for (int off = prefix; off < p.length; off += b.maxBatch()) {
+                                    int n = Math.min(b.maxBatch(), p.length - off);
+                                    b.forward(p, off, n, off, null);
+                                }
+                                long t1 = 0;
+                                for (int t = 0; t < warm + steps; t++) {
+                                    if (t == warm) {
+                                        t1 = System.nanoTime();
+                                    }
+                                    b.forward(feed, t, 1, p.length + t, logits);
+                                }
+                                tps[v][r] = steps / ((System.nanoTime() - t1) / 1e9);
+                                System.out.printf(Locale.ROOT, "# %s len %d round %d: %.2f tok/s%n", variants[v], len, r, tps[v][r]);
+                                System.out.flush();
+                            }
+                        }
+                    }
+                } finally {
+                    KvSparse.set(KvSparse.OFF);
+                    pool.close();
+                }
+                for (int v = 0; v < variants.length; v++) {
+                    double[] x = tps[v].clone();
+                    java.util.Arrays.sort(x);
+                    double med = x[x.length / 2];
+                    System.out.printf(Locale.ROOT, "| %d (%d) | %s | %.2f | %.1f |%n", len, p.length, variants[v], med, 1000 / med);
                 }
                 System.out.flush();
             }

@@ -243,6 +243,11 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
     with no `FAIL` before it was restarted on the newer commit. `f4e9739` changes only the image, audio and vision CPU
     kernels, which arch smoke does not run. Run it to the end (or `scripts/arch-smoke.sh` on a Mac) before relying on it.
   - Exactness, CPU: `79472f690f73bd28598d5d7fb5dee1a4`, as on the Mac. The Metal half needs a Mac.
+  - **Re-run on `main` at `47fbbb9`** (after the Gemma 4 loader fix, the GGUF families and the docs; later commits change
+    docs and test tools only), 2026-10-28, same machine: `mvn -o install` BUILD SUCCESS (every engine test, including
+    `GgufFamiliesCheck` with the seven new variants: 124 checks), web tests 62 / 62, `scripts/build-metal-emu.sh` exit 0,
+    `kernel_tests.py` 1172 ok / 0 FAIL, CPU exactness `79472f690f73bd28598d5d7fb5dee1a4`. Not run: the emulator arch smoke
+    (hours here) and everything that needs a Mac.
 - **Left:**
   - Run the six gates on a Mac against `main` (the arch smoke to its end, the Metal half of the exactness run).
   - Run the real Wan encoder once (22.7 GB download) to measure the read time with the copy off and on (mac-validate row).
