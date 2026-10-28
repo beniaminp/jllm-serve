@@ -1262,7 +1262,10 @@ clamp (7.0, alpha 1.702, `LLM_FFN_SWIGLU_OAI_MOE`); Llama 4's chunk (8192), temp
 layers (every 4th), chunked layers (three of four) and q / k norm (not for 128 experts); the Mamba-2 gated norm per group
 (`build_mamba2_layer`) and no step-size clamp (`ggml_ssm_scan`). Two keys the converter writes and llama.cpp's loader ignores are
 **followed**: `rope.scaling.yarn_truncate` (gpt-oss's `truncate: false` keeps the YaRN correction range fractional; ggml always rounds
-it outwards) and the per-layer `attention.sliding_window_pattern` when present.
+it outwards) and the per-layer `attention.sliding_window_pattern` when present. Because of that, the llama.cpp comparison of gpt-oss runs
+its tiny model with `truncate: true` (with `false` the logits differ by 7.5e-2 relative: a different YaRN frequency ramp, nothing else), and
+for the MXFP4 variant on a file whose experts are the same values as Q8_0-rounded F32: llama.cpp's CPU kernel quantizes the activations of an
+MXFP4 matmul to Q8_0, which jllm's float path does not (1.1e-2 apart; on F32 experts 3.6e-7).
 
 **What the test writer refuses** (`HfToGguf`, "llama.cpp's converter cannot express this model"): a gpt-oss with another SwiGLU limit or
 other windowed layers; a Llama 4 whose chunk, temperature, NoPE layers, chunked layers, `moe_layers` or q / k norm differ from llama.cpp's

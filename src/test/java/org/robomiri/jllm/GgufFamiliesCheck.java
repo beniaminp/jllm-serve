@@ -42,6 +42,9 @@ public final class GgufFamiliesCheck {
      * llama.cpp's converter can express), the tolerance of the safetensors comparison, and whether llama.cpp is
      * expected to run it identically.
      */
+    private static final String GPT_OSS_YARN = "rope_scaling={\"rope_type\":\"yarn\",\"factor\":32.0,\"beta_fast\":32.0,"
+            + "\"beta_slow\":1.0,\"truncate\":true,\"original_max_position_embeddings\":16}";
+
     record Model(String name, double tol, double llamaCppTol, String... args) {
     }
 
@@ -81,9 +84,11 @@ public final class GgufFamiliesCheck {
                     "--set", YARN_EQ),
             new Model("deepseek-v3", 2e-5, 2e-3, "deepseek_v3"),
             new Model("deepseek-v3-fused-exps", 2e-5, 2e-3, "deepseek_v3", "--fuse-gate-up-exps"),
-            // gpt-oss: llama.cpp's graph clamps the SwiGLU at 7.0 whatever the config says
-            new Model("gpt-oss", 2e-5, 2e-3, "gptoss", "--set", "swiglu_limit=7.0"),
-            new Model("gpt-oss-mxfp4", 2e-5, 2e-3, "gptoss_mxfp4", "--set", "swiglu_limit=7.0"),
+            // gpt-oss: llama.cpp's graph clamps the SwiGLU at 7.0 whatever the config says, and its YaRN always rounds the
+            // correction range outwards (ggml_rope_yarn_corr_dims; it has no yarn_truncate key), where the released
+            // checkpoints say truncate=false (jllm follows transformers and the file's key): the check uses truncate=true
+            new Model("gpt-oss", 2e-5, 2e-3, "gptoss", "--set", "swiglu_limit=7.0", "--set", GPT_OSS_YARN),
+            new Model("gpt-oss-mxfp4", 2e-5, 2e-3, "gptoss_mxfp4", "--set", "swiglu_limit=7.0", "--set", GPT_OSS_YARN),
             // Llama 4: llama.cpp hard-codes the chunk (8192) and the NoPE temperature (floor 8192, scale 0.1)
             new Model("llama4", 2e-5, 2e-3, "llama4", "--set", "attention_chunk_size=8192", "--set", "floor_scale=8192",
                     "--set", "attn_scale=0.1"),
@@ -237,6 +242,18 @@ public final class GgufFamiliesCheck {
         }
         HfToGguf.convert(hf, q8, new HfToGguf.Options(HfToGguf.Outtype.Q8_0, false, fq, fg));
         HfToGguf.convert(hf, deq, new HfToGguf.Options(HfToGguf.Outtype.DEQ_Q8_0, false, fq, fg));
+        Path deqF32 = deq;
+        if (m.name().endsWith("-mxfp4")) {
+            // llama.cpp quantizes the activations of an MXFP4 matmul to Q8_0, jllm's float path does not: compare the
+            // layout on the same values as F32 (the file with the MXFP4 blocks is compared below as the floor)
+            deqF32 = root.resolve(m.name() + "-deqf32.gguf");
+            HfToGguf.dequantRaw = true;
+            try {
+                HfToGguf.convert(hf, deqF32, new HfToGguf.Options(HfToGguf.Outtype.DEQ_Q8_0, false, fq, fg));
+            } finally {
+                HfToGguf.dequantRaw = false;
+            }
+        }
         int vocab = hfArch.core().vocabSize();
         int[] prompt = PROMPT;
         try (ModelWeights hfw = ModelWeights.load(hf, hfArch, QType.Q8_0, ShardProvider.local(hf))) {
@@ -266,7 +283,7 @@ public final class GgufFamiliesCheck {
             check(vs < (hfArch.core().layers() > 20 ? 0.5 : 0.05), m.name() + ": Q8_0 GGUF vs safetensors within quantization noise: " + vs);
             System.out.printf("%-12s   Q8_0 in place vs F32 of the same values: %.2e; vs safetensors %.2e%n", "", diff, vs);
             if (llamaDebug != null) {
-                llamaCpp(llamaDebug, root, m, deq, vocab, true);
+                llamaCpp(llamaDebug, root, m, deqF32, vocab, true);
                 llamaCpp(llamaDebug, root, m, f32split, vocab, false);
             }
         }

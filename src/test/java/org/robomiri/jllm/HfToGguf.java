@@ -52,6 +52,12 @@ final class HfToGguf {
 
     /** Test hook: write the Llama-style conversion under another GGUF architecture name (e.g. mistral3). */
     static String archOverride;
+    /**
+     * With {@link Outtype#DEQ_Q8_0}: write the repacked MXFP4 tensors as their Q8_0-rounded F32 values too. llama.cpp's CPU
+     * kernel for an MXFP4 matrix quantizes the activations to Q8_0 (its vec_dot_type), which jllm's float path does not, so
+     * the two differ by that rounding (~1e-2 of the logits of these tiny models); the F32 file compares the layout exactly.
+     */
+    static boolean dequantRaw;
 
     private final Map<String, Object> hp;
     private final Map<String, Object> raw;
@@ -1550,6 +1556,21 @@ final class HfToGguf {
             }
         }
         for (Map.Entry<String, Object[]> e : rawTensors.entrySet()) {
+            if (dequantRaw && opt.type() == Outtype.DEQ_Q8_0 && e.getValue()[0] == GgmlType.MXFP4) {
+                byte[] o = (byte[]) e.getValue()[2];
+                float[] kv = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};   // kvalues_mxfp4, doubled
+                float[] out = new float[o.length / 17 * 32];
+                for (int b = 0; b < o.length / 17; b++) {
+                    float d = (float) Math.pow(2, (o[b * 17] & 0xFF) - 128);
+                    for (int j = 0; j < 16; j++) {
+                        int v = o[b * 17 + 1 + j] & 0xFF;
+                        out[b * 32 + j] = kv[v & 15] * d;
+                        out[b * 32 + j + 16] = kv[v >>> 4] * d;
+                    }
+                }
+                w.f32Tensor(e.getKey(), (long[]) e.getValue()[1], dequantQ8(q8Blocks(out)));
+                continue;
+            }
             w.tensor(e.getKey(), (GgmlType) e.getValue()[0], (long[]) e.getValue()[1], (byte[]) e.getValue()[2]);
         }
     }
