@@ -101,6 +101,15 @@ public final class CpuBackend implements Backend {
     }
 
     /**
+     * Resolves {@code backend.cpu.batch-int8-rows}: a number 0..64 as given, {@code auto} by timing both ways on
+     * {@code w} once (see {@link CpuMatmul#batchRows}); applied process-wide as {@link #configureBatchInt8Rows(int)} does.
+     */
+    public static void configureBatchInt8Rows(String setting, ModelWeights w, int threads) {
+        String v = setting.trim();
+        configureBatchInt8Rows(v.equalsIgnoreCase("auto") ? CpuMatmul.batchRows(w, threads) : Integer.parseInt(v));
+    }
+
+    /**
      * Resolves {@code backend.cpu.int8-activations}: {@code true} / {@code false} as given, {@code auto} by timing both
      * paths on {@code w} once (see {@link CpuMatmul#int8Faster}).
      */

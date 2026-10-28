@@ -238,8 +238,9 @@ public final class Settings {
                 "engine.prompt-cache-mb", "must be 0 (off) .. 1048576");
         require(get("backend.cpu.native").trim().matches("(?i)auto|true|false"),
                 "backend.cpu.native", "must be auto, true or false");
-        require(getInt("backend.cpu.batch-int8-rows") >= 0 && getInt("backend.cpu.batch-int8-rows") <= 64,
-                "backend.cpu.batch-int8-rows", "must be 0 (off) .. 64");
+        require(get("backend.cpu.batch-int8-rows").trim().equalsIgnoreCase("auto")
+                || get("backend.cpu.batch-int8-rows").trim().matches("\\d{1,2}") && getInt("backend.cpu.batch-int8-rows") <= 64,
+                "backend.cpu.batch-int8-rows", "must be auto or 0 (off) .. 64");
         require(get("engine.scheduler").trim().matches("(?i)slots|mixed"), "engine.scheduler", "must be slots or mixed");
         for (String k : new String[]{"engine.pass-budget", "engine.mixed-reserve", "engine.background-chunk-cap",
                 "engine.max-running", "engine.session-max-running"}) {

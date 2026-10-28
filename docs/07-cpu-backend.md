@@ -245,7 +245,7 @@ float path: every weight row unpacked to floats), then make two sandwiches from 
 not for two. The quick way for two: read one line of the recipe, do that step for both sandwiches, read the next line. The
 recipe page stays open on the counter (in the cache) while both sandwiches get that step.
 
-📐 Passes of 2 to 3 rows are not prefill: they are **decode steps of several slots batched into one pass**
+📐 Passes of a few rows (2 to 3 on x86, up to 16 on ARM) are not prefill: they are **decode steps of several slots batched into one pass**
 ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)), a short speculative verification run, or the last few
 tokens of a chat turn. For them the float path above is the wrong tool: it dequantizes every weight row to floats (the cost
 `D`, the same for any n) and then runs `dot4` once per token, so a 2-row pass costs `D + 2F` where a lone int8 step costs `I`.
@@ -273,33 +273,88 @@ pool.forRange(rows, 16, (r0, r1) -> {
   1 280 bytes a row): a chunk is `131 072 / 1 280 = 102` rows; 4 threads take the 1 024 rows in 16 ranges of 64 rows, each one chunk,
   so a 2-row pass is 32 downcalls instead of 16. The 151 936-row Q8_0 LM head (1 024 columns: 32 × 36 = 1 152 bytes a row) goes
   in chunks of 113 rows.
-- **Where the crossover is.** From 4 rows on the float `dot4x4` tile (four tokens per pass over the dequantized rows) is faster
-  again, so the default is 3. Measured with the command below (median of 5 rounds of 20 passes):
+- **Where the crossover is, and `auto`.** The float `dot4x4` tile (four tokens per pass over the dequantized rows) costs a fixed
+  `D` for unpacking plus a little per token; the row-by-row kernel costs about `C` per token and nothing fixed. They cross at
+  `n* = D / (C - F)`, which depends on the CPU: on the 4-core x86 VM below the int8 kernel is slow per token and the tiles win
+  from 4 rows on; on an Apple M1 Pro the `sdot` kernel is fast and the tiles' unpacking is slow, and the tiles do not win before
+  about 20 rows. So a fixed default is wrong somewhere, and the default is `auto`.
+
+🧸 `auto` is the sandwich maker trying both ways once, when the kitchen opens: make the same few sandwiches both ways, a small
+party and a big one, and write down from how many guests copying the recipe first starts to pay off. Then use that number all day.
+
+📐 The rule (`CpuMatmul.batchRows`, run once per model at load by `ModelLoader`, only on the CPU backend with int8 activations
+possible and the native library present; elsewhere it is 3): for a candidate `n` in `{2, 3, 4, 6, 8, 12, 16}` time the matmuls of
+one pass both ways, `int8(n) = Σ_tensors layers · t_rowwise(n)` over the first decoder layer's tensors `+` the LM head's first 2 048
+rows scaled up to all of them (`rows / 2048`), and the same with the float tiles for `float(n)`, each the best of 4 alternating
+runs after 2 warm-up ones. The setting is the largest candidate with `int8(n) < float(n)`, found by a binary search (3 candidates
+timed, since `int8(n)` grows with `n` and the tiles' cost much more slowly, so the curves cross once); 1 if even 2 rows lose
+(row by row never used), 16 at most (the longest speculative verification run is 16 tokens, and a pass of that many decode
+rows is more slots than `serve` is usually given). One line is logged:
+
+```
+batch int8 rows: auto -> 16 (one pass's matmuls, rows:int8/float ms: 6:24.4/67.3 12:45.7/79.2 16:65.0/92.1; probe 104 ms)
+```
+
+Worked example, Qwen3-0.6B on the M1 Pro: the candidates are indexed 0..6, so the search times index 3 (6 rows: 24.4 ms against
+67.3, int8 wins, go up), index 5 (12: 45.7 against 79.2, wins), index 6 (16: 65.0 against 92.1, wins), and `lo` passes `hi`:
+the answer is 16, the cap. The probe took 104–122 ms in a warm process (0.46–0.55 s in a fresh `./jllm run`, where the weights are
+paged in and the kernels compiled by the probe itself). Its numbers are for the matmuls
+only, so they are close to, not equal to, a real pass (16 rows: 81 ms real against the probe's 65 for int8, 112 against 92 for the
+tiles: the probe's ordering is right, its sizes about 20 % off). A number `0..64` in the setting is used as it stands, exactly as before.
+
+Measured with the command below (`passes`: median of 5 rounds of 20 passes, the rows are 16 slots' decode steps in one
+`forwardBatch`):
 
 ```sh
 java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/test-classes:target/classes \
      org.robomiri.jllm.BatchDecodeTest models/Qwen_Qwen3-0.6B passes
 ```
 
-Qwen3-0.6B Q4_0 (LM head Q8_0), int8 activations, Intel Xeon @ 2.80 GHz, 4 cores, AVX512-VNNI, two runs:
+Qwen3-0.6B Q4_0 (LM head Q8_0), int8 activations, Intel Xeon @ 2.80 GHz, 4 cores, AVX512-VNNI, two runs (the earlier table: rows
+1 to 4 only; row-by-row = `backend.cpu.batch-int8-rows 4`):
 
 | `backend.cpu.batch-int8-rows` | lone step | 1 row | 2 rows | 3 rows | 4 rows |
 |---|---|---|---|---|---|
 | 4 (row by row, int8) | 29.7 / 27.2 ms | 28.6 / 27.4 | **48.5 / 46.4** | **68.5 / 66.1** | 89.2 / 86.9 |
 | 0 (float tiles, as before) | 27.9 / 27.8 ms | 28.9 / 28.6 | 68.0 / 65.2 | 83.8 / 79.0 | **75.2 / 73.0** |
 
-So at the default (3) a pass of 2 rows costs 1.7× a lone step instead of 2.4× (more than two lone steps), 3 rows 2.4× instead of
+Apple M1 Pro (8 performance + 2 efficiency cores, native `neon-dotprod`), same model, one run (another process was using the GPU,
+so expect a few ms of noise):
+
+| `backend.cpu.batch-int8-rows` | lone step | 1 row | 2 rows | 3 rows | 4 rows | 6 rows | 8 rows | 12 rows | 16 rows |
+|---|---|---|---|---|---|---|---|---|---|
+| 32 (row by row, int8) | 8.3 ms | 8.0 | **12.3** | **17.4** | **22.6** | **32.4** | **42.0** | **65.8** | **81.1** |
+| 0 (float tiles) | 7.6 | 8.0 | 56.3 | 59.9 | 56.6 | 68.9 | 70.8 | 88.8 | 112.4 |
+| auto (resolved to 16) | 7.9 | 8.2 | 12.6 | 17.2 | 22.3 | 32.0 | 41.9 | 62.7 | 80.7 |
+
+At the old default (3) a 2-row pass on the M1 Pro was 57 ms instead of 13: on ARM the tiles' weight unpacking costs about seven
+lone steps however few rows share it, and the row-by-row kernel stays ahead until about 20 rows (rows 24 and 32 timed
+by the probe: 84–92 against 95–112, 119–133 against 126–140; roughly even at 32). On the x86 VM it is at 3.
+
+So on x86 at 3 a pass of 2 rows costs 1.7× a lone step instead of 2.4× (more than two lone steps), 3 rows 2.4× instead of
 2.9×, and 4 rows keep the tiles. The chunk size was swept with `-Djllm.cpu.fewRowsChunkBytes`: 8 KiB 51–53 ms for 2 rows, 32 KiB
-50–51, **128 KiB 47–48**, 512 KiB 50–67. On this machine one token's int8 kernel, not the memory, sets the speed (the profile of a lone
+50–51, **128 KiB 47–48**, 512 KiB 50–67. On that machine one token's int8 kernel, not the memory, sets the speed (the profile of a lone
 step is ~52 % inside the native `dotRows`), which is why rows 2 and 3 cost almost a full step each; a kernel that unpacks each
 weight block once for several tokens (one `vpdpbusd` per token on the same unpacked register) is the next step and not done.
+
+Over HTTP the effect is the multi-user speed (`ServerSlotsTest <model> bench --backend cpu`, 4 slots, M1 Pro, tok/s of all users):
+
+| `backend.cpu.batch-int8-rows` | 4 users | 8 users |
+|---|---|---|
+| 3 (the old default) | 60.7 | 61.2 |
+| 8 | 132 | 136 |
+| `auto` (16), three runs | 134.4 / 130.3 / 128.7 | 137.0 / 138.5 / 129.7 |
+
+(one slot taking turns: 102). Speculative decoding on the same machine (`./jllm bench --backend cpu`, 128 tokens, ngram up to 16
+per pass): 86–90 tok/s with `auto`, 79–87 with 3, so no regression there.
 
 - **Not used** with the Java int8 kernels (no native library: the tiles as before), for float activations, or with
   `-Djllm.cpu.deterministic` (which already runs every token through `mulOne`). `NativeCpuCheck` checks every native type at 2 and 3
   tokens, with and without accumulation, on 333 rows: bit for bit against one-token `mul`, and the switch-off path within the int8
   rounding.
-- **Switch.** `backend.cpu.batch-int8-rows` (0..64, default 3; 0 = the float tiles for every n > 1, the earlier behaviour),
-  applied process-wide by `ModelLoader` through `CpuBackend.configureBatchInt8Rows`.
+- **Switch.** `backend.cpu.batch-int8-rows` (`auto`, the default, or 0..64; 0 = the float tiles for every n > 1, the earlier
+  behaviour; the value of `auto` is 3 where it cannot measure), applied process-wide by `ModelLoader` through
+  `CpuBackend.configureBatchInt8Rows`.
 
 ---
 
@@ -1516,7 +1571,7 @@ void jllm_cpu_dot_rows(int type, const uint8_t *w, int64_t scales_off, int r0, i
   blocks), then adds `Σ_k w_k · down` in slot order, the same order as the Java loop.
 
 Prefill (`n > 1`) is unchanged: the float `dot4x4` path, with each row dequantized once for all tokens. Passes of 2 to
-`backend.cpu.batch-int8-rows` (3) tokens, batched decode steps above all, call the native kernel once per token over chunks of
+`backend.cpu.batch-int8-rows` (`auto`) tokens, batched decode steps above all, call the native kernel once per token over chunks of
 rows instead ([7.4.1](#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)).
 
 ### 📐 Finding, checking and choosing the library

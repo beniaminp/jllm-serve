@@ -670,7 +670,13 @@ public final class ModelLoader {
             nativeMode = System.getProperty("jllm.cpu.native");
         }
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
-        org.robomiri.jllm.cpu.CpuBackend.configureBatchInt8Rows(s.getInt("backend.cpu.batch-int8-rows"));
+        String fewRows = s.get("backend.cpu.batch-int8-rows").trim();
+        // auto measures on the CPU backend with int8 activations possible; elsewhere there is no CPU pass to batch
+        if (!fewRows.equalsIgnoreCase("auto") || "cpu".equals(backendName)
+                && !s.get("backend.cpu.int8-activations").trim().equalsIgnoreCase("false")) {
+            org.robomiri.jllm.cpu.CpuBackend.configureBatchInt8Rows(fewRows, weights,
+                    threads > 0 ? threads : Runtime.getRuntime().availableProcessors());
+        }
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));

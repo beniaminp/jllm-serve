@@ -50,7 +50,7 @@ final class CpuMatmul {
      * Passes of up to this many tokens run every token through the native single-token int8 kernel
      * ({@code backend.cpu.batch-int8-rows}, {@link #configureFewRows}); 0 = the float multi-row kernels for every n > 1.
      */
-    private static volatile int fewRows = 3;
+    private static volatile int fewRows = 3; // = BATCH_DEFAULT
 
     /**
      * Weight bytes of the row chunk a few-rows pass reuses from the cache for all its tokens: within a core's L2. Measured
@@ -168,6 +168,125 @@ final class CpuMatmul {
         }
         PROBED.put(w, faster);
         return faster;
+    }
+
+    /** Probe results of {@link #batchRows} per weights. */
+    private static final java.util.Map<ModelWeights, Integer> BATCH_PROBED =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    /** The pass sizes {@link #batchRows} tries, in ascending order; the last is the cap of {@code auto}. */
+    private static final int[] BATCH_CANDIDATES = {2, 3, 4, 6, 8, 12, 16};
+
+    /** The value {@code backend.cpu.batch-int8-rows=auto} takes where it cannot measure (the 4-core x86 VM of docs/07 §7.4.1). */
+    static final int BATCH_DEFAULT = 3;
+
+    /**
+     * {@code backend.cpu.batch-int8-rows=auto}: the largest pass size n (of {@link #BATCH_CANDIDATES}) up to which running
+     * the n tokens one by one through the native int8 kernel ({@link #mulFewNative}) is still faster than the float
+     * 4x4 tiles, measured on this machine and these weights once. Both ways time the matmuls of the first decoder layer
+     * (layer count times, plus the LM head's first 2048 rows scaled up) at n = 2, 3, 4, 6, ... 16, best of 4 alternating runs after 2
+     * warm-up ones; a binary search over the candidates (the per-row cost grows linearly with n, the
+     * tiles' much more slowly, so they cross once). Without the native library, or with no native int8 tensor in the
+     * first layer, {@link #BATCH_DEFAULT}. Logs one line.
+     */
+    static int batchRows(ModelWeights w, int threads) {
+        Integer known = BATCH_PROBED.get(w);
+        if (known != null) {
+            return known;
+        }
+        java.util.List<QTensor> layer = new java.util.ArrayList<>();
+        for (LayerWeights L : w.layers) {
+            if (L instanceof org.robomiri.jllm.model.DecoderLayer d) {
+                collect(d, layer, 0);
+                break;
+            }
+        }
+        int best = BATCH_DEFAULT;
+        if (NativeCpu.get() != null && !layer.isEmpty()) {
+            long t0 = System.nanoTime();
+            int maxCols = 0;
+            for (QTensor t : layer) {
+                maxCols = Math.max(maxCols, t.cols);
+            }
+            StringBuilder trail = new StringBuilder();
+            try (ThreadPool pool = new ThreadPool(threads)) {
+                CpuMatmul i8 = new CpuMatmul(pool, true, false, 4 * maxCols);
+                CpuMatmul f32 = new CpuMatmul(pool, false, false, 4 * maxCols);
+                java.util.List<QTensor> used = new java.util.ArrayList<>();
+                for (QTensor t : layer) {
+                    if (i8.nativeInt8(t)) {
+                        used.add(t);
+                    }
+                }
+                boolean head = i8.nativeInt8(w.lmHead);
+                int headRows = Math.min(w.lmHead.rows, 2048);
+                if (!used.isEmpty()) {
+                    // the first runs fault the mapped weights in and compile the kernels: take them out of the timings
+                    for (QTensor t : used) {
+                        timeRows(i8, f32, t, t.rows, 2);
+                    }
+                    if (head) {
+                        timeRows(i8, f32, w.lmHead, headRows, 2);
+                    }
+                    // binary search for the last candidate where per-row int8 wins (best 1: it loses even at 2 rows)
+                    best = 1;
+                    int lo = 0;
+                    int hi = BATCH_CANDIDATES.length - 1;
+                    while (lo <= hi) {
+                        int mid = (lo + hi) >>> 1;
+                        int n = BATCH_CANDIDATES[mid];
+                        double t8 = 0;
+                        double tf = 0;
+                        for (QTensor t : used) {
+                            long[] ns = timeRows(i8, f32, t, t.rows, n);
+                            t8 += w.layers.length * ns[0];
+                            tf += w.layers.length * ns[1];
+                        }
+                        if (head) { // the LM head's first rows, scaled to all of them: the tiles dequantize every one
+                            long[] ns = timeRows(i8, f32, w.lmHead, headRows, n);
+                            t8 += (double) w.lmHead.rows / headRows * ns[0];
+                            tf += (double) w.lmHead.rows / headRows * ns[1];
+                        }
+                        trail.append(String.format(java.util.Locale.ROOT, "%s%d:%.1f/%.1f", trail.length() > 0 ? " " : "", n,
+                                t8 / 1e6, tf / 1e6));
+                        if (t8 < tf) {
+                            best = n;
+                            lo = mid + 1;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                }
+            }
+            System.err.printf("batch int8 rows: auto -> %d (one pass's matmuls, rows:int8/float ms: %s; probe %d ms)%n",
+                    best, trail, (System.nanoTime() - t0) / 1_000_000);
+        }
+        BATCH_PROBED.put(w, best);
+        return best;
+    }
+
+    /** Best of 4 alternating runs (after 2 warm-up ones) of an {@code n}-token matmul of the first {@code rows} rows of {@code t}: per-row int8, float tiles, in ns. */
+    private static long[] timeRows(CpuMatmul i8, CpuMatmul f32, QTensor t, int rows, int n) {
+        float[] in = new float[n * t.cols];
+        java.util.Random r = new java.util.Random(1);
+        for (int i = 0; i < in.length; i++) {
+            in[i] = (float) r.nextGaussian();
+        }
+        float[] out = new float[n * t.rows];
+        long best8 = Long.MAX_VALUE;
+        long bestF = Long.MAX_VALUE;
+        for (int round = 0; round < 6; round++) {
+            long a = System.nanoTime();
+            i8.mulFewNative(t, rows, in, out, 0, n, false);
+            long b = System.nanoTime();
+            f32.mul(t, rows, in, out, 0, n, false);
+            long c = System.nanoTime();
+            if (round >= 2) {
+                best8 = Math.min(best8, b - a);
+                bestF = Math.min(bestF, c - b);
+            }
+        }
+        return new long[]{best8, bestF};
     }
 
     /** Best of 12 alternating runs (after 4 warm-up rounds) of a single-token {@code t} matmul each way, in ns. */

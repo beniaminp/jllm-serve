@@ -285,7 +285,7 @@ Leave `engine.draft-tokens=16` and `engine.ngram-min=3` (2-token matches cost 8 
 |---|---|---|---|
 | `backend.cpu.int8-activations` | `auto` (times both on the loaded model at start and keeps the faster) | M1 Pro 0.6B: float ~237 / ~13 tok/s, int8 ~275 / ~51 (≈ 3.9× decode); ~0.9 % RMS error per dot product ([11 §11.1](11-performance.md#111-measured)) | `auto`; `false` for results identical to Metal |
 | `backend.cpu.native` | `auto` (`libjllm_cpu`: NEON `sdot`, AVX2, AVX-VNNI, AVX-512 VNNI) | x86 VM, AVX-512 VNNI, 4 threads, loaded machine: one token's matmuls 76–79 ms native vs 130–188 float; decode 4.2–5.2 vs 2.4–3.3 tok/s; single-thread row kernels 2.8× (Q4_0) to 8× (Q6_K) the Java int8 ([07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)) | `auto`; the launcher builds the library when a C compiler exists (`scripts/build-native-cpu.sh`) |
-| `backend.cpu.batch-int8-rows` | `3` | passes of 2–3 rows (batched decode steps of several slots, short verification runs) row by row through the native int8 kernel: x86 VM, 0.6B, a 2-row pass 46–49 ms instead of 65–68 (a lone step 27–30), each row's logits its lone step's bit for bit ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) | `3`; `0` = the float tiles (the earlier behaviour) |
+| `backend.cpu.batch-int8-rows` | `auto` | passes of 2..N rows (batched decode steps of several slots, short verification runs) row by row through the native int8 kernel, N measured once at load (3 on a 4-core x86 VM: a 2-row pass 46–49 ms instead of 65–68, a lone step 27–30; 16 on an M1 Pro: 13 ms instead of 57, 4 users on 4 slots 60 -> 130 tok/s), each row's logits its lone step's bit for bit ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) | `auto`; a number 0..64 = fixed; `0` = the float tiles (the earlier behaviour) |
 | `backend.threads` | `0` = every processor | not swept | `0`; fewer to leave cores to another program |
 | `-Djllm.cpu.fastmath` (JVM) | on | decode after a 3 023-token prompt +5–9 %, bench decode 57 → 60–62 ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) | on; `false` for bit-exact comparisons |
 | `-Djllm.cpu.deterministic` (JVM) | off | prefill through the single-token kernels: slower | off; on only to compare prefill with decode bit for bit |
@@ -624,7 +624,7 @@ before seeing a word. Give the server as many slots as users who type at the sam
 | `backend.kv-paged` | `auto` (paged from 2 slots) | a shared system prompt is stored and prefilled once: the second user found 716 of its 731 prompt tokens cached |
 | `backend.ctx` | `auto` | it divides the free memory by the number of slots; a fixed `--ctx` reserves `ctx` positions per slot with flat caches |
 | `server.queue-timeout-ms` | `60000` (default) | more users than slots wait this long, then get a 503 `overloaded` (also under `engine.scheduler=mixed`) |
-| `backend.cpu.batch-int8-rows` | `3` (default) | on the CPU, 2 users sharing a pass got 30–31 tok/s together where the float tiles gave 25 |
+| `backend.cpu.batch-int8-rows` | `auto` (default; 3 on that x86 VM) | on the CPU, 2 users sharing a pass got 30–31 tok/s together where the float tiles gave 25 |
 | `engine.scheduler` | `slots` | `mixed` gives every request one queue and mixes prefill into the decode passes; correct on CPU (`ServerSlotsTest`), its speed not measured yet |
 
 ---

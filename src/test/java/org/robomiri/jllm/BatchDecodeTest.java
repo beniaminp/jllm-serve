@@ -22,7 +22,7 @@ import java.util.concurrent.Future;
  *
  * <p>usage: BatchDecodeTest &lt;model dir&gt; [bench] [--setting value ...] (models/Qwen_Qwen3-0.6B; {@code bench} adds
  * the throughput run; settings override the test's, e.g. {@code --backend metal} on a Mac, as scripts/mac-validate.sh
- * runs it). {@code BatchDecodeTest <model dir> passes}: the time of one CPU decode pass of 1 to 4 rows, int8 activations,
+ * runs it). {@code BatchDecodeTest <model dir> passes}: the time of one CPU decode pass of 1 to 16 rows, int8 activations,
  * with {@code backend.cpu.batch-int8-rows} 4 (every pass of up to 4 rows token by token through the int8 kernel) and 0
  * (the float multi-row kernels), docs/07 §7.4.1.
  */
@@ -175,57 +175,78 @@ public final class BatchDecodeTest {
         }
     }
 
-    /** The pass-time table of docs/07 §7.4.1: lone step and forwardBatch of 1..4 rows, median of 5 rounds of 20 passes. */
+    /** The pass sizes of the {@link #passes} table. */
+    private static final int[] PASS_ROWS = {1, 2, 3, 4, 6, 8, 12, 16};
+
+    /**
+     * The pass-time table of docs/07 §7.4.1: lone step and forwardBatch of {@link #PASS_ROWS} rows, median of 5 rounds of
+     * 20 passes, with {@code backend.cpu.batch-int8-rows} 32 (per-row int8 up to 32 rows), 0 (the float tiles) and auto.
+     */
     private static void passes(Path dir) throws Exception {
-        System.out.println("| backend.cpu.batch-int8-rows | lone step | 1 row | 2 rows | 3 rows | 4 rows |");
-        System.out.println("|---|---|---|---|---|---|");
-        for (String rows : new String[]{"4", "0"}) {
+        StringBuilder head = new StringBuilder("| backend.cpu.batch-int8-rows | lone step |");
+        StringBuilder sep = new StringBuilder("|---|---|");
+        for (int n : PASS_ROWS) {
+            head.append(n == 1 ? " 1 row |" : " " + n + " rows |");
+            sep.append("---|");
+        }
+        System.out.println(head);
+        System.out.println(sep);
+        int slots = PASS_ROWS[PASS_ROWS.length - 1];
+        for (String rows : new String[]{"32", "0", "auto"}) {
             Settings st = Settings.load(new String[]{"--backend", "cpu", "--model.dir", dir.toAbsolutePath().getParent().toString(),
                     "--backend.ctx", "1024", "--engine.speculative", "off", "--backend.cpu.int8-activations", "true",
                     "--backend.cpu.batch-int8-rows", rows});
             SamplingParams one = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 1, List.of());
-            try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), dir.getFileName().toString(), 4);
-                 Engine e2 = ModelLoader.extraEngine(st, l);
-                 Engine e3 = ModelLoader.extraEngine(st, l);
-                 Engine e4 = ModelLoader.extraEngine(st, l)) {
-                Engine[] engines = {l.engine(), e2, e3, e4};
-                Backend[] inner = new Backend[4];
-                for (int i = 0; i < 4; i++) {
-                    engines[i].generate(chat(engines[i], "Tell me a story about robot " + i + " and its friends."), one, null,
-                            () -> false);
-                    Backend b = engines[i].backend();
-                    inner[i] = b instanceof BatchGroup.Member m ? m.inner() : b;
-                }
-                int vocab = engines[0].tokenizer().vocabSize();
-                float[][] logits = new float[4][vocab];
-                int pos = 30;
-                double[][] ms = new double[5][5];
-                for (int round = 0; round < 5; round++) {
-                    long t0 = System.nanoTime();
-                    for (int r = 0; r < 20; r++) {
-                        inner[0].forward(new int[]{100}, 0, 1, pos, logits[0]);
+            try (ModelLoader.Loaded l = ModelLoader.load(st, ModelLoader.hub(st), dir.getFileName().toString(), slots)) {
+                List<Engine> engines = new java.util.ArrayList<>();
+                engines.add(l.engine());
+                try {
+                    for (int i = 1; i < slots; i++) {
+                        engines.add(ModelLoader.extraEngine(st, l));
                     }
-                    ms[0][round] = (System.nanoTime() - t0) / 1e6 / 20;
-                    for (int n = 1; n <= 4; n++) {
-                        Backend[] bs = Arrays.copyOf(inner, n);
-                        int[] toks = new int[n];
-                        int[] ps = new int[n];
-                        Arrays.fill(toks, 100);
-                        Arrays.fill(ps, pos);
-                        float[][] out = Arrays.copyOf(logits, n);
-                        t0 = System.nanoTime();
+                    Backend[] inner = new Backend[slots];
+                    for (int i = 0; i < slots; i++) {
+                        engines.get(i).generate(chat(engines.get(i), "Tell me a story about robot " + i + " and its friends."),
+                                one, null, () -> false);
+                        Backend b = engines.get(i).backend();
+                        inner[i] = b instanceof BatchGroup.Member m ? m.inner() : b;
+                    }
+                    int vocab = engines.get(0).tokenizer().vocabSize();
+                    float[][] logits = new float[slots][vocab];
+                    int pos = 30;
+                    double[][] ms = new double[PASS_ROWS.length + 1][5];
+                    for (int round = 0; round < 5; round++) {
+                        long t0 = System.nanoTime();
                         for (int r = 0; r < 20; r++) {
-                            inner[0].forwardBatch(bs, toks, ps, out);
+                            inner[0].forward(new int[]{100}, 0, 1, pos, logits[0]);
                         }
-                        ms[n][round] = (System.nanoTime() - t0) / 1e6 / 20;
+                        ms[0][round] = (System.nanoTime() - t0) / 1e6 / 20;
+                        for (int k = 0; k < PASS_ROWS.length; k++) {
+                            int n = PASS_ROWS[k];
+                            Backend[] bs = Arrays.copyOf(inner, n);
+                            int[] toks = new int[n];
+                            int[] ps = new int[n];
+                            Arrays.fill(toks, 100);
+                            Arrays.fill(ps, pos);
+                            float[][] out = Arrays.copyOf(logits, n);
+                            t0 = System.nanoTime();
+                            for (int r = 0; r < 20; r++) {
+                                inner[0].forwardBatch(bs, toks, ps, out);
+                            }
+                            ms[k + 1][round] = (System.nanoTime() - t0) / 1e6 / 20;
+                        }
+                    }
+                    StringBuilder row = new StringBuilder("| " + rows + " |");
+                    for (double[] m : ms) {
+                        Arrays.sort(m);
+                        row.append(String.format(java.util.Locale.ROOT, " %.1f ms |", m[2]));
+                    }
+                    System.out.println(row);
+                } finally {
+                    for (int i = 1; i < engines.size(); i++) {
+                        engines.get(i).close();
                     }
                 }
-                StringBuilder row = new StringBuilder("| " + rows + " |");
-                for (double[] m : ms) {
-                    Arrays.sort(m);
-                    row.append(String.format(java.util.Locale.ROOT, " %.1f ms |", m[2]));
-                }
-                System.out.println(row);
             }
         }
     }

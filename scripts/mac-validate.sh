@@ -241,10 +241,10 @@ echo
 echo "| serve --server.slots | slots | users | tok/s, all users | first token, mean / worst |"
 echo "|---|---|---|---|---|"
 serverslots "Metal" --backend metal
-serverslots "CPU, batch-int8-rows 3 (default)" --backend cpu
+serverslots "CPU, batch-int8-rows auto (default)" --backend cpu
 serverslots "CPU, batch-int8-rows 0 (float tiles)" --backend cpu --backend.cpu.batch-int8-rows 0
-# one CPU decode pass of 1..4 rows (backend.cpu.batch-int8-rows on and off, docs/07 section 7.4.1): where the row-by-row
-# int8 kernel stops beating the float tiles on this CPU (3 on a 4-core AVX512-VNNI x86; the ARM crossover is not measured)
+# one CPU decode pass of 1..16 rows (backend.cpu.batch-int8-rows 32, 0 and auto, docs/07 section 7.4.1): where the row-by-row
+# int8 kernel stops beating the float tiles on this CPU (3 on a 4-core AVX512-VNNI x86; past 16 on an M1 Pro)
 echo
 "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -cp target/classes:target/test-classes \
   org.robomiri.jllm.BatchDecodeTest "models/$(echo "$DENSE" | tr / _)" passes 2>/dev/null | grep '^|' || echo "| CPU pass times | failed |"

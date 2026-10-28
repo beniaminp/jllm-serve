@@ -726,7 +726,7 @@ and attention run per row, each in its own conversation's cache at its own posit
 
 **Results.** With float activations a batched step uses the multi-token kernels, which add up in a different order than
 the single-token ones on the CPU, so its logits agree with a step taken alone to rounding. With int8 activations (the CPU
-default) and the native kernels, a pass of up to `backend.cpu.batch-int8-rows` (3) rows runs every row through the
+default) and the native kernels, a pass of up to `backend.cpu.batch-int8-rows` (`auto`: measured at load, 3 on a 4-core x86 VM, 16 on an M1 Pro) rows runs every row through the
 single-token int8 kernel ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)),
 so each row's logits are its lone step's **bit for bit**; longer passes take the float 4 × 4 tiles (int8 rounding apart). The
 greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU, part of `mvn test`; 54–56 of the steps
@@ -858,7 +858,7 @@ carry prompt chunks, [25 §25.2.9](25-scheduler.md#2529-what-the-same-as-alone-m
 | `engine.batch-decode` | `true` | decode steps of slots generating together share one pass; `false` = one slot at a time |
 | `engine.scheduler` | `slots` | `mixed`: one queue per model, passes mixing a prefill chunk with every decode token ([25](25-scheduler.md)) |
 | `backend.kv-paged` | `auto` | paged from two slots on; `false` = one flat cache per slot (prefixes copied from slot to slot instead, ≥ 256 tokens) |
-| `backend.cpu.batch-int8-rows` | `3` | CPU passes of up to this many rows go row by row through the int8 kernel ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) |
+| `backend.cpu.batch-int8-rows` | `auto` | CPU passes of up to this many rows go row by row through the int8 kernel; `auto` times it against the float tiles at load (3 on a 4-core x86 VM, 16 on an M1 Pro) ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) |
 
 ```sh
 ./jllm serve --server.slots 4                                   # four users at once, decode steps batched
@@ -875,7 +875,7 @@ streaming 64 tokens of a different story with greedy sampling, prompt lookup off
 
 ```sh
 java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/test-classes:target/classes \
-     org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench                                   # batch-int8-rows 3 (default)
+     org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench                                   # batch-int8-rows auto (default; 3 on this x86 VM)
 java … org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench --backend.cpu.batch-int8-rows 0   # float tiles for 2+ rows
 ```
 
@@ -887,6 +887,16 @@ java … org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench --backen
 | 4 | 2 | **31.3 / 30.0** | 0.31 s / 0.44 s | 25.0 | 0.35 s / 0.45 s |
 | 4 | 4 | 38.2 / 38.1 | 0.60 s / 1.06 s | 40.9 | 0.48 s / 0.79 s |
 | 4 | 8 | 44.0 / 40.2 | 3.36 s / 6.40 s | 42.9 | 3.48 s / 6.83 s |
+
+On an Apple M1 Pro (10 threads, native `neon-dotprod`, same model and test, 4 slots, tok/s of all users; `auto` resolved to
+16 rows; the old default 3 gave the float tiles for 4 rows and up, which cost 57 ms for a 2-row pass instead of 13):
+
+| users | `batch-int8-rows 3` | `8` | `auto` (three runs) |
+|---|---|---|---|
+| 4 | 60.7 | 132 | 134.4 / 130.3 / 128.7 |
+| 8 | 61.2 | 136 | 137.0 / 138.5 / 129.7 |
+
+(one slot taking turns: 102 tok/s).
 
 Reading it: one user's speed swings between 22.6 and 30.9 tok/s from run to run on this machine, the noise of the VM. What is
 steady: with one slot the fourth user waits ≈ 6.2–6.5 s for its first token and with four slots ≈ 0.8–1.1 s; two users on four
