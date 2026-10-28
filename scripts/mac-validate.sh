@@ -10,6 +10,8 @@
 #   scripts/mac-validate.sh --skip-smoke                     speed only
 #   scripts/mac-validate.sh --qwen35 /path/to/Qwen3.5-27B-Q4_0.gguf   plus multi-token-prediction speculation on/off
 #                                                                     (a qwen35 GGUF with its nextn layer; ~19 GB of memory)
+#   scripts/mac-validate.sh --gemma4 unsloth/gemma-4-12b-it-GGUF      plus Gemma 4 on Metal against the CPU (docs/14 14.10.7:
+#                                                                     the loader runs it on the GPU now; ~8 GB with Q4_K_M)
 #   scripts/mac-validate.sh --vs-llama                       plus jllm vs llama.cpp (llama-bench) on the same GGUF file
 #   scripts/mac-validate.sh --vs-llama --llama-moe unsloth/Qwen3-30B-A3B-GGUF   ... and on a MoE GGUF
 #   scripts/mac-validate.sh --llama-only --vs-llama          only the llama.cpp comparison
@@ -36,6 +38,7 @@ cd "$(dirname "$0")/.."
 DENSE=Qwen/Qwen3-0.6B
 MOE=""
 QWEN35=""
+GEMMA4=""
 SMOKE=1
 ROUNDS=3
 VS_LLAMA=""
@@ -53,6 +56,7 @@ while [ $# -gt 0 ]; do
     --model) DENSE="$2"; shift 2 ;;
     --moe) MOE="$2"; shift 2 ;;
     --qwen35) QWEN35="$2"; shift 2 ;;
+    --gemma4) GEMMA4="$2"; shift 2 ;;
     --skip-smoke) SMOKE=""; shift ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
     --vs-llama) VS_LLAMA=1; shift ;;
@@ -290,6 +294,17 @@ echo "| context length and speed | prefill tok/s | decode tok/s | note |"
 echo "|---|---|---|---|"
 bench "$DENSE: backend.ctx=auto (default)" "$DENSE" ""
 bench "$DENSE: --ctx 4096 (the old default)" "$DENSE" "" --ctx 4096
+if [ -n "$GEMMA4" ]; then
+  # Gemma 4 on the GPU (512-wide heads, per-layer shapes) against the CPU; the first line must say Backend: metal, and the
+  # greedy text of the two (CPU without int8 activations) should agree
+  bench "$GEMMA4: Metal (backend.batch=auto = 256)" "$GEMMA4" "" --gguf-quant Q4_K_M --backend metal --ctx 4096
+  bench "$GEMMA4: CPU" "$GEMMA4" "" --gguf-quant Q4_K_M --backend cpu --ctx 4096
+  for b in metal cpu; do
+    ./jllm run --model "$GEMMA4" --gguf-quant Q4_K_M --backend $b --backend.cpu.int8-activations false --temp 0 --max-tokens 24 \
+      --ctx 4096 --prompt "Why is the sky blue?" > "$OUT/g4-$b.log" 2>&1 || true
+  done
+  echo "| $GEMMA4: $(grep -m1 '^Backend:' "$OUT/g4-metal.log" | cut -c1-40) | greedy text Metal == CPU: $(cmp -s <(grep -v '^[A-Z][a-z]*:' "$OUT/g4-metal.log" | tail -3) <(grep -v '^[A-Z][a-z]*:' "$OUT/g4-cpu.log" | tail -3) && echo yes || echo no) | | |"
+fi
 # the vision encoder (docs/20): the second encoding of a picture (weights resident, pipelines built) on the GPU against
 # the CPU encoder (vision.backend=cpu); VisionDump prints the time per chunk of the picture
 vision() { # label backend
