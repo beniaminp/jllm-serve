@@ -619,7 +619,8 @@ The 12B is dense with no per-layer input embeddings (`hidden_size_per_layer_inpu
 `attention_split_d512`) and per-layer head-shape dispatch, and it applies `attention_k_eq_v` (V = the pre-RoPE key
 projection), the parameterless per-head V-norm and the per-layer `layer_scalar` on the GPU. The paged, batched, mixed
 and tiered KV passes, q4 KV and rotated q8 are not offered (each layer keeps its own flat KV cache). GGUF files name
-the same decoder `gemma4` (E2B / E4B / 26B / 31B) or `gemma4_unified` (12B).
+the same decoder `gemma4`: llama.cpp's converter (b11669) writes the 12B's `Gemma4UnifiedForConditionalGeneration` under that
+architecture too (`Gemma4UnifiedModel.model_arch = GEMMA4`); the reader also accepts the name `gemma4_unified`.
 
 ## 14.11 DeepSeek-V2 / V3 (Multi-head Latent Attention + shared experts)
 
