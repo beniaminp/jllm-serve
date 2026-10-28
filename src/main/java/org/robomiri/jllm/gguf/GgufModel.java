@@ -105,6 +105,11 @@ public final class GgufModel implements AutoCloseable {
         }
     }
 
+    /** {@code tokenizer.ggml.add_bos_token} of the file, null when it does not say. */
+    public Boolean addBosToken() {
+        return file.get("tokenizer.ggml.add_bos_token") instanceof Boolean b ? b : null;
+    }
+
     /** An integer array (u8 or i8 elements) as bytes, or null. */
     private static byte[] bytes(long[] a) {
         if (a == null) {

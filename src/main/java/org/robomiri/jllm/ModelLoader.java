@@ -32,6 +32,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -575,6 +576,16 @@ public final class ModelLoader {
                 hub.ensure(repo, "main", tdir, "tokenizer_config.json");
             } catch (IOException ignored) {
                 // optional: it only supplies BOS / EOS names
+            }
+            // The repository's tokenizer_config.json often has no add_bos_token (Gemma 4) and its post-processor adds
+            // no BOS, so a plain prompt would reach the model without one; the GGUF states what the model expects.
+            Boolean addBos = gm.addBosToken();
+            if (addBos != null) {
+                Path cfg = tdir.resolve("tokenizer_config.json");
+                Map<String, Object> config = new java.util.LinkedHashMap<>(
+                        Files.isRegularFile(cfg) ? Json.parseObject(Files.readString(cfg)) : Map.of());
+                config.put("add_bos_token", addBos);
+                return Tokenizer.fromMaps(Json.parseObject(Files.readString(tdir.resolve("tokenizer.json"))), config);
             }
             return Tokenizer.load(tdir.resolve("tokenizer.json"));
         }
