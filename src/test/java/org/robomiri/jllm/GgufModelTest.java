@@ -503,6 +503,22 @@ public final class GgufModelTest {
         Path p = root.resolve("olmo2.gguf");
         new GgufWriter().str("general.architecture", "olmo2").write(p);
         expectFail(p, "unsupported GGUF architecture 'olmo2'");
+        p = root.resolve("nemotron-moe.gguf");
+        new GgufWriter().str("general.architecture", "nemotron_h_moe").write(p);
+        expectFail(p, "mixture-of-experts layers are not implemented");
+        // the hybrids: Jamba's attention layers must be every n-th layer, Granite 4's experts need the shared expert
+        p = root.resolve("jamba-irregular.gguf");
+        new GgufWriter().str("general.architecture", "jamba").u32("jamba.block_count", 6).u32("jamba.embedding_length", 64)
+                .u32("jamba.attention.head_count", 4).i32s("jamba.attention.head_count_kv", 0, 2, 2, 0, 0, 2)
+                .f32Tensor("token_embd.weight", new long[]{64, 96}, new float[64 * 96]).write(p);
+        expectFail(p, "are not every n-th layer");
+        p = root.resolve("granite-noshared.gguf");
+        new GgufWriter().str("general.architecture", "granitehybrid").u32("granitehybrid.block_count", 2)
+                .u32("granitehybrid.embedding_length", 64).u32("granitehybrid.attention.head_count", 4)
+                .i32s("granitehybrid.attention.head_count_kv", 0, 2).u32("granitehybrid.feed_forward_length", 32)
+                .u32("granitehybrid.expert_count", 4).u32("granitehybrid.expert_used_count", 2)
+                .f32Tensor("token_embd.weight", new long[]{64, 96}, new float[64 * 96]).write(p);
+        expectFail(p, "without a shared expert");
         p = root.resolve("notensors.gguf");
         new GgufWriter().str("general.architecture", "llama").u32("llama.block_count", 1).u32("llama.embedding_length", 64)
                 .u32("llama.attention.head_count", 4).u32("llama.feed_forward_length", 96)
