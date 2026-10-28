@@ -262,7 +262,9 @@ Where the guesses come from (an index of every 2..8-token sequence of the text) 
 
 When several people talk to the same model at once, their next words are computed together: reading the model's
 weights is the slow part, and one reading can serve every conversation
-([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)).
+([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)). `./jllm serve --server.slots 4` keeps four
+conversations going at the same time, so nobody waits for three other answers before seeing their first word
+([10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)).
 
 ## 13. Why the first answer of a coding agent is slow, and later ones are fast
 

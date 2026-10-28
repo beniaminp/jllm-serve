@@ -238,6 +238,69 @@ once per 4 rows. The expensive unpack happens `1/n` as often — this is why pre
 float decode reaches ~13 on the same hardware. Rows left over when `rows % 4 != 0` fall back to `dotRow`. With `-Djllm.cpu.deterministic` the prefill branch
 is skipped and the tokens go one by one through the decode path ([7.14](#714-prefill-and-decode-are-not-bit-identical-results-depend-on-history)).
 
+### 7.4.1 A few tokens: the single-token int8 kernel per token (`backend.cpu.batch-int8-rows`)
+
+🧸 Two friends want a sandwich each from the same recipe. The slow way: copy the whole recipe onto a big sheet first (that is the
+float path: every weight row unpacked to floats), then make two sandwiches from the copy. That is worth it for a party of sixty,
+not for two. The quick way for two: read one line of the recipe, do that step for both sandwiches, read the next line. The
+recipe page stays open on the counter (in the cache) while both sandwiches get that step.
+
+📐 Passes of 2 to 3 rows are not prefill: they are **decode steps of several slots batched into one pass**
+([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)), a short speculative verification run, or the last few
+tokens of a chat turn. For them the float path above is the wrong tool: it dequantizes every weight row to floats (the cost
+`D`, the same for any n) and then runs `dot4` once per token, so a 2-row pass costs `D + 2F` where a lone int8 step costs `I`.
+With int8 activations on and the native library ([7.16](#716-native-int8-kernels-libjllm_cpu-nativecpu)), `CpuMatmul.mul` now
+takes `mulFewNative` for `1 < n ≤ backend.cpu.batch-int8-rows`:
+
+```java
+for t < n:  nat.quantize(in, t * cols, cols, acts[t]);        // each token's activation, once (as mulOne does)
+chunk = max(16, CHUNK_BYTES / rowBytes)                       // CHUNK_BYTES = 128 KiB: weight rows that stay in L2
+pool.forRange(rows, 16, (r0, r1) -> {
+    for (c0 = r0; c0 < r1; c0 += chunk)                       // a chunk of weight rows ...
+        for t < n:  nat.dotRows(wt, c0, c1, acts[t], 0, out, outOff + t * stride + c0, acc);   // ... for every token
+});
+```
+
+- **Exact.** Each token's output row is what `mulOne` computes for that token alone, bit for bit: the same quantizer, the same
+  kernel per row, and a row's dot product does not depend on where a chunk starts. So a batched decode step with int8 activations
+  gives each slot its lone step's logits bit for bit (`BatchDecodeTest` checks it: 0 of 303 338 logits differ; with the switch at
+  0, all of them differ by the int8 rounding of the float tiles).
+- **Cost.** The chunk is read from memory for the first token and from L2 for the others, so the pass costs about one token's
+  weight traffic plus `n` times the kernel's arithmetic: `T(n) ≈ max(W / bandwidth, n · C)`. Where decode is bound by bandwidth
+  (many cores, little bandwidth per core) that is close to `T(1)` for small n; where the kernel's instructions are the limit, as on
+  the 4-core VM below, it is about `n · T(1)` minus the saved memory stalls.
+- **Worked example.** Qwen3-0.6B's `o_proj` (1 024 rows × 2 048 columns, Q4_0 in the engine's layout: 64 blocks × (16 + 4) bytes =
+  1 280 bytes a row): a chunk is `131 072 / 1 280 = 102` rows; 4 threads take the 1 024 rows in 16 ranges of 64 rows, each one chunk,
+  so a 2-row pass is 32 downcalls instead of 16. The 151 936-row Q8_0 LM head (1 024 columns: 32 × 36 = 1 152 bytes a row) goes
+  in chunks of 113 rows.
+- **Where the crossover is.** From 4 rows on the float `dot4x4` tile (four tokens per pass over the dequantized rows) is faster
+  again, so the default is 3. Measured with the command below (median of 5 rounds of 20 passes):
+
+```sh
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/test-classes:target/classes \
+     org.robomiri.jllm.BatchDecodeTest models/Qwen_Qwen3-0.6B passes
+```
+
+Qwen3-0.6B Q4_0 (LM head Q8_0), int8 activations, Intel Xeon @ 2.80 GHz, 4 cores, AVX512-VNNI, two runs:
+
+| `backend.cpu.batch-int8-rows` | lone step | 1 row | 2 rows | 3 rows | 4 rows |
+|---|---|---|---|---|---|
+| 4 (row by row, int8) | 29.7 / 27.2 ms | 28.6 / 27.4 | **48.5 / 46.4** | **68.5 / 66.1** | 89.2 / 86.9 |
+| 0 (float tiles, as before) | 27.9 / 27.8 ms | 28.9 / 28.6 | 68.0 / 65.2 | 83.8 / 79.0 | **75.2 / 73.0** |
+
+So at the default (3) a pass of 2 rows costs 1.7× a lone step instead of 2.4× (more than two lone steps), 3 rows 2.4× instead of
+2.9×, and 4 rows keep the tiles. The chunk size was swept with `-Djllm.cpu.fewRowsChunkBytes`: 8 KiB 51–53 ms for 2 rows, 32 KiB
+50–51, **128 KiB 47–48**, 512 KiB 50–67. On this machine one token's int8 kernel, not the memory, sets the speed (the profile of a lone
+step is ~52 % inside the native `dotRows`), which is why rows 2 and 3 cost almost a full step each; a kernel that unpacks each
+weight block once for several tokens (one `vpdpbusd` per token on the same unpacked register) is the next step and not done.
+
+- **Not used** with the Java int8 kernels (no native library: the tiles as before), for float activations, or with
+  `-Djllm.cpu.deterministic` (which already runs every token through `mulOne`). `NativeCpuCheck` checks every native type at 2 and 3
+  tokens, with and without accumulation, on 333 rows: bit for bit against one-token `mul`, and the switch-off path within the int8
+  rounding.
+- **Switch.** `backend.cpu.batch-int8-rows` (0..64, default 3; 0 = the float tiles for every n > 1, the earlier behaviour),
+  applied process-wide by `ModelLoader` through `CpuBackend.configureBatchInt8Rows`.
+
 ---
 
 ## 7.5 Attention (`KvCache.attention`)
@@ -1452,7 +1515,9 @@ void jllm_cpu_dot_rows(int type, const uint8_t *w, int64_t scales_off, int r0, i
   projection, each chunk of output rows makes one call per slot into `down[k·dim + r]` (activation offset `k·m/32`
   blocks), then adds `Σ_k w_k · down` in slot order, the same order as the Java loop.
 
-Prefill (`n > 1`) is unchanged: the float `dot4x4` path, with each row dequantized once for all tokens.
+Prefill (`n > 1`) is unchanged: the float `dot4x4` path, with each row dequantized once for all tokens. Passes of 2 to
+`backend.cpu.batch-int8-rows` (3) tokens, batched decode steps above all, call the native kernel once per token over chunks of
+rows instead ([7.4.1](#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)).
 
 ### 📐 Finding, checking and choosing the library
 

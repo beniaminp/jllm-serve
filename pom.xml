@@ -110,6 +110,53 @@
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>
+                    <!-- ServerSlotsTest: `serve` with server.slots, over HTTP: concurrent users get their lone answers, share passes and the prefix cache, the 503 when every slot is busy. -->
+                    <execution>
+                        <id>server-slots-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.ServerSlotsTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                                <argument>slots</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- ServerSlotsTest under engine.scheduler=mixed (deterministic CPU: a mixed pass also carries prompt chunks). -->
+                    <execution>
+                        <id>server-slots-mixed-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>${java.home}/bin/java</executable>
+                            <arguments>
+                                <argument>--add-modules</argument>
+                                <argument>jdk.incubator.vector</argument>
+                                <argument>--enable-native-access=ALL-UNNAMED</argument>
+                                <argument>-Djllm.cpu.deterministic=true</argument>
+                                <argument>-cp</argument>
+                                <classpath/>
+                                <argument>org.robomiri.jllm.ServerSlotsTest</argument>
+                                <argument>${jllm.test.model}</argument>
+                                <argument>mixed</argument>
+                            </arguments>
+                            <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
                     <!-- AgentDefaultsTest: backend.ctx=auto arithmetic, request priority parsing and the device queue order. -->
                     <execution>
                         <id>agent-defaults-test</id>

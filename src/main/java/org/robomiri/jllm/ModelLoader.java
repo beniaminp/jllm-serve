@@ -461,12 +461,6 @@ public final class ModelLoader {
                 ? GROUPS.computeIfAbsent(weights, w -> new org.robomiri.jllm.engine.BatchGroup(s.getBool("engine.priority-order"))) : null;
     }
 
-    /**
-     * Another engine on the weights of {@code l}: its own backend and KV cache, the same tokenizer, template, stop
-     * tokens and queue timeout. Lets a server keep several conversations' prefixes cached at once (memory: one KV
-     * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
-     * does not (it would need its own copy).
-     */
     /** The chat format of the model; a GGUF of a family whose model_type is shared with another one asks by its own name. */
     private static org.robomiri.jllm.tokenizer.ChatTemplate.Format chatFormat(Prepared p, Architecture arch, Tokenizer tok) {
         if (p.gguf() != null) {
@@ -482,6 +476,12 @@ public final class ModelLoader {
         return org.robomiri.jllm.tokenizer.ChatTemplate.forModelType(arch.core().modelType(), tok);
     }
 
+    /**
+     * Another engine on the weights of {@code l}: its own backend and KV cache, the same tokenizer, template, stop
+     * tokens and queue timeout. Lets a server keep several conversations' prefixes cached at once (memory: one KV
+     * cache each; the memory-mapped weights are shared). Prompt-lookup speculation carries over; a draft model
+     * does not (it would need its own copy).
+     */
     public static Engine extraEngine(Settings s, Loaded l) throws Exception {
         Engine first = l.engine();
         // the same context as the first slot's (backend.ctx=auto was decided once, for all the slots)
@@ -659,6 +659,7 @@ public final class ModelLoader {
             nativeMode = System.getProperty("jllm.cpu.native");
         }
         org.robomiri.jllm.cpu.NativeCpu.configure(nativeMode, s.opt("backend.cpu.native-lib"));
+        org.robomiri.jllm.cpu.CpuBackend.configureBatchInt8Rows(s.getInt("backend.cpu.batch-int8-rows"));
         KvDtype kvDtype = KvDtype.parse(s.get("backend.kv-dtype"));
         KvDtype.setQ4Recent(s.getInt("backend.kv-q4-recent"));
         KvDtype.setQ8Rotate(s.getBool("backend.kv-q8-rotate"));

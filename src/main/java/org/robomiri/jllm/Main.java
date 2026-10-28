@@ -66,7 +66,7 @@ public final class Main {
                 }
                 case "chat" -> chat(ModelLoader.load(s, hub, model), s);
                 case "run" -> run(ModelLoader.load(s, hub, model), s);
-                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model), model, s, hub);
+                case "serve" -> serve(model.equals("none") ? null : ModelLoader.load(s, hub, model, s.getInt("server.slots")), model, s, hub);
                 case "image" -> image(s, hub);
                 case "video" -> video(s, hub);
                 case "transcribe" -> org.robomiri.jllm.audio.AudioCli.transcribe(s, hub, model, cli(s, "audio"), cli(s, "language"),
@@ -284,6 +284,26 @@ public final class Main {
                 s.getLong("engine.max-prompt-bytes"), s.getLong("server.request-timeout-ms"), http);
         ModelWeights weights = l == null ? null : l.weights();
         Engine engine = l == null ? null : l.engine();
+        // server.slots engines on the same weights (the first is l's): several users at once, their decode steps batched
+        java.util.List<Engine> engines = new java.util.ArrayList<>();
+        org.robomiri.jllm.engine.SlotPool slots = null;
+        if (l != null) {
+            engines.add(engine);
+            int n = s.getInt("server.slots");
+            for (int i = 1; i < n; i++) {
+                engines.add(ModelLoader.extraEngine(s, l));
+            }
+            slots = new org.robomiri.jllm.engine.SlotPool(engines, org.robomiri.jllm.engine.SlotPool.mixedConfig(s), null, model);
+            slots.enablePagedHousekeeping(s.getLong("server.kv-idle-release-seconds"));
+            if (n > 1) {
+                org.robomiri.jllm.model.Backend b = engine.backend();
+                System.err.println("Slots: " + n + " engines on the shared weights, context " + b.contextLength() + " each"
+                        + (b.kvSequence() != null ? ", paged KV cache shared through its prefix tree" : ", own KV caches")
+                        + (b instanceof org.robomiri.jllm.engine.BatchGroup.Member m
+                        ? (m.group().mixed() ? ", mixed scheduler (one queue, mixed passes)" : ", decode steps batched across slots")
+                        : ", decoding one slot at a time"));
+            }
+        }
         org.robomiri.jllm.diffusion.ImagePipeline pipe = null;
         org.robomiri.jllm.diffusion.VideoPipeline videoPipe = null;
         try (org.robomiri.jllm.audio.AudioModels audioModels = new org.robomiri.jllm.audio.AudioModels()) {
@@ -301,7 +321,7 @@ public final class Main {
                                 s.get("video.format")));
                 System.err.println("Video model " + videos.modelId() + ": " + videoPipe.description());
             }
-            try (ApiServer server = new ApiServer(engine, model, host, port, options).withImages(images).withVideo(videos).imageLimits(
+            try (ApiServer server = ApiServer.onSlots(slots, model, host, port, options).withImages(images).withVideo(videos).imageLimits(
                     s.getLong("vision.max-image-bytes"), s.getLong("vision.max-image-pixels"), s.getBool("vision.allow-private-urls"))) {
                 if (audio) {
                     for (String repo : new String[]{as.sttModel(), as.ttsModel()}) {
@@ -322,6 +342,12 @@ public final class Main {
             }
             if (videoPipe != null) {
                 videoPipe.close();
+            }
+            if (slots != null) {
+                slots.stop();
+            }
+            for (int i = engines.size() - 1; i >= 1; i--) {
+                engines.get(i).close();
             }
             if (engine != null) {
                 engine.close();

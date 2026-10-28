@@ -1,6 +1,9 @@
 package org.robomiri.jllm.server;
 
+import org.robomiri.jllm.engine.Admission;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.Priority;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -20,6 +23,10 @@ import java.util.function.BooleanSupplier;
  * OpenAI-compatible endpoints on top of {@link Engine}:
  * {@code POST /v1/chat/completions}, {@code POST /v1/completions} (both with {@code "stream": true} SSE support),
  * {@code GET /v1/models}, {@code GET /health}, plus a tiny chat page at {@code /}.
+ *
+ * <p>The text model is a {@link SlotPool}: with one slot (the default) requests take turns on its engine; with
+ * {@code server.slots} of them (docs/10 §10.9c) each request picks a slot, so several users are served at once, their
+ * decode steps sharing forward passes ({@code engine.batch-decode}) and their prompts the paged cache's blocks.
  */
 public final class ApiServer implements AutoCloseable {
 
@@ -90,6 +97,8 @@ public final class ApiServer implements AutoCloseable {
         }
     }
 
+    private final SlotPool slots;
+    /** The first slot's engine: tokenizer, template, context and vision encoder (the same for every slot); null without a text model. */
     private final Engine engine;
     private final String modelId;
     private volatile AudioRoutes audio; // null: no /v1/audio endpoints
@@ -111,7 +120,20 @@ public final class ApiServer implements AutoCloseable {
     }
 
     public ApiServer(Engine engine, String modelId, String host, int port, Options options) throws IOException {
-        this.engine = engine;
+        this(engine == null ? null : new SlotPool(List.of(engine), null, null, modelId), options, modelId, host, port);
+    }
+
+    /**
+     * A server whose requests run on the slots of {@code slots} ({@code server.slots}, docs/10 §10.9c): each request takes
+     * the slot {@link SlotPool#pick} chooses for its prompt. Null: no text model, images / video / audio only.
+     */
+    public static ApiServer onSlots(SlotPool slots, String modelId, String host, int port, Options options) throws IOException {
+        return new ApiServer(slots, options, modelId, host, port);
+    }
+
+    private ApiServer(SlotPool slots, Options options, String modelId, String host, int port) throws IOException {
+        this.slots = slots;
+        this.engine = slots == null ? null : slots.first();
         this.modelId = modelId;
         this.defaults = options.sampling();
         this.thinkingDefault = options.thinkingDefault();
@@ -192,7 +214,9 @@ public final class ApiServer implements AutoCloseable {
         }
         switch (path) {
             case "/", "/index.html" -> res.send(200, "text/html; charset=utf-8", WebUi.HTML);
-            case "/health" -> res.send(200, "application/json", Json.write(Json.obj("status", "ok", "model", modelId)));
+            case "/health" -> res.send(200, "application/json", Json.write(slots == null ? Json.obj("status", "ok", "model", modelId)
+                    : Json.obj("status", "ok", "model", modelId, "slots", slots.size(), "busy_slots", slots.busy(),
+                    "queued", slots.admission() == null ? 0 : slots.admission().queued())));
             case "/v1/models" -> {
                 List<Object> data = new ArrayList<>();
                 if (engine != null) {
@@ -302,7 +326,38 @@ public final class ApiServer implements AutoCloseable {
         String object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
         Engine.Decoding decoding = o.decoding(tok);
         org.robomiri.jllm.engine.MediaPrompt mediaFinal = media;
+        try (SlotPool.Slot slot = pick(prompt, Json.str(body, "user", null), decoding.priority(), req, res)) {
+            if (slot == null) {
+                return;
+            }
+            generate(slot.engine(), req, res, chat, stream, o, prompt, mediaFinal, params, decoding, echoFrom, echoText,
+                    separateUsage, includeUsage, id, created, object);
+        }
+    }
 
+    /**
+     * The slot that serves a request: {@link SlotPool#pick} in the request's priority class, which orders the mixed
+     * scheduler's queue; a client that leaves while queued there ends the request like a disconnect, and one queued for
+     * longer than {@code server.queue-timeout-ms} gets the 503 a busy engine gives (null: answered).
+     */
+    private SlotPool.Slot pick(int[] prompt, String session, Priority priority, HttpServer.Request req, HttpServer.Response res)
+            throws IOException {
+        try (Priority.Scope ignored = Priority.enter(priority)) {
+            return slots.pick(prompt, session, req::clientGone, engine.queueTimeoutMs());
+        } catch (Admission.Abandoned e) {
+            throw new IOException("client disconnected while queued for a slot");
+        } catch (Engine.OverloadedException e) {
+            res.send(503, "application/json", error(e.getMessage(), "server_error", "overloaded"));
+            return null;
+        }
+    }
+
+    /** Runs a parsed request on {@code engine} (its slot's) and writes the response. */
+    private void generate(Engine engine, HttpServer.Request req, HttpServer.Response res, boolean chat, boolean stream,
+                          OpenAiFeatures.Options o, int[] prompt, org.robomiri.jllm.engine.MediaPrompt mediaFinal,
+                          SamplingParams params, Engine.Decoding decoding, int echoFrom, String echoText,
+                          boolean separateUsage, boolean includeUsage, String id, long created, String object) throws Exception {
+        Tokenizer tok = engine.tokenizer();
         Deadline deadline = new Deadline(requestTimeoutMs);
         if (!stream) {
             List<Engine.Result> all;
@@ -518,6 +573,7 @@ public final class ApiServer implements AutoCloseable {
                 "completion_tokens", s.generatedTokens(),
                 "total_tokens", s.promptTokens() + s.generatedTokens(),
                 "cached_tokens", s.cachedTokens(),
+                "prompt_tokens_details", Json.obj("cached_tokens", s.cachedTokens()), // where OpenAI clients read the cache hits
                 "prefill_ms", Math.round(s.prefillMs()),
                 "decode_ms", Math.round(s.decodeMs()),
                 "drafted_tokens", s.draftedTokens(),

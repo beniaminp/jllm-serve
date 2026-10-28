@@ -6,6 +6,7 @@ import org.robomiri.jllm.engine.Admission;
 import org.robomiri.jllm.engine.BatchGroup;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.Priority;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.kv.KvPool;
 import org.robomiri.jllm.kv.KvSequence;
@@ -262,7 +263,7 @@ class MixedSlotsTest {
     private static final SamplingParams GREEDY40 = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 40, List.of());
 
     private static Engine.Result run(LoadedModel model, int[] prompt, Priority prio, SamplingParams p, java.util.function.BooleanSupplier gone) {
-        try (Priority.Scope ignored = Priority.enter(prio); LoadedModel.Slot slot = model.pick(prompt, null, gone)) {
+        try (Priority.Scope ignored = Priority.enter(prio); SlotPool.Slot slot = model.pick(prompt, null, gone)) {
             return slot.engine().generate(prompt, p, null, gone);
         }
     }
@@ -316,7 +317,7 @@ class MixedSlotsTest {
     }
 
     private static Engine.Result runWithSink(LoadedModel model, int[] prompt, SamplingParams p, CountDownLatch started) {
-        try (LoadedModel.Slot slot = model.pick(prompt)) {
+        try (SlotPool.Slot slot = model.pick(prompt)) {
             return slot.engine().generate(prompt, p, t -> started.countDown(), () -> false);
         }
     }
@@ -372,7 +373,7 @@ class MixedSlotsTest {
             ExecutorService ex = Executors.newFixedThreadPool(2);
             CountDownLatch generating = new CountDownLatch(5);
             Future<Engine.Result> bg = ex.submit(() -> {
-                try (Priority.Scope ignored = Priority.enter(Priority.BACKGROUND); LoadedModel.Slot slot = s.model().pick(bgPrompt, null, () -> false)) {
+                try (Priority.Scope ignored = Priority.enter(Priority.BACKGROUND); SlotPool.Slot slot = s.model().pick(bgPrompt, null, () -> false)) {
                     return slot.engine().generate(bgPrompt, longGen, t -> generating.countDown(), () -> false);
                 }
             });
@@ -412,7 +413,7 @@ class MixedSlotsTest {
             AtomicBoolean gone = new AtomicBoolean();
             AtomicReference<Throwable> thrown = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
-                try (LoadedModel.Slot slot = s.model().pick(tokens(new Random(1), 30), null, gone::get)) {
+                try (SlotPool.Slot slot = s.model().pick(tokens(new Random(1), 30), null, gone::get)) {
                     thrown.set(new IllegalStateException("got a slot"));
                 } catch (Admission.Abandoned e) {
                     thrown.set(e);
@@ -429,7 +430,7 @@ class MixedSlotsTest {
             assertTrue(ms < 500, "within half a second: " + ms);
             assertEquals(0, s.model().admission().queued());
             assertThrows(Admission.Abandoned.class, () -> {
-                try (LoadedModel.Slot slot = s.model().pick(tokens(new Random(2), 30), null, () -> true)) {
+                try (SlotPool.Slot slot = s.model().pick(tokens(new Random(2), 30), null, () -> true)) {
                     assertTrue(false, "a request whose client is gone must not get the busy slot");
                 }
             });

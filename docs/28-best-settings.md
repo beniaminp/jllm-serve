@@ -285,6 +285,7 @@ Leave `engine.draft-tokens=16` and `engine.ngram-min=3` (2-token matches cost 8 
 |---|---|---|---|
 | `backend.cpu.int8-activations` | `auto` (times both on the loaded model at start and keeps the faster) | M1 Pro 0.6B: float ~237 / ~13 tok/s, int8 ~275 / ~51 (≈ 3.9× decode); ~0.9 % RMS error per dot product ([11 §11.1](11-performance.md#111-measured)) | `auto`; `false` for results identical to Metal |
 | `backend.cpu.native` | `auto` (`libjllm_cpu`: NEON `sdot`, AVX2, AVX-VNNI, AVX-512 VNNI) | x86 VM, AVX-512 VNNI, 4 threads, loaded machine: one token's matmuls 76–79 ms native vs 130–188 float; decode 4.2–5.2 vs 2.4–3.3 tok/s; single-thread row kernels 2.8× (Q4_0) to 8× (Q6_K) the Java int8 ([07 §7.16](07-cpu-backend.md#716-native-int8-kernels-libjllm_cpu-nativecpu)) | `auto`; the launcher builds the library when a C compiler exists (`scripts/build-native-cpu.sh`) |
+| `backend.cpu.batch-int8-rows` | `3` | passes of 2–3 rows (batched decode steps of several slots, short verification runs) row by row through the native int8 kernel: x86 VM, 0.6B, a 2-row pass 46–49 ms instead of 65–68 (a lone step 27–30), each row's logits its lone step's bit for bit ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) | `3`; `0` = the float tiles (the earlier behaviour) |
 | `backend.threads` | `0` = every processor | not swept | `0`; fewer to leave cores to another program |
 | `-Djllm.cpu.fastmath` (JVM) | on | decode after a 3 023-token prompt +5–9 %, bench decode 57 → 60–62 ([07 §7.15](07-cpu-backend.md#715-fast-math-jllmcpufastmath)) | on; `false` for bit-exact comparisons |
 | `-Djllm.cpu.deterministic` (JVM) | off | prefill through the single-token kernels: slower | off; on only to compare prefill with decode bit for bit |
@@ -299,6 +300,7 @@ sums of the tiled prefill kernels were rewritten this month as a butterfly of wh
 | key | default | what it does | measured | best |
 |---|---|---|---|---|
 | `slots` (console load form, `/api/models/load`) | 1 | engines (KV caches) per model on shared weights | 2 slots: a title request no longer evicts the main conversation; 10 443 of 10 484 tokens cached, prefilled in 2.5 s (README) | **2 for agents**; more for several users |
+| `server.slots` (`./jllm serve`) | 1 | the same for the plain API server: every request picks a slot, decode steps of the slots generating together share a pass | x86 VM, 0.6B, 4 users × 64 tokens: every first token within 0.8–1.1 s instead of up to 6.2–6.5 s on one slot, 38–41 tok/s together instead of ~31 ([10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)) | **one per user expected at the same time**; 2 for one agent (a side request keeps the main conversation) |
 | `backend.kv-paged` | `auto` = paged with ≥ 2 slots | one pool of 16-position blocks + a prefix tree; identical prefixes stored once | 8 conversations sharing 4 096 tokens: 7 663 MB flat vs 1 086 MB paged; the n-th conversation's prefill CPU 24 272 → 529 ms, Metal 6 640 → 196 ms; a resent 4 160-token conversation Metal 6 315 → 32 ms; decode paged / flat 0.96–1.02 ([24 §24.5](24-paged-kv-cache.md#245-measured)) | `auto` |
 | `backend.kv-pool-tokens` | 0 (= every slot's ctx + spare) | most positions the pool keeps | not measured | raise it to keep more conversations cached than there are slots |
 | `engine.batch-decode` | `true` | slots that generate together share one forward pass | 3 slots in shared passes 177 tok/s, 181–198 with `-Djllm.metal.concurrent=batch` ([08 §8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before)) | `true` |
@@ -605,6 +607,26 @@ the files it read. The engine should read each of those tokens once, keep them, 
 | thinking | off for speed (`"enable_thinking": false`), on for hard tasks; Cline needs `chat.thinking=false` on the server | — |
 | scheduler | `slots` | `mixed` is implemented but not measured yet |
 
+### 28.6.1 Several users on one server
+
+🧸 One slot is one conversation being worked on. With one slot, users take turns: the fourth one waits for three whole answers
+before seeing a word. Give the server as many slots as users who type at the same time.
+
+```sh
+./jllm serve --server.slots 4                                    # API server: 4 users at once, steps batched, paged KV
+./jllm serve --server.slots 4 --backend.kv-dtype q8              # CPU: q8 halves the KV memory again and decodes fastest (28.4.4)
+./jllm-web/run.sh                                                # console: "slots" in the Models page's load form
+```
+
+| item | best value | why (measured, [10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)) |
+|---|---|---|
+| `server.slots` | the number of users generating at the same time (memory permitting) | 4 users × 64 tokens on the x86 VM: worst first token 0.8–1.1 s instead of 6.2–6.5 s, 38–41 tok/s together instead of ~31 |
+| `backend.kv-paged` | `auto` (paged from 2 slots) | a shared system prompt is stored and prefilled once: the second user found 716 of its 731 prompt tokens cached |
+| `backend.ctx` | `auto` | it divides the free memory by the number of slots; a fixed `--ctx` reserves `ctx` positions per slot with flat caches |
+| `server.queue-timeout-ms` | `60000` (default) | more users than slots wait this long, then get a 503 `overloaded` (also under `engine.scheduler=mixed`) |
+| `backend.cpu.batch-int8-rows` | `3` (default) | on the CPU, 2 users sharing a pass got 30–31 tok/s together where the float tiles gave 25 |
+| `engine.scheduler` | `slots` | `mixed` gives every request one queue and mixes prefill into the decode passes; correct on CPU (`ServerSlotsTest`), its speed not measured yet |
+
 ---
 
 ## 28.7 CPU-only machines: Linux, x86, Docker
@@ -723,7 +745,8 @@ What this chapter cannot recommend from data yet, each with what would decide it
 
 1. **`engine.scheduler=mixed` against `slots`**: the tables of [25 §25.5](25-scheduler.md#255-measured) are still to be filled
    on the Mac (`SchedulerBench`); its knobs (`pass-budget`, `mixed-reserve`, `background-chunk-cap`, `max-running`) are unmeasured.
-2. **Batched decoding against taking turns** on a quiet Mac ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)).
+2. **Batched decoding against taking turns** on a quiet Mac ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)), and
+   `ServerSlotsTest bench --backend metal` for `serve --server.slots` (the CPU's table is in [10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)).
 3. **Sparse attention on Metal**: the needle table and the decode speed on the GPU (the CPU's are in [27 §27.5.3](27-sparse-attention.md#2753-needle-in-a-haystack-cpu-x86-2026-10-28)
    and 27.5.4); whether 64 or 128 blocks should be the default (128 is closer in perplexity and 9 – 25 % slower per step, both are within one haystack of dense).
 4. **Tiered KV** beyond the interim 0.6B numbers, and the accuracy of `backend.kv-disk-format` q8 / q4 ("about 0.5 %" / "about 8 %").

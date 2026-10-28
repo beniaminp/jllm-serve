@@ -1,6 +1,6 @@
 # Work in progress that is not merged yet
 
-Status on 2026-10-27 (UTC); items 1–6 as of 2026-10-23, item 7 added on 2026-10-27. Everything listed here is pushed to
+Status on 2026-10-28 (UTC); items 1–6 as of 2026-10-23, item 7 added on 2026-10-27 and extended on 2026-10-28. Everything listed here is pushed to
 GitHub on a `wip/*` branch (item 7: `ccr-be155af0-ycvdp8`), so another person or agent can pick it up. `main` holds only work that passed every gate below, except item 7, which the
 owner had pushed to `main` on 2026-10-27 after the gates that run on Linux. Each `wip/*` branch has
 `main` merged in at the commit given, and none of them is on `main` unless this file says so.
@@ -57,8 +57,8 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   - `Backend.forwardMixed` on CPU and Metal: one prefill chunk plus every decode token plus every draft verification in
     one pass;
   - `BatchGroup` mixed mode with `PassPlanner` (token budget, aging);
-  - a cache-aware global admission queue in `LoadedModel`, with the `priority` classes, session limits, and preemption
-    by suspending a sequence so its blocks spill and reload;
+  - a cache-aware global admission queue (in `engine/SlotPool` since item 7, shared by the console and `serve --server.slots`),
+    with the `priority` classes, session limits, and preemption by suspending a sequence so its blocks spill and reload;
   - client-gone wake in under 60 ms;
   - tests: `SchedulerPolicyTest`, `MixedSchedulerTest`, `MixedPassChecks` in arch smoke, jllm-web `MixedSlotsTest`, and
     the `SchedulerBench` agent workload.
@@ -234,6 +234,29 @@ A change to the Metal encoder or batched rows should also pass `JAVA_OPTS=-Djllm
   experts) and refuses what llama.cpp would compute differently; `GgufFamiliesCheck` has seven new variants (F32 GGUF vs
   safetensors <= 4.9e-7; all 124 checks pass), and `scripts/arch-smoke.sh` generates them for `GgufArchSmoke` (CPU half run;
   the Metal half and `scripts/gguf-llamacpp-check.sh` are for a Mac: llama.cpp could not be built here).
+- **Several users on `./jllm serve` (at the owner's request, 2026-10-28; docs/10 §10.9c, docs/07 §7.4.1, docs/28 §28.6.1):**
+  - Before, only the console had slots; the API server ran one engine and requests took turns. `server.slots=N` (default 1 =
+    the old server) runs N engines on the shared weights through `engine/SlotPool`, the console's slot logic moved out of
+    `jllm-web`'s `LoadedModel` (which now delegates; the 62 web tests pass on it). Each request picks its slot (continuation,
+    else idle LRU, prefix copy for flat caches; under `engine.scheduler=mixed` the model's one queue), decode steps of the slots
+    share passes, the paged pool shares prefixes. `/health` reports `slots`, `busy_slots`, `queued`; `usage` adds OpenAI's
+    `prompt_tokens_details.cached_tokens` (also in the console). `server.kv-idle-release-seconds` gives idle slots' blocks back.
+  - **Mixed-scheduler bug found and fixed:** `BatchGroup.forwardBatchOf` read `tokens[0]` of a step instead of `tokens[off]`, so
+    a prompt cached up to its last token, re-run while another slot decoded, was fed its *first* token at the last position
+    (the answer began with a stray `\n\n`). `MixedSchedulerTest` checks it now (fails with the fix reverted). The same code serves
+    the console.
+  - Under `mixed`, the queue now honours `server.queue-timeout-ms` for the API server (503 `overloaded`, as the slots scheduler's
+    engine lock); the console keeps waiting while its client stays.
+  - CPU: a batched pass of 2 rows cost 2.4× a lone step with the float tiles (two users together were slower than one alone). With
+    int8 activations and the native library, passes of up to `backend.cpu.batch-int8-rows` (3) rows now run each row through the
+    single-token int8 kernel over 128 KiB chunks of weight rows: 1.7× for 2 rows, 2.4× for 3, and every row bit-identical to its
+    lone step (`NativeCpuCheck`, `BatchDecodeTest`). 0 = the old tiles. On this 4-core VM the kernel's arithmetic, not memory,
+    bounds decode, so four users get ≈ 1.3× one slot's tok/s; the larger win is the first token (≤ 1.1 s instead of up to 6.5 s).
+  - Tests: `ServerSlotsTest` (new, in `mvn test` for both schedulers: answers equal those alone over HTTP, overlap, shared passes,
+    the shared system prompt found in the pool, `/health`, the 503 when every slot is busy); `BatchDecodeTest passes` prints the
+    pass-time table. `mac-validate.sh` has `serve --server.slots` rows (Metal, CPU on/off) and the pass-time table.
+  - Left: the Metal rows of `ServerSlotsTest bench` (a Mac); a native kernel that unpacks each weight block once for several
+    tokens (the CPU's next step for batched decode); the ARM crossover of `backend.cpu.batch-int8-rows`.
 - **Gates on this branch** (Linux x86-64, Xeon with AVX-512, 4 cores, 15 GB, Temurin JDK 26.0.2; no Mac):
   - `mvn -o install`: BUILD SUCCESS. The web tests: 62 run, 0 failures. `scripts/build-metal-emu.sh`: exit 0.
     `kernel_tests.py`: 1172 ok, 0 FAIL.

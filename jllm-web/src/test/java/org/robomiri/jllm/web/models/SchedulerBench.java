@@ -6,6 +6,7 @@ import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.BatchGroup;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.Priority;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.sampling.SamplingParams;
 
 import java.nio.file.Path;
@@ -84,7 +85,7 @@ class SchedulerBench {
             SamplingParams pc = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, chatGen, List.of());
 
             // warm-up: compile the kernels, touch the weights (not measured)
-            try (LoadedModel.Slot s = lm.pick(sys)) {
+            try (SlotPool.Slot s = lm.pick(sys)) {
                 s.engine().generate(Arrays.copyOf(sys, 200), new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 8, List.of()), null, () -> false);
             }
 
@@ -182,7 +183,7 @@ class SchedulerBench {
             throws Exception {
         long t0 = System.nanoTime();
         List<Double> stamps = new ArrayList<>();
-        try (Priority.Scope ignored = Priority.enter(prio); LoadedModel.Slot slot = lm.pick(prompt, session, () -> false)) {
+        try (Priority.Scope ignored = Priority.enter(prio); SlotPool.Slot slot = lm.pick(prompt, session, () -> false)) {
             Engine.Result r = slot.engine().generate(prompt, p, piece -> stamps.add((System.nanoTime() - t0) / 1e6), () -> false);
             double ttft = stamps.isEmpty() ? (System.nanoTime() - t0) / 1e6 : stamps.getFirst();
             double[] gaps = new double[Math.max(0, stamps.size() - 1)];

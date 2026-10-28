@@ -3,6 +3,7 @@ package org.robomiri.jllm.web.tools;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.MediaPrompt;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
 import org.robomiri.jllm.tokenizer.ChatTemplate;
@@ -95,7 +96,7 @@ public final class DescribeImageTool implements Tool {
                     List.of(new ChatTemplate.Message("user", MediaChat.MARK + MediaChat.stripMarks(question))), false, List.of(img));
             SamplingParams p = new SamplingParams(0.2f, 20, 0.9f, 0f, 1.05f, 0f, 0f, -1L,
                     (int) Math.max(1, Math.min(512, engine.backend().contextLength() - mp.length() - 1)), List.of());
-            try (LoadedModel.Slot slot = model.pick(mp.identity())) {
+            try (SlotPool.Slot slot = model.pick(mp.identity())) {
                 Engine.Result r = slot.engine().generate(mp, p, null, model::closing);
                 model.record(slot, r.stats());
                 String text = r.text().strip();

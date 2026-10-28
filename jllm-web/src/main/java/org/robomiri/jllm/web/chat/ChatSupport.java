@@ -228,6 +228,7 @@ public final class ChatSupport {
                 "completion_tokens", s.generatedTokens(),
                 "total_tokens", s.promptTokens() + s.generatedTokens(),
                 "cached_tokens", s.cachedTokens(),
+                "prompt_tokens_details", Json.obj("cached_tokens", s.cachedTokens()), // where OpenAI clients read the cache hits
                 "prefill_ms", Math.round(s.prefillMs()),
                 "decode_ms", Math.round(s.decodeMs()),
                 "drafted_tokens", s.draftedTokens(),

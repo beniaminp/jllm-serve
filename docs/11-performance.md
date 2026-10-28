@@ -341,6 +341,7 @@ Optional system properties, passed through `JAVA_OPTS` (for example `JAVA_OPTS="
 | `jllm.metal.expertCountEvery` | 8 | layers whose experts are all on the GPU are counted on one forward pass in this many (1 = every pass, as `arch-smoke.sh` uses) |
 | `jllm.metal.decodeThreads` | tuned | threads per threadgroup (64, 128, 256) of the plain single-token matmul; the start-up self-check times the three on the model's own output projection and keeps the fastest per chip (bit-identical results) |
 | `jllm.engine.batchWindowMicros` | 2000 | how long a batched decode step waits for the other slots' steps ([10 §10.9b](10-engine-and-server.md#109b-batched-decoding-across-slots)) |
+| `jllm.cpu.fewRowsChunkBytes` | 131072 | weight bytes per chunk of a CPU pass of 2..`backend.cpu.batch-int8-rows` rows, re-read from L2 for every row ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows): 8 / 32 / 128 / 512 KiB measured, 128 the fastest) |
 | `jllm.metal.emulator` | false | run the Metal backend on the CPU emulator (with `jllm.metal.lib` = the emulator library; [18](18-metal-emulator.md)) |
 
 **Prefill chunk for MoE models.** With `backend.batch=auto` (the default), a mixture-of-experts model prefills in chunks

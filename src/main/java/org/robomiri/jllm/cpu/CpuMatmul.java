@@ -15,7 +15,12 @@ import org.robomiri.jllm.model.QType;
  *       activations on and a Q4_0 / Q8_0 / K-quant weight ({@link #useInt8}), one {@link Int8Kernels#dotRow} /
  *       {@link KQuantKernels#dotRow} against the activation quantized once per call ({@link #quantizeInt8}). With the
  *       native library ({@link NativeCpu}) loaded, each thread's range of rows is one call into it instead.</li>
- *   <li>{@code n > 1}: four rows are dequantized into thread-local scratch once and reused for every token
+ *   <li>{@code 1 < n <=} {@link #fewRows()} ({@code backend.cpu.batch-int8-rows}: a decode step batched across slots,
+ *       a speculative verification run, a short prefill) with the native int8 kernel for the tensor: every token is
+ *       quantized once and run through the single-token kernel, chunk of weight rows by chunk ({@link #CHUNK_BYTES}),
+ *       so a chunk read from memory serves all the tokens from the cache; each token's result is the single-token
+ *       result bit for bit (docs/07 §7.4.1).</li>
+ *   <li>{@code n > 1} otherwise: four rows are dequantized into thread-local scratch once and reused for every token
  *       ({@link VectorKernels#dot4x4} / {@link VectorKernels#dot4}); rows left over when {@code rows % 4 != 0}
  *       fall back to {@code dotRow}. With {@link CpuBackend#DETERMINISTIC} the tokens go one by one through the
  *       single-token path instead (docs/07 §7.14).</li>
@@ -38,6 +43,33 @@ final class CpuMatmul {
     /** The native int8 kernels (null: the Java ones) and their activation buffer. */
     private final NativeCpu nat;
     private final NativeCpu.Activation act = new NativeCpu.Activation();
+    /** One activation per token of a few-rows pass ({@link #mulFewNative}). */
+    private NativeCpu.Activation[] acts = new NativeCpu.Activation[0];
+
+    /**
+     * Passes of up to this many tokens run every token through the native single-token int8 kernel
+     * ({@code backend.cpu.batch-int8-rows}, {@link #configureFewRows}); 0 = the float multi-row kernels for every n > 1.
+     */
+    private static volatile int fewRows = 3;
+
+    /**
+     * Weight bytes of the row chunk a few-rows pass reuses from the cache for all its tokens: within a core's L2. Measured
+     * on Qwen3-0.6B, 4 AVX512-VNNI cores (docs/07 §7.4.1): 8 KB and 32 KB chunks slower, 512 KB no better.
+     */
+    static final long CHUNK_BYTES = Long.getLong("jllm.cpu.fewRowsChunkBytes", 128 * 1024);
+
+    /** Applies {@code backend.cpu.batch-int8-rows} (0..64) to every CPU backend of the process. */
+    static void configureFewRows(int rows) {
+        if (rows < 0 || rows > 64) {
+            throw new IllegalArgumentException("backend.cpu.batch-int8-rows must be 0..64, got " + rows);
+        }
+        fewRows = rows;
+    }
+
+    /** The current {@code backend.cpu.batch-int8-rows}. */
+    static int fewRows() {
+        return fewRows;
+    }
 
     /**
      * @param int8       quantize single-token activations to int8 and use the integer kernels for Q4_0 / Q8_0 weights
@@ -255,6 +287,10 @@ final class CpuMatmul {
             }
             return;
         }
+        if (n <= fewRows && nativeInt8(wt)) {
+            mulFewNative(wt, rows, in, out, outOff, n, acc);
+            return;
+        }
         if (KQuantKernels.supports(wt)) {
             mulPermuted(wt, rows, in, out, outOff, n, acc);
             return;
@@ -286,6 +322,39 @@ final class CpuMatmul {
                             out[o] = acc ? out[o] + v : v;
                         }
                     }
+                }
+            }
+        });
+    }
+
+    /**
+     * {@link #mul} for a few tokens with the native int8 kernel: each token quantized once (as {@link #mulOne} does), then
+     * per thread, chunk of {@link #CHUNK_BYTES} weight rows by chunk, the single-token kernel for every token. The chunk
+     * comes from memory once and from the cache for the other tokens, so the pass costs about one token's weight
+     * traffic plus the extra tokens' integer arithmetic, where the float path dequantizes every weight row first; and
+     * each token's output is {@link #mulOne}'s bit for bit (a row's dot product does not depend on the chunking).
+     */
+    private void mulFewNative(QTensor wt, int rows, float[] in, float[] out, int outOff, int n, boolean acc) {
+        int cols = wt.cols;
+        int stride = wt.rows;
+        if (acts.length < n) {
+            NativeCpu.Activation[] grown = java.util.Arrays.copyOf(acts, n);
+            for (int t = acts.length; t < n; t++) {
+                grown[t] = new NativeCpu.Activation();
+            }
+            acts = grown;
+        }
+        NativeCpu.Activation[] a = acts;
+        for (int t = 0; t < n; t++) {
+            nat.quantize(in, t * cols, cols, a[t]);
+        }
+        long rowBytes = (long) wt.blocksPerRow() * (wt.type.blockBytes + wt.type.scaleBytes);
+        int chunk = (int) Math.max(16, CHUNK_BYTES / Math.max(1, rowBytes));
+        pool.forRange(rows, 16, (r0, r1) -> {
+            for (int c0 = r0; c0 < r1; c0 += chunk) {
+                int c1 = Math.min(r1, c0 + chunk);
+                for (int t = 0; t < n; t++) {
+                    nat.dotRows(wt, c0, c1, a[t], 0, out, outOff + t * stride + c0, acc);
                 }
             }
         });

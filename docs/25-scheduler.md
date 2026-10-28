@@ -297,6 +297,7 @@ conversations are found again through the tree rather than in place.
 | `engine.preempt` | `true` | an interactive request that finds no running place pauses the background slot that started last; only with `engine.max-running < slots` |
 | `engine.session-max-running` | `0` | most slots one session (the request's `user`) holds, running or paused; `0` = no limit |
 | `slots` (console / `/api/models/load`) | `1` | 1 to 16 now (was 8); under `mixed` slots are cheap: a block table and some activation rows each, not a KV cache |
+| `server.slots` (`./jllm serve`) | `1` | the same slots for the plain API server ([10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)); there the queue honours `server.queue-timeout-ms` (a request queued longer gets the 503 `overloaded`), the console's queue waits as long as its client stays |
 | request `priority`, header `X-Jllm-Priority` | `interactive` | `interactive` or `background` ([10 §10.14](10-engine-and-server.md)) |
 | request `user` | none | the session for `engine.session-max-running` |
 
@@ -350,8 +351,19 @@ Verified by:
   leading backend rotating (once one that owns no segment): the arg max of every row must be equal and the logits within `1e-4` of the
   largest; the count of bit-identical segments is printed. Run with and without `-Djllm.metal.concurrent=true`.
 * `MixedSchedulerTest` (Qwen3-0.6B, CPU, deterministic, in `mvn test`; on the GPU in `mac-validate.sh`): a 240-token prompt's chunks
-  with two slots' decode tokens, every answer equal to the one alone; a generation paused in the middle and resumed gives the same
-  text; prompt-lookup speculation with three slots, drafts verified in shared passes, the same text as alone.
+  with two slots' decode tokens, every answer equal to the one alone; the same two chats again at once, each prompt cached up to its
+  last token, so that token is a one-token forward call at its offset in the prompt batched with the other slot's step, the same
+  answers; a generation paused in the middle and resumed gives the same text; prompt-lookup speculation with three slots, drafts
+  verified in shared passes, the same text as alone.
+* `ServerSlotsTest` (in `mvn test`, `mixed` with `-Djllm.cpu.deterministic=true`): the same over HTTP through `./jllm serve
+  --server.slots 3` ([10 §10.9c](10-engine-and-server.md#109c-several-users-at-once-serve---serverslots)), plus the 503 of a request that
+  waited in the queue longer than `server.queue-timeout-ms`.
+* **A bug these found** (fixed): a `Step` queued by `Member.forward` keeps the caller's array and an offset (`tokens[off ..]`); a
+  decode-only pass ran its steps through `forwardBatchOf`, which took `tokens[0]`. A one-token step from a decode loop has its own
+  one-element array, so this only showed when a prompt cached up to its last token re-ran that token (`forward(prompt, len − 1, 1, …)`)
+  while another slot's decode step shared the pass: the pass fed the prompt's *first* token at the last position, and the answer began
+  with a stray `\n\n`. `forwardBatchOf` (and the slots-mode loop) now read `tokens[off]`; with the fix reverted the new
+  `MixedSchedulerTest` check fails for both slots.
 * `jllm-web` `MixedSlotsTest` (fake backends whose rows are a hash of the whole prefix, so a wrong block changes the text): a pass
   carries a chunk and decode tokens and every conversation generates what it generates alone; an interactive request overtakes
   background ones; a background generation is paused for an interactive one, its blocks are spilled to the block store and

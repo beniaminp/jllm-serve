@@ -1,8 +1,8 @@
 #!/bin/bash
 # Validates the Metal features on a real Mac: first correctness on the GPU (every family, CPU == Metal), then speed:
 # each newer feature on (the default) against off, on a dense model and optionally on a mixture-of-experts model;
-# draft-model speculation (the dense model drafting for itself, adaptive length and draft pipelining on and off) and
-# batched decoding of three slots in shared passes against taking turns.
+# draft-model speculation (the dense model drafting for itself, adaptive length and draft pipelining on and off),
+# batched decoding of three slots in shared passes against taking turns, and `serve --server.slots` with 1..8 users.
 # Prints a markdown table; paste it into an issue or docs/11.
 #
 #   scripts/mac-validate.sh                                  Qwen/Qwen3-0.6B, ~25 minutes
@@ -227,6 +227,27 @@ mixedtest() { # label java-opts
 }
 mixedtest "mixed scheduler: answers equal those alone, a paused generation continues" ""
 mixedtest "mixed scheduler, concurrent encoder on" "-Djllm.metal.concurrent=true"
+# several users on `./jllm serve` (docs/10 section 10.9c): ServerSlotsTest bench streams 64 tokens for 1, 4 users on one
+# slot (server.slots=1, the old server) and 1, 2, 4, 8 users on four slots, over HTTP: tok/s of all users, first token
+serverslots() { # label settings...
+  local label="$1"; shift
+  "$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g \
+    -Djllm.metal.lib=target/native/libjllm_metal.dylib -cp target/classes:target/test-classes \
+    org.robomiri.jllm.ServerSlotsTest "models/$(echo "$DENSE" | tr / _)" bench "$@" > "$OUT/serverslots.log" 2>&1 || {
+    echo "| $label | failed | | | $(tail -1 "$OUT/serverslots.log") |"; return; }
+  grep '^| [0-9]' "$OUT/serverslots.log" | sed "s/^/| $label /"
+}
+echo
+echo "| serve --server.slots | slots | users | tok/s, all users | first token, mean / worst |"
+echo "|---|---|---|---|---|"
+serverslots "Metal" --backend metal
+serverslots "CPU, batch-int8-rows 3 (default)" --backend cpu
+serverslots "CPU, batch-int8-rows 0 (float tiles)" --backend cpu --backend.cpu.batch-int8-rows 0
+# one CPU decode pass of 1..4 rows (backend.cpu.batch-int8-rows on and off, docs/07 section 7.4.1): where the row-by-row
+# int8 kernel stops beating the float tiles on this CPU (3 on a 4-core AVX512-VNNI x86; the ARM crossover is not measured)
+echo
+"$JAVA" --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -Xmx4g -cp target/classes:target/test-classes \
+  org.robomiri.jllm.BatchDecodeTest "models/$(echo "$DENSE" | tr / _)" passes 2>/dev/null | grep '^|' || echo "| CPU pass times | failed |"
 schedbench() { # label scheduler-settings...
   local label="$1"; shift
   (cd jllm-web && mvn -o -q test -Dtest=SchedulerBench -Djllm.metal.lib="$PWD/../target/native/libjllm_metal.dylib" -Dbench.model="$DENSE" -Dbench.dir=../models -Dbench.label="$label" \

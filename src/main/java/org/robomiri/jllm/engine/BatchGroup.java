@@ -304,7 +304,7 @@ public final class BatchGroup {
             }
             if (!batched) {
                 for (Step s : batch) {
-                    s.member.inner.forward(s.tokens, 0, 1, s.pos, s.logits);
+                    s.member.inner.forward(s.tokens, s.off, 1, s.pos, s.logits);
                 }
             }
         } catch (RuntimeException e) {
@@ -323,7 +323,10 @@ public final class BatchGroup {
         }
     }
 
-    /** {@code lender.forwardBatch} over single decode steps. */
+    /**
+     * {@code lender.forwardBatch} over single decode steps. A step's token is {@code tokens[off]}: in mixed mode a one-token
+     * forward call (the last prompt token of a prompt that is cached up to it) queues the whole prompt with its offset.
+     */
     private static boolean forwardBatchOf(Backend lender, List<Step> steps) {
         int n = steps.size();
         Backend[] backends = new Backend[n];
@@ -333,7 +336,7 @@ public final class BatchGroup {
         for (int i = 0; i < n; i++) {
             Step s = steps.get(i);
             backends[i] = s.member.inner;
-            tokens[i] = s.tokens[0];
+            tokens[i] = s.tokens[s.off];
             positions[i] = s.pos;
             logits[i] = s.logits;
         }

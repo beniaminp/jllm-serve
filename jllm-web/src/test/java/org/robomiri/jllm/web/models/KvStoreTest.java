@@ -3,6 +3,7 @@ package org.robomiri.jllm.web.models;
 import org.junit.jupiter.api.Test;
 import org.robomiri.jllm.ModelLoader;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.model.Architecture;
 import org.robomiri.jllm.model.Backend;
@@ -151,7 +152,7 @@ class KvStoreTest {
     /** Runs a request on the model (pick, generate 4 tokens, record) and returns the slot's cached tokens after it. */
     private static int[] request(LoadedModel model, int[] prompt) {
         SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 4, List.of());
-        try (LoadedModel.Slot s = model.pick(prompt)) {
+        try (SlotPool.Slot s = model.pick(prompt)) {
             Engine.Result r = s.engine().generate(prompt, greedy, null, () -> false);
             model.record(s, r.stats());
             return s.engine().cachedTokens();
@@ -213,7 +214,7 @@ class KvStoreTest {
 
             // a prompt sharing the first 1500 tokens with A: only those are loaded from A's file
             int[] c = concat(Arrays.copyOf(cachedA3, 1500), tokens(r, 300));
-            try (LoadedModel.Slot s = model.pick(c)) {
+            try (SlotPool.Slot s = model.pick(c)) {
                 assertEquals(1500, s.engine().cachedLength(), "restored the shared prefix only");
                 assertEquals(1500, backend.lastLoadN.get());
                 assertEquals(cachedA3.length, backend.lastLoadStored.get(), "... of the longer saved conversation");

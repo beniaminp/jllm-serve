@@ -99,6 +99,23 @@ public final class MixedSchedulerTest {
             }
             System.out.println("     mixed passes " + (after[0] - before[0]) + ", rider rows " + (after[1] - before[1])
                     + ", chunks run in parts " + (after[2] - before[2]));
+
+            // the same two chats again, at once: each prompt is cached up to its last token, which is fed as a one-token
+            // forward call at its offset in the prompt, batched with the other slot's step (it once ran the prompt's first token)
+            CountDownLatch go = new CountDownLatch(1);
+            List<Future<String>> again = new ArrayList<>();
+            for (int i = 1; i < 3; i++) {
+                int k = i;
+                again.add(ex.submit(() -> {
+                    go.await();
+                    return engines[k].generate(prompts[k], greedy, null, () -> false).text();
+                }));
+            }
+            go.countDown();
+            for (int i = 1; i < 3; i++) {
+                check(alone[i].equals(again.get(i - 1).get()), "slot " + i + ", its prompt cached up to the last token, gives the"
+                        + " same answer alone and batched with another slot");
+            }
             ex.shutdown();
 
             // pause a generation in the middle and let it go on

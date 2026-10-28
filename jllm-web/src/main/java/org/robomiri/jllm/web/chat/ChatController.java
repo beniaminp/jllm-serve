@@ -4,6 +4,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.web.chat.ChatSupport.RequestError;
 import org.robomiri.jllm.web.models.LoadedModel;
@@ -154,9 +155,9 @@ public class ChatController {
             }
             ToolCallFormat.Holdback holdback = new ToolCallFormat.Holdback(piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)));
             Engine.Result r;
-            LoadedModel.Slot used;
+            SlotPool.Slot used;
             try (org.robomiri.jllm.engine.Priority.Scope ignored = org.robomiri.jllm.engine.Priority.enter(priority);
-                 LoadedModel.Slot slot = model.pick(prompt, null, gone); AutoCloseable alive = sse.keepAlive()) {
+                 SlotPool.Slot slot = model.pick(prompt, null, gone); AutoCloseable alive = sse.keepAlive()) {
                 used = slot;
                 Engine.TextSink sink = byName.isEmpty() ? piece -> emit(sse, failure, Json.obj("type", "delta", "content", piece)) : holdback;
                 java.util.function.BooleanSupplier cancelled = () -> failure[0] != null || sse.failed() || model.closing()

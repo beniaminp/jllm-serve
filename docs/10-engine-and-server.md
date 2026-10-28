@@ -17,7 +17,7 @@ pseudo-code, with the matching line in `generateLocked` on the right:
 
 ```
 ids = preparePrompt(ids)                                    # BOS if tokenizer.promptBos() ≥ 0; empty ⇒ [EOS]
-acquire the fair lock, at most server.queue-timeout-ms      # one KV cache ⇒ one request at a time; else 503
+acquire the fair lock, at most server.queue-timeout-ms      # one KV cache ⇒ one request at a time per slot; else 503
 if len(ids) >= ctx: error "prompt too long"
 if cancelled(): return finish = "cancelled"                 # the client left while queued
 
@@ -180,7 +180,8 @@ whatever is still pending is flushed (unless a stop string was hit).
   concurrent HTTP requests are served one at a time in arrival order, and virtual threads make the waiting cheap.
   The wait is bounded by `server.queue-timeout-ms` (default 60 s, 0 = forever): after that `generate` throws
   `Engine.OverloadedException`, which the API turns into a 503 `overloaded` instead of letting requests pile up.
-  Serving many users at once would require batching several sequences per forward pass ([11](11-performance.md)).
+  One engine is one slot: to serve several users at once, `./jllm serve --server.slots N` runs N engines on the same
+  weights and batches their decode steps into shared passes ([10.9c](#109c-several-users-at-once-serve---serverslots)).
 - **Statistics** (`Engine.Stats`): `promptTokens`, `cachedTokens`, `generatedTokens`, `prefillMs`, `decodeMs`,
   `draftedTokens`, `acceptedTokens` (speculation, 10.9), `tokPerSec()`. The CLI prints them after each answer; the API returns them inside `usage`.
 
@@ -268,7 +269,7 @@ convention is one JSON object per event and a final `data: [DONE]`. `ApiServer.s
 | `/v1/chat/completions` | POST | messages → chat template → generate |
 | `/v1/completions` | POST | raw `prompt` → generate |
 | `/v1/models` | GET | lists the loaded model id |
-| `/health` | GET | `{"status":"ok","model":…}` |
+| `/health` | GET | `{"status":"ok","model":…,"slots":N,"busy_slots":…,"queued":…}` (slots, [10.9c](#109c-several-users-at-once-serve---serverslots)) |
 | `/` (and `/index.html`) | GET | the chat page (`WebUi`) |
 | any path | OPTIONS | CORS preflight: 204, with the `Access-Control-*` headers only when `server.cors-origin` is set |
 | anything else | — | 404 JSON error; non-POST on a completion route → 405; a body that is not `application/json` → 415 |
@@ -298,10 +299,13 @@ server's defaults ([09 §9.10](09-sampling.md#910-where-each-setting-comes-from)
               "message": {"role": "assistant", "content": "Mercury, Venus, Earth."},
               "finish_reason": "stop"}],
  "usage": {"prompt_tokens": 24, "completion_tokens": 7, "total_tokens": 31,
-           "cached_tokens": 0, "prefill_ms": 96, "decode_ms": 65, "tokens_per_second": 107.7}}
+           "cached_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0},
+           "prefill_ms": 96, "decode_ms": 65, "tokens_per_second": 107.7}}
 ```
 
-`usage` carries the standard three counters plus jllm's extras (`cached_tokens`, `prefill_ms`, `decode_ms`,
+`usage` carries the standard three counters, OpenAI's `prompt_tokens_details.cached_tokens` (the prompt tokens the prefix
+cache or the paged pool already held, where OpenAI SDKs and agents read cache hits) and jllm's extras (`cached_tokens`, the
+same count at the top level, `prefill_ms`, `decode_ms`,
 `drafted_tokens`, `accepted_draft_tokens` (speculative decoding, [10.9](#109-speculative-decoding), 0 when off),
 `forced_tokens` (tokens a JSON or tool-call constraint forced and jump-forward appended without sampling,
 [17 §17.7](17-agent-speedups.md#177-constrained-tool-calls-and-jump-forward)), `tokens_per_second`), which OpenAI
@@ -695,8 +699,8 @@ passes (CPU, Qwen3-0.6B: −40 % on prose became −4 %, −37 % on a tool call 
 the same book, she can read the page once and answer all three, instead of reading it three times.
 
 📐 Generating one token means reading every weight of the model once (decode is limited by memory bandwidth, see
-[11](11-performance.md)). A server with several slots (`jllm-web`, one engine per slot) used to read them once
-per conversation. With `engine.batch-decode=true` (the default) the slots of a model form an
+[11](11-performance.md)). A server with several slots (`jllm-web`, or `./jllm serve --server.slots N`, one engine per
+slot, [10.9c](#109c-several-users-at-once-serve---serverslots)) used to read them once per conversation. With `engine.batch-decode=true` (the default) the slots of a model form an
 `engine.BatchGroup`, and the next tokens of all conversations generating at the same time come out of one pass
 (`Backend.forwardBatch`):
 
@@ -720,11 +724,16 @@ and attention run per row, each in its own conversation's cache at its own posit
 - Pipelined GPU decoding ([08 §8.16](08-metal-backend.md#816-pipelined-greedy-decoding)) is used only while a slot
   is alone in its group.
 
-**Results.** A batched step uses the multi-token kernels, which add up in a different order than the single-token
-ones on the CPU, so its logits agree with a step taken alone to rounding (with int8 activations, to the int8 rounding). The
-greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU, part of `mvn test`; 42 of the
-steps ran in shared passes). Its throughput comparison runs with a second argument, `bench`, and takes settings after it
-(`--backend metal` on a Mac, as `scripts/mac-validate.sh` runs it); it was not measured on a quiet machine yet.
+**Results.** With float activations a batched step uses the multi-token kernels, which add up in a different order than
+the single-token ones on the CPU, so its logits agree with a step taken alone to rounding. With int8 activations (the CPU
+default) and the native kernels, a pass of up to `backend.cpu.batch-int8-rows` (3) rows runs every row through the
+single-token int8 kernel ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)),
+so each row's logits are its lone step's **bit for bit**; longer passes take the float 4 × 4 tiles (int8 rounding apart). The
+greedy answers were the same in `BatchDecodeTest` (three slots on Qwen3-0.6B, CPU, part of `mvn test`; 54–56 of the steps
+ran in shared passes; it also checks the int8 bit-identity). Its throughput comparison runs with a second argument,
+`bench`, and takes settings after it (`--backend metal` on a Mac, as `scripts/mac-validate.sh` runs it). On the CPU, what
+a shared pass costs is in [07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)
+and what several HTTP users get end to end in [10.9c](#109c-several-users-at-once-serve---serverslots).
 
 **Backends.** The CPU backend implements `forwardBatch` for every attention family except DeepSeek's MLA. The Metal
 backend implements it for every attention family including MLA, with f32, f16 and q8 caches, MoE layers and experts on
@@ -740,6 +749,170 @@ either (a recurrent state cannot be rolled back).
 token of every generating slot and every speculative draft to verify go into *one* forward pass (`Backend.forwardMixed`), the requests wait in one
 queue per model instead of at a slot chosen on arrival, and a background generation can be paused (its blocks spilled) for an interactive one.
 `BatchGroup` is the same class with a mixed mode; `slots` (this section) stays the default.
+
+## 10.9c Several users at once: `serve --server.slots`
+
+### In plain words
+
+🧸 An ice-cream stand with one scoop: the second child waits until the first one's cone is completely done, and the fourth child
+waits for three whole cones before getting a single lick. Put four scoops behind the same counter, over the same tubs, and all four
+children get their first lick right away. Each time the server reaches into a tub, it fills every cone that needs that flavor, so
+the tubs (the model's weights) are opened once for everybody. And if two children ask for the same topping first (the same long
+system prompt), it is prepared once and both get it.
+
+### How it works
+
+📐 **Before.** `./jllm serve` ran one `Engine`: one KV cache behind a fair lock ([10.4](#104-cancellation-the-lock-statistics)). Concurrent
+requests were served one after another; the console (`jllm-web`) already had slots, in its own `LoadedModel`.
+
+**Now.** `server.slots=N` (default 1, which is exactly the old server):
+
+```
+Main.serve
+  ModelLoader.load(s, hub, model, N)       ctx=auto and the Metal expert budget plan N KV caches (10.13)
+  + (N − 1) × ModelLoader.extraEngine      same mapped weights, tokenizer, template, vision encoder; own backend + KV cache;
+                                           every backend joins the model's BatchGroup (engine.batch-decode)
+  SlotPool(engines, mixedConfig(s))        engine/SlotPool.java: the console's slot logic, moved to the engine (one class for both)
+  enablePagedHousekeeping(server.kv-idle-release-seconds)
+  ApiServer.onSlots(pool, …)
+
+per request (a virtual thread):
+  parse, template, tokenize, pictures      on the first engine (the tokenizer and the vision encoder are shared)
+  slot = pool.pick(ids, "user", clientGone, server.queue-timeout-ms)   in the request's priority class (10.14)
+  generate(slot.engine(), …)               the old non-streaming / streaming code, unchanged
+  slot.close()                             the next request may take it
+```
+
+**Which slot** (`SlotPool.choose`, the slots scheduler, `engine.scheduler=slots`):
+
+1. an idle slot whose whole cache the prompt continues (the next turn of its conversation) runs it in place;
+2. else the idle slot that matters least (empty, else least recently used); with flat caches the longest matching prefix
+   is first copied into it from another idle slot when that saves at least 256 tokens of prefill (`MIN_COPY`);
+3. when every slot is busy, the request waits at the engine of the slot holding the longest prefix of its prompt: that
+   engine's fair lock, at most `server.queue-timeout-ms`, then the 503.
+
+With **`engine.scheduler=mixed`** ([25](25-scheduler.md)) there is one `Admission` queue per model instead: a freed slot goes to
+the waiting request with the most cached tokens in the highest priority class, and the queue honours
+`server.queue-timeout-ms` with the same 503 (`SlotPool.pick`'s `queueTimeoutMs`; the console passes 0 and keeps waiting while
+its client stays).
+
+**What the slots share.**
+
+```
+ user A ─┐                                   ┌─ slot 0: Engine ─ CpuBackend/MetalBackend ─ block table ─┐
+ user B ─┼─ ApiServer ─ SlotPool.pick ───────┼─ slot 1: Engine ─ …                      ─ block table ─┼─ KvPool (16-position
+ user C ─┘   (virtual threads)               └─ slot 2: Engine ─ …                      ─ block table ─┘  blocks) + prefix tree
+                                                       │ │ │ decode steps of slots generating at the same time
+                                                       ▼ ▼ ▼
+                                             BatchGroup leader: one forwardBatch (weights read once for all rows)
+```
+
+- **Weights**: memory-mapped once; every slot's backend reads the same pages.
+- **KV memory**: `backend.kv-paged=auto` pages the cache from two slots on ([24](24-paged-kv-cache.md)): blocks are allocated as a
+  conversation grows, and the prefix tree lets any slot take over the blocks any other slot computed. A system prompt shared by all
+  users is stored and prefilled once. An idle slot gives its blocks back after `server.kv-idle-release-seconds` (the conversation
+  stays findable in the tree) or at once when the pool runs out.
+- **Compute**: the device lock of the `BatchGroup`. Prefill chunks take it alone (or, under `mixed`, ride in one pass with the
+  others' decode tokens); decode steps of the slots that generate at the same time are one pass ([10.9b](#109b-batched-decoding-across-slots)).
+
+**Memory, exactly.** The KV bytes of one position are `2 · layers · kvHeads · headDim · bytes(kv-dtype)`. For Qwen3-0.6B at f32:
+`2 · 28 · 8 · 128 · 4 = 229 376 B` (224 KiB). A flat cache reserves `ctx` positions per slot: 4 slots × 2 048 × 224 KiB = 1.75 GiB
+whether used or not; the paged pool holds what the conversations use, a shared prefix once. `backend.ctx=auto` divides the free
+memory by the number of slots before it picks a context ([10.13](#1013-the-default-context-length-backendctxauto)).
+
+**Throughput, exactly.** A pass of `n` decode rows costs `T(n)`; the users together get `n / T(n)` tokens per second, each user
+`1 / T(n)`. Batching pays when `T(n) < n · T(1)`. On a GPU, or a CPU whose cores outrun its memory bandwidth, decode is bound by
+reading the weights, so `T(n) ≈ T(1)` for small n. On the 4-core x86 VM below the int8 kernel itself is the limit, so the gain is
+smaller: `T(2) = 46–48 ms` against `T(1) = 27–30 ms` ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)).
+
+**Worked example** (the numbers of the table below). Four users ask at the same moment for 64 tokens each.
+- One slot: they take turns. The first user's first token comes after its prefill (≈ 0.3 s); the fourth user's after three whole
+  answers (≈ 6.2–6.5 s). The four together get ≈ 31 tok/s, a lone user's speed.
+- Four slots: all four prefill one after another (each ≈ 0.15–0.3 s), then decode together. Every first token arrives within
+  ≈ 0.8–1.1 s, and the four together get ≈ 38–41 tok/s (1.3× one slot).
+- Eight users on four slots: four run, four wait in the queue for a slot (the worst first token ≈ 6.4–7.1 s again), 40–44 tok/s.
+
+**Answers.** A user's greedy answer does not depend on who else is being served: `ServerSlotsTest` checks it over HTTP for both
+schedulers (the slots scheduler on the fast float path, the mixed scheduler with `-Djllm.cpu.deterministic=true`, whose passes also
+carry prompt chunks, [25 §25.2.9](25-scheduler.md#2529-what-the-same-as-alone-means)).
+
+### Why this design
+
+- **One `SlotPool` for `serve` and the console.** The slot policy, the prefix copy, the mixed queue and the paged housekeeping were
+  console code; moved into `engine/`, both servers run the same lines and the console's tests (`PagedSlotsTest`, `MixedSlotsTest`,
+  `KvStoreTest`) now test the API server's slot logic too.
+- **A fixed number of slots, not one engine per request.** Each slot is a KV cache: the number bounds memory, and a full server
+  answers 503 after `server.queue-timeout-ms` (backpressure) instead of slowing every user down without limit.
+- **Slots in one process, not N servers.** N processes would map the weights N times into their page tables, could not share a
+  prefix, and could not batch their decode steps.
+- **`server.slots=1` is the old server.** One slot, a flat cache (paging needs two), no queue: the request waits at the engine's fair
+  lock as before.
+
+### Settings
+
+| key | default | meaning |
+|---|---|---|
+| `server.slots` | `1` | engines (KV caches) on the shared weights, 1..64; 2+ turns on slot choice, batched decoding, the paged cache (`backend.kv-paged=auto`) and, with `engine.scheduler=mixed`, the model's one queue |
+| `server.kv-idle-release-seconds` | `120` | a paged slot idle this long gives its blocks back to the pool (the conversation stays in the prefix tree); 0 = only when the pool is full |
+| `server.queue-timeout-ms` | `60000` | how long a request waits for a slot (its engine, or the mixed queue) before the 503; 0 = forever |
+| `engine.batch-decode` | `true` | decode steps of slots generating together share one pass; `false` = one slot at a time |
+| `engine.scheduler` | `slots` | `mixed`: one queue per model, passes mixing a prefill chunk with every decode token ([25](25-scheduler.md)) |
+| `backend.kv-paged` | `auto` | paged from two slots on; `false` = one flat cache per slot (prefixes copied from slot to slot instead, ≥ 256 tokens) |
+| `backend.cpu.batch-int8-rows` | `3` | CPU passes of up to this many rows go row by row through the int8 kernel ([07 §7.4.1](07-cpu-backend.md#741-a-few-tokens-the-single-token-int8-kernel-per-token-backendcpubatch-int8-rows)) |
+
+```sh
+./jllm serve --server.slots 4                                   # four users at once, decode steps batched
+./jllm serve --server.slots 4 --engine.scheduler mixed          # one queue per model, mixed passes (docs/25)
+curl -s localhost:8080/health                                   # {"status":"ok","model":…,"slots":4,"busy_slots":0,"queued":0}
+```
+
+The model's `user` field (OpenAI's end-user id) is the session of the mixed queue's per-session limit (`engine.session-max-running`).
+
+### Measured
+
+Qwen3-0.6B Q4_0, CPU backend (Intel Xeon @ 2.80 GHz, 4 cores, AVX512-VNNI native kernels, int8 activations `auto`), each user
+streaming 64 tokens of a different story with greedy sampling, prompt lookup off; a busy shared VM, so two runs are shown:
+
+```sh
+java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp target/test-classes:target/classes \
+     org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench                                   # batch-int8-rows 3 (default)
+java … org.robomiri.jllm.ServerSlotsTest models/Qwen_Qwen3-0.6B bench --backend.cpu.batch-int8-rows 0   # float tiles for 2+ rows
+```
+
+| slots | users | tok/s, all users (run 1 / run 2) | first token, mean / worst (run 1) | tok/s with `batch-int8-rows 0` | first token, mean / worst |
+|---|---|---|---|---|---|
+| 1 | 1 | 22.6 / 24.5 | 0.31 s / 0.31 s | 28.8 | 0.24 s / 0.24 s |
+| 1 | 4 | 31.6 / 30.6 | 3.30 s / 6.23 s | 30.8 | 3.32 s / 6.49 s |
+| 4 | 1 | 26.4 / 26.8 | 0.23 s / 0.23 s | 30.9 | 0.17 s / 0.17 s |
+| 4 | 2 | **31.3 / 30.0** | 0.31 s / 0.44 s | 25.0 | 0.35 s / 0.45 s |
+| 4 | 4 | 38.2 / 38.1 | 0.60 s / 1.06 s | 40.9 | 0.48 s / 0.79 s |
+| 4 | 8 | 44.0 / 40.2 | 3.36 s / 6.40 s | 42.9 | 3.48 s / 6.83 s |
+
+Reading it: one user's speed swings between 22.6 and 30.9 tok/s from run to run on this machine, the noise of the VM. What is
+steady: with one slot the fourth user waits ≈ 6.2–6.5 s for its first token and with four slots ≈ 0.8–1.1 s; two users on four
+slots get 30–31 tok/s together where the float tiles gave 25 (less than one user alone: their 2-row pass cost more than two lone
+steps), and four users get 38–41 tok/s, 1.3× one slot. On Metal, decode is bound by memory bandwidth and three slots in shared
+passes reached 177 tok/s ([08 §8.28](08-metal-backend.md#828-the-concurrent-compute-encoder-barriers-only-where-a-kernel-needs-the-one-before));
+`serve --server.slots` on a Mac is still to be measured with this bench.
+
+### Checks and limits
+
+- `ServerSlotsTest` (in `mvn test`, twice: `slots`, and `mixed` with `-Djllm.cpu.deterministic=true`): over HTTP, three users at
+  once get the answers each gets alone; their requests overlap and their decode steps share passes (≈ 57 steps in 25 passes); a
+  second user's 731-token prompt finds 716 tokens of the first user's system prompt in the paged pool, reported in
+  `usage.cached_tokens` and `usage.prompt_tokens_details.cached_tokens`; `/health` reports the slots; with both slots busy a third
+  user gets the 503 after the 300 ms queue timeout and the busy users' answers are unaffected.
+- The mixed scheduler queued one-token forward calls by their offset in the prompt but batched them by the first token of the
+  array: a prompt cached up to its last token (the same request again, a retry) ran its first token in that position when another
+  slot's decode step shared the pass, and started its answer with stray `\n\n`. Found by this test; fixed in
+  `BatchGroup.forwardBatchOf` (`tokens[off]`); `MixedSchedulerTest` now checks it directly ([25 §25.6](25-scheduler.md#256-checks-and-limits)).
+- The console's 62 tests run on the moved `SlotPool` unchanged.
+- Limits: every slot gets the full context (`backend.ctx`), so N slots need up to N times the KV memory of one with flat caches
+  (paged: what is used). A draft model (`engine.speculative=draft`) speculates on the first slot only (`extraEngine` does not copy
+  it); prompt lookup and MTP work on every slot. A verification pass of prompt lookup takes the device alone under the slots
+  scheduler (under `mixed` it joins the shared pass). On this 4-core CPU the int8 kernel, not memory, limits decode, so batching
+  adds ≈ 30 % throughput at four users; the latency win (every user's first token at once) is the larger one. Image, video and
+  audio endpoints do not use the slots.
 
 ## 10.10 Configuration
 
@@ -792,7 +965,9 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `server.write-timeout-ms` | `10000` | how long a streamed answer may wait for a client that stopped reading before it is dropped and its generation cancelled, 0 = forever |
 | `server.max-connections` | `256` | simultaneous connections; more wait in the accept queue |
 | `server.max-body-bytes` | `4194304` | largest request body (413) |
-| `server.queue-timeout-ms` | `60000` | how long a request waits for the engine before the 503, 0 = forever |
+| `server.slots` | `1` | engines (KV caches) on the shared weights, 1..64: several users at once, decode steps batched ([10.9c](#109c-several-users-at-once-serve---serverslots)) |
+| `server.kv-idle-release-seconds` | `120` | a paged slot idle this long gives its blocks back (0 = only when the pool is full) |
+| `server.queue-timeout-ms` | `60000` | how long a request waits for its slot (the slot's engine, or the mixed scheduler's queue) before the 503, 0 = forever |
 | `server.request-timeout-ms` | `0` | wall-clock limit for one generation, 0 = none; hit = `finish_reason: "length"` |
 | `server.cors-origin` | empty | `Access-Control-Allow-Origin` value; empty = no CORS headers at all |
 | `backend.ctx` / `backend.ctx-max` | `auto` / `131072` | context length per slot; `auto` sizes it from the free memory ([10.13](#1013-the-default-context-length-backendctxauto)), a number overrides; the cap applies to `auto` only |
@@ -813,7 +988,7 @@ The `server.*` and `engine.*` keys, all of which this chapter has met:
 | `download` | fetches the inference files of `model.repo` (refuses if they do not fit on disk; use `--low-disk` with `run`/`serve` instead) |
 | `run --prompt "…"` | one chat-templated completion, streamed to stdout, statistics to stderr; `--raw` skips the template |
 | `chat` | terminal REPL with history; `/clear`, `/quit`; `--think`, `--system` |
-| `serve` | the HTTP API on `server.host:server.port` |
+| `serve` | the HTTP API on `server.host:server.port`, on `server.slots` engines ([10.9c](#109c-several-users-at-once-serve---serverslots)) |
 | `bench` | 413-token prompt, `bench.max-tokens` generated, `bench.rounds` rounds after a warm-up, prefix cache evicted between rounds |
 | `config` | prints the effective settings |
 

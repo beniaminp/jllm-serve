@@ -2,6 +2,7 @@ package org.robomiri.jllm.web.models;
 
 import org.robomiri.jllm.engine.CacheFile;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.web.WebProperties;
 import org.springframework.stereotype.Service;
 
@@ -209,7 +210,7 @@ public class KvStore {
      * Before a request runs on {@code slot}: loads the prefix of a saved cache that covers the most of {@code prompt},
      * when that beats what the slot holds. The slot's own cache is saved first if it is worth keeping.
      */
-    public void restore(LoadedModel m, LoadedModel.Slot slot, int[] prompt) {
+    public void restore(LoadedModel m, SlotPool.Slot slot, int[] prompt) {
         Engine e = slot.engine();
         if (!enabled() || !e.canPersistCache() || prompt.length <= MIN_GAIN || blockSessions(m, slot)) {
             return; // (block sessions come back through the pool's own match / adopt)
@@ -246,7 +247,7 @@ public class KvStore {
      * After a request, while its slot is still reserved: saves the slot's cache when the prefill was expensive. Only
      * the token list is taken here; the rows are written in the background.
      */
-    public void afterRequest(LoadedModel m, LoadedModel.Slot slot, Engine.Stats stats) {
+    public void afterRequest(LoadedModel m, SlotPool.Slot slot, Engine.Stats stats) {
         if (enabled() && slot.engine().canPersistCache() && stats.prefillMs() >= props.kvCacheSaveAfterMs()
                 && !slot.engine().saving()) {
             save(m, slot, "after a " + String.format("%.1f", stats.prefillMs() / 1000) + " s prefill", Mode.AFTER_REQUEST);
@@ -258,7 +259,7 @@ public class KvStore {
         if (!enabled()) {
             return;
         }
-        for (LoadedModel.Slot s : m.slots()) {
+        for (SlotPool.Slot s : m.slots()) {
             save(m, s, "on unload", Mode.NOW);
         }
     }
@@ -279,12 +280,12 @@ public class KvStore {
      * Reloading needs no file of its own: the next prompt's tokens find the blocks by their path hashes, and the engine adopts
      * them like any evicted block (prefetched, and only as far as the prompt matches).
      */
-    private boolean blockSessions(LoadedModel m, LoadedModel.Slot slot) {
+    private boolean blockSessions(LoadedModel m, SlotPool.Slot slot) {
         var seq = slot.engine().backend().kvSequence();
         return seq != null && seq.pool().spill() != null && "true".equals(m.settings().get("backend.kv-tier"));
     }
 
-    private void saveBlocks(LoadedModel m, LoadedModel.Slot slot, String why) {
+    private void saveBlocks(LoadedModel m, SlotPool.Slot slot, String why) {
         Engine e = slot.engine();
         int[] tokens = e.cachedTokens();
         if (tokens.length < props.kvCacheMinTokens()) {
@@ -301,7 +302,7 @@ public class KvStore {
     }
 
     /** Saves the slot's cache unless it is short or a saved file already holds it. */
-    void save(LoadedModel m, LoadedModel.Slot slot, String why, Mode mode) {
+    void save(LoadedModel m, SlotPool.Slot slot, String why, Mode mode) {
         Engine e = slot.engine();
         if (blockSessions(m, slot)) {
             saveBlocks(m, slot, why);
@@ -362,7 +363,7 @@ public class KvStore {
     }
 
     /** Writes the rows of a begun save and indexes the file. */
-    private void finish(LoadedModel m, LoadedModel.Slot slot, String why, Engine.PendingSave pending, String fp,
+    private void finish(LoadedModel m, SlotPool.Slot slot, String why, Engine.PendingSave pending, String fp,
                         String h, long t0, double beginMs) {
         Path file = pending.file();
         try {

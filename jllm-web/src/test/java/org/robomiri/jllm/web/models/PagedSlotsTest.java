@@ -3,6 +3,7 @@ package org.robomiri.jllm.web.models;
 import org.junit.jupiter.api.Test;
 import org.robomiri.jllm.ModelLoader;
 import org.robomiri.jllm.engine.Engine;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.kv.KvPool;
 import org.robomiri.jllm.kv.KvSequence;
@@ -175,7 +176,7 @@ class PagedSlotsTest {
 
     private static Engine.Stats request(LoadedModel model, int[] prompt, PagedBackend[] outBackend) {
         SamplingParams greedy = new SamplingParams(0f, 0, 1f, 0f, 1f, 0f, 0f, 1, 4, List.of());
-        try (LoadedModel.Slot s = model.pick(prompt)) {
+        try (SlotPool.Slot s = model.pick(prompt)) {
             Engine.Result r = s.engine().generate(prompt, greedy, null, () -> false);
             model.record(s, r.stats());
             if (outBackend != null) {

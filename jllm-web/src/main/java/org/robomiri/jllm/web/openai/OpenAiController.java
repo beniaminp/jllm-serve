@@ -5,6 +5,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import org.robomiri.jllm.config.Settings;
 import org.robomiri.jllm.engine.Engine;
 import org.robomiri.jllm.engine.MediaPrompt;
+import org.robomiri.jllm.engine.SlotPool;
 import org.robomiri.jllm.engine.TokenLogprob;
 import org.robomiri.jllm.json.Json;
 import org.robomiri.jllm.sampling.SamplingParams;
@@ -244,7 +245,7 @@ public class OpenAiController {
         int count = o.count();
 
         try (org.robomiri.jllm.engine.Priority.Scope ignored = org.robomiri.jllm.engine.Priority.enter(decoding.priority()); // the queue's class
-             LoadedModel.Slot slot = model.pick(prompt, Json.str(body, "user", null), gone)) {
+             SlotPool.Slot slot = model.pick(prompt, Json.str(body, "user", null), gone)) {
             Engine e = slot.engine();
             if (!stream) {
                 List<Engine.Result> all;
@@ -468,7 +469,7 @@ public class OpenAiController {
     }
 
     /** One line per request in the log: enough to see what an agent is doing and where the time goes. */
-    private static void log(String model, LoadedModel.Slot slot, boolean chat, int messages, int tools, int choices,
+    private static void log(String model, SlotPool.Slot slot, boolean chat, int messages, int tools, int choices,
                             Engine.Stats st, String finish) {
         System.err.printf("%s %s [slot %d] %d msg%s%s%s | prompt %d tok (%d cached) %.1f s | %d tok %.1f tok/s | %s%n",
                 chat ? "chat" : "completion", model, slot.index(), messages, messages == 1 ? "" : "s",

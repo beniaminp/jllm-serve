@@ -62,6 +62,7 @@ public final class NativeCpuCheck {
         n.setLevel(detected);
         check(n.selfCheck(), "load-time self-check");
         matmul(n);
+        fewRows(n);
         System.out.println("native cpu kernels (" + lib + ", levels " + String.join(", ", levels) + "; detected "
                 + n.name(detected) + "): " + passed + " checks passed, " + failed + " failed");
         if (failed > 0) {
@@ -229,6 +230,73 @@ public final class NativeCpuCheck {
                     check(fail, "CpuMatmul " + t + " " + rows + "x" + cols);
                 }
             }
+        }
+    }
+
+    /**
+     * {@link CpuMatmul#mul} for 2 and 3 tokens with {@code backend.cpu.batch-int8-rows} 3 (the native single-token kernel
+     * per token, weight rows in cache-sized chunks): every token's output equals its own one-token {@code mul} bit for bit,
+     * with and without accumulating, on rows that are not a multiple of the chunk; with the switch at 0 the float
+     * multi-row kernels run instead (within float rounding of the same).
+     */
+    private static void fewRows(NativeCpu n) {
+        Random rnd = new Random(12);
+        int saved = CpuMatmul.fewRows();
+        try (Arena arena = Arena.ofShared(); ThreadPool pool = new ThreadPool(3)) {
+            for (QType t : TYPES) {
+                if (NativeCpu.typeId(t) >= NativeCpu.T_Q4_1 && !n.hasKernelFor(t)) {
+                    continue;
+                }
+                int cols = t.blockSize == Ggml.QK_K ? 1024 : 1056;
+                int rows = 333;
+                QTensor w = NativeCpu.randomTensor(arena, t, rows, cols, rnd, false, false);
+                CpuMatmul mm = new CpuMatmul(pool, true, false, 4 * cols, n);
+                for (int tokens = 2; tokens <= 3; tokens++) {
+                    float[] x = new float[tokens * cols];
+                    for (int i = 0; i < x.length; i++) {
+                        x[i] = (float) rnd.nextGaussian();
+                    }
+                    for (boolean acc : new boolean[]{false, true}) {
+                        float[] base = new float[tokens * rows];
+                        for (int i = 0; i < base.length; i++) {
+                            base[i] = (float) rnd.nextGaussian();
+                        }
+                        float[] lone = base.clone();
+                        for (int k = 0; k < tokens; k++) {
+                            float[] xk = java.util.Arrays.copyOfRange(x, k * cols, (k + 1) * cols);
+                            float[] ok = java.util.Arrays.copyOfRange(base, k * rows, (k + 1) * rows);
+                            mm.mul(w, xk, ok, 0, 1, acc);
+                            System.arraycopy(ok, 0, lone, k * rows, rows);
+                        }
+                        CpuMatmul.configureFewRows(3);
+                        float[] few = base.clone();
+                        mm.mul(w, x, few, 0, tokens, acc);
+                        CpuMatmul.configureFewRows(0);
+                        float[] tiles = base.clone();
+                        mm.mul(w, x, tiles, 0, tokens, acc);
+                        String fail = null;
+                        for (int i = 0; i < lone.length && fail == null; i++) {
+                            if (Float.floatToRawIntBits(few[i]) != Float.floatToRawIntBits(lone[i])) {
+                                fail = "token " + i / rows + " row " + i % rows + ": " + few[i] + " vs " + lone[i] + " alone";
+                            }
+                        }
+                        check(fail, "CpuMatmul " + t + " " + tokens + " tokens" + (acc ? " +=" : "")
+                                + ": the few-rows path is each token's one-token result bit for bit");
+                        double worst = 0;
+                        double scale = 0;
+                        for (int i = 0; i < lone.length; i++) {
+                            worst = Math.max(worst, Math.abs(tiles[i] - lone[i]));
+                            scale = Math.max(scale, Math.abs(lone[i]));
+                        }
+                        // the float tiles see unrounded activations: int8 rounding apart (~0.4 % per element), the same sums
+                        check(worst <= 0.02 * scale ? null : "difference " + worst + " of outputs up to " + scale,
+                                "CpuMatmul " + t + " " + tokens
+                                + " tokens" + (acc ? " +=" : "") + ": with the switch off the float tiles agree");
+                    }
+                }
+            }
+        } finally {
+            CpuMatmul.configureFewRows(saved);
         }
     }
 }

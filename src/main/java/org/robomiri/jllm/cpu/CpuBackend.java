@@ -92,6 +92,15 @@ public final class CpuBackend implements Backend {
     private final LayerPlan[] plans;
 
     /**
+     * Applies {@code backend.cpu.batch-int8-rows} to every CPU backend of the process: passes of up to {@code rows} tokens
+     * (decode steps batched across slots, verification runs, short prefills) run each token through the native
+     * single-token int8 kernel, chunk of weight rows by chunk (docs/07 §7.4.1); 0 = the float multi-row kernels.
+     */
+    public static void configureBatchInt8Rows(int rows) {
+        CpuMatmul.configureFewRows(rows);
+    }
+
+    /**
      * Resolves {@code backend.cpu.int8-activations}: {@code true} / {@code false} as given, {@code auto} by timing both
      * paths on {@code w} once (see {@link CpuMatmul#int8Faster}).
      */
