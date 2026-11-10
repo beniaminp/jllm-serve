@@ -667,7 +667,7 @@ JVM's own, the heap size; [docs/10 §10.13](docs/10-engine-and-server.md#1013-th
 
 ```
 src/main/java/org/robomiri/jllm/
-  Main.java              CLI: download | run | chat | serve | bench | config
+  Main.java              CLI: download | run | chat | serve | image | video | transcribe | speak | bench | config
   ModelLoader.java       resolve / download / load a model as the settings describe (used by the CLI and jllm-web)
   config/                layered settings (jllm.properties → external file → flags)
   json/                  JSON parser & writer

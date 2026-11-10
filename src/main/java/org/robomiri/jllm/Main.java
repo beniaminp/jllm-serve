@@ -96,6 +96,8 @@ public final class Main {
                   serve      OpenAI-compatible HTTP server (--image-model <repo> adds /v1/images; --model none: images only)
                   image      generate a picture with a Stable Diffusion model (--image-model <repo|folder> --prompt "...")
                   video      generate a clip with AnimateDiff (--video-model <motion adapter repo|folder> --prompt "..." --frames 16 --fps 8 --out clip.mp4)
+                  transcribe speech to text with a Whisper model (--model <repo> --audio <file> [--language de] [--translate true] [--format text|json|srt|vtt|verbose_json] [--words true])
+                  speak      text to speech with an OuteTTS model (--model <repo> --prompt "..." [--voice <name>] [--speed 1.0] --out speech.wav)
                   bench      measure prefill/decode throughput
                   config     print the effective configuration and where each value comes from
                 options (defaults in src/main/resources/jllm.properties; override with --config <file> or flags):
