@@ -277,11 +277,24 @@ const Models = (() => {
         <td>${new Date(e.usedAt).toLocaleString()}</td></tr>`).join('')}</table>` : '<p class="empty">Nothing saved yet.</p>');
   }
 
+  // The tab asks every 1.5 s while it is visible, and most answers say what the last one said. A list is drawn
+  // again only when its data changed: drawing it replaces its elements, which drops a text selection, can take a
+  // button away under a click, and lays the tab out 40 times a minute for nothing.
+  const drawn = {};   // list -> the JSON it was last drawn from
+  function changed(what, data) {
+    const json = JSON.stringify(data ?? null);
+    if (drawn[what] === json) return false;
+    drawn[what] = json;
+    return true;
+  }
+
   async function refresh(full) {
     try {
       const [loaded, jobs] = await Promise.all([refreshLoaded(), api('/api/jobs')]);
-      renderLoaded(loaded); renderJobs(jobs);
-      api('/api/memory').then(renderMemory).catch(() => { $('#memory-list').innerHTML = ''; });
+      if (changed('loaded', loaded)) renderLoaded(loaded);
+      if (changed('jobs', jobs)) renderJobs(jobs);
+      api('/api/memory').then(m => { if (changed('memory', m)) renderMemory(m); })
+        .catch(() => { drawn.memory = undefined; $('#memory-list').innerHTML = ''; });
       // audio:begin
       window.AudioUI?.renderModelsRows();
       // audio:end
@@ -292,7 +305,7 @@ const Models = (() => {
         renderLocal(await api('/api/models/local'));
         renderKv(await api('/api/kv-cache'));
       }
-    } catch (e) { $('#loaded-list').innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+    } catch (e) { drawn.loaded = undefined; $('#loaded-list').innerHTML = `<p class="error">${esc(e.message)}</p>`; }
   }
 
   function init() {

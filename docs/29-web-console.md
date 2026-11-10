@@ -208,6 +208,11 @@ is shown again (`visibilitychange`) it refreshes the status, the models and the 
 is left open all day beside a coding agent sent about 2 000 requests an hour from the Chat tab (several times that
 from the Models tab) to a server that is busy generating; hidden, it now sends none. A generation that is running is not affected: its stream is one open response, not a timer.
 
+**The Models tab.** Its tick asks for the loaded models, the jobs and the memory report every 1.5 s, and most
+answers repeat the last one. Each list is drawn again only when its data changed (`changed()` in `models.js`
+compares the JSON with the one it was last drawn from), so a text selection survives, a button does not vanish
+under a click and the tab is not laid out 40 times a minute. The Audio rows of that tab already worked this way.
+
 **The log view.** `GET /api/logs?after=n` returns only the lines after sequence number `n`. The page used to draw
 all of them again whenever one arrived: up to 2 500 `<span>` elements every 1.5 s during a download or a
 conversion, which are exactly the moments the log is watched. `appendLog` now adds the new lines at the end and
@@ -334,5 +339,4 @@ These are application properties of the console (`jllm-web/src/main/resources/ap
   changed. It is what remains of "layout" in the table.
 * `localStorage` holds every conversation in one value (`jllm.convs`), written when a turn ends. Browsers allow
   about 5 MB; a write that does not fit is ignored, so very old conversations should be deleted or exported.
-* The Models tab draws its lists again on every tick while it is visible.
 * The effect on the tokens per second of a CPU backend that shares its cores with the browser was not measured.
