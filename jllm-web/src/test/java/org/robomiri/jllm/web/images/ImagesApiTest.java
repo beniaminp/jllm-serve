@@ -140,6 +140,13 @@ class ImagesApiTest {
         mvc.perform(post("/v1/images/edits").header("Authorization", AUTH).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"prompt\":\"x\"}"))
                 .andExpect(status().isBadRequest()).andExpect(jsonPath("$.error.message", containsString("image is required")));
+        // a file part over vision.max-image-bytes (32 MB) is refused before it is read; so is an oversized text field
+        mvc.perform(multipart("/v1/images/edits").part(new MockPart("image", "image.png", new byte[(32 << 20) + 1]))
+                        .param("prompt", "x").header("Authorization", AUTH))
+                .andExpect(status().isContentTooLarge()).andExpect(jsonPath("$.error.message", containsString("vision.max-image-bytes")));
+        mvc.perform(multipart("/v1/images/edits").part(new MockPart("image", "image.png", png))
+                        .part(new MockPart("prompt", new byte[(1 << 20) + 1])).header("Authorization", AUTH))
+                .andExpect(status().isContentTooLarge()).andExpect(jsonPath("$.error.message", containsString("prompt")));
     }
 
     private static byte[] maskBytes() {

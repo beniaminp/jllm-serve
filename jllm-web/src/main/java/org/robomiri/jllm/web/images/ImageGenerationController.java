@@ -25,10 +25,15 @@ import java.util.NoSuchElementException;
 @RestController
 public class ImageGenerationController {
 
-    private final ImageService images;
+    /** The most a text field of a multipart request may hold (the prompt and the numbers). */
+    private static final long MAX_FIELD_BYTES = 1L << 20;
 
-    public ImageGenerationController(ImageService images) {
+    private final ImageService images;
+    private final org.robomiri.jllm.web.settings.SettingsService settings;
+
+    public ImageGenerationController(ImageService images, org.robomiri.jllm.web.settings.SettingsService settings) {
         this.images = images;
+        this.settings = settings;
     }
 
     @PostMapping("/v1/images/generations")
@@ -62,8 +67,19 @@ public class ImageGenerationController {
         String ct = req.getContentType();
         try {
             if (ct != null && ct.toLowerCase(java.util.Locale.ROOT).startsWith("multipart/form-data")) {
+                // The container accepts multipart requests of gigabytes (the audio uploads need that), so the limit
+                // of a picture is checked here, before a part is read into memory: vision.max-image-bytes, the
+                // same setting as for the pictures of a chat.
+                long maxFile = settings.current().getLong("vision.max-image-bytes");
                 for (Part p : req.getParts()) {
                     String name = p.getName().endsWith("[]") ? p.getName().substring(0, p.getName().length() - 2) : p.getName();
+                    boolean isFile = p.getSubmittedFileName() != null;
+                    if (p.getSize() > (isFile ? maxFile : MAX_FIELD_BYTES)) {
+                        ChatSupport.send(res, 413, ChatSupport.error(isFile
+                                ? "the file \"" + name + "\" is larger than the limit of " + maxFile + " bytes (vision.max-image-bytes)"
+                                : "the field \"" + name + "\" is larger than " + MAX_FIELD_BYTES + " bytes", "invalid_request_error", null));
+                        return;
+                    }
                     byte[] data = p.getInputStream().readAllBytes();
                     if (p.getSubmittedFileName() != null) {
                         if (name.equals("image") && image == null) {

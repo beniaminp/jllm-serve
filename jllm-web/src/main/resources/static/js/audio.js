@@ -472,7 +472,7 @@ const AudioTab = (() => {
     onShow.audio = () => AudioState.refresh().then(() => { renderModels(); AudioEditor.shown(); });
     onTick.audio = () => AudioState.refresh();
     modelListeners.push(() => AudioState.refresh());
-    setInterval(() => { if (activeTab !== 'audio') AudioState.refresh(); }, 6000);
+    setInterval(() => { if (!document.hidden && activeTab !== 'audio') AudioState.refresh(); }, 6000);   // not from a hidden page (core.js startApp)
     AudioState.refresh();
   }
 

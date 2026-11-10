@@ -332,7 +332,9 @@ repository by its launcher).
 - **Chat**: streaming chat with any loaded model; conversations kept in the browser (searchable, renamable, grouped
   by date, exportable as Markdown); edit a message and resend, regenerate, copy; Markdown with tables and code blocks;
   Qwen3 thinking toggle (the `<think>` part is collapsible); per-chat sampling parameters and system prompt; tokens/s
-  and a context-usage meter; light / dark theme.
+  and a context-usage meter; light / dark theme. While an answer streams, finished Markdown blocks are drawn once and
+  only the block being written is drawn again, so a long answer does not slow the page down; a console in a
+  background tab stops polling the server ([docs/29](docs/29-web-console.md)).
 - **Pictures**: with a vision-language GGUF model (SmolVLM, Qwen2.5-VL, Qwen3-VL; the projector is loaded with it,
   the load form can name another or none) the chat box takes pictures: the attach button, paste and drag and drop;
   thumbnails stay in the browser, the model list shows a *vision* badge, and `image_url` parts work on `/v1/chat/completions`
@@ -465,7 +467,9 @@ saying how much is needed, instead of thrashing the garbage collector.
 The console binds to `127.0.0.1` by default: the management API can load models and delete files. Set
 `jllm.web.api-key` before exposing it; `/v1/**` and `/api/**` then need `Authorization: Bearer <key>`.
 Application settings are in `jllm-web/src/main/resources/application.properties`; `cd jllm-web && mvn test` runs
-its tests (no model needed).
+its tests (no model needed). The page's own logic has two node tests outside the Maven build,
+`node jllm-web/src/test/js/markdown-stream-test.js` and `node jllm-web/src/test/js/audio-edit-test.js`, and
+`node jllm-web/src/test/js/chat-stream-bench.js` measures the chat page in a headless Chromium ([docs/29](docs/29-web-console.md)).
 
 ## Configuration
 
@@ -666,6 +670,7 @@ src/main/java/org/robomiri/jllm/
   safetensors/           .safetensors reader (mmap + FFM)
   tokenizer/             BPE tokenizers, per-family chat templates, streaming UTF-8 decoder, the GGUF tokenizer (llama.cpp's pre-tokenizer lists, SentencePiece)
   gguf/                  GGUF reader, metadata to Architecture for each family, tensor names and fused tensors, which types run in place
+  kv/                    the paged KV cache: block pool with its prefix tree, per-conversation sequences (copy on write), tiers and spill to disk, block summaries for sparse attention (docs/24, 26, 27)
   model/                 typed Architecture + per-family parsers, quantized tensors, cache file + converter, weights, RoPE, Backend interface
   cpu/                   Vector API kernels (float, int8, K-quant and the newer ggml types), native kernels (NativeCpu), thread pool, KV caches (f32 f16 q8 q4), CPU forward pass
   metal/                 FFM bindings + Metal forward pass
@@ -680,6 +685,7 @@ src/main/native/jllm_cpu.c, jllm_cpu_arm.inc, jllm_cpu_x86.inc   native int8 dot
 src/main/resources/org/robomiri/jllm/metal/kernels.metal   GPU compute kernels
 src/main/resources/org/robomiri/jllm/metal/vision.metal    GPU kernels of the vision encoder
 src/main/resources/org/robomiri/jllm/metal/diffusion.metal  GPU kernels of the image-generation stack (own Metal library)
+src/main/resources/org/robomiri/jllm/audio/audio.metal     GPU kernels of the Whisper encoder and decoder
 docs/                    how it all works
 scripts/                 build-native.sh, arch-smoke.sh and the synthetic-model generators
 jllm-web/                Spring Boot web console + OpenAI API (separate Maven project, depends on the engine jar)
@@ -691,10 +697,12 @@ jllm-web/                Spring Boot web console + OpenAI API (separate Maven pr
     openai/              /v1 endpoints
     images/              image models in memory, /v1/images/generations and /edits, the pictures served by link
     video/               video models in memory, /v1/videos/generations and /encode, the clips served by link
+    audio/               audio models in memory, /v1/audio/transcriptions, /translations and /speech, the console's audio files
     settings/            jllm.properties view and persisted overrides
     api/                 /api management, tools and integrations (opencode, Continue, aider, Cline) endpoints, API key filter
     logs/                captured engine output
-  src/main/resources/static/   the console (plain HTML/CSS/JS modules, no build step)
+  src/main/resources/static/   the console (plain HTML/CSS/JS modules, no build step; docs/29)
+  src/test/js/           node tests of the page's pure parts (audio editing, the streaming Markdown renderer) and the chat page benchmark
   run.sh                 launcher
   agent-config.sh        writes opencode / Continue / aider settings for the running console (prints Cline's); opencode.sh = agent-config.sh opencode
 ```

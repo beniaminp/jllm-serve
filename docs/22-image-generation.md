@@ -621,7 +621,8 @@ The response lists `data[i] = {b64_json | url, seed, width, height, revised_prom
 **`POST /v1/images/edits`**: `image` and optional `mask` as multipart files (as the OpenAI SDKs send) or as base64 / data URLs in
 a JSON body, plus `prompt`, `n`, `size` (`auto` = the picture's size, ≤ 1024), the extras above, and `strength` (default 0.8; 1
 with a mask) or `upscale` (1 to 4, e.g. 2: enlarge ×2 and redraw at strength 0.35). Without a mask: image to image; with one: inpainting
-(white or transparent pixels are repainted). With an inpainting model the 9-channel route is used.
+(white or transparent pixels are repainted). With an inpainting model the 9-channel route is used. In the console a multipart
+file larger than `vision.max-image-bytes` (32 MB by default) is refused with a 413 before it is read ([29 §29.8](29-web-console.md#298-checks-and-limits)).
 
 **Streaming** (`"stream": true`): server-sent events `image_generation.progress` `{image, step, steps}`,
 `image_generation.partial_image` (a small PNG preview of the current estimate, made by a 4 × 3 matrix from the latents — no VAE —

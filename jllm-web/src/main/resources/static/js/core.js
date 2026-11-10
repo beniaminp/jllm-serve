@@ -115,11 +115,20 @@ async function refreshLoaded() {
   return loadedModels;
 }
 
+// The timers below ask the server only while the page is visible: a console left open in a background tab or a
+// minimized window sends nothing (the status every 5 s, the visible tab every 1.5 s and the loaded models every
+// 6 s add up, and each request wakes the server). Showing the page again refreshes everything at once.
 function startApp() {
   applyTheme(store.get('jllm.theme', 'auto'));
   refreshStatus(); refreshLoaded();
-  setInterval(refreshStatus, 5000);
-  setInterval(() => onTick[activeTab]?.(), 1500);
-  setInterval(() => { if (activeTab !== 'models') refreshLoaded(); }, 6000);
+  setInterval(() => { if (!document.hidden) refreshStatus(); }, 5000);
+  setInterval(() => { if (!document.hidden) onTick[activeTab]?.(); }, 1500);
+  setInterval(() => { if (!document.hidden && activeTab !== 'models') refreshLoaded(); }, 6000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    refreshStatus();
+    if (activeTab !== 'models') refreshLoaded();   // the Models tab's own tick reloads them
+    onTick[activeTab]?.();
+  });
   showTab(location.hash.slice(1) || 'chat');
 }

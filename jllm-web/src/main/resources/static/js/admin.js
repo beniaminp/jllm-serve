@@ -55,24 +55,42 @@ const Admin = (() => {
   async function pollLogs() {
     try {
       const r = await api('/api/logs?after=' + logAfter);
-      if (r.last < logAfter) logLines = []; // the server restarted
+      const restarted = r.last < logAfter;
+      if (restarted) logLines = [];
       logLines.push(...r.lines);
       if (logLines.length > 4000) logLines = logLines.slice(-4000);
       logAfter = r.last;
       $('#log-pending').textContent = r.pending;
-      if (r.lines.length || !$('#log').childNodes.length) renderLog();
+      if (restarted || !$('#log').childNodes.length) renderLog();
+      else if (r.lines.length) appendLog(r.lines);
     } catch { /* the status line shows it */ }
   }
 
+  const LOG_SHOWN = 2500;   // lines on the page; logLines keeps a few more for the filter
+
+  function logHtml(lines, f) {
+    const mark = f && new RegExp(f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[&<>"']/g, c => esc(c)), 'gi');
+    return lines.map(l => `<span class="${l.stream}">${mark ? esc(l.text).replace(mark, m => `<mark>${m}</mark>`) : esc(l.text)}\n</span>`).join('');
+  }
+
+  // everything again: the first time, when the filter changes, after "clear" and after a server restart
   function renderLog() {
     const f = $('#log-filter').value.toLowerCase();
     const pre = $('#log');
     const shown = f ? logLines.filter(l => l.text.toLowerCase().includes(f)) : logLines;
-    pre.innerHTML = shown.slice(-2500).map(l => {
-      let t = esc(l.text);
-      if (f) t = t.replace(new RegExp(f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/[&<>"']/g, c => esc(c)), 'gi'), m => `<mark>${m}</mark>`);
-      return `<span class="${l.stream}">${t}\n</span>`;
-    }).join('');
+    pre.innerHTML = logHtml(shown.slice(-LOG_SHOWN), f);
+    if ($('#log-follow').checked) pre.scrollTop = pre.scrollHeight;
+  }
+
+  // the lines of one poll go under the ones shown (one span per line), the oldest leave at the top: a busy log
+  // costs the new lines per poll, not the 2500 shown ones
+  function appendLog(lines) {
+    const f = $('#log-filter').value.toLowerCase();
+    const pre = $('#log');
+    const add = f ? lines.filter(l => l.text.toLowerCase().includes(f)) : lines;
+    if (!add.length) return;
+    pre.insertAdjacentHTML('beforeend', logHtml(add.slice(-LOG_SHOWN), f));
+    while (pre.childElementCount > LOG_SHOWN) pre.firstElementChild.remove();
     if ($('#log-follow').checked) pre.scrollTop = pre.scrollHeight;
   }
 

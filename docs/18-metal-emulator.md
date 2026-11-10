@@ -15,7 +15,7 @@ generation kernels; `ggml_ref.py`, numpy decoders of the newer GGUF block format
 🧸 You want to check that a recipe for a giant bakery works, but you only have a tiny home kitchen. So you follow
 the same recipe, one tray at a time, very slowly. The cake is the same; it just takes longer.
 
-📐 The Metal backend's kernels are about 7 200 lines of GPU code (`kernels.metal` 5 243 lines, `diffusion.metal` 1 059, `vision.metal` 547, `audio.metal` 366, at this writing; the first version of this chapter covered 2 700). Without the emulator, every change to them could
+📐 The Metal backend's kernels are about 7 900 lines of GPU code (`kernels.metal` 5 943 lines, `diffusion.metal` 1 059, `vision.metal` 547, `audio.metal` 366, at this writing; the first version of this chapter covered 2 700). Without the emulator, every change to them could
 only be tested on a Mac, by hand. With it, the **unchanged** `MetalBackend` Java code runs on Linux (or a Mac)
 against a library that has the same C functions as the real Objective-C shim, and the full cross-check of
 `ArchSmoke` — every model family, CPU logits vs Metal logits — runs anywhere:

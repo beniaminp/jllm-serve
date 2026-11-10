@@ -5,8 +5,9 @@ const Chat = (() => {
   let convs = store.get('jllm.convs', []);
   let currentId = store.get('jllm.current', null);
   let availableTools = [];   // from /api/tools
-  let running = null;        // {abort, conv, live, calls: {id: {status, result}}}
+  let running = null;        // {abort, conv, text, calls: {id: 'running'|'done', id + ':r': {ms, error}}, error, toolRunning}
   let frame = 0;
+  let liveView = null;       // the DOM of the turn being generated (paintLive)
 
   const PARAMS = ['temperature', 'top_p', 'top_k', 'min_p', 'max_tokens', 'repetition_penalty', 'presence_penalty', 'seed'];
   const SUGGESTIONS = [
@@ -94,15 +95,14 @@ const Chat = (() => {
       : {think: t.slice(open + 7, close), rest: t.slice(close + 8), open: false};
   }
 
-  function assistantHtml(text, streaming) {
-    const {think, rest, open} = splitThink(text);
+  // a finished assistant message (the one being generated is painted by paintLive)
+  function assistantHtml(text) {
+    const {think, rest} = splitThink(text);
     let html = '';
     if (think != null && think.trim()) {
-      html += `<details class="think"${open ? ' open' : ''}><summary>${open ? '<span class="spinner"></span> Thinking…' : 'Thought process'}</summary>`
-        + `<div class="think-body">${esc(think.trim())}</div></details>`;
+      html += `<details class="think"><summary>Thought process</summary><div class="think-body">${esc(think.trim())}</div></details>`;
     }
-    html += `<div class="md">${Markdown.render(rest.replace(/^\s+/, ''))}</div>`;
-    return html + (streaming && !open ? '<span class="cursor"></span>' : '');
+    return html + `<div class="md">${Markdown.render(rest.replace(/^\s+/, ''))}</div>`;
   }
 
   function toolCardHtml(call, result, status) {
@@ -139,22 +139,63 @@ const Chat = (() => {
     return out;
   }
 
-  function assistantTurnHtml(msgs, live) {
+  // the messages a turn already has: answers, tool cards (calls: the state of the tools of a running turn)
+  function assistantTurnHtml(msgs, calls) {
     const results = {};
     for (const m of msgs) if (m.role === 'tool') results[m.tool_call_id] = {content: m.content, error: m.error, ms: m.ms};
     let html = '';
     for (const m of msgs) {
       if (m.role !== 'assistant') continue;
-      if (m.content) html += assistantHtml(m.content, false);
-      for (const c of m.tool_calls || []) html += toolCardHtml(c, results[c.id], live?.calls?.[c.id]);
+      if (m.content) html += assistantHtml(m.content);
+      for (const c of m.tool_calls || []) html += toolCardHtml(c, results[c.id], calls?.[c.id]);
       if (m.error) html += `<div class="error">${esc(m.error)}</div>`;
     }
-    if (live) {
-      if (live.text) html += assistantHtml(live.text, true);
-      else if (!live.toolRunning) html += '<span class="cursor"></span>';
-      if (live.error) html += `<div class="error">${esc(live.error)}</div>`;
-    }
     return html;
+  }
+
+  // The bubble of the turn being generated. It is painted once per animation frame while tokens arrive, so it
+  // must not cost in proportion to what the turn already shows. Two parts, both display: contents:
+  //   .settled  the turn's finished messages and tool cards; rendered again only when a message arrives or a
+  //             tool changes state (so the pictures and clips of a tool result are not reloaded on every token)
+  //   .live     the text being generated, on nodes that stay: the reasoning grows by appending to one text
+  //             node, the answer goes through Markdown.stream (finished blocks are rendered once), the cursor
+  //             and the error are shown or hidden
+  function paintLive(bubble, msgs) {
+    const live = running;
+    if (liveView?.bubble !== bubble) {
+      bubble.innerHTML = '<div class="settled"></div><div class="live"><details class="think hidden"><summary></summary>'
+        + '<div class="think-body"></div></details><div class="md"></div><span class="cursor"></span><div class="error hidden"></div></div>';
+      const [think, md, cursor, error] = bubble.lastChild.children;
+      liveView = {bubble, settled: bubble.firstChild, think, thinkBody: think.lastChild, md, cursor, error,
+        stream: Markdown.stream(md), key: null, thinkText: '', thinking: null};
+    }
+    const v = liveView;
+    const key = msgs.length + '|' + JSON.stringify(live.calls);
+    if (key !== v.key) {
+      const openCards = [...v.settled.querySelectorAll('details')].map(d => d.open);   // keep what the user expanded
+      v.settled.innerHTML = assistantTurnHtml(msgs, live.calls);
+      v.settled.querySelectorAll('details').forEach((d, i) => { if (openCards[i]) d.open = true; });
+      v.key = key;
+    }
+    const {think, rest, open} = splitThink(live.text);
+    const thought = think == null ? '' : think.trim();
+    v.think.classList.toggle('hidden', !thought);
+    if (!thought) {
+      v.thinkText = ''; v.thinking = null;
+    } else {
+      if (open !== v.thinking) {   // open while it thinks, folded once the answer starts; in between the user decides
+        v.think.open = open;
+        v.think.firstChild.innerHTML = open ? '<span class="spinner"></span> Thinking…' : 'Thought process';
+        v.thinking = open;
+      }
+      if (v.thinkText && thought.startsWith(v.thinkText) && v.thinkBody.firstChild) v.thinkBody.firstChild.appendData(thought.slice(v.thinkText.length));
+      else v.thinkBody.textContent = thought;
+      v.thinkText = thought;
+    }
+    v.stream.update(rest.replace(/^\s+/, ''));
+    v.cursor.classList.toggle('hidden', live.text ? open : live.toolRunning);
+    v.error.classList.toggle('hidden', !live.error);
+    if (live.error) v.error.textContent = live.error;
   }
 
   function renderMessages() {
@@ -183,10 +224,11 @@ const Chat = (() => {
     const live = running?.conv === c && isLast ? running : null;
     const lastMsg = t.msgs[t.msgs.length - 1];
     const model = t.msgs.find(m => m.model)?.model || (live && $('#chat-model').value) || 'assistant';
-    el.innerHTML = `<div class="who">${esc(model)}</div><div class="bubble">${assistantTurnHtml(t.msgs, live)}</div>`
+    el.innerHTML = `<div class="who">${esc(model)}</div><div class="bubble">${live ? '' : assistantTurnHtml(t.msgs)}</div>`
       + `<div class="stats">${live ? '' : esc(statsLine(lastMsg?.usage, lastMsg?.finish && lastMsg.finish !== 'stop' ? 'finish: ' + lastMsg.finish : ''))}</div>`
       + (live ? '' : `<div class="actions"><button data-a="copy">copy</button>${isLast ? '<button data-a="regen">regenerate</button>' : ''}</div>`);
-    if (!live) {
+    if (live) paintLive(el.querySelector('.bubble'), t.msgs);
+    else {
       const text = t.msgs.filter(m => m.role === 'assistant').map(m => splitThink(m.content).rest.trim()).filter(Boolean).join('\n\n');
       el.querySelector('[data-a=copy]').onclick = e => copyText(text, e.target);
       el.querySelector('[data-a=regen]')?.addEventListener('click', () => regenerate(c));
@@ -224,14 +266,12 @@ const Chat = (() => {
       const box = $('#messages');
       const c = running?.conv;
       if (!c || c.id !== currentId) return;
-      const last = box.lastElementChild;
-      if (!last || !last.classList.contains('assistant')) { renderMessages(); return; }
+      const bubble = box.lastElementChild?.classList.contains('assistant') ? box.lastElementChild.querySelector('.bubble') : null;
+      if (!bubble || liveView?.bubble !== bubble) { renderMessages(); return; }   // not the running turn's bubble: build it
       const ts = turns(c.messages);
       const t = ts[ts.length - 1]?.role === 'assistant' ? ts[ts.length - 1] : {msgs: []};
       const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-      const openCards = [...last.querySelectorAll('details')].map(d => d.open);
-      last.querySelector('.bubble').innerHTML = assistantTurnHtml(t.msgs, running);
-      last.querySelectorAll('details').forEach((d, i) => { if (openCards[i] && !d.classList.contains('think')) d.open = true; });
+      paintLive(bubble, t.msgs);
       if (stick) box.scrollTop = box.scrollHeight;
     });
   }
@@ -343,6 +383,7 @@ const Chat = (() => {
     }
     if (last) { last.usage = usageTotal; last.finish = finish; }
     running = null;
+    liveView = null;
     setBusy(false);
     save(); renderConvs(); renderMessages();
   }

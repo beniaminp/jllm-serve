@@ -64,7 +64,10 @@ const Markdown = (() => {
       if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { flush(); out.push('<hr>'); continue; }
       if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
         flush();
-        const rows = [];
+        // the header and the separator are taken as they are: a separator without a leading pipe ("---", "--- | ---")
+        // is not a row for the loop below, and a table of one line has no separator to read the alignment from
+        const rows = [lines[i], lines[i + 1]];
+        i += 2;
         while (i < lines.length && /^\s*\|.*\|?\s*$/.test(lines[i]) && lines[i].includes('|')) rows.push(lines[i++]);
         i--;
         out.push(table(rows));
@@ -82,15 +85,17 @@ const Markdown = (() => {
       if (li) {
         flush();
         const ordered = /\d/.test(li[2]);
+        const first = ordered ? parseInt(li[2], 10) : 1;   // "3." starts the list at 3
         const items = [];
         while (i < lines.length) {
           const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
           if (m) { items.push({depth: m[1].length >= 2 ? 1 : 0, text: m[3]}); i++; continue; }
-          if (/^\s{2,}\S/.test(lines[i]) && items.length) { items[items.length - 1].text += '<br>' + lines[i].trim(); i++; continue; }
+          // an indented line continues the item, except a code fence: that ends the list and becomes a code block
+          if (/^\s{2,}\S/.test(lines[i]) && items.length && !/^\s*```/.test(lines[i])) { items[items.length - 1].text += '<br>' + lines[i].trim(); i++; continue; }
           break;
         }
         i--;
-        let html = ordered ? '<ol>' : '<ul>';
+        let html = ordered ? (first === 1 ? '<ol>' : `<ol start="${first}">`) : '<ul>';
         let nested = false;
         for (const it of items) {
           if (it.depth && !nested) { html += '<ul>'; nested = true; }
@@ -113,5 +118,62 @@ const Markdown = (() => {
     if (b) copyText(b.closest('.codeblock').querySelector('code').textContent, b);
   });
 
-  return {render};
+  // ---------------------------------------------------------------- streaming
+  //
+  // While an answer streams, rendering the whole text again for every frame costs O(length) per frame, so
+  // O(length^2) for the answer, and replacing the HTML drops the selection and re-lays out every block. A stream
+  // renders each block once instead. render() treats its input line by line and every construct (paragraph, list,
+  // table, quote) ends at a blank line, except a fenced code block, which may contain blank lines. So for a
+  // blank line that is outside a fence, render(a + blank + b) === render(a) + render(b): the text before the last
+  // such line is "settled" (appended to the element once, never touched again) and only the tail after it is
+  // rendered again as it grows.
+  //
+  //   const s = Markdown.stream(el);   // el: an empty element, typically <div class="md">
+  //   s.update(text);                  // text so far; a text that does not extend the previous one starts over
+  //
+  // The element then holds the settled blocks followed by <div class="md-tail"> (display: contents) with the tail.
+  const FENCE_OPEN = /^\s*```/, FENCE_CLOSE = /^\s*```\s*$/, BLANK = /^\s*$/;
+
+  // Length of the longest prefix of src (from offset `from`, which is the start of a block outside a fence) that
+  // ends just after a blank line outside a fence; `from` when there is none.
+  function settledEnd(src, from) {
+    let end = from, inFence = false, pos = from;
+    while (pos < src.length) {
+      const nl = src.indexOf('\n', pos);
+      if (nl < 0) break;                 // the last line is still being written
+      const line = src.slice(pos, nl);
+      if (inFence) { if (FENCE_CLOSE.test(line)) inFence = false; }
+      else if (FENCE_OPEN.test(line)) inFence = true;
+      else if (BLANK.test(line)) end = nl + 1;
+      pos = nl + 1;
+    }
+    return end;
+  }
+
+  function stream(el) {
+    let settled = '';                    // the source already rendered into settled blocks
+    let tailSrc = null;                  // the source the tail shows
+    let tail = null;
+    const reset = () => {
+      el.innerHTML = '<div class="md-tail"></div>';
+      tail = el.firstChild;
+      settled = ''; tailSrc = null;
+    };
+    reset();
+    return {
+      update(src) {
+        if (!src.startsWith(settled)) reset();
+        const end = settledEnd(src, settled.length);
+        if (end > settled.length) {
+          tail.insertAdjacentHTML('beforebegin', render(src.slice(settled.length, end)));
+          settled = src.slice(0, end);
+          tailSrc = null;
+        }
+        const rest = src.slice(settled.length);
+        if (rest !== tailSrc) { tail.innerHTML = render(rest); tailSrc = rest; }
+      },
+    };
+  }
+
+  return {render, stream, settledEnd};
 })();

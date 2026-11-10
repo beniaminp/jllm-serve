@@ -29,6 +29,7 @@ final class WebUi {
               msgs.push({role:'user',content:text});
               log.insertAdjacentHTML('beforeend','<div class="u">you: '+esc(text)+'</div>');
               const a=document.createElement('div');a.className='a';a.textContent='assistant: ';log.appendChild(a);
+              const out=a.appendChild(document.createTextNode('')); // each piece is appended to this node: no rewrite of the whole answer per token
               let full='',usage=null,err=null;
               try{
                 const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -40,8 +41,9 @@ final class WebUi {
                     let i;while((i=buf.indexOf('\\n\\n'))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+2);
                       if(!line.startsWith('data: '))continue;const d=line.slice(6);if(d==='[DONE]')continue;
                       const j=JSON.parse(d);if(j.error){err=j.error.message||'error';break read;}
-                      const c=j.choices?.[0]?.delta?.content;if(c){full+=c;a.textContent='assistant: '+full;}
-                      if(j.usage)usage=j.usage;window.scrollTo(0,document.body.scrollHeight);}}
+                      const c=j.choices?.[0]?.delta?.content;if(c){full+=c;out.appendData(c);}
+                      if(j.usage)usage=j.usage;}
+                    window.scrollTo(0,document.body.scrollHeight);}
                 }
               }catch(e){err=String(e);}
               // keep the history consistent: no empty assistant turn, and a failed user turn is not re-sent

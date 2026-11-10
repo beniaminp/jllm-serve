@@ -167,6 +167,9 @@ pre.code { background: var(--code); padding: 12px; border-radius: 8px; overflow:
 .actions button:hover { color: var(--text); background: var(--panel-2); }
 .stats { font-size: 11px; color: var(--muted); margin-top: 4px; }
 .md p { margin: 0 0 10px; } .md > :last-child { margin-bottom: 0; }
+/* the turn being generated (chat.js paintLive, markdown.js stream): wrappers that add no box of their own */
+.bubble > .settled, .bubble > .live, .md > .md-tail { display: contents; }
+.md > .md-tail > :last-child, .md > :has(+ .md-tail:empty) { margin-bottom: 0; }
 .md h1, .md h2, .md h3, .md h4 { margin: 14px 0 6px; line-height: 1.3; } .md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15px; }
 .md ul, .md ol { margin: 0 0 10px; padding-left: 22px; } .md li { margin: 2px 0; }
 .md blockquote { margin: 0 0 10px; padding: 2px 12px; border-left: 3px solid var(--border); color: var(--muted); }
