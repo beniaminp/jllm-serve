@@ -614,7 +614,12 @@ The MLA latent KV cache of DeepSeek models is much smaller than a plain one (V2-
 
 ## Tests
 
+The engine's tests run on real weights: download Qwen3-0.6B once (1.5 GB, into `models/Qwen_Qwen3-0.6B`) before the
+first `mvn test`; without it the first test stops with that instruction. `-Djllm.test.model=<folder>` names another
+copy. Everything else the tests need is in the repository (tiny synthetic models) or built by them.
+
 ```sh
+./jllm download --model Qwen/Qwen3-0.6B   # once
 mvn test                   # SmokeTest + ServerTest + MetalParamsTest + the GGUF checks (plain main() classes, no test framework)
 sh scripts/arch-smoke.sh   # 21 synthetic models x 5 formats, CPU == Metal (MoE also with experts on the CPU); DeepSeek vs float64
 METAL_EMU=1 sh scripts/arch-smoke.sh            # the same on any OS, Metal side on the CPU emulator (needs clang++, python3)

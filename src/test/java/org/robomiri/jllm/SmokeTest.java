@@ -45,6 +45,11 @@ public final class SmokeTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Path.of(args.length > 0 ? args[0] : "models/Qwen_Qwen3-0.6B");
+        if (!java.nio.file.Files.isRegularFile(dir.resolve("tokenizer.json"))) { // say what is missing, not a stack trace
+            System.err.println("The tests run on Qwen3-0.6B, which is not in " + dir.toAbsolutePath()
+                    + ". Download it once (1.5 GB): ./jllm download --model Qwen/Qwen3-0.6B");
+            System.exit(2);
+        }
         json();
         Q2KCheck.run();
         Q6KCheck.run();
