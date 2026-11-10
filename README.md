@@ -384,8 +384,11 @@ repository by its launcher).
   force the call, the fixed parts (`{"name": "`, `", "arguments": `, `}</tool_call>`, …) are appended in one pass
   without sampling, and `response_format` may be combined with `tools` (calls or that JSON). `POST /api/chat` is the console's chat with server-side
   tools (an event stream). The management API: `/api/models/load|download|loaded|local`, `/api/hub/inspect`,
-  `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`,
-  `/api/kv-cache` (`GET`, `POST /save`, `DELETE`).
+  `/api/jobs`, `/api/tools` (`/settings`, `/call`, `/mcp`), `/api/settings`, `/api/logs`, `/api/status`, `/api/memory`
+  (what each loaded model keeps where), `/api/kv-cache` (`GET`, `POST /save`, `DELETE`), `/api/images` (upload a picture for
+  `describe_image`), `/api/audio/models|voices|files` and `/api/integrations/opencode|continue|aider|cline` (the files of the
+  Connect tab). The media endpoints are `/v1/images/generations|edits`, `/v1/videos/generations|encode` and
+  `/v1/audio/transcriptions|translations|speech`.
 
 Function calling uses the Hermes / Qwen format (`<tools>` in the system prompt, `<tool_call>` blocks in the answer,
 `<tool_response>` for results), which Qwen2.5 and Qwen3 were trained on; other families follow it less reliably, and
