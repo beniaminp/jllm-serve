@@ -294,7 +294,7 @@ so the per-weight work is "convert a 0…3 code to float, multiply-add with x" �
 `−8`. (With int8 activations, as llama.cpp uses on ARM, this is a much bigger win: `q·x` becomes an integer
 dot product and `Σx` per sub-block is precomputed once per activation vector as the "block sums". This project
 does **not** do that for Q2_K: `Int8Kernels` has kernels for Q4_0 and Q8_0 only (`CpuMatmul.useInt8`), so with
-`backend.cpu.int8-activations=true` (the default) Q4_0 / Q8_0 matmuls take the integer path
+`backend.cpu.int8-activations` on (`true`, or the default `auto` when it measures int8 as the faster one at load) Q4_0 / Q8_0 matmuls take the integer path
 ([07 §7.10](07-cpu-backend.md#710-int8-activations-integer-dot-products-int8kernels)) while Q2_K rows still use the
 f32 kernel below. In the f32 kernel the saving is the per-weight `fma(dl, q, −ml)` that direct dequantization
 would need; the `Σx` adds cost about as much, so the two forms are close — the algebra is what an int8 Q2_K
