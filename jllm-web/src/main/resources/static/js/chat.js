@@ -17,7 +17,16 @@ const Chat = (() => {
     {title: 'Write code', text: 'Write a Java record for a 2D vector with add, dot and length methods.'},
   ];
 
-  const save = () => { store.set('jllm.convs', convs); store.set('jllm.current', currentId); };
+  // A browser keeps about 5 MB per origin. When the conversations no longer fit, the write fails and a reload
+  // would show the state of the last write that fit: say so (once, until a write works again) instead of losing
+  // turns silently.
+  let saveFailed = false;
+  const save = () => {
+    const ok = store.set('jllm.convs', convs);
+    store.set('jllm.current', currentId);
+    if (!ok && !saveFailed) toast('The browser storage is full: this chat is not saved. Export or delete old chats to make room.', 'err', 12000);
+    saveFailed = !ok;
+  };
   const current = () => convs.find(c => c.id === currentId);
 
   function newConv(focus = true) {

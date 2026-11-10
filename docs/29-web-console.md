@@ -338,5 +338,7 @@ These are application properties of the console (`jllm-web/src/main/resources/ap
 * Scrolling to the end reads the height of the message list once per frame, which makes the browser lay out what
   changed. It is what remains of "layout" in the table.
 * `localStorage` holds every conversation in one value (`jllm.convs`), written when a turn ends. Browsers allow
-  about 5 MB; a write that does not fit is ignored, so very old conversations should be deleted or exported.
+  about 5 MB per origin. A write that does not fit used to be ignored, and a reload then showed the conversations
+  as they were at the last write that fit; the chat now says that the storage is full (once, until a write works
+  again). Moving the conversations to IndexedDB, as the pictures and clips are, would lift the limit.
 * The effect on the tokens per second of a CPU backend that shares its cores with the browser was not measured.
