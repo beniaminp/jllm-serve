@@ -21,12 +21,13 @@ acceptance tests), how to prove the port matches the original, and the effort in
 | Java to port | ~73k lines of engine code, ~29k lines of test/bench programs (94 files, 81 with a `main`), ~9k lines of jllm-web Java plus ~3k of its tests; ~114k in all. Also ~1.3k lines of C and 575 of Objective-C |
 | Reusable as is | ~7.9k lines of Metal shaders (`metal/kernels.metal`, `diffusion.metal`, `vision.metal`: 7.5k; `audio/audio.metal`: 366), the Metal emulator (`scripts/metal-emu/`), all Python reference scripts and checked-in fixtures, the web console's static JS/CSS/HTML (~8.6k lines), the docs |
 | Expected Rust size | ~0.8–1.0× the Java line count |
-| Effort | **~130–150 engineer-weeks** for full parity (the work packages of §30.9 add up to 144), or about 2.5–3 person-years. A line-rate cross-check gives ~95–125 as the optimistic end (§30.10). A team of 4 would need **~10–12 months**, with Apple Silicon hardware available |
+| Effort | **~125–150 engineer-weeks** for full parity (the work packages of §30.9 add up to 140), or about 2.5–3 person-years. A line-rate cross-check gives ~95–125 as the optimistic end (§30.10). A team of 4 would need **~10–12 months**, with Apple Silicon hardware available |
 | Reduced scope | ~100 engineer-weeks for the LLM server only (CPU + Metal, GGUF + safetensors, OpenAI API, `./jllm serve`), without diffusion/video/audio/vision and without porting the Spring console |
 | First results | first greedy token on the CPU after porting ~14k Java lines; first served chat completion after ~4.5k more; first Metal token after ~5.3k more (§30.9.3) |
 | Hardest parts | (1) the unsafe boundary where kernels and the GPU write KV blocks while the pool's refcount protocol keeps them safe; (2) tokenizer regex/Unicode parity; (3) the volume of quant formats × kernels × model families; (4) scheduler timing semantics; (5) Metal host code that must match shader parameter layouts exactly; (6) a `Backend` interface whose batched passes hand one backend the caches of several others (§30.4) |
 | What gets better | no JIT warm-up (docs/07 §7.10 reports the Vector API 500–1000× slower in the interpreter and C1), no FFM layer, a single static binary instead of a JDK, AVX-512 VNNI / dotprod usable directly in the language, predictable memory without `-Xmx` / `MaxDirectMemorySize` tuning, core pinning |
-| What gets worse | stable Rust has no portable SIMD, so x86 and NEON kernels are written twice. Unsafe code appears in kernels, the thread pool, mmap→`MTLBuffer` and KV storage. The JDK's TLS, HTTP client, Unicode normalization, regex and ImageIO were free, and need crates or hand-written code in Rust |
+| Libraries | The Rust port may use any library for the math (§30.5): matrix multiply, FFT, generic SIMD, f16. That saves about 4 weeks, not more, because the hot path (int8 activations × quantized blocks read in place) has no library equivalent |
+| What gets worse | stable Rust has no portable SIMD, so the int8 kernels are written once per instruction set (the float kernels can use a generic SIMD crate). Unsafe code appears in kernels, the thread pool, mmap→`MTLBuffer` and KV storage. The JDK's TLS, HTTP client, Unicode normalization, regex and ImageIO were free, and need crates in Rust |
 
 "Identical" should mean the **same features, the same CLI and config keys, the same HTTP/JSON/SSE wire contract,
 the same on-disk formats, and the same greedy token ids**. Bit-identical logits are not a realistic target, and
@@ -56,8 +57,8 @@ HTTP surface of `./jllm serve` (`server/`): `GET /`, `/index.html`, `/health`, `
 `OPTIONS` for CORS. Subcommands of `Main`: `config`, `download`, `chat`, `run`, `serve`, `image`, `video`,
 `transcribe`, `speak`, `bench`.
 
-The project's defining ethos is **zero external dependencies**: only the JDK. A Rust port has to decide early how
-strictly to keep that (§30.5).
+The Java project's defining rule is **zero external dependencies**: only the JDK. The Rust port drops that rule
+for the math and for what the JDK supplied (§30.5).
 
 ---
 
@@ -65,7 +66,7 @@ strictly to keep that (§30.5).
 
 | Java | Used for | Rust |
 |---|---|---|
-| `jdk.incubator.vector` (`SPECIES_PREFERRED`, ~280 vector load sites in `cpu/`, fma, `reduceLanes`) | all CPU kernels | `std::arch` intrinsics under `#[target_feature]`, one implementation per dispatch level (scalar / NEON / dotprod / AVX2 / AVX-VNNI / AVX-512 VNNI). `pulp` or `wide` can multiversion the float kernels. `std::simd` is still nightly-only, so it is ruled out |
+| `jdk.incubator.vector` (`SPECIES_PREFERRED`, ~280 vector load sites in `cpu/`, fma, `reduceLanes`) | all CPU kernels | Float kernels: a generic SIMD crate with runtime dispatch (`macerator` or `fearless_simd`), and a library matrix multiply for the dense f32 paths (§30.5). Int8 kernels: `std::arch` intrinsics under `#[target_feature]`, one implementation per level (scalar / NEON / dotprod / AVX2 / AVX-VNNI / AVX-512 VNNI). `std::simd` is still nightly-only, so it is ruled out |
 | JIT-stability workarounds (fixed-order reductions, magic-constant int→float, one call site per helper) | bit-stable results under C1/C2 | Mostly unnecessary. Keep the fixed reduction order where results must be stable, and use `f32::round_ties_even` (stable since 1.77) for `rint` |
 | `libjllm_cpu` via FFM `Linker` with `Linker.Option.critical` + self-check (`NativeCpu`, 610 lines) | int8 dot products | Removed. The C kernels become Rust intrinsics (~1.3k C → ~1.5–2k Rust) and the self-check becomes `cargo test`. The AVX-512 VNNI and AVX-VNNI intrinsics are stable since Rust 1.89 and the NEON dot-product intrinsics (`vdotq_s32`) since **1.98**, which sets the minimum toolchain. `is_x86_feature_detected!` replaces cpuid. On Apple Silicon build with `+dotprod` (every M-series CPU has it), because the documentation of `is_aarch64_feature_detected!` only promises runtime detection on Linux |
 | `FileChannel.map` → `MemorySegment` | weights in place (GGUF, safetensors, quant cache); also KV slabs (`CpuKvStorage`), `StreamedKv` and `FileSpill` | `memmap2::Mmap` inside an `Arc`, with offsets rather than borrowed slices (avoids self-referential structs). Only the quant cache is 16 KiB-aligned (`QTensor.PAGE`); GGUF and safetensors tensors sit at arbitrary offsets, and `Metal.java` wraps the pages a tensor touches and carries the offset. `bytemuck`/`zerocopy` + `read_unaligned` for block structs |
@@ -139,19 +140,62 @@ the shaders once per model instead of once per slot.
 
 ---
 
-## 30.5 The dependency decision
+## 30.5 Libraries: what to use and what to write
 
-The Java project depends only on the JDK, but the JDK supplies a lot: TLS, an HTTP client, regex, Unicode
-normalization, image codecs and SHA-256. A Rust port has to settle this first. The recommended policy is
-**"zero dependencies in the compute path, a small vetted set at the edges"**:
+The Java project depends only on the JDK. **The Rust port does not keep that rule for the math:** any library may
+be used there, and the edges (TLS, HTTP client, Unicode, image decoding) use crates too, because the JDK supplied
+them. What stays hand-written is what defines the project's behaviour or has no library equivalent.
 
-| Keep hand-written (as in Java) | Use a crate |
-|---|---|
-| all kernels, quant formats, GGUF/safetensors readers, the quant cache file, KV pool, scheduler, sampler, constrained decoding, tokenizers, chat templates, VP8L/GIF encoders, WAV codec, thread pool, config | `memmap2`, `half`, `parking_lot`, `rustls` + `ureq`, `sha2`, `unicode-normalization`, `fancy-regex` (or hand splitters), `png` + `zune-jpeg`, `objc2-metal` (phase 2). For the server, either hand-written HTTP or `axum`/`tokio`. `serde_json` with `preserve_order` or a ported `Json` |
+The crates below were checked on crates.io and docs.rs in November 2026 (versions in brackets).
 
-Use the `tokenizers` crate **only as a dev-dependency test oracle**. It does not cover GGUF vocabularies,
-llama.cpp pre-types, protected special tokens or the piece cache, so the from-scratch tokenizer has to be ported
-anyway.
+**Math libraries to use**
+
+| Need | Library | Replaces | Notes |
+|---|---|---|---|
+| f32 matrix multiply | `gemm` [0.19] or `matrixmultiply` [0.3.11]: pure Rust, runtime-detected AVX2 / AVX-512, NEON; optional threads. On macOS, Apple Accelerate through `blas-src` (links the system framework, nothing to install) | the dense f32 paths: `vision/VMath`, `audio/Dense`, `diffusion/CpuOps` (conv2d as im2col + sgemm, linear layers, attention products), and the F32 / F16 / BF16 weight paths of the LLM | `gemm` also multiplies f16 directly. Their threading must not fight the engine's own pool: run them single-threaded inside pool jobs, or give them the cores for the media models only |
+| FFT | `rustfft` [6.4] + `realfft` [3.5]: AVX, SSE4.1 and NEON chosen at runtime on stable | `audio/Fft` and its uses in `LogMel` and `WavTokenizerDecoder` | |
+| SIMD without writing each kernel twice | `macerator` [0.5] or `fearless_simd` [1.2]: one generic source, runtime dispatch, x86 (to AVX-512) and NEON. `wide` [1.7] has no runtime dispatch; `multiversion` [0.9] dispatches autovectorized scalar code | the float kernels of `VectorKernels`, `GgufKernels`, `KvCache` (dots, axpy, norms, RoPE, softmax) | None of them wraps the 4-way u8×i8→i32 dot product (VNNI `vpdpbusd`, NEON `sdot`), so the int8 kernels keep raw `std::arch`. `pulp` [0.22] is x86-centred: a NEON backend could not be confirmed from its documentation |
+| f16 / bf16 | `half` [2.7], slice conversions | `Float.float16ToFloat` loops | |
+| Tensor shapes in the media models | `ndarray` [0.17] (its `dot` goes through `matrixmultiply` or BLAS) | hand-indexed `float[]` in the UNet, VAE and Whisper code | optional; NHWC layout is kept so the Metal kernels see the same buffers |
+| Log-mel, resampling | `mel_spec` [0.5] (aligned with whisper.cpp / librosa), `rubato` [5.1] | `audio/LogMel`, `audio/Resampler` | only if `scripts/audio-accuracy.py` still passes; otherwise port the ~300 lines |
+| Scalar math | std / `libm` | `Math.exp` and friends | no stable crate vectorizes `exp` / `tanh` (`sleef` needs nightly), so the fast-math polynomials of `VectorKernels` are ported as they are |
+
+**What no library replaces**
+
+- **The quantized matrix-vector kernels.** The hot path multiplies int8-quantized activations with weight blocks
+  read in place from the memory-mapped file, for 15 block formats, through VNNI or dotprod. General BLAS has
+  nothing for this. `candle-core` [0.11] is the closest: it has block kernels for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0
+  and Q2_K–Q6_K, quantizes activations to int8 and multiplies on the blocks directly, with AVX2 and NEON versions
+  of most of them. But it copies the blocks out of the file (no in-place mmap, so no zero-copy Metal buffers and
+  twice the memory), has no AVX-512 or VNNI path, and lacks IQ4_NL, IQ4_XS and MXFP4. Use it as a reference
+  implementation and as a second oracle in tests, not as the kernel layer.
+- **llama.cpp / ggml bindings** (`llama-cpp-2`) expose the whole llama.cpp API, not its vector kernels. Linking
+  them would make the project a wrapper around llama.cpp and lose the paged KV cache, the scheduler and the Metal
+  kernels.
+- **Ready-made model crates** (`candle-transformers` has Whisper, Stable Diffusion, CLIP and SigLIP; `burn` is a
+  tensor framework). They are different implementations with their own weights handling and GPU backends, so
+  they cannot share the project's Metal kernels, KV cache or formats, and their outputs would not be the Java
+  engine's. They serve as oracles, like diffusers and whisper.cpp today.
+- Attention through the KV cache (flat, paged, sparse, quantized keys), the Metal backend, the sampler and the
+  constrained decoding: project-specific, hand-written as in Java.
+- Random numbers: no crate reproduces Java's `SplittableRandom` or `diffusion/Rng`; both are short hand ports.
+
+**Other crates** (non-math): `memmap2`, `parking_lot`, `rustls` + `ureq`, `sha2`, `unicode-normalization`,
+`fancy-regex` (or hand splitters), `png` + `zune-jpeg`, `objc2-metal` (phase 2), `serde_json` with
+`preserve_order` or a ported `Json`, and `axum` / `tokio` if the server is not hand-written. The `tokenizers`
+crate is a dev-dependency test oracle only: it does not cover GGUF vocabularies, llama.cpp pre-types, protected
+special tokens or the piece cache.
+
+**What the libraries change**
+
+- *Effort:* about 4 weeks less (§30.9.4: C2, C3, V2, A1, A2, A4, D1). The saving is small because the
+  expensive kernels are the quantized ones.
+- *Results:* a library matrix multiply sums in its own order, so f32 results differ from Java's in the last
+  bits. The media models are already compared with a tolerance against diffusers, whisper.cpp and llama.cpp, so
+  their gates stay as they are. For the LLM, the exactness gate compares the generated text of a greedy run on
+  CPU and Metal; the quantized kernels that decide it stay hand-written with a fixed summation order.
+- *x86 coverage:* with a generic SIMD crate, the float kernels get AVX-512 and NEON from one source, which the
+  Java build gets from the Vector API.
 
 ---
 
@@ -182,7 +226,7 @@ Java's semantics leak into results, files or the wire format:
 
 ## 30.7 Area by area
 
-### 30.7.1 CPU backend (~21 weeks)
+### 30.7.1 CPU backend (~20 weeks)
 
 - The Java side has two kernel sets for the int8 dot products: the Vector API ones (`Int8Kernels`,
   `GgufInt8Kernels`, `KQuantKernels`, ~1k lines) and the C library. Rust needs one. Those ~1k lines, the 610-line
@@ -193,7 +237,8 @@ Java's semantics leak into results, files or the wire format:
   and scalar versions only and run on the Vector API on x86 today. The Rust port has to write AVX2 / VNNI versions
   of them, or accept a scalar path there.
 - The cost is volume, not depth: 15 block types × {float dot, int8 dot, prefill tile} × the dispatch levels, plus
-  scalar references.
+  scalar references. A generic SIMD crate removes the per-architecture copies of the float kernels, and
+  `candle-core`'s block kernels are a reference for the common formats (§30.5).
 - Rust never contracts `a*b+c` into an FMA by itself, which matches `-ffp-contract=off` in
   `scripts/build-native-cpu.sh`. The int8 paths are exact integer arithmetic per sub-block, so only the final
   float summation order needs matching.
@@ -247,11 +292,12 @@ Where Rust's ownership model pushes back:
 Wire fidelity covers SSE framing (`data: [DONE]`), error shapes and status codes, `usage.prompt_tokens_details`,
 stop strings across partial UTF-8, JSON number formatting and seeded sampling (both in §30.6).
 
-### 30.7.5 Vision, audio, diffusion, video (~29 weeks)
+### 30.7.5 Vision, audio, diffusion, video (~26 weeks)
 
 - These modules should share the CPU kernel crate and the Metal device with the LLM path. `Ops` becomes a trait
   with CPU and Metal implementations. The new ops on top of the LLM set are conv2d (im2col + GEMM), GroupNorm,
-  tanh-GELU and adaptive modulation.
+  tanh-GELU and adaptive modulation. On the CPU the matrix multiplies and the FFT come from libraries (§30.5),
+  which is where most of the library saving is.
 - Port the hand-written VP8L and GIF encoders exactly, since they are pure bit manipulation. Crates would produce
   different bytes, and `image-webp` cannot encode animations.
 - ImageIO is the one JDK facility without a hand-written equivalent. Rust decoders will produce slightly
@@ -311,7 +357,7 @@ stop strings across partial UTF-8, JSON number formatting and seeded sampling (b
 
 | Decision | Recommendation |
 |---|---|
-| Dependency policy | §30.5: zero dependencies in the compute path, a short reviewed list at the edges |
+| Libraries | §30.5: libraries for matrix multiply, FFT, generic SIMD and f16; hand-written quantized kernels, KV attention and Metal. Pick `gemm` or `matrixmultiply` (and Accelerate on macOS or not) by a benchmark in package C3 |
 | Minimum Rust version | 1.98 (NEON dot-product intrinsics), edition 2024 |
 | `Backend` shape | the `Model` / `SlotState` split of §30.4, agreed in a design note with both backend owners |
 | Server | hand-written HTTP on OS threads for `jllm serve` first (it is 733 lines in Java and keeps the engine free of async); decide on axum when the console backend is ported |
@@ -410,8 +456,8 @@ re-expressed as `cargo test` cases with the same inputs and the same assertions.
 | ID | Contents | Lines | Needs | Acceptance | Weeks |
 |---|---|---|---|---|---|
 | C1 | `ThreadPool`; the int8 kernels and activation quantizer of `jllm_cpu.c` and its `.inc` files as Rust intrinsics, with runtime dispatch (replaces `NativeCpu`) | 2,085 | F2 | `NativeCpuCheck` against scalar references on every dispatch level | 3.5 |
-| C2 | the remaining block kernels of `Int8Kernels`, `GgufInt8Kernels`, `KQuantKernels`, `Q2KKernels`, `Q6KKernels`, including x86 versions of the 7 types that have none | 1,249 | C1 | `GgufKernelsCheck`, `JitStableKernelsTest` (its fixed-order sums) | 2 |
-| C3 | `VectorKernels`, `GgufKernels`, `CpuMatmul` (float dots, fast math, norms, decode and prefill matmul) | 1,838 | C1 | `GgufKernelsCheck`; results within tolerance of the Java dump | 3 |
+| C2 | the remaining block kernels of `Int8Kernels`, `GgufInt8Kernels`, `KQuantKernels`, `Q2KKernels`, `Q6KKernels`, including x86 versions of the 7 types that have none; `candle-core` as a second oracle | 1,249 | C1 | `GgufKernelsCheck`, `JitStableKernelsTest` (its fixed-order sums) | 1.5 |
+| C3 | `VectorKernels`, `GgufKernels`, `CpuMatmul` (float dots, fast math, norms, decode and prefill matmul) on a generic SIMD crate; a library matrix multiply for F32 / F16 / BF16 weights, chosen by benchmark | 1,838 | C1 | `GgufKernelsCheck`; results within tolerance of the Java dump | 2.5 |
 | C4 | `KvCache` (f32, f16, q8, q4, rotated keys, tiled attention, save / restore), `KvQ4Sim`, `CpuKvStorage` | 2,824 | C3, K0 | `LongContextTest`, `KvStateTest` | 3 |
 | C5 | `PagedKv`, `PagedKernels`, sparse block attention | 1,175 | C4, K1 | `PagedKvTest`, `PagedKvChecks`, `SparseKvTest`, `PagedEngineTest` | 2 |
 | C6 | `CpuBackend`, `MoeExperts`, `MlaCpu` | 2,099 | C3, C4, M2 | `GgufBackendsTest`, `MixedPassChecks`, `DeepSeekRef` | 3 |
@@ -459,16 +505,16 @@ re-expressed as `cargo test` cases with the same inputs and the same assertions.
 | ID | Contents | Lines | Needs | Acceptance | Weeks |
 |---|---|---|---|---|---|
 | V1 | Image decoding, `Preprocess`, `Resize`, `ImageParts`, `ImageFetcher` | 940 | F1 | preprocessing equal to the dumps (PNG inputs) | 1 |
-| V2 | `ClipModel`, `Mmproj`, `ClipCpu`, `VMath` | 1,591 | V1, F3, C3 | `VisionTest`; `scripts/vision-llamacpp-check.cpp` | 2 |
+| V2 | `ClipModel`, `Mmproj`, `ClipCpu`; `VMath` on the matrix-multiply library | 1,591 | V1, F3, C3 | `VisionTest`; `scripts/vision-llamacpp-check.cpp` | 1.5 |
 | V3 | `VisionContext`, `MediaChat` (embeddings in the prompt, M-RoPE) | 399 | V2, E1 | `VisionTest` end to end | 1 |
 | V4 | `ClipMetal` | 714 | V2, X1 | CPU = Metal embeddings within tolerance | 1.5 |
-| A1 | `Wav`, `Fft`, `LogMel`, `Resampler`, ffmpeg decode / encode | 1,079 | none | `AudioTest` front-end cases | 1 |
-| A2 | Whisper on the CPU | 1,242 | A1, C3 | `AudioTest`; `scripts/audio-accuracy.py` | 1.5 |
+| A1 | `Wav`, ffmpeg decode / encode; `Fft` replaced by `rustfft`; `LogMel` and `Resampler` ported or from `mel_spec` / `rubato` | 1,079 | none | `AudioTest` front-end cases | 0.5 |
+| A2 | Whisper on the CPU, on the matrix-multiply library | 1,242 | A1, C3 | `AudioTest`; `scripts/audio-accuracy.py` | 1 |
 | A3 | `WhisperTranscriber`, `WordAligner`, `Transcript` | 1,342 | A2 | transcripts and timestamps equal to Java on the fixtures | 1.5 |
-| A4 | OuteTTS, `WavTokenizerDecoder`, `TimeStretch` | 1,371 | A1, E1 | `AudioTest` speech cases | 2 |
+| A4 | OuteTTS, `WavTokenizerDecoder` (library FFT and matrix multiply), `TimeStretch` | 1,371 | A1, E1 | `AudioTest` speech cases | 1.5 |
 | A5 | `AudioApi`, `AudioCli`, `AudioModels`, `AudioSettings` | 517 | A3, A4 | endpoint replay | 0.5 |
 | A6 | Whisper on Metal | 731 | A2, X1 | CPU = Metal within tolerance | 1.5 |
-| D1 | `Ops`, `CpuOps` (conv2d, GroupNorm, attention variants) | 1,599 | C3 | each op equal to the Java dump on the tiny fixtures; `KernelBench` | 2 |
+| D1 | `Ops`, `CpuOps` (conv2d as im2col + library sgemm, GroupNorm, attention variants) | 1,599 | C3 | each op within tolerance of the Java dump on the tiny fixtures; `KernelBench` | 1 |
 | D2 | `ClipText`, `ClipTokenizer`, `Umt5Encoder`, `UnigramTokenizer` | 1,058 | D1, T1 | embeddings equal to the `ref-*` fixtures | 1.5 |
 | D3 | `Scheduler`, `UNet`, `Vae`, `Rng` | 1,699 | D1 | `DiffusionTest`, `DiffusionCompare` | 2 |
 | D4 | `ImagePipeline`, `Imaging`, `ImageApi`, `ImageStore`, `Vp8l` | 2,005 | D2, D3 | `DiffusionTest`; WebP bytes identical to Java | 2.5 |
@@ -491,10 +537,11 @@ re-expressed as `cargo test` cases with the same inputs and the same assertions.
 | R1 | The remaining benchmark and study programs as `cargo bench` / examples; `GgufGreedy`, `GgufTokenize`, `GgufTinyWrite`, `HfToGguf` as `xtask` commands | ~6k | G1 | the shell checks in `scripts/` run without a JVM | 3 |
 | R2 | Docker image, entrypoint, release builds for Linux x86-64 / arm64 and macOS arm64, docs updated | — | CL1 | `scripts/docker-build.sh` equivalent; docs/19 and docs/28 commands verified | 1.5 |
 
-Totals: foundations 7.5, tokenizer and models 21, CPU 21, Metal 21.5, KV / sampling / engine / server 27.5,
-media 29, console and release 16.5 — **144 engineer-weeks**. The same total by the areas of §30.7: models,
-formats, tokenizer and hub 24.5; CPU 21; Metal 21.5; engine, KV, sampling, server and config 28.5 (with B1 and
-K0); media 29; console, tests, build and packaging 19.5 (with P0).
+Totals: foundations 7.5, tokenizer and models 21, CPU 20, Metal 21.5, KV / sampling / engine / server 27.5,
+media 26, console and release 16.5 — **140 engineer-weeks**. The same total by the areas of §30.7: models,
+formats, tokenizer and hub 24.5; CPU 20; Metal 21.5; engine, KV, sampling, server and config 28.5 (with B1 and
+K0); media 26; console, tests, build and packaging 19.5 (with P0). Without the math libraries of §30.5 the CPU
+and media figures would be 21 and 29, and the total 144.
 
 ### 30.9.5 Milestones
 
@@ -540,7 +587,8 @@ review.
   golden comparisons pass in the category of §30.8 (bit-exact or tolerance).
 - `unsafe` is allowed only in the kernel modules, the thread pool, mmap wrappers, the KV block store and the
   Metal device layer. Each block states the invariant it relies on; everything else is `#![forbid(unsafe_code)]`.
-- Every kernel has a scalar reference and is tested against it on each dispatch level the CI machine offers.
+- Every hand-written kernel has a scalar reference and is tested against it on each dispatch level the CI
+  machine offers. A library call in the compute path is benchmarked against the Java figure before it is kept.
 - A package that changes a file format or the wire contract fails review; such changes are separate, after parity.
 - Performance is checked when a package lands, against the Java figure in the docs for the same model and
   machine, not at the end.
@@ -554,12 +602,12 @@ review.
 | Area | Engineer-weeks |
 |---|---|
 | Models / GGUF / safetensors / tokenizer / hub | 24.5 |
-| CPU backend + native kernels | 21 |
+| CPU backend + native kernels | 20 |
 | Metal backend (shaders reused) | 21.5 |
 | Engine / KV / scheduler / sampling / server / config | 28.5 |
-| Vision / audio / diffusion / video | 29 |
+| Vision / audio / diffusion / video | 26 |
 | Web console backend, test tooling, build, Docker | 19.5 |
-| **Total** | **144** (range ~130–150) |
+| **Total** | **140** (range ~125–150) |
 
 These are single-engineer estimates per package by an experienced Rust/SIMD/Metal engineer, with tests included.
 
@@ -568,9 +616,9 @@ that disappear (the duplicated int8 kernels and the FFM layer), is about 109k li
 an existing, tested implementation usually moves at 1,000–1,200 finished lines per engineer-week, which gives
 **~90–110 weeks**, or up to ~125 with the restructuring of §30.4 and the parity harness. The bottom-up figure is
 higher because each package carries its own debugging and tuning reserve. Treat ~95–125 as the optimistic range
-and ~130–150 as the planning figure.
+and ~125–150 as the planning figure.
 
-The text LLM server alone (milestones 0–6 and 9: everything except the media packages, SV4 and W1–W7) is 102
+The text LLM server alone (milestones 0–6 and 9: everything except the media packages, SV4 and W1–W7) is 101
 of those weeks.
 
 ---
@@ -589,7 +637,9 @@ of those weeks.
 | Scope: 22 families × 15 quant formats × 2 backends | Tiny-model fixtures per family from day one. Port families in the order of docs/28 |
 | No CI and Mac-only GPU paths | Metal emulator on Linux, plus one Apple Silicon runner (package P0) |
 | The Java engine keeps changing during the port | Pin a commit as the oracle; replay later Java changes as separate, small packages |
-| Dependency creep against the zero-dependency ethos | Write the §30.5 policy down and review new crates |
+| A math library is slower than the hand-written Java kernel, or its threads fight the engine's pool | Benchmark before adopting (C3, D1); run libraries single-threaded inside pool jobs; keep the hand-written path as the fallback |
+| A library changes results enough to flip a greedy token | Libraries only in f32 paths compared by tolerance; the quantized kernels behind the exactness gate stay hand-written |
+| Dependency creep outside the math | Write the §30.5 list down and review new crates |
 
 ---
 
